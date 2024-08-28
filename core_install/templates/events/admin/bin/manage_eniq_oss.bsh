@@ -1,0 +1,1518 @@
+#!/bin/bash
+# ********************************************************************
+# Ericsson Radio Systems AB                                     SCRIPT
+# ********************************************************************
+#
+#
+# (c) Ericsson Radio Systems AB 2019 - All rights reserved.
+#
+# The copyright to the computer program(s) herein is the property
+# of Ericsson Radio Systems AB, Sweden. The programs may be used
+# and/or copied only with the written permission from Ericsson Radio
+# Systems AB or in accordance with the terms and conditions stipulated
+# in the agreement/contract under which the program(s) have been
+# supplied.
+#
+# ********************************************************************
+# Name    : manage_eniq_oss.bsh
+# Date    : 04/02/2019
+# Revision: main/48
+# Purpose : This script will define the hostname that ENIQ will use
+#           to communicate with an OSS server. This hostname/alias
+#           will be unique. It will also install & activate the
+#           required features for OSS.
+#
+# Usage   : manage_eniq_oss.bsh -a {add|list [ -h <eniq_hname> ]|update [ -h <eniq_hname>} ]
+#                     -d <eniq_sw_dir> [ -b <eniq_base_dir> ] [ -l <path_to_logfile> ]
+#
+# ********************************************************************
+#
+#   Command Section
+#
+# ********************************************************************
+
+AWK=/usr/bin/awk
+BASENAME=/usr/bin/basename
+BASH=/usr/bin/bash
+CAT=/usr/bin/cat
+CHOWN=/usr/bin/chown
+CP=/usr/bin/cp
+DATE=/usr/bin/date
+DIRNAME=/usr/bin/dirname
+ECHO='/usr/bin/echo -e'
+EGREP=/usr/bin/egrep
+EXPR=/usr/bin/expr
+GREP=/usr/bin/grep
+ID=/usr/bin/id
+MKDIR=/usr/bin/mkdir
+PERL=/usr/bin/perl
+PRINTF=/usr/bin/printf
+RM=/usr/bin/rm
+SED=/usr/bin/sed
+SORT=/usr/bin/sort
+TEE=/usr/bin/tee
+TOUCH=/usr/bin/touch
+
+# ********************************************************************
+#
+#       Configuration Section
+#
+# ********************************************************************
+
+# Default user
+DEFAULT_USER=root
+
+# Name of SunOS & ENIQ ini Files
+ENIQ_INI=niq.ini
+SUNOS_INI=SunOS.ini
+
+# Directory on the root filesystem
+ENIQ_ROOT_DIR=/eniq
+
+# Port number range
+PORT_START_NUM=4001
+PORT_END_NUM=4050
+
+# ********************************************************************
+#
+#       Pre-execution Operations
+#
+# ********************************************************************
+
+
+# ********************************************************************
+#
+#   Functions
+#
+# ********************************************************************
+### Function: abort_script ###
+#
+#   This will is called if the script is aborted thru an error
+#   error signal sent by the kernel such as CTRL-C or if a serious
+#   error is encountered during runtime
+#
+# Arguments:
+#       $1 - Error message from part of program (Not always used)
+# Return Values:
+#       none
+abort_script()
+{
+_err_time_=`$DATE '+%Y-%b-%d_%H.%M.%S'`
+
+if [ "$1" ]; then
+    _err_msg_="${_err_time_} - $1"
+else
+    _err_msg_="${_err_time_} - ERROR : Script aborted.......\n"
+fi
+
+$ECHO "\n$_err_msg_\n" | $TEE -a ${LOGFILE}
+
+cd $SCRIPTHOME
+$RM -rf ${TEM_DIR}
+
+if [ "$2" ]; then
+    ${2}
+else
+   exit 1
+fi
+
+$RM -rf ${TEM_DIR}
+}
+
+### Function: add_features_to_server ###
+#
+# Add and Activate the required features for the OSS
+#
+# Arguments:
+#       $1 - ENIQ HNAME for OSS server
+# Return Values:
+#       none
+add_features_to_server()
+{
+local _feature_list_file_=${1}    
+local _eniq_hname_=${2}
+
+if [ "${_eniq_hname_}" == "" ]; then
+    _eniq_hname_="NO"
+fi
+
+if [ ! -s ${ENIQ_ADMIN_BIN_DIR}/manage_features.bsh ]; then
+    _err_msg_="Failed to locate ENIQ TechPack installer script ${ENIQ_ADMIN_BIN_DIR}/manage_features.bsh"
+    abort_script "$_err_msg_"
+fi
+
+if [ ! -s ${ENIQ_ADMIN_BIN_DIR}/manage_eniq_services.bsh ]; then
+    _err_msg_="Failed to locate ENIQ service script ${ENIQ_ADMIN_BIN_DIR}/manage_eniq_services.bsh"
+    abort_script "$_err_msg_"
+fi
+
+# Ensure all services are online
+$ECHO "Starting ENIQ services with command:" >> ${LOGFILE}
+$ECHO "/usr/bin/bash ${ENIQ_ADMIN_BIN_DIR}/manage_eniq_services.bsh -a start -s ALL -N -l ${LOGFILE}" >> ${LOGFILE}
+/usr/bin/bash ${ENIQ_ADMIN_BIN_DIR}/manage_eniq_services.bsh -a start -s ALL -N -l ${LOGFILE}
+if [ $? -ne 0 ]; then
+    abort_script "Exiting...." 
+fi
+
+_inst_flag_="NO"
+if [ "${HNAME_ACT}" == "add" -o "${HNAME_ACT}" == "update" ]; then
+    _inst_flag_="-I"
+fi
+_roll_flag_="-R"
+if [ "${DISABLE_FEATURES}" == "YES" ]; then
+    _roll_flag_="NO"
+else
+    # Change permissions on this directory to allow tp_installer to update files after each feature install
+    $CHOWN -R ${SYS_USER}:${SYS_USER_GROUP} ${MANAGED_OSS_DIR}    
+fi
+
+_no_provisioning_flag_="-P"
+
+
+if [ "${GET_FEATURE_LIST}" != "NO" ]; then
+    add_activate_features "${TEM_DIR}/feature_output_list" ${_eniq_hname_} ${ENIQ_ADMIN_BIN_DIR} ${_inst_flag_} ${BASE_SW_DIR} ${INSTALL_TYPE} ${LOGFILE} ${_roll_flag_} ${_no_provisioning_flag_} ${HNAME_ACT}
+else
+    add_activate_features "${ENIQ_CORE_ETC_DIR}/feature_output_list_${_eniq_hname_}" ${_eniq_hname_} ${ENIQ_ADMIN_BIN_DIR} ${_inst_flag_} ${BASE_SW_DIR} ${INSTALL_TYPE} ${LOGFILE} ${_roll_flag_} ${_no_provisioning_flag_} ${HNAME_ACT}
+fi
+
+if [ $? -ne 0 ]; then
+    _err_msg_="Failed to manipulate the features"
+    abort_script "$_err_msg_" 
+fi
+
+if [ "${DISABLE_FEATURES}" != "YES" ]; then
+    # Change permissions back now after tp_installer has updated these files
+    $CHOWN -R ${ROOT}:${ROOT} ${MANAGED_OSS_DIR}
+    if [ $? -ne 0 ]; then
+        _err_msg_="Failed to restore owner:group of ${MANAGED_OSS_DIR} to ${ROOT}:${ROOT}"
+        abort_script "$_err_msg_" 
+    fi
+fi
+# Store the ENIQ feature list for this OSS
+store_feature_det ${_feature_list_file_} "${ENIQ_CONF_DIR}/${ENIQ_INI}" ${TEM_DIR} ${LOGFILE}
+if [ $? -ne 0 ]; then
+    _err_msg_="Failed to store features information"
+    abort_script "$_err_msg_" 
+fi
+
+}
+
+### Function: clear ### 
+#
+# To clear the screen
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+clear()
+{
+
+# Clearing the screen without removing scrollback buffer
+$PRINTF '\33[H\33[2J'
+
+}
+
+### Function: add_managed_oss ###
+#
+#   Add a new OSS to be managed
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+add_managed_oss()
+{
+# Did User specify ENIQ HNAME and BASE_SW_DIR
+if [ ! "${BASE_SW_DIR}" ]; then
+    usage_msg
+    abort_script
+fi
+
+
+if [ ! "${HNAME_IP}" ]; then
+    # Get OSS server Name/IP
+    get_oss_server_det
+else
+    SRV_IP="${HNAME_IP}"
+fi
+
+# Get the next available OSS reference name. From now on
+# we will only refer to the oss as this
+get_next_avail_oss_name ${SRV_IP}
+
+$CAT /etc/hosts | $EGREP -v "^[[:blank:]]*#" | $GREP -w ${OSS_REF_NAME} >> /dev/null 2>&1
+if [ $? -eq 0 ]; then
+    _err_msg_="${OSS_REF_NAME} already reference in the /etc/hosts\nThis value must be unique and not used before"
+    abort_script "$_err_msg_"
+fi
+
+let _field1_=_field1_+20
+let _field2_=_field2_+20
+
+_line1_str_="%-${_field1_}s%-${_field2_}s\n"
+_line2_str_="\n%-${_field1_}s%-${_field2_}s\n"
+
+if [ "${CURR_SERVER_TYPE}" == "eniq_stats"  -o "${CURR_SERVER_TYPE}" == "eniq_coordinator" -o "${CURR_SERVER_TYPE}" == "stats_coordinator"  ]; then
+    # Only go in here if we are not an initial install
+    if [ ! "${NO_INITIAL_FEATURE}" ]; then
+        # Get the list of ENIQ features to be installed
+        get_eniq_features_list ${OSS_REF_NAME}
+        DISABLE_FEATURES=YES
+    fi
+    
+    if [ -z "${NO_CONFIRM}" ]; then
+        # Set up a file to display out
+        $RM -f ${TEM_DIR}/disp_file
+            if [ ! ${ENM} ];then
+            printf "${_line2_str_}" "OSS IP Address:" "${SRV_IP}" >> ${TEM_DIR}/disp_file
+            printf "${_line1_str_}" "ENIQ OSS Alias:" "${OSS_REF_NAME}" >> ${TEM_DIR}/disp_file
+            else
+                printf "${_line2_str_}" "ENM IP Address:" "${SRV_IP}" >> ${TEM_DIR}/disp_file
+                printf "${_line1_str_}" "ENIQ ENM Alias:" "${OSS_REF_NAME}" >> ${TEM_DIR}/disp_file
+            fi
+        $ECHO "\nENIQ Features List:" >> ${TEM_DIR}/disp_file
+        $ECHO "-------------------" >> ${TEM_DIR}/disp_file
+        $CAT ${TEM_DIR}/feature_output_list | $AWK -F"::" '{print $2}' >> ${TEM_DIR}/disp_file
+            if [ ! ${ENM} ];then    
+            $ECHO "\n\nDo you wish to continue to add the OSS Server" >> ${TEM_DIR}/disp_file
+            else
+                 $ECHO "\n\nDo you wish to continue to add the ENM Server" >> ${TEM_DIR}/disp_file
+            fi
+            $ECHO "and configure with the features above (Yy/Nn)\n" >> ${TEM_DIR}/disp_file
+    
+        # Confirm that the User still wants to add the OSS
+        confirm_user_input ${TEM_DIR}/disp_file
+    
+        if [ $? -eq 1 ]; then # user said no
+            $RM -rf ${TEM_DIR}
+            exit 0
+        fi
+    fi
+    
+    if [ -s ${TEM_DIR}/feature_output_list ]; then
+        add_features_to_server "${TEM_DIR}/feature_output_list" ${OSS_REF_NAME} 
+    fi
+else
+    if [ -z "${NO_CONFIRM}" ]; then
+        # Set up a file to display out
+        $RM -f ${TEM_DIR}/disp_file
+        printf "${_line2_str_}" "OSS IP Address:" "${SRV_IP}" >> ${TEM_DIR}/disp_file
+        printf "${_line1_str_}" "ENIQ OSS Alias:" "${OSS_REF_NAME}" >> ${TEM_DIR}/disp_file
+        $ECHO "\n\nDo you wish to continue to add the OSS Server (Yy/Nn)\n" >> ${TEM_DIR}/disp_file
+        
+        # Confirm that the User still wants to add the OSS
+        confirm_user_input ${TEM_DIR}/disp_file
+    
+        if [ $? -eq 1 ]; then # user said no
+            $RM -rf ${TEM_DIR}
+            exit 0
+        fi
+    fi
+fi
+
+if [ "${INSTALL_TYPE}" == "stats" ]; then
+    if [ "${STORAGE_TYPE}" == "fs" ]; then
+        # Create structure for tunnel
+        add_tunnel_info
+    fi
+fi
+
+# Add the entry to the REF File
+$ECHO "Adding \"${OSS_REF_NAME} ${SRV_IP}\" to ${OSS_REF_NAME_FILE}" | $TEE -a ${LOGFILE}
+$ECHO "${OSS_REF_NAME} ${SRV_IP}" >> ${OSS_REF_NAME_FILE}
+
+if [ ! ${ENM} ]; then
+    $ECHO "Adding \"${SRV_IP}::${OSS_REF_NAME}::${OSS_REF_NAME}\" to ${SRV_NAME_FILE}" | $TEE -a ${LOGFILE}
+    $ECHO "${SRV_IP}::${OSS_REF_NAME}::${OSS_REF_NAME}" >> ${SRV_NAME_FILE}
+    $ECHO "\nAddition of OSS successful\n" | $TEE -a ${LOGFILE}
+else
+    srv_ip=`$CAT ${OSS_REF_NAME_FILE} | $GREP -w ${OSS_REF_NAME} | $AWK -F " " '{print $NF}'`
+    $ECHO "Adding \"${srv_ip}::${OSS_REF_NAME}::${OSS_REF_NAME}\" to ${SRV_NAME_FILE}" | $TEE -a ${LOGFILE}
+    $ECHO "${srv_ip}::${OSS_REF_NAME}::${OSS_REF_NAME}" >> ${SRV_NAME_FILE}
+    $ECHO "\nAddition of ENM successful\n" | $TEE -a ${LOGFILE}
+fi
+}
+
+### Function: add_tunnel_info ###
+#
+#   Create a directory structure for
+#   the ssh tunnel to use
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+add_tunnel_info()
+{
+$ECHO "Beginning to setup ssh tunnel files..." | $TEE -a ${LOGFILE}
+    
+$RM -f ${TEM_DIR}/tunnel_port_list ${TEM_DIR}/port_data
+
+# Directory containing details for that OSS tunnel such as
+# port number, mounted filesystems, etc
+_oss_tunnel_ref_=${ENIQ_CONNECTD_DIR}/mount_info/${OSS_REF_NAME}
+_tunnel_port_list_=${ENIQ_CONNECTD_DIR}/etc/tunnel_port_list
+
+# Populate a temp file with list of port numbers
+for (( i=${PORT_START_NUM}; i<=${PORT_END_NUM}; i++ )); do
+    $ECHO ${i} >> ${TEM_DIR}/tunnel_port_list
+    if [ $? -ne 0 ]; then
+        _err_msg_="Failed to add port number ${i} to ${TEM_DIR}/tunnel_port_list"
+        abort_script "$_err_msg_"
+    fi
+done
+
+# Copy temp port info file to proper location
+# if one doesn't already exist
+if [ -s ${TEM_DIR}/tunnel_port_list ]; then
+    $ECHO "Creating ${_tunnel_port_list_} file" | $TEE -a ${LOGFILE}
+    $CP ${TEM_DIR}/tunnel_port_list ${_tunnel_port_list_}
+    if [ $? -ne 0 ]; then
+        _err_msg_="Failed to copy ${TEM_DIR}/tunnel_port_list to ${_tunnel_port_list_}"
+        abort_script "$_err_msg_"
+    fi
+fi
+
+# Create directory for the OSS if it doesn't exist
+if [ ! -d ${_oss_tunnel_ref_} ]; then
+    $ECHO "Creating ${_oss_tunnel_ref_} directory" | $TEE -a ${LOGFILE}
+    $MKDIR -p ${_oss_tunnel_ref_}
+    if [ $? -ne 0 ]; then
+        _err_msg_="Failed create ${_oss_tunnel_ref_} directory"
+        abort_script "$_err_msg_"
+    fi
+fi
+
+# Create the disable_oss file
+if [ ! -e ${_oss_tunnel_ref_}/disable_OSS ]; then
+    $ECHO "Creating ${_oss_tunnel_ref_}/disable_OSS file" | $TEE -a ${LOGFILE}
+    $TOUCH ${_oss_tunnel_ref_}/disable_OSS
+    if [ $? -ne 0 ]; then
+        _err_msg_="Failed to create ${_oss_tunnel_ref_}/disable_oss file"
+        abort_script "$_err_msg_"
+    fi
+fi
+
+# Get the alias number so I can determine if it is the first OSS alias or not.
+_alias_num_=`$ECHO ${OSS_REF_NAME} | $AWK -F\_ '{print $NF}'`
+if [ $? -ne 0 ]; then
+    _err_msg_="Failed to find alias number from ${OSS_REF_NAME}"
+    abort_script "$_err_msg_"
+fi
+
+# Create the port_data file if it doesn't exist with the
+# port number for this particular OSS
+if [ ! -s ${_oss_tunnel_ref_}/port_data ]; then
+    # Find a suitable port number by checking the port list file, and
+    # finding a port thats not already used by another OSS
+    while read _port_number_; do
+        # if this is the first OSS added, give it the first port number
+        if [ ${_alias_num_} -eq 1 ]; then
+            _port_=${_port_number_}
+            if [ "${_port_}" ]; then
+                break
+            fi
+        else
+            _used_port_=`$CAT ${ENIQ_CONNECTD_DIR}/mount_info/eniq_oss_*/port_data`
+            $ECHO ${_used_port_} | $GREP ${_port_number_} > /dev/null 2>&1
+            if [ $? -ne 0 ]; then
+                _port_=${_port_number_}
+                break
+            fi
+        fi
+    done < ${_tunnel_port_list_}
+
+    # We should have a unique Port number so we'll use that
+    $ECHO ${_port_} > ${TEM_DIR}/port_data
+    if [ $? -ne 0 ]; then
+        _err_msg_="Failed to add ${_port_} to ${TEM_DIR}/port_data"
+        abort_script "$_err_msg_"
+    fi
+
+    # Copy the temp port_data file to its permanent location
+    if [ -s ${TEM_DIR}/port_data ]; then
+        $ECHO "Creating ${_oss_tunnel_ref_}/port_data file" | $TEE -a ${LOGFILE}
+        $CP ${TEM_DIR}/port_data ${_oss_tunnel_ref_}/port_data
+        if [ $? -ne 0 ]; then
+            _err_msg_="Failed to copy ${TEM_DIR}/port_data to ${_oss_tunnel_ref_}/port_data"
+            abort_script "$_err_msg_"
+        fi
+    fi
+fi
+}
+
+### Function: check_id ###
+#
+#   Check that the effective id of the user is correct
+#   If not print error msg and exit.
+#
+# Arguments:
+#       $1 : User ID name
+# Return Values:
+#       none
+check_id()
+{
+_check_id_=`$ID  | $AWK -F\( '{print $2}' | $AWK -F\) '{print $1}'`
+if [ "$_check_id_" != "$1" ]; then
+    _err_msg_="You must be $1 to execute this script."
+    abort_script "$_err_msg_"
+fi
+}
+
+### Function: chk_create_logfile ###
+#
+# Check/Create Logfile
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+chk_create_logfile()
+{
+$MKDIR -p `$DIRNAME ${LOGFILE}`
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not create directory `$DIRNAME ${LOGFILE}`"
+    abort_script "$_err_msg_"
+fi
+
+$TOUCH -a ${LOGFILE}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not write to file ${LOGFILE}"
+    abort_script "$_err_msg_"
+fi
+}
+
+### Function: confirm_user_input ###
+#
+# Confirm with user that values entered are correct
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+confirm_user_input()
+{
+while :; do
+    clear
+    $CAT ${1}
+    read USER_CONF
+
+    # If the User hit nothing
+    if [ ! "${USER_CONF}" ]; then
+        continue
+    fi
+
+    # Did the user input (Y/y)
+    if [ "${USER_CONF}" == "Y" -o "${USER_CONF}" == "y" ];  then
+        return 0
+    fi
+    # Did the user input (N/n)
+    if [ "${USER_CONF}" == "N" -o "${USER_CONF}" == "n" ]; then
+        return 1
+    fi
+done
+}
+
+### Function: get_absolute_path ###
+#
+# Determine absolute path to software
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+get_absolute_path()
+{
+_dir_=`$DIRNAME $0`
+SCRIPTHOME=`cd $_dir_ 2>/dev/null && pwd || $ECHO $_dir_`
+}
+
+### Function: get_and_install_features ###
+#
+# Add/activate features without a host
+#
+# Arguments:
+#   $1: Optional parameter, alias of oss to add features to
+# Return Values:
+#   none
+get_and_install_features()
+{
+local _host_to_use_=$1
+
+if [ "${GET_FEATURE_LIST}" != "NO" ]; then
+    get_eniq_features_list ${_host_to_use_}
+
+    if [ -z "${NO_CONFIRM}" ]; then
+        setup_update_disp_file
+
+        # If there is no file then there is nothing to update
+        if [ -s  ${TEM_DIR}/disp_file ]; then
+        
+            # Confirm that the User still wants to add the OSS
+            confirm_user_input ${TEM_DIR}/disp_file
+        
+            if [ $? -eq 1 ]; then # User said no
+                $RM -rf ${TEM_DIR}
+                $ECHO "\n\n"
+                exit 0
+            fi
+        else
+            clear
+            $ECHO "No update required....exiting\n\n"
+            $RM -rf ${TEM_DIR}
+            exit 0
+        fi
+    fi
+
+    if [ -s ${TEM_DIR}/feature_output_list ]; then
+        add_features_to_server "${TEM_DIR}/feature_output_list" ${_host_to_use_}
+    fi
+else
+    if [ -s "${ENIQ_CORE_ETC_DIR}/feature_output_list_${_host_to_use_}" ]; then
+        add_features_to_server "${ENIQ_CORE_ETC_DIR}/feature_output_list_${_host_to_use_}" ${_host_to_use_}
+    fi
+fi
+}
+
+### Function: get_and_install_features_with_host ###
+#
+# Add/activate features with a host
+#
+# Arguments:
+# $1 : host to use
+# $2 : OSS reference name file
+# Return Values:
+#   none
+get_and_install_features_with_host()
+{
+_host_to_use_=$1
+
+
+# Check that the user specified a ENIQ HNAME format eg. eniq_oss_
+$ECHO "\nChecking ${_host_to_use_} is in a valid format" | $TEE -a ${LOGFILE}
+$ECHO ${_host_to_use_} | $EGREP "${OSS_REF_STR}[1-9][0-9]*"  >> /dev/null 2>&1
+if [ $? -ne 0 ]; then
+    _err_msg_="${_host_to_use_} must be specified in the ENIQ HNAME format eg. ${OSS_REF_STR}1"
+    abort_script "$_err_msg_"
+fi
+
+# Have we previous OSS defined
+if [ ! -s ${OSS_REF_NAME_FILE} ]; then
+    _err_msg_="No OSS's are currently managed by this ENIQ server"
+    abort_script "$_err_msg_"
+fi
+
+# Is the OSS managed
+$ECHO "Checking ${_host_to_use_} is in ${OSS_REF_NAME_FILE}" | $TEE -a ${LOGFILE}
+$CAT ${OSS_REF_NAME_FILE} | $GREP -w ${_host_to_use_} >> /dev/null 2>&1
+if [ $? -ne 0 ]; then
+    _err_msg_="${_host_to_use_} does not seem to be currently managed by ENIQ server"
+    abort_script "$_err_msg_"
+fi
+
+
+# Update OSS server Name/IP
+if [ "${GET_FEATURE_LIST}" != "NO" ]; then
+    update_oss_server_det ${_host_to_use_} ${OSS_REF_NAME_FILE}
+else
+    update_oss_server_det ${_host_to_use_} ${OSS_REF_NAME_FILE} SKIP_INPUT
+fi
+
+get_and_install_features ${_host_to_use_}
+
+if [ "${NEW_SRV_IP}" != "${OLD_SRV_IP}" ]; then
+      # Update the entry in the REF File
+    update_oss_ref_file ${OSS_REF_NAME_FILE} ${_host_to_use_} ${OLD_SRV_IP} ${NEW_SRV_IP}
+
+fi    
+}
+
+### Function: get_eniq_features_list ###
+#
+# Get the list of ENIQ features to be installed
+#
+# Arguments:
+#       $1 - ENIQ HNAME for OSS server
+# Return Values:
+#       none
+get_eniq_features_list()
+{
+local _eniq_hname_=${1}
+
+# Get directory where the ENIQ Features are stored on DVD/Jumpstart - eniq_techpacks
+_eniq_feat_input_dir_=`iniget FEATURE_INFO -f ${CLI_CONF_DIR}/${ENIQ_INI} -v Feature_Input_Dir`
+if [ ! "${_eniq_feat_input_dir_}" ]; then
+    _err_msg_="Could not read parameter Feature_Input_Dir from file\n${CLI_CONF_DIR}/${ENIQ_INI}"
+    abort_script "$_err_msg_"
+fi
+
+# Get file where the ENIQ Features are listed on DVD/Jumpstart - install_features
+_tem_feat_input_file_=`iniget FEATURE_INFO -f ${CLI_CONF_DIR}/${ENIQ_INI} -v Feature_Input_File`
+if [ ! "${_tem_feat_input_file_}" ]; then
+    _err_msg_="Could not read parameter Feature_Input_File from file\n${CLI_CONF_DIR}/${ENIQ_INI}"
+    abort_script "$_err_msg_"
+fi
+
+# Does the feature input file exist?
+if [ "${CURR_SERVER_TYPE}" == "eniq_coordinator" ]; then
+        _eniq_feat_input_file_="$OLD_SW_DIR/${_eniq_feat_input_dir_}/${_tem_feat_input_file_}"
+else
+    _eniq_feat_input_file_="$BASE_SW_DIR/${_eniq_feat_input_dir_}/${_tem_feat_input_file_}"
+fi
+if [ ! -s ${_eniq_feat_input_file_} ]; then
+    _err_msg_="Could not locate ENIQ Features input file\n${_eniq_feat_input_file_}"
+    abort_script "$_err_msg_"
+fi
+
+# Get Directory where the list of managed features will be stored
+_feature_list_dir_=`iniget FEATURE_INFO -f ${ENIQ_CONF_DIR}/${ENIQ_INI} -v Feature_Interface_Dir`
+if [ ! "${_feature_list_dir_}" ]; then
+    _err_msg_="Failed to read Parameter Feature_Interface_Dir from ${ENIQ_CONF_DIR}/${ENIQ_INI}"
+    abort_script "$_err_msg_"
+fi
+
+# Total Interface File
+_eniq_total_feature_output_file_=${_feature_list_dir_}/total_feature_install_list
+if [ ! -s ${_eniq_total_feature_output_file_} ]; then
+    $ECHO "${_eniq_total_feature_output_file_} not found or empty"
+    $ECHO "We will handle via ${ENIQ_FEATURE_FILE} file."
+fi
+
+# Does the sentinel environment file exist?
+if [ ! -s ${ENIQ_SENTINEL_ENV} ]; then
+    _err_msg_="${ENIQ_SENTINEL_ENV} not found or empty"
+    abort_script "$_err_msg_"
+fi
+. ${ENIQ_SENTINEL_ENV}
+
+# Does the sentinel lsmon binary exist?
+if [ ! -x ${ENIQ_SENTINEL_BIN_DIR}/lsmon ]; then
+    _err_msg_="${ENIQ_SENTINEL_BIN_DIR}/lsmon not found or not executable"
+    abort_script "$_err_msg_"
+fi
+
+# Get a list of licenced features
+get_licenced_features ${LOGFILE} ${TEM_DIR} ${ENIQ_SENTINEL_BIN_DIR}/lsmon ${LSHOST}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not generate a list of licences on ${LSHOST}"
+    abort_script "$_err_msg_"
+fi
+    
+_working_list_=${TEM_DIR}/feature_work_list
+
+# Build a list of features
+# Was I supplied Feature in a file for a specific OSS to be upgraded
+if [ "${ENIQ_FEATURE_FILE}" ]; then
+    if [ ! -s ${ENIQ_FEATURE_FILE} ]; then
+        _err_msg_="Interface list file ${ENIQ_FEATURE_FILE} missing or empty"
+        abort_script "$_err_msg_"
+    fi
+    $CP ${ENIQ_FEATURE_FILE} ${_working_list_} 
+    if [ $? -ne 0 ]; then
+        _err_msg_="Could not copy ${ENIQ_FEATURE_FILE} to ${_working_list_}"
+        abort_script "$_err_msg_"
+    fi
+# Was I supplied Techpacks to be updated
+elif [ "${ENIQ_FEATURE}" ]; then
+    if [ "${ENIQ_FEATURE}" == "ALL" ]; then
+        $CP ${_eniq_total_feature_output_file_} ${_working_list_} 
+    else
+        _tem_list_=`$ECHO ${ENIQ_FEATURE}|$SED -e 's|,| |g'`
+        for _feat_ in ${_tem_list_}; do
+            _chk_feat_inst_=`$CAT ${_eniq_total_feature_output_file_}|$GREP -w ${_feat_}`
+            if [ $? -ne 0 ]; then
+                _err_msg_="Feature ${_feat_} cannot be updated as it has not been installed"
+                abort_script "$_err_msg_"
+            fi
+            $ECHO ${_chk_feat_inst_} >>  ${_working_list_}
+        done
+    fi
+else
+    $CP ${_eniq_feat_input_file_} ${_working_list_}
+    if [ $? -ne 0 ]; then
+        _err_msg_="Could not copy ${_eniq_feat_input_file_} to ${_working_list_}"
+        abort_script "$_err_msg_"
+    fi
+    _build_list_=1
+fi
+
+unset FEATURE_ARRAY START_DATE_ARRAY END_DATE_ARRAY
+# Build 3 arrays of all the ENIQ Features. One array for the description
+# and the 2nd array for the file designation
+_cnt_=${#_tem_feature_array_[@]}
+_ptr_=0
+for (( i=0; i<=${_cnt_}; i++)); do
+    _desc_=`$CAT ${_working_list_}|$EGREP "^[ ]*${_tem_feature_array_[${i}]}::"|$AWK -F"::" '{print $2}'`
+    if [ "${_desc_}" ]; then
+        let _ptr_=${_ptr_}+1
+        FEATURE_ARRAY[${_ptr_}]=${_tem_feature_array_[${i}]}
+        START_DATE_ARRAY[${_ptr_}]=${_tem_start_date_array_[${i}]}
+        END_DATE_ARRAY[${_ptr_}]=${_tem_end_date_array_[${i}]}
+        DESC_ARRAY[${_ptr_}]=${_desc_}
+    
+        # Assume feature has not already being installed/activated
+        _act_chk_array_[${_ptr_}]="0"
+    
+        # Has the Interface been activated already for the OSS
+        if [ -s ${_eniq_total_feature_output_file_} ]; then
+            if [ "${_eniq_hname_}" ]; then
+                $CAT ${_eniq_total_feature_output_file_} | $EGREP "^[     ]*${FEATURE_ARRAY[${_ptr_}]}::.*::${_eniq_hname_}[     ]*$" >> /dev/null 2>&1
+                if [ $? -eq 0 ]; then
+                    _act_chk_array_[${_ptr_}]="1"
+                fi
+            else
+                $CAT ${_eniq_total_feature_output_file_} | $EGREP "^[     ]*${FEATURE_ARRAY[${_ptr_}]}::.*" >> /dev/null 2>&1
+                if [ $? -eq 0 ]; then
+                    _act_chk_array_[${_ptr_}]="1"
+                fi
+            fi
+        fi
+        if [ ! "${FEATURE_ARRAY[${_ptr_}]}" -o ! "${START_DATE_ARRAY[${_ptr_}]}" -o ! "${END_DATE_ARRAY[${_ptr_}]}" -o ! "${DESC_ARRAY[${_ptr_}]}" ]; then
+            _err_msg_="Malformed license value"
+            abort_script "$_err_msg_"
+        fi
+    fi
+done
+
+if [ ${#START_DATE_ARRAY[@]} -eq 0 ]; then
+    _err_msg_="No valid ENIQ licenses read from License Server ${LSHOST}"
+    abort_script "$_err_msg_"
+fi
+
+# Get todays date
+_now_date_=`$DATE '+%Y%m%d'`
+
+# Create the Display file
+_disp_file_=${TEM_DIR}/disp_file
+_unlic_file_=${TEM_DIR}/unlicensed_file
+$RM -f ${_disp_file_} ${_unlic_file_}
+
+$ECHO "\nENIQ Feature List" >> ${_disp_file_}
+$ECHO "=================" >> ${_disp_file_}
+
+
+_cnt_=${#FEATURE_ARRAY[@]}
+_menu_opt_=0
+for (( i=1; i<=${_cnt_}; i++)); do
+    unset _act_
+
+    if [ ${_act_chk_array_[${i}]} -eq 1 ]; then
+        _act_="(*)"
+    fi
+
+    if [ ${START_DATE_ARRAY[${i}]} -gt ${_now_date_} -o ${END_DATE_ARRAY[${i}]} -lt ${_now_date_} ]; then
+        $ECHO "[N/A]  ${DESC_ARRAY[${i}]}  (E)" >> ${_unlic_file_}
+    else
+        let _menu_opt_=_menu_opt_+1
+        VALID_FEATURE_ARRAY[${_menu_opt_}]=${FEATURE_ARRAY[${i}]}
+        VALID_DESC_ARRAY[${_menu_opt_}]=${DESC_ARRAY[${i}]}
+        $ECHO "[${_menu_opt_}]  ${DESC_ARRAY[${i}]}  ${_act_}" >> ${_disp_file_}
+    fi
+done
+
+# Any unlicensed stuff to display
+if [ -s ${_unlic_file_} ]; then
+    $ECHO "" >> ${_disp_file_}
+    $CAT ${_unlic_file_} >> ${_disp_file_}
+fi
+
+$ECHO "\nSelect range of ENIQ features to be installed using the format [n,n,n-n,n...n]" >> ${_disp_file_}
+if [ "${_eniq_hname_}" ]; then
+    $ECHO "\tE.G. 1,2,3-8,9,10 (*) means feature already installed for ${_eniq_hname_}" >> ${_disp_file_}
+else
+    $ECHO "\tE.G. 1,2,3-8,9,10 (*) means feature is already installed" >> ${_disp_file_}
+fi
+
+_cnt_=${#VALID_FEATURE_ARRAY[@]}
+while :; do
+    clear
+    $CAT ${_disp_file_}
+    if [ "${HNAME_ACT}" == "update" ]; then
+        $ECHO "\nSelect 'None' if you do not wish to add any features"
+    fi
+    
+    $ECHO "\n\nSelect the ENIQ features numbers you wish to"
+    if [ "${_eniq_hname_}" ]; then
+        $ECHO "install & activate for ${_eniq_hname_}"
+    else
+        $ECHO "install & activate"
+    fi
+    read _opt_
+
+    # If the User hit nothing and there is a default. that will do
+    if [ ! "${_opt_}" ]; then
+        continue
+    fi
+
+    if [ "${HNAME_ACT}" == "update" ]; then
+        if [ "${_opt_}" == "None" -o  "${_opt_}" == "none" ]; then
+            break
+        fi
+    fi
+    
+    $RM -f ${TEM_DIR}/feature_output_list1 ${TEM_DIR}/feature_selection
+    _numerror_=0
+
+    for _num_ in `$ECHO ${_opt_} | $SED -e 's| ||g' -e 's|,| |g'`; do
+        $ECHO ${_num_} | $EGREP '-' >> /dev/null 2>&1
+        if [ $? -eq 0 ]; then
+            _start_=`$ECHO ${_num_} | $AWK -F\- '{print $1}'`
+            if [ ! "${_start_}" ]; then
+                continue
+            fi
+            _end_=`$ECHO ${_num_} | $AWK -F\- '{print $2}'`
+            for (( _sel_=${_start_}; _sel_<=${_end_}; _sel_++ )); do
+                $ECHO ${_sel_} | $EGREP '^[0-9]+$' >> /dev/null 2>&1
+                if [ $? -ne 0 ]; then
+                    _numerror_=1
+                    break
+                fi
+                if [ ${_sel_} -lt 1 -o ${_sel_} -gt ${_cnt_} ]; then
+                    _numerror_=1
+                    break
+                fi
+                $ECHO ${_sel_} >> ${TEM_DIR}/feature_selection
+            done
+        else
+            $ECHO ${_num_} | $EGREP '^[0-9]+$' >> /dev/null 2>&1
+            if [ $? -ne 0 ]; then
+                _numerror_=1
+                break
+            fi
+            if [ ${_num_} -lt 1 -o ${_num_} -gt ${_cnt_} ]; then
+                _numerror_=1
+                break
+            fi
+            $ECHO ${_num_} >> ${TEM_DIR}/feature_selection
+        fi
+    done
+
+    # Okay I should have a valid choice now in the ${TEM_DIR}/feature_selection
+    # file, however it may need to be sorted and to remove duplicate numbers if
+    # the user entered duplicate values. Output details to output file. I will
+    # output the desc as well as I might show the user
+    for i in `$CAT ${TEM_DIR}/feature_selection | $SORT -u`; do
+        if [ "${_eniq_hname_}" ]; then
+            $ECHO "${VALID_FEATURE_ARRAY[${i}]}::${VALID_DESC_ARRAY[${i}]}::${_eniq_hname_}" >> ${TEM_DIR}/feature_output_list1
+        else
+            $ECHO "${VALID_FEATURE_ARRAY[${i}]}::${VALID_DESC_ARRAY[${i}]}" >> ${TEM_DIR}/feature_output_list1
+        fi
+    done
+
+    if [ ${_numerror_} -eq 0 ]; then
+        break
+    fi
+done
+
+if [ -s ${TEM_DIR}/feature_output_list1 ]; then
+    # We need to put the list in order now and remove the duplicates.
+    while read _feat_detail_; do
+        _feat_=`$ECHO ${_feat_detail_}| $AWK -F"::" '{print $1}'`
+        $CAT ${TEM_DIR}/feature_output_list1 | $SORT -u | $EGREP "^${_feat_}::" >> ${TEM_DIR}/feature_output_list 2>/dev/null
+    done < ${_eniq_feat_input_file_}
+fi
+}
+
+### Function: get_oss_server_det ###
+#
+# Get ENIQ server Name/IP
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+get_oss_server_det()
+{
+unset SRV_IP
+
+if [ ! ${ENM} ]; then
+    while :; do
+        clear
+        $ECHO "\n\nPlease enter the IP address of the OSS Server\n"
+        read SRV_IP
+
+        if [ ! "${SRV_IP}" ]; then
+            continue
+        fi
+
+        validate_ip ${SRV_IP}
+        if [ $? -ne 0 ]; then
+            continue
+        fi
+
+        break
+     done
+else
+    while :; do
+        $RM -rf /var/tmp/ip_list >> /dev/null 2>&1
+        clear
+        $ECHO "\n\nPlease enter NAS IP addresses of ENM on which pm and pmlinks volumes are present "
+        $ECHO "\nEnter the IP addresses in comma separated format, if more than one exists"
+        $ECHO "For Example: 1.1.1.1, 1.1.1.2, 1.1.1.3"
+        read SRV_IP_LIST
+
+        if [ ! "${SRV_IP_LIST}" ]; then
+            continue
+        fi
+        wrong_ip=0
+
+        # Remove any spaces in between 
+        SRV_IP_LIST=`$ECHO ${SRV_IP_LIST} | $SED 's/ //g'`
+
+        # Validate the IP addresses entered
+        IFS=","
+        for _srv_ip_ in ${SRV_IP_LIST}; do
+            validate_ip ${_srv_ip_}
+            if [ $? -ne 0 ]; then
+                wrong_ip=1
+                echo -e "${_srv_ip_} is invalid IP address"
+                break
+            fi
+            echo -e "$_srv_ip_" >> /var/tmp/ip_list
+        done
+        unset IFS
+        if [ ${wrong_ip} -eq 1 ];then
+            continue
+        else
+            break
+        fi
+    done
+fi
+
+
+# Have we previous OSS defined
+if [ ! -s ${OSS_REF_NAME_FILE} ]; then
+    return 0
+fi
+
+# Is the IP already listed
+if [ ! ${ENM} ];then
+    $CAT ${OSS_REF_NAME_FILE} | $GREP -w ${SRV_IP} >> /dev/null 2>&1
+    if [ $? -eq 0 ]; then
+        _err_msg_="${SRV_IP} already referenced in ${OSS_REF_NAME_FILE}"
+        abort_script "$_err_msg_"
+    fi
+else
+    $RM -rf /var/tmp/ip_list1 >> /dev/null 2>&1
+    while read _ip_ ; do
+        $CAT ${OSS_REF_NAME_FILE} | $GREP -w  ${_ip_} >> /dev/null 2>&1
+        if [ $? -eq 0 ]; then
+            _err_msg_="${_ip_} already referenced in ${OSS_REF_NAME_FILE}"
+            abort_script "$_err_msg_"
+        fi
+
+        echo -n "$_ip_ " >> /var/tmp/ip_list1
+     done  < /var/tmp/ip_list
+     SRV_IP=$($CAT /var/tmp/ip_list1)
+fi
+ 
+}
+
+### Function: get_next_avail_oss_name ###
+#
+# Get the next available OSS reference name. From now on
+# we will only refer to the oss as this
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+get_next_avail_oss_name()
+{
+local _oss_ip_val_=$1
+    
+if [ ! -s ${OSS_REF_NAME_FILE} ]; then
+    OSS_REF_NAME="${OSS_REF_STR}1"
+else
+    # Get the last used number
+    _last_num_=`$CAT ${OSS_REF_NAME_FILE} | $AWK '{print $1}' | $SED "s|$OSS_REF_STR||" | $SORT -k 1,1n | $TAIL -1`
+    if [ ! "$_last_num_" ]; then
+        _err_msg_="Could not read last numeric value from ${OSS_REF_NAME_FILE}"
+        abort_script "$_err_msg_"
+    fi
+    
+    # Check that I got a numeric value
+    $ECHO ${_last_num_} | $EGREP '^[0-9]+$' >> /dev/null 2>&1
+    if [ $? -ne 0 ]; then
+        OSS_REF_NAME="${OSS_REF_STR}1"
+        return 0
+    fi
+    
+    # Assign the name
+    OSS_REF_NAME="${OSS_REF_STR}`$EXPR $_last_num_ + 1`"
+fi
+
+if [ "${ALIAS_CHANGER}" ]; then
+    if [ "${INSTALL_TYPE}" == "stats" ]; then
+        _alias_str_="eniq_oss_"
+    fi
+    
+    while :; do
+        clear
+        $ECHO "\nPlease enter the OSS alias for ${_oss_ip_val_}."
+        $ECHO "This value must be in the form of ${_alias_str_}<n>\nPress (enter) for \"${OSS_REF_NAME}\""
+        read _new_alias_
+        
+        # If the User hit nothing...Loop
+        if [ ! "${_new_alias_}" ]; then
+            _new_alias_=${OSS_REF_NAME}
+        fi
+        
+        $ECHO "${_new_alias_}" | $EGREP "${_alias_str_}[0-9]*$" >> /dev/null 2>&1
+        if [ $? -ne 0 ]; then
+            continue
+        fi
+        
+        if [ -s ${OSS_REF_NAME_FILE} ]; then
+            $CAT ${OSS_REF_NAME_FILE} | $EGREP -w ${_new_alias_} >> /dev/null 2>&1
+            if [ $? -eq 0 ]; then
+                $ECHO "\n\n${_new_alias_} is already assigned by ENIQ. Press (enter) to continue"
+                read _any_
+                continue
+            fi
+        fi
+        
+        OSS_REF_NAME="${_new_alias_}"
+        break
+    done
+fi
+}
+
+### Function: list_managed_oss ###
+#
+#   List the OSS(s)
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+list_managed_oss()
+{
+# Have we previous OSS defined
+if [ ! -s ${OSS_REF_NAME_FILE} ]; then
+    _err_msg_="No OSS's are currently managed by this ENIQ server"
+    abort_script "$_err_msg_"
+fi
+
+clear
+# Did User specify ENIQ HNAME
+if [ ! "${HNAME_HOST}" ]; then
+    $CAT ${OSS_REF_NAME_FILE}
+else
+    $CAT ${OSS_REF_NAME_FILE} | $GREP -w ${HNAME_HOST} > ${TEM_DIR}/list_disp_oss_file
+    if [ $? -ne 0 ]; then
+        _err_msg_="No details found for ${HNAME_HOST} in ${OSS_REF_NAME_FILE}"
+        abort_script "$_err_msg_"
+    fi
+
+    if [ "${DETAIL_LIST}" ]; then
+        # Get Directory where the list of managed features will be stored
+        _feature_list_dir_=`iniget FEATURE_INFO -f ${ENIQ_CONF_DIR}/${ENIQ_INI} -v Feature_Interface_Dir`
+        if [ ! "${_feature_list_dir_}" ]; then
+            _err_msg_="Failed to read Parameter Feature_Interface_Dir from ${ENIQ_CONF_DIR}/${ENIQ_INI}"
+            abort_script "$_err_msg_"
+        fi
+    
+        # OSS Interface File
+        _eniq_oss_feature_output_file_=${_feature_list_dir_}/feature_info/${HNAME_HOST}/feature_install_list
+        if [ ! -s ${_eniq_oss_feature_output_file_} ]; then
+            _err_msg_="${_eniq_oss_feature_output_file_} not found or empty"
+            abort_script "$_err_msg_"
+        fi
+        $CAT ${_eniq_oss_feature_output_file_} |$AWK -F"::" '{print $2}' >> ${TEM_DIR}/list_disp_oss_file
+    fi
+    $CAT ${TEM_DIR}/list_disp_oss_file
+fi
+$ECHO ""
+}
+
+## Function: read_storage_type ###
+#
+# Arguments:
+#   none
+# Return Values:
+#   set varibale STORAGE_TYPE
+read_storage_type()
+{
+# Read the storage type
+if [ -s ${ENIQ_CONF_DIR}/${SUNOS_INI} ]; then
+    STORAGE_TYPE=`iniget STOR_TYPE -f ${ENIQ_CONF_DIR}/${SUNOS_INI} -v STORAGE_TYPE`
+else
+    if [ -s ${ENIQ_CONF_DIR}/san_details ]; then
+        STORAGE_TYPE=`$CAT ${ENIQ_CONF_DIR}/san_details | $EGREP "^STORAGE_TYPE=" | $AWK -F\= '{print $2}'`
+    fi
+fi
+
+if [ ! "${STORAGE_TYPE}" ]; then
+    _err_msg_="Could not read STORAGE_TYPE param "
+    abort_script "$_err_msg_"
+fi
+}
+
+### Function: setup_env ###
+#
+# Setup up path environment etc
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+setup_env()
+{
+if [ ! "${ENIQ_BASE_DIR}" ]; then
+    ENIQ_BASE_DIR=${ENIQ_ROOT_DIR}
+fi
+
+ENIQ_CONF_DIR=${ENIQ_BASE_DIR}/installation/config
+if [ ! -s ${ENIQ_CONF_DIR}/ericsson_use_config ]; then
+    _err_msg_="Could not locate file ${ENIQ_CONF_DIR}/ericsson_use_config"
+    abort_script "$_err_msg_"
+fi
+ENIQ_INI=niq.ini
+
+# File containing the type of OSS installation. Eg. oss or single
+INST_TYPE_FILE=${ENIQ_CONF_DIR}/ericsson_use_config
+if [ ! -s "${INST_TYPE_FILE}" ]; then
+    _err_msg_="ENIQ install type not defined in ${INST_TYPE_FILE}"
+    abort_script "$_err_msg_"
+fi
+# Read the installation type - should be "statistics"
+INSTALL_TYPE=`$CAT ${INST_TYPE_FILE} | $AWK -F\= '{print $2}'`
+
+# Directory of sw/conf
+CLI_CONF_DIR=${ENIQ_BASE_DIR}/sw/conf
+
+# Main Directory for the Core Installation SW
+ENIQ_INST_DIR=${ENIQ_BASE_DIR}/installation/core_install
+
+# Main Directory for the Core Installation ETC
+ENIQ_CORE_ETC_DIR=${ENIQ_INST_DIR}/etc
+
+# ENIQ admin bin directory
+ENIQ_ADMIN_DIR=${ENIQ_BASE_DIR}/admin
+
+# ENIQ admin bin directory
+ENIQ_ADMIN_BIN_DIR=${ENIQ_ADMIN_DIR}/bin
+
+# ENIQ admin bin directory
+ENIQ_CONNECTD_DIR=${ENIQ_BASE_DIR}/connectd
+
+# Name of file containing List of used OSS reference names
+OSS_REF_NAME_FILE=${CLI_CONF_DIR}/.oss_ref_name_file
+
+# Service names file
+SRV_NAME_FILE=${CLI_CONF_DIR}/service_names
+
+# Sentinel Stuff
+ENIQ_SENTINEL_DIR=${ENIQ_BASE_DIR}/sentinel
+ENIQ_SENTINEL_BIN_DIR=${ENIQ_SENTINEL_DIR}/bin
+ENIQ_SENTINEL_ENV=${ENIQ_SENTINEL_DIR}/etc/sentinel.env
+
+# Set the log directory
+LOG_DIR=${ENIQ_BASE_DIR}/log
+LOGFILE_DIR="$LOG_DIR/manage_eniq_oss_log"
+
+CURR_SERVER_TYPE=`$CAT $ENIQ_CONF_DIR/installed_server_type | $EGREP -v  '^[[:blank:]]*#' | $SED -e 's/ //g'`
+if [ ! "${CURR_SERVER_TYPE}" ]; then
+    _err_msg_="Could not determine which server type this is"
+    abort_script "$_err_msg_"
+fi
+
+# String denoting the start of and OSS refernce name. Appended
+# to this will be the next available number
+
+    
+    OSS_REF_STR="eniq_oss_"
+    
+
+
+# Directory containing lists of installed features and the OSS's they are activated towards
+MANAGED_OSS_DIR=`iniget FEATURE_INFO -f ${ENIQ_CONF_DIR}/${ENIQ_INI} -v Feature_Interface_Dir`
+# User variables for changing permissions on MANAGED_OSS_DIR
+SYS_USER=dcuser
+SYS_USER_GROUP=dc5000
+ROOT=root
+
+}
+
+### Function: setup_update_disp_file ###
+#
+# Set up a file to display out for update details
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+setup_update_disp_file()
+{
+# Set up a file to display out
+$RM -f ${TEM_DIR}/disp_file
+
+_update_=0
+if [ "${NEW_SRV_IP}" != "${OLD_SRV_IP}" ]; then
+    $ECHO "Alias IP Address : \t$NEW_SRV_IP" >> ${TEM_DIR}/disp_file
+    _update_=1
+fi
+
+$ECHO "Alias :\t\t\t${HNAME_HOST}\n" >> ${TEM_DIR}/disp_file
+if [ -s ${TEM_DIR}/feature_output_list ]; then
+    $ECHO "ENIQ Features" >> ${TEM_DIR}/disp_file
+    $ECHO "--------------" >> ${TEM_DIR}/disp_file
+    $CAT ${TEM_DIR}/feature_output_list|$AWK -F"::" '{print $2}' >> ${TEM_DIR}/disp_file
+    $ECHO "\n\nDo you wish to continue to update the system" >> ${TEM_DIR}/disp_file
+    $ECHO "with the features above (Yy/Nn)\n" >> ${TEM_DIR}/disp_file
+    _update_=1
+else
+    $ECHO "\n\nDo you wish to continue to update the OSS Server details (Yy/Nn)\n" >> ${TEM_DIR}/disp_file
+fi
+
+# If there is nothing to upgrade then delete the disp file
+if [ ${_update_} -eq 0 ]; then
+    $RM -f ${TEM_DIR}/disp_file
+fi
+}
+
+### Function: update_managed_oss ###
+#
+#   List the OSS(s)
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+update_managed_oss()
+{
+# Did User specify ENIQ HNAME and BASE_SW_DIR
+if [ ! "${BASE_SW_DIR}" ]; then
+    usage_msg
+    abort_script
+fi
+
+unset _host_exists_
+if [ -s ${OSS_REF_NAME_FILE} ]; then
+    if [ ! "${HNAME_HOST}" ]; then
+        usage_msg
+        abort_script
+    fi
+
+    $CAT ${OSS_REF_NAME_FILE} | $GREP -w ${HNAME_HOST} >> /dev/null 2>&1
+    if [ $? -ne 0 ]; then
+        _err_msg_="No details found for ${HNAME_HOST} in ${OSS_REF_NAME_FILE}"
+        abort_script "$_err_msg_"
+    fi
+    _host_exists_=1
+else
+    _host_exists_=0
+fi
+
+if [ "${INSTALL_TYPE}" == "stats" ]; then
+    _host_exists_=1
+fi
+
+if [ ${_host_exists_} -eq 1 ]; then
+    get_and_install_features_with_host ${HNAME_HOST} 
+    $ECHO "\nSuccessfully added selected features for ${HNAME_HOST}\n" | $TEE -a ${LOGFILE}
+else
+    get_and_install_features
+    $ECHO "\nSuccessfully added selected features\n" | $TEE -a ${LOGFILE}
+fi
+
+GET_IP_ORDER_SCRIPT=${ENIQ_INST_DIR}/lib/get_ip_order.pl
+if [ ! -s "${GET_IP_ORDER_SCRIPT}" ]; then
+        _err_msg_="Could not find script: ${GET_IP_ORDER_SCRIPT}"
+        abort_script "$_err_msg_"
+fi
+
+_deployed_servers_="${TEM_DIR}/deployed_servers.$$.tmp"
+ $PERL ${GET_IP_ORDER_SCRIPT} -f ${_deployed_servers_}
+ 
+SERVICE_COMMAND="$BASH ${ENIQ_ADMIN_DIR}/bin/manage_eniq_services.bsh -a restart -s ec -N -l ${LOGFILE}"
+
+}
+
+
+
+### Function: usage_msg ###
+#
+#   Print out the usage message
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+usage_msg()
+{
+clear
+$ECHO "
+Usage: `$BASENAME $0` -a {add|list [ -h <eniq_hname> ]|update [ -h <eniq_hname>} ] [ -t <connection_type> ]
+                      -d <eniq_sw_dir> [ -b <eniq_base_dir> ] [ -l <path_to_logfile> ] [-D] [-G] [-E]
+   
+options:
+
+-a  : Parameter containing action to be performed
+          add : Add a new OSS to be managed by the ENIQ server
+         list : List all the OSS's managed by the ENIQ server
+       update : Update details for an existing managed OSS, or
+                   add new features to the server.
+
+-b  : Optional parameter specifying the full path to where the ENIQ
+      BASEDIR directory is (eg. /eniq). If not specified, then the
+      script will assume the the base directory is
+      ../../<directory_that_this_script_is_in>
+
+-d  : Parameter specifying the full path to the directory
+      containing the Feature SW directory structure. Under this
+      directory,this script will locate a file that contains a
+      list of features available for installation/activation.
+      EG. <path_feature_sw>/eniq_techpacks/feature_descriptions
+
+-m  : Parameter specifying the full path to the directory 
+      containing the ENIQ Base SW directory structure. 
+      EG. <path_base_dir_sw>/eniq_techpacks/
+
+-h  : Parameter specifying the ENIQ HNAME. This is only required if an OSS has
+      already been added to the ENIQ server
+
+-E  : Optional Parameter used in case feature addition is for ENM 
+
+-l  : Optional parameter specifying the full path to logfile. If not specified, a 
+      logfile will be created in ${LOGFILE_DIR}
+      
+-t  : Optional Parameter used to specify the type of connection that will be used. Default is OSS.
+         OSS : Enable OSS server to be connected to Statistic machine.
+-D  : Optional parameter to disable existing features when adding/activating new features to an OSS.
+"
+}
+
+# ********************************************************************
+#
+#   Main body of program
+#
+# ********************************************************************
+#
+RUN_TIME=`$DATE '+%Y-%b-%d_%H.%M.%S'`
+TIMESTAMP=`$DATE '+%d-%m-%y_%H.%M.%S'`
+# Determine absolute path to software
+get_absolute_path
+
+# Check that the effective id of the user is root
+check_id $DEFAULT_USER
+
+while getopts ":a:b:d:m:Fh:i:Il:t:NODGE" arg; do
+  case $arg in
+    a) HNAME_ACT="$OPTARG"
+       ;;
+    b) ENIQ_BASE_DIR="$OPTARG"
+       ;;
+    d) BASE_SW_DIR="$OPTARG"
+       ;;
+    m) OLD_SW_DIR="$OPTARG"
+       ;;
+    F) FEATURE_FORCE="YES"
+       ;;
+    h) HNAME_HOST="$OPTARG"
+       ;;
+    i) HNAME_IP="$OPTARG"
+       ;;
+    I) NO_INITIAL_FEATURE="YES"
+       ;;
+    l) LOGFILE="$OPTARG"
+       ;;
+    N) NO_CONFIRM="YES"
+       ;;
+    O) ALIAS_CHANGER="YES"
+       ;;   
+    t) CONN_TYPE="$OPTARG"
+       ;;
+    D) DISABLE_FEATURES="YES"
+       ;;
+    G) GET_FEATURE_LIST="NO"
+       ;;
+    E) ENM="YES"
+       ;;
+   \?) usage_msg
+       exit 1
+       ;;
+  esac
+done
+shift `expr $OPTIND - 1`
+
+if [ ! "${HNAME_ACT}" ]; then
+    usage_msg
+    exit 1
+fi
+
+# Must be add or list
+if [ "${HNAME_ACT}" != "add" -a "${HNAME_ACT}" != "list" -a "${HNAME_ACT}" != "update" ]; then
+    usage_msg
+    exit 1
+fi
+
+# Source the common functions
+if [ -s ${ENIQ_ROOT_DIR}/admin/lib/common_functions.lib ]; then
+    . ${ENIQ_ROOT_DIR}/admin/lib/common_functions.lib
+else
+    _err_msg_="File ${ENIQ_ROOT_DIR}/admin/lib/common_functions.lib not found"
+    abort_script "$_err_msg_"
+fi
+
+# Setup up path environment etc
+setup_env
+
+if [ ! "${LOGFILE}" ]; then
+    LOGFILE=${LOGFILE_DIR}/manage_eniq_oss_${TIMESTAMP}.log
+fi    
+  
+# Check/Create Logfile
+chk_create_logfile
+
+# Flag to restart specified services
+if [ "${GET_FEATURE_LIST}" == "NO" ]; then
+    $TOUCH ${ENIQ_CORE_ETC_DIR}/service_restart
+    if [ $? -ne 0 ]; then
+        _err_msg_="Could not create ${ENIQ_CORE_ETC_DIR}/service_restart." 
+        abort_script "${_err_msg_}"
+    fi
+fi
+
+# Create a temporary Directory
+TEM_DIR=/tmp/manage_eniq_oss.$$.$$
+$RM -rf ${TEM_DIR}
+$MKDIR -p ${TEM_DIR}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not create directory ${TEM_DIR}"
+    abort_script "$_err_msg_"
+fi
+
+if [ "${CURR_SERVER_TYPE}" == "stats_engine" -o "${CURR_SERVER_TYPE}" == "eniq_stats"  \
+    -o "${CURR_SERVER_TYPE}" == "eniq_coordinator" -o "${CURR_SERVER_TYPE}" == "stats_coordinator"  ]; then
+        if [ ! ${ENM} ]; then
+             log_msg -h -s "${RUN_TIME} - Beginning to ${HNAME_ACT} OSS references" -l ${LOGFILE}
+        else
+             log_msg -h -s "${RUN_TIME} - Beginning to ${HNAME_ACT} ENM references" -l ${LOGFILE}
+        fi
+else
+    _err_msg_="This script should not run on this server type ${CURR_SERVER_TYPE}"
+    abort_script "$_err_msg_"
+fi
+
+# Read the storage type
+read_storage_type
+
+# Perform Required Action
+case ${HNAME_ACT} in
+    add)     add_managed_oss
+            ;;
+    list)   list_managed_oss
+            ;;
+    update) update_managed_oss
+            ;;
+    \?)     usage_msg
+            exit 1
+            ;;
+esac
+
+$RM -rf ${TEM_DIR}
+
+exit 0

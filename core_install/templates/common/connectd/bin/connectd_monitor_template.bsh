@@ -1,0 +1,1388 @@
+#!/bin/bash
+# ********************************************************************
+# Ericsson Radio Systems AB                                     SCRIPT
+# ********************************************************************
+#
+#
+# (c) Ericsson Radio Systems AB 2020 - All rights reserved.
+#
+# The copyright to the computer program(s) herein is the property
+# of Ericsson Radio Systems AB, Sweden. The programs may be used
+# and/or copied only with the written permission from Ericsson Radio
+# Systems AB or in accordance with the terms and conditions stipulated
+# in the agreement/contract under which the program(s) have been
+# supplied.
+#
+#
+# ********************************************************************
+# Name      : connectd_monitor_template.bsh
+# Date      : 10/12/2021
+# Revision  : \main\21
+# Purpose   : SERVICE connectd script starts a copy of this script for each connected
+#             OSS to setup and  monitor the NFS Mounts between ENIQ and each OSS/SFS.
+# Arguments : OSS_Alias
+#
+# Overview  : Each OSS setup on the system will have a sub-directory in
+#             the directory ${MOUNT_INFO_DIR}. This sub-directory will
+#             contain configuration data for that OSS.
+#             This script will setup and mount NFS filesystems for an OSS.
+#             An instance of this script should be started for each connected OSS
+#
+#
+# ********************************************************************
+#
+# **********************    Command Section     **********************
+#
+# ********************************************************************
+AWK=/usr/bin/awk
+BASENAME=/usr/bin/basename
+CAT=/usr/bin/cat
+CHOWN=/usr/bin/chown
+DATE=/usr/bin/date
+DIRNAME=/usr/bin/dirname
+ECHO=/usr/bin/echo
+EGREP=/usr/bin/egrep
+EXPR=/usr/bin/expr
+FUSER=/usr/sbin/fuser
+GETENT=/usr/bin/getent
+GREP=/usr/bin/grep
+ID=/usr/bin/id
+KILL=/usr/bin/kill
+LS=/usr/bin/ls
+MKDIR=/usr/bin/mkdir
+MOUNT=/usr/bin/mount
+PS=/usr/bin/ps
+RM=/usr/bin/rm
+SED=/usr/bin/sed
+SLEEP=/usr/bin/sleep
+SSH=/usr/bin/ssh
+SU=/usr/bin/su
+ULIMIT=ulimit
+UMOUNT=/usr/bin/umount
+WAIT=wait
+WC=/usr/bin/wc
+
+# ********************************************************************
+#
+# **********************  Configuration Section  *********************
+#
+# ********************************************************************
+#
+# User definable Configuration Data is read in from a config file
+# in the get_configuration function
+
+readonly SERVER_HOSTNAME=`hostname`
+
+# Only allow numeric value for PORT_NUMBER
+declare -i PORT_NUMBER
+
+# ConnectD Software Directory
+readonly CONNECTD_BASE_DIR="/eniq/connectd/"
+
+# Location of ConnectD Mount Info Directory
+readonly MOUNT_INFO_DIR="${CONNECTD_BASE_DIR}/mount_info"
+
+# Alias for OSS whose filesystems are to be mounted.
+# Set from command line argument.
+OSS_ALIAS=""
+
+# File to check for on NFS filesystems.
+#readonly TAGFILE=".tagfile"
+
+# Where to mount the eniq_oss_x/filesystems
+# All data f/s are mounted relative to this directory.
+DATA_IMPORT_DIR=/eniq/data/importdata/
+# All PMData f/s are mounted relative to this directory.
+PM_SYM_LINKS_DIR=/eniq/data/pmdata/
+# All SOEM PMData f/s are mounted relative to this directory.
+SOEM_PM_SYM_LINKS_DIR=/eniq/data/pmdata_soem/
+
+# Arrays containing NFS mount information for Data fs.
+# These are set in the function "create_nfs_mount_arrays" by
+# reading information from the file "DATA_FILE_SYSTEMS_LIST_FILE"
+NFS_SERVER_ARRAY=""
+NFS_SHARE_ARRAY=""
+MOUNT_POINT_ARRAY=""
+
+# Global Variable used during the script to define if SSH tunnel should be used.
+# Overwritten if the use_tunnel file exists
+USE_SSH_TUNNEL="FALSE"
+
+# File specifying if the tunnel is to be used
+USE_TUNNEL=use_tunnel
+
+# Number of log files to keep
+NUM_LOGS=20
+
+# Size in bytes that the log file is allowed to grow to
+SIZE_LOGS=10240000
+
+# Flag to determine whether to compress log or not (Must be y/n)
+COMPRESS_LOG=y
+
+# ********************************************************************
+#
+# **************************     Functions    ************************
+#
+# ********************************************************************
+#
+
+### Function: check_create_tunnel ###
+#
+#  If SSH tunnel exists do notthing.
+#  If it does not exist, Create it. Then mount the filesystems
+#
+# Arguments:
+#       $1 : OSS_name
+# Return Values:
+#       0 Tunnel is up
+#		1 Tunnel failed to setup;
+#
+check_create_tunnel()
+{
+# Check for SSH tunnel and if it does not exist, set it up.
+if [ "${CONN_TYPE}" == "SOEM" ]; then
+	$PS -ef | $GREP -vw egrep | $EGREP "ssh.*2049.*eniq_soem_[0-9]" >> /dev/null 2>&1
+else
+	$PS -ef | $GREP -vw egrep | $EGREP "ssh.*${PORT_NUMBER}:${OSS_ALIAS}:2049"  >> /dev/null 2>&1
+fi
+
+if [ $? -eq 1 ]; then
+	# log
+	_log_msg_="WARNING:: SSH Tunnel for ${OSS_ALIAS} does not exist. Executing Pre-Tunnel_Setup steps."
+	logit "${_log_msg_}"
+	
+	# There should not be any tunnels to this OSS or using this port
+	shutdown_tunnel
+	
+	# Create the SSH Tunnel.
+	start_tunnel
+	if [ $? -eq 0 ]; then
+		logit "INFO:: SSH Tunnel for ${OSS_ALIAS} started - preparing to mount filesystems."
+		${SLEEP} 1
+		# Mount NFS Shares
+		mount_filesystems
+		if [ $? -eq 0 ]; then
+			# mounts will be checked on next iteration
+			LOOP_ITERATION_COUNT=5
+			# tunnel and mounts setup ok
+			return 0
+		else
+			shutdown_tunnel
+			return 1
+		fi
+	else
+		logit "ERROR:: SSH Tunnel for ${OSS_ALIAS} did not start"
+		shutdown_tunnel
+		return 1
+	fi
+fi
+# Tunnel already setup, do notthing just return 0
+return 0
+}
+
+### Function: check_for_NFS_mounts ###
+#
+# Check that NFS are mounted.
+#
+# Uses Global Variable: "OSS_ALIAS"; "TEMP_DIR"; "DATA_IMPORT_DIR"; "MOUNT_POINT_ARRAY"
+#                     : "PMDATA_SERVER";    "PM_SYM_LINKS_DIR";     "PMDATA_MOUNT_POINT"
+# Arguments     : none
+# Return Values : 0 for success;
+#                 1 for failure;
+check_for_NFS_mounts()
+{
+local return_code=0
+local MOUNTED_FS_LIST=""
+local nfs_count=""
+local nfs_mount_point
+# Instead of running mount -p many times, there would be less overhead to print the list
+# of mounted filesystems once and output result to a file.
+# Then parse this file to check if required filesystem is mounted.
+if [[  -s ${DATA_FILE_SYSTEMS_LIST_FILE} ]]; then
+	MOUNTED_FS_LIST=${TEMP_DIR}/connectd_MOUNTED_FS_LIST
+	$RM -f ${MOUNTED_FS_LIST} >> /dev/null 2>&1
+	${MOUNT} > ${MOUNTED_FS_LIST}
+	
+	nfs_count=${#MOUNT_POINT_ARRAY[@]}
+	# Loop through each filesystem listed in fs config file.
+	for (( i=0; i<${nfs_count}; i++)); do
+	    NFS_Share=${MOUNT_POINT_ARRAY[${i}]}
+	    nfs_mount_point=`$ECHO "${DATA_IMPORT_DIR}${OSS_ALIAS}${MOUNT_POINT_ARRAY[${i}]}" | $SED -e 's/\/[\/]*/\//g' -e 's/[\/]*$//g'`
+	    # Check if NFS is mounted:
+	    ${GREP} ${nfs_mount_point} ${MOUNTED_FS_LIST} >> /dev/null 2>&1
+	    if [ $? -ne 0 ]; then
+	        logit "WARNING::  Filesystems '${nfs_mount_point}' is not mounted for ${OSS_ALIAS}."
+	        return_code=1
+	    fi
+	done
+fi
+
+
+# Check if PMData is mounted, if this is configured for PMData
+if [  "${PMDATA_SERVER}" ]; then
+	MOUNTED_FS_LIST=${TEMP_DIR}/connectd_MOUNTED_FS_LIST
+    nfs_mount_point=`$ECHO "${PM_SYM_LINKS_DIR}${OSS_ALIAS}${PMDATA_MOUNT_POINT}" | $SED -e 's/\/[\/]*/\//g' -e 's/[\/]*$//g'`
+    ${GREP} ${nfs_mount_point} ${MOUNTED_FS_LIST} >> /dev/null 2>&1
+    if [ $? -ne 0 ]; then
+        logit  "WARNING::  Filesystems '${nfs_mount_point}' is not mounted for ${OSS_ALIAS}."
+        return 1
+    fi
+fi
+
+return ${return_code}
+}
+
+
+### Function: check_id ###
+#
+#   Check that the effective id of the user is correct
+#   If not print error msg and exit.
+#
+# Arguments:
+#       $1 : User ID name
+# Return Values:
+#       0 for success; 1 for failure;
+check_id()
+{
+    _check_id_=`$ID  | $AWK -F\( '{print $2}' | $AWK -F\) '{print $1}'`
+    if [ "${_check_id_}" != "$1" ]; then
+        return 1
+    else
+        return 0
+    fi
+}
+
+
+### Function: check_mounted_filesystems ###
+#
+# Check if NFS mounts are ok and don't hang (can we 'ls' )
+#
+# Sets Global Variable: "LS_PID_LIST";
+# Uses Global Variable: WAIT_FOR_NAS_RESPONSE; WAIT_FOR_FAILOVER; NO_RETRYS_FOR_NAS_FAILOVER;
+#                     : "OSS_ALIAS"; "TEMP_DIR"; "TAGFILE";
+#                     : "DATA_IMPORT_DIR";  "MOUNT_POINT_ARRAY"
+#                     : "PMDATA_SERVER";    "PM_SYM_LINKS_DIR";     "PMDATA_MOUNT_POINT"
+# Arguments    : none
+# Return Values: 0 for success;
+#                1 for failure;
+check_mounted_filesystems()
+{
+    # Track number of failed attempts to mount filesystems or contact mounted NFS.
+    local REPEATING_NAS_RESPONSE_ERROR_COUNT=0
+    local NFS_MountPoint=""
+    local return_code=0
+    local nfs_count
+    local _ls_pid_
+
+# Make a file to store the PID and the filesystem name
+temp_ls_pid_list_file=${TEMP_DIR}/temp_ls_pid_list_file
+
+while [ "${REPEATING_NAS_RESPONSE_ERROR_COUNT}" -le "${NO_RETRYS_FOR_NAS_FAILOVER}" ]; do
+$RM -f ${temp_ls_pid_list_file} >> /dev/null 2>&1
+return_code=0
+    # Save all background process ids
+    LS_PID_LIST=""
+	if [ "${NFS_SERVER_ARRAY}" ]; then
+        # Check All Data filesystems first.
+        nfs_count=${#MOUNT_POINT_ARRAY[@]}
+        for (( i=0; i<${nfs_count}; i++)); do
+            NFS_MountPoint=${MOUNT_POINT_ARRAY[${i}]}
+            ${LS} ${DATA_IMPORT_DIR}${OSS_ALIAS}${NFS_MountPoint}/${TAGFILE} >> /dev/null 2>&1  &
+        _ls_pid_num_=$!
+        LS_PID_LIST="${LS_PID_LIST} ${_ls_pid_num_}"  # Save pid to list
+        
+        # Save the filesystem and PID in temp file
+        $ECHO "${_ls_pid_num_}::${DATA_IMPORT_DIR}${OSS_ALIAS}${NFS_MountPoint}" >> ${temp_ls_pid_list_file}
+        done
+	fi
+
+ 	# Now check if PMData are ok (can we 'ls' ).
+    
+    # Check PMData, if this is configured for PMData
+    if [  "${PMDATA_SERVER}" ]; then
+        $SU ${ENIQ_nfs_user} -c "${LS} ${PM_SYM_LINKS_DIR}${OSS_ALIAS}${PMDATA_MOUNT_POINT}/${TAGFILE}" >> /dev/null 2>&1 &
+   	 	_ls_pid_num_=$!
+    	LS_PID_LIST="${LS_PID_LIST} ${_ls_pid_num_}"  # Save pid to list
+    
+    	# Save the filesystem and PID in temp file
+    	$ECHO "${_ls_pid_num_}::${PM_SYM_LINKS_DIR}${OSS_ALIAS}${PMDATA_MOUNT_POINT}" >> ${temp_ls_pid_list_file}
+    fi
+
+
+    # Wait for "ls" to finish. Should be very quick, but in the event of a
+    # failover, it could take up to about 30 seconds
+    sleep_function ${WAIT_FOR_NAS_RESPONSE}
+
+    # Time to check all the results of the background "ls" on the Data mount points
+    for _ls_pid_ in ${LS_PID_LIST}; do
+		if [ -s ${temp_ls_pid_list_file} ]; then
+			_hanging_fs_=`$CAT ${temp_ls_pid_list_file} | $EGREP ${_ls_pid_} | $AWK -F"::" '{print $2}'`
+		else
+			logit "WARNING:: File containing 'ls' information not found. Not possible to determine which filesystem is being operated on"
+		fi
+	
+	        # LS should have finished. If not kill it.
+            _check_ls_pid_=`$PS -ef | $GREP -w ${_ls_pid_} | $GREP -w "${_hanging_fs_}" | $GREP -wv grep | $WC -l`
+            if [ ${_check_ls_pid_} -gt 0 ]; then
+                 logit "DEBUG:: Listing processes with PID: ${_ls_pid_}"
+                 $PS -ef | $GREP -w ${_ls_pid_}| $GREP -wv grep > ${TEMP_DIR}/ls_pid_check.log
+                 logit "`$CAT ${TEMP_DIR}/ls_pid_check.log`"
+        
+                 logit "ERROR:: 'ls' on NFS filesystems hanging. Killing 'ls' process pid ${_ls_pid_} for ${_hanging_fs_} filesystem"
+                 _check_ls_pid_=`$PS -ef | $GREP -w ${_ls_pid_} | $GREP -w "${_hanging_fs_}" | $GREP -wv grep | $WC -l`
+                 if [ ${_check_ls_pid_} -gt 0 ]; then
+                      logit "ERROR:: Force killing 'ls' process pid ${_ls_pid_} for ${_hanging_fs_} filesystem"
+                      ${KILL} -KILL ${_ls_pid_}
+                 fi
+                 return_code=1
+	        else # Check exit status of finished ls process
+	            ${WAIT} ${_ls_pid_} >> /dev/null 2>&1
+	            EXIT_CODE=$?
+	            if [[ ${EXIT_CODE} -ne 0 ]]; then
+	                logit "ERROR:: 'ls' on NFS filesystems unsuccessful. Exit code from 'ls' PID ${_ls_pid_} is ${EXIT_CODE}"
+	                return_code=0
+	            fi
+	        fi
+    done  # End of for loop checking results of background "ls" processes
+
+    LS_PID_LIST=""
+
+    if [ ${return_code} -eq 0 ]; then
+        return 0
+    else
+        # If NAS Failed to Respond. Then we should wait a reasonable amount of time to allow the NAS
+        # to Failover before retrying. Failover could take about 20 seconds.
+        REPEATING_NAS_RESPONSE_ERROR_COUNT=`${EXPR} ${REPEATING_NAS_RESPONSE_ERROR_COUNT} + 1`
+        logit "ERROR:: NFS filesystems failed to respond within ${WAIT_FOR_NAS_RESPONSE} seconds.
+               Waiting ${WAIT_FOR_FAILOVER} seconds before retry number ${REPEATING_NAS_RESPONSE_ERROR_COUNT}
+               This will give the cluster another chance to failover and recover before unmounting filesystems."
+        sleep_function ${WAIT_FOR_FAILOVER}
+    fi
+done
+
+# Should not be any child processes running. Just make sure all are completed before continueing.
+#    $WAIT
+    return 1
+}
+
+
+### Function: create_nfs_mount_arrays ###
+#
+# Reads config file containing filesystems to be mounted
+# and creates arrays of nfs shares and mount points.
+#
+# Sets Global variables: "NFS_SERVER_ARRAY"; "NFS_SHARE_ARRAY"; "MOUNT_POINT_ARRAY"
+#                        "PMDATA_SERVER";    "PMDATA_SHARE";    "PMDATA_MOUNT_POINT";
+# Uses Global Variables: "OSS_ALIAS";
+#                        "DATA_FILE_SYSTEMS_LIST_FILE"; "PMDATA_FILE_SYSTEM_FILE";
+# Arguments     : none
+# Return Values : 0 = Success
+#                 1 = Failure
+create_nfs_mount_arrays()
+{
+local _cnt1_ _cnt2_ _cnt3_
+local return_code=0
+
+# Configure arrays containing NFS mount information for Data FileSystems.
+# Check For config file containing DATA filesystems
+if [ ! -s ${DATA_FILE_SYSTEMS_LIST_FILE} ]; then
+    # file containing filesystems to mount does not exist. Exit.
+    logit "ERROR:: ${OSS_ALIAS} could not find ${DATA_FILE_SYSTEMS_LIST_FILE}  file. EXITING."
+    return 96
+fi
+
+if [[  -s ${DATA_FILE_SYSTEMS_LIST_FILE} ]]; then
+    NFS_SERVER_ARRAY=(`$CAT ${DATA_FILE_SYSTEMS_LIST_FILE} |$EGREP -v '^[ 	]*#' |$EGREP -v  '^[ 	]*$'\
+    	| $SED -e 's/^[ ]*//' -e 's/^[	]*//' -e 's/\/[\/]*/\//g' -e 's/[\/]*$//g' |$AWK '{print $1}'`)
+    #| $SED -e 's/^[ ]*//' -e 's/^[	]*//' -e 's/\/[\/]*/\//g' -e 's/[\/]*$//g' |$AWK '{print $1}'`)
+    _cnt1_=${#NFS_SERVER_ARRAY[@]}
+    if [ ${_cnt1_} -eq 0 ]; then
+        logit "ERROR:: Could not read NFS SERVER info from ${DATA_FILE_SYSTEMS_LIST_FILE}."
+        return_code=1
+    fi
+
+    NFS_SHARE_ARRAY=(`$CAT ${DATA_FILE_SYSTEMS_LIST_FILE}|$EGREP -v '^[ 	]*#' |$EGREP -v  '^[ 	]*$'\
+         | $SED -e 's/^[ ]*//' -e 's/^[	]*//' -e 's/\/[\/]*/\//g' -e 's/[\/]*$//g' |$AWK '{print $2}'`)
+    _cnt2_=${#NFS_SHARE_ARRAY[@]}
+    if [ ${_cnt2_} -eq 0 ]; then
+        logit "ERROR:: Could not read NFS SHARE info from ${DATA_FILE_SYSTEMS_LIST_FILE}."
+        return_code=1
+    fi
+
+    MOUNT_POINT_ARRAY=(`$CAT ${DATA_FILE_SYSTEMS_LIST_FILE}|$EGREP -v '^[ 	]*#'|$EGREP -v  '^[ 	]*$'\
+         | $SED -e 's/^[ ]*//' -e 's/^[	]*//' -e 's/\/[\/]*/\//g' -e 's/[\/]*$//g'|$AWK '{print $3}'`)
+         if [[ ${MOUNT_POINT_ARRAY} == "" ]]; then
+         	MOUNT_POINT_ARRAY=(`$CAT ${DATA_FILE_SYSTEMS_LIST_FILE}|$EGREP -v '^[ 	]*#'|$EGREP -v  '^[ 	]*$'\
+         		| $SED -e 's/^[ ]*//' -e 's/^[	]*//' -e 's/\/[\/]*/\//g' |$AWK '{print $3}'`)
+         fi
+    _cnt3_=${#MOUNT_POINT_ARRAY[@]}
+    
+    if [ ${_cnt3_} -eq 0 ]; then
+        logit "ERROR:: Could not read MOUNT POINT info from ${DATA_FILE_SYSTEMS_LIST_FILE}."
+        return_code=1
+    fi
+
+    if [ ${_cnt1_} -ne ${_cnt2_} -o ${_cnt1_} -ne ${_cnt3_} ]; then
+        logit "ERROR:: Inconsistent number of values read from ${DATA_FILE_SYSTEMS_LIST_FILE}."
+        return_code=1
+    fi
+else
+    logit "WARNING::Data file '${DATA_FILE_SYSTEMS_LIST_FILE}' not found for ${OSS_ALIAS}."
+fi
+
+
+# The NFS mount info for PMDATA symbolic links directory.
+# Configure PMDATA mounts if PMData file exists
+if [[  -s ${PMDATA_FILE_SYSTEM_FILE} ]]; then
+    logit "INFO:: Reading PM Data file '${PMDATA_FILE_SYSTEM_FILE}' for ${OSS_ALIAS}."
+    PMDATA_SERVER=(`$CAT ${PMDATA_FILE_SYSTEM_FILE}|$EGREP -v '^[ 	]*#'|$EGREP -v  '^[ 	]*$'\
+         | $SED -e 's/^[ ]*//' -e 's/^[	]*//' -e 's/\/[\/]*/\//g' |$AWK '{print $1}'`)
+    _cnt1_=${#PMDATA_SERVER[@]}
+    PMDATA_SHARE=(`$CAT ${PMDATA_FILE_SYSTEM_FILE}|$EGREP -v '^[ 	]*#'|$EGREP -v  '^[ 	]*$'\
+         | $SED -e 's/^[ ]*//' -e 's/^[	]*//' -e 's/\/[\/]*/\//g' |$AWK '{print $2}'`)
+    _cnt2_=${#PMDATA_SHARE[@]}
+    PMDATA_MOUNT_POINT=(`$CAT ${PMDATA_FILE_SYSTEM_FILE}|$EGREP -v '^[ 	]*#'|$EGREP -v  '^[ 	]*$'\
+         | $SED -e 's/^[ ]*//' -e 's/^[	]*//' -e 's/\/[\/]*/\//g' |$AWK '{print $3}'`)
+    _cnt3_=${#PMDATA_MOUNT_POINT[@]}
+
+
+    if [ ${_cnt1_} -ne 1 -o ${_cnt1_} -ne ${_cnt2_} -o ${_cnt1_} -ne ${_cnt3_} ]; then
+        logit "ERROR:: Inconsistent number of values read from ${PMDATA_FILE_SYSTEM_FILE}."
+        return_code=1
+    fi
+
+fi
+
+return  ${return_code}
+}
+
+
+### Function: get_absolute_path ###
+#
+# Determine absolute path to software
+#
+# Sets Global variables: SCRIPTHOME
+# Arguments     : none
+# Return Values : none
+get_absolute_path()
+{
+_dir_=`$DIRNAME $0`
+SCRIPTHOME=`cd $_dir_ 2>/dev/null && pwd || $ECHO $_dir_`
+}
+
+
+### Function: get_configuration ###
+#
+# Sets / Updates all configuration data from connectd_config file.
+# It first checks for an OSS specific file in the ${OSS_ALIAS} directoy.
+# If unscessfull then it looks for the default config file in
+#  the ${CONNECTD_BASE_DIR}etc/ directory.
+#
+# Uses Global Variables: "OSS_ALIAS"; "CONNECTD_CONFIG"; "CONNECTD_CONFIG_TEMPLATE"
+# Sets Global variables: "ENIQ_nfs_user"; "CHECK_MOUNTS_EVERY"; "LOOP_RETRYS_BEFORE_TIMEOUT"; "BACKOFF_SLEEP_TIME";
+#                        "MOUNT_TIME_OUT_TIME"; "WAIT_FOR_NAS_RESPONSE"; "WAIT_FOR_FAILOVER"; "NO_RETRYS_FOR_NAS_FAILOVER";
+#                        "MOUNT_OPTIONS_DATAFS"; "MOUNT_OPTIONS_PMDATA";
+# Arguments     : none
+# Return Values : 0 = Success
+#                 1 = Failure (config file not found)
+get_configuration()
+{
+logit "INFO:: *********** Reading Configuration Data **********"
+# **************************** Find Configuration File *************************
+
+if [[ -s ${CONNECTD_CONFIG} ]]; then
+    logit "INFO:: Using ${OSS_ALIAS} config file; '${CONNECTD_CONFIG}'"
+    CONNECTD_OPTIONS_FILE=${CONNECTD_CONFIG}
+elif [[ -s ${CONNECTD_CONFIG_TEMPLATE} ]]; then
+    logit "INFO:: Using default configd template file; '${CONNECTD_CONFIG_TEMPLATE}'"
+    CONNECTD_OPTIONS_FILE=${CONNECTD_CONFIG_TEMPLATE}
+else
+    logit "ERROR:: Could not find configuration file for ${OSS_ALIAS}."
+    logit "INFO:: Check for connectd config file '${CONNECTD_CONFIG}' "
+    exit 96
+fi
+
+# ************************ Read Configuration Data fron file ********************
+ENIQ_nfs_user=`$CAT ${CONNECTD_OPTIONS_FILE} | $EGREP '^[ 	]*ENIQ_nfs_user=' |$AWK -F\= '{print $2}'|$SED -e 's|"||g'`
+ENIQ_ssh_user=`$CAT ${CONNECTD_OPTIONS_FILE} | $EGREP '^[ 	]*ENIQ_ssh_user=' |$AWK -F\= '{print $2}'|$SED -e 's|"||g'`
+OSS_ssh_user=`$CAT ${CONNECTD_OPTIONS_FILE} | $EGREP '^[ 	]*OSS_ssh_user=' |$AWK -F\= '{print $2}'|$SED -e 's|"||g'`
+CHECK_MOUNTS_EVERY=`$CAT ${CONNECTD_OPTIONS_FILE} | $EGREP '^[ 	]*CHECK_MOUNTS_EVERY=' |$AWK -F\= '{print $2}'|$SED -e 's|"||g'`
+LOOP_RETRYS_BEFORE_TIMEOUT=`$CAT ${CONNECTD_OPTIONS_FILE} | $EGREP '^[ 	]*LOOP_RETRYS_BEFORE_TIMEOUT=' |$AWK -F\= '{print $2}'|$SED -e 's|"||g'`
+BACKOFF_SLEEP_TIME=`$CAT ${CONNECTD_OPTIONS_FILE} | $EGREP '^[ 	]*BACKOFF_SLEEP_TIME=' |$AWK -F\= '{print $2}'|$SED -e 's|"||g'`
+MOUNT_TIME_OUT_TIME=`$CAT ${CONNECTD_OPTIONS_FILE} | $EGREP '^[ 	]*MOUNT_TIME_OUT_TIME=' |$AWK -F\= '{print $2}'|$SED -e 's|"||g'`
+WAIT_FOR_NAS_RESPONSE=`$CAT ${CONNECTD_OPTIONS_FILE} | $EGREP '^[ 	]*WAIT_FOR_NAS_RESPONSE=' |$AWK -F\= '{print $2}'|$SED -e 's|"||g'`
+WAIT_FOR_FAILOVER=`$CAT ${CONNECTD_OPTIONS_FILE} | $EGREP '^[ 	]*WAIT_FOR_FAILOVER=' |$AWK -F\= '{print $2}'|$SED -e 's|"||g'`
+NO_RETRYS_FOR_NAS_FAILOVER=`$CAT ${CONNECTD_OPTIONS_FILE} | $EGREP '^[ 	]*NO_RETRYS_FOR_NAS_FAILOVER=' |$AWK -F\= '{print $2}'|$SED -e 's|"||g'`
+MOUNT_OPTIONS_DATAFS=`$CAT ${CONNECTD_OPTIONS_FILE} | $EGREP '^[ 	]*MOUNT_OPTIONS_DATAFS=' |$AWK -F "\"" '{print $2}'|$SED -e 's|"||g'`
+MOUNT_OPTIONS_PMDATA=`$CAT ${CONNECTD_OPTIONS_FILE} | $EGREP '^[ 	]*MOUNT_OPTIONS_PMDATA=' |$AWK -F "\"" '{print $2}'|$SED -e 's|"||g'`
+
+
+# ***************** Set Default Values if Not Found in Config File **************
+# ******************** User Account Config *****************
+# user account on this (ENIQ) server that owns/creates the mount points
+# and is trusted on the OSS master server
+if [ ! "${ENIQ_nfs_user}" ]; then
+    ENIQ_nfs_user=dcuser
+    logit "INFO:: ENIQ_nfs_user value not found. Using default value."
+fi
+
+# **************** Timing and Backoff Timing after failed mount attempts ***********
+# Number of seconds to wait between each iteration of the Check tunnel loop
+if [ ! "${CHECK_MOUNTS_EVERY}" ]; then
+    CHECK_MOUNTS_EVERY=10
+    logit "INFO:: CHECK_MOUNTS_EVERY value not found. Using default value."
+fi
+
+# Number of failed connection attempts before backing off
+if [ ! "${LOOP_RETRYS_BEFORE_TIMEOUT}" ]; then
+    LOOP_RETRYS_BEFORE_TIMEOUT=10
+    logit "INFO:: LOOP_RETRYS_BEFORE_TIMEOUT value not found. Using default value."
+fi
+
+# Wait between failed retry attempts after backoff attempts has been reached.
+if [ ! "${BACKOFF_SLEEP_TIME}" ]; then
+    BACKOFF_SLEEP_TIME=600
+    logit "INFO:: BACKOFF_SLEEP_TIME value not found. Using default value."
+fi
+
+# *********************** NFS Timing and TimeOut Configuration ********************
+# Number of seconds to wait for the mount process to finish during mounting nfs
+if [ ! "${MOUNT_TIME_OUT_TIME}" ]; then
+    MOUNT_TIME_OUT_TIME=20
+    logit "INFO:: MOUNT_TIME_OUT_TIME value not found. Using default value."
+fi
+
+# Number of seconds to wait for response from NAS after ls during testing of nfs
+if [ ! "${WAIT_FOR_NAS_RESPONSE}" ]; then
+    WAIT_FOR_NAS_RESPONSE=20
+    logit "INFO:: WAIT_FOR_NAS_RESPONSE value not found. Using default value."
+fi
+
+# Number of seconds to wait for between detecting fault with NAS and
+# waiting to allow NAS to failover and recover.
+if [ ! "${WAIT_FOR_FAILOVER}" ]; then
+    WAIT_FOR_FAILOVER=20
+    logit "INFO:: WAIT_FOR_FAILOVER value not found. Using default value."
+fi
+
+# Number of retrys before unmounting filesystems and starting over.
+if [ ! "${NO_RETRYS_FOR_NAS_FAILOVER}" ]; then
+    NO_RETRYS_FOR_NAS_FAILOVER=2
+    logit "INFO:: NO_RETRYS_FOR_NAS_FAILOVER value not found. Using default value."
+fi
+
+# ************************ NFS Mount Options Configuration *********************
+# write mount options for f/s in fs_mount_list to log file
+if [ "${MOUNT_OPTIONS_DATAFS}" ]; then
+    logit "INFO:: Mount Options for filesystems in fs_mount_list are ${MOUNT_OPTIONS_DATAFS}"
+else
+    logit "INFO:: No Mount Options for filesystems in fs_mount_list selected"
+    MOUNT_OPTIONS_DATAFS=soft,ro,
+fi
+
+# write mount options for pmdata to log file
+if [ "${MOUNT_OPTIONS_PMDATA}" ]; then
+    logit "INFO:: Mount options for pmdata are ${MOUNT_OPTIONS_PMDATA}"
+else
+    logit "INFO:: NO Mount options for PMData selected"
+    MOUNT_OPTIONS_PMDATA=soft,rw
+fi
+
+   
+# user account on this (ENIQ) server which sets up SSH Tunnel
+if [ ! "${ENIQ_ssh_user}" ]; then
+	ENIQ_ssh_user=dcuser
+	logit "INFO:: ENIQ_ssh_user value not found. Using default value."
+fi
+}
+
+### Function: get_port_number ###
+#
+# Sets/ Updates global integer variable  PORT_NUMBER
+# re-reads it from file
+#
+# Arguments:  [port_number]
+# Return Values: none
+get_port_number()
+{
+local log_msg
+logit "INFO:: ************ Getting Port Number for ${OSS_ALIAS} ************"
+
+# Get Port number from file
+if [ "$1" ]; then
+	PORT_NUMBER="${1}"
+	logit "INFO:: Using port number ${PORT_NUMBER} supplied as argument"
+elif [[ -s "${MOUNT_INFO_DIR}/${OSS_ALIAS}/port_data" ]]; then
+	PORT_NUMBER=`$CAT ${MOUNT_INFO_DIR}/${OSS_ALIAS}/port_data`
+	logit "INFO:: Using port number ${PORT_NUMBER} from file for ${OSS_ALIAS}"
+else
+	# Cannot get port number to use. Exiting
+	logit "ERROR:: Cannot get port number to use for ${OSS_ALIAS}. Exiting."
+	exit 6
+fi
+}
+
+### Function: logit ###
+#
+#  Logs Messages to default logfile "LOGFILE"
+#
+# Uses Global Variables: "LOGFILE", "SERVER_HOSTNAME"
+# Arguments:  log_message
+# Return Values: 0 for success
+#                1 for error LOGFILE undefined
+logit()
+{
+local _log_msg
+
+if [ -n "${1}" ]; then
+    _log_msg="${SERVER_HOSTNAME} - `$DATE '+%Y-%b-%d_%H.%M.%S'` - ${1}"
+else
+    _log_msg="${SERVER_HOSTNAME} - Error in script $0 at `$DATE '+%Y-%b-%d_%H.%M.%S'`\n"
+fi
+
+if [ "${LOGFILE}" ]; then
+    $ECHO "${_log_msg}" >> ${LOGFILE}
+    return 0
+else
+    $ECHO "\n${_log_msg}\n"
+    return 1
+fi
+}
+
+### Function: mount_filesystems ###
+#
+# Check All the NFS filesystems, and
+#  create a hidden file on each f/s that we can test for later.
+#
+# Uses Global Variable:  "OSS_ALIAS";  "TEMP_DIR";  "TAGFILE";  "ENIQ_nfs_user"
+#                        "DATA_IMPORT_DIR;       "NFS_SERVER_ARRAY"; "NFS_SHARE_ARRAY"; "MOUNT_POINT_ARRAY"      "MOUNT_OPTIONS_DATAFS"
+#                        "PM_SYM_LINKS_DIR";     "PMDATA_SERVER";    "PMDATA_SHARE";    "PMDATA_MOUNT_POINT";    "MOUNT_OPTIONS_PMDATA"
+# Sets Global variables: "MOUNT_PID_LIST"
+# Arguments     : none
+# Return Values : 0 for success;
+#                 1 for failure;
+mount_filesystems()
+{
+	# Save all background process pids
+    MOUNT_PID_LIST=""
+    local return_code=0
+    local NFS_Server=""
+    local NFS_Share=""
+    local NFS_MountPoint=""
+    local nfs_count=""
+    local ENIQ_nfs_grp=""
+    local _mount_pid_=""
+
+# Make a file to store the PID and the filesystem name
+_temp_mount_pid_list_file_=${TEMP_DIR}/temp_mount_pid_list_file
+$RM -f ${_temp_mount_pid_list_file_} >> /dev/null 2>&1
+
+    # When we create the mount points, change ownership to ${ENIQ_nfs_user}:${ENIQ_nfs_grp}
+    ENIQ_nfs_grp=`$ID ${ENIQ_nfs_user}|$AWK '{print $2}'|$AWK -F\( '{print $2}'|$AWK -F\) '{print $1}'`
+    if [[ $? -ne 0 ]]; then
+        logit "ERROR:: Error getting group id for user ${ENIQ_nfs_user} "
+        return 102
+    fi
+
+if [ "${NFS_SERVER_ARRAY}" ]; then
+ 	# All Data filesystems should be mounted first.
+    nfs_count=${#MOUNT_POINT_ARRAY[@]}
+    # Loop through all filesystems listed in array, and umount asap.
+    for (( i=0; i<${nfs_count}; i++)); do
+        NFS_Server=${NFS_SERVER_ARRAY[${i}]}
+        NFS_Share=${NFS_SHARE_ARRAY[${i}]}
+        NFS_MountPoint=${MOUNT_POINT_ARRAY[${i}]}
+
+        # We need to remove the mount point directory in case anybody is in it.
+        # It should be unmounted at this stage. If not then RMDIR will fail.
+        # We do not really care if it succeeds. We are at a best effort here
+        $RMDIR ${DATA_IMPORT_DIR}${OSS_ALIAS}${NFS_MountPoint} >> /dev/null 2>&1
+
+        # Now create the mount point and change ownership
+        ${MKDIR} -p ${DATA_IMPORT_DIR}${OSS_ALIAS}${NFS_MountPoint} >> /dev/null 2>&1
+        if [[ $? -ne 0 ]]; then
+            logit "ERROR:: Error creating directory '${DATA_IMPORT_DIR}${OSS_ALIAS}${NFS_MountPoint}'"
+            return 101
+        fi
+
+        # set ownership of the mount point just created
+        ${CHOWN} ${ENIQ_nfs_user}:${ENIQ_nfs_grp} ${DATA_IMPORT_DIR}${OSS_ALIAS}${NFS_MountPoint} >> /dev/null 2>&1
+        if [[ $? -ne 0 ]]; then
+            logit "ERROR:: Error changing ownership of '${DATA_IMPORT_DIR}${OSS_ALIAS}${NFS_MountPoint}'"
+            return 103
+        fi
+
+        # Okay, an attempt to remove any processes that have a lock on the mountpoint.
+        # Mount command will fail if there is a lock on the mountpoint.
+        $FUSER -k ${DATA_IMPORT_DIR}${OSS_ALIAS}${NFS_MountPoint} >> /dev/null 2>&1
+		
+        if [ "$USE_SSH_TUNNEL" == "TRUE" ]; then
+        	_mount_command_="$MOUNT -t nfs -o ${MOUNT_OPTIONS_DATAFS},port=${PORT_NUMBER} 127.0.0.1:/${NFS_Share} ${DATA_IMPORT_DIR}/${OSS_ALIAS}/${NFS_MountPoint}"
+        	$MOUNT -t nfs -o ${MOUNT_OPTIONS_DATAFS},port=${PORT_NUMBER} 127.0.0.1:/${NFS_Share} ${DATA_IMPORT_DIR}/${OSS_ALIAS}/${NFS_MountPoint}  >> /dev/null 2>&1 &
+		    _mount_pid_="$!"
+        else
+        	_mount_command_="$MOUNT -t nfs -o ${MOUNT_OPTIONS_DATAFS} ${NFS_Server}:${NFS_Share} ${DATA_IMPORT_DIR}${OSS_ALIAS}${NFS_MountPoint}"
+	        $MOUNT -t nfs -o ${MOUNT_OPTIONS_DATAFS} ${NFS_Server}:${NFS_Share} ${DATA_IMPORT_DIR}${OSS_ALIAS}${NFS_MountPoint} >> /dev/null 2>&1 &
+	        _mount_pid_="$!"
+	    fi
+		MOUNT_PID_LIST="${MOUNT_PID_LIST} ${_mount_pid_}"  # Save pid to list
+		$ECHO "${_mount_pid_}::${NFS_Share}::${NFS_MountPoint}" >> ${_temp_mount_pid_list_file_}
+        logit "INFO:: Mounting filesystems. '${_mount_command_}'. PID ${_mount_pid_}"
+    done
+
+    # Wait for "mount" to finish about 10 seconds
+    sleep_function ${MOUNT_TIME_OUT_TIME}
+
+    # Time to check if all the mount commands finished successfully.
+    for _mount_pid_ in ${MOUNT_PID_LIST}; do
+		if [ -s ${_temp_mount_pid_list_file_} ]; then
+			_hanging_mnt_fs_=`$CAT ${_temp_mount_pid_list_file_} | $EGREP ${_mount_pid_} | $AWK -F"::" '{print $3}'`
+		else
+			logit "WARNING:: File containing mount information not found. Not possible to determine which filesystem is being operated on"
+		fi
+
+		# MOUNT should have finished. If not kill it.
+		${KILL} -0 ${_mount_pid_} >> /dev/null 2>&1
+		if [ $? -eq 0 ]; then
+			return_code=5
+			logit "ERROR:: Mount hanging while trying to mount ${_hanging_mnt_fs_} filesystem. Killing mount PID ${_mount_pid_}"
+			${KILL} ${_mount_pid_} >> /dev/null 2>&1
+			$SLEEP 1
+			${KILL} -KILL ${_mount_pid_} >> /dev/null 2>&1
+		else # Check exit status of finished "mount" process
+			${WAIT} ${_mount_pid_} >> /dev/null 2>&1
+			EXIT_CODE=$?
+			if [[ ${EXIT_CODE} -ne 0 ]]; then
+				return_code=6
+				logit "ERROR:: Mounting filesystem ${_hanging_mnt_fs_} failed. Exit code from PID ${_mount_pid_} is ${EXIT_CODE}"
+			else
+				logit "INFO:: Mounting filesystem ${_hanging_mnt_fs_} completed. Exit code from PID ${_mount_pid_} is ${EXIT_CODE}"
+			fi
+		fi
+	done  # End of for loop checking results of background "mount" processes
+	
+    MOUNT_PID_LIST=""
+
+ # If all the Data filesytems mounted ok, then we can continue and mount the symbolic link directories.
+ # If not we cannot continue and must return with an error at this point.
+    if [[ ${return_code} -ne 0 ]]; then
+        return ${return_code}
+    fi
+fi
+
+   
+# Mount PMData, if this is configured for PMData
+if [  "${PMDATA_SERVER}" ]; then
+    # We need to remove the mount point directory in case anybody is in it.
+    # It should be unmounted at this stage. If not then RMDIR will fail.
+    # We do not really care if it succeeds. We are at a best effort here
+    $RMDIR ${PM_SYM_LINKS_DIR}${OSS_ALIAS}${PMDATA_MOUNT_POINT} >> /dev/null 2>&1
+
+    # Now create the mount point and change ownership
+    ${MKDIR} -p ${PM_SYM_LINKS_DIR}${OSS_ALIAS}${PMDATA_MOUNT_POINT} >> /dev/null 2>&1
+    if [[ $? -ne 0 ]]; then
+        logit "ERROR:: Error creating directory '${PM_SYM_LINKS_DIR}${OSS_ALIAS}${PMDATA_MOUNT_POINT}'"
+        return 101
+    fi
+
+    # set ownership of the mount point just created
+    ${CHOWN} ${ENIQ_nfs_user}:${ENIQ_nfs_grp} ${PM_SYM_LINKS_DIR}${OSS_ALIAS}${PMDATA_MOUNT_POINT} >> /dev/null 2>&1
+    if [[ $? -ne 0 ]]; then
+        logit "ERROR:: Error changing ownership of '${PM_SYM_LINKS_DIR}${OSS_ALIAS}${PMDATA_MOUNT_POINT}'"
+        return 103
+    fi
+
+    # Okay, an attempt to remove any processes that have a lock on the mountpoint.
+    # Mount command will fail if there is a lock on the mountpoint.
+    $FUSER -k ${PM_SYM_LINKS_DIR}${OSS_ALIAS}${PMDATA_MOUNT_POINT} >> /dev/null 2>&1
+	
+    if [ "$USE_SSH_TUNNEL" == "TRUE" ]; then
+    	_mount_command_="$MOUNT -t nfs -o ${MOUNT_OPTIONS_PMDATA},port=${PORT_NUMBER} 127.0.0.1:${PMDATA_SHARE} ${PM_SYM_LINKS_DIR}${OSS_ALIAS}${PMDATA_MOUNT_POINT}"
+    	$MOUNT -t nfs -o ${MOUNT_OPTIONS_PMDATA},port=${PORT_NUMBER} 127.0.0.1:${PMDATA_SHARE} ${PM_SYM_LINKS_DIR}${OSS_ALIAS}${PMDATA_MOUNT_POINT} >> /dev/null 2>&1 &
+        _mount_pid_="$!"
+    else
+    	_mount_command_="$MOUNT -t nfs -o ${MOUNT_OPTIONS_PMDATA} ${PMDATA_SERVER}:${PMDATA_SHARE} ${PM_SYM_LINKS_DIR}${OSS_ALIAS}${PMDATA_MOUNT_POINT}"
+        $MOUNT -t nfs -o ${MOUNT_OPTIONS_PMDATA} ${PMDATA_SERVER}:${PMDATA_SHARE} ${PM_SYM_LINKS_DIR}${OSS_ALIAS}${PMDATA_MOUNT_POINT} >> /dev/null 2>&1 &
+        _mount_pid_="$!"
+    fi
+	MOUNT_PID_LIST="${MOUNT_PID_LIST} ${_mount_pid_}"  # Save pid to list
+	$ECHO "${_mount_pid_}::${PMDATA_SHARE}::${PMDATA_MOUNT_POINT}" >> ${_temp_mount_pid_list_file_}
+    logit "INFO:: Mounting filesystems. '${_mount_command_}'. PID ${_mount_pid_}"
+fi
+
+# Wait for "mount" to finish about 10 seconds
+sleep_function ${MOUNT_TIME_OUT_TIME}
+
+# Time to check if all the mount commands finished successfully.
+for _mount_pid_ in ${MOUNT_PID_LIST}; do
+	if [ -s ${_temp_mount_pid_list_file_} ]; then
+		_hanging_mnt_fs_=`$CAT ${_temp_mount_pid_list_file_} | $EGREP ${_mount_pid_} | $AWK -F"::" '{print $3}'`
+	else
+		logit "WARNING:: File containing mount information not found. Not possible to determine which filesystem is being operated on"
+	fi
+	
+	# MOUNT should have finished. If not kill it.
+	${KILL} -0 ${_mount_pid_} >> /dev/null 2>&1
+	if [ $? -eq 0 ]; then
+		return_code=5
+		logit "ERROR:: Mount hanging while trying to mount ${_hanging_mnt_fs_} filesystem. Killing mount PID ${_mount_pid_}"
+		${KILL} ${_mount_pid_} >> /dev/null 2>&1
+		$SLEEP 1
+		${KILL} -KILL ${_mount_pid_} >> /dev/null 2>&1
+	else # Check exit status of finished "mount" process
+		${WAIT} ${_mount_pid_} >> /dev/null 2>&1
+		EXIT_CODE=$?
+		if [[ ${EXIT_CODE} -ne 0 ]]; then
+			return_code=6
+			logit "ERROR:: Mounting filesystem ${_hanging_mnt_fs_} failed. Exit code from PID ${_mount_pid_} is ${EXIT_CODE}"
+		else
+			logit "INFO:: Mounting filesystem ${_hanging_mnt_fs_} completed. Exit code from PID ${_mount_pid_} is ${EXIT_CODE}"
+		fi
+	fi
+done  # End of for loop checking results of background "mount" processes
+
+MOUNT_PID_LIST=""
+
+if [ ${return_code} -eq 0 ]; then
+    logit "INFO:: All filesystems for ${OSS_ALIAS} mounted successfully."
+    return ${return_code}
+else
+    logit "ERROR:: Problem mounting filesystems for ${OSS_ALIAS}"
+    return ${return_code}
+fi
+}
+
+
+### Function: set_environment ###
+#
+# Sets common variables
+#
+# Uses Global Variables: "OSS_ALIAS"
+# Sets Global variables: "CONNECTD_CONFIG"; "DISABLE_OSS"; "OSS_ALIAS_IP"
+#                        "DATA_FILE_SYSTEMS_LIST_FILE";  "PMDATA_FILE_SYSTEM_FILE";
+# Arguments     : none
+# Return Values : none
+set_environment()
+{
+# Resolve (alias) OSS_ALIAS and get the I.P. address for the OSS.
+OSS_ALIAS_IP=`$GETENT hosts ${OSS_ALIAS} | $AWK '{print $1}'`
+
+# If this file exists in the OSS specific subdirectory
+# MOUNT_INFO_DIR/<OSS_ALIAS>  then this OSS will be disabled.
+DISABLE_OSS="${MOUNT_INFO_DIR}/${OSS_ALIAS}/disable_OSS"
+
+# If this file exists in the SOEM specific subdirectory
+# MOUNT_INFO_DIR/<SOEM_ALIAS>  then this SOEM will be disabled.
+DISABLE_SOEM="${MOUNT_INFO_DIR}/${OSS_ALIAS}/disable_SOEM"
+
+# Location of ConnectD Config File
+CONNECTD_CONFIG="${MOUNT_INFO_DIR}/${OSS_ALIAS}/connectd_config"
+# Location of ConnectD Config Template
+CONNECTD_CONFIG_TEMPLATE=${CONNECTD_BASE_DIR}etc/connectd_config_template
+
+# Location of file containing list of Data filesystems to mount.
+DATA_FILE_SYSTEMS_LIST_FILE="${MOUNT_INFO_DIR}/${OSS_ALIAS}/fs_mount_list"
+# Location of file containing PM DATA symbolic links filesystem to mount.
+PMDATA_FILE_SYSTEM_FILE="${MOUNT_INFO_DIR}/${OSS_ALIAS}/pmdata_fs_mount"
+
+#Tempaory Directory which will contain OSS_Monitor temp files.
+readonly TEMP_DIR="/tmp/connectd/${OSS_ALIAS}/"
+$MKDIR -p ${TEMP_DIR} >> /dev/null 2>&1
+
+# Location of Logfile
+readonly LOG_DIRECTORY="/eniq/local_logs/connectd/"
+$MKDIR -p ${LOG_DIRECTORY} >> /dev/null 2>&1
+readonly LOGFILE="${LOG_DIRECTORY}connectd_${OSS_ALIAS}.log"
+    
+#Common Libraries
+readonly ENIQ_LIB_DIR="/eniq/installation/core_install/lib"
+
+# Use the SSH tunnel if the file xxx exists.
+# This can be overwritten by a command line argument.
+if [ -e $MOUNT_INFO_DIR/$OSS_ALIAS/$USE_TUNNEL ]; then
+	USE_SSH_TUNNEL="TRUE"
+fi  
+
+_node_type_=`$ECHO ${OSS_ALIAS}|$AWK -F"_" '{print $2}'`
+
+if [ "${_node_type_}" == "soem" ]; then
+	CONN_TYPE="SOEM"
+	PM_SYM_LINKS_DIR="${SOEM_PM_SYM_LINKS_DIR}"
+else
+	CONN_TYPE="OSS"
+fi
+
+# Source the common functions
+if [ -s ${ENIQ_LIB_DIR}/common_functions.lib ]; then
+    . ${ENIQ_LIB_DIR}/common_functions.lib
+else
+   logit "ERROR:: File ${ENIQ_LIB_DIR}/common_functions.lib not found."
+   exit 1
+fi
+}
+
+### Function: shutdown_and_exit ###
+#
+# Shutdown Shutdown the connectd cleanly.
+# ensure there are no hanging or unfinished subprocesses.
+# Then unmount all filesystems.
+#
+shutdown_and_exit()
+{
+    local exit_status
+    if [[ -n "${1}" ]]; then
+        exit_status=${1}
+    else
+        exit_status=1
+    fi
+
+    terminate_any_child_processes
+    unmount_filesystems
+    logit "INFO:: EXITING connectd Monitor for ${OSS_ALIAS} NOW"
+    exit ${exit_status}
+}
+
+### Function: shutdown_tunnel ###
+#
+# Stops the SSH/tunnel between the OSS and eniq server
+#
+# Arguments: none
+# Return Values: 0 for success; >0 for Error;
+shutdown_tunnel()
+{
+local return_code=0
+local log_msg
+
+# Unmount the filesystems
+unmount_filesystems
+
+# Run this section if the tunnel was used
+if [ "$USE_SSH_TUNNEL" == "TRUE" ]; then
+	# Kill all (NFS) ssh/Tunnels to this OSS on port 2049, from any port on this client
+	$RM -f ${TEMP_DIR}/stop_tunnel_list_OSS.$$.$$ >> /dev/null 2>&1
+	
+	$PS -ef | $EGREP "ssh.*:${OSS_ALIAS}:2049" | $GREP -vw $EGREP | $AWK '{print $2}' > ${TEMP_DIR}/stop_tunnel_list_OSS.$$.$$
+	$PS -ef | $EGREP "ssh.*127.0.0.1:2049" | $GREP -vw $EGREP | $AWK '{print $2}' >> ${TEMP_DIR}/stop_tunnel_list_OSS.$$.$$
+	if [ -s ${TEMP_DIR}/stop_tunnel_list_OSS.$$.$$ ]; then
+	    # Stop SSH/Tunnel
+	    while read pid_no; do
+			$KILL -KILL ${pid_no} >> /dev/null 2>&1
+			if [[ $? -ne 0 ]]; then
+				let "return_code=${return_code}+1"
+			fi
+			log_msg="INFO:: Stopped SSH Tunnel with Process ID ${pid_no} for ${OSS_ALIAS} using port ${PORT_NUMBER}"
+			logit "${log_msg}"
+	    done < ${TEMP_DIR}/stop_tunnel_list_OSS.$$.$$
+	fi
+	$RM -f ${TEMP_DIR}/stop_tunnel_list_OSS.$$.$$ >> /dev/null 2>&1
+
+	# Kill all (NFS) ssh/Tunnels using assigned port on this client
+	$RM -f ${TEMP_DIR}/stop_tunnel_list_port.$$.$$ >> /dev/null 2>&1
+	$PS -ef | $EGREP "ssh.*${PORT_NUMBER}:eniq_oss_[0-9]+:" | $GREP -vw $EGREP | $AWK '{ print $2 }' > ${TEMP_DIR}/stop_tunnel_list_port.$$.$$
+	$PS -ef | $EGREP "ssh.*2049.*eniq_soem_[0-9]" | $GREP -vw $EGREP | $AWK '{ print $2 }' >> ${TEMP_DIR}/stop_tunnel_list_port.$$.$$
+	if [ -s ${TEMP_DIR}/stop_tunnel_list_port.$$.$$ ]; then
+	    while read pid_no; do
+			$KILL -KILL ${pid_no} >> /dev/null 2>&1
+			if [[ $? -ne 0 ]]; then
+				let "return_code=${return_code}+1"
+			fi
+			log_msg="INFO:: Stopped SSH Tunnel with Process ID ${pid_no} using port ${PORT_NUMBER}"
+			logit "${log_msg}"
+	    done < ${TEMP_DIR}/stop_tunnel_list_port.$$.$$
+	fi
+	$RM -f ${TEMP_DIR}/stop_tunnel_list_port.$$.$$ >> /dev/null 2>&1
+
+	log_msg="INFO:: All SSH Tunnel(s) for ${OSS_ALIAS} stopped"
+	logit "${log_msg}"
+
+	unmount_filesystems
+fi
+
+return $return_code
+}
+
+### Function: sleep_function ###
+#
+# Sleep; but checks for interrupt every second
+# Any Interupt functions should set WAKE=true
+#
+# Uses Global Variables: "WAKE"
+# Arguments: Number of seconds to sleep for
+sleep_function()
+{
+    WAKE=false
+    if [[ -n "${1}" ]]; then
+        for (( i=0; i < ${1}; i++ )); do
+            $SLEEP 1
+            if [[ $WAKE = "true" ]]; then
+                return
+            fi
+        done
+    else
+        logit "ERROR:: Error sleep_function called without parameter."
+        $SLEEP 1
+    fi
+}
+
+### Function: start_tunnel ###
+#
+# Starts the SSH/tunnel between the OSS and eniq server
+#
+# Arguments: none
+# Return Values: 0 for success; 1 for Error.
+start_tunnel()
+{
+# If an unknown oss public key is in the known_hosts it will cause problems
+# For HA uncomment these lines, where a backup oss server may be used.
+ENIQ_ssh_user_HOME_DIR=`$GETENT passwd ${ENIQ_ssh_user} | $AWK -F\: '{print $6}' | $SED 's/\/[\/]*/\//g'`
+if [ -f /${ENIQ_ssh_user_HOME_DIR}/.ssh/known_hosts ]; then
+	$RM /${ENIQ_ssh_user_HOME_DIR}/.ssh/known_hosts >> /dev/null 2>&1
+fi
+if [ "${CONN_TYPE}" == "SOEM" ]; then
+	# Start SSH/Tunnel
+	logit "INFO:: Creating tunnel. '$SU ${ENIQ_ssh_user} -c \"${SSH} -fN -c blowfish -L ${PORT_NUMBER}:127.0.0.1:2049 ${OSS_ssh_user}@${OSS_ALIAS}\"'"
+	$SU ${ENIQ_ssh_user} -c "${SSH} -fN -c blowfish -L ${PORT_NUMBER}:127.0.0.1:2049 ${OSS_ssh_user}@${OSS_ALIAS}" >> /dev/null 2>&1
+else
+	# Start SSH/Tunnel
+	logit "INFO:: Creating tunnel. '$SU ${ENIQ_ssh_user} -c \"${SSH} -fN -L ${PORT_NUMBER}:${OSS_ALIAS}:2049 ${OSS_ssh_user}@${OSS_ALIAS}\"'"
+	$SU ${ENIQ_ssh_user} -c "${SSH} -fN -L ${PORT_NUMBER}:${OSS_ALIAS}:2049 ${OSS_ssh_user}@${OSS_ALIAS}" >> /dev/null 2>&1
+fi
+
+if [[ $? -ne 0 ]]; then
+	logit "ERROR:: Could not start tunnel for ${OSS_ALIAS} on port ${PORT_NUMBER}"
+	return 1
+else
+	logit "INFO:: Started tunnel for ${OSS_ALIAS} on port ${PORT_NUMBER}"
+	return 0
+fi
+}
+
+### Function: terminate_any_child_processes ###
+#
+#  Cleanup any child proccesses that may be hung or left over,
+#  If script was interrupted before it cleaned up child processes
+#
+# Uses Global Variables: LS_PID_LIST, MOUNT_PID_LIST
+# Arguments     : none
+# Return Values : none
+terminate_any_child_processes()
+{
+
+    # If function check_mounted_filesystems was interrupted during a test of the mount points "ls" and the ls hangs
+    # then there may be hung child processes that the function did not get to terminate.
+
+    if [[ ! -z "${LS_PID_LIST}" ]]; then
+        ${KILL} -KILL ${LS_PID_LIST} >> /dev/null 2>&1
+        logit "INFO:: Terminating Child Processes; interrupted ls"
+        LS_PID_LIST=""
+    fi
+
+    # If the mount process is interrupted (trap a kill interrupt ) between attempting to mount fs
+    # and checking the result, Then if these attempted mount processes hang;
+    # We must make sure to terminate these processes.
+    # The umount function will not kill them because the f/s are not mounted.
+    # Otherwise these child process will remain after this script is treminated,
+    # and SERVICE will terminate them and go into maintaince mode.
+
+    if [[ ! -z "${MOUNT_PID_LIST}" ]]; then
+        ${KILL} -KILL ${MOUNT_PID_LIST} >> /dev/null 2>&1
+        logit "INFO:: Terminating Child Processes; interrupted mount"
+        MOUNT_PID_LIST=""
+    fi
+}
+
+### Function: trap_shutdown_and_exit ###
+#
+# Shutdown and Exit is called by trapping the USR2 or any of the Terminate interrupts
+#
+trap_shutdown_and_exit()
+{
+local exit_status
+
+if [[ -n "${1}" ]]; then
+    exit_status=${1}
+else
+    exit_status=1
+fi
+
+logit "INFO:: Trapped a TERMINATE signal for connectd."
+
+shutdown_and_exit ${exit_status}
+}
+
+### Function: trap_restart_interupt ###
+#
+#  Restart connectd is called by trapping interrupt HUP USR1
+#  Wake from sleep, Read config file, reset counters.
+#
+trap_restart_interupt()
+{
+# Exits from sleep function immediately if interrupted during a sleep
+WAKE=true
+logit "INFO:: Trapped a RESTART signal for connectd."
+
+terminate_any_child_processes
+
+if [ "$USE_SSH_TUNNEL" == "TRUE" ]; then
+	shutdown_tunnel
+	# Re-read port number to use
+	get_port_number ${PORT_NUMBER}
+else
+	unmount_filesystems
+fi
+
+# Should not be any child processed running. Better to ensure all above has
+# completed before restarting.
+wait
+
+get_configuration
+if [ $? -ne 0 ]; then
+    shutdown_and_exit 1
+fi
+
+create_nfs_mount_arrays
+if [[ ${?} -ne 0 ]]; then
+    logit "ERROR:: Problem reading FileSystems to Mount ; Exiting."
+    exit 96
+fi
+
+# reset backoff counter
+REPEATING_MOUNT_ERROR_COUNT=0
+return
+}
+
+### Function: unmount_filesystems ###
+#
+# Uses Global Variable: "TEMP_DIR"; "OSS_ALIAS"; "MOUNT_POINT_ARRAY"; "PMDATA_MOUNT_POINT"
+# Arguments     : none
+# Return Values : 0 for successful unmount of filesystems
+#                 1 for errors unmounting filesystems
+unmount_filesystems()
+{
+    local return_code=0
+    local NFS_MountPoint=""
+    local nfs_count=""
+
+  
+    
+  # Filesystems containing Symbolic Links, PMData must be unmounted first.
+  
+    # unmount PMData, if this is configured for PMData
+    if [  "${PMDATA_SERVER}" ]; then	    
+        ${UMOUNT} -f ${PM_SYM_LINKS_DIR}${OSS_ALIAS}${PMDATA_MOUNT_POINT} >> /dev/null 2>&1
+        if [[ $? -ne 0 ]]; then
+            return_code=1
+        fi
+    fi
+
+ # All Data filesystems can be unmounted now.
+    nfs_count=${#MOUNT_POINT_ARRAY[@]}
+    # Loop through all filesystems listed in array, and umount asap.
+    for (( i=0; i<${nfs_count}; i++)); do
+        NFS_MountPoint=${MOUNT_POINT_ARRAY[${i}]}
+        ${UMOUNT} -f ${DATA_IMPORT_DIR}${OSS_ALIAS}${NFS_MountPoint} >> /dev/null 2>&1
+        if [[ $? -ne 0 ]]; then
+            return_code=1
+        fi
+    done
+
+    logit "INFO:: Unmounted filesystems for ${OSS_ALIAS}"
+
+    return ${return_code}
+}
+
+### Function: usage ###
+#
+# Displays the usage message.
+#
+usage()
+{
+$ECHO "
+`$BASENAME $0` -n OSS_ALIAS [-p <port_number>]
+    This script should only be started by the SERVICE connectd script.
+    It starts a copy of this script for each connected OSS
+    to setup and monitor the NFS Mounts between ENIQ and each OSS/SFS.
+"
+}
+
+# **********************************************************************
+#
+# ********************** Main body of program  *************************
+#
+# **********************************************************************
+#
+#****************************** Pre setup checks.***********************
+#
+# Check that the effective id of the user is root
+check_id root
+if [[ ${?} -ne 0 ]]; then
+    logit "ERROR:: You must be ROOT to execute Script $0 - exiting."
+    # SERVICE_EXIT_ERR_PERM     100
+    exit 100
+fi
+
+# Determine absolute path to software
+get_absolute_path
+
+$ULIMIT -n 1024
+
+while getopts ":n:p:" arg; do
+    case $arg in
+      n) OSS_ALIAS="$OPTARG"
+         ;;
+      p) PORT_NUMBER="$OPTARG"
+       ;;
+     \?) usage
+         exit 1
+         ;;
+    esac
+done
+
+shift `${EXPR} $OPTIND - 1`
+
+if [ ! "${OSS_ALIAS}" ]; then
+    usage
+    exit 1
+fi
+
+# Set up the environment
+set_environment
+
+logit "======================================================================="
+logit "******** Starting connectd Monitor daemon for  ${OSS_ALIAS} ******"
+logit "=======================================================================\n"
+
+# configuration data is set in this function
+get_configuration
+
+# Reads config file containing filesystems to be mounted from
+# and creates arrays of nfs shares and mount points.
+create_nfs_mount_arrays
+if [[ ${?} -ne 0 ]]; then
+    logit "ERROR:: Problem reading FileSystems to mount; Exiting."
+    exit 96
+fi
+
+trap "" INT
+trap "trap_restart_interupt" USR1 HUP  # restarts connectd
+trap "trap_shutdown_and_exit 0" USR2 QUIT  # Stops tunnel monitor script
+trap "trap_shutdown_and_exit 1" TERM ABRT TSTP # Stops tunnel monitor script
+
+# Do some pre-tunnel setting up and update config params
+if [ "$USE_SSH_TUNNEL" == "TRUE" ]; then
+	# Get Port Number
+	get_port_number ${PORT_NUMBER}
+
+	# The port assigned for this OSS should not be in use. If it is, it may not have been
+	# shutdown properly.
+	# Kill all (NFS) ssh/Tunnels to this OSS from any port on this client
+	$PS -ef | $GREP -vw $EGREP | $EGREP "ssh.*:${OSS_ALIAS}:2049" >> /dev/null 2>&1
+	if [[ $? -eq 0 ]]; then
+		_err_msg_="WARNING:: Tunnel already started to this OSS ${OSS_ALIAS}. Destroying Tunnel"
+		logit "${_err_msg_}"
+		shutdown_tunnel
+	fi
+	
+	# Kill all (NFS) ssh/Tunnels using assigned port on this client
+	$PS -ef | $GREP -vw $EGREP | $EGREP "ssh.*${PORT_NUMBER}:" >> /dev/null 2>&1
+	if [[ $? -eq 0 ]]; then
+		_err_msg_="WARNING:: Tunnel already started with port number ${PORT_NUMBER}. Destroying Tunnel"
+		logit "${_err_msg_}"
+		shutdown_tunnel
+	fi
+fi
+
+# Track number of failed attempts to mount filesystems or contact mounted NFS.
+REPEATING_MOUNT_ERROR_COUNT=0
+
+# Fetch the values of fs_mount_list file before entering the loop
+ORIG_FS_MOUNT_LIST=`$CAT ${DATA_FILE_SYSTEMS_LIST_FILE} |$EGREP -v '^[       ]*#' |$EGREP -v  '^[    ]*$'\
+        | $SED -e 's/^[ ]*//' -e 's/^[  ]*//' -e 's/\/[\/]*/\//g' -e 's/[\/]*$//g'`
+
+# Continueous loop to monitor Filesystems and mount them if necessary
+# Loop repeats every ${CHECK_MOUNTS_EVERY} seconds, for the first ${LOOP_RETRYS_BEFORE_TIMEOUT} times
+# Then backs off and only tries every ${BACKOFF_SLEEP_TIME} seconds
+while [[ ! -f "${DISABLE_OSS}" || ! -f "${DISABLE_SOEM}" ]]; do
+	# Rotate and compress the logs if necessary
+	if [ "${LOGFILE}" ]; then
+		rotate_compress_logs ${LOGFILE} ${NUM_LOGS} ${SIZE_LOGS} ${COMPRESS_LOG}	
+		if [[ ${?} -ne 0 ]]; then
+                         logit "WARNING::  Problem in rotating/compressing ${LOGFILE}."
+                fi
+	fi
+
+        # Check mount list file values and recreate nfs mount array if necessary
+        CURR_FS_MOUNT_LIST=`$CAT ${DATA_FILE_SYSTEMS_LIST_FILE} |$EGREP -v '^[       ]*#' |$EGREP -v  '^[    ]*$'\
+        | $SED -e 's/^[ ]*//' -e 's/^[  ]*//' -e 's/\/[\/]*/\//g' -e 's/[\/]*$//g'`
+        if [ "${ORIG_FS_MOUNT_LIST}" != "${CURR_FS_MOUNT_LIST}" ]; then
+                logit "INFO:: Creating mount points array from ${DATA_FILE_SYSTEMS_LIST_FILE} to mount filesystems."
+                create_nfs_mount_arrays
+                if [[ ${?} -ne 0 ]]; then
+                        logit "ERROR:: Problem reading FileSystems to mount; Exiting."
+                        exit 96
+                fi
+                ORIG_FS_MOUNT_LIST="${CURR_FS_MOUNT_LIST}"
+        fi
+
+	if [ "$USE_SSH_TUNNEL" == "TRUE" ]; then
+		check_create_tunnel "${OSS_ALIAS}"
+		if [ $? -ne 0 ]; then
+			let "REPEATING_MOUNT_ERROR_COUNT=${REPEATING_MOUNT_ERROR_COUNT}+1"
+	        logit "ERROR:: Filesystems for ${OSS_ALIAS} are not mounted through ssh tunnel"
+			shutdown_tunnel			
+		else
+	        check_mounted_filesystems
+	        if [ $? -eq 0 ]; then
+	            # All mounts are ok,
+	            REPEATING_MOUNT_ERROR_COUNT=0
+	        else
+	            let "REPEATING_MOUNT_ERROR_COUNT=${REPEATING_MOUNT_ERROR_COUNT}+1"
+	            logit "ERROR:: Filesystems for ${OSS_ALIAS} Not responding. "
+	            shutdown_tunnel
+	        fi
+		fi
+	else
+		# Check if the NFS filesystems are mounted. If not mounted then mount them.
+	    check_for_NFS_mounts
+	    if [ $? -ne 0 ]; then
+	        let "REPEATING_MOUNT_ERROR_COUNT=${REPEATING_MOUNT_ERROR_COUNT}+1"
+	        logit "ERROR:: Filesystems for ${OSS_ALIAS} are not mounted. "
+	        # Filesystems are not correctly mounted.
+	        # return to a known state before trying to mount filesystems again.
+	        unmount_filesystems
+	
+	        mount_filesystems
+	        if [ $? -ne 0 ]; then
+	            logit "ERROR:: Filesystems could not be mounted for ${OSS_ALIAS}. "
+	            logit "INFO:: Number of Failed Mount attempts is: ${REPEATING_MOUNT_ERROR_COUNT}"
+	            # If NAS filesystems are not mounted.
+	        else
+	            logit "INFO:: Filesystems successfully mounted for ${OSS_ALIAS}. "
+	        fi
+	    else
+	        check_mounted_filesystems
+	        if [ $? -eq 0 ]; then
+	            # All mounts are ok,
+	            REPEATING_MOUNT_ERROR_COUNT=0
+	        else
+	            let "REPEATING_MOUNT_ERROR_COUNT=${REPEATING_MOUNT_ERROR_COUNT}+1"
+	            logit "ERROR:: Filesystems for ${OSS_ALIAS} Not responding. "
+	            unmount_filesystems
+	        fi
+	    fi
+	fi
+	
+    sleep_function ${CHECK_MOUNTS_EVERY}  # Loop repeats every ${CHECK_MOUNTS_EVERY} seconds
+    
+    # If attempting to mount or check the filesystems  continues to fail, then
+    # Backoff from trying to mount filesystems every 2 seconds.
+    if [ "${REPEATING_MOUNT_ERROR_COUNT}" -ge "${LOOP_RETRYS_BEFORE_TIMEOUT}" ]; then
+        sleep_function ${BACKOFF_SLEEP_TIME}
+    fi
+done   # This loop only ends if the disable tunnel file exists
+logit "INFO:: Shutting down ${OSS_ALIAS} mounts because disable_OSS file detected."
+
+unmount_filesystems
+
+exit 0

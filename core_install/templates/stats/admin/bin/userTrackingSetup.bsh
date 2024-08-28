@@ -1,0 +1,710 @@
+#!/bin/bash
+# ********************************************************************
+# Ericsson Radio Systems AB                                     SCRIPT
+# ********************************************************************
+#
+#
+# (c) Ericsson Radio Systems AB 2019 - All rights reserved.
+#
+# The copyright to the computer program(s) herein is the property
+# of Ericsson Radio Systems AB, Sweden. The programs may be used 
+# and/or copied only with the written permission from Ericsson Radio 
+# Systems AB or in accordance with the terms and conditions stipulated 
+# in the agreement/contract under which the program(s) have been 
+# supplied.
+#
+# ********************************************************************
+# Name    : userTrackingSetup.bsh
+# Date    : 22/07/2022
+# Revision: /main/7    
+# Purpose : To track the connection information             
+#    
+# Usage   :  bash userTrackingSetup.bsh -a <enable_custom_users|enable_all|disable>  [-l] 
+#
+# ********************************************************************
+#
+#     Command Section
+#
+# ********************************************************************
+AWK=/usr/bin/awk
+BASENAME=/usr/bin/basename
+CAT=/usr/bin/cat
+CHMOD=/usr/bin/chmod
+DATE=/usr/bin/date
+DIRNAME=/usr/bin/dirname
+ECHO=/usr/bin/echo
+EGREP=/usr/bin/egrep
+EXPR=/usr/bin/expr
+ID=/usr/bin/id
+LS=/usr/bin/ls
+MKDIR=/usr/bin/mkdir
+PWD=/usr/bin/pwd
+RM=/usr/bin/rm
+SED=/usr/bin/sed
+BASH=/usr/bin/bash
+
+# ********************************************************************
+#
+#       Configuration Section
+#
+# ********************************************************************
+# Name of SunOS & ENIQ ini Files
+ENIQ_ENV=niq.rc
+ENIQ_INI=niq.ini
+
+# ********************************************************************
+#
+#   functions
+#
+# ********************************************************************
+### Function: abort_script ###
+#
+#   This will is called if the script is aborted thru an error
+#   error signal sent by the kernel such as CTRL-C or if a serious
+#   error is encountered during runtime
+#
+# Arguments:
+#       $1 - Error message from part of program (Not always used)
+# Return Values:
+#       none
+abort_script()
+{
+if [ "$1" ]; then
+    _err_msg_=$1
+else
+    _err_msg_="$($DATE '+%Y-%m-%d_%H.%M.%S'): Script aborted.......\n"    
+fi
+
+if [ "${LOGFILE}" ]; then
+    $ECHO "\n$_err_msg_\n"|$TEE -a ${LOGFILE}
+else
+    $ECHO "\n$_err_msg_\n"
+fi
+$RM -rf ${dwh_connection_string_enc}
+cleanup
+
+if [ "$2" ]; then
+    exit ${2}
+else
+   exit 1
+fi
+
+}
+
+### Function: check_id ###
+#
+#   Check that the effective id of the user is correct
+#   If not print error msg and exit.
+#
+# Arguments:
+#       $1 : User ID name
+# Return Values:
+#       none
+check_id()
+{
+_check_id_=`$ID  | $AWK -F\( '{print $2}' | $AWK -F\) '{print $1}'`
+if [ "$_check_id_" != "$1" ]; then
+    _err_msg_="You must be $1 to execute this script."
+    abort_script "$_err_msg_"
+fi
+
+}
+
+### Function: setup_env ###
+#
+# Setup up path environment etc
+#
+# Arguments:
+#    none
+# Return Values:
+#    DWH_port,DWH_eng and DBA password
+
+setup_env()
+{
+ENIQ_BASE_DIR=/eniq
+ENIQ_SW_DIR=${ENIQ_BASE_DIR}/sw
+ENIQ_BKUPSW_DIR=${ENIQ_BASE_DIR}/bkup_sw
+CLI_CONF_DIR=${ENIQ_BASE_DIR}/sw/conf
+ENIQ_CORE_BIN_DIR=${ENIQ_BASE_DIR}/installation/core_install/bin
+ENIQ_ADMIN_BIN=${ENIQ_BASE_DIR}/admin/bin
+
+# Sentinel Stuff
+ENIQ_SENTINEL_DIR=${ENIQ_BASE_DIR}/sentinel
+ENIQ_SENTINEL_BIN_DIR=${ENIQ_SENTINEL_DIR}/bin
+ENIQ_SENTINEL_ENV=${ENIQ_SENTINEL_DIR}/etc/sentinel.env
+
+
+ENIQ_CONF_DIR=${ENIQ_BASE_DIR}/installation/config
+if [ ! -s ${ENIQ_CONF_DIR}/SunOS.ini ]; then
+    _err_msg_="Could not locate file ${ENIQ_CONF_DIR}/SunOS.ini"
+    abort_script "$_err_msg_"
+fi
+
+#Temp directory.
+TEM=/tmp
+
+# Source the common functions
+if [ -s ${ENIQ_BASE_DIR}/admin/lib/common_functions.lib ]; then
+    . ${ENIQ_BASE_DIR}/admin/lib/common_functions.lib
+else
+    _err_msg_="File ${ENIQ_BASE_DIR}/admin/lib/common_functions.lib not found"
+    abort_script "$_err_msg_"
+fi
+
+if [ ! -s ${ENIQ_CORE_BIN_DIR}/set_core_memcache.bsh ]; then
+        _err_msg_="Failed to locate script ${ENIQ_CORE_BIN_DIR}/set_core_memcache.bsh"
+        abort_script "$_err_msg_" "${EXEC_SHELL_CMD}"
+fi
+    
+DWH_PORT=`iniget DWH -v PortNumber -f ${CLI_CONF_DIR}/niq.ini`
+DWH_ENG=`iniget DWH -v ServerName -f ${CLI_CONF_DIR}/niq.ini`
+if [ ! "${DWH_PORT}" -o ! "${DWH_ENG}" ]; then
+        _err_msg_="Could not read db values from ${CLI_CONF_DIR}/${ENIQ_INI}"
+        abort_script "$_err_msg_"
+fi
+
+DBA_PASSWORD=`inigetpassword DB -f ${CLI_CONF_DIR}/${ENIQ_INI} -v DBAPassword`
+if [ ! ${DBA_PASSWORD} ]; then
+  if [ -f ${ENIQ_BASE_DIR}/sw/installer/dbusers ]; then
+            DBA_PASSWORD=`${ENIQ_BASE_DIR}/sw/installer/dbusers dba dwh`
+     if [ ! "${DBA_PASSWORD}" ] ; then
+                _err_msg_="Could not get dwhdb DBA Password"
+                abort_script "$_err_msg_"
+     fi
+   fi
+fi
+
+
+#Initialising the connection string for dwhdb
+dwh_connection_string="-nogui -onerror exit -c \"eng=${DWH_ENG};links=tcpip{host=localhost;port=${DWH_PORT}};uid=dba;pwd=${DBA_PASSWORD}\""
+dwh_connection_string_enc=${TEM}/conn_str_setup_encrypt.txt.`uuidgen`
+
+# encrypt the connection string.
+get_encrypt_file "${dwh_connection_string}" "${dwh_connection_string_enc}"
+
+REP_PORT=`iniget REP -v PortNumber -f ${CLI_CONF_DIR}/niq.ini`
+REP_ENG=`iniget REP -v ServerName -f ${CLI_CONF_DIR}/niq.ini`
+if [ ! "${REP_PORT}" -o ! "${REP_ENG}" ]; then
+        _err_msg_="Could not read db values from ${CLI_CONF_DIR}/${ENIQ_INI}"
+        abort_script "$_err_msg_"
+fi
+
+#Initialising the connection string for dwhdb
+rep_connection_string="-nogui -onerror exit -c \"eng=${REP_ENG};links=tcpip{host=localhost;port=${REP_PORT}};uid=dba;pwd=${DBA_PASSWORD}\""
+
+. /eniq/sybase_iq/IQ-*/IQ-*.sh
+sybase_env_variables_ec=$?
+if [ $sybase_env_variables_ec -ne 0 ]; then
+    _err_msg_="Could not source sybase environment"
+    abort_script "$_err_msg_"
+fi
+
+CURR_SERVER_TYPE=`$CAT ${ENIQ_CONF_DIR}/installed_server_type | $EGREP -v '^[[:blank:]]*#' | $SED -e 's/ //g'`
+if [ ! "${CURR_SERVER_TYPE}" ]; then
+    _err_msg_="Could not determine which server type this is"
+    abort_script "$_err_msg_"
+fi
+
+if [ ! -s ${CLI_CONF_DIR}/${ENIQ_ENV} ]; then
+    _err_msg_="Could not locate file ${CLI_CONF_DIR}/${ENIQ_ENV}"
+    abort_script "$_err_msg_"
+else
+    . ${CLI_CONF_DIR}/niq.rc
+fi
+
+# Create a temporary Directory
+TEM_DIR=/tmp/userTrackingAdmin.$$.$$
+$RM -rf ${TEM_DIR}
+$MKDIR -p ${TEM_DIR}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not create directory ${TEM_DIR}"
+    abort_script "$_err_msg_"
+fi  
+$CHMOD 740 ${TEM_DIR}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not update directory ${TEM_DIR} permissions"
+    abort_script "$_err_msg_"
+fi 
+}
+
+### Function: setup_sybase_env ###
+#
+# Set up Sybase environment
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+setup_sybase_env()
+{
+$ENV |$EGREP '^(SYBASE|ASDIR|IQDIR|ASALOGDIR|SQLANY)' > ${TEM_DIR}/sybase_det.$$ >> /dev/null 2>&1
+
+# Source the environment
+set -a
+. ${TEM_DIR}/sybase_det.$$ >> /dev/null 2>&1
+set +a
+
+if [ ! "${SYBASE}" ]; then 
+    _err_msg_="Could not determine Sybase environment variable \${SYBASE}"
+    abort_script "$_err_msg_"
+fi
+
+DBISQL="$(ls /eniq/sybase_iq/IQ-*/bin64/dbisql)"
+if [ ! -x "$DBISQL" ]; then
+    _err_msg_="$DBISQL commands not found or not executable."
+    abort_script "$_err_msg_"
+fi
+
+}
+
+### Function: get_absolute_path ###
+#
+# Determine absolute path to software
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+get_absolute_path()
+{
+    _dir_=`$DIRNAME $0`
+    SCRIPTHOME=`cd $_dir_ 2>/dev/null && pwd || $ECHO $_dir_`
+}
+
+
+### Function: usage_msg ###
+#
+#   Print out the usage message
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+usage_msg()
+{
+$ECHO "
+Usage: /usr/bin/bash `$BASENAME $0` -a <enable_custom_users|enable_all|disable>  [-l] 
+
+Compulsory:
+-a: 'enable_custom_users'     Tracks connection information for non standard ENIQ custom users to SRVLOG file.  
+    'enable_all'       Includes standard ENIQ users in addition to 'enable_custom_users' connection tracking above.
+    'disable'   Disables an active connection tracking.
+   
+optional:
+-l :     Enables the logging of connection information to srvlog as well as in connectionLogging file.
+
+"
+}
+
+### Function: chk_create_logfile ###
+#
+# Check/Create Logfile
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+chk_create_logfile()
+{
+
+if [ ! "${LOGFILE}" ]; then
+    LOGFILE=${ENIQ_BASE_DIR}/log/sw_log/iq/user_tracking_$($DATE '+%Y-%b-%d_%H.%M.%S').log
+fi
+
+$MKDIR -p `$DIRNAME ${LOGFILE}`
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not create directory `$DIRNAME ${LOGFILE}`"
+     abort_script "$_err_msg_"
+fi
+
+$TOUCH -a ${LOGFILE}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not write to file ${LOGFILE}"
+    abort_script "$_err_msg_"
+fi
+
+
+}
+
+### Function: cleanup ###
+#
+# 
+#
+# Arguments: none
+#
+# Return Values: none
+cleanup() {
+  $RM -rf ${TEM_DIR} >/dev/null 2>&1
+}
+
+### Function: ConLogOpenCreation ###
+#
+# 
+#
+# Arguments: none
+#
+# Return Values: none
+ConLogOpenCreation() {
+
+
+
+  
+  SqlFile1=`mktemp ${TEM_DIR}/ConOpenLogCreation.XXXXXXXXXX` 
+ $ECHO " if (select count(e.event_name) from sysevent e,sysuser u where u.user_id=e.creator and u.user_name like 'dba' and e.event_name like 'logConCreateEvent') > 0   then
+    drop  event dba.logConCreateEvent ;
+
+    if (select count(e.event_name) from sysevent e,sysuser u where u.user_id=e.creator and u.user_name like 'dba' and e.event_name like 'logConCreateEvent') > 0   then
+        message '<<< FAILED to drop event dba.logConCreateEvent >>>' type info to client ;
+    else
+        message '<<< Dropped event dba.logConCreateEvent >>>' type info to client   ;
+    end if ;
+end if ;
+
+Create event dba.logConCreateEvent
+TYPE  \"Connect\" 
+Handler
+begin
+    declare @Userid Varchar(128);
+    declare @ConnHandle int;
+    declare @ConnCreateTime timestamp;
+    declare @IQconnID int;
+    declare @CommLink Varchar(255);
+    declare @NodeAddr Varchar(64);
+    declare @ConnInfo Varchar(128);
+    declare @checkLogConInfoSrvlog int;
+
+
+
+    set @ConnHandle=(select EVENT_PARAMETER('ConnectionId'));
+    set @Userid=(select EVENT_PARAMETER('User'));
+    set @ConnInfo=(SELECT EVENT_PARAMETER( 'AppInfo' ));
+    set @checkLogConInfoSrvlog=Public.checkLogConInfoSrvlog;
+
+
+    
+    if ( ${User} ) then
+        set @ConnCreateTime=(select ConnCreateTime from  sp_iqconnection() where Userid like @Userid and ConnHandle = @ConnHandle);
+        set @IQconnID=(select IQconnID from  sp_iqconnection() where Userid like @Userid and ConnHandle = @ConnHandle);    
+        set @CommLink=(select CommLink from  sp_iqconnection() where Userid like @Userid and ConnHandle = @ConnHandle);    
+        set @NodeAddr=(select NodeAddr from  sp_iqconnection() where Userid like @Userid and ConnHandle = @ConnHandle);            
+
+
+        if ( @checkLogConInfoSrvlog  = 0 )
+        then
+            message 'TRACK-INFO: A connection (ConnHandle: '|| @ConnHandle ||', IQconnID: '|| @IQconnID ||', User: ' || @UserID || ') was made at StartTime: '||@ConnCreateTime||' with ClientDetails as '||@ConnInfo||' ;' type info to LOG;
+        end if;
+    end if ; 
+END;
+
+if (select count(e.event_name) from sysevent e,sysuser u where u.user_id=e.creator and u.user_name like 'dba' and e.event_name like 'logConCreateEvent') > 0   then
+   message '<<< Created event dba.logConCreateEvent >>>' type info to client ;
+else
+   message '<<< FAILED to create event dba.logConCreateEvent >>>'   type info to client ;
+end if ;
+" > $SqlFile1
+
+${DBISQL} @${dwh_connection_string_enc} $SqlFile1 | $TEE -a ${LOGFILE}
+status=(${PIPESTATUS[@]})
+pipe_status0=${status[0]}
+pipe_status1=${status[1]}
+if [ "${pipe_status0}" -ne 0 ]; then 
+    _err_msg_="$($DATE '+%Y-%m-%d_%H.%M.%S'): Failed to create connection open logging event. "
+	abort_script "$_err_msg_"
+else
+    log_msg -s "$($DATE '+%Y-%m-%d_%H.%M.%S'): Successfully created connection open logging event. " -l ${LOGFILE}
+    	iniset DWH -f ${CLI_CONF_DIR}/niq.ini -v UserTrackingStatus=Y
+	if [ $? -eq 0 ]; then
+        	cp -rp ${CLI_CONF_DIR}/niq.ini ${ENIQ_CONF_DIR}/niq.ini
+		echo "User Tracking Enabled"
+	fi
+	
+fi
+}
+
+### Function: ConLogCloseCreation ###
+#
+# 
+#
+# Arguments: none
+# 
+#  Return Values: none
+ConLogCloseCreation() {
+
+SqlFile2=`mktemp ${TEM_DIR}/ConCloseLogCreation.XXXXXXXXXX` 
+ $ECHO "if (select count(e.event_name) from sysevent e,sysuser u where u.user_id=e.creator and u.user_name like 'dba' and e.event_name like 'logConCloseEvent') > 0   then
+    drop  event dba.logConCloseEvent ;
+
+    if (select count(e.event_name) from sysevent e,sysuser u where u.user_id=e.creator and u.user_name like 'dba' and e.event_name like 'logConCloseEvent') > 0   then
+        message '<<< FAILED to drop event dba.logConCloseEvent >>>' type info to client ;
+    else
+        message '<<< Dropped event dba.logConCloseEvent >>>' type info to client   ;
+    end if ;
+end if ;
+
+Create event dba.logConCloseEvent
+TYPE  \"Disconnect\" 
+Handler
+begin
+    declare @Userid Varchar(128);
+    declare @ConnHandle int;
+    declare @dt timestamp;
+    declare @ConnInfo Varchar(128);
+    declare @checkLogConInfoSrvlog int;
+
+    
+
+    set @ConnHandle=(select EVENT_PARAMETER('ConnectionId'));
+    set @Userid=(select EVENT_PARAMETER('User'));
+    set @dt=(select Now());
+    set @ConnInfo=(SELECT EVENT_PARAMETER( 'AppInfo' ));
+    set @checkLogConInfoSrvlog=Public.checkLogConInfoSrvlog;
+     
+    if ( ${User} ) then    
+
+        if ( @checkLogConInfoSrvlog  = 0 )
+        then
+            message 'TRACK-INFO: A connection (ConnHandle: '|| @ConnHandle ||', User: '||@UserID ||') was closed at EndTime: '||@dt||' with Client Details as '||@ConnInfo ||';' type info to LOG;        
+        end if;
+    end if ; 
+END;
+
+if (select count(e.event_name) from sysevent e,sysuser u where u.user_id=e.creator and u.user_name like 'dba' and e.event_name like 'logConCloseEvent') > 0   then
+   message '<<< Created event dba.logConCloseEvent >>>' type info to client ;
+else
+   message '<<< FAILED to create event dba.logConCloseEvent >>>'   type info to client ;
+end if ;
+" > $SqlFile2
+
+${DBISQL} @${dwh_connection_string_enc} $SqlFile2  | $TEE -a ${LOGFILE}
+status=(${PIPESTATUS[@]})
+pipe_status0=${status[0]}
+pipe_status1=${status[1]}
+if [ "${pipe_status0}" -ne 0 ]; then
+    _err_msg_="$($DATE '+%Y-%m-%d_%H.%M.%S'): Failed to create connection close logging event. "
+	abort_script "$_err_msg_"
+else
+    log_msg -s "$($DATE '+%Y-%m-%d_%H.%M.%S'): Successfully created connection close logging event. " -l ${LOGFILE}
+fi
+}
+
+
+### Function: logItCreation ###
+#
+# 
+#
+# Arguments: none
+#
+# Return Values: none
+logItCreation() {
+
+if [ -z "${logItFlag}" ]
+then
+    logItFlag=0
+fi
+
+
+${DBISQL} @${dwh_connection_string_enc} -q "CREATE OR REPLACE DATABASE VARIABLE PUBLIC.checkLogConInfoSrvlog INT =${logItFlag}"
+if [ $? -ne 0 ]
+then
+    _err_msg_="$($DATE '+%Y-%m-%d_%H.%M.%S'): Failed to create logging to srvlog file."
+	abort_script "$_err_msg_"
+else
+    log_msg -s "$($DATE '+%Y-%m-%d_%H.%M.%S'): Successfully created logging to srvlog file. " -l ${LOGFILE}
+fi
+
+}
+
+
+
+### Function: disableTracking ###
+#
+# 
+#
+# Arguments: none
+#
+# Return Values: none
+disableTracking() {
+
+if [ -s ${ENIQ_BASE_DIR}/admin/lib/common_functions.lib ]; then
+    . ${ENIQ_BASE_DIR}/admin/lib/common_functions.lib
+else
+    _err_msg_="File ${ENIQ_BASE_DIR}/admin/lib/common_functions.lib not found"
+    abort_script "$_err_msg_"
+fi
+
+${DBISQL} @${dwh_connection_string_enc} -q "alter event dba.logConCreateEvent  DISABLE; alter event dba.logConCloseEvent  DISABLE; "
+if [ $? -ne 0 ]
+then
+    _err_msg_="$($DATE '+%Y-%m-%d_%H.%M.%S'): Failed to Disable connection logging events."
+	abort_script "$_err_msg_"
+else
+	log_msg -s "$($DATE '+%Y-%m-%d_%H.%M.%S'): Successfully Disabled connection logging events. " -l ${LOGFILE}
+        iniset DWH -f ${CLI_CONF_DIR}/niq.ini -v UserTrackingStatus=N
+	if [ $? -eq 0 ]; then
+        	cp -rp ${CLI_CONF_DIR}/niq.ini ${ENIQ_CONF_DIR}/niq.ini
+		echo "User Tracking Disabled"
+	fi
+fi
+
+}
+
+
+
+### Function: enableTracking ###
+#
+# 
+#
+# Arguments: none
+#
+# Return Values: none
+enableTracking() {
+
+if [ -s ${ENIQ_BASE_DIR}/admin/lib/common_functions.lib ]; then
+    . ${ENIQ_BASE_DIR}/admin/lib/common_functions.lib
+else
+    _err_msg_="File ${ENIQ_BASE_DIR}/admin/lib/common_functions.lib not found"
+    abort_script "$_err_msg_"
+fi
+
+${DBISQL} @${dwh_connection_string_enc} -q "alter event dba.logConCreateEvent ENABLE; alter event dba.logConCloseEvent ENABLE; "
+if [ $? -ne 0 ]
+then
+    _err_msg_="$($DATE '+%Y-%m-%d_%H.%M.%S'): Failed to ENABLE connection logging events."
+	abort_script "$_err_msg_"
+else
+	iniset DWH -f ${ENIQ_BASE_DIR}/installation/core_install/templates/stats/niq.ini -v UserTrackingStatus=Y
+	if [ $? -eq 0 ]; then
+		iniset DWH -f ${ENIQ_BASE_DIR}/installation/config/niq.ini -v UserTrackingStatus=Y
+		if [ $? -eq 0 ]; then
+			iniset DWH -f ${ENIQ_BASE_DIR}/sw/conf/niq.ini -v UserTrackingStatus=Y
+			if [ $? -eq 0 ]; then
+				echo "User Tracking Enabled"
+			fi
+		fi
+    fi
+    log_msg -s "$($DATE '+%Y-%m-%d_%H.%M.%S'): Successfully ENABLED connection logging events. " -l ${LOGFILE}
+fi
+
+}
+
+
+### Function: dropTracking ###
+#
+# 
+#
+# Arguments: none
+#
+# Return Values: none
+dropTracking() {
+
+${DBISQL} @${dwh_connection_string_enc} "Drop event dba.logConCreateEvent; drop event dba.logConCloseEvent;"
+if [ $? -ne 0 ]
+then
+     _err_msg_="$($DATE '+%Y-%m-%d_%H.%M.%S'): Failed to drop connection Logging events."
+	 abort_script "$_err_msg_"
+else
+    log_msg -s "$($DATE '+%Y-%m-%d_%H.%M.%S'): Successfully dropped connection Logging events. " -l ${LOGFILE}
+fi
+
+
+
+}
+
+### Function: checkDBAPasword ###
+#
+# confirm user knows dba password
+#
+# Arguments: none
+#
+# Return Values: none
+checkDBAPasword()
+{
+
+    unset dba_user_pwd
+    
+    $ECHO "\nEnter the current password for DBA user : \c "
+    read -s dba_user_pwd
+    
+    if [ "${dba_user_pwd}" != "${DBA_PASSWORD}" ]; then
+        _err_msg_="$($DATE '+%Y-%b-%d_%H.%M.%S'): Aborting as the DBA password entered does not match the recorded DBA password."
+        abort_script "$_err_msg_"
+    else
+        log_msg -s "$($DATE '+%Y-%m-%d_%H.%M.%S'):  DBA password entered matches the recorded DBA password. " -l ${LOGFILE}
+    fi
+    $ECHO ''
+}
+
+# ********************************************************************
+#
+#     Main body of program
+#
+# ********************************************************************
+#
+# Determine absolute path to software
+get_absolute_path
+
+# Set up up path environment etc.
+setup_env
+setup_sybase_env
+
+# Check that the effective id of the user is dcuser
+check_id root
+
+while getopts "a:l" arg; do
+  case $arg in
+    a) trackchoice="$OPTARG"
+    ;;
+    l) logItFlag="1"
+    ;;
+    \?) usage_msg
+       _err_msg_="$($DATE '+%Y-%m-%d_%H.%M.%S'): Unknown argument passed to script."
+	   abort_script "$_err_msg_"
+       ;;
+  esac
+done
+shift `expr $OPTIND - 1`
+
+#Create logfile
+chk_create_logfile
+
+checkDBAPasword
+
+if [ -z "${trackchoice}" ]
+then
+    usage_msg
+    _err_msg_="$($DATE '+%Y-%m-%d_%H.%M.%S'): A tracking choice must be provided to script"
+	abort_script "$_err_msg_"
+elif [ "${trackchoice}" = "enable_custom_users" ]
+then
+    log_msg -s "$($DATE '+%Y-%m-%d_%H.%M.%S'): Enabling all custom users. " -l ${LOGFILE}
+    User="@Userid not like 'dbo' AND @Userid not like 'dba' AND @Userid not like 'dc' AND @Userid not like 'dcpublic'  AND @Userid not like 'dcbo'"
+elif [ "${trackchoice}" = "enable_all" ]
+then
+    log_msg -s "$($DATE '+%Y-%m-%d_%H.%M.%S'): Enabling all users. " -l ${LOGFILE}
+    User="@Userid not like 'dbo'"
+elif [ "${trackchoice}" = "disable" ]
+then
+    log_msg -s "$($DATE '+%Y-%m-%d_%H.%M.%S'): Disabling User Tracking " -l ${LOGFILE}
+    disableTracking
+    cleanup
+    $BASH ${ENIQ_ADMIN_BIN}/manage_deployment_services.bsh -a restart -s ALL
+    exit 0
+else
+    usage_msg
+    _err_msg_="$($DATE '+%Y-%m-%d_%H.%M.%S'): The tracking choice provided to script must be from 'enable_all','enable_custom_users','enable',disable' or 'drop'."
+	abort_script "$_err_msg_"
+fi
+
+log_msg -s "$($DATE '+%Y-%m-%d_%H.%M.%S'): Creating Log open event. " -l ${LOGFILE}
+ConLogOpenCreation
+log_msg -s "$($DATE '+%Y-%m-%d_%H.%M.%S'): Creating Log close event. " -l ${LOGFILE}
+ConLogCloseCreation
+logItCreation
+
+
+
+$RM -rf ${dwh_connection_string_enc}
+#removing tmp folder created during execution of the script
+$BASH ${ENIQ_ADMIN_BIN}/manage_deployment_services.bsh -a restart -s ALL
+cleanup
+

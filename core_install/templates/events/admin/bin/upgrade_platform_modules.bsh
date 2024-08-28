@@ -1,0 +1,685 @@
+#!/bin/bash
+# ********************************************************************
+# Ericsson Radio Systems AB                                     SCRIPT
+# ********************************************************************
+#
+#
+# (c) Ericsson Radio Systems AB 2018 - All rights reserved.
+#
+# The copyright to the computer program(s) herein is the property
+# of Ericsson Radio Systems AB, Sweden. The programs may be used
+# and/or copied only with the written permission from Ericsson Radio
+# Systems AB or in accordance with the terms and conditions stipulated
+# in the agreement/contract under which the program(s) have been
+# supplied.
+#
+# ********************************************************************
+# Name    : upgrade_platform_modules
+# Date    : 13/03/2020
+# Revision: \main\19
+# Purpose : Main wrapper script handling the installation of platform modules 
+#
+# Usage   : upgrade_platform_modules.bsh
+#
+# ********************************************************************
+#
+#       Command Section
+#
+# ********************************************************************
+AWK=/usr/bin/awk
+BASH=/usr/bin/bash
+CAT=/usr/bin/cat
+CLEAR=/usr/bin/clear
+CP=/usr/bin/cp
+DATE=/usr/bin/date
+DIRNAME=/usr/bin/dirname
+ECHO=/usr/bin/echo
+EGREP=/usr/bin/egrep
+EJECT=/usr/bin/eject
+EXPR=/usr/bin/expr
+GETENT=/usr/bin/getent
+GREP=/usr/bin/grep
+HEAD=/usr/bin/head
+ID=/usr/bin/id
+LS=/usr/bin/ls
+MKDIR=/usr/bin/mkdir
+MV=/usr/bin/mv
+PERL=/usr/bin/perl
+RM=/usr/bin/rm
+SED=/usr/bin/sed
+SLEEP=/usr/bin/sleep
+SU=/usr/bin/su
+SYSTEMCTL=/usr/bin/systemctl
+TEE=/usr/bin/tee
+TOUCH=/usr/bin/touch
+
+# ********************************************************************
+#
+#       Configuration Section
+#
+# ********************************************************************
+# Default user
+DEFAULT_USER=root
+
+# Name of SunOS & ENIQ ini Files
+ENIQ_ENV=niq.rc
+ENIQ_INI=niq.ini
+SUNOS_INI=SunOS.ini
+
+# DVD LABEL or Jumpstart Directory where all ENIQ SW will reside
+ENIQ_BASE_SW=eniq_base_sw
+
+# Directory on the root filesystem
+ENIQ_ROOT_DIR=/eniq
+
+# Install/Upgrade platform stage
+PLATFORM_STAGE="install_ENIQ_platform"
+
+# Database list
+DB_LIST="repdb,dwhdb"
+
+# Create a temporary Directory
+TEM_DIR=/tmp/install_platform.$$.$$
+
+# This is the ini file containing provision data of mediation-gateway
+MG_PRO_INI=mg_pro.ini
+
+# ********************************************************************
+#
+#       Functions
+#
+# ********************************************************************
+### Function: abort_script ###
+#
+#   This will is called if the script is aborted thru an error
+#   error signal sent by the kernel such as CTRL-C or if a serious
+#   error is encountered during runtime
+#
+# Arguments:
+#       $1 - Error message from part of program (Not always used)
+# Return Values:
+#       none
+abort_script()
+{
+_err_time_=`$DATE '+%Y-%b-%d_%H.%M.%S'`
+
+if [ "$1" ]; then
+    _err_msg_="${_err_time_} - $1"
+else
+    _err_msg_="${_err_time_} - ERROR : Script aborted.......\n"
+fi
+
+if [ "${LOGFILE}" ]; then
+    $ECHO "\nERROR : $_err_msg_\n"|$TEE -a ${LOGFILE}
+else
+    $ECHO "\nERROR : $_err_msg_\n"
+fi
+
+cd $SCRIPTHOME
+
+cleanup_manage_features
+
+$RM -rf ${TEM_DIR}
+
+if [ "$2" ]; then
+    ${2}
+else
+   exit 1
+fi
+}
+
+
+### Function: check_id ###
+#
+#   Check that the effective id of the user is correct
+#   If not print error msg and exit.
+#
+# Arguments:
+#       $1 : User ID name
+# Return Values:
+#       none
+check_id()
+{
+_check_id_=`$ID  | $AWK -F\( '{print $2}' | $AWK -F\) '{print $1}'`
+if [ "$_check_id_" != "$1" ]; then
+    _err_msg_="You must be $1 to execute this script."
+    abort_script "$_err_msg_"
+fi
+}
+
+### Function: chk_create_logfile ###
+#
+# Check/Create Logfile
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+chk_create_logfile()
+{
+$MKDIR -p `$DIRNAME ${LOGFILE}`
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not create directory `$DIRNAME ${LOGFILE}`"
+     abort_script "$_err_msg_"
+fi
+
+$TOUCH -a ${LOGFILE}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not write to file ${LOGFILE}"
+    abort_script "$_err_msg_"
+fi
+}
+
+### Function: enable_oss_mounting ###
+#
+# enable oss mounting after platform modules upgrade.
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+enable_oss_mounting()
+{
+# We want to enable mounts before doing rolling upgrade:
+    log_msg -t -l ${LOGFILE} -s "Re-enabling OSS mounts after upgrading platform modules."
+    # Get an ordered list of servers based on the server_list file:
+    _deployed_servers_="${TEM_DIR}/deployed_servers.$$.tmp"
+    $PERL ${GET_IP_ORDER_SCRIPT} -f ${_deployed_servers_}
+    if [ ! -s ${_deployed_servers_} ]; then
+        _err_msg_="Failed to retrieve required server list to enable OSS mounts."
+        abort_script "${_err_msg_}"
+    fi
+
+    for _line_ in `$EGREP -i 'engine|coordinator|eniq_stats' ${_deployed_servers_}`; do
+        local _ip_address_=`$ECHO ${_line_} | $AWK -F"::" '{print $1}'`
+        local _serv_hostname_=`$ECHO ${_line_} | $AWK -F"::" '{print $2}'`
+        local _serv_type_=`$ECHO ${_line_} | $AWK -F"::" '{print $3}'` 
+        if [ ! "${_ip_address_}" -o ! "${_serv_hostname_}" -o ! "${_serv_type_}" ]; then
+            _err_msg_="Failed to enable mounts. Could not read required info from ${_deployed_servers_}."
+            abort_script "${_err_msg_}"
+        fi
+        # Stats coordinator should not run the script 
+        if [ "${_serv_type_}" != "stats_coordinator" ]; then        
+            #If the IP found in the order file matches my IP,
+            # then I better run the command locally - no need to ssh            
+            if [ "${_ip_address_}" == "${HOST_IP}" ]; then
+                log_msg -t -l ${LOGFILE} -s "Re-enabling mounts on ${HNAME}"
+                ${ENIQ_ADMIN_BIN_DIR}/enable_mounts.bsh
+                if [ $? -ne 0 ]; then
+                    abort_script "Failed to enable mounts on ${HNAME}"
+                else
+                    log_msg -t -l ${LOGFILE} -s "Enabled mounts on ${HNAME}"
+                fi
+            else
+                log_msg -t -l ${LOGFILE} -s "Re-enabling mounts on ${_serv_hostname_}"
+                run_remote_cmd "${_ip_address_}" "$BASH ${ENIQ_ADMIN_BIN_DIR}/enable_mounts.bsh"
+                if [ $? -ne 0 ]; then
+                    abort_script "Failed to enable mounts on ${_serv_hostname_}"
+                else
+                    log_msg -t -l ${LOGFILE} -s "Enabled mounts on ${_serv_hostname_}"
+                fi
+            fi
+        fi
+    done
+}
+
+### Function: cleanup_manage_features###
+#
+#   Remove un-used files,reset files that were changed for the upgrade
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+cleanup_manage_features()
+{
+# Get the System User/Group. All directories are owned by this
+_sysuser_=`iniget ENIQ_INSTALL_CONFIG -f ${ENIQ_CONF_DIR}/${SUNOS_INI} -v ENIQ_SYSUSER`
+if [ ! "${_sysuser_}" ]; then
+    _err_msg_="Could not read parameter ENIQ_SYSUSER from file ${ENIQ_CONF_DIR}/${SUNOS_INI}"
+    abort_script "$_err_msg_" "${EXEC_SHELL_CMD}"
+fi
+
+_sysgrp_=`$ID ${_sysuser_} | $AWK '{print $2}' | $AWK -F\( '{print $2}' | $AWK -F\) '{print $1}'`
+if [ ! "${_sysgrp_}" ]; then
+    _err_msg_="Could not determine group ID of ${_sysgrp_}"
+    abort_script "$_err_msg_" "${EXEC_SHELL_CMD}"
+fi
+
+if [ "${CURR_SERVER_TYPE}" == "stats_coordinator" -o "${CURR_SERVER_TYPE}" == "eniq_stats" ]; then
+    log_msg -l ${LOGFILE} -s "\nTrying to restart all ENIQ services"
+    $BASH ${ENIQ_ADMIN_BIN_DIR}/manage_deployment_services.bsh -a restart -s ALL -N
+    _service_restart_status_=$?
+    if [ $_service_restart_status_ -ne 0 ]; then
+        log_msg -l ${LOGFILE} -s "ERROR - `$DATE '+%Y-%b-%d_%H.%M.%S'` - Failed to restart all ENIQ services\nExiting...." 
+        cd $SCRIPTHOME
+        $RM -rf ${TEM_DIR}
+        exit $_service_restart_status_
+    else
+        log_msg -l ${LOGFILE} -s "\nAll ENIQ services restarted correctly" 
+    fi
+fi
+}
+
+### Function: get_absolute_path ###
+#
+# Determine absolute path to software
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+get_absolute_path()
+{
+_dir_=`$DIRNAME $0`
+SCRIPTHOME=`cd $_dir_ 2>/dev/null && pwd || $ECHO $_dir_`
+}
+
+### Function: get_service_details ###
+#
+# This function will update the service names
+# file with the required service
+#
+# Arguments:
+#       $1 : Service name running
+#       $2 : Service name file
+# Return Values:
+#       : details of Service
+get_service_details()
+{
+local _servicename_=$1
+local _service_file_=$2
+
+if [ ! "${_servicename_}" -o ! "${_service_file_}" ]; then
+        abort_script "Incorrect arguments passed to get_service_details function"
+fi
+
+if [ -s ${_service_file_} ]; then
+        local _service_line_=`$CAT ${_service_file_} | $EGREP -v "^[[:blank:]]*#" | $EGREP ".*::.*::${_servicename_}$"`
+        if [ ! "${_service_line_}" ]; then
+                _err_msg_="Could not find ${_servicename_} in ${_service_file_}"
+            abort_script "$_err_msg_"
+        fi
+else
+        _err_msg_="${_service_file_} does not exist"
+        abort_script "$_err_msg_"
+fi
+
+$ECHO ${_service_line_}
+}
+
+### Function: set_engine ###
+#
+# Set Engine profile to Normal
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+set_engine()
+{
+CURRENT_ENGINE_PROFILE=`$SU - ${_sysuser_} -c "engine -e getCurrentProfile"`
+$ECHO ${CURRENT_ENGINE_PROFILE} | $GREP -i "normal" > /dev/null 2>&1
+if [ $? -ne 0 ] ; then
+    local RETRY_COUNT=3
+    while [ ${RETRY_COUNT} -gt 0 ]; do
+        set_engine_profile "Normal"
+        if [ $? -ne 0 ]; then
+            log_msg -q -t -l ${LOGFILE} -s "Failed to set engine to Normal profile."
+        fi
+        let RETRY_COUNT=RETRY_COUNT-1
+    done
+fi
+}
+
+### Function: setup_env ###
+#
+# Setup up path environment etc
+#
+# Arguments:
+#    none
+# Return Values:
+#    none
+setup_env()
+{
+if [ ! "${ENIQ_BASE_DIR}" ]; then
+    ENIQ_BASE_DIR=${ENIQ_ROOT_DIR}
+fi
+
+ENIQ_CONF_DIR=${ENIQ_BASE_DIR}/installation/config
+if [ ! -s ${ENIQ_CONF_DIR}/SunOS.ini ]; then
+    _err_msg_="Could not locate file ${ENIQ_CONF_DIR}/SunOS.ini"
+    abort_script "$_err_msg_"
+fi
+
+CLI_CONF_DIR=${ENIQ_BASE_DIR}/sw/conf
+if [ ! -s ${CLI_CONF_DIR}/niq.ini ]; then
+    _err_msg_="Could not locate file ${CLI_CONF_DIR}/niq.ini"
+    abort_script "$_err_msg_"
+fi
+
+# Main Directory for the Core Installation SW
+ENIQ_INST_DIR=`$DIRNAME ${SCRIPTHOME}`
+
+# Admin directory in the ENIQ filesystem
+ENIQ_ADMIN_DIR=${ENIQ_ROOT_DIR}/admin
+
+# Installer directory in the ENIQ filesystem
+ENIQ_INSTALLER_DIR=${ENIQ_ROOT_DIR}/sw/installer
+
+# TP Install program
+TP_INSTALLER="tp_installer"
+
+# Admin dir
+ENIQ_ADMIN_BIN_DIR=${ENIQ_ADMIN_DIR}/bin
+ENIQ_ADMIN_ETC_DIR=${ENIQ_ADMIN_DIR}/etc
+
+if [ ! -s ${ENIQ_ADMIN_BIN_DIR}/manage_eniq_services.bsh ]; then
+    _err_msg_="Failed to locate ENIQ service manager script - ${ENIQ_ADMIN_BIN_DIR}/manage_eniq_services.bsh"
+    abort_script "$_err_msg_"
+fi
+
+# Core install bin dir
+ENIQ_CORE_BIN_DIR=${ENIQ_BASE_DIR}/installation/core_install/bin
+
+# Connectd dir
+ENIQ_CONNECTD_DIR=${ENIQ_BASE_DIR}/connectd
+
+CURR_SERVER_TYPE=`$CAT $ENIQ_CONF_DIR/installed_server_type | $EGREP -v '^[[:blank:]]*#' | $SED -e 's/ //g'`
+if [ ! "${CURR_SERVER_TYPE}" ]; then
+        _err_msg_="Could not determine which server type this is"
+    abort_script "$_err_msg_"
+fi
+
+# File containing the type of OSS installation. Eg statistics
+INST_TYPE_FILE=${ENIQ_CONF_DIR}/ericsson_use_config
+if [ ! -s "${INST_TYPE_FILE}" ]; then
+    _err_msg_="ENIQ install type not defined in ${INST_TYPE_FILE}"
+    abort_script "$_err_msg_"  "${EXEC_SHELL_CMD}"
+fi
+# Read the installation type - should be "stats"
+INSTALL_TYPE=`$CAT ${INST_TYPE_FILE} | $AWK -F\= '{print $2}'`
+
+#smf_contract_config
+ENIQ_CORE_DIR=${ENIQ_BASE_DIR}/installation/core_install
+
+#hostname of local host
+HNAME=`${MYHOSTNAME}`
+
+#IP of local host
+HOST_IP=`$GETENT hosts ${HNAME} | $AWK '{print $1}' | $HEAD -1`
+
+# Set the log directory
+LOGFILE_DIR="$ENIQ_BASE_DIR/log/sw_log/platform_installer/platform_management_log"
+
+# Set the back file for the engine entry in the service_names file
+ENGINE_SERVICE_NAME_BACKUP=${CLI_CONF_DIR}/service_names_engine_backup
+
+# Get the System User
+_sysuser_=`iniget ENIQ_INSTALL_CONFIG -f ${ENIQ_CONF_DIR}/${SUNOS_INI} -v ENIQ_SYSUSER`
+if [ ! "${_sysuser_}" ]; then
+    _err_msg_="Could not read parameter ENIQ_SYSUSER from file ${ENIQ_CONF_DIR}/${SUNOS_INI}"
+    abort_script "$_err_msg_" "${EXEC_SHELL_CMD}"
+fi
+
+GET_IP_ORDER_SCRIPT=${ENIQ_CORE_DIR}/lib/get_ip_order.pl
+if [ ! -s "${GET_IP_ORDER_SCRIPT}" ]; then
+        _err_msg_="Could not find script: ${GET_IP_ORDER_SCRIPT}"
+        abort_script "$_err_msg_" "${EXEC_SHELL_CMD}"
+fi
+
+#Set the repdb directory
+REP_DB_DIR="${ENIQ_BASE_DIR}/database/rep_main"
+
+}
+
+### Function: start_dwhdb_repdb ###
+#
+# start the required eniq database before upgrade platform modules
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+start_dwhdb_repdb()
+{
+if [ "${CURR_SERVER_TYPE}" != "eniq_es" ] ; then
+   local _status_dwhdb=`$SYSTEMCTL show eniq-dwhdb -p ActiveState | $AWK -F "=" '{print $2}'`
+   local _status_repdb=`$SYSTEMCTL show eniq-repdb -p ActiveState | $AWK -F "=" '{print $2}'`
+   if [ ${_status_dwhdb} != 'active' -o ${_status_repdb} != 'active' ]; then
+       log_msg -t -l ${LOGFILE} -s "Starting ENIQ databases"
+       ${BASH} ${ENIQ_ADMIN_BIN_DIR}/manage_eniq_services.bsh -a start -s $DB_LIST -N -l ${LOGFILE}
+       if [ $? -ne 0 ]; then
+           _err_msg_="Failed to start the ENIQ databases"
+           abort_script "$_err_msg_"
+       fi
+       $ECHO "`$DATE '+%Y-%b-%d_%H.%M.%S'` - Please wait while database state changes"
+       $SLEEP 30
+   fi
+
+fi
+}
+
+### Function: update_smf_contract_config###
+#
+# This function will update the smf_contract_config
+# file with the following format
+##<server_type>::<SMF_contract>::<Y/N/X>
+# Arguments:
+#       $1 : _smf_contract_config file_
+#       $2 : _server_type_
+#       $3 : _service_type_
+#       $4 : _smf_contract_
+#       $5 : _smf_contract_value_       (options are <Y/N/X>)
+
+# Return Values:
+#       : details of Service
+update_smf_contract_config()
+{
+local _smf_contract_config_=$1
+local _server_type_=$2
+local _service_type_=$3
+local _smf_contract_=$4
+local _smf_contract_value_=$5
+
+local _smf_server_contract_="${_server_type_}::${_service_type_}::${_smf_contract_}::"
+if [ ! "${_smf_contract_config_}" -o ! "${_server_type_}" -o ! "${_service_type_}" -o ! "${_smf_contract_}" -o ! "${_smf_contract_value_}" ]; then
+    abort_script "Incorrect arguments passed to update_smf_contract_config function"
+    exit 1
+fi
+
+if [ -s ${_smf_contract_config_} ]; then
+        local _tmp_smf_file_=${TEM_DIR}/smf_contract_config.$$.$$
+        $CAT ${_smf_contract_config_} | $SED -e "s/${_smf_server_contract_}.*/${_smf_server_contract_}${_smf_contract_value_}/g" > ${_tmp_smf_file_}
+        if [ -s ${_tmp_smf_file_} ]; then
+                $CP ${_tmp_smf_file_} ${_smf_contract_config_}
+                if [ $? -ne 0 ]; then
+                        _err_msg_="Could not copy ${_tmp_smf_file_} to ${_smf_contract_config_}"
+                        abort_script "$_err_msg_"
+                fi
+        else
+                _err_msg_="Could not update  ${_smf_contract_config_} with $_smf_server_contract_} ${smf_contract_value}"
+            abort_script "$_err_msg_"
+        fi
+else
+        _err_msg_="${_smf_contract_config_} does not exist"
+        abort_script "$_err_msg_"
+fi
+}
+
+### Function: upgrade_platform_modules ###
+#
+# Upgrade ENIQ platform
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+upgrade_platform_modules()
+{
+# Ensure the DBs are started
+start_dwhdb_repdb
+
+# Upgrade the platform
+log_msg -t -l ${LOGFILE} -s "Starting to upgrade ENIQ platform and SMF"
+log_msg -l ${LOGFILE} -q -s "Using command:"
+log_msg -l ${LOGFILE} -q -s "$BASH ${ENIQ_CORE_BIN_DIR}/eniq_core_install.bsh -s ${_stage_} -n -d $BASE_SW_DIR -u -l ${LOGFILE}"
+
+for _stage_ in ${PLATFORM_STAGE}; do
+        $BASH ${ENIQ_CORE_BIN_DIR}/eniq_core_install.bsh -s ${_stage_} -n -d $BASE_SW_DIR -u -l ${LOGFILE}
+        if [ $? -ne 0 ]; then
+                _err_msg_="Failed in core install stage ${_stage_}"
+                abort_script "$_err_msg_"
+        fi
+done
+
+if [ "${CURR_SERVER_TYPE}" != "eniq_es" ] ; then
+        # Ensure the DBs are started
+        log_msg -t -l ${LOGFILE} -s "Restarting ENIQ databases"
+        $BASH ${ENIQ_ADMIN_BIN_DIR}/manage_eniq_services.bsh -a restart -s $DB_LIST -N -l ${LOGFILE}
+        if [ $? -ne 0 ]; then
+            _err_msg_="Failed to restart the ENIQ databases"
+                abort_script "$_err_msg_"
+        fi
+
+        log_msg -l ${LOGFILE} -s "`$DATE '+%Y-%b-%d_%H.%M.%S'` - Please wait while database state changes"
+        $SLEEP 120
+fi
+
+}
+
+### Function: usage_msg ###
+#
+#   Print out the usage message
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+usage_msg()
+{
+$CLEAR
+$ECHO "
+Usage: `$BASENAME $0` -a { add -F <feature_file> | update [ -F <feature_file> -f <list_of_features> ] }
+                      -d <eniq_sw_dir> [ -b <eniq_base_dir> ] [ -l <path_to_logfile> ]
+
+options:
+
+-a  : Feature Action. Must be either
+              add      --> Add specified Features(s)
+              update   --> Update specified Features(s)
+
+-b  : Optional parameter specifying the full path to where the ENIQ
+      BASEDIR directory is (eg. /eniq). If not specified, then the
+      script will assume the the base directory is /eniq
+
+-d  : Parameter specifying the full path to the directory
+      containing the ENIQ BASE SW directory structure. Under this
+      directory, script will locate a file that contains a list of
+      features available for installation/activation.
+      EG. <path_base_dir_sw>/eniq_techpacks/feature_descriptions
+
+-F  : Full Path to file containing list of features to be installed
+      Must be in the format of one Features per line E.g CXC12345679
+
+-f  : Comma delimited (no space) list of ENIQ features. Must be in
+      the following format e.g -f CXC12345679,CXC987654321,CXC24681357
+
+      If all installed features are to be upgraded, then the keyword
+      'ALL' can be used e.g. -f ALL
+
+-l  : Optional parameter specifying the full path to logfile. If not specified, a
+      logfile will be created in ${LOGFILE_DIR}
+-X  : Optional parameter to only be used during installation or upgrade. If specified
+      tp_installer will presume engine/scheduler are not started under SMF control
+      and are running on the same host as the installation is being done on.
+
+      If the -X arguement is NOT specified, tp_installer will lookup the service_names
+      file to determine the host that it should call the SMF commands on.
+
+-O  : Optional argument to skip platform upgrade
+
+-R      : Optional argument to use rolling upgrade/install of features."
+}
+
+# ********************************************************************
+#
+#       Main body of program
+#
+# ********************************************************************
+#
+RUN_TIME=`$DATE '+%Y-%b-%d_%H.%M.%S'`
+
+# Determine absolute path to software
+get_absolute_path
+
+# Check that the effective id of the user is root
+check_id $DEFAULT_USER
+
+while getopts ":b:d:l:N" arg; do
+  case $arg in
+    b) ENIQ_BASE_DIR="$OPTARG"
+       ;;
+    d) BASE_SW_DIR="$OPTARG"
+       ;;
+    l) LOGFILE="$OPTARG"
+       ;;
+    N) NO_CONFIRM="YES"
+       ;;
+   \?) usage_msg
+       exit 1
+       ;;
+  esac
+done
+shift `expr $OPTIND - 1`
+
+# Source the common functions
+if [ -s ${ENIQ_ROOT_DIR}/admin/lib/common_functions.lib ]; then
+    . ${ENIQ_ROOT_DIR}/admin/lib/common_functions.lib
+else
+    _err_msg_="File ${ENIQ_ROOT_DIR}/admin/lib/common_functions.lib not found"
+    abort_script "$_err_msg_"
+fi
+
+# Setup up path environment etc
+setup_env
+
+if [ ! "${LOGFILE}" ]; then
+    LOGFILE=${LOGFILE_DIR}/upgrade_platform_modules.log
+fi
+
+# Check/Create Logfile
+chk_create_logfile
+
+log_msg -h -t -l ${LOGFILE} -q -s "Starting to execute upgrade_platform_modules.bsh"
+
+#clean temp directory
+$RM -rf ${TEM_DIR}
+$MKDIR -p ${TEM_DIR}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not create directory ${TEM_DIR}"
+    abort_script "$_err_msg_"
+fi
+
+# upgrading platform modules
+upgrade_platform_modules
+
+# taking backup of alarm password and disabling active alarm reports
+manage_stats_alarm pre
+if [ $? != 0 ]; then
+    _err_msg_="Error: Cannot take alarm password and active alarm report backup"
+    abort_script "$_err_msg_"
+fi
+
+# enable oss mounting after platform modules upgrade.
+enable_oss_mounting
+
+# Cleanup from the acivites in setup_manage_features
+cleanup_manage_features
+
+# Set enigne profile to Normal
+set_engine
+$RM -rf ${TEM_DIR}
+log_msg -h -t -l ${LOGFILE} -q -s "Successfully completed upgrade_platform_modules.bsh "
+exit 0 
+

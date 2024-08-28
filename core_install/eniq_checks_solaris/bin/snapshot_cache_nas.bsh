@@ -1,0 +1,377 @@
+#!/usr/bin/bash
+#********************************************************************
+# Ericsson Radio Systems AB SCRIPT
+#********************************************************************
+#
+# (c) Ericsson Radio Systems AB 2016 - All rights reserved.
+#
+# The copyright to the computer program(s) herein is the property
+# of Ericsson Radio Systems AB, Sweden. The programs may be used
+# and/or copied only with the written permission from Ericsson Radio
+# Systems AB or in accordance with the terms and conditions stipulated
+# in the agreement/contract under which the program(s) have been
+# in the agreement/contract under which the program(s) have been
+# supplied.
+#
+#********************************************************************
+# Name     : snapshot_cache_nas.bsh
+# Date     : 10/12/2018
+# Revision : \main\Statistics_18.2_18.2.8_EU03\1
+# Purpose  : Objective of this script is to check the % used snapshot cache for NAS
+# Usage    : snapshot_cache_nas.bsh
+# Exit Values:
+#    0   : Success : Snapshot cache used is less than 90%.
+#    3   : No Run  : Script Aborted.
+#    14  : No Run  : Could not retrieve snapshot cache used.
+#    16  : No Run  : Not Applicable
+#    121 : Failure : Snapshot cache used is greater than or equal to 90%.
+#
+#********************************************************************
+#
+#       Command Section
+#
+#********************************************************************
+AWK=/usr/bin/awk
+BASH=/usr/bin/bash
+CAT=/usr/bin/cat
+CUT=/usr/bin/cut
+CP=/usr/bin/cp
+DATE=/usr/bin/date
+DF=/usr/bin/df
+ECHO=/usr/bin/echo
+GETENT=/usr/bin/getent
+GREP=/usr/bin/grep
+HEAD=/usr/bin/head
+MYHOSTNAME=/usr/bin/hostname
+ID=/usr/bin/id
+MKDIR=/usr/bin/mkdir
+NAWK=/usr/bin/nawk
+PING=/usr/sbin/ping
+PWD=/usr/bin/pwd
+RM=/usr/bin/rm
+SCP=/usr/bin/scp
+SLEEP=/usr/bin/sleep
+SVCS=/usr/bin/svcs
+SSH=/usr/bin/ssh
+SU=/usr/bin/su
+TAIL=/usr/bin/tail
+TEE=/usr/bin/tee
+TR=/usr/bin/tr
+TOUCH=/usr/bin/touch
+ZFS=/usr/sbin/zfs
+MV=/usr/bin/mv
+
+
+# ********************************************************************
+#
+#       Configuration Section
+#
+# ********************************************************************
+
+# Default user
+DEFAULT_USER=root
+
+#Present Working Directory
+CURR_DIR=`pwd`
+
+# AUTO LU Service
+AUTO_LU_SMF_ID="svc:/lu/auto_lu:default"
+
+# ********************************************************************
+#
+#   Functions
+#
+# ********************************************************************
+
+### Function: abort_script ###
+#
+#   This will is called if the script is aborted thru an error
+#   signal sent by the kernel such as CTRL-C or if a serious
+#   error is encountered during runtime
+#
+# Arguments:
+#       $1 - Error message from part of program (Not always used)
+# Return Values:
+#       none
+abort_script()
+{
+_err_time_=`$DATE '+%Y-%b-%d_%H.%M.%S'`
+
+if [ "$1" ]; then
+    _err_msg_="${_err_time_} - $1"
+else
+    _err_msg_="${_err_time_} - ERROR : Script aborted.......\n"
+fi
+
+if [ "${LOGFILE}" ]; then
+    $ECHO "\nERROR : ${_err_msg_}\n" | $TEE -a ${LOGFILE}
+else
+    $ECHO "\nERROR : ${_err_msg_}\n"
+fi
+
+cleanup
+exit 3
+}
+
+
+### Function: check_id ###
+#
+#   Check that the effective id of the user is correct
+#   If not print error msg and exit.
+#
+# Arguments:
+#       $1 : User ID name
+# Return Values:
+#       none
+check_id()
+{
+_check_id_=`$ID | $AWK -F\( '{print $2}' | $AWK -F\) '{print $1}'`
+if [ "$_check_id_" != "$1" ]; then
+    _err_msg_="You must be $1 to execute this script."
+    abort_script "${_err_msg_}"
+fi
+}
+
+
+### Function: cache_nas ###
+#
+#   Check the perecentage of snapshot cache used for active nas pool.  
+#   If not print error msg and exit.
+#
+# Arguments:
+#       $1 : Threshold 
+# Return Values:
+#       none
+cache_nas()
+{
+_threshold_=$1
+
+log_msg -t -s "Fetching value for NAS_Primary_Storage_Pool" -l $LOGFILE
+_nas_pri_pool_=`iniget NAS_DETAILS -f ${ENIQ_CONF_DIR}/SunOS.ini -v NAS_Primary_Storage_Pool`
+if [ $? -ne 0 ]; then
+   log_msg -t -s "ERROR:Could not fetch details for NAS storage cache."  -l $LOGFILE
+   cleanup
+   exit 14
+fi
+log_msg -t -s "NAS_Primary_Storage_Pool= ${_nas_pri_pool_}" -l $LOGFILE
+
+log_msg -t -s "Checking percentage used snapshot cache for ${_nas_pri_pool_}. " -l $LOGFILE
+
+_SFS_version_=`$CAT /ericsson/storage/plugins/filestore/etc/nasplugin.conf |$GREP SFS_VERSION | $AWK -F"=" '{print $2}'`
+
+if [ ${_SFS_version_} == 7.4 ]; then
+	_perc_used_=`$SU - storadm -c "$SSH support@nasconsole '/opt/VRTSnas/clish/bin/clish -u master -c \"storage rollback cache list\"'"  |$GREP ${_nas_pri_pool_} |$AWK '{print $4}' | $TR -d '()'`
+
+	$SU - storadm -c "$SSH support@nasconsole '/opt/VRTSnas/clish/bin/clish -u master -c \"storage rollback cache list\"'" | $GREP -w ${_nas_pri_pool_} | $AWK '{print $4}' | $TR -d '()' > ${TEM_DIR}/perc_used.txt
+
+else
+	_perc_used_=`su - storadm -c "ssh master@nasconsole storage rollback cache list " | $GREP ${_nas_pri_pool_} | awk '{print $4}' | tr -d '()'`
+	su - storadm -c "ssh master@nasconsole storage rollback cache list" | $GREP -w ${_nas_pri_pool_} | awk '{print $4}' | tr -d '()' > ${TEM_DIR}/perc_used.txt
+fi
+
+_pipe_status1_=${PIPESTATUS[1]}
+_pipe_status0_=${PIPESTATUS[0]}
+if [ "${_pipe_status0_}" != 0 ] ;then
+   log_msg -t -s "ERROR: Could not connect to nasconsole." -l $LOGFILE
+   cleanup
+   exit 14
+elif [ "$_pipe_status1_" != 0 ] ;then
+   log_msg -t -s "ERROR:Could not fetch percentage of used snapshot cache for ${_nas_pri_pool_}." -l $LOGFILE
+   cleanup
+   exit 14
+fi
+_perc_used_=`$CAT ${TEM_DIR}/perc_used.txt`
+if [ "${_perc_used_}"  == "" ] ;then
+   log_msg -t -s "ERROR:Could not find any reserved snapshot cache for ${_nas_pri_pool_} pool" -l $LOGFILE
+   exit 14
+else
+   log_msg -t -s "Percentage of snapshot cache used=${_perc_used_}%" -l $LOGFILE
+fi
+}
+
+### Function: cleanup ###
+#
+# Cleanup of temporary directory
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+cleanup()
+{
+log_msg -q -t -s "Cleaning up the temporary directory" -l ${LOGFILE}
+$RM -rf ${TEM_DIR}
+log_msg  -q -t -s "Successfully completed the cleanup" -l ${LOGFILE}
+}
+
+### Function: setup_env ###
+#
+# Set up environment variables for script.
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+setup_env()
+{
+# ENIQ Base Directory
+ENIQ_BASE_DIR=/eniq
+
+# ENIQ Admin Directory
+ENIQ_ADMIN_DIR=${ENIQ_BASE_DIR}/admin
+
+# ENIQ VAR Directory
+ENIQ_VAR_DIR=/var
+
+# ERICSSON Directory
+ERICSSON_DIR=/ericsson
+
+# ENIQ OPT Directory
+OPT_DIR=/opt
+
+# ENIQ LIB Directory
+LIB_DIR=/lib
+
+# ENIQ ETC Directory
+ETC_DIR=/etc
+
+# ENIQ SSH Directory
+SSH_DIR=/.ssh
+
+# ENIQ Admin Bin Directory
+ENIQ_ADMIN_BIN_DIR=${ENIQ_ADMIN_DIR}/bin
+
+# ENIQ Core Installation Directory
+ENIQ_INST_DIR=${ENIQ_BASE_DIR}/installation
+
+# ENIQ Core Installation SW
+ENIQ_CORE_INST_DIR=${ENIQ_INST_DIR}/core_install
+
+# ENIQ Core Installation Bin Directory
+ENIQ_CORE_DIR=${ENIQ_CORE_INST_DIR}/bin
+
+# ENIQ Log Directory
+ENIQ_LOG_DIR=${ENIQ_BASE_DIR}/local_logs
+
+# ENIQ Precheck Log Directory
+ENIQ_CHK_LOG_DIR=${ENIQ_LOG_DIR}/eniq_checks_log
+
+# ENIQ Config Directory
+ENIQ_CONF_DIR=${ENIQ_INST_DIR}/config
+
+# ENIQ SW Conf Directory
+ENIQ_SW_CONF_DIR=${ENIQ_BASE_DIR}/sw/conf
+
+# ENIQ Crontab Directory
+CRONTABS_DIR=${ENIQ_VAR_DIR}/spool/cron/crontabs
+
+# LIB METHOD Directory
+LIB_METHOD_DIR=${LIB_DIR}/svc/method
+
+HNAME=`${MYHOSTNAME}`
+HOST_IP=`$GETENT hosts ${HNAME} | $NAWK '{print $1}' | $HEAD -1`
+
+# Source the common functions
+if [ -s ${ENIQ_CORE_INST_DIR}/${LIB_DIR}/common_functions.lib ]; then
+    . ${ENIQ_CORE_INST_DIR}/${LIB_DIR}/common_functions.lib
+else
+    _err_msg_="File ${ENIQ_CORE_INST_DIR}/${LIB_DIR}/common_functions.lib not found"
+    abort_script "${_err_msg_}"
+fi
+
+if [ -s ${ENIQ_CORE_INST_DIR}/${LIB_DIR}/common_core_install_functions.lib ]; then
+    . ${ENIQ_CORE_INST_DIR}/${LIB_DIR}/common_core_install_functions.lib
+else
+    _err_msg_="File ${ENIQ_CORE_INST_DIR}/${LIB_DIR}/common_core_install_functions.lib not found"
+    abort_script "${_err_msg_}"
+fi
+
+if [ -s ${ENIQ_CORE_INST_DIR}/${LIB_DIR}/common_inirator_functions.lib ]; then
+    . ${ENIQ_CORE_INST_DIR}/${LIB_DIR}/common_inirator_functions.lib
+else
+    _err_msg_="File ${ENIQ_CORE_INST_DIR}/${LIB_DIR}/common_inirator_functions.lib not found"
+    abort_script "${_err_msg_}"
+fi
+
+# File containing the type of OSS installation. Eg. events or statistics
+INST_TYPE_FILE=${ENIQ_CONF_DIR}/ericsson_use_config
+if [ ! -s "${INST_TYPE_FILE}" ]; then
+    _err_msg_="ENIQ install type not defined in ${INST_TYPE_FILE}"
+    abort_script "${_err_msg_}"
+fi
+
+# Read the installation type - should be "events" or "stats"
+INST_TYPE=`$CAT ${INST_TYPE_FILE} | $NAWK -F\= '{print $2}'`
+
+# Storage type
+STORAGE_TYPE=`iniget STOR_TYPE -f ${ENIQ_BASE_DIR}/installation/config/SunOS.ini -v STORAGE_TYPE`
+if [ ! "${STORAGE_TYPE}" ]; then
+    _err_msg_="Could not obtain storage type from ${ENIQ_BASE_DIR}/installation/config/SunOS.ini"
+    abort_script "${_err_msg_}"
+fi
+
+# Templates Directory
+ENIQ_TEMPL_DIR=${ENIQ_CORE_INST_DIR}/templates/${INST_TYPE}
+}
+
+# ********************************************************************
+#
+#   Main body of program
+#
+# ********************************************************************
+
+# Timestamp
+TIMESTAMP=`$DATE '+%d-%m-%y_%H.%M.%S'`
+
+
+# Check that the effective id of the user is root
+check_id $DEFAULT_USER
+
+
+# Set up environment variables for script.
+setup_env
+
+
+# Log file
+LOGFILE="${ENIQ_CHK_LOG_DIR}/snap_cache.log"
+if [ ! -d "${ENIQ_CHK_LOG_DIR}" ]; then
+   $MKDIR -p ${ENIQ_CHK_LOG_DIR}
+   $TOUCH $LOGFILE
+else
+   if [ -e "${LOGFILE}" ]; then
+        $RM -rf $LOGFILE
+   fi
+   $TOUCH $LOGFILE
+fi
+
+
+# Create a temporary Directory
+
+TEM_DIR=/tmp/s_cache.$$.$$
+$RM -rf ${TEM_DIR}
+$MKDIR -p ${TEM_DIR}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not create directory $TEM_DIR"
+    abort_script "${_err_msg_}"
+fi
+
+# Check Storage type
+if [ "${STORAGE_TYPE}" == "zfs" ]; then
+    log_msg -s "This check is not applicable for RACK servers." -l $LOGFILE
+    cleanup
+    exit 16
+fi
+
+# Check cache used for nas
+_threshold_nas_=90
+cache_nas ${_threshold_nas_}
+if [ "${_perc_used_}" -ge "${_threshold_}" ] ;then
+   log_msg -t -s "ERROR:Snapshot Cache used(${_perc_used_})% for NAS is greater than or equal to threhsold(${_threshold_nas_})%." -l $LOGFILE
+   cleanup
+   exit 121
+else
+   log_msg -t -s "INFO:Snapshot Cache used(${_perc_used_})% for NAS is less than threhsold(${_threshold_nas_})%." -l $LOGFILE
+   cleanup
+   exit 0
+fi
+

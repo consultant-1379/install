@@ -1,0 +1,21 @@
+[Unit]
+Description=The Eniq Licmgr Service
+Requires=eniq-rmiregistry.service NAS-online.service
+After=eniq-rmiregistry.service NAS-online.service
+Before=eniq-engine.service
+
+[Service]
+Type=forking
+User=dcuser
+Group=dc5000
+ExecStart=/eniq/smf/bin/eniq_smf_start_stop.sh -a start -s licmgr
+ExecStop=/eniq/smf/bin/eniq_smf_start_stop.sh -a stop -s licmgr
+Restart=always
+RestartSec=15
+StartLimitInterval=1000
+StartLimitBurst=3
+TimeoutStartSec=0
+TimeoutStopSec=15
+
+[Install]
+WantedBy=multi-user.target eniq-rmiregistry.service NAS-online.service

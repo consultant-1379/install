@@ -1,0 +1,433 @@
+#!/bin/bash
+# ********************************************************************
+# Ericsson Radio Systems AB                                     SCRIPT
+# ********************************************************************
+#
+#
+# (c) Ericsson Radio Systems AB 2010 - All rights reserved.
+#
+# The copyright to the computer program(s) herein is the property
+# of Ericsson Radio Systems AB, Sweden. The programs may be used
+# and/or copied only with the written permission from Ericsson Radio
+# Systems AB or in accordance with the terms and conditions stipulated
+# in the agreement/contract under which the program(s) have been
+# supplied.
+#
+# ********************************************************************
+# Name    : eniq_rollsnapd.bsh
+# Date    : 24/07/2023
+# Revision: main/5
+# Purpose : This script is started by Service to monitor the administration
+#           of the ENIQ rolling snapshot functionality
+#
+# Overview: Periodically, this script will check for the existence of the
+#           file ${ROLL_SNAP_FILE_INDICATOR}. This file indicates that
+#           script should initiate a rolling snapshot.
+#
+# ********************************************************************
+
+# ********************************************************************
+#
+#   Command Section
+#
+# ********************************************************************
+AWK=/usr/bin/awk
+BASH=/usr/bin/bash
+CAT=/usr/bin/cat
+COMPRESS=/usr/bin/compress
+DATE=/usr/bin/date
+DIRNAME=/usr/bin/dirname
+ECHO=/usr/bin/echo
+EGREP=/usr/bin/egrep
+EXPR=/usr/bin/expr
+GREP=/usr/bin/grep
+ID=/usr/bin/id
+KILL=/usr/bin/kill
+LS=/usr/bin/ls
+MKDIR=/usr/bin/mkdir
+MV=/usr/bin/mv
+RM=/usr/bin/rm
+PS=/usr/bin/ps
+SED=/usr/bin/sed
+SLEEP=/usr/bin/sleep
+SORT=/usr/bin/sort
+TOUCH=/usr/bin/touch
+WC=/usr/bin/wc
+
+# ********************************************************************
+#
+#       Configuration Section
+#
+# ********************************************************************
+# Flag to determine whether to compress log or not (Must be y/n)
+COMPRESS_LOG=n
+
+# Number of log files to keep
+NUM_LOGS=10
+
+# Size in kbytes that the log file is allowed to grow to
+SIZE_LOGS=2048000
+
+# Number of seconds to sleep between looking for snapshot flag file
+readonly SLEEP_TIME=300
+
+DEFAULT_USER=root
+
+#
+# ********************************************************************
+#
+#   functions
+#
+# ********************************************************************
+### Function: abort_script ###
+#
+#   This will is called if the script is aborted thru an error
+#   error signal sent by the kernel such as CTRL-C or if a serious
+#   error is encountered during runtime
+#
+# Arguments:
+#       $1 - Error message from part of program (Not always used)
+# Return Values:
+#       none
+abort_script()
+{
+if [ "${1}" ]; then
+    _err_msg_="ERROR:: ${1}\n\nScript aborted.......at `$DATE '+%Y-%m-%d_%H.%M.%S'`\n"
+else
+    _err_msg_="ERROR:: Script aborted.......at `$DATE '+%Y-%m-%d_%H.%M.%S'`\n"
+fi
+
+log_script "${_err_msg_}"
+
+cd ${SCRIPTHOME}
+
+exit 1
+}
+
+### Function: check_id ###
+#
+#   Check that the effective id of the user is correct
+#   If not print error msg and exit.
+#
+# Arguments:
+#       $1 : User ID name
+# Return Values:
+#       none
+check_id()
+{
+_check_id_=`$ID  | $AWK -F\( '{print $2}' | $AWK -F\) '{print $1}'`
+if [ "$_check_id_" != "$1" ]; then
+    _err_msg_="You must be $1 to execute this script."
+    abort_script "$_err_msg_"
+fi
+}
+
+### Function: chk_create_logfile ###
+#
+# Check/Create Logfile
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+chk_create_logfile()
+{
+$MKDIR -p `$DIRNAME ${LOGFILE}`
+if [ $? -ne 0 ]; then
+    unset LOGFILE
+    _err_msg_="Could not create directory `$DIRNAME ${LOGFILE}`"
+        abort_script "$_err_msg_"
+fi
+
+$TOUCH -a ${LOGFILE}
+if [ $? -ne 0 ]; then
+    unset LOGFILE
+    _err_msg_="Could not write to file ${LOGFILE}"
+    abort_script "$_err_msg_"
+fi
+
+if [ -s ${LOGFILE} ]; then
+    $ECHO "\n\n" >> ${LOGFILE}
+fi
+$ECHO "================================================================" >> ${LOGFILE}
+$ECHO "Rolling Snapshot daemon started at ${RUN_TIME}\n" >> ${LOGFILE}
+$ECHO "================================================================" >> ${LOGFILE}
+}
+
+### Function: get_absolute_path ###
+#
+# Determine absolute path to software
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+get_absolute_path()
+{
+_dir_=`$DIRNAME $0`
+SCRIPTHOME=`cd $_dir_ 2>/dev/null && pwd || $ECHO $_dir_`
+}
+
+### Function: log_script ###
+#
+#  Logs Messages
+#
+# Arguments:  log_message
+# Return Values: none
+log_script()
+{
+local log_msg
+if [[ -n "${1}" ]]; then
+    log_msg=" `$DATE '+%Y-%b-%d_%H.%M.%S'`:: ${1}"
+else
+    log_msg="Error in Script $0 at `$DATE '+%Y-%b-%d_%H.%M.%S'`"
+fi
+
+if [ "${LOGFILE}" ]; then
+    $ECHO "${log_msg}\n" >> ${LOGFILE}
+else
+    $ECHO "\n${log_msg}\n"
+fi
+}
+
+### Function: roll_snap_pre_checks ###
+#
+# Do Rolling Snapshot pre-checks
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+roll_snap_pre_checks()
+{
+if [ ! -s ${SCRIPTHOME}/prepare_eniq_bkup.bsh ]; then
+    _err_msg_="${SCRIPTHOME}/prepare_eniq_bkup.bsh not found"
+    abort_script "$_err_msg_"
+fi
+}
+
+### Function: rotate_compress_logs ###
+#
+# Rotate and compress the logs if necessary.
+#
+# Arguments:
+#       $1 - Logfile
+#       $2 - Num Logs to keep. This number is addition to the original log
+#       $3 - Size Log in Kbytes (0 means size not relevant. Rotation always occurs)
+#       $4 - Param to compress log or not (y/n)
+# Return Values:
+#       0 : Rotation sucessful
+rotate_compress_logs()
+{
+local logfile=${1}
+local numlog=${2}
+local sizelog_kbytes=${3}
+local compress_log=${4}
+local _chk_size_ run_time num_exist_log
+
+if [ ! "${logfile}" -o ! "${numlog}" -o ! "${sizelog_kbytes}" -o ! "${compress_log}" ]; then
+    $ECHO "Incorrect Parameters supplied to function rotate_compress_logs"
+    return 1
+fi
+
+if [ ! -s ${logfile} ]; then
+    return 0
+fi
+
+# Test for numeric
+$ECHO ${numlog} | $EGREP '[^0-9]' >> /dev/null 2>&1
+if [ $? -eq 0 ]; then
+    $ECHO "Numeric value only for param 2 in function rotate_compress_logs"
+    return 1
+fi
+
+# Test for numeric
+$ECHO ${sizelog_kbytes} | $EGREP '[^0-9]' >> /dev/null 2>&1
+if [ $? -eq 0 ]; then
+    $ECHO "Numeric value only for param 3 in function rotate_compress_logs"
+    return 1
+fi
+
+# Param must be either y/n
+if [ "${compress_log}" != "y" -a "${compress_log}" != "n" ]; then
+    $ECHO "Param 4 can only have (y/n) value in function rotate_compress_logs"
+    return 1
+fi
+
+# Is the logfile big enough to need rotation
+if [ ${sizelog_kbytes} -ne 0 ]; then
+    _chk_size_=`$LS -l ${logfile} | $AWK '{print $5}'`
+    if [ ${_chk_size_} -lt ${sizelog_kbytes} ]; then
+        return 0
+    fi
+fi
+
+tem_file=/tmp/temfile.$$
+# Loop until I get a file name that does not exist
+while :; do
+    $LS ${tem_file} >> /dev/null 2>&1
+    if [ $? -ne 0 ]; then
+        break
+    fi
+    tem_file=${tem_file}.$$
+done
+
+$RM -f  ${tem_file}
+
+$LS "${logfile}_#*@* 2> /dev/null" \
+            | $EGREP "${logfile}_#[1-9]+[0-9]*@[0-9]+-[0-9]+-[0-9]+.[0-9]+.[0-9]+.[0-9]+" \
+            | $SORT -t \# -k 2,2n > ${tem_file}
+
+num_exist_log=`$CAT ${tem_file} | $WC -l`
+if [ `$EXPR ${num_exist_log} + 1` -ge ${numlog} ]; then
+    _cnt_=0
+    for _file_ in `$CAT ${tem_file}`; do
+        _cnt_=`$EXPR ${_cnt_} +  1`
+        if [ ${_cnt_} -ge ${numlog} ]; then
+            $RM -f ${_file_}
+        fi
+    done
+fi
+
+$LS "${logfile}_#*@*" 2>/dev/null \
+            | $EGREP "${logfile}_#[1-9]+[0-9]*@[0-9]+-[0-9]+-[0-9]+.[0-9]+.[0-9]+.[0-9]+" \
+            | $SORT -t \# -k 2,2nr > ${tem_file}
+
+# Rotate the dumps
+for _file_ in `$CAT ${tem_file}`; do
+    _file_num_=`$ECHO ${_file_} | $NAWK -F\# '{print $2}' | $NAWK -F\@ '{print $1}'`
+    _new_file_num_=`$EXPR ${_file_num_} + 1`
+    _new_file_name_=`$ECHO ${_file_} | $SED -e "s|#${_file_num_}@|#${_new_file_num_}@|"`
+    $MV -f ${_file_} ${_new_file_name_}
+done
+
+$RM -f  ${tem_file}
+
+local run_time=`$DATE '+%Y-%m-%d_%H.%M.%S'`
+$MV ${logfile} "${logfile}_#1@${run_time}"
+
+if [ "${compress_log}" = "y" ]; then
+    $COMPRESS -f "${logfile}_#1@${run_time}" 2>/dev/null &
+fi
+}
+
+### Function: sleep_function ###
+#
+# Sleep; but checks for interrupt every second
+#
+# Arguments: Number of seconds to sleep for
+# Any Interupt functions should set WAKE=true
+sleep_function()
+{
+WAKE=false
+if [[ -n "${1}" ]]; then
+    for (( i=0; i < ${1}; i++ )); do
+        $SLEEP 1
+        if [[ $WAKE = "true" ]]; then
+            return
+        fi
+    done
+else
+    log_script "Error sleep_function called without parameter"
+    $SLEEP 1
+fi
+}
+
+# ********************************************************************
+#
+#   Main body of program
+#
+# ********************************************************************
+#
+# Save the time of running. I do this here as I want all
+# dates and time to be the same
+RUN_TIME=`$DATE '+%Y-%m-%d_%H.%M.%S'`
+
+# Determine absolute path to software
+get_absolute_path
+
+# Check that the effective id of the user is root
+check_id ${DEFAULT_USER}
+
+# Do backup pre-checks
+roll_snap_pre_checks
+
+# Location of Logfile
+readonly LOGDIR="/eniq/local_logs/rolling_snapshot_logs"
+readonly LOGFILE="${LOGDIR}/eniq_rollsnapd.log"
+
+# Check/Create Logfile
+chk_create_logfile
+
+# File that indicates that a ROLLING SNAPSHOT should be taken. This file
+# will be created by cronjob
+readonly ROLL_SNAP_FILE_INDICATOR="/eniq/bkup_sw/etc/.create_rolling_snapshot"
+
+# File that indicates that extra log information will be given. This file
+# will be created by the user for debugging purposes.
+readonly DEBUG_INDICATOR="/eniq/sw/conf/.debug_rollsnap"
+
+# File that indicates that a ROLLING SNAPSHOT is in progress
+readonly ROLL_SNAP_PROGRESS_INDICATOR="/eniq/bkup_sw/etc/.rolling_snapshot_in_progress"
+
+# Loop continuously
+while :; do
+    RUN_TIME=`$DATE '+%Y-%m-%d_%H.%M.%S'`
+    # Does the file exist
+    if [ -f ${ROLL_SNAP_FILE_INDICATOR} ]; then
+        $ECHO "File ${ROLL_SNAP_FILE_INDICATOR} detected at ${RUN_TIME}" >> ${LOGFILE}
+        # Okay Sleep for a random amount of time. This will ensure that if
+        # a rolling snapshot is just about to start I should correctly
+        # detect it
+        _tem_sleep_=`$EXPR $RANDOM  % 20 + 9`
+                sleep_function ${_tem_sleep_}
+
+        # Is the trigger file still there? May have been deleted while asleep
+        if [ ! -f ${ROLL_SNAP_FILE_INDICATOR} ]; then
+            continue
+        fi
+
+        # Is there a rolling snapshot possibly in progress?
+        if [ -f ${ROLL_SNAP_PROGRESS_INDICATOR} ]; then
+            $ECHO "File ${ROLL_SNAP_PROGRESS_INDICATOR} detected" >> ${LOGFILE}
+            # If this file exists but no script running then chances are
+            # it has been left over by mistake
+            $PS -ef | $GREP -w "prepare_eniq_bkup.bsh" | $GREP -vw "grep" >> /dev/null 2>&1
+            if [ $? -ne 0 ]; then
+                $ECHO "Expected Process not detected" >> ${LOGFILE}
+                sleep_function ${_tem_sleep_}
+                if [ -f ${ROLL_SNAP_PROGRESS_INDICATOR} ]; then
+                    $PS -ef | $GREP -w "prepare_eniq_bkup.bsh" | $EGREP -vw "vi|cat|more|grep|egrep" >> /dev/null 2>&1
+                    if [ $? -ne 0 ]; then
+                        $ECHO "Removing hung file - ${ROLL_SNAP_PROGRESS_INDICATOR}" >> ${LOGFILE}
+                        $RM -f ${ROLL_SNAP_PROGRESS_INDICATOR}
+                    fi
+                fi
+            else
+                $ECHO "Snapshots are already in progress" >> ${LOGFILE}
+            fi
+
+            continue
+        else
+            # If this file doesn't exists but  script is running 
+            $PS -ef | $GREP -w "prepare_eniq_bkup.bsh" | $EGREP -vw "vi|cat|more|grep|egrep" >> /dev/null 2>&1
+            if [ $? -eq 0 ]; then
+                $ECHO "Snapshots are already in progress" >> ${LOGFILE}
+                continue
+            fi
+
+            # Now initiate the snapshot
+            $ECHO "Initiating Rolling snapshot" >> ${LOGFILE}
+            $BASH ${SCRIPTHOME}/prepare_eniq_bkup.bsh -q -N -R
+
+            # Rotate and compress the logs if necessary
+            rotate_compress_logs ${LOGFILE} ${NUM_LOGS} ${SIZE_LOGS} ${COMPRESS_LOG}
+        fi
+    elif [ -f ${DEBUG_INDICATOR} ]; then
+        $ECHO "File ${ROLL_SNAP_FILE_INDICATOR} not detected at ${RUN_TIME}\n" >> ${LOGFILE}
+    fi
+
+    sleep_function $SLEEP_TIME  # Loop repeats every ${SLEEP_TIME} seconds
+done
+
+exit 0

@@ -1,0 +1,14 @@
+#
+# File containing the server type
+# that can be installed.
+#
+# Based on this selection, a different flow
+# of steps will be carried out during installation
+#
+# This file is ordered, and should not be altered
+#
+# File Format -	
+#	<server_type>::<description>
+#
+eniq_es::LTE Event Based Statistics Coordinator
+eniq_mz::LTE Event Based Statistics Peer Server

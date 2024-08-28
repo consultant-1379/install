@@ -1,0 +1,798 @@
+#!/bin/bash
+# ********************************************************************
+# Ericsson Radio Systems AB                                     SCRIPT
+# ********************************************************************
+#
+#
+# (c) Ericsson Radio Systems AB 2022 - All rights reserved.
+#
+# The copyright to the computer program(s) herein is the property
+# of Ericsson Radio Systems AB, Sweden. The programs may be used 
+# and/or copied only with the written permission from Ericsson Radio 
+# Systems AB or in accordance with the terms and conditions stipulated 
+# in the agreement/contract under which the program(s) have been 
+# supplied.
+#
+# ********************************************************************
+# Name    : save_conf_data.bsh
+# Date    : 04/04/2022
+# Revision: \main\15
+# Purpose : This script will prepare ENIQ for Backup. It will snapshot
+#           all required filesystems and mount those under a pre-defined
+#           mountpoint.
+#
+# Usage   : save_conf_data.bsh [ -l <path_to_logfile> ] [ -N ] 
+#
+# ********************************************************************
+#
+# 	Command Section
+#
+# ********************************************************************
+AWK=/usr/bin/awk
+BASENAME=/usr/bin/basename
+BC=/usr/bin/bc
+CAT=/usr/bin/cat
+CHMOD=/usr/bin/chmod
+CHOWN=/usr/bin/chown
+CP=/usr/bin/cp
+DATE=/usr/bin/date
+DIRNAME=/usr/bin/dirname
+ECHO='/usr/bin/echo -e'
+EGREP=/usr/bin/egrep
+EXPR=/usr/bin/expr
+FIND=/usr/bin/find
+GETENT=/usr/bin/getent
+GREP=/usr/bin/grep
+GZIP=/usr/bin/gzip
+HEAD=/usr/bin/head
+HOSTNAME=/usr/bin/hostname
+ID=/usr/bin/id
+IFCONFIG=/usr/sbin/ifconfig
+IP=/usr/sbin/ip
+LS=/usr/bin/ls
+LVDISPLAY=/usr/sbin/lvdisplay
+LVS=/usr/sbin/lvs
+MKDIR=/usr/bin/mkdir
+MV=/usr/bin/mv
+NMCLI=/usr/bin/nmcli
+RM=/usr/bin/rm
+SED=/usr/bin/sed
+SORT=/usr/bin/sort
+TAR=/usr/sbin/tar
+TEE=/usr/bin/tee
+TOUCH=/usr/bin/touch
+UNIQ=/usr/bin/uniq
+VGDISPLAY=/usr/sbin/vgdisplay
+VGS=/usr/sbin/vgs
+WC=/usr/bin/wc
+
+# ********************************************************************
+#
+#       Configuration Section
+#
+# ********************************************************************
+# Flag to determine whether to compress log or not (Must be y/n)
+COMPRESS_LOG=n
+
+# Number of log files to keep
+NUM_LOGS=10
+
+# Size in kbytes that the log file is allowed to grow to
+SIZE_LOGS=2048000
+
+# Default user
+DEFAULT_USER=root
+
+# INI files
+ENIQ_INI=niq.ini
+
+# Name of SunOS & ENIQ ini Files
+BLK_STOR_INI=block_storage.ini
+ENIQ_ENV=niq.rc
+ENIQ_INI=niq.ini
+SYM_INI=sym_links.ini
+IPMP_INI=ipmp.ini
+LUN_MAP_INI=lun_map.ini
+RBAC_INI=RBAC.ini
+SUNOS_INI=SunOS.ini
+COORD_INI=coordinator_sym_links.ini
+
+# ********************************************************************
+#
+#       Pre-execution Operations
+#
+# ********************************************************************
+
+
+# ********************************************************************
+#
+#   Functions
+#
+# ********************************************************************
+### Function: abort_script ###
+#
+#   This will is called if the script is aborted thru an error
+#   error signal sent by the kernel such as CTRL-C or if a serious
+#   error is encountered during runtime
+#
+# Arguments:
+#       $1 - Error message from part of program (Not always used)
+# Return Values:
+#       none
+abort_script()
+{
+_err_time_=`$DATE '+%Y-%b-%d_%H.%M.%S'`
+	
+if [ "$1" ]; then
+    _err_msg_="${_err_time_} - $1"
+else
+    _err_msg_="${_err_time_} - ERROR : Script aborted.......\n"
+fi
+
+# Check if log_msg() is defined, else define log()
+type log_msg > /dev/null 2>&1
+if [ $? -gt 0 ]; then
+    if [ "${LOGFILE}" ]; then
+		if [ ! "${BKUP_QUIET}" ]; then
+		    $ECHO "\n${_err_msg_}\n" | $TEE -a ${LOGFILE}
+		else
+		    $ECHO "\n${_err_msg_}\n" >> ${LOGFILE}
+       fi
+    else
+		$ECHO "\n${_err_msg_}\n"
+    fi
+else
+    if [ "${LOGFILE}" ]; then
+		log_msg -s "\n${_err_msg_}\n" -l ${LOGFILE} ${BKUP_QUIET}
+    else
+		log_msg -s "\n${_err_msg_}\n" ${BKUP_QUIET}
+    fi
+fi
+
+cd $SCRIPTHOME
+$RM -rf ${TEM_DIR}
+
+if [ "$2" ]; then
+    ${2}
+else
+   exit 1
+fi
+}
+
+### Function: check_id ###
+#
+#   Check that the effective id of the user is correct
+#   If not print error msg and exit.
+#
+# Arguments:
+#       $1 : User ID name
+# Return Values:
+#       none
+check_id()
+{
+_check_id_=`$ID  | $AWK -F\( '{print $2}' | $AWK -F\) '{print $1}'`
+if [ "$_check_id_" != "$1" ]; then
+    _err_msg_="You must be $1 to execute this script."
+    abort_script "${_err_msg_}"
+fi
+}
+
+### Function: chk_create_logfile ###
+#
+# Check/Create Logfile
+#
+# Arguments:
+#	none
+# Return Values:
+#	none
+chk_create_logfile()
+{
+$MKDIR -p `$DIRNAME ${LOGFILE}`
+if [ $? -ne 0 ]; then
+	unset LOGFILE
+	_err_msg_="Could not create directory `$DIRNAME ${LOGFILE}`"
+	abort_script "${_err_msg_}"
+fi	
+
+$TOUCH -a ${LOGFILE}
+if [ $? -ne 0 ]; then
+	unset LOGFILE
+	_err_msg_="Could not write to file ${LOGFILE}"
+	abort_script "${_err_msg_}"
+fi	
+
+if [ -s ${LOGFILE} ]; then
+	$ECHO "\n\n" >> ${LOGFILE}
+fi
+
+$ECHO "================================================================" >> ${LOGFILE}
+$ECHO "================================================================" >> ${LOGFILE}
+$ECHO "Saving of config data started at ${RUN_TIME}\n" >> ${LOGFILE}
+}
+
+### Function: get_absolute_path ###
+#
+# Determine absolute path to software
+#
+# Arguments:
+#	none
+# Return Values:
+#	none
+get_absolute_path()
+{
+_dir_=`$DIRNAME $0`
+SCRIPTHOME=`cd $_dir_ 2>/dev/null && pwd || $ECHO $_dir_`
+}
+
+
+### Function: get_NAS_shares ###
+#
+# Generate all filesystems to share
+#
+# Arguments:
+#   none 
+# Return Values:
+#   none
+get_nas_shares() {
+if [ "${CO_SERVER}" == "YES" ]; then
+    # Temp NASCLI file
+    _tmp_nascli_file_=${TEM_DIR}/NASCLI.txt
+    # Temp Block_storage file
+    _tmp_blk_stor_file_=${TEM_DIR}/BLK_STORAGE.txt
+    # out access rights file
+    _tmp_access_file_=${TEM_DIR}/shares.txt
+    # Temp shares file 
+    _nascli_shares_=${TEM_DIR}/NASCLI_SHARES.txt
+    _ini_file_="${ENIQ_BASE_DIR}/installation/config/SunOS.ini"
+    
+    # Check storage.ini
+    if [ ! -s $ENIQ_BASE_DIR/installation/config/storage.ini ]; then
+	_err_msg_="$ENIQ_BASE_DIR/installation/config/storage.ini does not exist"
+	abort_script "$_err_msg_"
+    fi
+    
+    # Check SunOS.ini
+    if [ ! -s ${_ini_file_} ]; then
+	_err_msg_="$ENIQ_BASE_DIR/installation/config/storage.ini does not exist"
+	abort_script "$_err_msg_"
+    fi
+    
+    _nas_sw_target_dir_=`iniget NAS_STORAGE_API -f ${_ini_file_} -v NAS_API_TARGET_DIR`
+    if [ ! "${_nas_sw_target_dir_}" ]; then
+	_err_msg_="Failed to get NAS API target dir information from ${_ini_file_}"
+	abort_script "$_err_msg_"
+    fi
+    
+    _nascli_=${_nas_sw_target_dir_}/bin/nascli
+    if [ ! -s ${_nascli_} ]; then
+	_err_msg_="${_nascli_} not found"
+	abort_script "$_err_msg_"
+    fi
+
+    # remove hidden nas files
+    $RM ${ENIQ_CONF_DIR}/.shared.txt ${ENIQ_CONF_DIR}/.nas_share.txt > /dev/null 2>&1
+    $TOUCH ${_tmp_nascli_file_} ${_tmp_access_file_} ${_nascli_shares_}
+    if [ $? -ne 0 ]; then
+	_err_msg_="Problem encountered creating tmp files"
+	abort_script "$_err_msg_"
+    fi
+    
+    # Get nas filesystems
+    $ECHO "Generating shared filesystems from NASCLI" |$TEE -a ${LOGFILE}
+    ${_nascli_} list_shares - > ${_tmp_nascli_file_}
+    if [ $? -ne 0 ]; then
+	_err_msg_="Problem encountered listing shares to ${_tmp_nascli_file_}" |$TEE -a ${LOGFILE}
+	abort_script "$_err_msg_"
+    fi
+    
+    # Get nas storage blocks
+    iniget Storage_NAS_FS_LIST -f ${ENIQ_BASE_DIR}/installation/config/storage.ini > ${_tmp_blk_stor_file_}
+    if [ ! -s ${_tmp_blk_stor_file_} ]; then
+        _err_msg_="Problem encountered editing ${_tmp_blk_stor_file_} from $ENIQ_BASE_DIR/installation/config/storage.ini" |$TEE -a ${LOGFILE}
+        abort_script "$_err_msg_"
+    fi
+
+    $ECHO "Generating shared IP Addresses from storage.ini" |$TEE -a ${LOGFILE}
+    for i in `$CAT ${_tmp_blk_stor_file_}`; do
+        _filesys_=`iniget $i -f ${ENIQ_BASE_DIR}/installation/config/storage.ini -v SHARE_PATH `
+        if [ $? -ne 0 ]; then
+            _err_msg_="Error Reading ${i} SHARE_PATH variable from ${ENIQ_BASE_DIR}/installation/config/storage.ini" |$TEE -a ${LOGFILE}
+            abort_script "$_err_msg_"
+        fi
+        _access_=`iniget $i -f ${ENIQ_BASE_DIR}/installation/config/storage.ini -v NFS_SHARE_OPTIONS | $SED 's|\"||g'`
+        if [ $? -ne 0 ]; then
+            _err_msg_="Error Reading ${i} NFS_SHARE_OPTIONS variable from ${ENIQ_BASE_DIR}/installation/config/storage.ini" |$TEE -a ${LOGFILE}
+            abort_script "$_err_msg_"
+        fi
+        _path_=`iniget $i -f ${ENIQ_BASE_DIR}/installation/config/storage.ini -v FS_NAME `
+        if [ $? -ne 0 ]; then
+            _err_msg_="Error Reading ${i} FS_NAME variable from ${ENIQ_BASE_DIR}/installation/config/storage.ini" |$TEE -a ${LOGFILE}
+            abort_script "$_err_msg_"
+        fi
+
+        _ip_list_=`$CAT ${_tmp_nascli_file_} | $EGREP "^${_filesys_}[[:blank:]]+"|$AWK '{print $3}'| $SED 's|\/32||g'|$UNIQ`
+        for _ip_ in ${_ip_list_}; do
+            $ECHO "${_ip_} ${_access_} ${_path_}" >> ${_nascli_shares_}
+            if [ $? -ne 0 ]; then
+                _err_msg_="Error writing ${_ip_} ${_access_} ${_path_} to ${_nascli_shares_} " |$TEE -a ${LOGFILE}
+                abort_script "$_err_msg_"
+            fi
+        done
+    done
+
+    # Copy ${_nascli_shares_} to different directory
+    $CAT ${_nascli_shares_} | $SORT -u > ${ENIQ_CONF_DIR}/.nas_share.txt
+    if [ $? -ne 0 ]; then
+	_err_msg_="Error copying nas shares to ${ENIQ_CONF_DIR}/.nas_share.txt" |$TEE -a ${LOGFILE}
+	abort_script "$_err_msg_"
+    fi
+    $ECHO "List complete." |$TEE -a ${LOGFILE}
+else
+    # touch file, so we know not to share nas fs again
+    $TOUCH ${ENIQ_CONF_DIR}/.shared.txt
+    if [ $? -ne 0 ]; then
+	_err_msg_="Error copying nas shares to ${ENIQ_CONF_DIR}/.shared.txt" |$TEE -a ${LOGFILE}
+	abort_script "$_err_msg_"
+    fi
+fi
+
+}
+
+## Function: read_storage_type ###
+#
+# Arguments:
+#   none
+# Return Values:
+#   set varibale STORAGE_TYPE
+read_storage_type()
+{
+# Read the storage type
+if [ -s ${ENIQ_CONF_DIR}/${SUNOS_INI} ]; then
+    STORAGE_TYPE=`iniget STOR_TYPE -f ${ENIQ_CONF_DIR}/${SUNOS_INI} -v STORAGE_TYPE`
+else
+    if [ -s ${ENIQ_CONF_DIR}/san_details ]; then
+        STORAGE_TYPE=`$CAT ${ENIQ_CONF_DIR}/san_details | $EGREP "^STORAGE_TYPE=" | $AWK -F\= '{print $2}'`
+    fi
+fi
+
+if [ ! "${STORAGE_TYPE}" ]; then
+    _err_msg_="Could not read STORAGE_TYPE param "
+    abort_script "${_err_msg_}"
+fi
+}
+
+## Function: save_iq_header_info ###
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+save_iq_header_info()
+{
+if [ "${INSTALL_TYPE}" == "es" ]; then
+    return 0
+fi
+
+if [ "${CO_SERVER}" != "YES" ]; then
+    # Am i a reader
+    READER_ALIAS=`$CAT ${ENIQ_CONF_DIR}/service_names | $GREP -w "${HOST_IP}" | $GREP "dwh_" | $AWK -F"::" '{print $3}'`
+    if [ ${READER_ALIAS} ]; then
+	_reader_=YES 
+    else
+        return 0 
+    fi
+fi
+
+if [ ! -s ${CLI_CONF_DIR}/${COORD_INI} ]; then
+    _err_msg_="${CLI_CONF_DIR}/${COORD_INI} not found or is empty"
+    abort_script "${_err_msg_}"
+fi
+
+if [ ! -s ${ENIQ_CONF_DIR}/${SYM_INI} ]; then
+    _err_msg_="${ENIQ_CONF_DIR}/${SYM_INI} not found or is empty"
+    abort_script "${_err_msg_}"
+fi
+
+# Get iqheader binary
+_iqheader_=`$FIND ${ENIQ_BASE_DIR}/sybase_iq/IQ*|$EGREP "\/IQ-.*\/bin.*\/iqheader[[:blank:]]*$"|$HEAD -1`
+if [ ! -x ${_iqheader_} ]; then
+    _err_msg_="Could not locate iqheader binary"
+    abort_script "${_err_msg_}"
+fi
+
+_par_tag_list_="DWH_SYSTEM_MAIN DWH_DBSPACES_MAIN DWH_DBSPACES_TEMP"
+if [ "${CO_SERVER}" == "YES" ]; then
+    _ini_file_list_="${CLI_CONF_DIR}/${COORD_INI} ${ENIQ_CONF_DIR}/${SYM_INI}"
+else
+    _ini_file_list_="${ENIQ_CONF_DIR}/${SYM_INI}"
+fi
+
+$RM -f ${TEM_DIR}/iq_header_info.$$.$$
+for _ini_file_ in `$ECHO ${_ini_file_list_}`; do
+    for _parent_block_ in `$ECHO ${_par_tag_list_}`; do
+	if [ "${_reader_}" == "YES" ]; then
+	    if [ "${_ini_file_}" == "${CLI_CONF_DIR}/${COORD_INI}" ]; then
+		if [ "${_parent_block_}" == "DWH_DBSPACES_TEMP" ]; then
+		    continue
+		fi
+	    fi
+	fi
+	_block_list_=`iniget ${_parent_block_} -f ${_ini_file_}`
+	if [ ! "${_block_list_}" ]; then
+	    _err_msg_="Could not find values for ${_parent_block_} in ${_ini_file_}"
+	    abort_script "$_err_msg_"
+	fi
+
+	for _block_ in ${_block_list_}; do
+	    _path_=`iniget ${_block_} -f ${_ini_file_} -v Path`
+	    if [ ! "${_path_}" ]; then
+		_err_msg_="Could not read Path value for ${_block_} in ${_ini_file_}"
+		abort_script "$_err_msg_"
+	    fi
+
+	    _file_id_=`${_iqheader_} ${_path_} 2>/dev/null |$EGREP "^[[:blank:]]*File[[:blank:]]+ID:"|$AWK '{print $NF}'`
+	    if [ ! "${_file_id_}" ]; then
+		_err_msg_="Could not read IQ File ID value for ${_path_}"
+		abort_script "$_err_msg_"
+	    fi
+	    
+	    if [ -s ${TEM_DIR}/iq_header_info.$$.$$ ]; then
+		$CAT ${TEM_DIR}/iq_header_info.$$.$$|$EGREP -w "${_file_id_}"  >> /dev/null 2>&1
+		if [ $? -ne 0 ]; then
+		    $ECHO "${_path_} ${_file_id_}" >> ${TEM_DIR}/iq_header_info.$$.$$
+		fi
+	    else
+		$ECHO "${_path_} ${_file_id_}" >> ${TEM_DIR}/iq_header_info.$$.$$
+	    fi
+	done
+    done
+done
+
+if [ -s ${TEM_DIR}/iq_header_info.$$.$$ ]; then
+    $CP ${TEM_DIR}/iq_header_info.$$.$$ ${ENIQ_CONF_DIR}/iq_header_info
+else
+    _err_msg_="No IQ Header information could be collected"
+    abort_script "$_err_msg_"
+fi
+
+}
+
+### Function: setup_env ###
+#
+# Setup up path environment etc
+#
+# Arguments:
+#	none
+# Return Values:
+#	none
+setup_env()
+{
+ENIQ_BASE_DIR=/eniq
+
+ENIQ_CONF_DIR=${ENIQ_BASE_DIR}/installation/config
+if [ ! -s ${ENIQ_CONF_DIR}/ericsson_use_config ]; then
+    _err_msg_="Could not locate file ${ENIQ_CONF_DIR}/ericsson_use_config"
+    abort_script "${_err_msg_}"
+fi
+
+CLI_CONF_DIR=${ENIQ_BASE_DIR}/sw/conf
+
+# Main Directory for the Core Installation SW
+ENIQ_INST_DIR=${ENIQ_BASE_DIR}/installation/core_install
+
+# Main Directory for the Core Installation SW
+ENIQ_REST_TEMPL_DIR=${ENIQ_BASE_DIR}/bkup_sw/templates/
+if [ ! -d ${ENIQ_REST_TEMPL_DIR} ]; then
+    _err_msg_="Could not locate directory ${ENIQ_REST_TEMPL_DIR}"
+    abort_script "${_err_msg_}"
+fi
+
+# File containing the type of ENIQ system
+INST_TYPE_FILE=${ENIQ_CONF_DIR}/ericsson_use_config
+if [ ! -s "${INST_TYPE_FILE}" ]; then
+    _err_msg_="ENIQ install type not defined in ${INST_TYPE_FILE}"
+    abort_script "${_err_msg_}"
+fi
+
+# Read the installation type - should be "events" or "stats"
+INSTALL_TYPE=`$CAT ${INST_TYPE_FILE} | $AWK -F\= '{print $2}'`
+if [ ! "${INSTALL_TYPE}" ]; then
+    _err_msg_="Could not read INSTALL_TYPE parameter"
+    abort_script "${_err_msg_}"
+fi
+
+BMR_CONFIG_DATA_DIR=${ENIQ_BASE_DIR}/bkup_sw/bmr_config_data
+BMR_DATA_DIR=/usr/openv/netbackup/bin/ombs/bmr/bmr_config_data
+
+SAVE_FILES_LIST=${ENIQ_BASE_DIR}/bkup_sw/etc/save_conf_data_files
+
+# Default Logfile location
+DEF_LOGFILE="${ENIQ_BASE_DIR}/local_logs/backup_logs/save_conf_data.log"
+
+# Determine the current server type
+CURR_SERVER_TYPE=`$CAT $ENIQ_CONF_DIR/installed_server_type | $EGREP -v '^[[:blank:]]*#' | $SED -e 's/ //g'`
+if [ ! "${CURR_SERVER_TYPE}" ]; then
+	_err_msg_="Could not determine which server type this is"
+	abort_script "$_err_msg_"
+fi
+
+CO_SERVER=""
+if [ "${CURR_SERVER_TYPE}" == "eniq_coordinator" -o "${CURR_SERVER_TYPE}" == "son_coordinator" -o "${CURR_SERVER_TYPE}" == "eniq_events" \
+	-o "${CURR_SERVER_TYPE}" == "eniq_iqw" -o "${CURR_SERVER_TYPE}"  == "eniq_stats"  -o "${CURR_SERVER_TYPE}" == "stats_coordinator" -o "${CURR_SERVER_TYPE}" == "eniq_es" ]; then
+    CO_SERVER="YES"
+fi
+
+HNAME=`${HOSTNAME}`
+HOST_IP=`$GETENT hosts ${HNAME} | $AWK '{print $1}' | $HEAD -1`
+
+LVMDUMP_DIR=root_disk_lvmdump
+}
+
+# ********************************************************************
+#
+# 	Main body of program
+#
+# ********************************************************************
+#
+# Save the time of running. I do this here as I want all
+# dates and time to be the same
+RUN_TIME=`$DATE '+%Y-%m-%d_%H.%M.%S'`
+
+# Determine absolute path to software
+get_absolute_path
+
+# Check that the effective id of the user is root
+check_id $DEFAULT_USER
+
+while getopts ":l:Nq" arg; do
+  case $arg in
+    l) LOGFILE="$OPTARG" 
+       ;;
+    N) NO_CONFIRM="YES"
+       ;;
+    q) SAVE_QUIET="-q"
+       ;;
+   \?) _err_msg_="`$BASENAME $0` [ -l <path_to_logfile> ] [ -N ] -q"
+       abort_script "${_err_msg_}"
+       ;;
+  esac
+done
+shift `expr $OPTIND - 1`
+
+# Setup up path environment etc
+setup_env
+
+# Set up default logfile if required
+if [ ! "${LOGFILE}" ]; then
+    LOGFILE="${DEF_LOGFILE}"
+fi
+
+# Check/Create Logfile
+chk_create_logfile
+    
+# Source the common functions
+if [ -s ${ENIQ_INST_DIR}/lib/common_functions.lib ]; then
+    . ${ENIQ_INST_DIR}/lib/common_functions.lib
+else
+    _err_msg_="File ${ENIQ_INST_DIR}/lib/common_functions.lib not found"
+    abort_script "${_err_msg_}"
+fi
+
+# Read the storage type
+read_storage_type
+
+# Create a temporary Directory
+TEM_DIR=/tmp/save_conf_data.$$.$$
+$RM -rf ${TEM_DIR}
+$MKDIR -p ${TEM_DIR}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not create directory ${TEM_DIR}"
+    abort_script "${_err_msg_}"
+fi
+
+log_msg -s "Checking whether extra backup tar files are present\n" -l ${LOGFILE}
+log_msg -s "----------------------------------------------------------------------------\n" -l ${LOGFILE}
+
+if [ ! -d ${BMR_CONFIG_DATA_DIR} ]; then
+    log_msg -s "No Tar files to delete" -l ${LOGFILE}
+else
+    _total_tars_=`$LS ${BMR_CONFIG_DATA_DIR} | $WC -l`
+    if [ $_total_tars_ -gt 3 ]; then
+        _tars_to_delete_=`$ECHO "${_total_tars_} - 3" | $BC`
+        $LS -1tr ${BMR_CONFIG_DATA_DIR} | $HEAD -${_tars_to_delete_} > /tmp/delete
+        for i in `$CAT /tmp/delete`; do
+            $RM -rf ${BMR_CONFIG_DATA_DIR}/$i
+            if [ $? -eq 0 ]; then
+                log_msg -s "Successfully deleted the tar file ${i}" -l ${LOGFILE}
+            fi
+        done
+        $RM -rf /tmp/delete
+    fi
+fi
+
+if [ ! -d ${BMR_DATA_DIR} ]; then
+    log_msg -s "No Tar files to delete in ${BMR_DATA_DIR} directory" -l ${LOGFILE}
+else
+    log_msg -s "Removing the ${BMR_DATA_DIR} directory" -l ${LOGFILE}
+    $RM -rf ${BMR_DATA_DIR}
+fi
+
+if [ "${STORAGE_TYPE}" == "raw" ]; then
+   SAN_DEVICE=`iniget SAN_DEV -f ${ENIQ_CONF_DIR}/${SUNOS_INI} -v SAN_DEVICE`
+   if [ ! "${SAN_DEVICE}" ]; then
+       _err_msg_="Could not read SAN_DEVICE param "
+       abort_script "${_err_msg_}"
+   fi
+fi
+
+# Save off Sybase Raw device IQ HEADER info if required
+if [ "${STORAGE_TYPE}" == "raw" ]; then
+    save_iq_header_info
+	if [ "${SAN_DEVICE}" != "unityXT" ]; then
+    get_nas_shares
+	fi
+fi
+
+# Sync the niq.ini file
+$CP ${CLI_CONF_DIR}/${ENIQ_INI} ${ENIQ_CONF_DIR} 
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not copy ${CLI_CONF_DIR}/${ENIQ_INI} to ${ENIQ_CONF_DIR}"
+    abort_script "${_err_msg_}"
+fi	
+
+$MKDIR -p ${TEM_DIR}/bmr/installation
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not create directory ${TEM_DIR}/bmr/installation"
+    abort_script "${_err_msg_}"
+fi	
+
+$MKDIR -p ${TEM_DIR}/bmr/etc
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not create directory ${TEM_DIR}/bmr/etc"
+    abort_script "${_err_msg_}"
+fi
+
+# Copy in the restore files
+$CP -rp ${ENIQ_REST_TEMPL_DIR}/* ${TEM_DIR}/bmr
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not copy directory ${ENIQ_REST_TEMPL_DIR} to ${TEM_DIR}/bmr"
+    abort_script "${_err_msg_}"
+fi	
+
+# Copy in the config files
+$CP -rp ${ENIQ_CONF_DIR} ${TEM_DIR}/bmr/installation
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not copy directory ${ENIQ_CONF_DIR} to ${TEM_DIR}/bmr/installation"
+    abort_script "${_err_msg_}"
+fi	
+
+# Copy in the core inst dir files
+$CP -rp ${ENIQ_INST_DIR} ${TEM_DIR}/bmr/installation
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not copy directory ${ENIQ_INST_DIR} to ${TEM_DIR}/bmr/installation"
+    abort_script "${_err_msg_}"
+fi
+
+# Copy in the smf files
+$CP -rp ${ENIQ_BASE_DIR}/smf ${TEM_DIR}/bmr/
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not copy directory ${ENIQ_BASE_DIR}/smf to ${TEM_DIR}/bmr/installation"
+    abort_script "${_err_msg_}"
+fi
+
+# Save all FS info
+for _vg_ in `$VGS -a -o vg_name --noheadings | $GREP -v vg_root`; do
+    # Make the main directory to store all info for this volume group
+    $MKDIR -p ${TEM_DIR}/bmr/fs/${_vg_}
+    if [ $? -ne 0 ]; then
+		_err_msg_="Could not create directory ${TEM_DIR}/bmr/fs/${_vg_}"
+		abort_script "${_err_msg_}"
+    fi	
+
+    # Save volume group info
+    $VGDISPLAY -v ${_vg_} > ${TEM_DIR}/bmr/fs/${_vg_}/vg_list
+    if [ $? -ne 0 ]; then
+		_err_msg_="Error running command $VGDISPLAY -v ${_vg_}"
+		abort_script "${_err_msg_}"
+    fi
+
+    # Save a simple logical volume list
+    $LVS ${_vg_} > ${TEM_DIR}/bmr/fs/${_vg_}/lv_list
+    if [ $? -ne 0 ]; then
+		_err_msg_="Error running command $LVS ${_vg_}"
+		abort_script "${_err_msg_}"
+    fi	
+
+    # Save detailed info per logical volume
+    for _lv_ in `$LVS -o lv_name ${_vg_} --noheadings`; do
+		_name_="${_vg_}"_"${_lv_}"
+		$LVDISPLAY -v /dev/${_vg_}/${_lv_} > ${TEM_DIR}/bmr/fs/${_vg_}/${_name_}
+		if [ $? -ne 0 ]; then
+		    _err_msg_="Error running command $LVDISPLAY -v /dev/${_vg_}/${_lv_}"
+		    abort_script "${_err_msg_}"
+		fi	
+    done
+done
+
+# Save the files I am supposed to
+if [ -s ${SAVE_FILES_LIST} ]; then
+
+    # Remove comments,trailing/leading spaces and any blank lines from the file  
+	# Otherwise it can mess up tar command
+    $CAT ${SAVE_FILES_LIST} | $EGREP -v '^[[:blank:]]*#' | $EGREP -v '^[[:blank:]]*$'	\
+							| $SED -e 's/^[ ]*//' -e 's/[ ]*$//' -e 's/\/[\/]*/\//g' -e 's/[\/]*$//g' > ${TEM_DIR}/file_list
+
+    $MKDIR ${TEM_DIR}/bmr/network
+    $IFCONFIG -a >> ${TEM_DIR}/bmr/network/ifconfig-a
+    for _net_if_ in `$NMCLI -f DEVICE con show --active | $GREP -v DEVICE`; do
+	    $MKDIR ${TEM_DIR}/bmr/network/${_net_if_}
+	    $NMCLI device show ${_net_if_} >> ${TEM_DIR}/bmr/network/${_net_if_}/nmcli-device-show
+	    $IP addr show dev ${_net_if_} >> ${TEM_DIR}/bmr/network/${_net_if_}/ip-addr
+	done
+    cd /
+
+    $TAR -cf ${TEM_DIR}/bmr/backup_files.tar -T ${TEM_DIR}/file_list
+    if [ $? -ne 0 ]; then
+		_err_msg_="Error running command $TAR -cf ${TEM_DIR}/bmr/backup_files.tar"
+		abort_script "${_err_msg_}"
+    fi	 
+
+    $GZIP -f ${TEM_DIR}/bmr/backup_files.tar
+    if [ $? -ne 0 ]; then
+		_err_msg_="Error running command $GZIP -f ${TEM_DIR}/bmr/backup_files.tar"
+		abort_script "${_err_msg_}"
+    fi	
+    
+    cd ${SCRIPTHOME}
+fi
+
+# Create LVM DUMP 
+if [ -s ${ENIQ_BASE_DIR}/bkup_sw/bin/collect_root_disk_conf.bsh ]; then
+	$MKDIR -p ${TEM_DIR}/bmr/${LVMDUMP_DIR}
+	if [ $? -ne 0 ]; then
+        _err_msg_="Failed to create lvmdump directory"
+        abort_script "${_err_msg_}"	
+    fi 
+	
+    /usr/bin/bash ${ENIQ_BASE_DIR}/bkup_sw/bin/collect_root_disk_conf.bsh ${TEM_DIR}/bmr/${LVMDUMP_DIR} >>${LOGFILE}
+    if [ $? -ne 0 ]; then
+        _err_msg_="Failed to create lvmdump for root lvm"
+        abort_script "${_err_msg_}"	
+    fi 
+fi
+
+cd ${TEM_DIR}
+
+# Okay tar up the whole bmr directory and copy it to BMR config backup directory
+
+_tar_name_="`${HOSTNAME}`_bmr_save_config@${RUN_TIME}.tar"
+$TAR -cf ${TEM_DIR}/${_tar_name_} bmr
+if [ $? -ne 0 ]; then
+    _err_msg_="Error running command $TAR -cf ${TEM_DIR}/${_tar_name_} bmr"
+    abort_script "${_err_msg_}"
+fi	
+
+cd ${SCRIPTHOME}
+
+$GZIP -f ${TEM_DIR}/${_tar_name_}
+if [ $? -ne 0 ]; then
+    _err_msg_="Error running command $GZIP -f ${TEM_DIR}/${_tar_name_}"
+    abort_script "${_err_msg_}"
+fi	
+
+$MKDIR -p ${BMR_CONFIG_DATA_DIR}
+$CP ${TEM_DIR}/${_tar_name_}.gz ${BMR_CONFIG_DATA_DIR}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not copy ${TEM_DIR}/${_tar_name_}.gz to ${BMR_CONFIG_DATA_DIR}"
+    abort_script "${_err_msg_}"
+fi
+
+
+log_msg -s "BMR config data saved" -l ${LOGFILE} ${SAVE_QUIET}
+
+# Rotate and compress the logs if necessary
+rotate_compress_logs ${LOGFILE} ${NUM_LOGS} ${SIZE_LOGS} ${COMPRESS_LOG}
+
+$RM -rf ${TEM_DIR}
+
+exit 0

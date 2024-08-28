@@ -1,0 +1,26 @@
+######################################################
+# This contains a list of of filesystems that contain
+# need to be snapshot at the time of the DB Virtual
+# Backup. It has the format of
+#
+# <fs_name>::<snap>::<rollback>
+#
+# Comments are preceded by '#' 
+######################################################
+admin::Y::Y
+archive::Y::Y
+backup::Y::Y
+eventdata/00::N::N
+eventdata/01::N::N
+eventdata/02::N::N
+eventdata/03::N::N
+home::Y::Y
+log::Y::N
+mediation_sw::Y::Y
+mediation_inter::Y::Y
+northbound::N::N
+reference::Y::Y
+rejected::N::N
+sentinel::Y::Y
+sw::Y::Y
+upgrade::Y::Y

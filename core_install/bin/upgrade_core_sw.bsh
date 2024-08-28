@@ -1,0 +1,817 @@
+#!/bin/bash
+# ********************************************************************
+# Ericsson Radio Systems AB                                     SCRIPT
+# ********************************************************************
+#
+#
+# (c) Ericsson Radio Systems AB 2019 - All rights reserved.
+#
+# The copyright to the computer program(s) herein is the property
+# of Ericsson Radio Systems AB, Sweden. The programs may be used
+# and/or copied only with the written permission from Ericsson Radio
+# Systems AB or in accordance with the terms and conditions stipulated
+# in the agreement/contract under which the program(s) have been
+# supplied.
+#
+# ********************************************************************
+# Name    : upgrade_core_sw.bsh
+# Date    : 12/10/2023
+# Revision: main/22
+# Purpose : A wrapper script to upgrade the Core Installer SW from coordinator across all the 
+# 			blades in the deployement.In case single blade deployement will run 
+#			on single blade only.	
+#
+# Usage   : upgrade_core_sw.bsh 
+#
+# ********************************************************************
+#
+#   Command Section
+#
+# ********************************************************************
+AWK=/usr/bin/awk
+BASENAME=/usr/bin/basename
+CAT=/usr/bin/cat
+CLEAR=/usr/bin/clear
+CP=/usr/bin/cp
+CUT=/usr/bin/cut
+DATE=/usr/bin/date
+DIRNAME=/usr/bin/dirname
+ECHO="/usr/bin/echo -e"
+EGREP=/usr/bin/egrep
+EXPR=/usr/bin/expr
+GETENT=/usr/bin/getent
+GREP=/usr/bin/grep
+HEAD=/usr/bin/head
+HOSTNAME=/usr/bin/hostname
+ID=/usr/bin/id
+LS=/usr/bin/ls
+MKDIR=/usr/bin/mkdir
+MYHOSTNAME=/usr/bin/hostname
+PS=/usr/bin/ps
+PWD=/usr/bin/pwd
+RM=/usr/bin/rm
+SCP=/usr/bin/scp
+TEE=/usr/bin/tee
+TEST=/usr/bin/test
+TOUCH=/usr/bin/touch
+
+# ********************************************************************
+#
+#       Configuration Section
+#
+# ********************************************************************
+
+# Default user
+DEFAULT_USER=root
+
+# Coordinator server list
+CO_SERVER_TYPE="stats_coordinator|eniq_stats|eniq_iqw|son_coordinator"
+
+
+
+# ********************************************************************
+#
+#       Pre-execution Operations
+#
+# ********************************************************************
+
+
+# ********************************************************************
+#
+#   functions
+#
+# ********************************************************************
+
+### Function: abort_script ###
+#
+#   This will is called if the script is aborted thru an error
+#   error signal sent by the kernel such as CTRL-C or if a serious
+#   error is encountered during runtime
+#
+# Arguments:
+#       $1 - Error message from part of program (Not always used)
+# Return Values:
+#       none
+abort_script()
+{
+_err_time_=`$DATE '+%Y-%b-%d_%H.%M.%S'`	
+
+if [ "$1" ]; then
+    _err_msg_="${_err_time_} - $1"
+else
+    _err_msg_="${_err_time_} - Script aborted.......\n"    
+fi
+if [ "${LOGFILE}" ]; then
+    $ECHO "\nERROR : $_err_msg_\n" | $TEE -a ${LOGFILE}
+else
+    $ECHO "\nERROR : $_err_msg_\n"
+fi
+copy_logfile_share_fs
+
+cd $SCRIPTHOME
+$RM -rf ${TEM_DIR}
+
+if [ "$2" ]; then
+    ${2}
+else
+   exit 1
+fi
+}
+### Function: check_rollback_file ###
+#
+# Return Values:
+#       none
+check_rollback_file()
+{
+if [ ! -e ${ROLLBACK_CHK_FILE} ]; then
+	$ECHO "Creating rollback check file ${ROLLBACK_CHK_FILE}" | $TEE -a ${LOGFILE}
+    $TOUCH ${ROLLBACK_CHK_FILE}
+	if [ $? -ne 0 ]; then
+		_err_msg_="Could not create ${ROLLBACK_CHK_FILE}"
+		 abort_script "$_err_msg_"
+	fi
+	if [ -s ${UPGRADE_TRACK} ]; then
+	$ECHO "System was rolled back, upgrade all deployed servers " | $TEE -a ${LOGFILE}
+		$RM ${UPGRADE_TRACK}
+		if [ $? -ne 0 ]; then
+			_err_msg_="Could not delete  ${UPGRADE_TRACK}"
+			 abort_script "$_err_msg_"
+		fi
+	fi
+fi
+
+}
+### Function: check_id ###
+#
+#   Check that the effective id of the user is correct
+#   If not print error msg and exit.
+#
+# Arguments:
+#       $1 : User ID name
+# Return Values:
+#       none
+check_id()
+{
+_check_id_=`$ID  | $AWK -F\( '{print $2}' | $AWK -F\) '{print $1}'`
+if [ "$_check_id_" != "$1" ]; then
+    _err_msg_="You must be $1 or have equal permissions to execute this script."
+    abort_script "$_err_msg_"
+fi
+}
+### Function: check_ip_file ###
+#
+# Checks the file with ips to see if the ip pass to the
+# function is in it
+#   
+#
+# Arguments:
+#   $1 : ip	
+#	$2 : file with ips
+# Return Values:
+#       none
+check_ip_file()
+{
+local _ip_address_=$1
+local _track_file_=$2
+
+if [ ! -s "${_track_file_}" ]; then
+	return 0
+fi
+
+$CAT "${_track_file_}" | $EGREP -w "${_ip_address_}" >> /dev/null 2>&1
+if [ $? -eq 0 ]; then
+	return 1
+else
+	return 0
+fi
+
+}
+### Function: check_params ###
+#
+# Check Input Params
+#
+# Arguments:
+#	none
+# Return Values:
+#	none
+check_params()
+{
+# Check that we got the required params
+if [ ! "${BASE_SW_DIR}" -o ! "${UPGRADE_SW}" -o ! "${OM_SW_DIR}" -o ! "${STORAGE_TYPE}" ]; then
+    usage_msg
+    exit 1
+fi 
+	
+case "${STORAGE_TYPE}" in
+	raw)	:
+			;;
+	fs)	:
+			;;
+	*)		usage_msg
+			exit 1
+			;;
+esac
+}
+
+
+# Check/Create Logfile
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+chk_create_logfile()
+{
+
+
+$MKDIR -p `$DIRNAME ${LOGFILE}`
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not create directory `$DIRNAME ${LOGFILE}`"
+     abort_script "$_err_msg_"
+fi
+$MKDIR -p `$DIRNAME ${FINAL_LOG}`
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not create directory `$DIRNAME ${FINAL_LOG}`"
+     abort_script "$_err_msg_"
+fi
+
+$TOUCH -a ${LOGFILE}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not write to file ${LOGFILE}"
+    abort_script "$_err_msg_"
+fi
+
+_log_id_str="-l ${LOGFILE}"
+}
+### Function: copy_logfile_share_fs ###
+#
+# Copy the logfile to the share location for all servers
+# In case the NAS is down check the id process and timeout
+# Arguments:
+#		none
+# Return Values:
+#		0         Successful
+#		1		  failed
+#
+copy_logfile_share_fs()
+{
+local _timeout_=30
+local copy_cmd="$CP ${LOGFILE} ${FINAL_LOG}"
+local _err_msg_="Warning couldn't copy logfile to shared filesystem \n$copy_cmd"
+
+	$ECHO "Copying logfile ${LOGFILE} to ${FINAL_LOG}" | $TEE -a ${LOGFILE}
+
+	if  [ "${LOGFILE}" == "" -o "${FINAL_LOG}" == "" ]; then
+		$ECHO "$_err_msg_"
+		return 1
+	fi
+
+	if [ ! -s ${LOGFILE} ]; then
+		$ECHO "$_err_msg_"
+		return 1
+	fi
+	$copy_cmd >> /dev/null 2>&1 &
+	local _ls_pid_num_=$!
+	local check="${PS} -ef | ${EGREP} ${_ls_pid_num_} | ${EGREP} -vw grep"
+	$check  >> /dev/null 2>&1
+    if [ "$(${check} >> /dev/null 2>&1)" != "" ] ; then
+			_time_now_=${SECONDS}
+			_max_time_=$(( _time_now_ + _timeout_))
+			while (( _time_now_ < _max_time_ )); do
+				if ["$(${check})" == ""]; then
+					break
+				fi
+				_time_now_=${SECONDS}
+			done
+	
+	fi
+    if [ "$(${check} >> /dev/null 2>&1)" != "" ] ; then
+		$KILL -0 ${_ls_pid_num_} >> /dev/null 2>&1
+		$ECHO "$_err_msg_"
+		return 1
+	fi
+	return 0
+}
+
+### Function: get_absolute_path ###
+#
+# Determine absolute path to software
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+get_absolute_path() 
+{
+_dir_=`$DIRNAME $0`
+SCRIPTHOME=`cd $_dir_ 2>/dev/null && pwd || $ECHO $_dir_`
+}
+### Function: get_deployment_order ###
+#
+# Get the order of the deployment
+# for starting and stopping services
+#
+# Arguments:
+#	none
+# Return Values:
+#	none
+get_deployment_order()
+{
+$RM -rf ${TEM_DIR}/server_order_list
+
+# Get an ordered list of servers based on the server_list file
+/usr/bin/perl ${GET_IP_ORDER} -f ${TEM_DIR}/server_order_list
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not get an ordered list of servers"
+    abort_script "$_err_msg_"
+fi
+
+}
+
+### Function: check_logfile_msg ###
+#
+# check log msg
+#   
+#
+# Arguments:
+#   $1 : ip	
+#   $2 : logfile	
+# Return Values:
+#       none
+check_logfile_msg()
+{
+local _ip_address_=$1
+local _logfile_=$2
+local reboot_str="reboot is required"
+local _tmpfile_=${TEM_DIR}/reboot_msg.tmp
+local _count_ _server_name_
+
+_count_=`$CAT ${TEM_DIR}/server_order_list | $EGREP "^${_ip_address_}::" | grep -o "::" | wc -l`
+
+if [ "${_ip_type_}" == "IPv6" ] && [ "${_count_}" == 3 ]; then
+	_server_name_=$($CAT ${TEM_DIR}/server_order_list | $EGREP "^${_ip_address_}::" | $AWK -F"::" '{print $3}')
+else	
+	_server_name_=$($CAT ${TEM_DIR}/server_order_list | $EGREP "^${_ip_address_}::" | $AWK -F"::" '{print $2}')
+fi
+if [ ! "${_server_name_}" ]; then
+	_server_name_="${_ip_address_}"
+fi
+
+if [ -s ${_logfile_} ]; then
+    $CAT ${_logfile_} | $EGREP -i "${reboot_str}" > ${_tmpfile_}
+	if [ -s ${_tmpfile_} ]; then
+		if [ ! -s ${REBOOT_MSG_FILE} ]; then
+			$ECHO "=========================================================" > ${REBOOT_MSG_FILE} 
+			$ECHO " Recorded messages regarding reboots needed from logfiles " >> ${REBOOT_MSG_FILE} 
+			$ECHO "=========================================================" >> ${REBOOT_MSG_FILE} 
+		fi
+		$ECHO "=====${_server_name_}====" >> ${REBOOT_MSG_FILE}
+		$CAT ${_tmpfile_} >> ${REBOOT_MSG_FILE}
+		
+	fi
+fi
+
+}
+### Function: check_logfile_msg ###
+#
+# check the logfile  for a message
+#   
+#
+# Arguments:
+#   $1 : ip	
+#   $2 : logfile to be checked
+get_remote_logfile()
+{
+local _ip_address_=$1
+	if [ "${_ip_address_}" != "${HOST_IP}" ]; then
+		$ECHO "\nGetting log file from ${_ip_address_}" | $TEE -a $LOGFILE
+		local tmp_logname_=$($BASENAME ${LOGFILE})
+		if [ $? -ne 0 ]; then
+			abort_script "couldn't get basename on $LOGFILE"
+		fi
+		_logname_="${tmp_logname_}.${_ip_address_}"
+		if [ "${_ip_type_}" == "IPv6" ]; then
+			$SCP -6 [${_ip_address_}]:${LOGFILE} ${TEM_DIR}/${_logname_}
+		else
+			$SCP ${_ip_address_}:${LOGFILE} ${TEM_DIR}/${_logname_}
+		fi
+		if [ $? -ne 0 ]; then
+			abort_script "could not $SCP ${_ip_address_}:${LOGFILE} ${TEM_DIR}/${_logname_}"
+		fi
+		$ECHO "===================================================" >> $LOGFILE
+		$ECHO "            Upgrade log for $_ip_address_         " >> $LOGFILE
+		$ECHO "==================================================" >> $LOGFILE
+		$CAT ${TEM_DIR}/${_logname_} >> $LOGFILE
+		check_logfile_msg "${_ip_address_}" "${TEM_DIR}/${_logname_}"
+	else
+		check_logfile_msg "${_ip_address_}" "${LOGFILE}"
+	fi
+}
+
+### Function: run_upgrade_cmd ###
+#
+# Run the upgrade Command
+#   
+#
+# Arguments:
+#   $1 : ip	
+# Return Values:
+#       none
+run_upgrade_cmd()
+{
+local _ip_address_=$1
+local _err_msg_upgrade="Upgrade failed on using command ${cmd_upgrade}"
+local cmd_upgrade="$BASH ${ENIQ_CORE_UPGRADE} -d ${BASE_SW_DIR} -p ${UPGRADE_SW} -o ${OM_SW_DIR} -t ${STORAGE_TYPE} -l ${LOGFILE}"
+
+
+$ECHO "Starting to run $cmd_upgrade on $_ip_address_ $LOGFILE" 	 
+	if [ "${_ip_address_}" == "${HOST_IP}" ]; then
+		${cmd_upgrade}
+		if [ $? -ne 0 ]; then
+			abort_script "${_error_mgs_}"
+		fi
+	else
+		run_remote_cmd "${_ip_address_}" "${cmd_upgrade}" "$LOGFILE"
+			if [ $? -ne 0 ]; then
+				get_remote_logfile "${_ip_address_}"
+				abort_script "${_err_msg_upgrade}"
+			fi
+	fi
+	$ECHO "${_ip_address_}" >> ${UPGRADE_TRACK}
+	get_remote_logfile "${_ip_address_}"
+}
+### Function: run_cmd ###
+#
+# Builds a list of servers installed
+#   
+#
+# Arguments:
+#   $1 : cmd	
+#	$2 : ip
+#	$3 : error
+# Return Values:
+#       none
+run_cmd()
+{
+local _cmd_=$1
+local _ip_address_=$2
+local _error_mgs_="$3 on $_ip_address_"
+
+		if [ "${_ip_address_}" == "${HOST_IP}" ]; then
+			${_cmd_}
+			if [ $? -ne 0 ]; then
+				abort_script "${_error_mgs_}"
+			fi
+		else
+			run_remote_cmd "${_ip_address_}" "${_cmd_}" "$LOGFILE"
+			if [ $? -ne 0 ]; then
+				abort_script "${_error_mgs_}"
+			fi
+		fi
+
+}
+### Function: setup_env ###
+#
+# Set up environment variables for script.
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+setup_env()
+{
+if [ ! "${ENIQ_BASE_DIR}" ]; then
+    # Directory on the root filesystem
+    ENIQ_BASE_DIR=/eniq
+fi
+
+ENIQ_LOG_DIR=${ENIQ_BASE_DIR}/log
+LOGFILE_DIR="${ENIQ_LOG_DIR}/manage_upgrade_log"
+FINAL_LOG=${LOGFILE_DIR}/manage_upgrade.${RUN_TIME}.log
+LOGFILE=${UPGRADE_SW}/local_manage_upgrade.${RUN_TIME}.log
+REBOOT_MSG_FILE=${UPGRADE_SW}/reboot_msg.log
+
+# ENIQ Log Directory
+
+UPGRADE_TRACK=${UPGRADE_SW}/installed
+
+BASENAME_UPGRADE_SW=$($BASENAME $UPGRADE_SW)
+if [ ! "${BASENAME_UPGRADE_SW}" ]; then
+	_err_msg_="Couldn't get basename from ${UPGRADE_SW}"
+	abort_script "$_err_msg_"
+fi
+
+ROLLBACK_CHK_FILE="${ENIQ_BASE_DIR}/upgrade/${BASENAME_UPGRADE_SW}"
+
+# Main Directory for the Core Installation SW
+ENIQ_INST_DIR=${ENIQ_BASE_DIR}/installation
+
+# Main Directory for the Core Installation SW
+ENIQ_CORE_INST_DIR=${ENIQ_INST_DIR}/core_install
+
+# ENIQ Config Directory
+ENIQ_CONF_DIR=${ENIQ_INST_DIR}/config
+
+# ENIQ Admin Directory
+ENIQ_ADMIN_DIR=${ENIQ_BASE_DIR}/admin
+
+# SW conf dir
+CLI_CONF_DIR=${ENIQ_BASE_DIR}/sw/conf
+
+# Get server type
+CURR_SERVER_TYPE=`$CAT $ENIQ_CONF_DIR/installed_server_type`
+if [ ! "${CURR_SERVER_TYPE}" ]; then
+    _err_msg_="Could not read $ENIQ_CONF_DIR/installed_server_type"
+    abort_script "$_err_msg_" 
+fi
+
+$ECHO "${CURR_SERVER_TYPE}" | $EGREP "${CO_SERVER_TYPE}" >> /dev/null 2>&1
+if [ $? -eq 0 ]; then
+	SERVER_TYPE="CO"
+else
+	SERVER_TYPE="${CURR_SERVER_TYPE}"
+fi
+
+
+
+
+HNAME=`${MYHOSTNAME}`
+if [ ! "${HNAME}" ]; then
+	_err_msg_="Couldn't get hostname from ${MYHOSTNAME}"
+	abort_script "$_err_msg_"
+fi
+HOST_IP=`$HOSTNAME -i | $AWK '{print $1}' | $HEAD -1`
+if [ ! "${HOST_IP}" ]; then
+	_err_msg_="Couldn't get ip from $GETENT hosts ${HNAME} "
+	abort_script "$_err_msg_"
+fi
+UPGRADE_CORE_BIN=${UPGRADE_SW}/core_install/bin
+UPGRADE_CORE_LIB=${UPGRADE_SW}/core_install/lib
+COMMON_FUNCTION=${UPGRADE_CORE_LIB}/common_functions.lib 
+# Source the common functions
+if [ -s ${COMMON_FUNCTION} ]; then
+    . ${COMMON_FUNCTION}
+else
+    _err_msg_="File ${COMMON_FUNCTION} not found"
+    abort_script "$_err_msg_"
+fi
+
+GET_IP_ORDER=${UPGRADE_CORE_LIB}/get_ip_order.pl 
+if [ ! -s ${GET_IP_ORDER} ]; then
+	_err_msg_="${UPGRADE_CORE_LIB}/get_ip_order.pl  script not found"
+	abort_script "$_err_msg_"
+fi
+ENIQ_CORE_UPGRADE=${UPGRADE_CORE_BIN}/eniq_core_upgrade.bsh
+if [ ! -s ${ENIQ_CORE_UPGRADE} ]; then
+	_err_msg_="${UPGRADE_CORE_BIN}/eniq_core_upgrade.bsh script not found"
+	abort_script "$_err_msg_"
+fi
+
+#Fetching IP Type from ipmp.ini file.
+check_ip_type
+
+if [ ! "${_ip_type_}" ]; then
+    _err_msg_="Could not read parameter _IP_TYPE_ from file ${ENIQ_CONF_DIR}/${IPMP_INI}"
+    abort_script "$_err_msg_"
+fi
+}
+
+
+### Function: upgrade_servers ###
+#
+# Start the ENIQ services in the deployment
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+upgrade_servers()
+{
+local _server_det_file_=$1
+
+if [ ! "${NO_CONFIRM}" ]; then
+     user_confirm "start upgrading" "${_server_det_file_}"
+     if [ "$USER_CONF" == "No" ]; then
+         $RM -rf ${TEM_DIR}
+         exit 0
+     fi    
+fi
+
+$CLEAR
+local cmd_test_dir="${TEST} -e ${UPGRADE_SW}"
+local cmd_test_script="${TEST} -s ${ENIQ_CORE_UPGRADE}"
+#local cmd_test_dir="ls /eniq/admin"
+
+
+for _line_ in `$CAT ${_server_det_file_}`; do
+	unset _ip_address_ _serv_hostname_ _count_
+	local _ip_address_ _serv_hostname_ _count_
+	_count_=`$ECHO "${_line_}" | grep -o "::" | wc -l`
+
+	if [ "${_ip_type_}" == "IPv6" ] && [ "${_count_}" == 3 ]; then
+		_ip_address_=`$ECHO ${_line_} | grep -oE '([a-fA-F0-9]{1,4}::?){1,7}[a-fA-F0-9]{1,4}' | head -n 1 | awk -F "::" '{ print $1 "::" $2}'`
+		_serv_hostname_=`$ECHO ${_line_} | $AWK -F"::" '{print $3}'`
+	else
+		_ip_address_=`$ECHO ${_line_} | $AWK -F"::" '{print $1}'`
+		_serv_hostname_=`$ECHO ${_line_} | $AWK -F"::" '{print $2}'`
+	fi
+	if [ ! "${_ip_address_}" -o ! "${_serv_hostname_}" ]; then
+		_err_msg_="Could not read required info from ${_server_det_file_}"
+		abort_script "${_err_msg_}"
+	fi
+	check_ip_file "${_ip_address_}" "${UPGRADE_TRACK}"
+	if [  $? -eq 0  ]; then 
+		$ECHO "\nTest if ${UPGRADE_SW} exists on ${_serv_hostname_}" | $TEE -a $LOGFILE	
+		local _err_msg_dir="${UPGRADE_SW} doesn't exists"
+		local _err_msg_script="Script ${ENIQ_CORE_UPGRADE} does not exists"
+		run_cmd "${cmd_test_dir}" "${_ip_address_}" "${_err_msg_dir}"
+		run_cmd "${cmd_test_script}" "${_ip_address_}" "${_err_msg_script}"
+		run_upgrade_cmd "${_ip_address_}"
+		$ECHO "\nUpgrade completed on ${_serv_hostname_} with software from ${UPGRADE_SW}\n\n" | $TEE -a $LOGFILE			
+	else
+		$ECHO "\nServer ${_serv_hostname_}is already upgraded with Core Installer SW from ${ENIQ_CORE_UPGRADE}\n" | $TEE -a $LOGFILE
+	fi
+	
+done 
+}
+### Function: usage_msg ###
+#
+#   Print out the usage message
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+usage_msg()
+{
+$CLEAR
+$ECHO "
+Usage: `$BASENAME $0` -d <eniq_sw_dir> -p <new_sw_extraction_loc> -o <om_sw_dir>/om_linux
+						[-M <sol_om_media_location> [ -b <eniq_base_dir> ]  -t [raw|fs]
+
+options:
+
+-b  : Optional parameter specifying the full path to where the ENIQ
+      BASEDIR directory is (eg. /eniq). If not specified, then the
+      script will assume the the base directory is /eniq
+
+-d  : Parameter specifying the full path to the directory
+      containing the ENIQ BASE SW directory structure.
+      
+-p  : Parameter specifying where the new core SW is extracted.
+	  e.g. <path_to_core_sw>/core_install  
+	  
+-o	: Parameter specifying the full path to the directory
+      containing the O&M SW directory structure.
+	  
+-M  : Optional parameter for ENIQ Events specifying the full path to the directory
+      containing RHEL 7.4 O&M SW directory structure. 
+      
+-t 	: Parameter specifying the storage type. The storage type can usually be determined
+      by reading the STORAGE_TYPE parameter in /eniq/installation/config/SunOS.ini
+	  e.g. [raw|fs]
+"
+}
+
+### Function: user_confirm ###
+#
+# Get confirmation from user to proceed with snapshot action
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+user_confirm()
+{
+local _conf_msg_=$1
+local _server_det_file_=$2
+	
+while :; do
+    unset USER_CONF
+    $CLEAR
+    $ECHO "\nDeployed Servers\n================"
+	
+    > ${VAR_TMP_DIR}/server_hostname.txt
+    for _line_ in `$CAT ${_server_det_file_}`; do
+		unset _serv_hostname_ _count_
+		local _serv_hostname_ _count_
+		_count_=`$ECHO "${_line_}" | grep -o "::" | wc -l`
+
+		if [ "${_ip_type_}" == "IPv6" ] && [ "${_count_}" == 3 ]; then
+			_serv_hostname_=`$ECHO ${_line_} | $AWK -F"::" '{print $3}'`
+		else
+			_serv_hostname_=`$ECHO ${_line_} | $AWK -F"::" '{print $2}'`
+		fi
+		if [ ! "${_serv_hostname_}" ]; then
+			_err_msg_="Could not read required info from ${_server_det_file_}"
+			abort_script "${_err_msg_}"
+		fi
+		$ECHO ${_serv_hostname_} >> ${VAR_TMP_DIR}/server_hostname.txt
+	done
+	$CAT ${VAR_TMP_DIR}/server_hostname.txt
+	
+    rm -rf ${VAR_TMP_DIR}/server_hostname.txt
+    $ECHO "\nAre you sure you wish to ${_conf_msg_} the above servers?"
+    $ECHO "Enter [Yes | No] (case sensitive) : \c"
+    read USER_CONF
+    if [ "$USER_CONF" == "Yes" -o "$USER_CONF" == "No" ]; then
+         break
+    fi
+done
+}
+
+# ********************************************************************
+#
+#   Main body of program
+#
+# ********************************************************************
+#
+RUN_TIME=`$DATE '+%Y-%b-%d_%H.%M.%S'`
+
+# Determine absolute path to software
+get_absolute_path
+
+# Check that the effective id of the user is root
+check_id $DEFAULT_USER
+
+while getopts ":b:d:l:p:o:M:t:N" arg; do
+  case $arg in
+    b) ENIQ_BASE_DIR="$OPTARG"
+       ;;
+    d) BASE_SW_DIR="$OPTARG"
+       ;;
+    p) UPGRADE_SW="$OPTARG"
+       ;;
+    o) OM_SW_DIR="$OPTARG"
+       ;;
+    M) SOL_OM_MEDIA_LOCATION="$OPTARG"
+       ;;
+    t) STORAGE_TYPE="$OPTARG"
+   	   ;;
+    N) NO_CONFIRM="YES" 
+       ;;
+   \?) usage_msg
+       exit 1
+       ;;
+  esac
+done
+shift `expr $OPTIND - 1`
+
+# Check Input Params
+check_params 
+
+# Setup up path environment etc
+setup_env
+
+# Check/Create Logfile
+chk_create_logfile
+
+
+$ECHO "#################################################################" | $TEE -a ${LOGFILE}
+$ECHO "#$RUN_TIME Starting to run `$BASENAME $0` and logging to $LOGFILE " | $TEE -a ${LOGFILE}
+$ECHO "#################################################################" | $TEE -a ${LOGFILE}
+$ECHO "Parameters passed to script:
+BASE_SW_DIR=${BASE_SW_DIR}
+UPGRADE_SW=${UPGRADE_SW}
+OM_SW_DIR=${OM_SW_DIR}
+STORAGE_TYPE=${STORAGE_TYPE}
+" >> ${LOGFILE}
+
+# Create a temporary Directory
+TEM_DIR=/tmp/manage_upgrade.$$.$$
+$RM -rf ${TEM_DIR}
+$MKDIR -p ${TEM_DIR}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not create directory ${TEM_DIR}"
+    abort_script "$_err_msg_"
+fi
+
+# Only run on the coordinator
+if [ "${SERVER_TYPE}" != "CO" ]; then
+	_err_msg_="$0 can not be executed on ${SERVER_TYPE} server types"
+    abort_script "$_err_msg_"
+fi
+
+# checking if system was rolled backed
+check_rollback_file
+
+# Get the order to start and stop services
+get_deployment_order
+
+upgrade_servers ${TEM_DIR}/server_order_list
+
+if [ -s ${REBOOT_MSG_FILE} ]; then
+	$CAT ${REBOOT_MSG_FILE} | $TEE -a ${LOGFILE}
+	$RM -rf ${REBOOT_MSG_FILE}
+fi
+
+$RM -rf ${TEM_DIR}
+$RM -rf ${UPGRADE_TRACK}
+
+
+copy_logfile_share_fs
+
+$RM -rf ${ROLLBACK_CHK_FILE}
+
+$ECHO " Successfully upgraded servers, see Logfile $FINAL_LOG  for more details" | $TEE -a ${LOGFILE}
+exit 0

@@ -1,0 +1,571 @@
+#!/bin/bash
+# ********************************************************************
+# Ericsson Radio Systems AB                                     SCRIPT
+# ********************************************************************
+#
+#
+# (c) Ericsson Radio Systems AB 2020 - All rights reserved.
+#
+# The copyright to the computer program(s) herein is the property
+# of Ericsson Radio Systems AB, Sweden. The programs may be used
+# and/or copied only with the written permission from Ericsson Radio
+# Systems AB or in accordance with the terms and conditions stipulated
+# in the agreement/contract under which the program(s) have been
+# supplied.
+#
+# ********************************************************************
+# Name    : get_ombs_info.bsh
+# Date    : 09/10/2023 
+# Revision: \main\9
+# Purpose : To get backup option from user and create/share NFS directory with OMBS server
+#
+# Usage   : get_ombs_info.bsh
+#
+# ********************************************************************
+#
+#       Command Section
+# ********************************************************************
+AWK=/usr/bin/awk
+BASH=/usr/bin/bash
+CAT=/usr/bin/cat
+CLEAR=/usr/bin/clear
+CP=/usr/bin/cp
+CRONTAB=/usr/bin/crontab
+DATE=/usr/bin/date
+ECHO='/usr/bin/echo -e'
+EGREP=/usr/bin/egrep
+EXPORTFS=/usr/sbin/exportfs
+GETENT=/usr/bin/getent
+GREP=/usr/bin/grep
+HEAD=/usr/bin/head
+ID=/usr/bin/id
+MKDIR=/usr/bin/mkdir
+MYHOSTNAME=/usr/bin/hostname
+PERL=/usr/bin/perl
+RM=/usr/bin/rm
+SED=/usr/bin/sed
+SYSTEMCTL=/usr/bin/systemctl
+TEE=/usr/bin/tee
+WC=/usr/bin/wc
+
+# ********************************************************************
+#
+#   Functions
+#
+# ********************************************************************
+### Function: abort_script ###
+#
+#   This function is called if the script is aborted thru an error
+#   signal sent by the kernel or if a serious
+#   error is encountered during runtime
+#
+# Arguments:
+#       $1 - Error message from part of program (Not always used)
+# Return Values:
+#       none
+abort_script()
+{
+_err_time_=`$DATE '+%Y-%b-%d_%H.%M.%S'`
+
+if [ "$1" ]; then
+    _err_msg_="${_err_time_} - $1"
+else
+    _err_msg_="${_err_time_} - ERROR : Script aborted.......\n"
+fi
+
+if [ "${LOGFILE}" ]; then
+    $ECHO "\nERROR : ${_err_msg_}\n" | $TEE -a ${LOGFILE}
+else
+    $ECHO "\nERROR : ${_err_msg_}\n"
+fi
+
+$RM -rf ${TEM_DIR}
+
+if [ "$2" ]; then
+    ${2}
+else
+   exit 1
+fi
+
+}
+
+### Function: check_id ###
+#
+#   Check that the effective id of the user is correct
+#   If not print error msg and exit.
+#
+# Arguments:
+#       $1 : User ID name
+# Return Values:
+#       none
+check_user()
+{
+_check_id_=`$ID  | $AWK -F\( '{print $2}' | $AWK -F\) '{print $1}'`
+if [ "$_check_id_" != "$1" ]; then
+    _err_msg_="You must be $1 to execute this script."
+    abort_script "$_err_msg_"
+fi
+}
+
+### Function: dump_ombs_data ###
+#
+# Run the create_ombs_info.bsh script on all servers
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+dump_ombs_data()
+{
+log_msg -h -s "Running ${OMBS_INFO_SCRIPT}" -l $LOGFILE
+
+$BASH ${OMBS_INFO_SCRIPT}
+	if [ $? -ne 0 ]; then
+        _err_msg_="Issue encountered running ${OMBS_INFO_SCRIPT}"
+        abort_script "${_err_msg_}"
+    fi    
+}
+
+### Function: get_deployment_order ###
+#
+# Get the order of the deployment
+# for running few commands
+#
+# Arguments:
+#    none
+# Return Values:
+#    none
+get_deployment_order()
+{
+$RM -rf ${TEM_DIR}/server_order_list
+
+# Get an ordered list of servers based on the server_list file
+${PERL} ${GET_IP_ORDER} -f ${TEM_DIR}/server_order_list
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not get an ordered list of servers"
+    abort_script "${_err_msg_}"
+fi
+}
+
+### Function: get_backup_hostname ###
+#
+# Get backup host name from user
+#
+# Arguments:
+#   $1 : Server list
+# Return Values:
+#   none
+
+get_backup_hostname()
+{
+local _server_det_file_=$1
+local _count_
+local _ip_address_
+local _serv_hostname_
+local _server_type_
+
+for _line_ in `$CAT ${_server_det_file_}`; do 
+
+_count_=`$ECHO "${_line_}" | $GREP -o "::" | $WC -l`
+	if [ "${_ip_type_}" == "IPv6" ] && [ "${_count_}" == 3 ]; then
+		_ip_address_=`$ECHO ${_line_} | $GREP -oE '([a-fA-F0-9]{1,4}::?){1,7}[a-fA-F0-9]{1,4}' | $HEAD -n 1 | $AWK -F "::" '{ print $1 "::" $2}'`
+		_serv_hostname_=`$ECHO ${_line_} | $AWK -F"::" '{print $3}'`
+		_server_type_=`$ECHO ${_line_} | $AWK -F"::" '{print $4}'`
+	else
+		_ip_address_=`$ECHO ${_line_} | $AWK -F"::" '{print $1}'`
+		_serv_hostname_=`$ECHO ${_line_} | $AWK -F"::" '{print $2}'`
+		_server_type_=`$ECHO ${_line_} | $AWK -F"::" '{print $3}'`
+	fi
+    
+    $ECHO "\nEnter the Backup Host Name for "${_serv_hostname_}""
+    read _hostname_
+    
+    if [ ! "${_hostname_}" ]; then
+       continue
+    fi
+    
+    $ECHO ""${_ip_address_}"::"${_serv_hostname_}"::"${_server_type_}"::"${_hostname_}"" >> ${ENIQ_BKUP_ETC_DIR}/server_details
+    if [ $? -ne 0 ]; then
+        _err_msg_="Failed to create ${ENIQ_BKUP_ETC_DIR}/server_details"
+        abort_script "${_err_msg_}"
+    fi
+done
+}
+
+### Function: check_backup_hostname ###
+#
+# check backup host name from user
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+
+check_backup_hostname()
+{
+# Get Backup host name from user and append it in server_details file.
+ 
+if [ -f ${ENIQ_BKUP_ETC_DIR}/server_details ]; then
+    for _line_ in `$CAT ${ENIQ_BKUP_ETC_DIR}/server_details`; do
+	local _count_=`$ECHO "${_line_}" | $GREP -o "::" | $WC -l`
+	if [ "${_ip_type_}" == "IPv6" -a "${_count_}" == 4 ]; then
+		local _ip_address_=`$ECHO ${_line_} | $GREP -oE '([a-fA-F0-9]{1,4}::?){1,7}[a-fA-F0-9]{1,4}' | $HEAD -n 1 | $AWK -F "::" '{ print $1 "::" $2}'`
+		local _host_name_=`$ECHO ${_line_} | $AWK -F"::" '{print $3}'`
+		local _serv_type_=`$ECHO ${_line_} | $AWK -F"::" '{print $4}'`
+		local _backup_host_name_=`$ECHO ${_line_} | $AWK -F"::" '{print $5}'`
+	else
+		local _ip_address_=`$ECHO ${_line_} | $AWK -F"::" '{print $1}'`
+		local _host_name_=`$ECHO ${_line_} | $AWK -F"::" '{print $2}'`
+		local _serv_type_=`$ECHO ${_line_} | $AWK -F"::" '{print $3}'`
+		local _backup_host_name_=`$ECHO ${_line_} | $AWK -F"::" '{print $4}'`
+	fi
+        
+       $ECHO "\nBackup Host Name for "${_host_name_}" is "${_backup_host_name_}"" >> ${TEM_DIR}/disp_file
+       if [ $? -ne 0 ]; then
+           _err_msg_="Could not create display file"
+           abort_script "${_err_msg_}"
+       fi
+    done
+    
+    while :; do
+    $CLEAN
+    $CAT ${TEM_DIR}/disp_file
+    $ECHO "\nDo you want to continue with above Backup Host Name (Y|N)?"
+    
+        read _ans_
+    
+        if [ ! "${_ans_}" ]; then
+            continue
+        fi
+    
+        if [ "${_ans_}" == "N" ]; then
+            $RM -rf ${ENIQ_BKUP_ETC_DIR}/server_details
+            if [ $? -ne 0 ]; then
+                _err_msg_="Failed to delete ${ENIQ_BKUP_ETC_DIR}/server_details"
+                abort_script "${_err_msg_}"
+            fi
+
+            get_backup_hostname ${TEM_DIR}/server_order_list
+            break
+        elif [ "${_ans_}" == "Y" ]; then
+            break
+        else
+            continue
+        fi
+    done
+else
+    get_backup_hostname ${TEM_DIR}/server_order_list    
+fi
+    
+}
+
+### Function: get_ombs_ip ###
+#
+# Get OMBS server IP
+#
+# Arguments:
+#   none
+# Return Values:
+#   ombs server ip
+get_ombs_ip()
+{
+
+# Get OMBS server IP from the user and validate it
+while :; do
+    unset _ombs_ip_
+    
+    $CLEAR
+    $ECHO "\nEnter the OMBS backup IP configured for backup"
+    read _ombs_ip_
+    
+    if [ ! "${_ombs_ip_}" ]; then
+        continue
+    fi
+    
+    validate_ip ${_ombs_ip_}
+    if [ $? -ne 0 ]; then
+        continue    
+    else    
+        break
+    fi
+done
+}
+
+#### Function: update_crontab ###
+#
+# Updating crontab with new cron entry for raw backup monitoring
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+update_crontab()
+{
+log_msg -s "\nUpdating crontab with ${ENIQ_BACKUP_BIN_DIR}/${CRON_FILE} entry" -l ${LOGFILE}
+
+# New cron for raw backup monitoring
+_new_cron_="*/15 * * * * [ -x ${ENIQ_BACKUP_BIN_DIR}/${CRON_FILE} ] &&  ${ENIQ_BACKUP_BIN_DIR}/${CRON_FILE} >> /dev/null 2>&1"
+
+$CRONTAB -l > ${TEM_DIR}/cron.$$
+if [ ! -s ${TEM_DIR}/cron.$$ ]; then
+    _err_msg_="Could not get existing cron entries"
+    abort_script "${_err_msg_}"
+fi
+
+$CAT ${TEM_DIR}/cron.$$ | $EGREP "${CRON_FILE}" >> /dev/null 2>&1
+if [ $? -ne 0 ]; then
+    $ECHO "${_new_cron_}" >> ${TEM_DIR}/cron.$$
+
+    # Updating crontab with new cron entry
+    $CRONTAB ${TEM_DIR}/cron.$$
+    if [ $? -ne 0 ]; then
+        _err_msg_="Could not update crontab with {ENIQ_BACKUP_BIN_DIR}/${CRON_FILE}"
+        abort_script "${_err_msg_}"
+    else
+        log_msg -s "Successfully added ${ENIQ_BACKUP_BIN_DIR}/${CRON_FILE} in crontab" -l ${LOGFILE}
+    fi
+else
+    log_msg -s "${ENIQ_BACKUP_BIN_DIR}/${CRON_FILE} already added in crontab" -l ${LOGFILE}
+fi
+
+}
+
+### Function: setup_env ###
+#
+# Setup up path environment etc
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+setup_env()
+{
+ENIQ_BASE_DIR=/eniq
+
+# ENIQ BKUP SW Directory
+ENIQ_BKUP_DIR=${ENIQ_BASE_DIR}/bkup_sw
+
+# ENIQ BKUP SW ETC Directory
+ENIQ_BKUP_ETC_DIR=${ENIQ_BKUP_DIR}/etc
+
+# ENIQ Core install directory
+ENIQ_CORE_INST_DIR=${ENIQ_BASE_DIR}/installation/core_install
+
+# ENIQ Config Directory
+ENIQ_CONF_DIR=${ENIQ_BASE_DIR}/installation/config
+
+# ENIQ Backup SW Bin Directory
+ENIQ_BACKUP_BIN_DIR=${ENIQ_BKUP_DIR}/bin
+
+# Hostname Information
+HNAME=`${MYHOSTNAME}`
+
+# Source the common functions
+if [ -s ${ENIQ_CORE_INST_DIR}/lib/common_functions.lib ]; then
+    . ${ENIQ_CORE_INST_DIR}/lib/common_functions.lib
+else
+    _err_msg_="File ${ENIQ_CORE_INST_DIR}/lib/common_functions.lib not found"
+    abort_script "$_err_msg_"
+fi
+
+# Get storage type
+if [ -s ${ENIQ_CONF_DIR}/san_details ]; then
+    STORAGE_TYPE=`$CAT ${ENIQ_CONF_DIR}/san_details | $EGREP "^STORAGE_TYPE=" | $AWK -F\= '{print $2}'`
+else
+    _err_msg_="Could not get ${ENIQ_CONF_DIR}/san_details file"
+    abort_script "$_err_msg_"
+fi
+
+# Log file directory
+LOGDIR=${ENIQ_BASE_DIR}/local_logs/backup_logs/
+if [ ! -d ${LOGDIR} ]; then
+    $MKDIR -p ${ENIQ_BASE_DIR}/local_logs/backup_logs/
+fi
+
+# Log file
+LOGFILE=${LOGDIR}/get_ombs_info.log
+
+# Get IP Order script
+GET_IP_ORDER=${ENIQ_CORE_INST_DIR}/lib/get_ip_order.pl
+
+# NFS FS
+FS_NAME=${ENIQ_BKUP_DIR}/ombs_cfg
+
+# NFS Share Options
+SHARE_OPTS="rw,no_root_squash"
+
+# NFS service
+NFS_SERVICE="nfs-server.service"
+
+# Cron file
+CRON_FILE="raw_backup_supervisor.bsh"
+
+if [ ! -f ${ENIQ_BACKUP_BIN_DIR}/${CRON_FILE} ]; then
+    _err_msg_="Could not find ${ENIQ_BACKUP_BIN_DIR}/${CRON_FILE} script"
+    abort_script "${_err_msg_}"
+fi
+
+# Create OMBS Infor Script
+OMBS_INFO_SCRIPT=${ENIQ_BACKUP_BIN_DIR}/create_ombs_info.bsh
+if [ ! -f ${OMBS_INFO_SCRIPT} ]; then
+    _err_msg_="Could not find ${OMBS_INFO_SCRIPT} script"
+    abort_script "${_err_msg_}"
+fi
+
+EXPORTS="/etc/exports"
+
+
+check_ip_type
+if [ ! "${_ip_type_}" ]; then
+    _err_msg_="Could not read parameter _ip_type_ from ipmp.ini file"
+    abort_script "$_err_msg_"
+fi
+}
+
+### Function: share_nfs_dir ###
+#
+# Share /eniq/bkup_sw/ombs_cfg as NFS with OMBS
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+share_nfs_dir()
+{
+    # Start NFS service
+    _service_state_=`$SYSTEMCTL show ${NFS_SERVICE} -p ActiveState | $AWK -F "ActiveState=" '{print $2}'`
+    if [ ! "${_service_state_}" ]; then
+        _err_msg_="Could not get the status of ${NFS_SERVICE} service"
+        abort_script "${_err_msg_}"
+    fi
+	
+    if [ "${_service_state_}" != "active" ]; then
+        log_msg -s "Starting ${NFS_SERVICE} service" -l ${LOGFILE}
+        $SYSTEMCTL enable ${NFS_SERVICE} >> /dev/null 2>&1
+
+        $SYSTEMCTL start ${NFS_SERVICE} >> /dev/null 2>&1
+    fi
+
+    _nfs_state_=`$SYSTEMCTL show ${NFS_SERVICE} -p ActiveState | $AWK -F "ActiveState=" '{print $2}'`
+    if [ "${_nfs_state_}" != "active" ]; then
+        _err_msg_="Could not start ${NFS_SERVICE} service"
+        abort_script "${_err_msg_}"
+    fi
+
+    $CAT "${EXPORTS}" | $GREP -wv "${FS_NAME}" > ${TEM_DIR}/exports
+    _old_ip_=`$CAT "${EXPORTS}" | $GREP -w "${FS_NAME}" | $AWK '{print $2}' | $AWK -F\( '{print $1}'`
+    if [  "${_old_ip_}" ]; then  
+          log_msg -s "OMBS backup ip found. Removing nfs export share" -l ${LOGFILE}
+          #Unshare the export with old OMBS backup ip
+          $EXPORTFS -u ${_old_ip_}:${FS_NAME} >> /dev/null 2>&1
+          if [ $? -ne 0 ]; then
+               log_msg -s "WARNING: Not able to remove the export share with old ip ${_old_ip_}" -l ${LOGFILE}
+          fi
+          log_msg -s "Sharing ${FS_NAME} file system with OMBS server : ${_ombs_ip_}\n" -l ${LOGFILE} 
+          $EXPORTFS -o ${SHARE_OPTS} ${_ombs_ip_}:${FS_NAME} >> /dev/null 2>&1
+          if [ $? -ne 0 ]; then
+               _err_msg_="Could not share ${FS_NAME} with ${_ombs_ip_}"
+               abort_script "${_err_msg_}"
+          fi
+          # Updating /etc/exports
+          log_msg -q -s "Updating /etc/exports" -l  ${LOGFILE}
+          $ECHO "${FS_NAME}   ${_ombs_ip_}(${SHARE_OPTS})" >> "${TEM_DIR}/exports"
+          if [ $? -ne 0 ]; then
+	       _err_msg_="Could not add "${FS_NAME}   ${_ombs_ip_}"(${SHARE_OPTS})" in ${EXPORTS} ""
+	       abort_script "${_err_msg_}"
+          fi
+          $CP ${TEM_DIR}/exports ${EXPORTS} >> /dev/null 2>&1
+          if [ $? -ne 0 ]; then
+               _err_msg_="Failed to update ${EXPORTS} file"
+               abort_script "${_err_msg_}"
+          fi
+    else
+          log_msg -s "Sharing ${FS_NAME} file system with OMBS server : ${_ombs_ip_}\n" -l ${LOGFILE}
+          $EXPORTFS -o ${SHARE_OPTS} ${_ombs_ip_}:${FS_NAME} >> /dev/null 2>&1
+          if [ $? -ne 0 ]; then
+               _err_msg_="Could not share ${FS_NAME} with ${_ombs_ip_}"
+               abort_script "${_err_msg_}"
+          fi
+          # Updating /etc/exports
+          log_msg -q -s "Updating /etc/exports" -l  ${LOGFILE}
+          $ECHO "${FS_NAME}   ${_ombs_ip_}(${SHARE_OPTS})" >> "${TEM_DIR}/exports"
+          if [ $? -ne 0 ]; then
+               _err_msg_="Could not add "${FS_NAME}   ${_ombs_ip_}"(${SHARE_OPTS})" in ${EXPORTS} ""
+               abort_script "${_err_msg_}"
+          fi
+          $CP ${TEM_DIR}/exports ${EXPORTS} >> /dev/null 2>&1
+          if [ $? -ne 0 ]; then
+               _err_msg_="Failed to update ${EXPORTS} file"
+               abort_script "${_err_msg_}"
+          fi
+    fi
+                 
+
+}
+
+# ********************************************************************
+#       Main body of program
+#
+# ********************************************************************
+# Check that the effective id of the user is root
+check_user root
+
+
+# Create a temporary Directory
+TEM_DIR=/tmp/get_ombs_info.$$.$$
+$RM -rf ${TEM_DIR}
+$MKDIR -p ${TEM_DIR}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not create directory ${TEM_DIR}"
+    abort_script "${_err_msg_}"
+fi
+
+# Setup up path environment etc
+setup_env
+
+# Check if current server type is Coordinator in case of Multiblade
+CURR_SERVER_TYPE=`$CAT ${ENIQ_CONF_DIR}/installed_server_type | $EGREP -v  '^[[:blank:]]*#' | $SED -e 's/ //g'`
+if [ ! "${CURR_SERVER_TYPE}" ]; then
+    _err_msg_="Could not determine which server type this is"
+    abort_script "${_err_msg_}"
+fi
+
+if [ "${CURR_SERVER_TYPE}" == "stats_engine" -o "${CURR_SERVER_TYPE}" == "stats_iqr"  ]; then
+    _err_msg_="$0 cannot be executed on current server type : ${CURR_SERVER_TYPE}"
+    abort_script "${_err_msg_}"
+fi
+
+log_msg -t -h -s "Started executing ${ENIQ_BACKUP_BIN_DIR}/get_ombs_info.bsh" -l ${LOGFILE}
+
+# Get the order to run few commands
+get_deployment_order
+
+# Get OMBS server IP from user
+get_ombs_ip
+
+#Get Backup hostname from user
+check_backup_hostname
+
+# Get backup option
+log_msg -s "\nStarting to execute ${ENIQ_BACKUP_BIN_DIR}/get_backup_option.bsh" -l ${LOGFILE}
+
+${BASH} ${ENIQ_BACKUP_BIN_DIR}/get_backup_option.bsh
+if [ $? -ne 0 ]; then
+    _err_msg_="Error while executing ${ENIQ_BACKUP_BIN_DIR}/get_backup_option.bsh"
+    abort_script "$_err_msg_"
+fi
+
+# Collect data for OMBS backup from all servers
+dump_ombs_data
+
+# Share /eniq/backup dir with OMBS server
+share_nfs_dir
+
+# Update crontab
+update_crontab
+
+log_msg -t -h -s "Successfully executed ${ENIQ_BACKUP_BIN_DIR}/get_ombs_info.bsh" -l ${LOGFILE}
+
+$RM -rf ${TEM_DIR}
+
+exit 0

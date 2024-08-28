@@ -1,0 +1,397 @@
+#!/bin/bash
+# ********************************************************************
+# Ericsson Radio Systems AB                                     SCRIPT
+# ********************************************************************
+#
+#
+# (c) Ericsson Radio Systems AB 2018 - All rights reserved.
+#
+# The copyright to the computer program(s) herein is the property
+# of Ericsson Radio Systems AB, Sweden. The programs may be used
+# and/or copied only with the written permission from Ericsson Radio
+# Systems AB or in accordance with the terms and conditions stipulated
+# in the agreement/contract under which the program(s) have been
+# supplied.
+#
+# ********************************************************************
+# Name    : call_dtrace.bsh
+# Date    : 16/01/2019
+# Revision: \main\13
+# Purpose : Starts dtrace on a server.
+#
+# Usage   : call_dtrace.bsh -a start
+#
+# ********************************************************************
+#
+#       Command Section
+#
+# ********************************************************************
+BASENAME=/usr/bin/basename
+DATE=/usr/bin/date
+DIRNAME=/usr/bin/dirname
+ECHO='/usr/bin/echo -e'
+EGREP=/usr/bin/egrep
+GREP=/usr/bin/grep
+MKDIR=/usr/bin/mkdir
+MYHOSTNAME=/usr/bin/hostname
+PS=/usr/bin/ps
+RM=/usr/bin/rm
+SLEEP=/usr/bin/sleep
+SU=/usr/bin/su
+TEE=/usr/bin/tee
+TOUCH=/usr/bin/touch
+UNAME=/usr/bin/uname
+
+# ********************************************************************
+#
+#       Configuration Section
+#
+# ********************************************************************
+# Default user
+DEFAULT_USER=root
+DCUSER=dcuser
+
+# Name of SunOS & ENIQ ini Files
+ENIQ_ENV=niq.rc
+ENIQ_INI=niq.ini
+SUNOS_INI=SunOS.ini
+
+# Determine Solaris OS version
+unset SOLARIS_10
+OS_VERSION=`$UNAME -r`
+if [ "${OS_VERSION}" == "5.10" ]; then
+    SOLARIS_10="YES"
+fi
+
+# DVD LABEL or Jumpstart Directory where all ENIQ SW will reside
+ENIQ_BASE_SW=eniq_base_sw
+
+# Directory on the root filesystem
+ENIQ_BASE_DIR=/eniq
+
+# Admin directory in the ENIQ filesystem
+ENIQ_ADMIN_DIR=${ENIQ_BASE_DIR}/admin
+
+HNAME=`${MYHOSTNAME}`
+
+#smf_contract_config
+ENIQ_CORE_DIR=${ENIQ_BASE_DIR}/installation/core_install
+
+ENIQ_CONF_DIR=${ENIQ_BASE_DIR}/installation/config
+
+CLI_CONF_DIR=${ENIQ_BASE_DIR}/sw/conf
+
+GET_IP_ORDER_SCRIPT=${ENIQ_CORE_DIR}/lib/get_ip_order.pl
+if [ ! -s "${GET_IP_ORDER_SCRIPT}" ]; then
+        _err_msg_="Could not find script: ${GET_IP_ORDER_SCRIPT}"
+        abort_script "$_err_msg_" "${EXEC_SHELL_CMD}"
+fi
+
+DTRACE_LOG_DIRECTORY=${ENIQ_BASE_DIR}/local_logs/Dtrace
+
+# Define path to dtrace flag file.
+# This will disable dtrace when it's created/touched.
+FLAG_FILE=stop_dtrace.txt
+DISABLE_DTRACE_FLAG_FILE=${DTRACE_LOG_DIRECTORY}/${FLAG_FILE}
+
+# Define path to dtrace symlink log file.
+# This will hold the symlinks.
+RUN_TIME=`$DATE '+%Y-%b-%d_%H.%M.%S'`
+DTRACE_SYMLINK_LOG_FILE=${DTRACE_LOG_DIRECTORY}/dtrace_symlink_log_${RUN_TIME}.txt
+
+# Define path to regeneration script.
+REGENERATION_SCRIPT=${ENIQ_ADMIN_DIR}/bin/regenerate_symlinks.bsh
+
+# Set the log directory
+LOGFILE_DIR="$ENIQ_BASE_DIR/log/feature_management_log"
+
+# Define log file for the script
+LOGFILE=${LOGFILE_DIR}/${HNAME}_${RUN_TIME}_call_dtrace.log
+
+# Dtrace script:
+DTRACE_SCRIPT=${ENIQ_ADMIN_DIR}/bin/es_start_dtrace.d
+
+
+# Regex to exclude MZ temporary files:
+SYMLINK_FILTER="partial\.[0-9]+$|base_[0-9]+$|batch_[0-9]+\.dat$|full\.[0-9]+$|\.tagfile|<none>"
+
+# Dtrace failed flag file:
+DTRACE_FAILED_FILE=${LOGFILE_DIR}/dtrace_failure.log
+
+# ********************************************************************
+#
+#       Functions
+#
+# ********************************************************************
+### Function: abort_script ###
+#
+#   This will is called if the script is aborted thru an error
+#   error signal sent by the kernel such as CTRL-C or if a serious
+#   error is encountered during runtime
+#
+# Arguments:
+#       $1 - Error message from part of program (Not always used)
+# Return Values:
+#       none
+abort_script()
+{
+_err_time_=`$DATE '+%Y-%b-%d_%H.%M.%S'`
+
+if [ "$1" ]; then
+    _err_msg_="${_err_time_} - $1"
+else
+    _err_msg_="${_err_time_} - ERROR : Script aborted.......\n"
+fi
+
+if [ "${LOGFILE}" ]; then
+    $ECHO "\nERROR : $_err_msg_\n"|$TEE -a ${LOGFILE}
+else
+    $ECHO "\nERROR : $_err_msg_\n"
+fi
+
+# Clean up temporary files:
+cleanup_temporary_files
+
+if [ "$2" ]; then
+    ${2}
+else
+   exit 1
+fi
+}
+
+### Function: usage_msg ###
+#
+#   Print out the usage message
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+usage_msg()
+{
+$ECHO "
+Usage: `$BASENAME $0` -a {start} [ -l <path_to_logfile> ]
+
+options:
+
+-a  : Action. Must be either
+        start          --> Start the dtrace script
+
+-l  : Optional parameter specifying the full path to logfile. If not specified, a
+      logfile will be created in ${LOGFILE_DIR}"
+}
+
+### Function: start_dtrace ###
+#
+#   Starts the dtrace script.
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+start_dtrace()
+{
+local _check_interval_=10
+local _dtrace_grep_=0
+local _restart_count_=0
+
+log_msg -q -t -l ${LOGFILE} -s "Starting dtrace on ${HNAME}"
+
+# Check if start_dtrace.d is already running:
+$PS -ef | $GREP -i "es_start_dtrace.d" | $GREP -v "grep" > /dev/null 2>&1
+_dtrace_grep_=$?
+
+if [ ${_dtrace_grep_} -eq 0 ]; then
+	log_msg -q -t -l ${LOGFILE} -s "Dtrace already started on ${HNAME}, exiting..."
+	return
+fi
+
+	
+# Run the dtrace script.
+# This will loop until the flag file is created.
+${DTRACE_SCRIPT} | $EGREP --line-buffered -iv "${SYMLINK_FILTER}" >> ${DTRACE_SYMLINK_LOG_FILE} &
+local _dtrace_pid_=$!
+log_msg -q -t -l ${LOGFILE} -s "Dtracing Process ID ${_dtrace_pid_} (use ptree ${_dtrace_pid_} to check this)."
+
+sleep ${_check_interval_}
+
+
+while [ ! -f ${DISABLE_DTRACE_FLAG_FILE} ]; do
+	# Grep for start_dtrace.d:
+	$PS -ef | $GREP -i "start_dtrace.d" | $GREP -v "grep" > /dev/null 2>&1
+	_dtrace_grep_=$?
+	
+	if [ ${_dtrace_grep_} -ne 0 ]; then
+		if [ ${_restart_count_} -ge 3 ]; then
+			# Put engine into noloads if dtrace has failed 3 or more times:
+			log_msg -q -t -l ${LOGFILE} -s "Setting engine to NoLoads."
+			# Try to put engine into NoLoads.
+			local _retry_profile_count_=3
+			while [ ${_retry_profile_count_} -gt 0 ]; do
+				set_engine_profile "NoLoads"
+				if [ $? -eq 0 ]; then
+					break
+				else
+					log_msg -q -t -l ${LOGFILE} -s "Failed to set engine to NoLoads."
+				fi
+				let _retry_profile_count_=_retry_profile_count_-1
+			done
+			# Create failed flag file:
+			log_msg -q -t -l ${DTRACE_FAILED_FILE} -s "Error: Dtrace has failed on server ${HNAME}"
+			break
+		else
+			# Dtrace has stopped, restart it:
+			log_msg -q -t -l ${LOGFILE} -s "Dtrace process not found. Restarting..."
+			${DTRACE_SCRIPT} | $EGREP --line-buffered -iv "${SYMLINK_FILTER}" >> ${DTRACE_SYMLINK_LOG_FILE} &
+			_dtrace_pid_=$!
+			let _restart_count_=_restart_count_+1
+			log_msg -q -t -l ${LOGFILE} -s "Restarted dtrace. New process ID is: ${_dtrace_pid_}"
+		fi
+	else
+		log_msg -q -t -l ${LOGFILE} -s "Dtrace still Running Process ID $_dtrace_pid_"
+	fi
+	
+	sleep ${_check_interval_}
+done
+
+if [ ${_restart_count_} -ge 3 ]; then
+	log_msg -q -t -l ${LOGFILE} -s "Exiting: dtrace was restarted 3 times but failed."	
+elif [ -f ${DISABLE_DTRACE_FLAG_FILE} ]; then
+	log_msg -q -t -l ${LOGFILE} -s "Exiting, 'manage_dtrace.bsh -a disable' called."
+fi
+
+# Before exiting kill the dtrace process:
+local _retry_kill_count_=3
+while [ ${_retry_kill_count_} -gt 0 ]; do
+	# This will kill all of the child processes:
+	# Use kill -9 to do this because the child processes have
+	# the same traps as this script:
+	kill -9 $(jobs -p)
+	# Check if the process is still running:
+	${SLEEP} 5
+	${PS} -p ${_dtrace_pid_} > /dev/null 2>&1
+	if [ $? -ne 0 ]; then
+		# Dtrace process not found, break:
+		break
+	else
+		log_msg -q -t -l ${LOGFILE} -s "Dtrace process still running, retrying..."
+	fi
+	let _retry_kill_count_=_retry_kill_count_-1
+done
+
+if [ ${_retry_kill_count_} -le 1 ]; then
+	log_msg -t -l ${LOGFILE} -s "WARNING: failed to terminate Dtrace process."
+	log_msg -t -l ${LOGFILE} -s "Please try to terminate the process manually. Process id is: ${_dtrace_pid_}"
+fi
+
+cleanup_temporary_files	
+log_msg -q -t -l ${LOGFILE} -s "Terminated dtrace process."
+log_msg -q -t -l ${LOGFILE} -s "Finished Dtrace!"
+}
+
+### Function: cleanup_temporary_files ###
+#
+#   Cleans up files created by the script.
+#   Note: this does not remove the symlink log file.
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+cleanup_temporary_files()
+{
+if [ -f ${DISABLE_DTRACE_FLAG_FILE} ]; then
+        ${RM} -f ${DISABLE_DTRACE_FLAG_FILE}
+fi
+}
+
+### Function: setup_logfile ###
+#
+# Make sure the log file is created.
+#
+# Arguments:
+#   $1 : Log file
+# Return Values:
+#	none
+setup_logfile() 
+{
+local _log_file_=$1
+
+$MKDIR -p `$DIRNAME ${_log_file_}`
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not create directory for logfile: `$DIRNAME ${_log_file_}`"
+     abort_script "$_err_msg_"
+fi
+
+if [ ! -f "${_log_file_}" ]; then
+    $TOUCH -a ${_log_file_}
+	if [ $? -ne 0 ]; then
+		_err_msg_="Could not write to file ${_log_file_}"
+		abort_script "$_err_msg_"
+	fi
+fi
+}
+
+# ********************************************************************
+#
+#       Main body of program
+#
+# ********************************************************************
+#
+# Source the common functions
+if [ -s ${ENIQ_BASE_DIR}/admin/lib/common_functions.lib ]; then
+    . ${ENIQ_BASE_DIR}/admin/lib/common_functions.lib
+else
+    _err_msg_="File ${ENIQ_BASE_DIR}/admin/lib/common_functions.lib not found"
+    abort_script "$_err_msg_"
+fi
+
+if [ ! -d ${DTRACE_LOG_DIRECTORY} ]; then
+	$SU - ${DCUSER} -c "${MKDIR} -p ${DTRACE_LOG_DIRECTORY}"
+fi
+
+# Clean up flag file and pid file from previous run:
+cleanup_temporary_files
+
+# Get command line options:
+while getopts ":a:l:" arg; do
+  case $arg in
+  a) ACTION="$OPTARG"
+       ACTION_SPECIFIED="YES"
+       ;;
+  l) LOGFILE="$OPTARG"
+       ;;
+  *) usage_msg
+       exit 1
+       ;;
+  esac
+done
+
+if [ -z ${ACTION_SPECIFIED} ]; then
+        usage_msg
+	exit 1
+fi
+
+# Set up logfile:
+setup_logfile ${LOGFILE}
+
+# Trap interrupts ( do nothing )
+
+# Run if Hang up detected on controlling terminal -SIGHUP
+# Run if user sends an interrupt signal (Ctrl + C) -SIGINT
+# Run if Software termination signal (sent by kill by default) -SIGTERM 
+# The SIGABRT signal is sent to a process to tell it to abort, i.e. to terminate -SIGABRT
+# SIGQUIT by default, this causes the process to terminate and dump core -SIGQUIT 
+# SIGTSTP by default, this causes the process to suspend execution. -SIGTSTP
+# SIGUSR1 & SIGUSR2 User-defined signals
+# to test e.g. kill -SIGTERM pid
+trap '' SIGHUP SIGINT SIGTERM SIGABRT SIGQUIT SIGTSTP SIGUSR1 SIGUSR2
+
+
+case "${ACTION}" in
+      start) start_dtrace
+                  ;;
+          *) $ECHO "Unknown action: ${ACTION}"
+                  ;;
+esac
+

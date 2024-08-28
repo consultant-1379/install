@@ -1,0 +1,998 @@
+#!/bin/bash
+# ********************************************************************
+# Ericsson Radio Systems AB      SCRIPT                                    
+# ********************************************************************
+#
+# (c) Ericsson Radio Systems AB 2022 - All rights reserved.
+#
+# The copyright to the computer program(s) herein is the property
+# of Ericsson Radio Systems AB, Sweden. The programs may be used
+# and/or copied only with the written permission from Ericsson Radio
+# Systems AB or in accordance with the terms and conditions stipulated
+# in the agreement/contract under which the program(s) have been
+# supplied.
+#
+# ********************************************************************
+#
+# Name    : continue_eniq_recovery.bsh
+# Date    : 24/01/2022
+# Revision: \main\6
+# Purpose : This script will be called when recovery is       
+#           continued after OS installation is completed.
+#           
+# Usage   : continue_eniq_recovery.bsh
+#
+# ********************************************************************
+#
+#   Command Section
+#
+# ********************************************************************
+AWK=/usr/bin/awk
+BASH=/usr/bin/bash
+CAT=/usr/bin/cat
+CUT=/usr/bin/cut
+CP=/usr/bin/cp
+CPIO=/usr/bin/cpio
+DATE=/usr/bin/date
+DF=/usr/bin/df
+DIRNAME=/usr/bin/dirname
+DU=/usr/bin/du
+ECHO=/usr/bin/echo
+EGREP=/usr/bin/egrep
+EXPR=/usr/bin/expr
+FIND=/usr/bin/find
+GREP=/usr/bin/grep
+MYHOSTNAME=/usr/bin/hostname
+ID=/usr/bin/id
+LS=/usr/bin/ls
+MKDIR=/usr/bin/mkdir
+MV=/usr/bin/mv
+PRINTF=/usr/bin/printf
+PWD=/usr/bin/pwd
+REBOOT=/usr/sbin/reboot
+RM=/usr/bin/rm
+SED=/usr/bin/sed
+STMSBOOT=/usr/sbin/stmsboot
+TEE=/usr/bin/tee
+TOUCH=/usr/bin/touch
+TR=/usr/bin/tr
+WC=/usr/bin/wc
+YES=/usr/bin/yes
+OPENSSL=/usr/bin/openssl
+
+# ********************************************************************
+#
+#       Configuration Section
+#
+# ********************************************************************
+# Cmd to exec a shell and drop user to it in case of an error
+EXEC_SHELL_CMD="exec /bin/bash -o emacs"
+
+# Default user
+DEFAULT_USER=root
+
+# Config file and directory list
+CONFIG_FILE_LIST="hosts"
+
+# Host name
+HNAME=`$MYHOSTNAME`
+
+# Var tmp directory
+VAR_TMP=/var/tmp
+
+# Migration conf directories/files
+REC_DIR=${VAR_TMP}/continue_recovery
+
+# Build an array to store the stage names
+SOL_REC_STAGES=( copy_from_nas_backup
+install_san_sw
+install_storage_api
+configure_storage_api
+enable_mpxio
+cleanup
+)
+
+# Continue migration stage file
+STAGEFILE=${REC_DIR}/curr_stage_continue_recovery
+
+
+# *********************
+#
+# Functions
+#
+# *********************
+
+### Function: abort_script ###
+#
+#   This will be called if the script is aborted through 
+#   error encountered during runtime
+#
+# Arguments:
+#       $1 - Error message from part of program (Not always used)
+#       $2 - EXEC_SHELL_CMD
+# Return Values:
+#       none
+abort_script()
+{
+if [ "$1" ]; then
+    _err_msg_="ERROR: $1"
+else
+    _err_msg_="ERROR: Script aborted......."
+fi
+
+if [ "${LOGFILE}" ]; then
+    $ECHO "\n${_err_msg_}\n" |$TEE -a ${LOGFILE}
+else
+    $ECHO "\n${_err_msg_}\n" 
+fi
+
+cd $SCRIPTHOME
+
+if [ "$2" ]; then
+    ${2} 
+else
+   exit 1
+fi
+}
+
+### Function: check_id ###
+#
+#   Check that the effective id of the user is correct
+#   If not print error msg and exit.
+#
+check_id()
+{
+_check_id_=`$ID | $AWK -F\( '{print $2}' | $AWK -F\) '{print $1}'`
+if [ "$_check_id_" != "$1" ]; then
+    _err_msg_="You must be $1 to execute this script."
+    abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+fi
+}
+
+### Function: check_required_scripts_files ###
+#
+# Checks for few mandatory files which
+# are required for migration to run
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+check_required_scripts_files()
+{
+# Checking Migration conf file exist or not
+if [ ! -s ${MIGRATION_CONF} ]; then
+    _err_msg_="${MIGRATION_CONF} does not exist or empty"
+    abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+fi
+
+logit -q "Required file is present on server"
+}
+
+### Function: cleanup ###
+#
+# Final stage. Clean up
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+cleanup()
+{
+# Remove the TEMP directory
+$RM -rf ${TEM_DIR}
+
+cat ${STAGEFILE} | sed -e "s|enable_mpxio|cleanup|" >/tmp/stage_file
+mv /tmp/stage_file ${STAGEFILE}
+}
+
+### Function: clear ###
+#
+# Clears the terminal screen
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+clear()
+{
+# Clearing the screen without removing scrollback buffer
+$PRINTF '\33[H\33[2J'
+}
+
+### Function: configure_storage_api ###
+#
+# Configure storage API
+#
+# Arguments:
+#   none 
+# Return Values:
+#    none
+configure_storage_api()
+{
+insert_header_footer head "Entering stage - ${NEXT_STAGE}" ${LOGFILE}
+
+# Host Agent IP
+HOST_AGENT_IP=`read_value HOST_AGENT_IP ${MIGRATION_CONF}` || abort_script "${HOST_AGENT_IP}" "${EXEC_SHELL_CMD}"
+
+SAN_DEVICE=`$CAT ${ENIQ_CONF_DIR}/san_details | $EGREP "^SAN_DEVICE=" | $AWK -F\= '{print $2}'`
+if [ ! "${SAN_DEVICE}" ]; then
+    _err_msg_="Could not read SAN_DEVICE type from ${ENIQ_CONF_DIR}/san_details."
+    abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+fi
+
+# Check if storage is configured
+logit "Checking if storage is already configured."
+_storage_conf_file_=${ERICSSON_STOR_DIR}/san/plugins/${SAN_DEVICE}/etc/clariion.conf
+if [ -s "${_storage_conf_file_}" ];then
+    logit "Storage is already configured.\n"
+    set_next_stage `$EXPR ${ARRAY_ELEM}+1`
+    insert_header_footer foot "Successfully completed stage - ${NEXT_STAGE} " ${LOGFILE}
+    return 0
+else    
+    # Verifying the existence/executable status of storage api command
+    if [ ! -x ${_stor_api_cmd_} ]; then
+        _err_msg_="${_stor_api_cmd_} is not found or is not executable"
+        abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+    fi
+
+    _stor_det_file_=${TEM_DIR}/store_api_det_file
+    $RM -rf ${_stor_det_file_}
+
+    logit "INFO: Configuring Storage device"
+    # Get required SAN details from migration conf file
+    _stor_name_=`read_value STORAGE_NAME_1 ${MIGRATION_CONF}` || abort_script "${_stor_name_}" "${EXEC_SHELL_CMD}"
+    _stor_admin_=`read_value STORAGE_ADMIN_1 ${MIGRATION_CONF}` || abort_script "${_stor_admin_}" "${EXEC_SHELL_CMD}"
+    _stor_pass_=`read_value STORAGE_PASS_1 ${MIGRATION_CONF}`
+    if [ $? -ne 0 ]; then
+        while [ 1 ]
+        do
+            $ECHO "Please enter the admin user password of $_stor_name_"
+            read _admin_stor_pass_
+            if [ ! "${_admin_stor_pass_}" ];then
+                continue
+            else
+               	_admin_stor_pass_=`$ECHO ${_admin_stor_pass_} | $OPENSSL enc -base64 `
+			if [ $? -ne 0 ]; then
+				_err_msg_="Unable to encrypt the storage password."
+				abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+			fi
+		set_conf_value "STORAGE_PASS_1" ${_admin_stor_pass_} ${MIGRATION_CONF}
+                break
+            fi
+        done
+    fi
+	#Decrypting Storage password
+        _stor_pass_=`$ECHO ${_stor_pass_} | $OPENSSL enc -base64 -d`
+        if [ $? -ne 0 ]; then
+            _err_msg_="Unable to decrypt the storage password."
+            abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+        fi
+    _stor_spa_=`read_value STORAGE_SPA_1 ${MIGRATION_CONF}` || abort_script "${_stor_spa_}" "${EXEC_SHELL_CMD}"
+    _stor_spb_=`read_value STORAGE_SPB_1 ${MIGRATION_CONF}` || abort_script "${_stor_spb_}" "${EXEC_SHELL_CMD}"
+    _stor_group_=`read_value STORAGE_GROUP_1 ${MIGRATION_CONF}` || abort_script "${_stor_group_}" "${EXEC_SHELL_CMD}"
+
+    if [ ! -s ${_stor_det_file_} ]; then
+        $ECHO "agentip=${HOST_AGENT_IP}" > ${_stor_det_file_}
+    fi
+
+    $ECHO "${SAN_DEVICE}=${_stor_name_}:${_stor_admin_}:${_stor_pass_}:${_stor_spa_}:${_stor_spb_}:${_stor_group_}" >> ${_stor_det_file_}
+
+    # Check stor api file
+    if [ ! -s ${_stor_det_file_} ];then
+        _err_msg_="Unable to store SAN data in ${_stor_det_file_} file."
+        abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+    fi
+
+    # Register the server with the SAN and see the Luns
+    logit "Executing command:\n${_stor_api_cmd_} --action configure --plugin ${SAN_DEVICE} --config ${_stor_det_file_}\n"
+    ${_stor_api_cmd_} --action configure -plugin ${SAN_DEVICE} --config ${_stor_det_file_}
+    if [ $? -ne 0 ]; then
+        _error_msg_="Unable to configure SAN."
+        abort_script "${_error_msg_}" "${EXEC_SHELL_CMD}" 
+    fi
+
+    logit "INFO: Successfully configured Storage API.\n"
+
+    insert_header_footer foot "Successfully completed stage - ${NEXT_STAGE} " ${LOGFILE}
+    set_next_stage `$EXPR ${ARRAY_ELEM} + 1`
+
+    $TOUCH /reconfigure
+    $ECHO "============================================"
+    logit "WARNING: Server will now be rebooted..."
+    $ECHO "============================================"
+    # Rebooting the server
+    $REBOOT
+fi
+}
+
+### Function: copy_from_nas_backup ###
+#
+#   copy files from NAS to server
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+copy_from_nas_backup()
+{
+insert_header_footer head "Entering stage - ${NEXT_STAGE}" ${LOGFILE}
+
+# Create /eniq/installation directory
+$MKDIR -p ${ENIQ_INST_DIR}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not create directory ${ENIQ_INST_DIR}"
+    abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+fi
+
+# Create /eniq/local_logs directory
+$MKDIR -p ${ENIQ_LOCAL_LOGS_DIR}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not create directory ${ENIQ_LOCAL_LOGS_DIR}"
+    abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+fi
+
+# Copy installation, local_logs and /var/tmp/upgrade directory from NAS backup
+logit "Copying installation directory from NAS backup"
+restore_data_from_NAS ${ENIQ_PORTBACKUP}/${HNAME}/ZFS/${ENIQ_INST_DIR} ${ENIQ_INST_DIR}
+
+#Checking the available size of ROOT file system and keeping 5GB buffer size while copying local_logs
+_size_port_=`$DU -sk ${ENIQ_PORTBACKUP}/${HNAME}/ZFS/${ENIQ_LOCAL_LOGS_DIR} |$AWK '{print $1}'`
+_size_port_local_log_=`$EXPR 2 \* ${_size_port_}`
+_size_root_avail_=`$DF -k / |$AWK 'NR==2{print $4}'`
+
+#Removing flag file of successfully copy of eniq/local_logs
+$RM -rf ${VAR_TMP}/local_logs_sucess
+
+#keeping 5GB buffer size
+_size_root_=`$EXPR ${_size_root_avail_} - 5242880`
+#copying the local logs from NAS backup if sufficient space are available
+if [ ${_size_port_local_log_} -lt ${_size_root_} ]; then 
+    logit "\nCopying All the local_logs directory from NAS backup"
+    restore_data_from_NAS ${ENIQ_PORTBACKUP}/${HNAME}/ZFS/${ENIQ_LOCAL_LOGS_DIR} ${ENIQ_LOCAL_LOGS_DIR}
+    #Creating a flag file in order to indicate all local_logs are restored
+    $TOUCH ${VAR_TMP}/local_logs_sucess
+else 
+    logit "\nCopying Selective local_logs directory from NAS backup"
+    for _log_dir_ in `$ECHO ${LOCAL_LOGS_LIST}`; do
+        if [ -d ${ENIQ_PORTBACKUP}/${HNAME}/ZFS/${ENIQ_LOCAL_LOGS_DIR}/${_log_dir_} ] || [ -f ${ENIQ_PORTBACKUP}/${HNAME}/ZFS/${ENIQ_LOCAL_LOGS_DIR}/${_log_dir_} ]; then
+            _size_dir_=`$DU -sk ${ENIQ_PORTBACKUP}/${HNAME}/ZFS/${ENIQ_LOCAL_LOGS_DIR}/${_log_dir_} |$AWK '{print $1}'`
+            _size_root_avail_=`$DF -k / |$AWK 'NR==2{print $4}'`
+            _size_root_=`$EXPR ${_size_root_avail_} - 5242880`
+            if [ ${_size_dir_} -lt ${_size_root_} ]; then
+                logit "\nCopying ${ENIQ_LOCAL_LOGS_DIR}/${_log_dir_} directory from NAS backup"
+                $CP -pr ${ENIQ_PORTBACKUP}/${HNAME}/ZFS/${ENIQ_LOCAL_LOGS_DIR}/${_log_dir_} ${ENIQ_LOCAL_LOGS_DIR}
+            else
+                logit "\nSufficient space is not available on root partition. Unable to copy ${ENIQ_LOCAL_LOGS_DIR}/${_log_dir_} directory from NAS backup. Files will be attempted to copy later."
+            fi
+        fi
+    done
+fi
+
+logit "\nCopying /var/tmp/upgrade directory from NAS backup"
+restore_data_from_NAS ${ENIQ_PORTBACKUP}/${HNAME}/ROOT/${VAR_TMP} ${VAR_TMP}
+
+# Copying /etc/hosts file from NAS backup
+for _file_ in `$ECHO ${CONFIG_FILE_LIST}`; do
+    logit "\nCopying ${_file_} file from NAS backup"
+    $CAT ${ROOT_ETC}/${_file_} > /etc/${_file_}
+    if [ $? -ne 0 ]; then
+       _err_msg_="Failed to copy ${_file_} to /etc directory"
+       abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+    fi
+done
+
+# Check mandatory scripts and config files are available
+check_required_scripts_files
+
+logit "Copy contents from NAS has been completed"
+
+insert_header_footer foot "Successfully completed stage - ${NEXT_STAGE} " ${LOGFILE}
+
+set_next_stage `$EXPR ${ARRAY_ELEM} + 1`
+}
+
+### Function: enable_mpxio ###
+#
+# Enable mpxio on Solaris X86 box
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+enable_mpxio()
+{
+insert_header_footer head "Entering stage - ${NEXT_STAGE}" ${LOGFILE}
+
+if [ ! -d "${DRV_DIR}" ]; then
+    _err_msg_="Cannot locate directory ${DRV_DIR}"
+    abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+fi
+# Turn off MPXIO
+if [ -s ${DRV_DIR}/fp.conf ]; then
+    if [ ! -s ${DRV_DIR}/fp.conf.orig ]; then
+        $CP -p ${DRV_DIR}/fp.conf ${DRV_DIR}/fp.conf.orig
+    fi
+    $SED -e 's|^[       ]*mpxio-disable=.*|mpxio-disable="no";|' ${DRV_DIR}/fp.conf > ${TEM_DIR}/fp.conf
+    $CP ${TEM_DIR}/fp.conf ${DRV_DIR}/fp.conf
+fi
+
+logit "Multipathing Successfully enabled"
+insert_header_footer foot "Successfully completed stage - ${NEXT_STAGE} " ${LOGFILE}
+
+# Calling cleanup function
+cleanup
+
+$ECHO "\nAll stages of continue_eniq_recovery are successfully completed\n"
+
+$ECHO "==========================================="
+logit "WARNING: Server will now be rebooted..."
+$ECHO "==========================================="
+
+#Rebooting server
+$YES | $STMSBOOT -e >> /dev/null 2>&1
+
+# If stms is already enabled stmsboot will not take place then display following message
+$ECHO "======================================================"
+logit "STMS is already enabled. No changes or reboot needed"
+$ECHO "======================================================"
+}
+
+### Function: get_absolute_path ###
+#
+# Determine absolute path to software
+#
+get_absolute_path()
+{
+_dir_=`$DIRNAME $0`
+SCRIPTHOME=`cd $_dir_ 2>/dev/null && pwd || $ECHO $_dir_`
+
+}
+
+### Function: get_array_element ###
+#
+# Get the current array element number
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+get_array_element()
+{
+_array_length_=${#SOL_REC_STAGES[*]}
+_array_length_=`${EXPR} ${_array_length_} - 1`
+
+for (( _elem_=0; _elem_<=${_array_length_}; _elem_++ )); do
+    $ECHO ${SOL_REC_STAGES[${_elem_}]} | $GREP -w ${NEXT_STAGE} >> /dev/null 2>&1
+    if [ $? -eq 0 ]; then
+        ARRAY_ELEM=${_elem_}
+        break
+    fi
+done
+}
+
+### Function: get_next_stage ###
+#
+# Get the stage to be run
+#
+get_next_stage()
+{
+ARRAY_ELEM=0
+
+if [ -s ${STAGEFILE} ]; then
+    NEXT_STAGE=`$CAT ${STAGEFILE}|$EGREP -v '^[ 	]*#' | $SED -e 's| ||g'`
+    if [ ! "$NEXT_STAGE" ]; then
+        _err_msg_="ERROR: Failed to read stage from ${STAGEFILE}, exiting."
+        abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+    fi
+    if [ "$NEXT_STAGE" == "cleanup" ]; then
+        return 0
+    else
+        $ECHO ${SOL_REC_STAGES[*]} | $GREP -w ${USER_STAGE} >> /dev/null 2>&1
+        if [ $? -eq 0 ]; then
+            _err_msg_="Specified stage ${USER_STAGE} is not a valid stage"
+            abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+        fi
+    fi
+    # Get the element number so we can move along the array
+    get_array_element
+else
+    $MKDIR -p `$DIRNAME ${STAGEFILE}`
+    if [ $? -ne 0 ]; then
+        _err_msg_="Failed to create directory `$DIRNAME ${STAGEFILE}`, exiting."
+        abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+    fi
+    NEXT_STAGE=${SOL_REC_STAGES[${ARRAY_ELEM}]}
+fi
+}
+
+### Function: insert_header_footer ###
+#
+#   Insert a stage header/footer message
+#
+# Arguments:
+#   $1 : head/foot
+#   $2 : Message
+#   $3 : Logfile
+# Return Values:
+#   none
+insert_header_footer()
+{
+if [ $# -ne 3 ]; then
+    _err_msg_="3 Parameters must be passed to header/footer function"
+    abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+fi	
+
+_type_=$1
+_msg_=$2
+_logfile_=$3
+
+if [ "$_type_" != "banner" -a "$_type_" != "head" -a "$_type_" != "foot" ]; then
+    _err_msg_="Only Param of banner/head/foot is allowed...exiting!"
+    abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+fi
+
+$MKDIR -p `$DIRNAME ${_logfile_}`
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not create directory `$DIRNAME ${_logfile_}`"
+    abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+fi
+
+$TOUCH -a ${_logfile_}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not write to file ${_logfile_}"
+    abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+fi
+
+_time_=`$DATE '+%Y-%b-%d_%H.%M.%S'`
+if [ "$_type_" == "banner" ]; then
+    $ECHO "\n=====================================================" | $TEE -a ${_logfile_}
+    $ECHO "-----------------------------------------------------" | $TEE -a ${_logfile_}
+    $ECHO "$_msg_" | $TEE -a ${_logfile_}
+    $ECHO "-----------------------------------------------------" | $TEE -a ${_logfile_}
+    $ECHO "=====================================================\n" | $TEE -a ${_logfile_}
+fi
+
+if [ "$_type_" == "head" ]; then
+    $ECHO "\n=====================================================" | $TEE -a ${_logfile_}
+    $ECHO "-----------------------------------------------------" | $TEE -a ${_logfile_}
+    $ECHO "$_time_ : $_msg_" | $TEE -a ${_logfile_}
+    $ECHO "-----------------------------------------------------" | $TEE -a ${_logfile_}
+fi
+
+if [ "$_type_" == "foot" ]; then
+    $ECHO "\n-----------------------------------------------------" | $TEE -a ${_logfile_}
+    $ECHO "$_time_ : $_msg_" | $TEE -a ${_logfile_}
+    $ECHO "-----------------------------------------------------" | $TEE -a ${_logfile_}
+    $ECHO "=====================================================\n" | $TEE -a ${_logfile_}
+fi
+}
+
+### Function: install_san_sw ###
+#
+# Install EMC SW
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+install_san_sw()
+{
+insert_header_footer head "Entering stage - ${NEXT_STAGE}" ${LOGFILE}
+
+# Calling install_san_sw stage from eniq_core_install.bsh
+$BASH ${ENIQ_CORE_INST_SCRIPT} -s install_san_sw  ${ENIQ_CORE_INST_ARG}
+if [ $? -ne 0 ]; then
+    _err_msg_="Failed in ${ACTION_TYPE} stage - install_san_sw"
+    abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+fi
+
+insert_header_footer foot "Successfully completed stage - ${NEXT_STAGE} " ${LOGFILE}
+
+set_next_stage `$EXPR ${ARRAY_ELEM} + 1`
+}
+
+### Function: install_storage_api ###
+#
+# Install Storage API
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+install_storage_api()
+{
+insert_header_footer head "Entering stage - ${NEXT_STAGE}" ${LOGFILE}
+
+# Calling install_storage_api stage from eniq_core_install.bsh
+$BASH ${ENIQ_CORE_INST_SCRIPT} -s install_storage_api ${ENIQ_CORE_INST_ARG}
+if [ $? -ne 0 ]; then
+    _err_msg_="Failed in ${ACTION_TYPE} stage - install_storage_api"
+    abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+fi
+
+insert_header_footer foot "Successfully completed stage - ${NEXT_STAGE} " ${LOGFILE}
+
+set_next_stage `$EXPR ${ARRAY_ELEM} + 1`
+}
+
+### Function: logit ###
+#
+#   Displays message to user and logs as well
+#   including timestamp
+#
+# Arguments:
+#   $1 : Message to be logged
+# Return Values:
+#   None
+logit()
+{
+unset _quiet_
+_usage_msg_='
+Usage:
+    logit "<msg>"    : To display and log the message
+    logit -q "<msg>" : To log the message
+'
+if [ $# -lt 1 ]; then
+    $ECHO "ERROR: No arguments passed to logit function."
+    $ECHO "${_usage_msg_}"
+    exit 1
+fi
+
+if [ $# -gt 2 ]; then
+    $ECHO "ERROR: logit function accepts two arguments at most."
+    $ECHO "${_usage_msg_}"
+    exit 1
+fi
+
+# Get the message
+if [ "$1" == "-q" ]; then
+    _quiet_="YES"
+    _msg_="$2"
+else
+    _msg_="$1"
+fi
+
+# Get the timestamp
+_timestamp_=`$DATE '+%Y-%m-%d_%H:%M:%S'`
+
+# Print the message
+if [ "${LOGFILE}" ]; then
+    $ECHO "${_timestamp_}:: ${_msg_}" >> ${LOGFILE}
+fi
+
+if [ ! "${_quiet_}" ]; then
+    $ECHO "${_msg_}\n"
+fi
+}
+
+### Function: print_heading ###
+#
+#   Displays message to user formatted with 
+#   '-' in next line
+#
+# Arguments:
+#   $1 : Message to be formatted
+# Return Values:
+#   None
+print_heading()
+{
+_msg_="$*"
+_len_=50
+if [ "${_msg_}" ]; then
+    _len_=`$ECHO ${_msg_} | $WC -c`
+fi
+
+# Print message followed by line of '-' below
+$ECHO "\n${_msg_}" 
+$PRINTF "%-${_len_}s" | $TR ' ' '-'
+}
+
+### Function: read_value ###
+#
+#   Common function to get value from file
+#   having the param=value format
+#
+# Arguments:
+#       $1 : Parameter name
+#       $2 : File name
+# Return Values:
+#       $_value_
+read_value()
+{
+if [ $# -ne 2 ];then
+    _err_msg_="Incorrect number of arguments passed to read_value"
+    $ECHO "${_err_msg_}"
+    exit 1
+fi
+
+_param_=$1
+_file_=$2
+
+if [ ! -s ${_file_} ];then
+    _err_msg_="Could not find ${_file_} to read value from."
+    $ECHO "${_err_msg_}"
+    exit 1
+fi
+
+_value_=""
+# Read the value
+_value_=`$CAT ${_file_} | $GREP "^${_param_}=" | $CUT -f 2 -d =`
+if [ ! "${_value_}" ];then
+    _err_msg_="Could not get the ${_param_} value from ${_file_} file."
+    $ECHO "${_err_msg_}"
+    exit 1
+fi
+$ECHO $_value_
+}
+
+### Function: restore_data_from_NAS ###
+#
+#   Dumping data back to ENIQ from NAS
+#
+# Arguments:
+#       $1 - Source Directory
+#       $2 - Target Directory
+# Return Values:
+#       none
+restore_data_from_NAS()
+{
+for _dir_ in `$ECHO $1`; do
+    cd $1
+    $FIND . -xdev -depth -print | $CPIO -pdum $2 >> /dev/null 2>&1
+    if [ $? -ne 0 ]; then
+        _err_msg_="Failed to copy data from NAS backup"
+        abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+    fi
+    cd /
+done
+}
+
+
+### Function: script_interrupt ###
+#
+#   Called if there is interrupt
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+script_interrupt()
+{
+$ECHO "\n"
+logit "User aborted the script $0. Exiting..."
+$RM -rf ${TEM_DIR}
+exit 1
+}
+
+
+### Function: set_conf_value ###
+#
+#   Common function to set value in file
+#   having the param=value format
+#
+# Arguments:
+#       $1 : Parameter name
+#       $2 : Value
+#       $3 : File name
+# Return Values:
+#       none
+set_conf_value()
+{
+if [ $# -ne 3 ];then
+    _err_msg_="Incorrect number of parameters passed to set_conf_value"
+    abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+fi
+
+_param_=$1
+_value_=$2
+_file_=$3
+
+# Update param=value
+# Check if the param exists in file
+$CAT ${_file_} | $GREP "^${_param_}=" >> /dev/null 2>&1
+if [ $? -ne 0 ];then
+    $ECHO "${_param_}=${_value_}" >> ${_file_}
+else
+    $CAT ${_file_} | $SED 's/"${_param_}=*"/"${_param_}=${_value_}"/' > /tmp/updated_file.$$.$$
+    if [ $? -ne 0 ];then
+        _err_msg_="Failed to update ${_param_} value in ${_file_}"
+        abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+    fi
+    $MV -f /tmp/updated_file.$$.$$ ${_file_}
+    if [ $? -ne 0 ];then
+        _err_msg_="Failed to save ${_param_} value in ${_file_}"
+        abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+    fi
+fi
+}
+
+### Function: set_next_stage ###
+#
+# Set up the stage to be run
+#
+# Arguments:
+#   $1 : Stage to be set to. Either numeric value or 'cleanup'
+# Return Values:
+#   none
+set_next_stage()
+{
+_stage_time_=`$DATE '+%Y-%b-%d_%H.%M.%S'`
+$ECHO "# Setting new stage at $_stage_time_" > ${STAGEFILE} | $TEE -a ${LOGFILE}
+$ECHO "${SOL_REC_STAGES[$1]} " >> ${STAGEFILE} | $TEE -a ${LOGFILE}
+}
+
+### Function: setup_recovery_env###
+#
+#   Read NAS details from user
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+setup_recovery_env()
+{
+
+# Driver directory
+DRV_DIR=/etc/driver/drv
+
+# Initialize the variables
+ERICSSON_STOR_DIR=/ericsson/storage
+
+# ENIQ directories
+ENIQ_BASE_DIR=/eniq
+ENIQ_INST_DIR=${ENIQ_BASE_DIR}/installation
+ENIQ_CORE_INST_DIR=${ENIQ_INST_DIR}/core_install
+ENIQ_CONF_DIR=${ENIQ_INST_DIR}/config
+ENIQ_LOCAL_LOGS_DIR=${ENIQ_BASE_DIR}/local_logs
+ENIQ_REC_LOG_DIR=${ENIQ_LOCAL_LOGS_DIR}/recovery
+
+# ENIQ Core Install Script
+ENIQ_CORE_INST_SCRIPT=${ENIQ_CORE_INST_DIR}/bin/eniq_core_install.bsh
+
+#ENIQ Core install arguments
+ENIQ_CORE_INST_ARG="-n -l ${LOGFILE}"
+
+#Local logs
+LOCAL_LOGS_LIST="migration installation iq esm hostsync rolling_snapshot_logs connectd NASd snapshot_logs eniq_services_log replacement sw_log"
+
+# Migration files
+MIGRATION_CONF=${ENIQ_CONF_DIR}/linux_migration_${HNAME}.conf
+
+# Mount directory
+ENIQ_PORTBACKUP=/eniq/portbackup
+
+# Root ETC directory
+ROOT_ETC=${ENIQ_PORTBACKUP}/${HNAME}/ROOT/etc/
+
+# Read location of storage API command
+_stor_api_cmd_=${ERICSSON_STOR_DIR}/san/bin/blkcli
+}
+
+### Function: user_confirm ###
+#
+# This function will confirm the user input
+#
+# Arguments:none
+#       
+# Return Values:_response_ YES/NO
+#       
+user_confirm()
+{
+_usr_msg_=$1
+
+if [ ! "$1" ]; then
+    _usr_msg_="\n\nDo you want to proceed with above values? (Yes/No)"
+fi
+
+unset _response_
+
+while [ 1 ]
+do
+    $ECHO ${_usr_msg_}
+    read ans
+
+    case $ans in
+      Y|y|Yes|yes|yES|YES) _response_="YES"
+                       break
+                       ;;
+      N|n|No|no|nO|NO) _response_="NO"
+                    break
+                    ;;
+      *) $ECHO "Invalid input. Enter again."
+         ;;
+    esac
+done
+}
+
+
+# ********************************************************************
+#
+# 	Main body of program
+#
+# ********************************************************************
+#
+
+RUN_TIME=`$DATE '+%Y-%b-%d_%H.%M.%S'`
+
+trap "script_interrupt" INT
+
+check_id $DEFAULT_USER
+
+get_absolute_path
+
+# Create TEM_DIR
+TEM_DIR=/tmp/continue_recovery.$$.$$
+$MKDIR -p ${TEM_DIR} 
+
+# Create directory for migration operations
+if [ ! -d ${REC_DIR} ]; then
+    $MKDIR -p ${REC_DIR}
+fi
+
+# Logfile name
+LOG_STAMP=`$DATE '+%Y-%b-%d'`
+LOGFILE=${REC_DIR}/continue_eniq_recovery_${LOG_STAMP}.log
+$TOUCH ${LOGFILE} >> /dev/null 2>&1
+
+# Script variables
+SCRIPTPATH=$0
+SCRIPTNAME=`basename $0`
+
+# Set start/resume status
+_status_str_="Starting to run"
+if [ -s ${STAGEFILE} ]; then
+    _status_str_="Resuming"
+fi
+
+insert_header_footer banner "${_status_str_} ${SCRIPTNAME} on $RUN_TIME" ${LOGFILE}
+
+# Copy the script to REC_DIR directory in case of second run
+if [ ! -f ${REC_DIR}/$SCRIPTNAME ];then 
+    $CP $SCRIPTPATH ${REC_DIR} >> /dev/null 2>&1
+    if [ ! -f ${REC_DIR}/$SCRIPTNAME ];then
+        _err_msg_="Failed to copy $SCRIPTNAME to ${REC_DIR}."
+        abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+    fi
+fi
+
+# Setting up all the migration related files and directories
+setup_recovery_env
+
+# Get the stage to run
+get_next_stage
+
+# If we read cleanup from the stagefile
+if [ "$NEXT_STAGE" == "cleanup" ]; then
+    # Clean up as it may not be done already
+    $ECHO "\nAll stages of continue_eniq_recovery are already completed\n" 
+    exit 0    
+fi
+
+while :; do
+    _nxt_stage_="${NEXT_STAGE}"
+    $_nxt_stage_
+    if [ $? -ne 0 ]; then
+        _err_msg_="Error in Stage ${NEXT_STAGE}"
+        abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+    fi
+
+    # If we read cleanup from the stagefile
+    if [ "$NEXT_STAGE" == "cleanup" ]; then
+        break
+    fi
+
+    get_next_stage
+done
+
+# Print completion message
+logit -q "Completed execution of ${SCRIPTNAME}" 
+
+# Copy the log to eniq location
+if [ -d ${ENIQ_REC_LOG_DIR} ]; then
+    logit -q "Copying ${LOGFILE} to ${ENIQ_REC_LOG_DIR} directory"
+    $CP ${LOGFILE} ${ENIQ_REC_LOG_DIR}/
+fi
+
+exit 0
+

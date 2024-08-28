@@ -1,0 +1,660 @@
+#!/bin/bash
+# ********************************************************************
+# Ericsson Radio Systems AB                                     SCRIPT
+# ********************************************************************
+#
+#
+# (c) Ericsson Radio Systems AB 2020 - All rights reserved.
+#
+# The copyright to the computer program(s) herein is the property
+# of Ericsson Radio Systems AB, Sweden. The programs may be used
+# and/or copied only with the written permission from Ericsson Radio
+# Systems AB or in accordance with the terms and conditions stipulated
+# in the agreement/contract under which the program(s) have been
+# supplied.
+#
+#
+# ********************************************************************
+# Name    : eniq_NASd_install.sh
+# Updated : 06/05/2020
+# Revision: main\12
+# Purpose :
+#
+# ********************************************************************
+#
+#         Command Section
+#
+# ********************************************************************
+AWK=/usr/bin/awk
+BASENAME=/usr/bin/basename
+BASH=/usr/bin/bash
+CHMOD=/usr/bin/chmod
+CHOWN=/usr/bin/chown
+CP=/usr/bin/cp
+CPIO=/usr/bin/cpio
+CUT=/usr/bin/cut
+DATE=/usr/bin/date
+DIRNAME=/usr/bin/dirname
+LS=/usr/bin/ls
+ECHO=/usr/bin/echo
+FIND=/usr/bin/find
+GREP=/usr/bin/grep
+GUNZIP=/usr/bin/gunzip
+HOSTNAME=/usr/bin/hostname
+HEAD=/usr/bin/head
+MKDIR=/usr/bin/mkdir
+MV=/usr/bin/mv
+PWD=pwd
+RM=/usr/bin/rm
+RPM=/usr/bin/rpm
+RSYNC=/usr/bin/rsync
+SLEEP=/usr/bin/sleep
+SYSTEMCTL=/usr/bin/systemctl
+TAR=/usr/bin/tar
+TEE=/usr/bin/tee
+TOUCH=/usr/bin/touch
+CMP=/usr/bin/cmp
+
+
+
+
+# ********************************************************************
+#
+#       Configuration Section
+#
+# ********************************************************************
+#
+# Tar.gz file containing install files
+NASd_SOURCE_FILE="/var/tmp/ENIQ_NASd.tar.gz"
+
+# Logfile used for installation
+NASd_INSTALL_LOGFILE="/eniq/local_logs/NASd_install.log"
+LOGFILE=${NASd_INSTALL_LOGFILE}
+# Tempaory directory used during install to unpack files to.
+TEMP_INST_DIR="/tmp/NASd_install/"
+
+readonly SERVER_HOSTNAME=`hostname`
+# Services to install
+# The NAS storage services.
+readonly NAS_online_FMRI="NAS-online.service"
+readonly NASD_SVC="NASd.service"
+# Files to install
+readonly NASd_SVC_FILE="NASd.service"
+readonly NASd_METHOD_FILE="NASd.sh"
+readonly NAS_ONLINE_FILE="NAS-online.service"
+readonly NASd_MONITOR_SCRIPT="NAS_Monitor.bsh"
+readonly NASd_ONLINE_SCRIPT="NAS-online.bsh"
+readonly NASd_VER_DIR="version"
+readonly NASd_VER_FILE="pkginfo"
+# Destination directories for installation
+readonly NASd_SVC_DIR="/etc/systemd/system"
+readonly NASd_SMF_METHOD_DIR="/eniq/smf/bin/"
+readonly NASd_SCRIPTS_DIR="/eniq/smf/nasd/"
+readonly NASd_SMF_VERSION_DIR="/eniq/smf/nasd/version/"
+
+# Used for upgrade. If SVC is started before upgrade then restart after upgrade.
+I_STOPPED_SVC="false"
+# for now, always upgrade
+FORCE_INSTALL="true"
+START_SVC="false"
+
+# ********************************************************************
+#
+#         Functions
+#
+# ********************************************************************
+#
+
+### Function: cleanup ###
+#
+#  Deletes temporary files.
+#
+# Arguments:  none
+# Return Values: 0 for success
+cleanup ()
+{
+    cd ${SCRIPTHOME}
+    #rm -rf ${TEMP_INST_DIR}
+}
+
+
+### Function: get_absolute_path ###
+#
+# Determine absolute path to software
+#
+# Arguments:     none
+# Return Values: none
+get_absolute_path()
+{
+    _dir_=`$DIRNAME $0`
+    SCRIPTHOME=`cd $_dir_ 2>/dev/null && pwd || $ECHO $_dir_`
+}
+
+
+### Function: import_service ###
+#
+#  Importing the service files for NASd
+#
+# Arguments:  none
+# Return Values: 0 for success
+# Uses Global variables:  NASd_SVC_DIR, NASd_SVC_FILE, NASd_SVC_DIR, NAS_ONLINE_FILE
+import_service ()
+{
+    logit " Importing NASd and NAS-Online Service file "
+    ${SYSTEMCTL} daemon-reload >> ${LOGFILE} 2>&1
+    if [ $? -ne 0 ]; then
+        logit "ERROR running command ${SYSTEMCTL} daemon-reload for NASd and NAS-Online Service file"
+        return 1
+    fi
+    
+    ${SYSTEMCTL} enable ${NASd_SVC_FILE}
+    
+}
+
+
+### Function: install_Unit ###
+#
+#  Installs NAS service for NASd Storage.
+#
+# Arguments:  none
+# Return Values: 0 for success
+# Uses Global variables:  NASd_SVC_DIR, NASd_SVC_FILE, NASd_SVC_DIR, NAS_ONLINE_FILE
+#
+install_Unit ()
+{
+     if [ ! -d ${NASd_SVC_DIR} ]; then
+        logit "${NASd_SVC_DIR} does not exist. Creating it."
+        $MKDIR -p ${NASd_SVC_DIR} >> /dev/null 2>&1
+        if [ $? -ne 0 ]; then
+            logit "ERROR creating directory ${NASd_SVC_DIR}"
+            return 1
+        fi
+     fi
+    logit " Copying the NASd Service file."
+    $CP ${TEMP_INST_DIR}/${NASd_SVC_FILE} ${NASd_SVC_DIR} >> /dev/null 2>&1
+    if [ $? -ne 0 ]; then
+        logit "ERROR running command $CP ${TEMP_INST_DIR}/${NASd_SVC_FILE} ${NASd_SVC_DIR} "
+        return 1
+    fi
+    $CHOWN -R root:sys ${NASd_SVC_DIR}/${NASd_SVC_FILE}
+    $CHMOD  444 ${NASd_SVC_DIR}/${NASd_SVC_FILE}
+
+    logit " Installing  NAS-online Service file "
+    
+    logit " Copying the NAS-Online Service file."
+    $CP ${TEMP_INST_DIR}/${NAS_ONLINE_FILE} ${NASd_SVC_DIR} >> /dev/null 2>&1
+    if [ $? -ne 0 ]; then
+        logit "ERROR running command $CP ${TEMP_INST_DIR}/${NAS_ONLINE_FILE} ${NASd_SVC_DIR} "
+        return 1
+    fi
+    $CHOWN -R root:sys ${NASd_SVC_DIR}/${NAS_ONLINE_FILE}
+    $CHMOD  444 ${NASd_SVC_DIR}/${NAS_ONLINE_FILE}
+
+}
+
+
+### Function: install_method ###
+#
+#  Installs SMF start/stop method for NASd Storage.
+#
+# Arguments:  none
+# Return Values: 0 for success
+# Uses Global variables:  NASd_METHOD_FILE, NASd_SMF_METHOD_DIR
+install_method()
+{
+    logit " Installing start/stop Method for NASd"
+    if [ ! -d ${NASd_SMF_METHOD_DIR} ]; then
+        logit "${NASd_SMF_METHOD_DIR} does not exist. Creating it."
+        $MKDIR -p ${NASd_SMF_METHOD_DIR} >> /dev/null 2>&1
+        if [ $? -ne 0 ]; then
+            logit "ERROR creating directory ${NASd_SMF_METHOD_DIR}"
+            return 1
+        fi
+        $CHOWN -R root:sys ${NASd_SMF_METHOD_DIR}
+        $CHMOD  755 ${NASd_SMF_METHOD_DIR}
+    fi
+    logit " Copying the NASd method script."
+    $CP ${TEMP_INST_DIR}${NASd_METHOD_FILE} ${NASd_SMF_METHOD_DIR} >> /dev/null 2>&1
+    if [ $? -ne 0 ]; then
+        logit "ERROR running command $CP ${TEMP_INST_DIR}${NASd_METHOD_FILE} ${NASd_SMF_METHOD_DIR} "
+        return 1
+    fi
+    $CHOWN -R root:sys ${NASd_SMF_METHOD_DIR}/${NASd_METHOD_FILE}
+    $CHMOD  755 ${NASd_SMF_METHOD_DIR}/${NASd_METHOD_FILE}
+    
+    
+}
+### Function: check_version ###
+#
+# Checks Installed NASd version against version to be installed
+#
+# Arguments:  none
+# Return Values: 0 for success
+#                  1 for unsuccessful check
+#                 3 for versions the same
+# Uses Global variables:  NASd_SMF_VERSION_DIR, TEMP_INST_DIR, NASd_VER_DIR, NASd_VER_FILE
+check_version()
+{
+
+    if [ ! -e ${CMP} ]; then
+            logit "ERROR can't check version, ${CMP} doesn't exist"
+            return 1
+
+    else
+        if [ -e ${NASd_SMF_VERSION_DIR}/${NASd_VER_FILE} -a -e ${TEMP_INST_DIR}${NASd_VER_DIR}/${NASd_VER_FILE} ]; then
+        
+            $CMP ${NASd_SMF_VERSION_DIR}/${NASd_VER_FILE} ${TEMP_INST_DIR}${NASd_VER_DIR}/${NASd_VER_FILE}
+            if [ $? -ne 0 ]; then
+                logit "ERROR creating directory ${NASd_SMF_VERSION_DIR}"
+                return 1
+            else
+                logit "NASd version are the same"
+                return 3            
+            fi
+
+        else
+            logit "WARNING directory ${NASd_SMF_VERSION_DIR} doesn't exist  or ${TEMP_INST_DIR}${NASd_VER_DIR} can't check version"
+            return 1
+        
+        fi
+    fi
+}
+### Function: install_NASd_version ###
+#
+#  Installs NASd Monitor version file
+#
+# Arguments:  none
+# Return Values: 0 for success
+# Uses Global variables:  NASd_SMF_VERSION_DIR, TEMP_INST_DIR, NASd_VER_DIR, NASd_VER_FILE
+install_NASd_version()
+{
+    if [ -e ${TEMP_INST_DIR}${NASd_VER_DIR}/${NASd_VER_FILE} ] ;then
+        if [ ! -d ${NASd_SMF_VERSION_DIR} ]; then
+            logit "${NASd_SMF_VERSION_DIR} does not exist. Creating it."
+            $MKDIR -p ${NASd_SMF_VERSION_DIR} >> /dev/null 2>&1
+            if [ $? -ne 0 ]; then
+                logit "ERROR creating directory ${NASd_SMF_VERSION_DIR}"
+                return 1
+            fi
+            $CHOWN -R root:sys ${NASd_SMF_VERSION_DIR}
+        fi
+        logit " Copying the NASd version file."
+        $CP ${TEMP_INST_DIR}${NASd_VER_DIR}/${NASd_VER_FILE} ${NASd_SMF_VERSION_DIR} >> /dev/null 2>&1
+        if [ $? -ne 0 ]; then
+            logit "ERROR running command $CP ${TEMP_INST_DIR}${NASd_MONITOR_version} ${NASd_SMF_VERSION_DIR} "
+            return 1
+        fi
+        $CHOWN -R root:sys ${NASd_SMF_VERSION_DIR}/${NASd_VER_FILE}
+        $CHMOD  744 ${NASd_SMF_VERSION_DIR}/${NASd_VER_FILE}
+    else
+        logit "WARNING ${TEMP_INST_DIR}${NASd_VER_DIR}/${NASd_VER_FILE} doesn't exist"
+        if [ -e ${NASd_SMF_VERSION_DIR}/${NASd_VER_FILE} ] ;then
+            $RM ${NASd_SMF_VERSION_DIR}/${NASd_VER_FILE}
+        fi
+
+        return 1
+    fi
+}
+### Function: install_NASd ###
+#
+#  Installs NASd Monitor Scripts
+#
+# Arguments:  none
+# Return Values: 0 for success
+# Uses Global variables:  NASd_SCRIPTS_DIR, TEMP_INST_DIR, NASd_MONITOR_SCRIPT
+install_NASd()
+{
+    if [ ! -d ${NASd_SCRIPTS_DIR} ]; then
+        logit "${NASd_SCRIPTS_DIR} does not exist. Creating it."
+        $MKDIR -p ${NASd_SCRIPTS_DIR} >> /dev/null 2>&1
+        if [ $? -ne 0 ]; then
+            logit "ERROR creating directory ${NASd_SCRIPTS_DIR}"
+            return 1
+        fi
+        $CHOWN -R root:sys ${NASd_SCRIPTS_DIR}
+    fi
+    logit " Copying the NASd Monitor script."
+    $CP ${TEMP_INST_DIR}${NASd_MONITOR_SCRIPT} ${NASd_SCRIPTS_DIR} >> /dev/null 2>&1
+    if [ $? -ne 0 ]; then
+        logit "ERROR running command $CP ${TEMP_INST_DIR}${NASd_MONITOR_SCRIPT} ${NASd_SCRIPTS_DIR} "
+        return 1
+    fi
+    $CHOWN -R root:sys ${NASd_SCRIPTS_DIR}/${NASd_MONITOR_SCRIPT}
+    $CHMOD  744 ${NASd_SCRIPTS_DIR}/${NASd_MONITOR_SCRIPT}
+    
+    logit " Copying the NAS-online script."
+    $CP ${TEMP_INST_DIR}${NASd_ONLINE_SCRIPT} ${NASd_SCRIPTS_DIR} >> /dev/null 2>&1
+    if [ $? -ne 0 ]; then
+        logit "ERROR running command $CP ${TEMP_INST_DIR}${NASd_ONLINE_SCRIPT} ${NASd_SCRIPTS_DIR} "
+        return 1
+    fi
+    $CHOWN -R root:sys ${NASd_SCRIPTS_DIR}/${NASd_ONLINE_SCRIPT}
+    $CHMOD  744 ${NASd_SCRIPTS_DIR}/${NASd_ONLINE_SCRIPT}
+}
+
+
+### Function: logit ###
+#
+#  Logs Messages to default logfile "LOGFILE"
+#
+# Uses Global Variables: "LOGFILE", "SERVER_HOSTNAME"
+# Arguments:  log_message
+# Return Values: 0 for success
+#                 1 for error LOGFILE undefined
+logit ()
+{
+    local _log_msg
+    local _id=`id | cut -f1 -d " "`
+
+    if [ -n "${1}" ]; then
+        _log_msg="${_id}::${SERVER_HOSTNAME}:: `$DATE '+%Y-%b-%d_%H.%M.%S'`:: ${1}"
+    else
+        _log_msg="${_id}::${SERVER_HOSTNAME}:: Error in Script $0 at `$DATE '+%Y-%b-%d_%H.%M.%S'`\n"
+    fi
+
+    if [ "${LOGFILE}" ]; then
+        $ECHO -e "${_log_msg}\n" >> ${LOGFILE}
+        return 0
+    else
+        $ECHO -e "\n${_log_msg}\n"
+        return 1
+    fi
+}
+
+
+### Function: start_SVC ###
+#
+#  Starts NASd service
+#
+# Arguments:  none
+# Return Values: 0 for success
+# Uses Global variables:  NASD_SVC
+start_SVC()
+{
+    ${SYSTEMCTL} reset-failed ${NASD_SVC}  >> /dev/null 2>&1
+    ${SYSTEMCTL} start ${NASD_SVC}
+    if [ $? -ne 0 ]; then
+        logit "ERROR: Starting the Service for ${NASD_SVC} "
+        return 1
+    else
+        ${SYSTEMCTL} enable ${NASD_SVC}  >> /dev/null 2>&1
+        logit "Started the Service for ${NASD_SVC} "
+        return 0
+    fi
+}
+
+
+### Function: stop_SVC ###
+#
+#  Stops NAS Services
+#
+# Arguments:  none
+# Return Values: 0 for success
+# Uses Global variables:  NASD_SVC
+# set a flag if Service is stopped by this function; I_STOPPED_SVC
+#
+stop_SVC()
+{
+logit "Stopping ${NASD_SVC} if it exists."
+
+_service_state=`${SYSTEMCTL} show -p LoadState ${NASD_SVC} | $AWK -F= '{print $2}'`
+if [ "${_service_state}" == "not-found" ]; then
+    logit "${NASD_SVC} does not exist, continueing."
+    return 0
+else     
+    _service_state=`${SYSTEMCTL} show ${NASD_SVC} -p ActiveState | $AWK -F= '{print $2}'`
+    if [ "${_service_state}" == "inactive" ]; then
+        logit "${NASD_SVC} is already in inactive state"
+        return 0
+
+    elif [ "${_service_state}" == "active" ]; then
+        logit "${NASD_SVC} is in active state"
+        ${SYSTEMCTL} stop ${NASD_SVC}
+        _service_state=`${SYSTEMCTL} show ${NASD_SVC} -p ActiveState | $AWK -F= '{print $2}'`
+        if [ "${_service_state}" == "inactive"  ]; then
+            I_STOPPED_SVC="true"
+            logit "Stopped ${NASD_SVC} ."
+            return 0
+        else
+            ${SYSTEMCTL} reset-failed ${NASD_SVC}
+            logit "WARNING: Problem stopping Service for ${NASD_SVC} return code ${_retcode_}"
+            return 0
+        fi
+
+    elif [ "${_service_state}" == "failed" ]; then
+        logit "${NASD_SVC} is in failed state"
+        ${SYSTEMCTL} reset-failed ${NASD_SVC}
+        _service_state=`${SYSTEMCTL} show ${NASD_SVC} -p ActiveState | $AWK -F= '{print $2}'`
+        if [ "${_service_state}" == "inactive"  ]; then
+            I_STOPPED_SVC="true"
+            logit "Stopped ${NASD_SVC} ."
+            return 0
+        else
+            logit "ERROR:: Problem stopping Service for ${NASD_SVC}."
+            return 1
+        fi
+
+    else
+        logit "ERROR:: ${NASD_SVC} is in an unrecognised state"
+        return 1
+    fi
+fi                    
+}
+
+
+### Function: unpack_NASd ###
+#
+#  Unpacks the NASd software files
+#
+# Arguments:  none
+# Return Values: 0 for success
+unpack_NASd ()
+{
+$MKDIR -p ${TEMP_INST_DIR} >> ${NASd_INSTALL_LOGFILE} 2>&1
+if [ $? -ne 0 ]; then
+    logit "ERROR running command $MKDIR -p ${TEMP_INST_DIR}"
+    return 1
+fi
+
+cd ${TEMP_INST_DIR}
+$GUNZIP -c ${NASd_SOURCE_FILE} | $TAR -xf - >> ${NASd_INSTALL_LOGFILE} 2>&1
+if [ $? -ne 0 ]; then
+    logit "ERROR running command $GUNZIP -c ${NASd_SOURCE_FILE} | $TAR -xf - "
+    return 1
+fi
+
+# Set pkg name
+_nasd_pkg_name_=`$LS -t ${TEMP_INST_DIR} | $GREP NASd | $HEAD -1`
+if [ ! ${TEMP_INST_DIR}/${_nasd_pkg_name_} ]; then
+    logit "Failed to locate NASd pkg \n${TEMP_INST_DIR}/${_nasd_pkg_name_}"
+    return 1
+fi
+
+# Is the package already installed? If so remove it
+$RPM -qa | $GREP NASd 2>/dev/null
+if [ $? -eq 0 ]; then
+    logit "Removing current instance of NASd"
+    $RPM -evh NASd
+    if [ $? -ne 0 ]; then
+        logit "Failed to remove NASd"
+        return 1
+    fi
+fi
+
+logit "Adding NASd" 
+$RPM -ivh ${_nasd_pkg_name_} 2>/dev/null | $TEE -a ${LOGFILE}
+_pkg_install_status_=`$ECHO ${PIPESTATUS[0]}`
+if [ ${_pkg_install_status_} -ne 0 ]; then
+    logit "Failed to add ${_stor_api_pkg_}"
+    return 1
+fi
+
+$RSYNC -a /NASd/*  ${TEMP_INST_DIR} >> /dev/null 2>&1
+if [ $? -ne 0 ]; then
+    logit "Failed to copy NASd software to ${TEMP_INST_DIR}"
+    return 1
+fi
+}
+
+
+### Function: usage ###
+#
+#  Prints the usage help.
+#
+# Arguments:       none
+# Return Values: none
+usage()
+{
+$ECHO "
+`$BASENAME $0` [-s <software_location>] [-l <logfile_location>] [-F] [-S]
+    -s <software_location>
+        Optional parameter specifying the full path to the NASd software to install.
+    -l <logfile_location>
+        Optional parameter specifing the full path to the logfile file.
+    -F
+        Force upgrade, even if newest version is installed.
+    -S
+        Start service for NASd Service.
+"
+}
+
+
+
+# ***********************************************************************
+#
+#                    Main body of program
+#
+# ***********************************************************************
+#
+# Determine absolute path to software
+get_absolute_path
+
+while getopts ":l:s:FS" arg; do
+  case $arg in
+    l)     NASd_INSTALL_LOGFILE="$OPTARG"
+        LOGFILE=${NASd_INSTALL_LOGFILE}
+           ;;
+
+    s)     NASd_SOURCE_FILE="$OPTARG"
+           ;;
+
+    F)     FORCE_INSTALL="true"
+           ;;
+
+    S)     START_SVC="true"
+
+
+
+           ;;
+
+   \?)     usage
+        exit 2
+           ;;
+  esac
+done
+shift `expr $OPTIND - 1`
+
+
+logit "===================================================================="
+logit "************ Started eniq_NASd_install.bsh script. ***************"
+logit "************* Prepairing to install NASd service. ***************"
+logit "===================================================================="
+
+logit "Options set using command line arguments."
+logit "Set Install Logfile to ${NASd_INSTALL_LOGFILE}"
+logit "Set Location of installation source file to ${NASd_SOURCE_FILE} "
+logit "Force install is set to ${FORCE_INSTALL}"
+logit "Start Service is set to ${START_SVC}"
+
+
+# Ensure there is not an old version of temporary files lying around.
+cleanup
+
+
+# untar the NASd software to temporary directory.
+unpack_NASd
+if [ $? -eq 0 ]; then
+    logit "Successfully Unpacked NASd Package, Continuing "
+else
+    logit "ERROR:: unpacking SNASd Package. Exiting "
+    cleanup
+    exit 1
+fi
+
+if [ "${FORCE_INSTALL}" != "true" ]; then
+    check_version
+    if [ $? -eq 3 ]; then
+        logit "Installed Version of NASd same as version to be installed."
+        #logit "Upgrade not required. Skipping."
+        #exit 0
+    fi
+fi
+
+# stop Service, if it exists
+stop_SVC
+if [ $? -ne 0 ]; then
+    logit "ERROR Problem stopping Service.  Exiting"
+    exit 1
+fi
+
+
+# Install the NASd
+install_NASd
+if [ $? -eq 0 ]; then
+    logit "Successfully Installed NASd Monitor Scripts, Continuing "
+else
+    logit "ERROR:: Installing NASd Monitor scripts. Exiting "
+    cleanup
+    exit 1
+fi
+
+# Install the service file for the NASd services
+install_Unit
+if [ $? -eq 0 ]; then
+    logit "Successfully Installed NAS Services for NASd Storage, Continuing "
+else
+    logit "ERROR:: Installing NAS Services for NASd Storage. Exiting "
+    cleanup
+    exit 1
+fi
+
+# Install the method for the NASd services
+install_method
+if [ $? -eq 0 ]; then
+    logit "Successfully Installed SVC method for NASd Storage, Continuing "
+else
+    logit "ERROR:: Installing SVC method for NASd Storage. Exiting "
+    cleanup
+    exit 1
+fi
+
+
+#  importing Services
+import_service
+if [ $? -eq 0 ]; then
+    logit "Successfully Imported Service files for NASd Storage, Continuing "
+else
+    logit "ERROR:: Importing Service files for NASd Storage. Exiting "
+    cleanup
+    exit 1
+fi
+
+# Install the NASd version
+install_NASd_version
+if [ $? -eq 0 ]; then
+    logit "Successfully Installed NASd version file, Continuing "
+else
+    logit "WARNING:: Did not Install NASd version file."
+fi
+
+# Restart Service if the START_SVC flag is set to true
+if [ "$START_SVC" == "true" ]; then
+    start_SVC
+    if [ $? -eq 0 ]; then
+        logit "Successfully restarted Service for NASd Storage"
+    else
+        logit "ERROR:: restarted Service for NASd Storage. Exiting "
+        cleanup
+        exit 1
+    fi
+fi

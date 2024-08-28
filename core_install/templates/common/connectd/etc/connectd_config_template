@@ -1,0 +1,87 @@
+#
+# Config File containing options for the ENIQ-OSS connectD
+# Version 1.0
+#
+# This default file should be located in the /eniq/connectd/etc directory,
+# And copied to each eniq_oss_<n> mount_info subdirectory when an OSS is added.
+# This can be used to customise connectivity options for each OSS independently.
+#
+# *********************************************************************
+#
+
+# **************************** User Account Config ****************************
+#
+# user account on OSS to accept SSH Tunnel
+OSS_ssh_user=eniqssh
+#
+# user account on this (ENIQ) server which sets up SSH Tunnel
+ENIQ_ssh_user=dcuser
+#
+# user account on this (ENIQ) server that owns/creates the mount points
+# and is trusted on the OSS master server
+ENIQ_nfs_user=dcuser
+
+
+# ************** Timing and Backoff Timing after failed mount attempts **************
+#
+# # Check nfs mounts every ${CHECK_MOUNTS_EVERY} Seconds.
+CHECK_MOUNTS_EVERY=5
+#
+# When trying to mount the NFS shared filesystems from OSS,SFS,
+# these settings decide how the ENIQ server should backoff after
+# a number of failed connection attempts.
+#
+# Number of failed connection attempts before backing off (Default=10)
+LOOP_RETRYS_BEFORE_TIMEOUT=10
+#
+# Wait between failed retry attempts after backoff attempts has been reached. (Def=600)
+BACKOFF_SLEEP_TIME=600
+
+
+# **************************** NFS Timeouts Config ****************************
+#
+# Number of seconds to wait for the mount process to finish during mounting nfs
+MOUNT_TIME_OUT_TIME=30
+#
+# Number of seconds to wait for response from NAS after ls during testing of nfs
+WAIT_FOR_NAS_RESPONSE=20
+#
+# Number of seconds to wait for between detecting fault with NAS and
+# waiting to allow NAS to failover and recover.
+WAIT_FOR_FAILOVER=20
+#
+# Number of retrys before unmounting filesystems and starting over.
+NO_RETRYS_FOR_NAS_FAILOVER=2
+
+
+# ********************** Mount Options Configuration *******************
+#
+# See man mount_nfs for more information and options
+# This MUST be a comma seperated list of options
+# Last Option MUST have a TRAILING COMMA
+# Retrys default is 10000.  or 0 for automounter (no retrys)
+# retry=10
+# timeout default is 600 tenths of a second
+# timeo=600
+# Retransmit Default =5.
+# retrans=5
+# read buffer size The default value is 32768. rsize=
+# Security mode. see nfssec for details. sec=
+# ro to mount the filesystem readonly
+#
+# e.g. MOUNT_OPTIONS=soft,retry=10,timeo=600,
+#
+# Mount options for filesystems listed in fs_mount_list
+MOUNT_OPTIONS_DATAFS="soft,ro"
+#
+# Mount options for pmdata
+MOUNT_OPTIONS_PMDATA="soft,rw"
+
+# Mount options for Eventdata
+MOUNT_OPTIONS_EventDATA=soft,rw
+
+# Different filesystems for PDM on sparc OSS starting with 12.0; 
+PDM_MOUNTPOINT_PRE_12=/ossrc/ericsson
+PDM_MOUNTPOINT_POST_12=/ossrc/data/ccpdm/pm_storage
+PDM_SHARE_OSS_PRE_12=/ossrc/ericsson
+PDM_SHARE_OSS_POST_12=/ossrc/data/ccpdm/pm_storage

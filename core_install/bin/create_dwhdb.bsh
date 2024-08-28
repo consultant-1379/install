@@ -1,0 +1,379 @@
+#!/bin/bash
+# ********************************************************************
+# Ericsson Radio Systems AB                                     SCRIPT
+# ********************************************************************
+#
+#
+# (c) Ericsson Radio Systems AB 2021 - All rights reserved.
+#
+# The copyright to the computer program(s) herein is the property
+# of Ericsson Radio Systems AB, Sweden. The programs may be used
+# and/or copied only with the written permission from Ericsson Radio
+# Systems AB or in accordance with the terms and conditions stipulated
+# in the agreement/contract under which the program(s) have been
+# supplied.
+#
+# ********************************************************************
+# Name    : create_dwhdb.bsh
+# Date    : 16/04/2021
+# Revision: main\12
+# Purpose : Create the dwhdb databse
+#
+# Usage   : create_dwhdb.bsh -c <path_to_cli_conf> -d <ini_file_location>
+#							 -s <storage_type> 	[-l <logfile>]
+#
+# ********************************************************************
+#
+#   Command Section
+#
+# ********************************************************************
+BASENAME=/usr/bin/basename
+BASH=/usr/bin/bash
+CAT=/usr/bin/cat
+DATE=/usr/bin/date
+DIRNAME=/usr/bin/dirname
+ECHO='/usr/bin/echo -e'
+EXPR=/usr/bin/expr
+HEAD=/usr/bin/head
+MKDIR=/usr/bin/mkdir
+PWD=/usr/bin/pwd
+RM=/usr/bin/rm
+SU=/usr/bin/su
+TEE=/usr/bin/tee
+
+# ********************************************************************
+#
+#   Functions
+#
+# ********************************************************************
+### Function: abort_script ###
+#
+#   This will is called if the script is aborted thru an error
+#   signal sent by the kernel such as CTRL-C or if a serious
+#   error is encountered during runtime
+#
+# Arguments:
+#       $1 - Error message from part of program (Not always used)
+# Return Values:
+#       none
+abort_script()
+{
+_err_time_=`$DATE '+%Y-%b-%d_%H.%M.%S'`
+	
+if [ "$1" ]; then
+    _err_msg_=$1
+else
+    _err_msg_="${_err_time_} - ERROR : Script aborted.......\n"
+fi
+
+if [ "${LOGFILE}" ]; then
+    $ECHO "\n${_err_time_} - ERROR : $_err_msg_\n" | $TEE -a ${LOGFILE}
+else
+    $ECHO "\n${_err_time_} - ERROR : $_err_msg_\n"
+fi
+$RM -rf ${CON_STR_ENC}
+$RM -rf ${CONN_STR_STRT_IQ_ENC}
+exit 55
+}
+
+### Function: create_sql_file ###
+#
+# Create the dwhdb SQL file
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+create_sql_file()
+{
+$ECHO "CREATE DATABASE '${DWH_DIR}/dwhdb.db'" > ${ENIQ_ADMIN_DIR}/sql/create_dwhdb.sql
+$ECHO "DBA USER 'DBA' DBA PASSWORD '${DBA_PASSWORD}'" >> ${ENIQ_ADMIN_DIR}/sql/create_dwhdb.sql
+$ECHO "MINIMUM PASSWORD LENGTH 3" >> ${ENIQ_ADMIN_DIR}/sql/create_dwhdb.sql
+$ECHO "CASE IGNORE "  >> ${ENIQ_ADMIN_DIR}/sql/create_dwhdb.sql
+$ECHO "PAGE SIZE ${PAGE_SIZE} COLLATION '${COLLATION}' " >> ${ENIQ_ADMIN_DIR}/sql/create_dwhdb.sql
+$ECHO "BLANK PADDING ON JAVA ON JCONNECT ON " >> ${ENIQ_ADMIN_DIR}/sql/create_dwhdb.sql
+$ECHO "IQ PATH '${MSTOREPATH}' " >> ${ENIQ_ADMIN_DIR}/sql/create_dwhdb.sql
+$ECHO "MESSAGE PATH '${MSGPATH}' " >> ${ENIQ_ADMIN_DIR}/sql/create_dwhdb.sql
+if [ "${STORAGE_TYPE}" == "fs" ]; then
+	_mstoresize_=`iniget ${SYS_MAIN_FILE} -v Size -f ${SYM_INI}`
+	$ECHO "IQ SIZE ${_mstoresize_} " >> ${ENIQ_ADMIN_DIR}/sql/create_dwhdb.sql
+fi
+$ECHO "IQ PAGE SIZE ${IQ_PAGE_SIZE} " >> ${ENIQ_ADMIN_DIR}/sql/create_dwhdb.sql
+$ECHO "TEMPORARY PATH '${TSTOREPATH}'" >> ${ENIQ_ADMIN_DIR}/sql/create_dwhdb.sql
+if [ "${STORAGE_TYPE}" == "fs" ]; then
+	_tstoresize_=`iniget ${TSTOREID} -v Size -f ${SYM_INI}`
+	$ECHO "TEMPORARY SIZE ${_tstoresize_}" >> ${ENIQ_ADMIN_DIR}/sql/create_dwhdb.sql
+fi
+}
+	
+### Function: get_absolute_path ###
+#
+# Determine absolute path to software
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+get_absolute_path()
+{
+_dir_=`$DIRNAME $0`
+SCRIPTHOME=`cd $_dir_ 2>/dev/null && pwd || $ECHO $_dir_`
+}
+
+### Function: setup_variables ###
+#
+# Set up some script variables
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+setup_variables()
+{
+if [ ! "${ENIQ_BASE_DIR}" ]; then
+    # Directory on the root filesystem
+    ENIQ_BASE_DIR=/eniq
+fi
+
+# Tmp directory
+TEM=/var/tmp
+
+# Admin Directory
+ENIQ_ADMIN_DIR=${ENIQ_BASE_DIR}/admin
+
+# ENIQ Log Directory
+ENIQ_LOG_DIR=${ENIQ_BASE_DIR}/local_logs
+
+# Main Directory for the Core Installation SW
+ENIQ_INST_DIR=${ENIQ_BASE_DIR}/installation
+
+# Main Directory for the Core Installation SW
+ENIQ_CORE_INST_DIR=${ENIQ_INST_DIR}/core_install
+
+# Config dir
+ENIQ_CONF_DIR=${ENIQ_INST_DIR}/config
+
+PAGE_SIZE=`iniget DWH -v PageSize -f ${ENIQ_INI}`
+COLLATION=`iniget DWH -v Collation -f ${ENIQ_INI}`
+IQ_PAGE_SIZE=`iniget DWH -v IQPageSize -f ${ENIQ_INI}`
+if [ ! "${PAGE_SIZE}" -o ! "${COLLATION}" -o ! "${IQ_PAGE_SIZE}" ]; then
+	_err_msg_="Could not read IQ values from ${ENIQ_INI}"
+	abort_script "$_err_msg_"
+fi
+
+SYS_MAIN_FILE=`iniget DWH_SYSTEM_MAIN -f ${SYM_INI} | $HEAD -1`
+MSTOREPATH=`iniget ${SYS_MAIN_FILE} -v Path -f ${SYM_INI}`
+MSTORETYPE=`iniget ${SYS_MAIN_FILE} -v Type -f ${SYM_INI}`
+if [ ! "${MSTOREPATH}" -o ! "${MSTORETYPE}" ]; then
+    _err_msg_="Could not read main dbspaces values from ${SYM_INI}"
+    abort_script "$_err_msg_"
+fi
+
+TSTOREID=`iniget DWH_DBSPACES_TEMP -f ${SYM_INI} | $HEAD -1`
+TSTOREPATH=`iniget ${TSTOREID} -v Path -f ${SYM_INI}`
+TSTORETYPE=`iniget ${TSTOREID} -v Type -f ${SYM_INI}`
+if [ ! "${TSTOREID}" -o ! "${TSTOREPATH}" -o ! "${TSTORETYPE}" ]; then
+    _err_msg_="Could not read dbspaces values from ${SYM_INI}"
+    abort_script "$_err_msg_"
+fi
+
+MSGPATH=${ENIQ_LOG_DIR}/iq/dwhdb
+$MKDIR -p ${ENIQ_LOG_DIR}/iq
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not create ${ENIQ_LOG_DIR}/iq"
+    abort_script "$_err_msg_"
+fi
+
+$MKDIR -p ${IQLOGDIR}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not create ${IQLOGDIR}"
+    abort_script "$_err_msg_"
+fi
+
+UTIL_PORT=`iniget DB -v DWHUtilServerPort -f ${ENIQ_INI}`
+if [ ! "${UTIL_PORT}" ]; then
+    _err_msg_="Could not read UtilServerPort value from ${ENIQ_INI}"
+    abort_script "$_err_msg_" "${EXEC_SHELL_CMD}"
+fi
+
+UTIL_DBA_PASSWORD=`inigetpassword DB -f ${ENIQ_INI} -v UtilDBAPASSWORD`
+if [ ! ${UTIL_DBA_PASSWORD} ]; then
+    _err_msg_="Could not read  UtilDBAPASSWORD value from ${ENIQ_INI}"
+    abort_script "$_err_msg_"
+fi
+
+DBA_PASSWORD=`inigetpassword DB -f ${ENIQ_INI} -v DBAPassword`
+if [ ! ${DBA_PASSWORD} ]; then
+    if [ -f ${ENIQ_BASE_DIR}/sw/installer/dbusers ]; then
+        DBA_PASSWORD=`${ENIQ_BASE_DIR}/sw/installer/dbusers dba dwh`
+        if [ ! "${DBA_PASSWORD}" ] ; then
+            _err_msg_="Could not get dwhdb DBA Password"
+            abort_script "$_err_msg_"
+        fi
+    else
+        err_msg_="`$DATE +%d.%m.%y_%H:%M:%S` - Could not get dwhdb DBA Password"
+        abort_script "$_err_msg_"
+    fi
+fi
+
+MAINCACHE=`iniget DWH -v MainCache -f ${ENIQ_INI}`
+if [ ! ${MAINCACHE} ]; then
+    _err_msg_="Could not read MainCache param from ${ENIQ_INI}"
+    abort_script "$_err_msg_"
+fi
+
+TEMPCACHE=`iniget DWH -v TempCache -f ${ENIQ_INI}`
+if [ ! ${TEMPCACHE} ]; then
+    _err_msg_="Could not read TempCache param from ${ENIQ_INI}"
+    abort_script "$_err_msg_"
+fi
+
+UTIL_CONN_STR_USER_DBA="-c \"uid=dba;pwd=${UTIL_DBA_PASSWORD};eng=utility_srv;dbn=utility_db;links=tcpip{host=localhost;port=${UTIL_PORT};dobroadcast=no;verify=no}\""
+CON_STR_ENC=/tmp/conn_str_Encrypt.`uuidgen`
+
+# encrypt the connection string.
+get_encrypt_file "${UTIL_CONN_STR_USER_DBA}" "${CON_STR_ENC}"
+CONN_STR_STRT_IQ="-su ${UTIL_DBA_PASSWORD}"
+CONN_STR_STRT_IQ_ENC=/tmp/conn_str_Encrypt_iq_start.`uuidgen`
+
+# encrypt the connection string.
+get_encrypt_file "${CONN_STR_STRT_IQ}" "${CONN_STR_STRT_IQ_ENC}"
+}
+
+### Function: usage_msg ###
+#
+# Usage message
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+usage_msg()
+{
+$ECHO "
+Usage: `$BASENAME $0` -c <conf dir> -n <niq.ini file> -s <sym_links.ini> -t [raw|fs] [-l <logfile>]
+
+Options:
+
+-c : Conf dir where niq.rc resides
+
+-l : Optional parameter specifying what logfile to use
+
+-n : Path to the niq.ini file.
+
+-s : Path to the sym_links.ini file
+
+-t : Storage type (raw|fs)
+"
+}
+
+# ********************************************************************
+#
+#   Main body of program
+#
+# ********************************************************************
+#
+# Determine absolute path to software
+get_absolute_path
+
+while getopts ":c:l:n:s:t:" arg; do
+  case $arg in
+	c) 	CLI_CONF_DIR="$OPTARG"
+		;;
+	l) 	LOGFILE="$OPTARG"
+		;;
+	n) 	ENIQ_INI="$OPTARG"
+		;;
+	s) 	SYM_INI="$OPTARG"
+		;;
+	t) 	STORAGE_TYPE="$OPTARG"
+		;;    
+	\?) usage_msg
+		exit 1
+		;;
+  esac
+done
+shift `expr $OPTIND - 1`
+
+# Source the common functions
+if [ -s $SCRIPTHOME/../lib/common_functions.lib ]; then
+    . $SCRIPTHOME/../lib/common_functions.lib
+else
+    _err_msg_="File $SCRIPTHOME/../lib/common_functions.lib not found"
+    abort_script "$_err_msg_"
+fi
+
+# Check required files and scripts exist	
+if [ ! -s ${CLI_CONF_DIR}/niq.rc ]; then
+    _err_msg_="File ${CLI_CONF_DIR}/niq.rc not found, or is empty"
+    abort_script "$_err_msg_"
+else
+    log_msg -l ${LOGFILE} -q -s "Sourcing ${CLI_CONF_DIR}/niq.rc" 
+    . ${CLI_CONF_DIR}/niq.rc
+fi
+
+if [ -z "$CONF_DIR" ] ; then
+    _err_msg_="ERROR: CONF_DIR is not set"
+    abort_script "$_err_msg_"
+fi
+
+if [ ! -f ${ENIQ_INI} ]; then
+    _err_msg_="${ENIQ_INI} does not exists"
+    abort_script "$_err_msg_"
+fi
+
+if [ ! -d ${DWH_DIR} ]; then
+     _err_msg_="DWH Database directory (${DWH_DIR}) does not exist"
+    abort_script "$_err_msg_"
+fi
+
+log_msg -s "Populating CREATE DB clause" -l ${LOGFILE}
+
+# Set up variables
+setup_variables
+
+# Create the SQL
+create_sql_file
+
+log_msg -s "Creating DWH Database..." -l ${LOGFILE}
+
+# Output the SQL file contents
+log_msg -s "\nSQL file contents (${ENIQ_ADMIN_DIR}/sql/create_dwhdb.sql) for dwhdb" -l ${LOGFILE}
+$CAT ${ENIQ_ADMIN_DIR}/sql/create_dwhdb.sql >> ${LOGFILE}
+
+log_msg -s "\nStarting utility db" -l ${LOGFILE}
+${IQDIR}/bin64/dbstop -y @${CON_STR_ENC} >> /dev/null 2>&1
+${IQDIR}/bin64/start_iq -n utility_srv @${CONN_STR_STRT_IQ_ENC} -iqmc ${MAINCACHE} -iqtc ${TEMPCACHE} -gu utility_db -sb 0 -x tcpip{port=${UTIL_PORT}}
+if [ $? -ne 0 ]; then
+    _err_msg_="Utildb startup failed"
+    abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+fi
+
+${IQDIR}/bin64/dbisql @${CON_STR_ENC} -q ${ENIQ_ADMIN_DIR}/sql/create_dwhdb.sql
+if [ $? -ne 0 ] ; then
+    _err_msg_="DWH Database creation failed"
+    abort_script "$_err_msg_"
+fi
+
+# Stop the Utility Database
+log_msg -l ${LOGFILE} -q -s "\nStopping utildb using command"
+log_msg -l ${LOGFILE} -q -s "${IQDIR}/bin64/dbstop -y -c \"uid=dba;pwd=****;eng=utility_srv;dbn=utility_db;links=tcpip{host=localhost;port=$UTIL_PORT;dobroadcast=no;verify=no}\""
+${IQDIR}/bin64/dbstop -y @${CON_STR_ENC}
+if [ $? -ne 0 ]; then
+    _err_msg_="utildb shutdown failed"
+    abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+fi
+
+log_msg -s "\nTrying to start DWH Database..." -l ${LOGFILE}
+${ADMIN_BIN}/dwhdb start
+if [ $? -ne 0 ] ; then
+     _err_msg_=" DWH Database failed to start"
+    abort_script "$_err_msg_"
+fi
+
+log_msg -s "DWH Database successfully created" -l ${LOGFILE}
+
+$RM -rf ${CON_STR_ENC}
+$RM -rf ${CONN_STR_STRT_IQ_ENC}
+
+exit 0

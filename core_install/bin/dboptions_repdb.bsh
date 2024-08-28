@@ -1,0 +1,387 @@
+#!/bin/bash
+# ********************************************************************
+# Ericsson Radio Systems AB                                     SCRIPT
+# ********************************************************************
+#
+#
+# (c) Ericsson Radio Systems AB 2021 - All rights reserved.
+#
+# The copyright to the computer program(s) herein is the property
+# of Ericsson Radio Systems AB, Sweden. The programs may be used
+# and/or copied only with the written permission from Ericsson Radio
+# Systems AB or in accordance with the terms and conditions stipulated
+# in the agreement/contract under which the program(s) have been
+# supplied.
+#
+# ********************************************************************
+# Name    : dboptions_repdb.bsh
+# Date    : 16/04/2021
+# Revision: main\10
+# Purpose : Setup the repdb database options
+#
+# Usage   : dboptions_repdb.bsh -c <path_to_cli_conf> -d <niq.ini_file_location>
+#                               [-l <logfile>]
+#
+# ********************************************************************
+#
+#   Command Section
+#
+# ********************************************************************
+BASENAME=/usr/bin/basename
+CAT=/usr/bin/cat
+DATE=/usr/bin/date
+DIRNAME=/usr/bin/dirname
+ECHO='/usr/bin/echo -e'
+EGREP=/usr/bin/egrep
+RM=/usr/bin/rm
+SED=/usr/bin/sed
+TEE=/usr/bin/tee
+
+# ********************************************************************
+#
+#   Functions
+#
+# ********************************************************************
+### Function: abort_script ###
+#
+#   This will is called if the script is aborted through an error
+#   signal sent by the kernel such as CTRL-C or if a serious
+#   error is encountered during runtime
+#
+# Arguments:
+#       $1 - Error message from part of program (Not always used)
+# Return Values:
+#       none
+abort_script()
+{
+if [ "$1" ]; then
+    _err_msg_=$1
+else
+    _err_msg_="`$DATE +%d.%m.%y_%H:%M:%S` - ERROR : Script aborted.......\n"
+fi
+
+if [ "${LOGFILE}" ]; then
+    $ECHO "\n`$DATE +%d.%m.%y_%H:%M:%S` - ERROR : $_err_msg_\n" | $TEE -a ${LOGFILE}
+else
+    $ECHO "\n`$DATE +%d.%m.%y_%H:%M:%S` - ERROR : $_err_msg_\n"
+fi
+$RM -rf ${REP_CONN_STR_USER_DBA_ENC}
+$RM -rf ${REP_CONN_STR_USER_DBA_ENC_dbping}
+exit 55
+}
+
+### Function: create_sql_file ###
+#
+# Create the repdb SQL file
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+create_sql_file()
+{
+$SED -e "/@@etlrep_passwd@@/s//${ETLREP_PASSWD}/g" ${ENIQ_ADMIN_DIR}/sql/create_users_repdb.sql > ${ENIQ_ADMIN_DIR}/sql/create_users_repdb1.sql
+$SED -e "/@@dwhrep_passwd@@/s//${DWHREP_PASSWD}/g" ${ENIQ_ADMIN_DIR}/sql/create_users_repdb1.sql > ${ENIQ_ADMIN_DIR}/sql/create_users_repdb2.sql
+}
+
+### Function: get_absolute_path ###
+#
+# Determine absolute path to software
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+get_absolute_path()
+{
+_dir_=`$DIRNAME $0`
+SCRIPTHOME=`cd $_dir_ 2>/dev/null && pwd || $ECHO $_dir_`
+}
+
+### Function: setup_variables ###
+#
+# Set up some script variables
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+setup_variables()
+{
+
+if [ ! "${ENIQ_BASE_DIR}" ]; then
+    # Directory on the root filesystem
+    ENIQ_BASE_DIR=/eniq
+fi
+
+# tmp directory
+TEM=/var/tmp
+
+# ENIQ Admin Directory
+ENIQ_ADMIN_DIR=${ENIQ_BASE_DIR}/admin
+
+# Main Directory for the Core Installation SW
+ENIQ_INST_DIR=${ENIQ_BASE_DIR}/installation
+
+# Config dir
+ENIQ_CONF_DIR=${ENIQ_INST_DIR}/config
+
+REP_PORT=`iniget REP -v PortNumber -f ${ENIQ_INI}`
+REP_NAME=`iniget REP -v ServerName -f ${ENIQ_INI}`
+if [ ! "${REP_PORT}" -o ! "${REP_NAME}" ]; then
+    _err_msg_="`$DATE +%d.%m.%y_%H:%M:%S` - Could not read DB values from ${ENIQ_INI}"
+    abort_script "$_err_msg_"
+fi
+
+DBA_PASSWORD=`inigetpassword DB -f ${ENIQ_INI} -v DBAPassword`
+if [ ! ${DBA_PASSWORD} ]; then
+    if [ -f ${ENIQ_BASE_DIR}/sw/installer/dbusers ]; then
+        DBA_PASSWORD=`${ENIQ_BASE_DIR}/sw/installer/dbusers dba etlrep`
+        if [ ! "${DBA_PASSWORD}" ] ; then
+            _err_msg_="`$DATE +%d.%m.%y_%H:%M:%S` - Could not get DBA Password"
+            abort_script "$_err_msg_"
+        fi
+    else
+        _err_msg_="`$DATE +%d.%m.%y_%H:%M:%S` - Could not get DBA Password"
+        abort_script "$_err_msg_"
+    fi
+fi
+
+#Temp directory
+TEM=/tmp			   		
+
+REP_CONN_STR_USER_DBA="-c \"uid=dba;pwd=${DBA_PASSWORD};eng=${REP_NAME};dbn=${REP_NAME};dbf=${REP_DIR}/${REP_NAME}.db;links=tcpip(host=localhost;port=$REP_PORT)\""
+REP_CONN_STR_USER_DBA_ENC=${TEM}/conn_str_encrypt_repdb_options.`uuidgen`
+
+# get the encrypt file
+get_encrypt_file "${REP_CONN_STR_USER_DBA}" "${REP_CONN_STR_USER_DBA_ENC}"
+
+REP_CONN_STR_USER_DBA_dbping="-q -c \"con=repdb;eng=$REP_NAME;uid=dba;pwd=${DBA_PASSWORD};links=tcpip(host=localhost;port=$REP_PORT)\""
+REP_CONN_STR_USER_DBA_ENC_dbping=${TEM}/conn_str_encrypt_dbping_repdb_options.`uuidgen`
+
+# get the encrypt file
+get_encrypt_file "${REP_CONN_STR_USER_DBA_dbping}" "${REP_CONN_STR_USER_DBA_ENC_dbping}"
+ETLREP_PASSWD=`inigetpassword REP -v ETLREPPassword -f ${ENIQ_INI}`
+if [ ! ${ETLREP_PASSWD} ]; then
+    if [ -f ${ENIQ_BASE_DIR}/sw/installer/dbusers ]; then
+        ETL_PASSWD=`${ENIQ_BASE_DIR}/sw/installer/dbusers etlrep etlrep`
+        if [ ! "${ETLREP_PASSWD}" ] ; then
+            _err_msg_="`$DATE +%d.%m.%y_%H:%M:%S` - Could not get etlrep Password"
+            abort_script "$_err_msg_"
+        fi
+    else
+        _err_msg_="`$DATE +%d.%m.%y_%H:%M:%S` - Could not get etlrep Password"
+        abort_script "$_err_msg_"
+    fi
+fi
+
+DWHREP_PASSWD=`inigetpassword REP -v DWHREPPassword -f ${ENIQ_INI}`
+if [ ! ${DWHREP_PASSWD} ]; then
+    if [ -f ${ENIQ_BASE_DIR}/sw/installer/dbusers ]; then
+        DWHREP_PASSWD=`${ENIQ_BASE_DIR}/sw/installer/dbusers dwhrep dwhrep`
+        if [ ! "${DWHREP_PASSWD}" ] ; then
+            _err_msg_="`$DATE +%d.%m.%y_%H:%M:%S` - Could not get dwhrep Password"
+            abort_script "$_err_msg_"
+        fi
+    else
+        _err_msg_="`$DATE +%d.%m.%y_%H:%M:%S` - Could not get dwhrep Password"
+        abort_script "$_err_msg_"
+    fi
+fi
+
+. ${ENIQ_CONF_DIR}/niq.rc
+
+
+if [ -s ${ASA_DIR}/bin64/sa_config.sh ]; then
+	. ${ASA_DIR}/bin64/sa_config.sh >> /dev/null 2>&1
+else
+	_err_msg_="File ${ASA_DIR}/bin64/sa_config.sh not found or empty"
+	abort_script "$_err_msg_"
+fi
+CURR_SERVER_TYPE=`$CAT $ENIQ_CONF_DIR/installed_server_type | $EGREP -v '^[[:blank:]]*#' | $SED -e 's/ //g'`
+}
+
+### Function: usage_msg ###
+#
+# Usage message
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+usage_msg()
+{
+$ECHO "
+Usage: `$BASENAME $0` -c <conf dir> -d <niq.ini file> [-l <logfile>
+
+options:
+
+-l : Optional parameter specifying what logfile to use
+
+-c : Conf dir where niq.rc resides
+
+-d : Path to the niq.ini file.
+"
+}
+
+# ********************************************************************
+#
+#   Main body of program
+#
+# ********************************************************************
+#
+TIMESTAMP=`$DATE +%d.%m.%y_%H:%M:%S`
+
+# Determine absolute path to software
+get_absolute_path
+
+while getopts ":l:c:d:" arg; do
+    case $arg in
+	l) LOGFILE="$OPTARG"
+	   ;;
+	c) CONF_DIR="$OPTARG"
+	   ;;
+	d) ENIQ_INI="$OPTARG"
+	   ;;
+	\?) usage_msg
+	   exit 1
+	;;
+    esac
+done
+shift `expr $OPTIND - 1`
+
+# Source the common functions
+if [ -s $SCRIPTHOME/../lib/common_functions.lib ]; then
+    . $SCRIPTHOME/../lib/common_functions.lib
+else
+    _err_msg_="`$DATE +%d.%m.%y_%H:%M:%S` - File $SCRIPTHOME/../lib/common_functions.lib not found"
+    abort_script "$_err_msg_"
+fi
+
+# Check required files and scripts exist
+if [ ! -s ${CONF_DIR}/niq.rc ]; then
+	_err_msg_="`$DATE +%d.%m.%y_%H:%M:%S` - File ${CONF_DIR}/niq.rc not found, or is empty"
+	abort_script "$_err_msg_"
+else
+        log_msg -t -l ${LOGFILE} -q -s "Sourcing ${CONF_DIR}/niq.rc"
+	. ${CONF_DIR}/niq.rc
+fi
+
+if [ ! "$LOGFILE" ] ; then
+	LOGFILE=${LOG_DIR}/asa/dboptions_repdb_${TIMESTAMP}.log
+fi
+
+if [ -z "$CONF_DIR" ] ; then
+    _err_msg_="`$DATE +%d.%m.%y_%H:%M:%S` - ERROR: CONF_DIR is not set"
+    abort_script "$_err_msg_"
+fi
+
+if [ -s ${ASA_DIR}/bin64/sa_config.sh ]; then
+    . ${ASA_DIR}/bin64/sa_config.sh >> /dev/null 2>&1
+else
+     _err_msg_="`$DATE +%d.%m.%y_%H:%M:%S` - File ${ASA_DIR}/bin64/sa_config.sh not found"
+    abort_script "$_err_msg_"
+fi
+
+if [ ! -f ${ENIQ_INI} ]; then
+     _err_msg_="`$DATE +%d.%m.%y_%H:%M:%S` - ${ENIQ_INI} does not exists"
+    abort_script "$_err_msg_"
+fi
+
+log_msg -s -t "Setting Repository Database DB options..." -l ${LOGFILE}
+
+# Set up variables
+setup_variables
+
+# Create the SQL
+create_sql_file
+# Need to stop Database as it fails to connect initially for SATMP issue
+log_msg -s -t "Stopping Repository Database" -l ${LOGFILE}
+${ADMIN_BIN}/repdb stop
+if [ $? -ne 0 ] ; then
+    _err_msg_="`$DATE +%d.%m.%y_%H:%M:%S` - Repository Database failed to stop"
+    abort_script "$_err_msg_"
+fi
+
+# start the database manually
+log_msg -s -t "Starting Repository Database Manually" -l ${LOGFILE}
+${ADMIN_BIN}/repdb start
+if [ $? -ne 0 ] ; then
+    _err_msg_="`$DATE +%d.%m.%y_%H:%M:%S` - Repository Database failed to start"
+    abort_script "$_err_msg_"
+fi
+#${SQLANY}/bin64/dbspawn ${SQLANY}/bin64/dbsrv16  @${REP_DIR}/repdb.cfg -n ${REP_NAME} -x tcpip{port=${REP_PORT}} -dt ${REP_TEMP_DIR} ${REP_DIR}/repdb.db >> ${LOGFILE} 2>&1
+
+${SQLANY}/bin64/dbping @${REP_CONN_STR_USER_DBA_ENC_dbping} >> ${LOGFILE} 2>&1
+if [ $? -eq 0 ] ; then
+    log_msg -t -l ${LOGFILE} -q -s "Database repdb successfully started"
+else
+    _err_msg_="`$DATE +%d.%m.%y_%H:%M:%S` - ERROR: repdb start failed"
+    abort_script "$_err_msg_"
+fi
+
+${IQDIR}/bin64/dbisql @${REP_CONN_STR_USER_DBA_ENC} -q ${ENIQ_ADMIN_DIR}/sql/repdb_authenticate.sql
+if [ $? -ne 0 ] ; then
+    _err_msg_="`$DATE +%d.%m.%y_%H:%M:%S` - Repository Database Authentication failed"
+    abort_script "$_err_msg_"
+fi
+
+# Need to restart Database for above authentication to take effect
+log_msg -s -t "Stopping Repository Database" -l ${LOGFILE}
+${ADMIN_BIN}/repdb stop
+if [ $? -ne 0 ] ; then
+    _err_msg_="`$DATE +%d.%m.%y_%H:%M:%S` - Repository Database failed to stop"
+    abort_script "$_err_msg_"
+fi
+
+log_msg -s -t "Restarting Repository Database" -l ${LOGFILE}
+${ADMIN_BIN}/repdb start
+if [ $? -ne 0 ] ; then
+    _err_msg_="`$DATE +%d.%m.%y_%H:%M:%S` - Repository Database failed to start"
+    abort_script "$_err_msg_"
+fi
+
+${IQDIR}/bin64/dbisql @${REP_CONN_STR_USER_DBA_ENC} -q ${ENIQ_ADMIN_DIR}/sql/repdb_connection_authentication.sql
+if [ $? -ne 0 ] ; then
+    _err_msg_="`$DATE +%d.%m.%y_%H:%M:%S` - Repository Database Connection Authentication failed"
+    abort_script "$_err_msg_"
+fi
+
+${IQDIR}/bin64/dbisql @${REP_CONN_STR_USER_DBA_ENC} -q ${ENIQ_ADMIN_DIR}/sql/create_users_repdb2.sql
+if [ $? -ne 0 ] ; then
+    _err_msg_="`$DATE +%d.%m.%y_%H:%M:%S` - Repository Database user creation failed"
+    abort_script "$_err_msg_"
+fi
+
+if [ "${CURR_SERVER_TYPE}" == "eniq_stats" -o "${CURR_SERVER_TYPE}" == "stats_coordinator" ] ; then 
+    log_msg -s "Creating procedure to using ${ENIQ_ADMIN_DIR}/sql/sp_eniq_login_environment.sql" -l ${LOGFILE}
+    ${IQDIR}/bin64/dbisql @${REP_CONN_STR_USER_DBA_ENC} -q ${ENIQ_ADMIN_DIR}/sql/sp_eniq_login_environment.sql
+    if [ $? -ne 0 ] ; then
+        _err_msg_="`$DATE +%d.%m.%y_%H:%M:%S` -Repository Database create procedure sp_eniq_login_environment() failed"
+        abort_script "$_err_msg_"
+    fi
+	log_msg -s "Creating events to using ${ENIQ_ADMIN_DIR}/sql/create_event_drop_idle_users_repdb.sql" -l ${LOGFILE}
+    ${IQDIR}/bin64/dbisql @${REP_CONN_STR_USER_DBA_ENC} -q ${ENIQ_ADMIN_DIR}/sql/create_event_drop_idle_users_repdb.sql
+    if [ $? -ne 0 ] ; then
+        _err_msg_="`$DATE +%d.%m.%y_%H:%M:%S` -Repository Database create event create_event_drop_idle_users_repdb.sql() failed"
+        abort_script "$_err_msg_"
+    fi
+	log_msg -s "Creating procedure to using ${ENIQ_ADMIN_DIR}/sql/create_drop_idle_users_repdb.sql" -l ${LOGFILE}
+    ${IQDIR}/bin64/dbisql @${REP_CONN_STR_USER_DBA_ENC} -q ${ENIQ_ADMIN_DIR}/sql/create_drop_idle_users_repdb.sql
+    if [ $? -ne 0 ] ; then
+        _err_msg_="`$DATE +%d.%m.%y_%H:%M:%S` -Repository Database create procedure create_drop_idle_users_repdb.sql() failed"
+        abort_script "$_err_msg_"
+    fi
+fi
+
+${IQDIR}/bin64/dbisql @${REP_CONN_STR_USER_DBA_ENC} -q ${ENIQ_ADMIN_DIR}/sql/dboptions_repdb.sql
+if [ $? -ne 0 ] ; then
+    _err_msg_="`$DATE +%d.%m.%y_%H:%M:%S` - Repository dboptions failed"
+    abort_script "$_err_msg_"
+fi
+
+log_msg -s -t "Repository Database DB options successfully set" -l ${LOGFILE}
+
+$RM -rf ${REP_CONN_STR_USER_DBA_ENC}
+$RM -rf ${REP_CONN_STR_USER_DBA_ENC_dbping}
+exit 0

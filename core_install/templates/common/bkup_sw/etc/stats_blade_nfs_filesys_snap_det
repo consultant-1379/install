@@ -1,0 +1,31 @@
+######################################################
+# This contains a list of of filesystems that contain
+# need to be snapshot at the time of the DB Virtual
+# Backup. It has the format of
+#
+# <fs_name>::<snap>::<rollback>
+#
+# Comments are preceded by '#' 
+######################################################
+admin::Y::Y
+archive::Y::Y
+backup::Y::Y
+etldata::Y::Y
+etldata_/00::Y::Y
+etldata_/01::Y::Y
+etldata_/02::Y::Y
+etldata_/03::Y::Y
+fmdata::Y::Y
+home::Y::Y
+log::Y::N
+pmdata::Y::Y
+pmdata_soem::Y::Y
+reference::Y::Y
+rejected::N::N
+sentinel::Y::Y
+snapshot::N::N
+sql_anywhere::Y::Y
+sybase_iq::Y::Y
+sw::Y::Y
+upgrade::Y::Y
+pmdata_sim::N::N

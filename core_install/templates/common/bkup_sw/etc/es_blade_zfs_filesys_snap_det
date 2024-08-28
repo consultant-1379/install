@@ -1,0 +1,16 @@
+######################################################
+# This contains a list of of filesystems that contain
+# need to be snapshot at the time of the DB Virtual
+# Backup. It has the format of
+#
+# <fs_name>::<snap>::<rollback>
+#
+# Comments are preceded by '#' 
+######################################################
+bkup_sw::Y::Y
+connectd::Y::Y
+installation::Y::Y
+local_logs::Y::N
+mgdb::Y::Y
+misc::Y::Y
+smf::Y::Y

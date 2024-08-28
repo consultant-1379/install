@@ -1,0 +1,548 @@
+#!/usr/bin/bash
+#********************************************************************
+# Ericsson Radio Systems AB SCRIPT
+#********************************************************************
+#
+# (c) Ericsson Radio Systems AB 2023 - All rights reserved.
+#
+# The copyright to the computer program(s) herein is the property
+# of Ericsson Radio Systems AB, Sweden. The programs may be used
+# and/or copied only with the written permission from Ericsson Radio
+# Systems AB or in accordance with the terms and conditions stipulated
+# in the agreement/contract under which the program(s) have been
+# in the agreement/contract under which the program(s) have been
+# supplied.
+#
+#********************************************************************
+# Name     : catalog_cache_tuning.bsh
+# Date     : 15/05/2023
+# Revision : D  
+# Purpose  : To increase the value of CatalogCache as per the requirement. 
+#           The catalog cache value needs to be adjusted during execution 
+#           of sp_iqemptyfile as in the ES standalone server the catalog 
+#           consumption is too high. 
+# Usage    : catalog_cache_tuning.bsh -a <increase_cache|restore_cache> [ -l <path_to_logfile> ]
+#
+#********************************************************************
+#
+#       Command Section
+#
+#********************************************************************
+AWK=/usr/bin/awk
+BASENAME=/usr/bin/basename
+CP=/usr/bin/cp
+CHMOD=/usr/bin/chmod
+DATE=/usr/bin/date
+ECHO=/usr/bin/echo
+EXPR=/usr/bin/expr
+EGREP=/usr/sfw/bin/egrep
+GREP=/usr/bin/grep
+ID=/usr/bin/id
+MKDIR=/usr/bin/mkdir
+SED=/usr/bin/sed
+SYSTEMCTL=/usr/bin/systemctl
+SU=/usr/bin/su
+SLEEP=/usr/bin/sleep
+TOUCH=/usr/bin/touch
+RM=/usr/bin/rm
+
+#********************************************************************
+#
+#       Functions Section
+#
+#********************************************************************
+### Function: abort_script ###
+#
+# This Function will abort the script if any issues or errors.
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+
+abort_script()
+{
+if [ "$1" ]; then
+    _err_msg_=$1
+else
+    _err_msg_="$TIMESTAMP - ERROR : Script aborted.......\n"
+fi
+
+if [ "${LOGFILE}" ]; then
+    $ECHO "\n$TIMESTAMP - ERROR : $_err_msg_\n" | $TEE -a ${LOGFILE}
+else
+    $ECHO "\n$TIMESTAMP - ERROR : $_err_msg_\n"
+fi
+
+exit 1
+}
+
+### Function: setup_env ###
+#
+# Setup up path environment etc
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+setup_env()
+{
+# ENIQ directories
+ENIQ_BASE_DIR=/eniq
+ENIQ_ADMIN_DIR=$ENIQ_BASE_DIR/admin
+ENIQ_CORE_INST_DIR=$ENIQ_BASE_DIR/installation/core_install
+ENIQ_CONF_DIR=$ENIQ_BASE_DIR/installation/config
+ENIQ_CORE_BIN_DIR=$ENIQ_CORE_INST_DIR/bin
+CLI_CONF_DIR=$ENIQ_BASE_DIR/sw/conf
+
+# Configuration files.
+ENIQ_INI=niq.ini
+SUNOS_INI=SunOS.ini
+_niq_ini_bkup_="$ENIQ_CONF_DIR/niq_backup.ini"
+
+# Source the common functions
+if [ -s $ENIQ_ADMIN_DIR/lib/common_functions.lib ]; then
+    . $ENIQ_ADMIN_DIR/lib/common_functions.lib
+else
+    _err_msg_="File $ENIQ_ADMIN_DIR/lib/common_functions.lib not found"
+    abort_script "$_err_msg_"
+fi
+
+# Setup Log file if user has not provided any
+if [ ! "${LOGFILE}" ] ; then
+    LOGFILE=/eniq/local_logs/iq/updateCatalogCache_${TIMESTAMP}.log
+    $ECHO "Log File Loctaion: ${LOGFILE}"
+fi
+
+$TOUCH ${LOGFILE}
+if [ $? -ne 0 ]; then
+        _err_msg_="Could not make log file"
+        abort_script "$_err_msg_"
+fi
+
+$CHMOD 777 ${LOGFILE}
+if [ $? -ne 0 ]; then
+        _err_msg_="Could not change permissions of log file"
+        abort_script "$_err_msg_"
+fi
+
+# Get the System User and Group. All directories are owned by this
+SYSUSER=$(iniget ENIQ_INSTALL_CONFIG -f ${ENIQ_CONF_DIR}/${SUNOS_INI} -v ENIQ_SYSUSER)
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not read SYSUSER param from ${ENIQ_CONF_DIR}/${SUNOS_INI}"
+    abort_script "$_err_msg_"
+fi
+
+# Remote connection string used while running commands remotely
+remote_conn_string="$SSH  -o StrictHostKeyChecking=no -o BatchMode=yes -q -l root"
+}
+
+### Function: check_user_id ###
+#
+#   Check that the effective id of the user is correct
+#   If not print error msg and exit.
+#
+# Arguments:
+#       $1 : User ID name
+# Return Values:
+#       none
+check_user_id()
+{
+_check_id_=$($ID | $AWK -F\( '{print $2}' | $AWK -F\) '{print $1}')
+if [ "$_check_id_" != "$1" ]; then
+    _err_msg_="You must be $1 to execute this script"
+    abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+fi
+}
+
+### Function: check_server ###
+#
+#   Check if the script is run on the coordinator
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+check_server()
+{
+setup_env
+CURR_SERVER_TYPE=$($GREP -Ev  '^[[:blank:]]*#' $ENIQ_CONF_DIR/installed_server_type | $SED -e 's/ //g')
+if [ ! "${CURR_SERVER_TYPE}" ]; then
+    _err_msg_="Could not determine which server type this is"
+    abort_script "$_err_msg_" "${EXEC_SHELL_CMD}"
+fi
+
+if [ "${CURR_SERVER_TYPE}" == "eniq_coordinator" -o "${CURR_SERVER_TYPE}" == "stats_coordinator" \
+    -o "${CURR_SERVER_TYPE}" == "eniq_events" -o "${CURR_SERVER_TYPE}" == "eniq_stats" -o "${CURR_SERVER_TYPE}" == "eniq_iqw" -o "${CURR_SERVER_TYPE}" == "s
+on_coordinator" ]; then
+    SERVER_TYPE="CO"
+fi
+
+if [ "$SERVER_TYPE" != "CO" ]; then
+    _err_msg_="You must be on coordinator to execute this script."
+    abort_script "$_err_msg_"
+fi
+}
+### Function: backup_niq_ini ###
+#
+#   Backup the niq.ini file
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+backup_niq_ini()
+{
+log_msg -l ${LOGFILE} -t -s "Creating backup of current ${ENIQ_INI} at ${_niq_ini_bkup_}.\n"
+$CP ${ENIQ_CONF_DIR}/${ENIQ_INI} ${_niq_ini_bkup_}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not copy the ${ENIQ_INI} to ${_niq_ini_bkup_}."
+    abort_script "$_err_msg_"
+    exit 1
+else log_msg -l ${LOGFILE} -t -s"Successfully created backup of current ${ENIQ_INI}.\n"
+fi
+}
+
+##Function: dwhdb_restart ###
+#
+# Stops/starts the dwhdb database
+#
+# Arguments:
+#       Yes
+# Return Values:
+#       None
+#
+dwhdb_restart()
+{
+# Get current dwhdb status
+_dwhdbstate_=$($SYSTEMCTL -a |$GREP dwhdb |$AWK '{print $3}')
+if [ "$_dwhdbstate_" == "" ]; then
+    _err_msg_="Could not get dwhdb current state and is $_dwhdbstate_ at $($DATE)"
+    abort_script "$_err_msg_"
+fi
+
+#When dwhdb is in start
+$SU - $SYSUSER -c "dwhdb restart"
+if [ $? -ne 0 ]; then
+    log_msg -l ${LOGFILE} -t -s "Could not restart dwhdb. Checking further\n"
+
+    # Get current dwhdb status
+    $SLEEP 10
+    _dwhdbstate_=$($SYSTEMCTL -a |$GREP dwhdb |$AWK '{print $3}')
+    if [ "${_dwhdbstate_}" == "active*" ]; then
+        log_msg -l ${LOGFILE} -t -s "Waiting for one minute then checking state again."
+        $SLEEP 60
+        _dwhdbstate_=$($SYSTEMCTL -a |$GREP dwhdb |$AWK '{print $3}')
+        if [ "${_dwhdbstate_}" == "inactive" ]; then
+            log_msg -l ${LOGFILE} -q -t -s "Dwhdb is disabled, starting it.\n"
+            $SU - $SYSUSER -c "dwhdb start"
+            if [ $? -ne 0 ]; then
+                _err_msg_="Failed to start dwhdb at $($DATE). Script will abort"
+                abort_script "$_err_msg_"
+            fi
+        fi
+    elif [ "${_dwhdbstate_}" == "maintenance" ]; then
+        log_msg -l ${LOGFILE} -t -s "Found dwhdb state as $_dwhdbstate_ while starting its service. Enabling dwhdb service."
+        $SLEEP 10
+        $SYSTEMCTL reset-failed eniq-dwhdb
+        $SYSTEMCTL enable eniq-dwhdb
+        $SLEEP 30
+        _dwhdbstate_=$($SYSTEMCTL -a |$GREP dwhdb |$AWK '{print $3}')
+        log_msg -l ${LOGFILE} -t -s "Dwhdb current state is $_dwhdbstate_"
+        if [ "$_dwhdbstate_" == "" -o "$_dwhdbstate_" == "maintenance" ]; then
+            _err_msg_="Could not get dwhdb current state or its still in $_dwhdbstate_ state at $($DATE).Kindly contact Ericsson support\n"
+            abort_script "$_err_msg_"
+        elif [ "$_dwhdbstate_" == "disabled" ]; then
+            $SYSTEMCTL enable eniq-dwhdb
+            $SLEEP 30
+            if [ "$_dwhdbstate_" != "active" ]; then
+                _err_msg_="Failed to start Dwhdb\n"
+                abort_script "$_err_msg_"
+            fi
+        fi
+    fi
+    else
+        _dwhdbstate_=$($SYSTEMCTL -a |$GREP dwhdb |$AWK '{print $3}')
+        if [ "$_dwhdbstate_" == "active" ]; then
+            log_msg -l ${LOGFILE} -t -s "Dwhdb is restarted succesfully\n"
+        fi
+    fi
+}
+
+### Function: engine_profile ###
+#
+# Checking the engine state and gives engine current profile
+#
+# Arguments:
+#       none
+# Return Values:
+#       Engine current profile
+engine_profile()
+{
+# Getting engine current state from remote engine server
+_cmd_1_="$SYSTEMCTL -a |grep engine | $AWK '{print \$3}'"
+_engine_ip_=$($GREP -w engine /etc/hosts | $AWK '{print $3}')
+SERVER_IP="$_engine_ip_"
+_engine_chk_=$($remote_conn_string $SERVER_IP "${_cmd_1_}")
+if [ "$_engine_chk_" == "" ]; then
+        _err_msg_="Could not get engine current state from server $_engine_ip_ at $($DATE).\n"
+        abort_script "$_err_msg_"
+fi
+
+#Getting current engine profile
+if [ "${_engine_chk_}" == "active" ]; then
+    _cmd_2_="$SU - $SYSUSER -c \"engine \"status\" \"dcuser\"\""
+    _eng_profile_=$($remote_conn_string $SERVER_IP "${_cmd_2_} | $GREP \"Current Profile: \" | $AWK '{print \$3}'")
+    if [ "$_eng_profile_" == "" ]; then 
+        _err_msg_="Could not get engine current profile from server $_engine_ip_ at $($DATE).\n"
+        abort_script "$_err_msg_"
+    else
+        log_msg -l ${LOGFILE} -t -s "Engine current profile on server $_engine_ip_ is $_eng_profile_"
+    fi
+else
+    log_msg -l ${LOGFILE} -t -s "Engine on server $_engine_ip_ is not online\n"
+fi
+}
+
+### Function: check_execution_slots ###
+#
+# Checking the check_execution_slots are empty or not
+#
+# Arguments:
+#       none
+# Return Values:
+#       Execution slot status
+check_execution_slots()
+{
+log_msg -l ${LOGFILE} -t -s "Checking execution slots status\n"
+_cmd_3_="$SU - $SYSUSER -c \"engine -e showSetsInExecutionSlots \"slots\" \"dcuser\"\""
+exec_count=$($remote_conn_string $SERVER_IP "${_cmd_3_} |$EGREP '(Loader|Count)'| $WC -l")
+while [ $exec_count -ne 0 ]
+do
+    log_msg -l ${LOGFILE} -t -q -s "Execution slot on server $_engine_ip_ is not empty, waiting until it gets empty"
+    $SLEEP 30
+    exec_count=$($ remote_conn_string $SERVER_IP "${_cmd_3_} |$EGREP '(Loader|Count)'| $WC -l")
+done
+log_msg -l ${LOGFILE} -t -s "Execution slot is empty now on server $_engine_ip_."
+}
+        
+### Function: engine_change ###
+#
+# Checking the engine state and changing it as requested
+#
+# Arguments:
+#       none
+# Return Values:
+#       Changing engine state to NoLoads
+engine_change()
+{
+if [ "${_engine_chk_}" == "active" ]; then
+       
+    # Check the user input for engine profile and Change engine Profile to NoLoads on engine server
+    if [ "$1" == "NoLoads" -a "$_eng_profile_" != "NoLoads" ]; then
+        log_msg -l ${LOGFILE} -s "\nEngine change required."
+                    
+    # Check for execution slots until empty
+    check_execution_slots
+        
+    _cmd_4_="$SU - $SYSUSER -c \"engine -e changeProfile 'NoLoads'\""
+    $remote_conn_string $SERVER_IP "${_cmd_4_}" > /dev/null
+                    
+    _eng_profile_chk_=$($remote_conn_string $SERVER_IP "${_cmd_2_} | $GREP \"Current Profile: \" | $AWK '{print \$3}'")
+        while [ "$_eng_profile_chk_" != "NoLoads" ]
+        do
+            $SLEEP 5
+            _eng_profile_chk_=$($remote_conn_string $SERVER_IP "${_cmd_2_} | $GREP \"Current Profile: \" | $AWK '{print \$3}'")
+        done
+    log_msg -l ${LOGFILE} -t -s "Engine profile on server $_engine_ip_ changed from $_eng_profile_ to NoLoads successfully.\n"
+
+    elif [ "$1" == "NoLoads" -a "$_eng_profile_" == "NoLoads" ]; then
+        # Engine already in NoLoads
+        log_msg -l ${LOGFILE} -t -s "Engine profile on server $_engine_ip_ is already $_eng_profile_, change not required"
+    fi
+    
+    #Check the user input for engine profile and Change engine Profile to Normal on engine server
+    if [ "$1" == "Normal" -a "$_eng_profile_" != "Normal" ]; then
+        log_msg -l ${LOGFILE} -s "\nEngine change required."
+    
+        _cmd_5_="$SU - $SYSUSER -c \"engine -e changeProfile 'Normal'\""
+        $remote_conn_string $SERVER_IP "${_cmd_5_}" > /dev/null
+                        
+        _eng_profile_chk_=$($remote_conn_string $SERVER_IP "${_cmd_2_} | $GREP \"Current Profile: \" | $AWK '{print \$3}'")
+        while [ "$_eng_profile_chk_" != "Normal" ]
+        do
+            $SLEEP 5
+            _eng_profile_chk_=$($remote_conn_string $SERVER_IP "${_cmd_2_} | $GREP \"Current Profile: \" | $AWK '{print \$3}'")
+        done
+        log_msg -l ${LOGFILE} -t -s "Engine profile on server $_engine_ip_ changed from $_eng_profile_ to Normal successfully.\n"
+
+    elif [ "$1" == "Normal" ] && [ "$_eng_profile_" == "Normal" ]; then
+        # Engine already in Normal
+        log_msg -l ${LOGFILE} -t -s "Engine profile on server $_engine_ip_ is already $_eng_profile_, change not required"
+    fi
+else log_msg -l ${LOGFILE} -t -s "Engine was not online and profile was not changed.\n"
+fi
+}
+
+### Function: restore_cache ###
+#
+# Restoring the backup of niq.ini file and the engine, dwhdb state to normal
+#
+# Arguments:
+#       none
+# Return Values:
+#       Restoring niq.ini file,engine, dwhdb state
+restore_cache()
+{
+# Restore configuration file
+log_msg -l ${LOGFILE} -t -s "Restoring the configuration file: ${ENIQ_INI}.\n"
+$CP ${_niq_ini_bkup_} ${ENIQ_CONF_DIR}/${ENIQ_INI} >> /dev/null 2>&1
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not restore original ${ENIQ_INI}"
+    abort_script "$_err_msg_"
+else 
+    log_msg -l ${LOGFILE} -t -s "Successfully restored ${ENIQ_INI}.\n"
+    $RM ${_niq_ini_bkup_} >> /dev/null 2>&1
+    if [ $? -ne 0 ]; then
+        _err_msg_="Could not remove ${_niq_ini_bkup_}"
+        abort_script "$_err_msg_"
+    fi
+fi
+
+if [ -f ${CLI_CONF_DIR}/${ENIQ_INI} ]; then
+    $CP -p ${ENIQ_CONF_DIR}/${ENIQ_INI} ${CLI_CONF_DIR}/${ENIQ_INI} >> /dev/null 2>&1
+    if [ $? -ne 0 ]; then
+            _err_msg_="Could not copy ${ENIQ_CONF_DIR}/${ENIQ_INI} to ${CLI_CONF_DIR}/${ENIQ_INI}"
+            abort_script "$_err_msg_"
+        fi
+fi
+
+# Set engine status to NoLoads.
+engine_profile
+if [ "$_eng_profile_" != "NoLoads" ]; then
+    engine_change NoLoads
+fi
+
+#Restart dwhdb
+dwhdb_restart
+
+# Set engine status to Normal.
+engine_profile
+if [ "$_eng_profile_" != "Normal" ]; then
+    engine_change Normal
+fi
+}
+
+### Function: increase_cache ###
+#
+#   Increase the CatalogCache by the provided Cache Value
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+increase_cache()
+{
+# Backup niq.ini file before updating the Cache values
+backup_niq_ini
+
+# Update the Cache Values
+log_msg -l ${LOGFILE} -t -s "Replacing caches in niq.ini\n" 
+log_msg -l ${LOGFILE} -q -s "Updating the ini setting with command:"
+log_msg -l ${LOGFILE} -q -s "${BASH} ${ENIQ_CORE_BIN_DIR}/set_core_memcache.bsh -d ${ENIQ_CONF_DIR} -m -f -M 15 -C 30 -L 15 -T 40 ${LOGFILE}"
+${BASH} ${ENIQ_CORE_BIN_DIR}/set_core_memcache.bsh -d ${ENIQ_CONF_DIR} -m -f -M 15 -C 30 -L 15 -T 40 ${LOGFILE}
+if [ $? -ne 0 ]; then
+    _err_msg_="Exiting... Unable to set the new cache values\n"
+    abort_script "$_err_msg_"
+    exit 1
+fi
+
+# Set engine status to NoLoads.
+engine_profile
+if [ "$_eng_profile_" != "NoLoads" ]; then
+    engine_change NoLoads
+fi
+
+# Restart dwhdb 
+dwhdb_restart
+
+# Set engine status to Normal.
+engine_profile
+if [ "$_eng_profile_" != "Normal" ]; then
+    engine_change Normal
+fi
+}
+
+### Function: usage_msg ###
+#
+#   Print out the usage message
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+usage_msg()
+{
+$CLEAR
+$ECHO "
+Usage: $($BASENAME $0) -a <increase_cache|restore_cache> [ -l <path_to_logfile> ]
+options:
+
+-a  : Action. Must be either
+        increase_cache  --> To increase the catalog cache.
+        restore_cache   --> To restore the niq.ini file, restart dwhdb and engine.
+-l  : To generate logfile other than default path
+"
+}
+
+#********************************************************************
+#
+#       Main body of program
+#
+#********************************************************************
+TIMESTAMP=$($DATE +%d.%m.%y_%H:%M:%S)
+
+# Get  values on runtime
+while getopts ":a:l:" arg; do
+  case $arg in
+    a) ACTION="$OPTARG"
+       ;;
+    l) LOGFILE="$OPTARG"
+       ;;
+    :) $ECHO "Option -$OPTARG requires an argument"
+        usage_msg
+        exit 1
+        ;;
+  esac
+done
+shift "$(expr $OPTIND - 1)"
+
+# Check that the effective id of the user is root
+check_user_id root
+
+# Check that the script is run on Coordinator
+check_server
+
+# Set Variables
+setup_env
+
+# Get the value for -a
+case "${ACTION}" in
+        increase_cache)  increase_cache
+                        ;;
+        restore_cache)  restore_cache
+                        ;;  
+                    *)  _err_msg_="Invalid or zero input provided"
+            usage_msg
+                        abort_script "${_err_msg_}"
+                        ;;
+esac
+
+$ECHO "Changing permission of the ${LOGFILE} to 644" | $TEE -a ${LOGFILE}
+$CHMOD 644 ${LOGFILE}
+    if [ $? -ne 0 ]; then
+        _err_msg_="Could not change ${LOGFILE} file permission to 644"
+    abort_script "${_err_msg_}"
+    fi
+
+exit 0

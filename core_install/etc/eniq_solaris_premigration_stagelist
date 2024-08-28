@@ -1,0 +1,9 @@
+get_migration_data
+health_checks
+create_snapshots
+remote_premigration
+update_core_scripts
+backup_iqheader
+backup_root_data
+disconnect_zpool
+cleanup_premigration

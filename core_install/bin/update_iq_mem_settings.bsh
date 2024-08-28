@@ -1,0 +1,818 @@
+#!/bin/bash
+# ********************************************************************
+# Ericsson Radio Systems AB                                     SCRIPT
+# ********************************************************************
+#
+#
+# (c) Ericsson Radio Systems AB 2018 - All rights reserved.
+#
+# The copyright to the computer program(s) herein is the property
+# of Ericsson Radio Systems AB, Sweden. The programs may be used 
+# and/or copied only with the written permission from Ericsson Radio 
+# Systems AB or in accordance with the terms and conditions stipulated 
+# in the agreement/contract under which the program(s) have been 
+# supplied.
+#
+# ********************************************************************
+# Name    : update_iq_mem_settings.bsh
+# Date    : 06/10/2023
+# Revision: main\21
+# Purpose : Update cache values for IQ
+#
+# Usage   : update_iq_mem_settings.bsh
+#
+# ********************************************************************
+#
+# 	Command Section
+#
+# ********************************************************************
+AWK=/usr/bin/awk
+BASENAME=/usr/bin/basename
+CAT=/usr/bin/cat
+CHMOD=/usr/bin/chmod
+CLEAR=/usr/bin/clear
+CP=/usr/bin/cp
+DATE=/usr/bin/date
+DIRNAME=/usr/bin/dirname
+ECHO='/usr/bin/echo -e'
+EGREP=/usr/bin/egrep
+ENV=/usr/bin/env
+EXPR=/usr/bin/expr
+FREE=/usr/bin/free
+GETENT=/usr/bin/getent
+GETTEXT=/usr/bin/gettext
+GREP=/usr/bin/grep
+GROUPADD=/usr/sbin/groupadd
+GTAR=/usr/sfw/bin/gtar
+GZCAT=/usr/bin/gzcat
+HEAD=/usr/bin/head
+HOSTNAME=/usr/bin/hostname
+ID=/usr/bin/id
+MKDIR=/usr/bin/mkdir
+PSRINFO=/usr/sbin/psrinfo
+RM=/usr/bin/rm
+SED=/usr/bin/sed
+SU=/usr/bin/su
+TEE=/usr/bin/tee
+TOUCH=/usr/bin/touch
+TOP=/usr/bin/top
+
+# ********************************************************************
+#
+#       Configuration Section
+#
+# ********************************************************************
+
+# ********************************************************************
+#
+#       Pre-execution Operations
+#
+# ********************************************************************
+# Default user
+#DEFAULT_USER=root
+
+# Name of SunOS & ENIQ ini Files
+ENIQ_INI=niq.ini
+SUNOS_INI=SunOS.ini
+
+# Default IQ Large Memory
+IQ_DEF_LARGE_MEMORY=2048
+
+# ********************************************************************
+#
+# 	Functions
+#
+# ********************************************************************
+### Function: abort_script ###
+#
+#   This will is called if the script is aborted thru an error
+#   error signal sent by the kernel such as CTRL-C or if a serious
+#   error is encountered during runtime
+#
+# Arguments:
+#       $1 - Error message from part of program (Not always used)
+# Return Values:
+#       none
+abort_script()
+{
+_err_time_=`$DATE '+%Y-%b-%d_%H.%M.%S'`
+
+if [ "$1" ]; then
+    _err_msg_="${_err_time_} - $1"
+else
+    _err_msg_="${_err_time_} - ERROR : Script aborted.......\n"
+fi
+
+if [ "${LOGFILE}" ]; then
+    $ECHO "\nERROR : $_err_msg_\n" | $TEE -a ${LOGFILE}
+else
+    $ECHO "\nERROR : $_err_msg_\n"
+fi
+
+cd $SCRIPTHOME
+$RM -rf ${TEM_DIR}
+
+if [ "$2" ]; then
+    ${2}
+    exit 1
+else
+	exit 1
+fi
+}
+
+### Function: calculate_reserved_memory ###
+#
+#  Calculate the memory values to reserve for the OS
+#
+# Arguments:
+#       $1 : User ID name
+# Return Values:
+#       none
+calculate_reserved_memory()
+{
+
+## some checks
+## If you need to check the memory settings use mdb -k
+##  :: memstat
+## Memory reservation for Page Cache, Kernel and the File System will change in Linux. Above comments can be replaced post identification of the same  
+
+if [ ! "${PAGE_CACHE_RES_PERCENTAGE}" ]; then
+    _err_msg_="Could not get PAGE_CACHE_RES_PERCENTAGE"
+    abort_script "$_err_msg_" 
+fi
+
+if [ ! "${ZFS_ARC_CACHE_MEM_RESERVE}" ]; then
+    _err_msg_="Could not get ZFS_ARC_CACHE_MEM_RESERVE"
+    abort_script "$_err_msg_" 
+fi
+
+if [ ! "${KERNAL_MEM_RESERVE}" ]; then
+    _err_msg_="Could not get KERNAL_MEM_RESERVE"
+    abort_script "$_err_msg_" 
+fi
+
+if [ ! "${RD_CATALOG_CACHE_MEM_RESERVE}" ]; then
+    _err_msg_="Could not get RD_CATALOG_CACHE_MEM_RESERVE"
+    abort_script "$_err_msg_" 
+fi
+
+### End checks
+
+### If the TOTAL_PHY_MEM is set then we are not going get the memory of the server 
+### we are only calculating values based on the TOTAL_PHY_MEM and not updating the ini.
+### to see what the Sybase settings would be for the memory specified
+if [ ! "${TOTAL_PHY_MEM}" ]; then 
+	# Get the total memory of server in MBytes
+	_total_phys_mem_=`$FREE -m|$GREP -iw "Mem"|$AWK '{print $2}'`
+else
+	_total_phys_mem_=${TOTAL_PHY_MEM}
+fi
+if [ ! "${_total_phys_mem_}" ]; then
+	_err_msg_="Could not read total memory value "
+	abort_script "$_err_msg_" 
+fi
+
+log_msg -l ${LOGFILE} -q -s "\nTotal physical memory is ${_total_phys_mem_}"
+
+#### Kernal Reserve ###
+PAGE_CACHE_MEM_RESERVE=`$EXPR ${_total_phys_mem_} \* ${PAGE_CACHE_RES_PERCENTAGE} / 100`
+if [ ! "${PAGE_CACHE_MEM_RESERVE}" ]; then
+    _err_msg_="Could not set Page cache reserve memory"
+    abort_script "$_err_msg_" 
+fi
+
+_phys_mem_res_=`$EXPR ${KERNAL_MEM_RESERVE} + ${ZFS_ARC_CACHE_MEM_RESERVE} + ${PAGE_CACHE_MEM_RESERVE}`
+if [ ! "${_phys_mem_res_}" ]; then
+    _err_msg_="Could not set Solaris reserve of memory"
+    abort_script "$_err_msg_" 
+fi
+
+log_msg -l ${LOGFILE} -q -s "Total physical memory reserved is ${_phys_mem_res_}"
+
+_sol_avail_mem_=`$EXPR ${OS_MIN_VALUE} + ${_phys_mem_res_}`
+if [ ! "${_sol_avail_mem_}" ]; then
+    _err_msg_="Could not set value required for OS"
+    abort_script "$_err_msg_" 
+fi
+
+local _count_=`$CAT ${CLI_CONF_DIR}/service_names|$GREP -w dwh_reader_2 |$GREP -o "::" | $WC -l`
+if [ "${_ip_type_}" == "IPv6" -a "${_count_}" == 3 ]; then
+   _host_name_=`$CAT ${CLI_CONF_DIR}/service_names | $GREP -w dwh_reader_2 | $AWK -F"::" '{print $3}'`
+else
+   _host_name_=`$CAT ${CLI_CONF_DIR}/service_names | $GREP -w dwh_reader_2 | $AWK -F"::" '{print $2}'`
+fi
+if [ "${_host_name_}" == ${HNAME} -a "${DWH_READER_2_MIN_MEM_RATIO}" ]; then
+	_min_mem_res_=`$EXPR ${_total_phys_mem_} \* ${DWH_READER_2_MIN_MEM_RATIO} / 100`
+	if [ ! "${_min_mem_res_}" ]; then
+		_err_msg_="Could not calculate  ${DWH_READER_2_MIN_MEM_RATIO}% reserve of memory"
+		abort_script "$_err_msg_" 
+	fi
+else	
+	_min_mem_res_=`$EXPR ${_total_phys_mem_} \* ${MIN_MEM_RATIO} / 100`
+	if [ ! "${_min_mem_res_}" ]; then
+		_err_msg_="Could not calculate  ${MIN_MEM_RATIO}% reserve of memory"
+		abort_script "$_err_msg_" 
+	fi
+fi	
+$ECHO "Minimum memory reserved is ${_min_mem_res_}Mb" >> ${LOGFILE}	
+
+if [ ${_min_mem_res_} -gt ${_sol_avail_mem_} ]; then
+        if [ ${_min_mem_res_} -gt ${MIN_OS_MEM} ]; then
+		_sol_res_=${_min_mem_res_}
+	else
+		_sol_res_=${MIN_OS_MEM}
+	fi
+else
+    if [ ${_sol_avail_mem_} -gt ${MIN_OS_MEM} ]; then
+		_sol_res_=${_sol_avail_mem_}
+	else
+		_sol_res_=${MIN_OS_MEM}
+	fi
+fi
+
+log_msg -l ${LOGFILE} -q -s "Total memory reserved for OS is ${_sol_res_}"
+
+### Remove the Solaris Memory and Sybase Catalog Cache Requirement from the physical memory
+_total_mem_=`$EXPR ${_total_phys_mem_} - ${_sol_res_} - ${RD_CATALOG_CACHE_MEM_RESERVE}`
+if [ ! "${_total_mem_}" ]; then
+    _err_msg_="Could not get a memory value for IQ"
+    abort_script "$_err_msg_" 
+fi
+
+if [ ${_total_mem_} -le 0 ]; then
+    _err_msg_="Memory required for IQ cannot be a negative value"
+    abort_script "$_err_msg_" 
+fi
+
+log_msg -l ${LOGFILE} -q -s "Total memory available for IQ is ${_total_mem_}Mb"
+log_msg -l ${LOGFILE} -q -s "MAIN_CACHE_FACTOR is ${DEF_MAIN_CACHE_FACTOR}"
+log_msg -l ${LOGFILE} -q -s "TEMP_CACHE_FACTOR is ${DEF_TEMP_CACHE_FACTOR}"
+log_msg -l ${LOGFILE} -q -s "LARGE_MEMORY_FACTOR is ${DEF_LARGE_MEMORY_FACTOR}"
+
+# Get the amount in MBytes for each cache
+DWH_TEMP_CACHE=`$EXPR ${_total_mem_} \* ${DEF_TEMP_CACHE_FACTOR} / 100 - ${CATALOG_CACHE_UPPER_MEM_LIMIT_RESERVE}`
+DWH_MAIN_CACHE=`$EXPR ${_total_mem_} \* ${DEF_MAIN_CACHE_FACTOR} / 100`
+DWH_LARGE_MEMORY=`$EXPR ${_total_mem_} \* ${DEF_LARGE_MEMORY_FACTOR} / 100`
+
+if [ ! "${DWH_TEMP_CACHE}" -o ! "${DWH_MAIN_CACHE}" -o ! "${DWH_LARGE_MEMORY}" ]; then
+    _err_msg_="Could not get the amount in MBytes for each cache"
+    abort_script "$_err_msg_" 
+fi
+
+log_msg -l ${LOGFILE} -q -s "DWH_MAIN_CACHE is ${DWH_MAIN_CACHE}Mb"
+log_msg -l ${LOGFILE} -q -s "DWH_TEMP_CACHE is ${DWH_TEMP_CACHE}Mb"
+log_msg -l ${LOGFILE} -q -s "DWH_LARGE_MEMORY is ${DWH_LARGE_MEMORY}Mb"
+log_msg -l ${LOGFILE} -q -s "DEF_CATALOG_CACHE_MEMORY is ${DEF_CATALOG_CACHE_MEMORY}Mb"
+}
+
+### Function: check_id ###
+#
+#   Check that the effective id of the user is correct
+#   If not print error msg and exit.
+#
+# Arguments:
+#       $1 : User ID name
+# Return Values:
+#       none
+check_id()
+{
+
+_get_id_=`$ENV |$GREP -w SUDO_USER | $EGREP "^[[:blank:]]*SUDO_USER="|$AWK -F\= '{print $2}'|$SED -e 's|"||g'`
+
+_check_id_=`$ID | $AWK -F\( '{print $2}' | $AWK -F\) '{print $1}'`
+
+_check_group_=`$ID $_get_id_ | $AWK -F\( '{print $3}' | $AWK -F\) '{print $1}'`
+
+
+    if [ "${_get_id_}" == "" ]; then
+
+        if [ "${_check_id_}" == "root" ]; then
+           # Set 1 for true
+           _user_root=1
+
+        else
+           _err_msg_="You must be root or admin to execute this script."
+           abort_script "${_err_msg_}"
+        fi
+          else
+            if [ "${_check_group_}" == "ENIQ_ADMIN_ROLE" ]; then
+               # Set 0 for false
+               _user_root=0
+
+            else
+               _err_msg_="You must be root or admin to execute this script." 
+               abort_script "${_err_msg_}"
+            fi
+    fi
+
+}
+
+### Function: chk_create_logfile ###
+#
+# Check/Create Logfile
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+chk_create_logfile()
+{
+$MKDIR -p `$DIRNAME ${LOGFILE}`
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not create directory `$DIRNAME ${LOGFILE}`"
+     abort_script "$_err_msg_"
+fi
+
+$TOUCH -a ${LOGFILE}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not write to file ${LOGFILE}"
+    abort_script "$_err_msg_"
+fi
+}
+
+### Function: get_absolute_path ###
+#
+# Determine absolute path to software
+#
+# Arguments:
+#	none
+# Return Values:
+#	none
+get_absolute_path() 
+{
+_dir_=`$DIRNAME $0`
+SCRIPTHOME=`cd $_dir_ 2>/dev/null && pwd || $ECHO $_dir_`
+}
+
+### Function: get_reader_info ###
+#
+# Determine reader name and number
+#
+# Arguments:
+#	none
+# Return Values:
+#	none
+get_reader_info()
+{
+if [ ! -s ${CLI_CONF_DIR}/service_names ]; then
+    _err_msg_="${CLI_CONF_DIR}/service_names not found, or is empty"
+    abort_script "$_err_msg_"
+fi
+
+log_msg -s "\nGathering reader info from ${CLI_CONF_DIR}/service_names" -l ${LOGFILE}
+local _count_=`$CAT ${CLI_CONF_DIR}/service_names|$GREP "${HOST_IP}" |$GREP -o "::" | $WC -l`
+if [ "${_ip_type_}" == "IPv6" -a "${_count_}" == 3 ]; then
+    READER_NAME=`$CAT ${CLI_CONF_DIR}/service_names | $GREP "${HOST_IP}" | $GREP "dwh_" | $AWK -F"::" '{print $4}'`
+    READER_NUM=`$CAT ${CLI_CONF_DIR}/service_names | $GREP "${HOST_IP}" | $GREP "dwh_" | $AWK -F"::" '{print $4}' | $AWK -F\_ '{print $NF}'`
+else
+    READER_NAME=`$CAT ${CLI_CONF_DIR}/service_names | $GREP "${HOST_IP}" | $GREP "dwh_" | $AWK -F"::" '{print $3}'`
+    READER_NUM=`$CAT ${CLI_CONF_DIR}/service_names | $GREP "${HOST_IP}" | $GREP "dwh_" | $AWK -F"::" '{print $3}' | $AWK -F\_ '{print $NF}'`
+fi
+if [ ! "${READER_NUM}" ] ; then
+    _err_msg_="Could not get reader number"
+    abort_script "$_err_msg_"
+fi
+
+READER_PARENT_TAG="DWH_READER_${READER_NUM}"
+eval READER_DIR=$($ECHO \${DWH_DIR_R${READER_NUM}})
+}
+
+### Function: setup_default_mem_iq_reader ###
+#
+# Set up default IQ values for readers.
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+setup_default_mem_iq_reader()
+{
+# Get the total memory of the server in MBytes
+RAM=`$FREE -g|$GREP -iw "Mem"|$AWK '{print $2}'`
+TOTAL_RAM=${RAM}
+
+if [ ! "${TOTAL_RAM}" ] ; then
+    _err_msg_="Could not get total memory of the server"
+    abort_script "$_err_msg_"
+fi
+
+if [ "${READER_PARENT_TAG}" == "DWH_READER_1" ]; then
+    BLADE_TYPE="RD_1"
+elif [ "${READER_PARENT_TAG}" == "DWH_READER_2" ]; then
+    BLADE_TYPE="RD_2"
+else
+    _err_msg_="This script needs to be executed on Readers only, not a reader, thats why aborting ..."
+    abort_script "$_err_msg_"
+fi
+
+if [ "${TOTAL_RAM}" -eq 251 ]; then
+    CURR_RAM=256
+elif [ "${TOTAL_RAM}" -ge 503 ]; then
+    CURR_RAM=512
+elif [ "${TOTAL_RAM}" -lt 503 -a "${TOTAL_RAM}" -gt 251 ]; then
+    CURR_RAM=256
+elif [ "${TOTAL_RAM}" -lt 251 ]; then
+    CURR_RAM="${TOTAL_RAM}"
+fi
+
+if [ "${CURR_RAM}" -eq 256 -a "${BLADE_TYPE}" == "RD_1" ]; then
+    DEF_MAIN_CACHE_FACTOR="${RD_1_DEF_MAIN_CACHE_FACTOR_256}"
+    DEF_TEMP_CACHE_FACTOR="${RD_1_DEF_TEMP_CACHE_FACTOR_256}"
+    DEF_LARGE_MEMORY_FACTOR="${RD_1_DEF_LARGE_MEMORY_FACTOR_256}"
+elif [ "${CURR_RAM}" -eq 512 -a "${BLADE_TYPE}" == "RD_1" ]; then
+    DEF_MAIN_CACHE_FACTOR="${RD_1_DEF_MAIN_CACHE_FACTOR_512}"
+    DEF_TEMP_CACHE_FACTOR="${RD_1_DEF_TEMP_CACHE_FACTOR_512}"
+    DEF_LARGE_MEMORY_FACTOR="${RD_1_DEF_LARGE_MEMORY_FACTOR_512}"
+elif [ "${CURR_RAM}" -eq 256 -a "${BLADE_TYPE}" == "RD_2" ]; then
+    DEF_MAIN_CACHE_FACTOR="${RD_2_DEF_MAIN_CACHE_FACTOR_256}"
+    DEF_TEMP_CACHE_FACTOR="${RD_2_DEF_TEMP_CACHE_FACTOR_256}"
+    DEF_LARGE_MEMORY_FACTOR="${RD_2_DEF_LARGE_MEMORY_FACTOR_256}"
+elif [ "${CURR_RAM}" -eq 512 -a "${BLADE_TYPE}" == "RD_2" ]; then
+    DEF_MAIN_CACHE_FACTOR="${RD_2_DEF_MAIN_CACHE_FACTOR_512}"
+    DEF_TEMP_CACHE_FACTOR="${RD_2_DEF_TEMP_CACHE_FACTOR_512}"
+    DEF_LARGE_MEMORY_FACTOR="${RD_2_DEF_LARGE_MEMORY_FACTOR_512}"
+fi
+
+DEF_CATALOG_CACHE_MEMORY="${RD_CATALOG_CACHE_MEM_RESERVE}"
+
+if [ ! "${DEF_MAIN_CACHE_FACTOR}" -o ! "${DEF_TEMP_CACHE_FACTOR}" -o ! "${DEF_LARGE_MEMORY_FACTOR}" -o ! "${DEF_CATALOG_CACHE_MEMORY}" ] ; then
+    _err_msg_="Could not get the required IQ Cache values"
+    abort_script "$_err_msg_"
+fi
+
+}
+
+
+### Function: setup_script_env ###
+#
+# Set up environment variables for script. 
+#
+# Arguments:
+#	none
+# Return Values:
+#	none
+setup_script_env()
+{
+if [ ! "${ENIQ_BASE_DIR}" ]; then
+    # Directory on the root filesystem
+    ENIQ_BASE_DIR=/eniq
+fi
+
+# Main Directory for the Core Installation SW
+ENIQ_INST_DIR=${ENIQ_BASE_DIR}/installation
+
+# This should not be needed in the future
+ENIQ_CONF_DIR=${ENIQ_INST_DIR}/config
+
+# This should not be needed in the future
+CLI_CONF_DIR=${ENIQ_BASE_DIR}/sw/conf
+
+#ipmp.ini
+IPMP_INI=${ENIQ_CONF_DIR}/ipmp.ini
+
+# ENIQ Log Directory
+ENIQ_LOG_DIR=${ENIQ_BASE_DIR}/log
+
+HNAME=`${HOSTNAME}`
+HOST_IP=` ${HOSTNAME} -i| $AWK '{print $1}'`
+if [ ! "${HOST_IP}" ]; then
+    _err_msg_="Host IP could not be determined"
+    abort_script "$_err_msg_" 
+fi
+
+# Source the common functions
+if [ -s ${SCRIPTHOME}/../lib/common_functions.lib ]; then
+    . ${SCRIPTHOME}/../lib/common_functions.lib
+else
+    _err_msg_="File ${SCRIPTHOME}/../lib/common_functions.lib not found"
+    abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+fi
+
+#get ip type from ipmp.ini
+check_ip_type
+if [ ! "${_ip_type_}" ]; then
+    _err_msg_="Could not read parameter _ip_type_ from file ${ENIQ_CONF_DIR}/${IPMP_INI}"
+    abort_script "$_err_msg_"
+fi
+
+# Source the memory config file
+if [ -s ${ENIQ_BASE_DIR}/admin/etc/mem_factors.cfg ]; then
+    . ${ENIQ_BASE_DIR}/admin/etc/mem_factors.cfg
+else
+    _err_msg_="File ${ENIQ_BASE_DIR}/admin/etc/mem_factors.cfg not found"
+    abort_script "$_err_msg_"
+fi
+
+# Determine the current server type
+if [ -s ${ENIQ_CONF_DIR}/installed_server_type ]; then
+    CURR_SERVER_TYPE=`$CAT ${ENIQ_CONF_DIR}/installed_server_type`
+else
+    _err_msg_="File ${ENIQ_CONF_DIR}/installed_server_type not found or empty"
+    abort_script "$_err_msg_"
+fi
+
+# Determine deployment type
+if [ -s ${ENIQ_CONF_DIR}/extra_params/deployment ]; then
+    DEPLOYMENT_TYPE=`$CAT ${ENIQ_CONF_DIR}/extra_params/deployment`
+else
+    _err_msg_="File ${ENIQ_CONF_DIR}/extra_params/deployment not found or empty"
+    abort_script "$_err_msg_"
+fi
+
+if [ ! "${CURR_SERVER_TYPE}" -o ! "${DEPLOYMENT_TYPE}" ]; then
+    _err_msg_="Required values could not be determined"
+    abort_script "$_err_msg_" 
+fi
+}
+
+### Function: setup_sybase_env ###
+#
+# Set up environment variables for script. 
+#
+# Arguments:
+#	none
+# Return Values:
+#	none
+setup_sybase_env()
+{
+# Get the System User/Group. All directories are owned by this
+SYSUSER=`iniget ENIQ_INSTALL_CONFIG -f ${ENIQ_CONF_DIR}/${SUNOS_INI} -v ENIQ_SYSUSER`
+if [ ! "${SYSUSER}" ]; then
+    _err_msg_="Could not read parameter ENIQ_SYSUSER from file ${ENIQ_CONF_DIR}/${SUNOS_INI}"
+    abort_script "$_err_msg_" "${EXEC_SHELL_CMD}"
+fi
+
+DBA_PASSWORD=`inigetpassword DB -f ${ENIQ_CONF_DIR}/${ENIQ_INI} -v DBAPassword`
+if [ ! ${DBA_PASSWORD} ]; then
+    if [ -f ${ENIQ_BASE_DIR}/sw/installer/dbusers ]; then
+        $SU - ${SYSUSER} >> /dev/null -c "${ENIQ_BASE_DIR}/sw/installer/dbusers dba dwh > ${TEM_DIR}/password"
+        DBA_PASSWORD=`$CAT ${TEM_DIR}/password`
+        if [ ! "${DBA_PASSWORD}" ] ; then
+            _err_msg_="`$DATE +%d.%m.%y_%H:%M:%S` - Could not get dwhdb DBA Password"
+            abort_script "$_err_msg_"
+        fi
+    else
+        _err_msg_="`$DATE +%d.%m.%y_%H:%M:%S` - Could not get dwhdb DBA Password"
+        abort_script "$_err_msg_"
+    fi
+fi
+
+# Get the port number associated with the database
+DWH_PORT=`iniget DWH -f ${ENIQ_CONF_DIR}/${ENIQ_INI} -v PortNumber`
+DWH_ENG=`iniget DWH -f ${ENIQ_CONF_DIR}/${ENIQ_INI} -v ServerName`
+if [ ! "${DWH_PORT}" -o ! "${DWH_ENG}" ]; then
+    _err_msg_="`$DATE +%d.%m.%y_%H:%M:%S` - Could not read DB parameters values from ${ENIQ_CONF_DIR}/${ENIQ_INI}"
+    abort_script "$_err_msg_"
+fi
+
+CONN_STR_USER_DBA="uid=dba;pwd=${DBA_PASSWORD};eng=${DWH_ENG};links=tcpip{host=${DWH_ENG};port=${DWH_PORT};dobroadcast=no;verify=no}"
+
+$SU - ${SYSUSER} >> /dev/null -c "$ENV |$EGREP '^(SYBASE|IQDIR|ASALOGDIR|SQLANY)' > $TEM_DIR/sybase_det.$$" >> /dev/null 2>&1
+
+# Source the environment
+set -a
+. $TEM_DIR/sybase_det.$$ >> /dev/null 2>&1
+set +a
+
+if [ ! "${SYBASE}" ]; then 
+    _err_msg_="Could not determine Sybase environment variable \${SYBASE}"
+    abort_script "$_err_msg_"
+fi
+
+DBISQL="$(ls /eniq/sybase_iq/IQ-*/bin64/dbisql)"
+if [ ! -x "$DBISQL" ]; then
+    _err_msg_="$DBISQL commands not found or not executable."
+    abort_script "$_err_msg_"
+fi
+
+}
+
+### Function: update_ini_file ###
+#
+# Update INI file
+#
+# Arguments:
+#	none
+# Return Values:
+#	none
+update_ini_file()
+{
+_main_cache_=$1
+_temp_cache_=$2
+_large_memory_=$3
+_catalog_cache_=$4
+_ini_file_=$5
+_reader_tag_=$6
+
+log_msg -s "\nSetting MainCache=${_main_cache_} in ${_ini_file_} for ${_reader_tag_}" -l ${LOGFILE}
+iniset ${_reader_tag_} -f ${_ini_file_} MainCache=${_main_cache_}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not update ${_ini_file_} with MainCache=${_main_cache_}"
+    abort_script "$_err_msg_"
+fi
+
+log_msg -s "Setting TempCache=${_temp_cache_} in ${_ini_file_} for ${_reader_tag_}" -l ${LOGFILE}
+iniset ${_reader_tag_} -f ${_ini_file_} TempCache=${_temp_cache_}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not update ${_ini_file_} with TempCache=${_temp_cache_}"
+    abort_script "$_err_msg_"
+fi
+
+log_msg -s "Setting LargeMemory=${_large_memory_} in ${_ini_file_} for ${_reader_tag_}" -l ${LOGFILE}
+iniset ${_reader_tag_} -f ${_ini_file_} LargeMemory=${_large_memory_}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not update ${_ini_file_} with TempCache=${_temp_cache_}"
+    abort_script "$_err_msg_"
+fi
+
+log_msg -s "Setting CatalogCache=${_catalog_cache_} in ${_ini_file_} for ${_reader_tag_}" -l ${LOGFILE}
+iniset ${_reader_tag_} -f ${_ini_file_} CatalogCache=${_catalog_cache_}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not update ${_ini_file_} with CatalogCache=${_catalog_cache_}" 
+    abort_script "$_err_msg_"
+fi
+
+$CP ${INI_FILE_DIR}/${ENIQ_INI} ${ENIQ_CONF_DIR}/${ENIQ_INI}
+if [ $? -ne 0 ]; then
+    _err_msg_="Failed to copy the ${ENIQ_INI} file in local directory ${ENIQ_CONF_DIR}/${ENIQ_INI}" 
+    abort_script "$_err_msg_"
+fi
+
+}
+
+### Function: usage_msg ###
+#
+#   Print out the usage message
+#
+# Arguments:
+#	none
+# Return Values:
+#	none
+usage_msg() 
+{
+$CLEAR
+$ECHO "
+Usage: `$BASENAME $0` -d <path_to_niq_ini_dir> -p <reader_parent_tag>
+					  -r <dwh_reader_<n> [-l <path_to_logfile>] 
+                      
+options:
+
+-d  : Parameter specifying the full path to the directory containing
+      the niq.ini file to be updated. 
+
+-l  : Used to specify a logfile. Default will be used if none specified.            
+
+-p  : Parameter specifying the parent tag of the reader to update in niq.ini
+
+-r  : Parameter psecifying the reader being updated. Must be specified in
+      the form of dwh_reader_<n>
+"
+}
+
+### Function: user_confirm ###
+#
+# Get confirmation from user to proceed with snapshot action
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+user_confirm()
+{
+while :; do
+    unset USER_CONF
+    $CLEAR
+    log_msg -s "\nAre you sure you wish to ${1}"
+    log_msg -s "Enter [Yes | No] (case sensitive) : \c"
+
+    read USER_CONF
+    if [ "$USER_CONF" == "Yes" -o "$USER_CONF" == "No" ]; then
+        break
+    fi
+done
+}
+
+# ********************************************************************
+#
+# 	Main body of program
+#
+# ********************************************************************
+#
+# Determine absolute path to software
+get_absolute_path
+
+# Check that the effective id of the user is root
+check_id 
+
+while getopts ":d:l:Np:r:" arg; do
+  case $arg in
+    d) INI_FILE_DIR="$OPTARG" 
+       ;;
+    l) LOGFILE="$OPTARG" 
+       ;;
+    N) NO_CONFIRM="YES"
+       ;;
+    p) READER_PARENT_TAG="$OPTARG" 
+       ;;
+    r) READER_NAME="$OPTARG" 
+       ;; 
+   \?) usage_msg
+       exit 1
+       ;;
+  esac
+done
+shift `expr $OPTIND - 1`
+
+if [ ! "${INI_FILE_DIR}" -o ! "${READER_PARENT_TAG}" -o ! "${READER_NAME}" ]; then
+    usage_msg
+    exit 1
+fi
+
+if [ ! -s ${INI_FILE_DIR}/${ENIQ_INI} ]; then
+    _err_msg_="File ${INI_FILE_DIR}/${ENIQ_INI} not found or empty"
+    abort_script "$_err_msg_"
+fi
+
+# Set up environment variables for script. 
+setup_script_env
+
+# Setting up the default values for Reader IQ
+setup_default_mem_iq_reader
+
+if [ ! "${LOGFILE}" ]; then
+    LOGFILE=${ENIQ_LOG_DIR}/sw_log/iq/update_iq_mem_settings.log
+fi	
+  
+# Check/Create Logfile
+chk_create_logfile
+
+# Create a temporary Directory
+TEM_DIR=/tmp/update_iq_mem_settings.$$
+$RM -rf ${TEM_DIR}
+$MKDIR -p ${TEM_DIR}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not create directory ${TEM_DIR}"
+    abort_script "$_err_msg_"
+fi
+$CHMOD 777 ${TEM_DIR}
+
+# Overwrite with new Values if the exist
+NEW_OS_MIN_VALUE=`iniget SYSTEM_INFO -f ${ENIQ_CONF_DIR}/${ENIQ_INI} -v OS_MIN_VALUE`
+if [ "${NEW_OS_MIN_VALUE}" ]; then
+    OS_MIN_VALUE=${NEW_OS_MIN_VALUE}
+fi
+
+NEW_MIN_OS_MEM=`iniget SYSTEM_INFO -f ${ENIQ_CONF_DIR}/${ENIQ_INI} -v MIN_OS_MEM`
+if [ "${NEW_MIN_OS_MEM}" ]; then
+    MIN_OS_MEM=${NEW_MIN_OS_MEM}
+fi
+
+#Checking for paramter during migration in niq.ini file
+$GREP "CatalogCacheUpperMemLimitReserve=" ${ENIQ_CONF_DIR}/${ENIQ_INI} >> /dev/null 2>&1
+if [ $? -ne 0 ]; then
+    #Setting value to 0 if parameter does not exist in niq.ini file during migration
+    CATALOG_CACHE_UPPER_MEM_LIMIT_RESERVE=0
+else
+     CATALOG_CACHE_UPPER_MEM_LIMIT_RESERVE=`iniget DWH -v CatalogCacheUpperMemLimitReserve -f ${ENIQ_CONF_DIR}/${ENIQ_INI}`
+     if [ ! ${CATALOG_CACHE_UPPER_MEM_LIMIT_RESERVE} ]; then
+         _err_msg_="Could not read CatalogCacheUpperLimitReserve param from ${ENIQ_CONF_DIR}/${ENIQ_INI}"
+         abort_script "$_err_msg_"
+     fi
+fi
+
+# Setup sybase env
+setup_sybase_env
+
+if [ ! "${READER_NAME}" -o ! "${READER_PARENT_TAG}" ]; then
+	# Determine the reader info
+	get_reader_info
+fi
+
+# Ensure that the reader we want to update exists in niq.ini
+iniget DWH_READER -f ${INI_FILE_DIR}/${ENIQ_INI} | $GREP ${READER_PARENT_TAG} >> /dev/null 2>&1
+if [ $? -ne 0 ]; then
+    _err_msg_="${READER_PARENT_TAG} does not exist in ${INI_FILE_DIR}/${ENIQ_INI}"
+    abort_script "$_err_msg_"
+fi
+
+# Determine the memory to reserve
+calculate_reserved_memory
+
+if [ ! "${NO_CONFIRM}" ]; then
+    user_confirm "update ${READER_NAME} memory settings"
+    if [ "$USER_CONF" == "No" ]; then
+        $RM -rf ${TEM_DIR}
+        exit 0
+    fi
+fi
+
+### If the TOTAL_PHY_MEM is set then we are not going get the memory of the server 
+### we are only calculating values based on the TOTAL_PHY_MEM and not updating the ini
+### to see what the Sybase settings would be for the memory specified
+if [ ! "${TOTAL_PHY_MEM}" ]; then 
+	# Update the ini file with the values
+	update_ini_file ${DWH_MAIN_CACHE} ${DWH_TEMP_CACHE} ${DWH_LARGE_MEMORY} ${DEF_CATALOG_CACHE_MEMORY} ${INI_FILE_DIR}/${ENIQ_INI} ${READER_PARENT_TAG}
+fi
+$RM -rf ${TEM_DIR}
+
+exit 0

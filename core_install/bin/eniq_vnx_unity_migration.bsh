@@ -1,0 +1,2556 @@
+#!/bin/bash
+# ********************************************************************
+# Ericsson Radio Systems AB                                     SCRIPT
+# ********************************************************************
+# Ericsson Radio Systems AB 2020 - All rights reserved.
+#
+# The copyright to the computer program(s) herein is the property
+# of Ericsson Radio Systems AB, Sweden. The programs may be used
+# and/or copied only with the written permission from Ericsson Radio
+# Systems AB or in accordance with the terms and conditions stipulated
+# in the agreement/contract under which the program(s) have been
+# supplied.
+#    
+# ********************************************************************
+#
+# Name    : eniq_vnx_unity_migration.bsh
+# Date    : 05/10/2023
+# Revision: \main\17
+#
+# Purpose : This script will support storage migration from VNX to Unity on RHEL
+#
+#
+# Usage   : eniq_vnx_unity_migration.bsh -a <action> [-l <logfile>]
+#
+# ********************************************************************
+#
+#   Command Section
+#
+# ********************************************************************
+AWK=/usr/bin/awk
+BASENAME=/usr/bin/basename
+BASH=/usr/bin/bash
+CAT=/usr/bin/cat
+CHOWN=/usr/bin/chown
+CUT=/usr/bin/cut
+CP=/usr/bin/cp
+DATE=/usr/bin/date
+DIRNAME=/usr/bin/dirname
+ECHO='/usr/bin/echo -e'
+EGREP=/usr/bin/egrep
+EXPR=/usr/bin/expr
+FIND=/usr/bin/find
+GETENT=/usr/bin/getent
+GREP=/usr/bin/grep
+HEAD=/usr/bin/head
+HOST=/usr/sbin/host
+ID=/usr/bin/id
+MD5SUM=/usr/bin/md5sum
+MYHOSTNAME=/usr/bin/hostname
+MKDIR=/usr/bin/mkdir
+MULTIPATH=/usr/sbin/multipath
+PASTE=/usr/bin/paste
+PERL=/usr/bin/perl
+PRINTF=/usr/bin/printf
+PVS=/usr/sbin/pvs
+RAW=/usr/bin/raw
+RM=/usr/bin/rm
+SED=/usr/bin/sed
+SCP=/usr/bin/scp
+SORT=/usr/bin/sort
+SLEEP=/usr/bin/sleep
+SYSTEMCTL=/usr/bin/systemctl
+TAC=/usr/bin/tac
+TAIL=/usr/bin/tail
+TEE=/usr/bin/tee
+TOUCH=/usr/bin/touch
+TR=/usr/bin/tr
+UDEVADM=/usr/sbin/udevadm
+UEMCLI=/usr/bin/uemcli
+UNIQ=/usr/bin/uniq
+YES=/usr/bin/yes
+    
+# ********************************************************************
+#
+#       Configuration Section
+#
+# ********************************************************************
+    
+# Default user
+DEFAULT_USER=root
+
+# Default checksum
+CHECKSUM="NO"
+    
+# Cmd to exec a shell and drop user to it in case of an error
+EXEC_SHELL_CMD="exec /bin/bash -o emacs"
+
+# Name of the ini Files
+BLOCK_STORAGE_INI=block_storage.ini
+SYM_LINKS_INI=sym_links.ini
+COORD_SYM_LINKS_INI=coordinator_sym_links.ini
+LUN_MAP_INI=lun_map.ini
+SUNOS_INI=SunOS.ini
+ENIQ_INI=niq.ini
+DISK_PARTITIONED=disks_partitioned
+
+# NAS SMF
+NAS_MILESTONE_SMF_ID="NAS-online.service"
+NASd_SMF_ID="NASd.service"
+
+# Setting no confirmation from user
+NO_CONFIRM="YES"
+
+# Flag indicating the current state of the scheduler (0 means Active, 1 means On Hold)
+_scheduler_change_=0
+
+# Flag indicating the current profile of the engine (0 means Normal, 1 means NoLoads)
+_engine_profile_change_=0
+
+# Flag indicating that IQ SYSTEM MAIN Disk has been passed to the script (0 means No, 1 means Yes)
+_dwh_system_main_=0
+# ********************************************************************
+#
+#   Functions
+#
+# ********************************************************************
+### Function: abort_script ###
+#
+#   This will be called if the script is aborted by an error
+#   which is encountered during runtime
+#
+# Arguments:
+#       $1 - Error message from part of program (Not always used)
+# Return Values:
+#       none
+abort_script()
+{
+_err_time_=`$DATE '+%Y-%b-%d_%H.%M.%S'`
+
+if [ "$1" ]; then
+    _err_msg_="${_err_time_} - $1"
+else
+    _err_msg_="${_err_time_} - ERROR : Script aborted.......\n"
+fi
+
+if [ "${LOGFILE}" ]; then
+    $ECHO "\nERROR : ${_err_msg_}\n" | $TEE -a ${LOGFILE}
+else
+    $ECHO "\nERROR : ${_err_msg_}\n"
+fi
+
+if [ ${_scheduler_change_} -eq 1 -a ${_engine_profile_change_} -eq 0 ]; then
+     change_engine_scheduler_profile "activate" ""
+elif [ ${_scheduler_change_} -eq 1 -a ${_engine_profile_change_} -eq 1 ]; then
+     change_engine_scheduler_profile "activate" "Normal"
+fi
+
+$RM -rf ${TEM_DIR}
+$RM -rf ${CONN_STR_USER_DBA_ENC}
+$RM -rf ${CONN_STR_USER_DBA_RD_ENC}
+
+exit 1
+}
+
+### Function: check_absolute_path ###
+#
+# Determine absolute path to software
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+check_absolute_path()
+{
+_dir_=`$DIRNAME $0`
+SCRIPTHOME=`cd ${_dir_} 2>/dev/null && pwd || $ECHO ${_dir_}`
+}
+
+### Function: check_and_manage_smf ###
+#
+#   Check service status and manage
+#
+# Arguments:
+#   $1 : Service name
+#   $2 : Action
+# Return Values:
+#   none
+check_and_manage_smf()
+{
+# Check argument count
+if [ $# -ne 2 ];then
+    _err_msg_="Incorrect number of argument passed to check_and_manage_smf."
+    abort_script "${_err_msg_}"
+fi
+
+_svc_str_=$1
+_svc_action_=$2
+
+# Check status of SMF
+_load_status_=`$SYSTEMCTL show -p LoadState ${_svc_str_} | $CUT -f2 -d=`
+if [ "${_load_status_}" != "loaded" ];then
+    _err_msg_="Could not find service ${_svc_str_}"
+    abort_script "${_err_msg_}"
+fi
+_svc_status_=`$SYSTEMCTL show -p ActiveState ${_svc_str_} | $CUT -f2 -d=`
+
+_svc_next_state_=""
+case $_svc_action_ in
+  enable) _svc_next_state_="active"
+          _svc_next_action_="start"
+     ;;
+  disable) _svc_next_state_="inactive"
+           _svc_next_action_="stop"
+     ;;
+  *) $ECHO "Invalid action"
+     exit 1
+     ;;
+esac
+
+if [ "${_svc_status_}" != "${_svc_next_state_}" ];then
+    if [ "${_svc_status_}" == "failed" ];then
+        $SYSTEMCTL reset-failed ${_svc_str_} >> /dev/null 2>&1
+    fi
+    $SYSTEMCTL ${_svc_action_} ${_svc_str_} >> /dev/null 2>&1
+    if [ $? -ne 0 ];then
+        _err_msg_="Could not $_svc_action_ $_svc_str_ service."
+        abort_script "${_err_msg_}"
+    fi
+    $SYSTEMCTL ${_svc_next_action_} ${_svc_str_} >> /dev/null 2>&1
+    if [ $? -ne 0 ];then
+        _err_msg_="Could not $_svc_next_action_ $_svc_str_ service."
+        abort_script "${_err_msg_}"
+    fi
+
+fi
+
+# Wait for NAS milestone service if enabling NASd service
+if [ "${_svc_str_}" == "${NASd_SMF_ID}" -a "${_svc_action_}" == "enable" ];then
+    _count_=0
+
+    $ECHO "\nWaiting for 60 seconds before proceeding with NAS service checks.\n"
+    $SLEEP 60
+
+    while [ 1 ];
+    do
+        _milestone_state_=`$SYSTEMCTL show -p ActiveState ${NAS_MILESTONE_SMF_ID} | $CUT -f2 -d=`
+        if [ "${_milestone_state_}" == "active" ];then
+            $ECHO "${NAS_MILESTONE_SMF_ID} service is active."
+            break
+        fi
+        if [ $_count_ -eq 0 ]; then
+            $ECHO "\nTrying to start NAS milestone service. It can take upto 2 to 5 minutes. Please wait...\n"
+        fi
+        $SLEEP 30
+        let _count_=_count_+1
+        if [ $_count_ -eq 5 ];then
+            _err_msg_="NAS milestone ${NAS_MILESTONE_SMF_ID} service not online. Check ${ENIQ_LOG_DIR}/NASd/NASd.log"
+            abort_script ${_err_msg_}
+        fi
+    done
+fi
+}
+
+### Function: change_db_files_read_value ###
+#
+#       Sets the sql_file to READONLY or READWRITE
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+change_db_files_read_value()
+{
+_action_=$1
+
+for _iq_disk_ in `$CAT ${ENIQ_CONF_DIR}/iq_disk_paths.txt`
+do
+  local _sybase_file_=`$ECHO ${_iq_disk_}|$AWK -F:: '{print $1}'|$AWK -F"/" '{print $NF}'`
+  local _sybase_file_name_=`$ECHO ${_iq_disk_}|$AWK -F:: '{print $1}'|$AWK -F"/" '{print $NF}'|$CUT -d"." -f1`
+  if [ "${_action_}" == "READONLY" ]; then
+        _read_status_=`$ECHO ${_iq_disk_}|$AWK -F:: '{print $2}'|$AWK -F= '{print $2}'`
+  elif [ "${_action_}" == "READWRITE" ]; then
+         _read_status_=`$ECHO ${_iq_disk_}|$AWK -F:: '{print $3}'|$AWK -F= '{print $2}'`
+  fi
+
+  if [ "${_read_status_}" == "NO" ]; then
+        $MKDIR -p ${TEM_DIR}/sql
+        local _sql_file_=${TEM_DIR}/sql/alter_file_${_sybase_file_name_}.sql
+        $RM -rf ${_sql_file_}
+
+        if [[ "${_sybase_file_name_}" == *"iq_system_main"* ]]; then
+             DBSPACE="IQ_SYSTEM_MAIN"
+        else
+             DBSPACE="IQ_MAIN"
+        fi
+        if [ "${DBSPACE}" == "IQ_MAIN" ]; then
+           $ECHO "ALTER DBSPACE ${DBSPACE}" > ${_sql_file_}
+           $ECHO "ALTER FILE ${_sybase_file_name_} ${_action_}" >> ${_sql_file_}
+           $ECHO "SQL on ${_sybase_file_name_} in ${DBSPACE}\n" | $TEE -a ${LOGFILE}
+           $CAT ${_sql_file_} | $TEE -a ${LOGFILE}
+           $SU - $SYSUSER -c "${IQDIR}/bin64/dbisql \"@${CONN_STR_USER_DBA_ENC}\" -q ${_sql_file_}"
+           if [ $? -ne 0 ]; then
+                   _err_msg_="Failed to run ${_action_} on ${_sybase_file_name_} in ${DBSPACE} failed"
+                   abort_script "${_err_msg_}"
+           fi
+
+           $SED -i "s/${_action_}=NO/${_action_}=YES/1" ${ENIQ_CONF_DIR}/iq_disk_paths.txt
+           if [ $? -ne 0 ]; then
+                _err_msg_="Failed to update ${ENIQ_CONF_DIR}/iq_disk_paths.txt"
+                abort_script "${_err_msg_}"
+           fi
+        fi
+  else
+        _readonly_status_=`$ECHO ${_iq_disk_}|$AWK -F:: '{print $2}'|$AWK -F= '{print $2}'`
+        _readwrite_status_=`$ECHO ${_iq_disk_}|$AWK -F:: '{print $3}'|$AWK -F= '{print $2}'`
+        if [ "${_readonly_status_}" == "YES" -a "${_readwrite_status_}" == "YES" ]; then
+              log_msg -l ${LOGFILE} -t -s "${_sybase_file_} is already migrated"
+        else
+        log_msg -l ${LOGFILE} -t -s "${_sybase_file_} is already ${_action_}"
+  fi
+  fi
+done
+}
+
+### Function: change_engine_scheduler_profile ###
+#
+#       Checking the engine status and changing it to NoLoads
+#       and checks the execution slots
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+change_engine_scheduler_profile()
+{
+_scheduler_action_=${1}
+_engine_action_=${2}
+
+_scheduler_status_=`$SU - $SYSUSER -c 'scheduler status'|$GREP -iw "running OK"|$AWK '{print $3" "$4}'`
+_engine_status_=`$SU - $SYSUSER -c 'engine status'|$GREP -w "running OK"|$AWK '{print $3" "$4}'`
+
+if [ -n "${_scheduler_action_}" ]; then
+     if [ "${_scheduler_status_}" == "running OK" ]; then
+          _command_="scheduler ${_scheduler_action_}"
+          log_msg -l ${LOGFILE} -t -s "Putting scheduler to ${_scheduler_action_}"
+          $SU - $SYSUSER -c "${_command_}" >> /dev/null 2>&1
+          if [ $? -ne 0 ];then
+               _err_msg_="Could not put scheduler ${_scheduler_action_}"
+               abort_script "${_err_msg_}"
+          else
+              _scheduler_change_=1
+          fi
+     fi
+fi
+
+if [ -n "${_engine_action_}" ]; then
+    if [ "${_engine_status_}" == "running OK" ]; then
+          _engine_profile_=`$SU - $SYSUSER -c 'engine status' | $GREP -w "Current Profile:" | $AWK {'print $3'}`
+          if [ "${_engine_profile_}" ]; then
+                  log_msg -l ${LOGFILE} -t -s "Engine current profile is ${_engine_profile_}"
+                  if [[ "${_engine_profile_}" == "Normal" || ${_engine_profile_change_} -eq 1 ]] || [[ "${_engine_profile_}" == "NoLoads" && "${ACTION_TYPE}" == "postmigration" ]] ; then
+                       _command_="engine -e changeProfile ${_engine_action_}"
+                       log_msg -l ${LOGFILE} -t -s "Changing engine profile to ${_engine_action_}"
+                       $SU - $SYSUSER -c "${_command_}" >> /dev/null 2>&1
+                       if [ $? -ne 0 ];then
+                            _err_msg_="Could not change engine profile to ${_engine_action_}"
+                            abort_script "${_err_msg_}"
+                       else
+                            if [ "${_engine_action_}" == "NoLoads" ]; then
+                                 _engine_profile_change_=1
+                            elif [ "${_engine_action_}" == "Normal" ]; then
+                                 _engine_profile_change_=0
+                            fi
+                       fi
+
+                       # Check that there are no Loader and Aggregation sets.
+                       _timeout_=0
+                       while true ;do
+                           _command_="engine -e showSetsInExecutionSlots | $EGREP 'Count|Loader'"
+                           $SU - $SYSUSER -c "${_command_}"  >> /dev/null 2>&1
+                           if [ $? -eq 0 ];then
+                               log_msg -t -s "Waiting for Execution Slots to get empty" -l ${LOGFILE}
+                               $SLEEP 5
+                               (( _timeout_ = _timeout_ + 5 ))
+                               if [ ${_timeout_} -eq 120 ]; then
+                                   break
+                               else
+                                   continue
+                               fi
+                           else
+                               log_msg -t -s "Execution slots are empty of Loader and Aggregation sets" -l ${LOGFILE}
+                               break
+                           fi
+                       done
+                  fi
+          else
+                  _err_msg_="Could not get the current Engine profile"
+                  abort_script "${_err_msg_}"
+          fi
+    fi
+fi
+}
+
+### Function: check_id ###
+#
+#   Check that the effective id of the user is correct
+#   If not print error msg and exit.
+#
+# Arguments:
+#       $1 : User ID name
+# Return Values:
+#       none
+check_id()
+{
+_check_id_=`$ID | $AWK -F\( '{print $2}' | $AWK -F\) '{print $1}'`
+if [ "$_check_id_" != "$1" ]; then
+    _err_msg_="You must be $1 to execute this script."
+    abort_script "${_err_msg_}"
+fi
+}
+
+### Function: check_iq_disk_id ###
+#
+# Checks if disks provided in the input are valid IQ Disks
+#
+# Arguments: none
+#
+# Return Values: none
+check_iq_disk_id()
+{
+_disk_id_=$1
+_par_tag_list_="DWH_SYSTEM_MAIN DWH_DBSPACES_MAIN"
+
+if [ "${CO_SERVER}" == "YES" ]; then
+    _ini_file_list_="${CLI_CONF_DIR}/${COORD_SYM_LINKS_INI}"
+else
+    _ini_file_list_="${ENIQ_CONF_DIR}/${SYM_LINKS_INI}"
+fi
+
+for _ini_file_ in `$ECHO ${_ini_file_list_}`; do
+    for _parent_block_ in `$ECHO ${_par_tag_list_}`; do
+
+        _block_list_=`iniget ${_parent_block_} -f ${_ini_file_}`
+        if [ ! "${_block_list_}" ]; then
+            _err_msg_="Could not find values for ${_parent_block_} in ${_ini_file_}"
+            abort_script "${_err_msg_}"
+        fi
+
+
+        for _block_ in ${_block_list_}; do
+         _lun_id_=`iniget ${_block_} -f ${_ini_file_} -v Lun_ID`
+          if [ "${_parent_block_}" == "DWH_SYSTEM_MAIN" ]; then
+            if [ ${_no_of_disk_ids_} -gt 1 -a "${_lun_id_}" == "${_disk_id_}" ]; then
+                  _err_msg_="${_lun_id_} is in an IQ_SYSTEM_MAIN file and cannot be passed with Main DB LUNs"
+                  abort_script "${_err_msg_}"
+            elif [ "${_lun_id_}" == "${_disk_id_}" ]; then
+                  _dwh_system_main_=1
+            fi
+          fi
+
+          if [ "${_lun_id_}" == "${_disk_id_}" ]; then
+              _path_=`iniget ${_block_} -f ${_ini_file_} -v Path`
+              _disk_mpath_=`iniget ${_block_} -f ${_ini_file_} -v Disk`
+              $GREP -w "${_path_}" ${ENIQ_CONF_DIR}/iq_disk_paths.txt >> /dev/null 2>&1
+              if [ $? -ne 0 ]; then
+                 #Format of iq_disk_paths.txt
+                 #IQ_FILE=<absolute_path_to_iq_file>::READONLY=NO::READWRITE=NO::MULTIPATH=<partitioned_multipath>::CHECKSUM_PRE=NO::CHECKSUM_POST=NO
+                 if [ ${_dwh_system_main_} -eq 1 ]; then
+                      $ECHO "IQ_FILE=${_path_}::READONLY=NA::READWRITE=NA::MULTIPATH=${_disk_mpath_}::CHECKSUM_PRE=NO::CHECKSUM_POST=NO" >> ${ENIQ_CONF_DIR}/iq_disk_paths.txt
+                 else
+                      $ECHO "IQ_FILE=${_path_}::READONLY=NO::READWRITE=NO::MULTIPATH=${_disk_mpath_}::CHECKSUM_PRE=NO::CHECKSUM_POST=NO" >> ${ENIQ_CONF_DIR}/iq_disk_paths.txt
+                 fi
+              fi
+          fi
+
+          $GREP -w "${_disk_id_}" ${_ini_file_} >> /dev/null 2>&1
+          if [ $? -ne 0 ]; then
+               _err_msg_="${_disk_id_} not present in ${_ini_file_}"
+               abort_script "${_err_msg_}"
+          fi
+        done
+    done
+done
+}
+
+### Function: check_params ###
+#
+# Check Input Parameters
+#
+# Arguments: none
+#
+# Return Values: none
+check_params()
+{
+# Check that we got the required action type
+if [ ! "${ACTION_TYPE}" ]; then
+       usage_msg
+       $ECHO "ERROR: Required parameters not passed."
+       exit 1
+fi
+
+if [ "${ACTION_TYPE}" != "presancopy" -a "${ACTION_TYPE}" != "precutover" -a "${ACTION_TYPE}" != "postmigration" -a "${ACTION_TYPE}" != "cleanup" -a "${ACTION_TYPE}" != "temp_db_migration" -a "${ACTION_TYPE}" != "plugincheck" -a "${ACTION_TYPE}" != "ext4_migration" ]; then
+      usage_msg
+      $ECHO "ERROR: Not a valid action type"
+      exit 1
+fi
+
+if [[ "${ACTION_TYPE}" == "presancopy" || "${ACTION_TYPE}" == "postmigration" ]] && [[ ! "${DISK_INPUT}" || ! "${MIGRATION_TYPE}" ]]; then
+      usage_msg
+      $ECHO "\nERROR: Disk IDs and Migration Type need to be passed along with ${ACTION_TYPE}"
+      exit 1
+elif [[ "${ACTION_TYPE}" == "presancopy" || "${ACTION_TYPE}" == "postmigration" ]] && [[ ! "${MIGRATION_TYPE}" != "EXT4" && ! "${MIGRATION_TYPE}" != "SAN" ]]; then
+      usage_msg
+      $ECHO "ERROR: Not a valid migration type"
+      exit 1
+else
+    _disk_ids_=`$ECHO ${DISK_INPUT} | $TR -d ' '`
+    
+    
+
+    OLDIFS=$IFS
+    IFS=\, _disk_id_array_=($_disk_ids_)
+    IFS=$OLDIFS
+
+    _no_of_disk_ids_=`echo ${#_disk_id_array_[@]}`
+    if [ ${_no_of_disk_ids_} -gt 7 ]; then
+         $ECHO "ERROR: More than 7 LUN IDs cannot be passed as an input."
+         exit 1
+    fi
+fi
+
+if [ "${ACTION_TYPE}" == "precutover" -a "${DISK_INPUT}" ]; then
+      usage_msg
+      $ECHO "\nERROR: Disk IDs need not be passed along with ${ACTION_TYPE}"
+      exit 1
+fi
+}
+
+
+### Function: cleanup ###
+#
+# Cleaning temporary files
+#
+# Arguments: none
+#
+# Return Values: none
+cleanup()
+{
+log_msg -t -s "Cleaning up temporary files since migration has been completed successfully" -l ${LOGFILE}
+
+log_msg -q -t -s "Removing /var/tmp/presancopy_success" -l ${LOGFILE}
+$RM -rf /var/tmp/presancopy_SAN_success
+
+log_msg -q -t -s "Removing /var/tmp/postmigration_success" -l ${LOGFILE}
+$RM -rf /var/tmp/postmigration_SAN_success
+
+log_msg -q -t -s "Removing /var/tmp/remove_vnx_mpath_success" -l ${LOGFILE}
+$RM -rf /var/tmp/remove_vnx_mpath_success
+
+log_msg -q -t -s "Removing /var/tmp/remove_vnx_mpath_success" -l ${LOGFILE}
+$RM -rf ${VAR_TMP_DIR}/ext4_migration_success 
+
+
+if [ "${FILES}" == "ALL" ]; then
+     log_msg q -t -s "Removing ${ENIQ_CONF_DIR}/raw_dev_info" -l ${LOGFILE}
+     $RM -rf ${ENIQ_CONF_DIR}/raw_dev_info
+
+     log_msg -q -t -s "Removing ${ENIQ_CONF_DIR}/storage_migration_iq_header_info" -l ${LOGFILE}
+     $RM -rf ${ENIQ_CONF_DIR}/storage_migration_iq_header_info
+
+     log_msg -q -t -s "Removing ${ENIQ_CONF_DIR}/storage_migration_md5sum_info" -l ${LOGFILE}
+     $RM -rf ${ENIQ_CONF_DIR}/storage_migration_md5sum_info
+
+     log_msg -q -t -s "Removing ${ENIQ_CONF_DIR}/san_details_bkp" -l ${LOGFILE}
+     $RM -rf ${ENIQ_CONF_DIR}/san_details_bkp
+
+     log_msg -q -t -s "Removing ${ENIQ_CONF_DIR}/${SUNOS_INI}_bkp" -l ${LOGFILE}
+     $RM -rf ${ENIQ_CONF_DIR}/${SUNOS_INI}_bkp
+
+     log_msg -q -t -s "Removing ${ENIQ_CONF_DIR}/iq_disk_paths.txt" -l ${LOGFILE}
+     $RM -rf ${ENIQ_CONF_DIR}/iq_disk_paths.txt
+
+     log_msg -q -t -s "Removing ${ENIQ_CONF_DIR}/storage_migration_iq_header_info_postmigration" -l ${LOGFILE}
+     $RM -rf ${ENIQ_CONF_DIR}/storage_migration_iq_header_info_postmigration
+
+     log_msg -q -t -s "Removing ${ENIQ_CONF_DIR}/storage_migration_md5sum_info_postmigration" -l ${LOGFILE}
+     $RM -rf ${ENIQ_CONF_DIR}/storage_migration_md5sum_info_postmigration
+
+     log_msg -q -t -s "Removing /var/tmp/sys_main_migration" -l ${LOGFILE}
+     $RM -rf /var/tmp/sys_main_migration
+
+     log_msg -q -t -s "Removing ${VAR_TMP_DIR}/backup_files_flag" -l ${LOGFILE}
+     $RM -rf ${VAR_TMP_DIR}/backup_files_flag
+
+     log_msg -q -t -s "Removing ${CLI_CONF_DIR}/merge_input_file" -l ${LOGFILE}
+     $RM -rf ${CLI_CONF_DIR}/merge_input_file
+
+     log_msg -q -t -s "Removing ${ENIQ_CONF_DIR}/${DISK_PARTITIONED}_ext4_bkp" -l ${LOGFILE}
+     $RM -rf ${ENIQ_CONF_DIR}/${DISK_PARTITIONED}_ext4_bkp
+
+      log_msg -q -t -s "Removing ${ENIQ_CONF_DIR}/${BLOCK_STORAGE_INI}_ext4_bkp" -l ${LOGFILE}
+     $RM -rf ${ENIQ_CONF_DIR}/${BLOCK_STORAGE_INI}_ext4_bkp
+     
+     log_msg -q -t -s "Removing ${ENIQ_CONF_DIR}/${LUN_MAP_INI}_ext4_bkp" -l ${LOGFILE}
+     $RM -rf ${ENIQ_CONF_DIR}/${LUN_MAP_INI}_ext4_bkp
+     
+     log_msg -q -t -s "Removing ${ENIQ_CONF_DIR}/${SUNOS_INI}_ext4_bkp" -l ${LOGFILE}
+     $RM -rf ${ENIQ_CONF_DIR}/${SUNOS_INI}_ext4_bkp
+
+     log_msg -q -t -s "Removing /var/tmp/temp_db_block" -l ${LOGFILE}
+     $RM -rf /var/tmp/temp_db_block
+
+fi
+
+}
+
+### Function: commit_and_checkpoint ###
+#
+#       ensuring that the nodes are up to date with
+#       the latest TLV log
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+commit_and_checkpoint()
+{
+log_msg -l ${LOGFILE} -t -s "Performing commit and checkpoints"
+
+if [ "${CURR_SERVER_TYPE}" == "eniq_stats" ]; then
+     $SU - $SYSUSER -c "${IQDIR}/bin64/dbisql -nogui -onerror exit \"@${CONN_STR_USER_DBA_ENC}\" \"COMMIT; BEGIN TRANSACTION;CHECKPOINT\""
+     if [ $? -ne 0 ];then
+             _err_msg_="Could not commit and checkpoint transactions"
+             abort_script "${_err_msg_}"
+     fi
+elif [ "${CURR_SERVER_TYPE}" == "stats_coordinator" ]; then
+       $SU - $SYSUSER -c "${IQDIR}/bin64/dbisql -nogui -onerror exit \"@${CONN_STR_USER_DBA_ENC}\" \"COMMIT; BEGIN TRANSACTION;CHECKPOINT\""
+       if [ $? -ne 0 ];then
+               _err_msg_="Could not commit and checkpoint transactions"
+               abort_script "${_err_msg_}"
+       fi
+
+       for _reader_ in ${_reader_list_}; do
+	   
+			
+			
+           CONN_STR_USER_DBA_RD="-c \"uid=dba;pwd=${DBA_PASSWORD};eng=${_reader_};links=tcpip{host=${_reader_};port=${DWH_READER_PORT};dobroadcast=no;verify=no}\""
+           CONN_STR_USER_DBA_RD_ENC=${TEM}/con_str_vnx_encrypt.txt.`uuidgen`
+		   
+		   # encrypt the connection string.
+			get_encrypt_file "${CONN_STR_USER_DBA_RD}" "${CONN_STR_USER_DBA_RD_ENC}"
+
+		   $SU - $SYSUSER -c "${IQDIR}/bin64/dbisql -nogui -onerror exit \"@${CONN_STR_USER_DBA_RD_ENC}\" \"COMMIT; BEGIN TRANSACTION;CHECKPOINT\""
+           if [ $? -ne 0 ];then
+                   _err_msg_="Could not commit and checkpoint transactions on ${_reader_}_ENG"
+                   abort_script "${_err_msg_}"
+           fi
+       done
+fi
+}
+
+### Function: compare_iq_header_info ###
+#
+# Compares IQ header information collected before and after migration
+#
+# Arguments: none
+#
+# Return Values: none
+compare_iq_header_info()
+{
+log_msg -t -s "Comparing IQ Header information for migrated IQ files" -l ${LOGFILE}
+
+for _migrated_iq_file_ in `$CAT ${TEM_DIR}/migrated_iq_file_info.txt`; do
+     _migrated_iq_file_header_info_=`$GREP ${_migrated_iq_file_} ${ENIQ_CONF_DIR}/storage_migration_iq_header_info_${ACTION_TYPE}`
+     $GREP "${_migrated_iq_file_header_info_}" ${ENIQ_CONF_DIR}/storage_migration_iq_header_info >> /dev/null 2>&1
+     if [ $? -ne 0 ]; then
+          _err_msg_="Mismatch observed in IQ Header information for ${_migrated_iq_file_}"
+          abort_script "${_err_msg_}"
+     else
+         log_msg -t -s "IQ Header information is matching for ${_migrated_iq_file_}" -l ${LOGFILE}
+     fi
+done
+}
+
+### Function: compare_md5sum_info ###
+#
+# Compares md5sum information collected before and after migration
+#
+# Arguments: none
+#
+# Return Values: none
+compare_md5sum_info()
+{
+log_msg -t -s "Comparing md5sum information for migrated IQ files" -l ${LOGFILE}
+
+for _migrated_iq_file_ in `$CAT ${TEM_DIR}/migrated_iq_file_info.txt`; do
+     _migrated_iq_file_md5sum_info_=`$GREP ${_migrated_iq_file_} ${ENIQ_CONF_DIR}/storage_migration_md5sum_info_${ACTION_TYPE}`
+     $GREP "${_migrated_iq_file_md5sum_info_}" ${ENIQ_CONF_DIR}/storage_migration_md5sum_info >> /dev/null 2>&1
+     if [ $? -ne 0 ]; then
+          _err_msg_="Mismatch observed in md5sum information for ${_migrated_iq_file_}"
+          abort_script "${_err_msg_}"
+     else
+         log_msg -t -s "md5sum information is matching for ${_migrated_iq_file_}" -l ${LOGFILE}
+     fi
+done
+}
+
+### Function: execute_migration ###
+#
+# Executes the migration procedure
+#
+# Arguments: none
+#
+# Return Values: none
+execute_migration()
+{
+
+if [ -s /var/tmp/${ACTION_TYPE}_${MIGRATION_TYPE}_success ]; then
+     log_msg -t -s "Skipping ${ACTION_TYPE} on ${HNAME} as ${ACTION_TYPE} already completed" -l ${LOGFILE}
+     return 0
+fi
+
+
+
+if [ "${RD_SERVER}" == "YES" ]; then
+     _dwh_reader_type_=`$CAT ${ENIQ_CONF_DIR}/install_reader_type | $GREP "dwh_reader"`
+     if [ ! "${_dwh_reader_type_}" ]; then
+          _err_msg_="Could not get Reader Alias"
+          abort_script "${_err_msg_}"
+     fi
+fi
+
+if [ "${CURR_SERVER_TYPE}" == "stats_coordinator" ]; then
+      SERVER_LIST=(stats_coordinator)
+elif [ "${CURR_SERVER_TYPE}" == "stats_engine" ]; then
+      SERVER_LIST=(stats_engine)
+elif [ "${CURR_SERVER_TYPE}" == "eniq_stats" ]; then
+       SERVER_LIST=(eniq_stats)
+else
+       SERVER_LIST+=("stats_iqr_${_dwh_reader_type_}")
+fi
+
+
+if [ "${ACTION_TYPE}" == "postmigration" -a "${MIGRATION_TYPE}" == "EXT4" ]; then
+     _no_of_disk_ids_=`echo ${#_disk_id_array_[@]}`
+     if [ "${CURR_SERVER_TYPE}" == "stats_coordinator" ]; then
+          if [ ${_no_of_disk_ids_} -lt 4 ]; then
+               $ECHO "ERROR: 4 LUN IDs need to be entered as an input."
+               exit 1
+          fi
+     elif [ "${CURR_SERVER_TYPE}" == "eniq_stats" ]; then
+          if [ ${_no_of_disk_ids_} -lt 1 ]; then
+               $ECHO "ERROR: A LUN ID need to be entered as an input."
+               exit 1
+          fi
+     fi
+
+     _ext4_loop_count_=0
+     for _disk_id_ in "${_disk_id_array_[@]}"
+     do
+        $ECHO  "${SERVER_LIST[_ext4_loop_count_]}:${_disk_id_}"  >> ${TEM_DIR}/ext4_luns
+        _ext4_loop_count_=`$EXPR ${_ext4_loop_count_} + 1`
+     done
+fi
+
+if [ "${ACTION_TYPE}" == "presancopy" -o "${ACTION_TYPE}" == "postmigration" ]; then
+
+     _disk_loop_count_=0
+     for _disk_id_ in "${_disk_id_array_[@]}"
+     do
+         # Checking for duplicates for presancopy and postmigration
+         _disk_loop_count_=`$EXPR ${_disk_loop_count_} + 1`
+         _disk_count_=`$PRINTF "%s\n" "${_disk_id_array_[@]}" | $GREP -w ${_disk_id_} | wc -l`
+         if [ ${_disk_count_} -gt 1 ]; then
+              _err_msg_="Duplicates found. Only unique LUN IDs should be entered"
+              abort_script "${_err_msg_}"
+         fi
+    
+    
+
+
+         if [ "${ACTION_TYPE}" == "presancopy" ]; then
+              check_iq_disk_id "${_disk_id_}"
+         fi
+
+         if [ "${ACTION_TYPE}" == "postmigration" ]; then
+               if [ ${_disk_loop_count_} -eq 1 ]; then
+
+                    # Getting list of LUNS configured for Unity
+                    ${_stor_api_cmd_} --action listluns > ${TEM_DIR}/disk_info.txt
+
+                    if [ "${MIGRATION_TYPE}" == "SAN" ]; then
+                         if [ "${CO_SERVER}" == "YES" ]; then
+                              $CP ${CLI_CONF_DIR}/${COORD_SYM_LINKS_INI} ${TEM_DIR}/${COORD_SYM_LINKS_INI}
+                              if [ $? -ne 0 ]; then
+                                   _err_msg_="Could not backup ${ENIQ_CONF_DIR}${SYM_LINKS_INI} to ${TEM_DIR}"
+                                   abort_script "${_err_msg_}"
+                              fi
+                         fi
+
+                         $CP ${ENIQ_CONF_DIR}/${SYM_LINKS_INI} ${TEM_DIR}/${SYM_LINKS_INI}
+                         if [ $? -ne 0 ]; then
+                              _err_msg_="Could not backup ${ENIQ_CONF_DIR}/${SYM_LINKS_INI} to ${TEM_DIR}"
+                              abort_script "${_err_msg_}"
+                         fi
+
+                         $CP ${ENIQ_CONF_DIR}/${LUN_MAP_INI} ${TEM_DIR}/${LUN_MAP_INI}
+                         if [ $? -ne 0 ]; then
+                              _err_msg_="Could not backup ${ENIQ_CONF_DIR}/${LUN_MAP_INI} to ${TEM_DIR}"
+                              abort_script "${_err_msg_}"
+                         fi
+
+                         $CP ${ENIQ_CONF_DIR}/${DISK_PARTITIONED} ${TEM_DIR}/${DISK_PARTITIONED}
+                         if [ $? -ne 0 ]; then
+                              _err_msg_="Could not backup ${ENIQ_CONF_DIR}/${DISK_PARTITIONED} to ${TEM_DIR}"
+                              abort_script "${_err_msg_}"
+                         fi
+                    fi
+               fi
+
+               if [ "${CURR_SERVER_TYPE}" != "stats_engine" ]; then
+                     $GREP -w "${_disk_id_}" ${TEM_DIR}/disk_info.txt >> /dev/null 2>&1
+                     if [ $? -eq 0 ]; then
+                          update_config_files "${_disk_id_}"
+                     else
+                          _err_msg_="${_disk_id_} not listed in the ${_stor_api_cmd_} output"
+                          abort_script "${_err_msg_}"
+                     fi
+               fi
+         fi
+     done
+fi
+
+if [ "${ACTION_TYPE}" == "presancopy" -a ${_dwh_system_main_} -eq 0 ]; then
+      if [ "${CO_SERVER}" == "YES" -o "${RD_SERVER}" == "YES" ]; then
+           save_iq_header_blockdump_information
+      fi
+
+      if [ "${CO_SERVER}" == "YES" ]; then
+             save_iq_dbspace_file_info
+             change_engine_scheduler_profile "hold" "NoLoads"
+             commit_and_checkpoint
+             change_db_files_read_value "READONLY"
+             change_engine_scheduler_profile "activate" "Normal"
+      fi
+elif [ "${ACTION_TYPE}" == "presancopy" -a ${_dwh_system_main_} -eq 1 ]; then
+       if [ "${CO_SERVER}" == "YES" ]; then
+            change_engine_scheduler_profile "hold" "NoLoads"
+            commit_and_checkpoint
+            start_stop_eniq_services "stop" "deployment"
+            if [ "$CHECKSUM" == "YES" ]; then
+                 save_checksum_information "" "CHECKSUM_PRE"
+            fi
+
+            $TOUCH /var/tmp/sys_main_migration
+            $ECHO "${HNAME}" > /var/tmp/sys_main_migration
+       else
+            log_msg -t -s "Skipping ${ACTION_TYPE} on $HNAME" -l ${LOGFILE}
+            return 0
+       fi
+fi
+
+if [ "${ACTION_TYPE}" == "precutover" -a ${_dwh_system_main_} -eq 0 ]; then
+     if [ -s /var/tmp/sys_main_migration ]; then
+           log_msg -t -s "Skipping ${ACTION_TYPE} on ${HNAME} since disk provided is IQ_SYSTEM_MAIN" -l ${LOGFILE}
+           return 0
+     fi
+     change_engine_scheduler_profile "hold" "NoLoads"
+     commit_and_checkpoint
+     start_stop_eniq_services "stop" "deployment"
+     if [ "$CHECKSUM" == "YES" ]; then
+          save_checksum_information "" "CHECKSUM_PRE"
+     fi
+fi
+
+if [ "${ACTION_TYPE}" == "postmigration" -a "${MIGRATION_TYPE}" == "SAN" ]; then
+      if [ "${ACTION_TYPE}" == "postmigration" ]; then
+           start_stop_eniq_services "stop" "standalone"
+      fi
+
+      register_raw_device
+      recreate_db_symlinks
+      if [ "${CO_SERVER}" == "YES" -o "${RD_SERVER}" == "YES" ]; then
+           save_iq_header_blockdump_information "storage_migration_iq_header_info_${ACTION_TYPE}"
+           compare_iq_header_info
+           if [ "$CHECKSUM" == "YES" ]; then
+                save_checksum_information "storage_migration_md5sum_info_${ACTION_TYPE}" "CHECKSUM_POST"
+                compare_md5sum_info
+           fi
+      fi
+
+      start_stop_eniq_services "start"
+      if [ "${CO_SERVER}" == "YES" ]; then
+           change_db_files_read_value "READWRITE"
+      fi
+
+      if [ "${CURR_SERVER_TYPE}" == "stats_engine" -o "${CURR_SERVER_TYPE}" == "eniq_stats" ]; then
+           change_engine_scheduler_profile "activate" "Normal"
+      fi
+
+    if [ ! -f ${VAR_TMP_DIR}/backup_files_flag ];then
+        $CP -pf ${ENIQ_CONF_DIR}/san_details ${ENIQ_CONF_DIR}/san_details_bkp
+        if [ $? -ne 0 ]; then
+            _err_msg_="Could not copy ${ENIQ_CONF_DIR}/san_details to ${ENIQ_CONF_DIR}/san_details_bkp"
+            abort_script "${_err_msg_}"
+        fi
+
+        $CP -pf ${ENIQ_CONF_DIR}/${SUNOS_INI} ${ENIQ_CONF_DIR}/${SUNOS_INI}_bkp
+        if [ $? -ne 0 ]; then
+            _err_msg_="Could not copy ${ENIQ_CONF_DIR}/${SUNOS_INI}  to ${ENIQ_CONF_DIR}/${SUNOS_INI}_bkp"
+            abort_script "${_err_msg_}"
+        fi
+
+        $TOUCH ${VAR_TMP_DIR}/backup_files_flag
+    fi
+
+    iniset SAN_DEV -f ${ENIQ_CONF_DIR}/${SUNOS_INI}_bkp SAN_DEVICE="${SAN_DEVICE_UNITY}"
+    if [ $? -ne 0 ]; then
+        _err_msg_="Could not update SAN_DEVICE="${SAN_DEVICE_UNITY}" in ${ENIQ_CONF_DIR}/${SUNOS_INI}_bkp"
+        abort_script "${_err_msg_}"
+    fi
+
+    SAN_SW_PKGS_TO_INST_UNITY=`iniget SAN_SW -f ${new_template_ini} -v SAN_SW_PKGS_TO_INST`
+    if [ $? -ne 0 ]; then
+        _err_msg_="Could not read SAN_SW_PKGS_TO_INST param from ${new_template_ini}}"
+        abort_script "${_err_msg_}"
+    fi
+
+    iniset SAN_SW -f ${ENIQ_CONF_DIR}/${SUNOS_INI}_bkp SAN_SW_PKGS_TO_INST="${SAN_SW_PKGS_TO_INST_UNITY}"
+    if [ $? -ne 0 ]; then
+        _err_msg_="Could not update SAN_DEVICE="${SAN_DEVICE_UNITY}" in ${ENIQ_CONF_DIR}/${SUNOS_INI}_bkp"
+        abort_script "${_err_msg_}"
+    fi
+
+    dwh_reader_2_rep_main_fs_size_unity=`iniget dwh_reader_2_fs_size -f ${new_template_ini} -v rep_main`
+    if [ $? -ne 0 ]; then
+        _err_msg_="Could not read rep_main param from ${new_template_ini}}"
+        abort_script "${_err_msg_}"
+    fi
+
+    iniset dwh_reader_2_fs_size -f ${ENIQ_CONF_DIR}/${SUNOS_INI}_bkp rep_main="${dwh_reader_2_rep_main_fs_size_unity}"
+    if [ $? -ne 0 ]; then
+        _err_msg_="Could not update SAN_DEVICE="${SAN_DEVICE_UNITY}" in ${ENIQ_CONF_DIR}/${SUNOS_INI}_bkp"
+        abort_script "${_err_msg_}"
+    fi
+
+    $SED  -i 's/SAN_DEVICE=.*/'SAN_DEVICE=${SAN_DEVICE_UNITY}'/g' ${ENIQ_CONF_DIR}/san_details_bkp
+    if [ $? -ne 0 ]; then
+        _err_msg_="Failed to update ${ENIQ_CONF_DIR}/san_details"
+        abort_script "${_err_msg_}"
+    fi
+
+    $CP -pf ${ENIQ_CONF_DIR}/san_details_bkp ${ENIQ_CONF_DIR}/san_details
+    if [ $? -ne 0 ]; then
+        _err_msg_="Could not copy ${ENIQ_CONF_DIR}/san_details_bkp to ${ENIQ_CONF_DIR}"
+        abort_script "${_err_msg_}"
+    fi
+
+    $CP -pf ${ENIQ_CONF_DIR}/${SUNOS_INI}_bkp ${ENIQ_CONF_DIR}/${SUNOS_INI}
+    if [ $? -ne 0 ]; then
+        _err_msg_="Could not copy ${ENIQ_CONF_DIR}/${SUNOS_INI}_bkp to ${ENIQ_CONF_DIR}"
+        abort_script "${_err_msg_}"
+    fi
+
+    if [ "${CO_SERVER}" == "YES" ]; then
+         if [ -s "${FLS_CONFIG_FILE}" ];then
+              $CAT ${FLS_CONFIG_FILE} > ${CLI_CONF_DIR}/merge_input_file
+         fi
+    fi
+
+    if [ -s "${CLI_CONF_DIR}/merge_input_file" ];then
+            while read _line_; do
+                $GREP -w "${_line_}" ${new_template_ini} >> /dev/null
+                if [ $? -ne 0 ]; then
+                     log_msg -l ${LOGFILE} -s "Merging block ${_line_} in ${new_template_ini}"
+                     old_tag=`$CAT ${old_template_ini} | $EGREP -B1 ${_line_} |$GREP SunOS_DIRECTORY_DIR_ | $HEAD -1 |$TR -d "[" |$TR -d "]"`
+                      _last_used_=`$CAT ${new_template_ini} |$GREP SunOS_DIRECTORY_DIR_ |$GREP -v "\[*\]" | $TAIL -1 |$SED 's/[^0-9]*//g'`
+                     ((_last_used_++))
+                     gtag="SunOS_DIRECTORY"
+                     ptag="SunOS_DIRECTORY_DIR_${_last_used_}"
+                     $ECHO "[${ptag}]" > ${TEM_DIR}/new_ini_block
+                     iniget $old_tag -f ${old_template_ini} >> ${TEM_DIR}/new_ini_block
+                     if [ $? -ne 0 ]; then
+                         _err_msg_="Failed to get $old_tag from ${old_template_ini}"
+                         abort_script "$_err_msg_" "${EXEC_SHELL_CMD}"
+                     fi
+
+                     log_msg -l ${LOGFILE} -q -s "Executing command: \n$INIADD -g $gtag -p $ptag -i ${new_template_ini} -d ${TEM_DIR}/new_ini_block -o ${TEM_DIR}/output_file"
+                     $INIADD -g $gtag -p $ptag -i ${new_template_ini} -d ${TEM_DIR}/new_ini_block -o ${TEM_DIR}/output_file
+                     if [ $? -ne 0 ]; then
+                         _err_msg_="Error in migrating block ${_item_} from ${old_template_ini}"
+                         abort_script "$_err_msg_" "${EXEC_SHELL_CMD}"
+                     fi
+
+                     $CP ${TEM_DIR}/output_file ${new_template_ini}
+                     if [ $? -ne 0 ]; then
+                         _err_msg_="Failed to migrate ${old_template_ini}"
+                         abort_script "$_err_msg_" "${EXEC_SHELL_CMD}"
+                     fi
+
+                     $RM -rf ${TEM_DIR}/output_file
+                     log_msg -l ${LOGFILE} -s "Successfully migrated block ${_line_} to ${new_template_ini}."
+                else
+                     log_msg -l ${LOGFILE} -s "Block ${_line_} already migrated to ${new_template_ini}."
+                fi
+            done < ${CLI_CONF_DIR}/merge_input_file
+    fi
+fi
+}
+
+### Function: ext4_migration ###
+#
+# Get the order of the deployment
+# for performing required functionality based on action type
+#
+# Arguments: none
+#
+# Return Values: none
+ext4_migration()
+{
+
+log_msg -t -s "Executing EXT4 Migration with Unity storage on $HNAME" -l ${LOGFILE}
+
+if [ -s ${VAR_TMP_DIR}/ext4_migration_success ]; then
+    log_msg -t -s "Skipping EXT4 Migration as it is already completed" -l ${LOGFILE}
+else
+    _pool_info_=`iniget SunOS_FS_POOL -f ${ENIQ_CONF_DIR}/${SUNOS_INI} | $HEAD -1`
+    if [ ! "${_pool_info_}" ]; then
+        _err_msg_="Could not read parameter SunOS_ZFS_POOL from ${ENIQ_CONF_DIR}/${SUNOS_INI}"
+        abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+    fi
+    _pool_name_=`iniget ${_pool_info_} -f ${ENIQ_CONF_DIR}/${SUNOS_INI} -v name`
+    if [ ! "${_pool_name_}" ]; then
+        _err_msg_="Could not read parameter name from ${ENIQ_CONF_DIR}/${SUNOS_INI}"
+        abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+    fi
+    _ext4_mpath_=`$PVS |$GREP -w ${_pool_name_} | $AWK -F " " '{print $1}' | $AWK -F/ '{print $NF}'`
+    if [ ! "${_ext4_mpath_}" ]; then
+        _err_msg_="Could not read mpath value from PVS output."
+        abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+    fi
+    _ext4_mpath_trimmed_=`$ECHO "${_ext4_mpath_//1}"`
+    if [ ! "${_ext4_mpath_trimmed_}" ]; then
+        _err_msg_="Could not trim mpath value."
+        abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+    fi
+    # Getting list of LUNS configured for Unity
+    ${_stor_api_cmd_} --action listluns > ${TEM_DIR}/disk_info.txt
+    if [ $? -ne 0 ]; then
+        _err_msg_="Could not get list of luns from blkcli."
+        abort_script "$_err_msg_" "${EXEC_SHELL_CMD}"
+    fi
+    _unity_ext4_disk_=`$CAT ${TEM_DIR}/disk_info.txt | $GREP -w ${_ext4_mpath_trimmed_} | $AWK -F ";" '{print $1}'`
+    if [ ! "${_unity_ext4_disk_}" ]; then
+        _err_msg_="Failed to get EXT4 disk from blkcli output."
+        abort_script "${_err_msg_}"
+    fi
+
+    $CP ${ENIQ_CONF_DIR}/${SUNOS_INI} ${ENIQ_CONF_DIR}/${SUNOS_INI}_ext4_bkp
+    if [ $? -ne 0 ]; then
+        _err_msg_="Could not backup ${ENIQ_CONF_DIR}/SunOS.ini to ${TEM_DIR}"
+        abort_script "${_err_msg_}"
+    else
+    
+        # Get vnx ext4 mpath from SunOS.ini
+        _vnx_ext4_mpath_=`iniget SunOS_FS_POOL_1 -f ${ENIQ_CONF_DIR}/${SUNOS_INI} -v disk_layout`
+        if [ ! "${_vnx_ext4_mpath_}" ]; then
+            _err_msg_="Could not read SunOS_FS_POOL_1 param from ${ENIQ_CONF_DIR}/${SUNOS_INI}"
+            abort_script "${_err_msg_}"
+        fi
+        
+        $GREP -w "${_unity_ext4_disk_}" ${TEM_DIR}/disk_info.txt >> /dev/null 2>&1
+        if [ $? -eq 0 ]; then
+             _unity_ext4_mpath_=`$CAT ${TEM_DIR}/disk_info.txt|$GREP -w ${_unity_ext4_disk_}|$AWK -F";" '{print $2}'`
+             log_msg -t -s "Setting the required parameter ${_unity_ext4_mpath_} in the ${ENIQ_CONF_DIR}/${SUNOS_INI} file on ${HNAME}" -l ${LOGFILE}
+             iniset SunOS_FS_POOL_1 -f ${ENIQ_CONF_DIR}/${SUNOS_INI}  disk_layout="${_unity_ext4_mpath_}"
+             if [ $? -ne 0 ]; then
+                  _err_msg_="Could not set the required parameter ${_unity_ext4_mpath_} in the ${TEM_DIR}/SunOS.ini file"
+                  abort_script "${_err_msg_}"
+             fi
+        else
+             _err_msg_="${_disk_id_} not listed in the ${_stor_api_cmd_} output"
+             abort_script "${_err_msg_}"
+        fi
+    fi
+    $CP ${ENIQ_CONF_DIR}/${DISK_PARTITIONED} ${ENIQ_CONF_DIR}/${DISK_PARTITIONED}_ext4_bkp
+    if [ $? -ne 0 ]; then
+         _err_msg_="Could not backup ${ENIQ_CONF_DIR}/${DISK_PARTITIONED} to ${TEM_DIR}"
+         abort_script "${_err_msg_}"
+    fi
+    $CP ${ENIQ_CONF_DIR}/${LUN_MAP_INI} ${ENIQ_CONF_DIR}/${LUN_MAP_INI}_ext4_bkp
+    if [ $? -ne 0 ]; then
+         _err_msg_="Could not backup ${ENIQ_CONF_DIR}/${LUN_MAP_INI} to ${TEM_DIR}"
+         abort_script "${_err_msg_}"
+    fi
+    $CP ${ENIQ_CONF_DIR}/${BLOCK_STORAGE_INI} ${ENIQ_CONF_DIR}/${BLOCK_STORAGE_INI}_ext4_bkp
+    if [ $? -ne 0 ]; then
+         _err_msg_="Could not backup ${ENIQ_CONF_DIR}/${BLOCK_STORAGE_INI} to ${TEM_DIR}"
+         abort_script "${_err_msg_}"
+    fi
+    
+    log_msg -t -s "Updating Lun ID details in ${ENIQ_CONF_DIR}/${LUN_MAP_INI} on ${HNAME} " -l ${LOGFILE}
+    for _lun_detail_ in `iniget LUN_MAP_DETAILS -f  ${ENIQ_CONF_DIR}/${LUN_MAP_INI}`;do
+        _lun_id_=`iniget ${_lun_detail_} -f ${ENIQ_CONF_DIR}/${LUN_MAP_INI} -v LUN_ID`; 
+      
+        if [ "${_lun_id_}" == "local" ];then 
+            $RM -rf ${TEM_DIR}/lun_map.ini 
+            $INIDEL -g LUN_MAP_DETAILS -p ${_lun_detail_} -i ${ENIQ_CONF_DIR}/${LUN_MAP_INI} -o ${TEM_DIR}/lun_map.ini 
+            if [ $? -ne 0 ]; then
+                _err_msg_="Error removing local values from ${TEM_DIR}/${LUN_MAP_INI}"
+                abort_script "${_err_msg_}"
+            fi
+                 $CP ${TEM_DIR}/${LUN_MAP_INI}  ${ENIQ_CONF_DIR}/${LUN_MAP_INI}
+                 if [ $? -ne 0 ]; then
+                      _err_msg_="Could not backup Lun ID details in ${ENIQ_CONF_DIR}/${LUN_MAP_INI} to ${TEM_DIR}"
+                      abort_script "${_err_msg_}"
+                 fi
+        fi
+    done
+    # If flag is set i.e it has already removed. So it will not remove the mpath again
+    if [ -s /var/tmp/remove_vnx_mpath_success ]; then
+           log_msg -t -s "Skipping removal of VNX mpath." -l ${LOGFILE}
+        else
+            log_msg -t -s "Removing VNX mpath - ${_vnx_ext4_mpath_} from disk partitioned file on ${HNAME} " -l ${LOGFILE}
+            $SED -i "/^${_vnx_ext4_mpath_}$/d"  ${ENIQ_CONF_DIR}/${DISK_PARTITIONED}
+            if [ $? -ne 0 ]; then
+                _err_msg_="Could not update mpath details in ${ENIQ_CONF_DIR}/${DISK_PARTITIONED}"
+                abort_script "${_err_msg_}"
+            else
+                $TOUCH /var/tmp/"remove_vnx_mpath_success"
+                $ECHO "${HNAME}" > /var/tmp/"remove_vnx_mpath_success"
+            fi
+    fi
+
+     ## Check for unity.conf  file if exist or not
+    if [ ! -f ${UNITY_CONF_FILE} ]; then
+      err_msg_="${UNITY_CONF_FILE}  file does not exist"
+      abort_script "${_err_msg_}"
+    fi
+    
+    # update Block storage ini CO ENG RD RD2
+    SPA_IP=`$CAT  ${UNITY_CONF_FILE} | $GREP -w sp | $AWK -F "=>" '{print $2}'| $TR -d "'" | $TR -d "," | $TR -d " "`
+    if [ ! "${SPA_IP}" ]; then
+        _err_msg_="Could not get SPA IP."
+        abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+    fi
+    STORAGE_USERNAME=`$CAT ${UNITY_CONF_FILE} | $GREP -w user | $AWK -F "=> '" '{print $2}' | $TR -d "'" | $SED 's/,$//'`
+    if [ ! "${STORAGE_USERNAME}" ]; then
+        _err_msg_="Could not get Storage Username."
+        abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+    fi
+    CG_ID=`$CAT ${UNITY_CONF_FILE} | $GREP -w csgrpid | $AWK -F "=> '" '{print $2}' | $TR -d "'" | $SED 's/,$//'`
+    if [ ! "${CG_ID}" ]; then
+        _err_msg_="Could not get CG ID."
+        abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+    fi
+    
+    # Get the SAN Storage name
+    $UEMCLI -noheader -d ${SPA_IP} /sys/general show -filter "System name" > $TEM_DIR/san_system_name
+    if [ $? -ne 0 ]; then
+        _err_msg_="Could not connect to the storage server."
+        abort_script "$_err_msg_" "${EXEC_SHELL_CMD}"
+    fi
+    SAN_DEV_NAME=`$CAT $TEM_DIR/san_system_name | $AWK '{print $NF}'`
+    if [ $? -ne 0 ]; then
+        _err_msg_="Could not get SAN Device Name."
+        abort_script "$_err_msg_" "${EXEC_SHELL_CMD}"
+    fi
+
+
+    log_msg -t -s "Updating ${ENIQ_CONF_DIR}/${BLOCK_STORAGE_INI} file on ${HNAME}" -l ${LOGFILE}    
+    $RM -rf ${TEM_DIR}/block_storage.ini_upd
+    $INIDEL -g BLK_STORAGE_DEV_DETAILS -p BLK_STORAGE_DEV_DETAILS_1 -i ${ENIQ_CONF_DIR}/${BLOCK_STORAGE_INI} -o ${TEM_DIR}/block_storage.ini_upd
+    if [ $? -ne 0 ]; then
+        _err_msg_="Error in removing block BLK_STORAGE_DEV_DETAILS_1 from ${ENIQ_CONF_DIR}/${BLOCK_STORAGE_INI}"
+        abort_script "$_err_msg_" "${EXEC_SHELL_CMD}"
+    fi
+    
+    $CAT ${TEM_DIR}/block_storage.ini_upd |  $GREP -E  "BLK_STORAGE_NAME|BLK_STORAGE_USERNAME|BLK_STORAGE_PASS|BLK_STORAGE_IP_SP|BLK_CONSISTENCY_GROUP_ID|BLK_STORAGE_DISKS|BLK_STORAGE_GROUP_NAME" > ${TEM_DIR}/vnx_param_details
+    if [ $? -eq 0 ];then
+        $GREP -Fvf ${TEM_DIR}/vnx_param_details ${TEM_DIR}/block_storage.ini_upd  > ${TEM_DIR}/block_storage.ini_upd1
+    else
+        $CAT ${TEM_DIR}/block_storage.ini_upd > ${TEM_DIR}/block_storage.ini_upd1
+    fi
+    
+    $ECHO -e "[BLK_STORAGE_DEV_DETAILS_1]\nBLK_STORAGE_NAME=${SAN_DEV_NAME}\nBLK_STORAGE_USERNAME=${STORAGE_USERNAME}\nBLK_STORAGE_PASS=**********\nBLK_STORAGE_IP_SPA=${SPA_IP}\nBLK_CONSISTENCY_GROUP_ID=${CG_ID}\nBLK_STORAGE_DISKS=" > ${TEM_DIR}/stor_dev_details
+    log_msg -t -s "Adding the required parameter of BLK_STORAGE_DEV_DETAILS in the ${ENIQ_CONF_DIR}/${BLOCK_STORAGE_INI}" -l ${LOGFILE}
+    $INIADD  -g BLK_STORAGE_DEV_DETAILS -p BLK_STORAGE_DEV_DETAILS_1 -i ${TEM_DIR}/block_storage.ini_upd1 -d ${TEM_DIR}/stor_dev_details -o ${TEM_DIR}/block_storage.ini
+    if [ $? -ne 0 ]; then
+        _err_msg_="Error in adding block BLK_STORAGE_DEV_DETAILS_1 from ${ENIQ_CONF_DIR}/${BLOCK_STORAGE_INI}"
+        abort_script "$_err_msg_" "${EXEC_SHELL_CMD}"
+    fi
+    
+    $CP -p ${TEM_DIR}/block_storage.ini ${ENIQ_CONF_DIR}/${BLOCK_STORAGE_INI}
+    if [ $? -ne 0 ]; then
+       _err_msg_="Could not restore ${TEM_DIR}/block_storage.ini to ${ENIQ_CONF_DIR}/${BLOCK_STORAGE_INI}"
+       abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+    fi
+
+    $CAT ${TEM_DIR}/disk_info.txt | $AWK -F ";" '{print $1}' > $TEM_DIR/disks.txt    
+    _disks_=`$CAT $TEM_DIR/disks.txt | $PASTE -s -d,`
+    if [ ! "${_disks_}" ]; then
+        _err_msg_="Could not get San Disks."
+        abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+    fi
+    
+    log_msg -t -s "Setting the required parameter BLK_STORAGE_DISKS=${_disks_} in the ${ENIQ_CONF_DIR}/${BLOCK_STORAGE_INI}" -l ${LOGFILE}
+    iniset BLK_STORAGE_DEV_DETAILS_1 -f ${ENIQ_CONF_DIR}/${BLOCK_STORAGE_INI} BLK_STORAGE_DISKS=${_disks_}
+    if [ $? -ne 0 ]; then
+       _err_msg_="Could not update BLK_STORAGE_DISKS in ${ENIQ_CONF_DIR}/${BLOCK_STORAGE_INI} "
+       abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+    fi
+
+    $TOUCH ${VAR_TMP_DIR}/ext4_migration_success 
+    $ECHO "Successfully completed EXT4 Migration on $HNAME" > ${VAR_TMP_DIR}/ext4_migration_success 
+fi
+
+}
+
+### Function: get_deployment_order ###
+#
+# Get the order of the deployment
+# for performing required functionality based on action type
+#
+# Arguments: none
+#
+# Return Values: none
+get_deployment_order()
+{
+$RM -rf ${TEM_DIR}/server_order_list ${TEM_DIR}/premigration_order ${TEM_DIR}/postmigration_order
+
+# Get an ordered list of servers based on the server_list file
+$PERL ${ENIQ_CORE_INST_DIR}/lib/get_ip_order.pl -f ${TEM_DIR}/postmigration_order
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not get an ordered list of servers"
+    abort_script "${_err_msg_}"
+fi
+
+# Reverse the created file for the stop order
+$TAC ${TEM_DIR}/postmigration_order > ${TEM_DIR}/premigration_order
+}
+
+
+### Function: plugin_check ###
+#
+# Check if plugin is set to unity
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+plugin_check()
+{
+if [ -f /ericsson/storage/san/etc/storage.conf ]; then
+    _plugin_=`$CAT /ericsson/storage/san/etc/storage.conf | $AWK -F "=" '{print $2}'`
+    if [ "${_plugin_}" == "unity" ]; then
+        log_msg -t -s "Plugin is set to unity on ${HNAME}" -l ${LOGFILE}
+    else
+        _err_msg_="Plugin is not set to unity ${HNAME}"
+        abort_script "${_err_msg_}"
+    fi
+else
+    _err_msg_="/ericsson/storage/san/etc/storage.conf file not found on ${HNAME}"
+    abort_script "${_err_msg_}"
+fi
+}
+
+### Function: recreate_db_symlinks ###
+#
+# To recreate DB symlinks
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+recreate_db_symlinks()
+{
+# Skip symbolic link creation if not CO or Reader server
+if [ "${CO_SERVER}" != "YES" -a "${RD_SERVER}" != "YES" ]; then
+     log_msg -t -s "Skipping symbolic link creation on $HNAME" -l ${LOGFILE}
+     return 0
+fi
+
+# NAS service should be online
+log_msg -t -s "Checking if NASd is online before repairing sym_links." -l ${LOGFILE}
+check_nasd_milestone_online ${ENIQ_CONF_DIR} ${SUNOS_INI} ${ENIQ_BASE_DIR}
+if [ $? -ne 0 ]; then
+    _err_msg_="NASd not in a correct state to continue"
+    abort_script "${_err_msg_}"
+fi
+
+# Re-create DB sym_links
+$BASH ${ENIQ_CORE_INST_SCRIPT} -M -s create_db_sym_links -n -R -l ${LOGFILE}
+if [ $? -ne 0 ]; then
+    _err_msg_="Unable to repair the DB symbolic links"
+    abort_script "${_err_msg_}"
+fi
+
+# Verify sym links are correctly configured
+_sym_links_check_="${ENIQ_CORE_INST_DIR}/bin/check_sym_links.pl"
+log_msg -t -s "Verifying if database symbolic links are correctly assigned" -l ${LOGFILE}
+$PERL ${_sym_links_check_} ${ENIQ_CONF_DIR}/${SYM_LINKS_INI} >> /dev/null
+_return_code_=$?
+if [ ${_return_code_} -eq 0 ]; then
+    log_msg -s "DB sym_links are correctly assigned.\n" -l ${LOGFILE}
+elif [ ${_return_code_} -eq 22 -o ${_return_code_} -eq 32 ]; then
+    _err_msg_="DB sym_links are still incorrect. Please fix the sym_links manually."
+    abort_script "${_err_msg_}"
+else
+    _err_msg_="Failed to execute ${_sym_links_check_} script to verify the sym_links."
+    abort_script "${_err_msg_}"
+fi
+}
+
+### Function: register_raw_device ###
+#
+# To register raw devices
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+register_raw_device()
+{
+# Skip raw device registration if not CO or Reader server
+if [ "${CO_SERVER}" != "YES" -a "${RD_SERVER}" != "YES" ]; then
+     log_msg -t -s "Skipping raw device registration on $HNAME" -l ${LOGFILE}
+     return 0
+fi
+
+$TOUCH ${TEM_DIR}/symlink.txt
+
+_main_db_luns_=`iniget DB_DISK_ALLOC -f ${TEM_DIR}/${SYM_LINKS_INI} -v MAINDB_DISKS`
+if [ ! "${_main_db_luns_}" ]; then
+    _err_msg_="Could not read MAINDB_DISKS parameter from  ${TEM_DIR}/${SYM_LINKS_INI}"
+    abort_script "${_err_msg_}"
+fi
+
+_sys_db_luns_=`iniget DB_DISK_ALLOC -f ${TEM_DIR}/${SYM_LINKS_INI} -v IQ_SYS_MAIN_DISKS`
+if [ ! "${_sys_db_luns_}" ]; then
+    _err_msg_="Could not read IQ_SYS_MAIN_DISKS value from ${TEM_DIR}/${SYM_LINKS_INI}"
+    abort_script "${_err_msg_}"
+fi
+
+_temp_db_luns_=`iniget DB_DISK_ALLOC -f ${TEM_DIR}/${SYM_LINKS_INI} -v TEMPDB_DISKS`
+if [ ! "${_temp_db_luns_}" ]; then
+    _err_msg_="Could not read TEMPDB_DISKS parameter from  ${TEM_DIR}/${SYM_LINKS_INI}"
+    abort_script "${_err_msg_}"
+fi
+
+$ECHO "${_main_db_luns_}" > ${TEM_DIR}/main_dbs.txt
+if [ ! -s ${TEM_DIR}/main_dbs.txt ]; then
+     _err_msg_="Could not write LUN information to ${TEM_DIR}/main_dbs.txt"
+     abort_script "${_err_msg_}"
+else
+     $SED -i 's/ /\n/g' ${TEM_DIR}/main_dbs.txt
+     if [ $? -ne 0 ]; then
+          _err_msg_="Could not align the content in ${TEM_DIR}/main_dbs.txt"
+          abort_script "${_err_msg_}"
+     fi
+
+     _no_of_main_db_luns_=`$CAT ${TEM_DIR}/main_dbs.txt|$WC -l`
+fi
+
+$ECHO "${_temp_db_luns_}" > ${TEM_DIR}/temp_dbs.txt
+if [ ! -s ${TEM_DIR}/main_dbs.txt ]; then
+     _err_msg_="Could not write LUN information to ${TEM_DIR}/temp_dbs.txt"
+     abort_script "${_err_msg_}"
+else
+     $SED -i 's/ /\n/g' ${TEM_DIR}/temp_dbs.txt
+     if [ $? -ne 0 ]; then
+          _err_msg_="Could not align the content in ${TEM_DIR}/temp_dbs.txt"
+          abort_script "${_err_msg_}"
+     fi
+
+     _no_of_temp_db_luns_=`$CAT ${TEM_DIR}/temp_dbs.txt|$WC -l`
+fi
+
+$ECHO "${_sys_db_luns_}" > ${TEM_DIR}/sys_db.txt
+if [ ! -s ${TEM_DIR}/main_dbs.txt ]; then
+     _err_msg_="Could not write LUN information to ${TEM_DIR}/sys_db.txt"
+     abort_script "${_err_msg_}"
+else
+     $SED -i 's/ /\n/g' ${TEM_DIR}/sys_db.txt
+     if [ $? -ne 0 ]; then
+          _err_msg_="Could not align the content in ${TEM_DIR}/sys_db.txt"
+          abort_script "${_err_msg_}"
+     fi
+
+     _no_of_sys_db_luns_=`$CAT ${TEM_DIR}/sys_db.txt|$WC -l`
+fi
+
+$ECHO "${_main_db_luns_} ${_sys_db_luns_} ${_temp_db_luns_}" > ${TEM_DIR}/symlink.txt
+if [ ! -s ${TEM_DIR}/symlink.txt ]; then
+     _err_msg_="Could not write LUN information to ${TEM_DIR}/symlink.txt"
+     abort_script "${_err_msg_}"
+fi
+
+$SED -i 's/ /\n/g' ${TEM_DIR}/symlink.txt
+if [ $? -ne 0 ]; then
+     _err_msg_="Could not align the content in ${TEM_DIR}/symlink.txt"
+     abort_script "${_err_msg_}"
+fi
+
+count=1
+
+if [ "${RD_SERVER}" == "YES" ]; then
+     _dwh_reader_type_=`$CAT ${ENIQ_CONF_DIR}/install_reader_type | $GREP "dwh_reader"`
+     $SED -i 's/ /\n/g' ${TEM_DIR}/symlink.txt
+     if [ ! "${_dwh_reader_type_}" ]; then
+          _err_msg_="Could not get Reader Alias"
+          abort_script "${_err_msg_}"
+     fi
+fi
+
+iniget "DWH_SYSTEM_MAIN" -f ${ENIQ_CONF_DIR}/${SYM_LINKS_INI}  > ${TEM_DIR}/sys_db_block
+_sys_db_lun_=`$CAT ${TEM_DIR}/sys_db_block | $HEAD -1 | $AWK '{print substr($0,length,1)}'`
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not get first block from ${ENIQ_CONF_DIR}/${SYM_LINKS_INI} for SYSMAIN"
+    abort_script "${_err_msg_}"
+fi
+
+
+iniget "DWH_DBSPACES_MAIN" -f ${ENIQ_CONF_DIR}/${SYM_LINKS_INI}  > ${TEM_DIR}/main_db_block
+_main_db_lun_=`$CAT ${TEM_DIR}/main_db_block | $HEAD -1 | $AWK '{print substr($0,length,1)}'`
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not get first block from ${ENIQ_CONF_DIR}/${SYM_LINKS_INI} for MAIN"
+    abort_script "${_err_msg_}"
+
+fi
+
+
+iniget "DWH_DBSPACES_TEMP" -f ${ENIQ_CONF_DIR}/${SYM_LINKS_INI}  > ${TEM_DIR}/temp_db_block
+_temp_db_lun_=`$CAT ${TEM_DIR}/temp_db_block | $HEAD -1 | $AWK '{print substr($0,length,1)}'`
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not get first block from ${ENIQ_CONF_DIR}/${SYM_LINKS_INI} for TEMP DBSPACE"
+    abort_script "${_err_msg_}"
+fi
+
+
+
+while read line
+do
+    $SED -ie "s/^\($line\)$/\1:\/dev\/raw\/raw$count/g" ${TEM_DIR}/symlink.txt
+    if [ $? -ne 0 ]; then
+        _err_msg_="Could not append raw device with ${line} in ${TEM_DIR}/symlink.txt"
+        abort_script "${_err_msg_}"
+    fi
+    count=`expr $count + 1`
+done < ${TEM_DIR}/symlink.txt
+
+## Delete udev rules file if already exist
+if [ -f ${UDEV_FILE} ]; then
+    $RM -rf ${UDEV_FILE}
+fi
+
+for _raw_device_ in `$RAW -qa|$AWK '{print $1}'|$CUT -d":" -f1`; do
+    $RAW ${_raw_device_} 0 0
+    if [ $? -ne 0 ]; then
+        _err_msg_="Could not unregister current raw device ${_raw_device_}"
+        abort_script "${_err_msg_}"
+    fi
+done
+
+
+
+if [ "${CO_SERVER}" == "YES" ]; then
+    _ini_file_list_="${CLI_CONF_DIR}/${COORD_SYM_LINKS_INI}"
+else
+    _ini_file_list_="${ENIQ_CONF_DIR}/${SYM_LINKS_INI}"
+fi
+
+_sys_db_lun_count_=0
+_main_db_lun_count_=0
+_temp_db_lun_count_=0
+
+
+# Registering raw devices
+if [ ! -f ${UDEV_FILE} ]; then
+
+    $ECHO "#BEGIN" >> ${UDEV_FILE}
+    $ECHO 'ACTION!="add|change", GOTO="raw_end"' >> ${UDEV_FILE}
+    while read line
+    do
+        if [ ${SAN_DEVICE} == "local" ]; then
+
+            _disk_=`$ECHO $line | $AWK -F":" '{print $1}'`
+            _raw_disk_=`$ECHO $line | $AWK -F":" '{print $2}'`
+            _uuid_=`$SCSI_ID -g -u -d /dev/${_disk_}1`
+            $ECHO "KERNEL=="\"sd*[0-9]\"", PROGRAM=="\"scsi_id -g -u -d %N\"", RESULT=="\"${_uuid_}\"", RUN+="\"/usr/bin/raw ${_raw_disk_} %N\""" >> ${UDEV_FILE}
+        else
+
+            _disk_=`$ECHO $line | $AWK -F":" '{print $1}'`
+            _raw_disk_=`$ECHO $line | $AWK -F":" '{print $2}'`
+            _uuid_=`$UDEVADM  info --query=all --name=/dev/mapper/${_disk_}1 | $GREP -i DM_UUID | $AWK -F"=" '{print $2}'`
+            $ECHO "ENV{DM_UUID}=="\"${_uuid_}\"", RUN+="\"/bin/raw ${_raw_disk_}  %M %m\""" >> ${UDEV_FILE}
+        fi
+
+        if [ ${_main_db_lun_count_} -lt ${_no_of_main_db_luns_} ]; then
+              _main_db_lun_count_=`expr ${_main_db_lun_count_} + 1`
+              _block_=`$GREP -w "main_${_main_db_lun_}.iq" ${ENIQ_CONF_DIR}/raw_dev_info|$AWK '{print $1}'`
+              _main_db_lun_=`expr ${_main_db_lun_} + 1`
+        elif [ ${_sys_db_lun_count_} -lt ${_no_of_sys_db_luns_} ]; then
+               _sys_db_lun_count_=`expr ${_sys_db_lun_count_} + 1`
+               _block_=`$GREP "iq_system_main" ${ENIQ_CONF_DIR}/raw_dev_info|$AWK '{print $1}'`
+        elif [  ${_temp_db_lun_count_} -lt ${_no_of_temp_db_luns_} ]; then
+               _temp_db_lun_count_=`expr ${_temp_db_lun_count_} + 1`
+               if [ "${CO_SERVER}" == "YES" ]; then
+                    _block_=`$GREP -w "temp_${_temp_db_lun_}.iqtmp" ${ENIQ_CONF_DIR}/raw_dev_info|$AWK '{print $1}'`
+               elif [ "${RD_SERVER}" == "YES" ]; then
+                    _block_=`$GREP -w "${_dwh_reader_type_}_temp_${_temp_db_lun_}.iqtmp" ${ENIQ_CONF_DIR}/raw_dev_info|$AWK '{print $1}'`
+               fi
+              _temp_db_lun_=`expr ${_temp_db_lun_} + 1`
+        fi
+
+        $ECHO "Setting ${_block_} Link=${_raw_disk_} in ${TEM_DIR}/${SYM_LINKS_INI}" >> ${LOGFILE}
+        iniset ${_block_} -f ${TEM_DIR}/${SYM_LINKS_INI} Link="${_raw_disk_}"
+        if [ $? -ne 0 ]; then
+             _err_msg_="Could not update Link=${_raw_disk_} in ${TEM_DIR}/${SYM_LINKS_INI}"
+             abort_script "${_err_msg_}"
+        fi
+
+        if [ "${CO_SERVER}" == "YES" ]; then
+             $ECHO "Setting ${_block_} Link=${_raw_disk_} in ${TEM_DIR}/${COORD_SYM_LINKS_INI}" >> ${LOGFILE}
+             iniset ${_block_} -f ${TEM_DIR}/${COORD_SYM_LINKS_INI} Link="${_raw_disk_}"
+             if [ $? -ne 0 ]; then
+                  _err_msg_="Could not update Link=${_raw_disk_} in ${TEM_DIR}/${COORD_SYM_LINKS_INI}"
+                  abort_script "${_err_msg_}"
+             fi
+        fi
+
+    done < ${TEM_DIR}/symlink.txt
+    $ECHO 'KERNEL=="raw*", OWNER="dcuser", GROUP="dc5000", MODE="0660"' >> ${UDEV_FILE}
+    $ECHO 'LABEL="raw_end"' >> ${UDEV_FILE}
+    $ECHO "#END" >> ${UDEV_FILE}
+fi
+
+## Check for udev rules file if exist or not
+if [ ! -f ${UDEV_FILE} ]; then
+    err_msg_="UDEV rules files does not exist"
+    abort_script "${_err_msg_}"
+fi
+
+## Activate the raw device created in udev rules
+$UDEVADM  control --reload-rules
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not reload udev rules for raw device"
+    abort_script "${_err_msg_}"
+fi
+
+$UDEVADM  trigger --type=devices --action=change
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not trigger udev rules for raw device"
+    abort_script "${_err_msg_}"
+fi
+
+$SLEEP 5
+
+## Check if the raw devices are created or not
+_count_=0
+
+while :; do
+    $RAW -qa | $GREP raw >> /dev/null 2>&1
+    if [ $? -eq 0 ]; then
+        break
+    else
+        $SLEEP 1
+        _count_=`$EXPR ${_count_} + 1`
+        if [ ${_count_} -eq 10 ]; then
+            err_msg_="Could not create raw device"
+            abort_script "${_err_msg_}"
+        fi
+        continue
+    fi
+done
+
+$CP -pf ${TEM_DIR}/${SYM_LINKS_INI} ${ENIQ_CONF_DIR}
+if [ $? -ne 0 ]; then
+     _err_msg_="Could not copy ${TEM_DIR}/${SYM_LINKS_INI} to ${ENIQ_CONF_DIR}"
+     abort_script "${_err_msg_}"
+fi
+
+$CP -pf ${TEM_DIR}/${LUN_MAP_INI} ${ENIQ_CONF_DIR}
+if [ $? -ne 0 ]; then
+     _err_msg_="Could not copy ${TEM_DIR}/${LUN_MAP_INI} to ${ENIQ_CONF_DIR}"
+     abort_script "${_err_msg_}"
+fi
+
+$CP -pf ${TEM_DIR}/${DISK_PARTITIONED} ${ENIQ_CONF_DIR}
+if [ $? -ne 0 ]; then
+     _err_msg_="Could not copy ${TEM_DIR}/${DISK_PARTITIONED} to ${ENIQ_CONF_DIR}"
+     abort_script "${_err_msg_}"
+fi
+
+
+if [ "${CO_SERVER}" == "YES" ]; then
+     $CP -pf ${TEM_DIR}/${COORD_SYM_LINKS_INI} ${CLI_CONF_DIR}
+     if [ $? -ne 0 ]; then
+          _err_msg_="Could not copy ${TEM_DIR}/${COORD_SYM_LINKS_INI} to ${ENIQ_CONF_DIR}"
+          abort_script "${_err_msg_}"
+     fi
+
+     $CP -pf ${TEM_DIR}/${COORD_SYM_LINKS_INI} ${ENIQ_CONF_DIR}
+     if [ $? -ne 0 ]; then
+          _err_msg_="Could not copy ${TEM_DIR}/${COORD_SYM_LINKS_INI} to ${ENIQ_CONF_DIR}"
+          abort_script "${_err_msg_}"
+     fi
+else
+     $CP -pf ${CLI_CONF_DIR}/${COORD_SYM_LINKS_INI} ${ENIQ_CONF_DIR}
+     if [ $? -ne 0 ]; then
+          _err_msg_="Could not copy ${TEM_DIR}/${COORD_SYM_LINKS_INI} to ${ENIQ_CONF_DIR}"
+          abort_script "${_err_msg_}"
+     fi
+fi
+}
+
+### Function: setup_env ###
+#
+# Set up environment variables for script.
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+setup_env()
+{
+# ENIQ Directories
+if [ ! "${ENIQ_BASE_DIR}" ]; then
+    # Directory on the root filesystem
+    ENIQ_BASE_DIR=/eniq
+fi
+
+ENIQ_ADMIN_DIR=${ENIQ_BASE_DIR}/admin
+ENIQ_INST_DIR=${ENIQ_BASE_DIR}/installation
+ENIQ_CORE_INST_DIR=${ENIQ_INST_DIR}/core_install
+ENIQ_LOG_DIR=${ENIQ_BASE_DIR}/local_logs
+ENIQ_CONF_DIR=${ENIQ_INST_DIR}/config
+DEPLOYMENT=/extra_params/deployment
+
+# Admin bin dir
+ENIQ_ADMIN_BIN_DIR=${ENIQ_ADMIN_DIR}/bin
+
+# ENIQ Core install script
+ENIQ_CORE_INST_SCRIPT=${ENIQ_CORE_INST_DIR}/bin/eniq_core_install.bsh
+
+# ENIQ SW conf directory
+CLI_CONF_DIR=${ENIQ_BASE_DIR}/sw/conf
+
+#Temp directory.
+TEM=/tmp
+
+VAR_TMP_DIR=/var/tmp
+
+# Hostname Information
+HNAME=`${MYHOSTNAME}`
+HOST_IP=`$GETENT hosts ${HNAME} | $AWK '{print $1}' | $HEAD -1`
+CO_IP_ADDRESS=`$GREP -w dwhdb /etc/hosts | $AWK '{print $1}'| $SORT -u`
+
+#Get IP address
+ENGINE_IP=`$CAT /etc/hosts |$EGREP -w engine |$AWK '{print $1}'`
+RD_1=`$CAT /etc/hosts |$EGREP -w dwh_reader_1 |$AWK '{print $1}'`
+RD_2=`$CAT /etc/hosts |$EGREP -w dwh_reader_2 |$AWK '{print $1}'`
+$ECHO $ENGINE_IP $RD_1 $RD_2 > /var/tmp/non_co_ip
+
+NON_CO_IP=/var/tmp/non_co_ip                              
+
+# ENIQ DWHDB database directory
+DWH_DIR="${ENIQ_BASE_DIR}/database/dwh_main"
+
+# ENIQ DWH_READER database directory
+DWH_READER_DIR="${ENIQ_BASE_DIR}/database/dwh_reader"
+
+if [ ! -s ${CLI_CONF_DIR}/${COORD_SYM_LINKS_INI} ]; then
+    _err_msg_="${CLI_CONF_DIR}/${COORD_SYM_LINKS_INI} not found or is empty"
+    abort_script "${_err_msg_}"
+fi
+
+if [ ! -s ${ENIQ_CONF_DIR}/${SYM_LINKS_INI} ]; then
+    _err_msg_="${ENIQ_CONF_DIR}/${SYM_LINKS_INI} not found or is empty"
+    abort_script "${_err_msg_}"
+fi
+
+if [ ! -s ${ENIQ_CORE_INST_DIR}/lib/inidel.pl ]; then
+    _err_msg_="Cannot locate ${SCRIPTHOME}/../lib/inidel"
+    abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+else
+    INIDEL=${ENIQ_CORE_INST_DIR}/lib/inidel.pl
+fi
+
+
+# Source the common functions
+_common_functions_list_="common_functions.lib common_core_install_functions.lib common_migration_functions.lib"
+for lib_file in ${_common_functions_list_}; do
+    if [ -s ${ENIQ_CORE_INST_DIR}/lib/${lib_file} ]; then
+        . ${ENIQ_CORE_INST_DIR}/lib/${lib_file}
+    else
+        _err_msg_="File ${ENIQ_CORE_INST_DIR}/lib/${lib_file} not found"
+        abort_script "${_err_msg_}"
+    fi
+done
+
+# Check hardware
+if [ -f ${ENIQ_CONF_DIR}/san_details ];then
+    STORAGE_TYPE=`$CAT ${ENIQ_CONF_DIR}/san_details | $GREP -w STORAGE_TYPE | $CUT -f 2 -d =`
+    if [ "${STORAGE_TYPE}" != "raw" ];then
+        _err_msg_="\nHardware type is not supported for Migration."
+        abort_script "${_err_msg_}"
+    fi
+else
+    _err_msg_="Could not find the file to get hardware type."
+    abort_script "${_err_msg_}"
+fi
+
+# Determine SAN Device type if raw
+if [ "${STORAGE_TYPE}" == "raw" ];then
+    SAN_DEVICE=`$CAT ${ENIQ_CONF_DIR}/san_details | $EGREP "^SAN_DEVICE=" | $AWK -F\= '{print $2}'`
+    if [ ! "${SAN_DEVICE}" ]; then
+        _err_msg_="Could not read SAN_DEVICE type from ${ENIQ_CONF_DIR}/san_details."
+        abort_script "${_err_msg_}"
+    fi
+fi
+
+SAN_DEVICE_UNITY=unity
+
+# File containing the type of installation. Eg. events or statistics
+INST_TYPE_FILE=${ENIQ_CONF_DIR}/ericsson_use_config
+if [ ! -s "${INST_TYPE_FILE}" ]; then
+    _err_msg_="ENIQ install type not defined in ${INST_TYPE_FILE}"
+    abort_script "${_err_msg_}"
+fi
+
+if [ -x ${ENIQ_CORE_INST_DIR}/lib/iniadd.pl ]; then
+    INIADD=${ENIQ_CORE_INST_DIR}/lib/iniadd.pl
+else
+    _err_msg_="${ENIQ_CORE_INST_DIR}/lib/iniadd.pl is not found, or is not executable"
+    abort_script "$_err_msg_" "${EXEC_SHELL_CMD}"
+fi
+
+old_template_ini=${ENIQ_CORE_INST_DIR}/templates/stats/SunOS.ini_vnx
+if [ ! -s "${old_template_ini}" ]; then
+    _err_msg_="${old_template_ini} is not found"
+    abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+fi
+
+new_template_ini=${ENIQ_CORE_INST_DIR}/templates/stats/SunOS.ini_unity
+if [ ! -s "${new_template_ini}" ]; then
+    _err_msg_="${new_template_ini} is not found"
+    abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+fi
+
+# FLS config file
+FLS_CONFIG_FILE=${ENIQ_CONF_DIR}/fls_conf
+
+#UDEV File
+UDEV_FILE=/etc/udev/rules.d/99-iq-raw-devs.rules
+
+#unity conf file
+UNITY_CONF_FILE=/ericsson/storage/san/plugins/unity/etc/unity.conf
+
+
+# Get current server type
+CURR_SERVER_TYPE=`$CAT ${ENIQ_CONF_DIR}/installed_server_type | $EGREP -v  '^[[:blank:]]*#' | $SED -e 's/ //g'`
+if [ ! "${CURR_SERVER_TYPE}" ]; then
+    _err_msg_="Could not determine which server type this is"
+    abort_script "${_err_msg_}"
+fi
+
+# Check if server is Coordinator or Reader type
+CO_SERVER=""
+RD_SERVER=""
+if [ "${CURR_SERVER_TYPE}" == "stats_coordinator" -o "${CURR_SERVER_TYPE}" == "eniq_stats" ]; then
+    CO_SERVER="YES"
+elif [ "${CURR_SERVER_TYPE}" == "stats_iqr" ]; then
+    RD_SERVER="YES"
+fi
+
+SYSUSER=`iniget ENIQ_INSTALL_CONFIG -f ${ENIQ_CONF_DIR}/${SUNOS_INI} -v ENIQ_SYSUSER`
+if [ ! "${SYSUSER}" ]; then
+    _err_msg_="Could not read System User from  ${ENIQ_CONF_DIR}/${SUNOS_INI}"
+    abort_script "${_err_msg_}"
+fi
+
+SYSGROUP=`iniget SunOS_GROUP_1 -f ${ENIQ_CONF_DIR}/${SUNOS_INI} -v name`
+if [ ! "${SYSGROUP}" ]; then
+    _err_msg_="Could not read SYSGROUP param from ${ENIQ_CONF_DIR}/${SUNOS_INI}"
+    abort_script "$_err_msg_"
+fi
+
+# Set the Connect DB parameters
+DWH_PORT=`iniget DWH -v PortNumber -f ${CLI_CONF_DIR}/${ENIQ_INI}`
+DWH_ENG=`iniget DWH -v ServerName -f ${CLI_CONF_DIR}/${ENIQ_INI}`
+if [ ! "${DWH_PORT}" -o ! "${DWH_ENG}" ]; then
+        _err_msg_="Could not read IQ values from ${CLI_CONF_DIR}/${ENIQ_INI}"
+        abort_script "${_err_msg_}"
+fi
+
+if [ "${CURR_SERVER_TYPE}" == "stats_coordinator" ]; then
+     _reader_list_=`iniget DWH_READER -f ${CLI_CONF_DIR}/niq.ini`
+     if [ ! "${_reader_list_}" ]; then
+         _err_msg_="Could not find values for DWH_READER in ${CLI_CONF_DIR}/niq.ini"
+         abort_script "${_err_msg_}"
+     fi
+
+     DWH_READER_PORT=`iniget DWH_READER_SETTINGS -v PortNumber -f ${CLI_CONF_DIR}/${ENIQ_INI}`
+     for _reader_ in ${_reader_list_}; do
+         eval "${_reader_}"_ENG=`iniget ${_reader_} -v Service_Name -f ${CLI_CONF_DIR}/${ENIQ_INI}`
+         if [ ! "${DWH_READER_PORT}" -o ! "${_reader_}_ENG" ]; then
+                _err_msg_="Could not read IQ values from ${CLI_CONF_DIR}/${ENIQ_INI}"
+                abort_script "${_err_msg_}"
+         fi
+         done
+fi
+
+
+DBA_PASSWORD=`inigetpassword DB -f ${CLI_CONF_DIR}/${ENIQ_INI} -v DBAPassword`
+if [ ! "${DBA_PASSWORD}" ]; then
+    if [ -f ${ENIQ_BASE_DIR}/sw/installer/dbusers ]; then
+        DBA_PASSWORD=`${ENIQ_BASE_DIR}/sw/installer/dbusers dba dwhrep`
+        if [ ! "${DBA_PASSWORD}" ] ; then
+            _err_msg_="Could not get dwhdb DBA Password"
+            abort_script "${_err_msg_}"
+        fi
+    else
+        err_msg_="Could not get dwhdb DBA Password"
+        abort_script "${_err_msg_}"
+    fi
+fi
+
+# Read location of storage API command
+_stor_api_cmd_=`iniget STOR_API -f ${ENIQ_CONF_DIR}/${SUNOS_INI} -v STOR_API_CMD`
+if [ ! "${_stor_api_cmd_}" ]; then
+    _err_msg_="Could not read STOR_API_CMD param from ${ENIQ_CONF_DIR}/${SUNOS_INI}"
+    abort_script "${_err_msg_}"
+fi
+
+# Log file
+if [ ! "${LOGFILE}" ]; then
+        $MKDIR -p ${ENIQ_LOG_DIR}/migration
+        LOGFILE="${ENIQ_LOG_DIR}/migration/eniq_vnx_unity_${ACTION_TYPE}.log"
+fi
+
+$TOUCH $LOGFILE
+if [ ! -f $LOGFILE ]; then
+     _err_msg_="Failed to create $LOGFILE"
+     abort_script "${_err_msg_}"
+fi
+
+$CHMOD 644 $LOGFILE
+if [ $? -ne 0 ]; then
+     _err_msg_="Could not change the permission of $LOGFILE to 644"
+     abort_script "${_err_msg_}"
+fi
+
+#ENIQ Core install arguments
+ENIQ_CORE_INST_ARG="-n -M -l ${LOGFILE}"
+
+# Create a temporary Directory
+TEM_DIR=/tmp/vnx-unity_migration.$$.$$
+$RM -rf ${TEM_DIR}
+$MKDIR -p ${TEM_DIR}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not create directory ${TEM_DIR}"
+    abort_script "${_err_msg_}"
+fi
+
+
+
+CONN_STR_USER_DBA="-c \"uid=dba;pwd=${DBA_PASSWORD};eng=${DWH_ENG};links=tcpip{host=${DWH_ENG};port=${DWH_PORT};dobroadcast=no;verify=no}\""
+CONN_STR_USER_DBA_ENC=${TEM}/conn_str_vnx_encrypt.txt.`uuidgen`
+
+# encrypt the connection string.
+get_encrypt_file "${CONN_STR_USER_DBA}" "${CONN_STR_USER_DBA_ENC}"
+
+# Get the required environment variables for Sybase
+$SU - ${SYSUSER} -c "$ENV |$EGREP '^(SYBASE|ASDIR|IQDIR|ASALOGDIR|SQLANY)'" > $TEM_DIR/sybase_det.$$
+$CAT $TEM_DIR/sybase_det.$$ |$EGREP '^(SYBASE|ASDIR|IQDIR|ASALOGDIR|SQLANY)' > $TEM_DIR/sybase_det_var.$$
+. $TEM_DIR/sybase_det_var.$$ >> /dev/null 2>&1
+
+if [ -z "$IQDIR" ] ; then
+    _err_msg_="ERROR: IQDIR is not set"
+    abort_script "${_err_msg_}"
+fi
+
+# Get iqheader binary
+_iqheader_=`$FIND ${ENIQ_BASE_DIR}/sybase_iq/IQ*|$EGREP "\/IQ-.*\/bin.*\/iqheader[[:blank:]]*$"|$HEAD -1`
+if [ ! -x ${_iqheader_} ]; then
+    _err_msg_="Could not locate the iqheader binary"
+    abort_script "${_err_msg_}"
+fi
+}
+
+### Function: start_stop_eniq_services ###
+#
+# Starts / Stops all ENIQ services
+#
+# Arguments: $1 = start / stop
+#
+# Return Values: none
+start_stop_eniq_services()
+{
+_action_=$1
+_deployment_=$2
+
+if [ "${_action_}" == "stop" -a "${_deployment_}" == "deployment" ]; then
+      $BASH ${ENIQ_ADMIN_DIR}/bin/manage_deployment_services.bsh -a ${_action_} -s ALL -N | $TEE -a ${LOGFILE}
+      _rc_service_start_=`$ECHO ${PIPESTATUS[0]}`
+      if [ ${_rc_service_start_} -ne 0 ]; then
+          _err_msg_="Failed to ${_action_} ENIQ services."
+          abort_script "${_err_msg_}"
+      fi
+elif [ "${_action_}" == "stop" -a "${_deployment_}" == "standalone" ]; then
+      $BASH ${ENIQ_ADMIN_DIR}/bin/manage_eniq_services.bsh -a ${_action_} -s ALL -N | $TEE -a ${LOGFILE}
+      _rc_service_stop_=`$ECHO ${PIPESTATUS[0]}`
+      if [ ${_rc_service_stop_} -ne 0 ]; then
+          _err_msg_="Failed to ${_action_} ENIQ services."
+          abort_script "${_err_msg_}"
+      fi
+elif [ "${_action_}" == "start" ]; then
+      $BASH ${ENIQ_ADMIN_DIR}/bin/manage_eniq_services.bsh -a ${_action_} -s ALL -N | $TEE -a ${LOGFILE}
+      _rc_service_stop_=`$ECHO ${PIPESTATUS[0]}`
+      if [ ${_rc_service_stop_} -ne 0 ]; then
+          _err_msg_="Failed to ${_action_} ENIQ services."
+          abort_script "${_err_msg_}"
+      fi
+      check_and_manage_smf "ddc" "enable"
+fi
+}
+
+### Function: save_checksum_information ###
+#
+# Collects the checksum information
+#
+# Arguments: none
+#
+# Return Values: none
+save_checksum_information()
+{
+_output_file_name_=$1
+_checksum_type_=$2
+
+log_msg -l ${LOGFILE} -t -s "Starting to collect checksum information. This may take some time"
+
+for _iq_disk_ in `$CAT ${ENIQ_CONF_DIR}/iq_disk_paths.txt`; do
+    local _sybase_file_=`$ECHO ${_iq_disk_}|$AWK -F:: '{print $1}'|$AWK -F"/" '{print $NF}'`
+    local _sybase_file_mpath_=`$ECHO ${_iq_disk_}|$AWK -F:: '{print $4}'|$AWK -F= '{print $2}'`
+    if [ "${_checksum_type_}" == "CHECKSUM_PRE" ]; then
+           _checksum_status_=`$ECHO ${_iq_disk_}|$AWK -F:: '{print $5}'|$AWK -F= '{print $2}'`
+    elif [ "${_checksum_type_}" == "CHECKSUM_POST" ]; then
+           _checksum_status_=`$ECHO ${_iq_disk_}|$AWK -F:: '{print $6}'|$AWK -F= '{print $2}'`
+    fi
+
+    if [ "${_checksum_status_}" == "NO" ]; then
+         if [ "${CO_SERVER}" == "YES" ]; then
+              _co_catalog_file_md5sum_=`$MD5SUM ${DWH_DIR}/dwhdb.db | $AWK '{print $1}'`
+              if [ -f ${DWH_DIR}/dwhdb.log ]; then
+                    _co_transaction_file_md5sum_=`$MD5SUM ${DWH_DIR}/dwhdb.log | $AWK '{print $1}'`
+              elif [ -f ${DWH_DIR}/dwhdb.tran ]; then
+                    _co_transaction_file_md5sum_=`$MD5SUM ${DWH_DIR}/dwhdb.tran | $AWK '{print $1}'`
+              fi
+              log_msg -l ${LOGFILE} -t -q -s "Starting to collect checksum information for ${_sybase_file_}"
+              _iq_file_md5sum_=`$MD5SUM "/dev/mapper/${_sybase_file_mpath_}"| $AWK '{print $1}'`
+
+              if [ ! "${_co_catalog_file_md5sum_}" -o ! "${_co_transaction_file_md5sum_}" -o ! "${_iq_file_md5sum_}" ]; then
+                        _err_msg_="Could not get required checksum information for ${_sybase_file_}"
+                        abort_script "${_err_msg_}"
+              fi
+
+              $SED -i "s/${_checksum_type_}=NO/${_checksum_type_}=YES/1" ${ENIQ_CONF_DIR}/iq_disk_paths.txt
+              if [ $? -ne 0 ]; then
+                   _err_msg_="Failed to update ${ENIQ_CONF_DIR}/iq_disk_paths.txt"
+                   abort_script "${_err_msg_}"
+              fi
+
+              if [ -s ${TEM_DIR}/md5sum_info.$$.$$ ]; then
+                  $CAT ${TEM_DIR}/md5sum_info.$$.$$|$EGREP -w "${_sybase_file_}"  >> /dev/null 2>&1
+                  if [ $? -ne 0 ]; then
+                      $ECHO "${_sybase_file_} ${_co_catalog_file_md5sum_} ${_co_transaction_file_md5sum_} ${_iq_file_md5sum_}" >> ${TEM_DIR}/md5sum_info.$$.$$
+                  fi
+              else
+                  $ECHO "${_sybase_file_} ${_co_catalog_file_md5sum_} ${_co_transaction_file_md5sum_} ${_iq_file_md5sum_}" >> ${TEM_DIR}/md5sum_info.$$.$$
+              fi
+         fi
+    else
+        log_msg -l ${LOGFILE} -t -s "Checksum information already collected for ${_sybase_file_}"
+    fi
+done
+
+if [ -s ${TEM_DIR}/md5sum_info.$$.$$ ]; then
+     if [ -n "${_output_file_name_}" ]; then
+          $RM -rf ${ENIQ_CONF_DIR}/${_output_file_name_}
+          $CAT ${TEM_DIR}/md5sum_info.$$.$$ >> ${ENIQ_CONF_DIR}/${_output_file_name_}
+     else
+          $CAT ${TEM_DIR}/md5sum_info.$$.$$ > ${ENIQ_CONF_DIR}/storage_migration_md5sum_info
+     fi
+
+     log_msg -l ${LOGFILE} -t -s "Checksum information collected successfully"
+else
+     return 0
+fi
+}
+
+### Function: save_iq_header_blockdump_information ###
+#
+# Collect the IQ Header and Blockdump information
+#
+# Arguments: none
+#
+# Return Values: none
+save_iq_header_blockdump_information()
+{
+_output_file_name_=$1
+
+_iqblockdump_=`$FIND ${ENIQ_BASE_DIR}/sybase_iq/IQ*|$EGREP "\/IQ-.*\/bin.*\/iqblockdump[[:blank:]]*$"|$HEAD -1`
+if [ ! -s ${_iqblockdump_} ]; then
+    _iqblockdump_=`$CP -p ${ENIQ_BASE_DIR}/sybase_iq/IQ-16_1/bin64/iqheader ${ENIQ_BASE_DIR}/sybase_iq/IQ-16_1/bin64/iqblockdump`
+    if [ $? -ne 0 ]; then
+      _err_msg_="Could not locate the iqblockdump binary"
+      abort_script "${_err_msg_}"
+    fi
+fi
+
+_par_tag_list_="DWH_SYSTEM_MAIN DWH_DBSPACES_MAIN DWH_DBSPACES_TEMP"
+if [ "${CO_SERVER}" == "YES" ]; then
+    _ini_file_list_="${CLI_CONF_DIR}/${COORD_SYM_LINKS_INI}"
+else
+    _ini_file_list_="${ENIQ_CONF_DIR}/${SYM_LINKS_INI}"
+fi
+
+$RM -f ${TEM_DIR}/iq_header_info.$$.$$
+
+if [ ! -s ${TEM_DIR}/migrated_iq_file_info.txt ]; then
+     for _ini_file_ in `$ECHO ${_ini_file_list_}`; do
+         for _parent_block_ in `$ECHO ${_par_tag_list_}`; do
+             if [ "${RD_SERVER}" == "YES" ]; then
+                 if [ "${_ini_file_}" == "${CLI_CONF_DIR}/${COORD_SYM_LINKS_INI}" ]; then
+                     if [ "${_parent_block_}" == "DWH_DBSPACES_TEMP" ]; then
+                         continue
+                     fi
+                 fi
+             fi
+
+             _block_list_=`iniget ${_parent_block_} -f ${_ini_file_}`
+             if [ ! "${_block_list_}" ]; then
+                 _err_msg_="Could not find values for ${_parent_block_} in ${_ini_file_}"
+                 abort_script "${_err_msg_}"
+             fi
+
+             for _block_ in ${_block_list_}; do
+                 _path_=`iniget ${_block_} -f ${_ini_file_} -v Path`
+                 _link_=`iniget ${_block_} -f ${_ini_file_} -v Link`
+                 if [ ! "${_path_}" ]; then
+                     _err_msg_="Could not read Path value for ${_block_} in ${_ini_file_}"
+                     abort_script "${_err_msg_}"
+                 fi
+
+                 if [ ! "${_link_}" ]; then
+                     _err_msg_="Could not read Path value for ${_block_} in ${_ini_file_}"
+                     abort_script "${_err_msg_}"
+                 fi
+                 log_msg -l ${LOGFILE} -t -s "Collecting IQ Header information for ${_path_}"
+                 _last_real_block_=`${_iqheader_} ${_path_} 2>/dev/null |$EGREP "^[[:blank:]]*Last[[:blank:]]+Real[[:blank:]]+Block:"|$AWK '{print $NF}'`
+                 _last_mapped_block_=`${_iqheader_} ${_path_} 2>/dev/null |$EGREP "^[[:blank:]]*Last[[:blank:]]+Mapped[[:blank:]]+Block:"|$AWK '{print $NF}'`
+                 _first_block_=`${_iqheader_} ${_path_} 2>/dev/null |$EGREP "^[[:blank:]]*First[[:blank:]]+Block:"|$AWK '{print $NF}'`
+                 _file_id_=`${_iqheader_} ${_path_} 2>/dev/null |$EGREP "^[[:blank:]]*File[[:blank:]]+ID:"|$AWK '{print $NF}'`
+                 if [ ! "${_file_id_}" -o ! "${_last_real_block_}" -o ! "${_last_mapped_block_}" -o ! "${_first_block_}" ]; then
+                     _err_msg_="Could not read required values for ${_path_}"
+                     abort_script "${_err_msg_}"
+                 fi
+
+                 if [ -s ${TEM_DIR}/iq_header_info.$$.$$ ]; then
+                     $CAT ${TEM_DIR}/iq_header_info.$$.$$|$EGREP -w "${_file_id_}"  >> /dev/null 2>&1
+                     if [ $? -ne 0 ]; then
+                         $ECHO "${_path_} ${_file_id_} ${_first_block_} ${_last_mapped_block_} ${_last_real_block_}" >> ${TEM_DIR}/iq_header_info.$$.$$
+                     fi
+                 else
+                     $ECHO "${_path_} ${_file_id_} ${_first_block_} ${_last_mapped_block_} ${_last_real_block_}" >> ${TEM_DIR}/iq_header_info.$$.$$
+                 fi
+
+                 if [ -s ${ENIQ_CONF_DIR}/raw_dev_info ]; then
+                     #$RM -rf ${ENIQ_CONF_DIR}/raw_dev_info
+                     $CAT ${ENIQ_CONF_DIR}/raw_dev_info|$EGREP -w "${_link_}"  >> /dev/null 2>&1
+                     if [ $? -ne 0 ]; then
+                         $ECHO "${_block_} ${_path_} ${_link_}" >> ${ENIQ_CONF_DIR}/raw_dev_info
+                     fi
+                 else
+                     $ECHO "${_block_} ${_path_} ${_link_}" > ${ENIQ_CONF_DIR}/raw_dev_info
+                 fi
+
+                 log_msg -t -s "Collecting IQ blockdump information for ${_path_} as part of ${ACTION_TYPE}" -l ${LOGFILE}
+                 ${_iqblockdump_} ${_path_} ${_first_block_} >> ${LOGFILE} 2>/dev/null
+                 ${_iqblockdump_} ${_path_} ${_last_real_block_} >> ${LOGFILE} 2>/dev/null
+                 ${_iqblockdump_} ${_path_} ${_last_mapped_block_} >> ${LOGFILE} 2>/dev/nul
+             done
+         done
+     done
+else
+     for _migrated_iq_file_ in `$CAT ${TEM_DIR}/migrated_iq_file_info.txt`; do
+         _path_="${_migrated_iq_file_}"
+         log_msg -l ${LOGFILE} -t -s "Collecting IQ Header information for ${_path_}"
+         _last_real_block_=`${_iqheader_} ${_path_} 2>/dev/null |$EGREP "^[[:blank:]]*Last[[:blank:]]+Real[[:blank:]]+Block:"|$AWK '{print $NF}'`
+         _last_mapped_block_=`${_iqheader_} ${_path_} 2>/dev/null |$EGREP "^[[:blank:]]*Last[[:blank:]]+Mapped[[:blank:]]+Block:"|$AWK '{print $NF}'`
+         _first_block_=`${_iqheader_} ${_path_} 2>/dev/null |$EGREP "^[[:blank:]]*First[[:blank:]]+Block:"|$AWK '{print $NF}'`
+         _file_id_=`${_iqheader_} ${_path_} 2>/dev/null |$EGREP "^[[:blank:]]*File[[:blank:]]+ID:"|$AWK '{print $NF}'`
+         if [ ! "${_file_id_}" -a ! "${_last_real_block_}" -a ! "${_last_mapped_block_}" -a ! "${_first_block_}" ]; then
+             _err_msg_="Could not read required values for ${_path_}"
+             abort_script "${_err_msg_}"
+         fi
+
+         if [ -s ${TEM_DIR}/iq_header_info.$$.$$ ]; then
+             $CAT ${TEM_DIR}/iq_header_info.$$.$$|$EGREP -w "${_file_id_}"  >> /dev/null 2>&1
+             if [ $? -ne 0 ]; then
+                 $ECHO "${_path_} ${_file_id_} ${_first_block_} ${_last_mapped_block_} ${_last_real_block_}" >> ${TEM_DIR}/iq_header_info.$$.$$
+             fi
+         else
+             $ECHO "${_path_} ${_file_id_} ${_first_block_} ${_last_mapped_block_} ${_last_real_block_}" >> ${TEM_DIR}/iq_header_info.$$.$$
+         fi
+
+         log_msg -t -s "Collecting IQ blockdump information for ${_path_} as part of ${ACTION_TYPE}" -l ${LOGFILE}
+         ${_iqblockdump_} ${_path_} ${_first_block_} >> ${LOGFILE} 2>/dev/null
+         ${_iqblockdump_} ${_path_} ${_last_real_block_} >> ${LOGFILE} 2>/dev/null
+         ${_iqblockdump_} ${_path_} ${_last_mapped_block_} >> ${LOGFILE} 2>/dev/nul
+     done
+fi
+
+if [ -s ${TEM_DIR}/iq_header_info.$$.$$ ]; then
+     if [ -n "${_output_file_name_}" ]; then
+          $RM -rf ${ENIQ_CONF_DIR}/${_output_file_name_}
+          $CAT ${TEM_DIR}/iq_header_info.$$.$$ >> ${ENIQ_CONF_DIR}/${_output_file_name_}
+     else
+          $CP ${TEM_DIR}/iq_header_info.$$.$$ ${ENIQ_CONF_DIR}/storage_migration_iq_header_info
+     fi
+else
+    _err_msg_="Could not collect IQ Header information"
+    abort_script "${_err_msg_}"
+fi
+}
+
+### Function: save_iq_dbspace_file_info ###
+#
+# Collect required IQ information using stored procedures (sp_iqfile and sp_iqdbspace)
+#
+# Arguments: none
+#
+# Return Values: none
+save_iq_dbspace_file_info()
+{
+log_msg -l ${LOGFILE} -t -s "Collecting IQ DBSpace information using sp_iqdbspace"
+$SU - $SYSUSER -c "${IQDIR}/bin64/dbisql -nogui -onerror exit \"@${CONN_STR_USER_DBA_ENC}\" sp_iqdbspace" >> ${LOGFILE}
+if [ $? -ne 0 ];then
+     _err_msg_="Could not collect required IQ information using stored procedure sp_iqdbspace"
+     abort_script "${_err_msg_}"
+fi
+
+log_msg -l ${LOGFILE} -t -s "Collecting IQ File information using sp_iqfile"
+$SU - $SYSUSER -c "${IQDIR}/bin64/dbisql -nogui -onerror exit \"@${CONN_STR_USER_DBA_ENC}\" sp_iqfile" >> ${LOGFILE}
+if [ $? -ne 0 ];then
+     _err_msg_="Could not collect required IQ information using stored procedure sp_iqfile"
+     abort_script "${_err_msg_}"
+fi
+}
+
+### Function: temp_db_migration ###
+#
+# Perform TEMP DB Expansion and Removal
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+temp_db_migration()
+{
+log_msg -t -s "Executing TEMP DB Expansion with Unity storage" -l ${LOGFILE}
+
+if [ -s ${VAR_TMP_DIR}/temp_db_expansion_v2u_success ]; then
+    log_msg -t -s "Skipping TEMP DB Expansion as it is already completed" -l ${LOGFILE}
+else
+    $BASH ${ENIQ_CORE_INST_DIR}/bin/temp_db_expansion.bsh -U
+    if [ $? -ne 0 ];then
+        _err_msg_="Failed to execute ${ENIQ_CORE_INST_DIR}/bin/temp_db_expansion.bsh"
+        abort_script "${_err_msg_}"
+    fi
+    $TOUCH ${VAR_TMP_DIR}/temp_db_expansion_v2u_success
+    $ECHO "Successfully completed TEMP DB Expansion" > ${VAR_TMP_DIR}/temp_db_expansion_v2u_success
+fi
+
+log_msg -t -s "Executing TEMP DB Removal with VNX storage" -l ${LOGFILE}
+if [ -s ${VAR_TMP_DIR}/temp_db_removal_v2u_success ]; then
+    log_msg -t -s "Skipping TEMP DB Removal as it is already completed" -l ${LOGFILE}
+else
+    $BASH ${ENIQ_CORE_INST_DIR}/bin/temp_db_removal.bsh
+    if [ $? -ne 0 ];then
+        _err_msg_="Failed to execute ${ENIQ_CORE_INST_DIR}/bin/temp_db_removal.bsh"
+        abort_script "${_err_msg_}"
+    fi
+    $TOUCH ${VAR_TMP_DIR}/temp_db_removal_v2u_success
+    $ECHO "Successfully completed TEMP DB Removal" > ${VAR_TMP_DIR}/temp_db_removal_v2u_success
+fi
+}
+
+### Function: update_config_files ###
+#
+#
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+update_config_files()
+{
+# Skip configuration file update if not CO or Reader server
+if [ "${CO_SERVER}" != "YES" -a "${RD_SERVER}" != "YES" ]; then
+     log_msg -t -s "Skipping configuration file update on $HNAME" -l ${LOGFILE}
+     return 0
+fi
+
+_disk_id_=$1
+
+log_msg -t -s "Updating configuration files for ${_disk_id_}" -l ${LOGFILE}
+
+_par_tag_list_="DWH_DBSPACES_MAIN DWH_SYSTEM_MAIN"
+if [ "${CO_SERVER}" == "YES" ]; then
+    _ini_file_list_="${TEM_DIR}/${COORD_SYM_LINKS_INI} ${TEM_DIR}/${SYM_LINKS_INI}"
+else
+    _ini_file_list_="${TEM_DIR}/${SYM_LINKS_INI}"
+fi
+
+for _mpath_ in `$CAT ${TEM_DIR}/disk_info.txt|$GREP -w ${_disk_id_}|$AWK -F";" '{print $2}'`; do
+    _file_id_=`${_iqheader_} /dev/mapper/"${_mpath_}"1 2>/dev/null |$GREP -w "File ID:"|$AWK '{print $3}'`
+     if [ "${_file_id_}" ]; then
+          _iq_file_=`$GREP -w ${_file_id_} ${ENIQ_CONF_DIR}/storage_migration_iq_header_info|$AWK '{print $1}'`
+           $GREP ${_iq_file_} ${TEM_DIR}/migrated_iq_file_info.txt >> /dev/null 2>&1
+           if [ $? -ne 0 ]; then
+                $ECHO "${_iq_file_}" >> ${TEM_DIR}/migrated_iq_file_info.txt
+           fi
+
+           if [ "${_iq_file_}" ]; then
+              for _ini_file_ in `$ECHO ${_ini_file_list_}`; do
+
+                  for _parent_block_ in `$ECHO ${_par_tag_list_}`; do
+
+                      _block_list_=`iniget ${_parent_block_} -f ${_ini_file_}`
+                      if [ ! "${_block_list_}" ]; then
+                          _err_msg_="Could not find values for ${_parent_block_} in ${_ini_file_}"
+                          abort_script "${_err_msg_}"
+                      fi
+
+                      for _block_ in ${_block_list_}; do
+
+                          _path_=`iniget ${_block_} -f ${_ini_file_} -v Path`
+                          _lun_id_=`iniget ${_block_} -f ${_ini_file_} -v Lun_ID`
+                          if [ "${_path_}" == "${_iq_file_}" ]; then
+                                _previous_mpath_=`iniget ${_block_} -f ${_ini_file_} -v Disk`
+                                _previous_mpath_trimmed_=`$ECHO "${_previous_mpath_//1}"`
+
+                                $ECHO "Setting ${_block_} Disk=${_mpath_}1 in ${_ini_file_}" >> ${LOGFILE}
+                                iniset ${_block_} -f ${_ini_file_} Disk="${_mpath_}1"
+                                if [ $? -ne 0 ]; then
+                                     _err_msg_="Could not update Disk=${_mpath_}1 in ${_ini_file_}"
+                                     abort_script "${_err_msg_}"
+                                fi
+
+                                $ECHO "Setting ${_block_} Lun_ID=${_disk_id_} in ${_ini_file_}" >> ${LOGFILE}
+                                iniset ${_block_} -f ${_ini_file_} Lun_ID="${_disk_id_}"
+                                if [ $? -ne 0 ]; then
+                                     _err_msg_="Could not update Lun_ID=${_disk_id_} in {_ini_file_}"
+                                     abort_script "${_err_msg_}"
+                                fi
+
+                                $ECHO "Setting ${_block_} Path=${_iq_file_} in ${_ini_file_}" >> ${LOGFILE}
+                                iniset ${_block_} -f ${_ini_file_} Path="${_iq_file_}"
+                                if [ $? -ne 0 ]; then
+                                     _err_msg_="Could not update Path=${_iq_file_} in ${_ini_file_}"
+                                     abort_script "${_err_msg_}"
+                                fi
+
+                                _main_wwn_id_=`$MULTIPATH -l | $GREP -w ${_mpath_} | $AWK -F "(" '{print $2}' | $AWK -F ")" '{print $1}'`
+                                $ECHO "Setting ${_block_} WWN=${_main_wwn_id_} in ${_ini_file_}" >> ${LOGFILE}
+                                iniset ${_block_} -f ${_ini_file_} WWN="${_main_wwn_id_}"
+                                if [ $? -ne 0 ]; then
+                                    _err_msg_="Could not update ${_ini_file_} with WWN=${_main_wwn_id_}"
+                                    abort_script "${_err_msg_}"
+                                fi
+
+                                $SED -i "s/\<${_previous_mpath_trimmed_}\>/${_mpath_}/1" ${_ini_file_}
+                                if [ $? -ne 0 ]; then
+                                    _err_msg_="Could not update DB_DISK_ALLOC for ${disk_id} with ${_mpath_} in ${_ini_file_}"
+                                    abort_script "${_err_msg_}"
+                                fi
+
+
+                                $SED -i "s/\<${_previous_mpath_trimmed_}\>/${_mpath_}/1" ${TEM_DIR}/${DISK_PARTITIONED}
+                                if [ $? -ne 0 ]; then
+                                    _err_msg_="Could not update ${_previous_mpath_trimmed_} with ${_mpath_} in ${TEM_DIR}/${DISK_PARTITIONED}"
+                                    abort_script "${_err_msg_}"
+                                fi
+
+                                $SED -i "s/\<${_previous_mpath_trimmed_}\>/${_mpath_}/1" ${TEM_DIR}/${LUN_MAP_INI}
+                                if [ $? -ne 0 ]; then
+                                    _err_msg_="Could not update ${_previous_mpath_trimmed_} with ${_mpath_} in ${TEM_DIR}/${LUN_MAP_INI}"
+                                    abort_script "${_err_msg_}"
+                                fi
+
+                                $SED -i "s/${_lun_id_}/${_disk_id_}/1" ${TEM_DIR}/${LUN_MAP_INI}
+                                if [ $? -ne 0 ]; then
+                                    _err_msg_="Could not update DB_DISK_ALLOC for ${disk_id} with ${_mpath_} in ${_ini_file_}"
+                                    abort_script "${_err_msg_}"
+                                fi
+                                break 2
+
+                          fi
+                      done
+                  done
+              done
+           fi
+     fi
+done
+}
+
+
+### Function: usage_msg ###
+#
+#   Print out the usage message
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+usage_msg()
+{
+clear
+$ECHO "
+Usage:
+
+`$BASENAME $0` -a presancopy -d <disk_list> -t <migration_type>
+
+`$BASENAME $0` -a precutover
+
+`$BASENAME $0` -a postmigration -d <disk_list> -t <migration_type>
+
+`$BASENAME $0` -a cleanup
+
+`$BASENAME $0` -a temp_db_migration
+
+`$BASENAME $0` -a ext4_migration
+
+
+Optional: [-C YES] [ -l <path_to_logfile> ] [ -f ALL ]
+
+-a  : Mandatory parameter specifying either of the migration action types:
+      presancopy      : To collect the required IQ Header information and md5sum information,
+                        changes LUNS to readonly (in case Migration Type is set to SAN)
+      precutover      : To stop all ENIQ services prior to Pre-Cutover
+      postmigration   : To update configuration files, compares IQ Header information and md5sum information
+                        of the migrated LUNS
+      cleanup         : Cleans-up success flags by default
+      temp_db_migration : Performs TEMP DB Expansion and Removal
+      ext4_migration  : Performs EXT4 migration : To update all the configuration files.
+
+
+-d  : Mandatory parameter that needs to be passed along with action types (presancopy/postmigration)
+      specifying the LUN IDs that need to be migrated
+
+      Example: ieatvnx-75@39, ieatvnx-75@40, ieatvnx-75@41 (In case of VNX as part of presancopy)
+               sv_39, sv_40, sv_41 (In case of Unity as part of postmigration)
+
+-t  : Mandatory parameter that needs to be passed along with action types (presancopy/postmigration)
+      specifying the Migration Type (SAN). 
+
+-C  : Optional parameter to perform checksums on the LUNS to be migrated (by default checksums are not performed)
+
+-f  : Optional parameter to delete all temporary files on all Blades created as part of the migration
+      activity
+      Example: `$BASENAME $0` -a cleanup -f ALL
+
+-l  : Optional parameter specifying the full path to logfile. If not specified,
+      a logfile will be created in /eniq/local_logs/migration
+
+"
+}
+
+# ********************************************************************
+#
+#   Main body of program
+#
+# ********************************************************************
+RUN_TIME=`$DATE '+%Y-%b-%d_%H:%M:%S'`
+
+# Check that the effective id of the user is root
+check_id ${DEFAULT_USER}
+
+while getopts ":a:d:t:l:C:f:" arg; do
+  case $arg in
+    a) ACTION_TYPE="$OPTARG"
+       ;;
+    d) DISK_INPUT="$OPTARG"
+       ;;
+    t) MIGRATION_TYPE="$OPTARG"
+       ;;
+    l) LOGFILE="$OPTARG"
+       ;;
+    C) CHECKSUM="$OPTARG"
+       ;;
+    f) FILES="$OPTARG"
+       ;;
+   \?) usage_msg
+       _err_msg_="Required parameters are not passed"
+       abort_script "${_err_msg_}"
+       ;;
+  esac
+done
+    
+shift `expr $OPTIND - 1`
+
+# Check Input Params
+check_params
+
+# Determine absolute path to software
+check_absolute_path
+
+check_and_manage_smf "NASd.service" "enable"
+
+# Set up environment variables for script.
+setup_env
+    
+if [ "${CO_SERVER}" == "YES" ]; then
+     get_deployment_order
+     if [ "${ACTION_TYPE}" == "presancopy" ]; then
+          _order_file_="${TEM_DIR}/premigration_order"
+     elif [ "${ACTION_TYPE}" == "postmigration" -o "${ACTION_TYPE}" == "cleanup" ]; then
+            _order_file_="${TEM_DIR}/postmigration_order"
+     fi
+    
+    if [ "${ACTION_TYPE}" == "temp_db_migration" ]; then
+        log_msg -h -l ${LOGFILE} -t -s "Entering TEMP DB Migration"
+        
+        # Check if plugin is set to unity
+        for _line_ in `$CAT ${TEM_DIR}/postmigration_order`; do
+            _ip_address_=`$ECHO ${_line_} | $AWK -F"::" '{print $1}'`
+            _serv_hostname_=`$ECHO ${_line_} | $AWK -F"::" '{print $2}'`
+            _serv_name_=`$ECHO ${_line_} | $AWK -F"::" '{print $3}'`
+            if [ ! "${_ip_address_}" -o ! "${_serv_hostname_}" ]; then
+                _err_msg_="Could not read required info from ${_order_file_}"
+                abort_script "${_err_msg_}"
+            fi
+            if [ "${_ip_address_}" == "${HOST_IP}" ]; then
+                log_msg -h -l ${LOGFILE} -t -s "Entering plugincheck on ${HNAME}"
+                plugin_check
+            else
+                run_remote_cmd "${_ip_address_}" "$BASH ${SCRIPTHOME}/eniq_vnx_unity_migration.bsh -a plugincheck" "$LOGFILE"
+            fi
+        done
+        # Execute TEMP DB Migration
+        temp_db_migration
+        log_msg -h -l ${LOGFILE} -t -s "Successfully completed TEMP DB Migration"
+        $RM -rf ${TEM_DIR}
+        exit 0
+    fi
+
+    if [ "${ACTION_TYPE}" == "ext4_migration" ]; then
+        log_msg -h -l ${LOGFILE} -t -s "Entering EXT4 Migration"
+        
+        # Check if plugin is set to unity
+        for _line_ in `$CAT ${TEM_DIR}/postmigration_order`; do
+            _ip_address_=`$ECHO ${_line_} | $AWK -F"::" '{print $1}'`
+            _serv_hostname_=`$ECHO ${_line_} | $AWK -F"::" '{print $2}'`
+            _serv_name_=`$ECHO ${_line_} | $AWK -F"::" '{print $3}'`
+            if [ ! "${_ip_address_}" -o ! "${_serv_hostname_}" ]; then
+                _err_msg_="Could not read required info from ${_order_file_}"
+                abort_script "${_err_msg_}"
+            fi
+            if [ "${_ip_address_}" == "${HOST_IP}" ]; then
+                log_msg -h -l ${LOGFILE} -t -s "Entering plugincheck on ${HNAME}"
+                plugin_check
+                ext4_migration
+            else
+                run_remote_cmd "${_ip_address_}" "$BASH ${SCRIPTHOME}/eniq_vnx_unity_migration.bsh -a plugincheck" "$LOGFILE"
+                run_remote_cmd "${_ip_address_}" "$BASH ${SCRIPTHOME}/eniq_vnx_unity_migration.bsh -a ext4_migration" "$LOGFILE"
+            fi
+        done
+        log_msg -h -l ${LOGFILE} -t -s "Successfully completed EXT4 Migration"
+        $RM -rf ${TEM_DIR}
+        exit 0
+    fi
+    
+     if [[ "${CO_SERVER}" == "YES" ]] && [[ "${ACTION_TYPE}" == "presancopy" || "${ACTION_TYPE}" == "postmigration" || "${ACTION_TYPE}" == "cleanup" ]]; then
+           for _line_ in `$CAT ${_order_file_}`; do
+               _ip_address_=`$ECHO ${_line_} | $AWK -F"::" '{print $1}'`
+               _serv_hostname_=`$ECHO ${_line_} | $AWK -F"::" '{print $2}'`
+               _serv_name_=`$ECHO ${_line_} | $AWK -F"::" '{print $3}'`
+              if [ ! "${_ip_address_}" -o ! "${_serv_hostname_}" ]; then
+                      _err_msg_="Could not read required info from ${_order_file_}"
+                      abort_script "${_err_msg_}"
+              fi
+    
+              if [ "${_ip_address_}" == "${HOST_IP}" ]; then
+                    log_msg -h -l ${LOGFILE} -t -s "Entering ${ACTION_TYPE} on ${_serv_hostname_}"
+                    if [ "${ACTION_TYPE}" == "cleanup" ]; then
+                         cleanup
+                    else
+                         execute_migration
+                         $TOUCH /var/tmp/"${ACTION_TYPE}_${MIGRATION_TYPE}_success"
+                         $ECHO "${HNAME}" > /var/tmp/"${ACTION_TYPE}_${MIGRATION_TYPE}_success"
+                    fi 
+              else
+                    if [[ "${ACTION_TYPE}" == "cleanup" ]]; then
+                         if [ ! "${FILES}" ]; then
+                              run_remote_cmd "${_ip_address_}" "$BASH ${SCRIPTHOME}/eniq_vnx_unity_migration.bsh -a ${ACTION_TYPE}" "$LOGFILE"
+                         else
+                              run_remote_cmd "${_ip_address_}" "$BASH ${SCRIPTHOME}/eniq_vnx_unity_migration.bsh -a ${ACTION_TYPE} -f ${FILES}" "$LOGFILE"
+                         fi
+                    else
+                            run_remote_cmd "${_ip_address_}" "$BASH ${SCRIPTHOME}/eniq_vnx_unity_migration.bsh -a ${ACTION_TYPE} -d \"${DISK_INPUT}\" -t ${MIGRATION_TYPE}" "$LOGFILE"
+
+                    fi
+
+                    if [ $? -ne 0 ]; then
+                          _err_msg_="Failed to execute eniq_vnx_unity_migration.bsh on ${_serv_hostname_}"
+                          abort_script "${_err_msg_}"
+                    fi
+              fi
+           done
+      else
+           log_msg -h -l ${LOGFILE} -t -s "Entering ${ACTION_TYPE} on ${_serv_hostname_}"
+           execute_migration
+      fi
+elif [ "${RD_SERVER}" == "YES" ]; then
+        log_msg -h -l ${LOGFILE} -t -s "Entering ${ACTION_TYPE} on ${HNAME}"
+        if [ "${ACTION_TYPE}" == "cleanup" ]; then
+            cleanup
+        elif [ "${ACTION_TYPE}" == "plugincheck" ]; then
+            plugin_check
+        elif [ "${ACTION_TYPE}" == "ext4_migration" ]; then
+            ext4_migration
+        else
+             execute_migration
+        fi
+elif [ ! "${CO_SERVER}" -a ! "${RD_SERVER}" -a "${ACTION_TYPE}" == "postmigration" ]; then
+    log_msg -h -l ${LOGFILE} -t -s "Entering ${ACTION_TYPE} on ${HNAME}"
+    execute_migration
+elif [ ! "${CO_SERVER}" -a ! "${RD_SERVER}" -a "${ACTION_TYPE}" == "plugincheck" ]; then
+    log_msg -h -l ${LOGFILE} -t -s "Entering ${ACTION_TYPE} on ${HNAME}"
+    plugin_check
+elif [ ! "${CO_SERVER}" -a ! "${RD_SERVER}" -a "${ACTION_TYPE}" == "ext4_migration" ]; then
+    log_msg -h -l ${LOGFILE} -t -s "Entering ${ACTION_TYPE} on ${HNAME}"
+    ext4_migration
+elif [ ! "${CO_SERVER}" -a ! "${RD_SERVER}" -a "${ACTION_TYPE}" == "cleanup" ]; then
+    log_msg -h -l ${LOGFILE} -t -s "Entering ${ACTION_TYPE} on ${HNAME}"
+    cleanup
+else
+    log_msg -t -s "Skipping ${ACTION_TYPE} on ${HNAME}" -l ${LOGFILE}
+    exit 0
+fi
+
+if [ "${ACTION_TYPE}" != "cleanup" -a "${CO_SERVER}" != "YES" ]; then
+      $TOUCH /var/tmp/"${ACTION_TYPE}_${MIGRATION_TYPE}_success"
+
+      $ECHO "${HNAME}" > /var/tmp/"${ACTION_TYPE}_${MIGRATION_TYPE}_success"
+fi
+
+log_msg -h -l ${LOGFILE} -t -s "Successfully completed ${ACTION_TYPE} on ${HNAME}. Logfile: ${LOGFILE}"
+
+$RM -rf ${TEM_DIR}
+$RM -rf ${CONN_STR_USER_DBA_ENC}
+$RM -rf ${CONN_STR_USER_DBA_RD_ENC}
+
+exit 0

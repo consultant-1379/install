@@ -1,0 +1,20 @@
+[Unit]
+Description=ENIQ Repository Database Service
+After=eniq-connectd.service
+
+[Service]
+Type=forking
+User=dcuser
+Group=dc5000
+ExecStart=/eniq/smf/bin/eniq_smf_start_stop.sh -a start -s repdb
+ExecStop=/eniq/smf/bin/eniq_smf_start_stop.sh -a stop -s repdb
+Restart=always
+RestartSec=15
+StartLimitInterval=100
+StartLimitBurst=3
+TimeoutStartSec=0
+TimeoutStopSec=140
+
+[Install]
+WantedBy=multi-user.target
+

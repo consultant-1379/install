@@ -1,0 +1,610 @@
+#!/bin/bash
+# ********************************************************************
+# Ericsson Radio Systems AB SCRIPT
+# ********************************************************************
+#
+#
+# (c) Ericsson Radio Systems AB 2021 - All rights reserved.
+#
+# The copyright to the computer program(s) herein is the property
+# of Ericsson Radio Systems AB, Sweden. The programs may be used
+# and/or copied only with the written permission from Ericsson Radio
+# Systems AB or in accordance with the terms and conditions stipulated
+# in the agreement/contract under which the program(s) have been
+# supplied.
+#
+# ********************************************************************
+# Name    : check_dir_perms
+# Date    : 12/10/2022
+# Revision: \main\12
+# Purpose : This script will check the mounts and the directory permissions.
+# Location:/eniq/installation/core_install/eniq_checks/bin/check_dir_perms.bsh
+# Usage   : check_dir_perms.bsh
+#
+# ********************************************************************
+#
+#   Command Section
+#
+# ********************************************************************
+
+
+AWK=/usr/bin/awk
+CAT=/usr/bin/cat
+CHMOD=/usr/bin/chmod
+DATE=/usr/bin/date
+DF=/usr/bin/df
+ECHO='/usr/bin/echo -e'
+EGREP=/usr/bin/egrep
+GREP=/usr/bin/grep
+ID=/usr/bin/id
+MKDIR=/usr/bin/mkdir
+PWD=/usr/bin/pwd
+RM=/usr/bin/rm
+SED=/usr/bin/sed
+TEE=/usr/bin/tee
+TOUCH=/usr/bin/touch
+
+# ********************************************************************
+#                                                                    *
+#                    Functions                                   *
+#                                                                    *
+# ********************************************************************
+
+### Function: abort_script 
+#                                                                     
+#   This will be called if the script is aborted through an error     
+#   signal                               
+#                                                                     
+# Arguments:                                                          
+#       $1 - Error message from part of program (Not always used)     
+# Return Values:                                                      
+#       none                                                          
+
+abort_script()
+{
+    _err_time_=`$DATE '+%Y-%b-%d_%H.%M.%S'`
+
+    if [ "$1" ]; then
+        _err_msg_="${_err_time_} - $1"
+    else
+        _err_msg_="${_err_time_} - ERROR : Script aborted.......\n"
+    fi
+	
+    if [ "${LOGFILE}" ]; then
+        $ECHO "\nERROR : ${_err_msg_}\n" | $TEE -a ${LOGFILE}
+    else
+        $ECHO "\nERROR : ${_err_msg_}\n"
+    fi
+	$RM -rf ${TEM_DIR}
+	exit 3
+	
+}
+
+### Function: check_id ###
+#
+#   Check that the effective id of the user is correct
+#   If not print error message and exit.
+#
+# Arguments:
+#       $1 : User ID name
+# Return Values:
+#       none
+
+check_id()
+{
+    local _check_id_=`$ID  | $AWK -F\( '{print $2}' | $AWK -F\) '{print $1}'`
+
+    if [ "${_check_id_}" != "$1" ]; then
+        _err_msg_="You must be $1 to execute this script."
+        abort_script "${_err_msg_}"
+    fi
+}
+
+### Function: chk_logfile ###
+#
+# Check Logfile
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+
+chk_logfile()
+{
+    if [ ! -d ${ENIQ_PRECHECK_LOG_DIR}  ]; then
+        $MKDIR -p ${ENIQ_PRECHECK_LOG_DIR}
+        if [ $? -ne 0 ]; then
+            _err_msg_="Could not create directory : ${ENIQ_PRECHECK_LOG_DIR}"
+            abort_script "${_err_msg_}" 
+        fi
+    fi
+    if [ -s ${LOGFILE}  ]; then
+        $RM -rf ${LOGFILE} 
+        if [ -s ${LOGFILE}  ]; then
+            _err_msg_="Warning : Could not remove older ${LOGFILE}"
+            abort_script "${_err_msg_}"
+        fi
+    fi
+
+    $TOUCH ${LOGFILE}
+    if [ $? -ne 0 ]; then
+        _err_msg_="Could not write to file ${LOGFILE}"
+        abort_script "${_err_msg_}"
+    fi
+    
+    $ECHO "Changing permission of the ${LOGFILE} to 644" | $TEE -a ${LOGFILE}
+    $CHMOD 644 ${LOGFILE}
+    if [ $? -ne 0 ]; then
+        _err_msg_="Could not change the permissions of the ${LOGFILE} file to 644"
+        abort_script "${_err_msg_}"
+    fi
+}
+
+
+### Function: chk_nas_file_mounts ###
+#
+# Check file mounts
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+
+chk_nas_file_mounts()
+{
+    # Getting the directory list from SunOs.ini file
+    _sunos_dir_section_list_=`iniget SunOS_DIRECTORY -f ${ENIQ_CONFIG_TEMP}`
+
+    # Parsing directories one by one
+    for _sunos_dir_ in ${_sunos_dir_section_list_}; do 
+    
+        # Storing the directory name in a variable
+        _dir_name_=`iniget ${_sunos_dir_} -f ${ENIQ_CONFIG_TEMP} -v path`
+    
+	if [ "${CURR_SERVER_TYPE}" == "stats_engine" ] && [ ${_dir_name_} == /tmp/.SQLAnywhere ]; then
+            log_msg -l "${LOGFILE}" -s "\n\n##############################################"
+            log_msg -l "${LOGFILE}" -s "Checking for ${_dir_name_}"
+    	    log_msg -l "${LOGFILE}" -s "##############################################"
+            log_msg -s "This check is not applicable for ENGINE server." -l $LOGFILE
+	continue
+	fi
+            
+	    case ${_dir_name_} in
+            /eniq/data/rejected)
+            _permission_=0770
+            ;;
+            /eniq/data/reference)
+            _permission_=0750
+            ;;
+            /eniq/data/etldata*)
+            _permission_=0750
+            ;;
+            *)
+            _permission_=`iniget ${_sunos_dir_} -f ${ENIQ_CONFIG_TEMP} -v perms`
+            ;;
+            esac
+            
+            _user_=`iniget ${_sunos_dir_} -f ${ENIQ_CONFIG_TEMP} -v user`
+            _group_=`iniget ${_sunos_dir_} -f ${ENIQ_CONFIG_TEMP} -v group`
+            
+    log_msg -l "${LOGFILE}" -s "\n\n##############################################"
+    log_msg -l "${LOGFILE}" -s "Checking for ${_dir_name_}"
+    log_msg -l "${LOGFILE}" -s "##############################################"            
+    
+    # Checking the directory mounts
+    $DF -h "${_dir_name_}" 2>/dev/null
+                    
+    if [ $? -ne 0 ]; then 
+        if [[ ${_dir_name_} == /eniq/data/* ]]; then 
+            log_msg -l "${LOGFILE}" -s "${_dir_name_} \n\nNot mounted\n\n"
+            $ECHO "${_dir_name_} " >> ${TEM_DIR}/not_mounted_data
+        else
+            log_msg -l "${LOGFILE}" -s "${_dir_name_} \n\nNot mounted\n\n"
+            $ECHO "${_dir_name_} " >> ${TEM_DIR}/not_mounted
+            break
+        fi
+    else
+                
+        log_msg -l "${LOGFILE}" -s "Checking the permissions"
+        $ECHO "${_dir_name_} " >> ${TEM_DIR}/mounted
+                
+        # Getting the permission of the directories mounted on the server
+        _permis_=`ls -ld ${_dir_name_}`
+        
+        # Extracting the permission,user and group
+        _service_=`$ECHO ${_permis_} | $AWK '{print $1}'`
+        _userid_=`$ECHO ${_permis_} | $AWK '{print $3}'`
+        _groupid_=`$ECHO ${_permis_} | $AWK '{print $4}'`
+        
+        # Changing the permission from string to octal
+        _received_=`$ECHO ${_service_} | chmod_format`
+        _length_=${#_received_}
+        _sticky_bit_boolean_expected_=${_permission_:0:1}
+        if [ ${_sticky_bit_boolean_expected_} -eq 1 ]; then
+            _expected_=${_permission_}  
+        else
+            _expected_=${_permission_:1}
+        fi
+        
+        # Check if the permission received is greater than or equal to expected
+        for ((i=0; i < ${_length_}; ++i)); do
+            _extract_received_=${_received_:${i}:1}    
+        
+            _extract_expected_=${_expected_:${i}:1}
+        
+            if [ ${_extract_expected_} -gt ${_extract_received_} ]; then
+                EXTRACT_VAL=1
+            else
+                EXTRACT_VAL=0
+            fi
+            $ECHO "${EXTRACT_VAL}" | $TEE -a ${TEM_DIR}/textt > /dev/null
+        done
+        
+        $ECHO `$CAT ${TEM_DIR}/textt` | $EGREP "1" > /dev/null
+        
+        # Check for mounting with expected permission
+        if [ $? -ne 0 ]; then
+            log_msg -t -l "${LOGFILE}" -s  "Mounted with expected permission"
+            printf '%-40s \t %30s\n' "${_dir_name_}" "${_received_}" >> ${TEM_DIR}/properly_mounted
+        else    
+            
+            if [[ ${_dir_name_} == /eniq/data/* ]] || [[ ${_dir_name_} == /eniq/backup* ]] || [[ ${_dir_name_} == /eniq/northbound* ]]; then
+                log_msg -t -l "${LOGFILE}" -s  "Mismatch in directory permissions"
+                printf '%-40s \t %-30s \t %-30s\n' "${_dir_name_}" "${_expected_}" "${_received_}"  >> ${TEM_DIR}/data_dir_mounted_perms
+            else
+                log_msg -t -l "${LOGFILE}" -s  "Mismatch in directory permissions"
+                printf '%-40s \t %-30s \t %-30s\n' "${_dir_name_}" "${_expected_}" "${_received_}"  >> ${TEM_DIR}/not_properly_mounted
+            fi
+        fi
+              
+        $RM -rf ${TEM_DIR}/textt
+        
+        # Check if the user matches with the SunOs.ini file
+    
+        $ECHO ${_user_} | $GREP -w ${_userid_} > /dev/null
+        if [ $? == 0 ]; then
+            log_msg -t -l "${LOGFILE}" -s  "Mounted with expected user_id"
+        
+        else
+            if [ ${_dir_name_} == '/eniq/smf' ]; then
+                $PWD > /dev/null
+            elif [[ ${_dir_name_} == /eniq/data/* ]] || [[ ${_dir_name_} == /eniq/backup* ]] || [[ ${_dir_name_} == /eniq/northbound* ]]; then
+                log_msg -t -l "${LOGFILE}" -s  "MISMATCH found in user_id"
+                printf '%-40s \t %-30s \t %-30s\n' "${_dir_name_}" "${_user_}" "${_userid_}"  >> ${TEM_DIR}/data_dir_mounted_user
+            else
+                log_msg -t -l "${LOGFILE}" -s  "MISMATCH found in user_id"
+                printf '%-40s \t %-30s \t %-30s\n' "${_dir_name_}" "${_user_}" "${_userid_}" >> ${TEM_DIR}/not_user_mounted
+            fi
+        fi
+            
+        # Check if the group matches with the SunOs.ini file
+        $ECHO ${_group_} | $GREP -w ${_groupid_} > /dev/null
+        if [ $? == 0 ]; then
+            log_msg -t -l "${LOGFILE}" -s  "Mounted with expected group_id"
+            
+        else
+            if [ ${_dir_name_} == '/eniq/smf' ]; then
+                $PWD > /dev/null
+            elif [[ ${_dir_name_} == /eniq/data/* ]] || [[ ${_dir_name_} == /eniq/backup* ]] || [[ ${_dir_name_} == /eniq/northbound* ]]; then
+                log_msg -t -l "${LOGFILE}" -s  "MISMATCH found in group_id"
+                printf '%-40s \t %-30s \t %-30s\n' "${_dir_name_}" "${_group_}" "${_groupid_}"  >> ${TEM_DIR}/data_dir_mounted_group
+            else
+                log_msg -t -l "${LOGFILE}" -s  "MISMATCH found in group_id"
+                printf '%-40s \t %-30s \t %-30s\n' "${_dir_name_}" "${_group_}" "${_groupid_}" >> ${TEM_DIR}/not_group_mounted
+            fi
+        fi
+    fi
+done
+}
+ 
+ ### Function: chk_fs_file_mounts ###
+#
+# Check FS file mounts
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+  
+ chk_fs_file_mounts()
+{
+    _sunos_fs_section_list_=`iniget SunOS_ZFS_FS -f ${ENIQ_CONFIG_TEMP}`
+
+    for _sunos_fs_dir_ in ${_sunos_fs_section_list_}; do
+        _fs_dir_name_=`iniget ${_sunos_fs_dir_} -f ${ENIQ_CONFIG_TEMP} -v mountpoint`
+        _permission_fs_=`iniget ${_sunos_fs_dir_} -f ${ENIQ_CONFIG_TEMP} -v perms`
+                
+        log_msg -l "${LOGFILE}" -s "\n\n##############################################"
+        log_msg -l "${LOGFILE}" -s "Checking for ${_fs_dir_name_}"
+        log_msg -l "${LOGFILE}" -s "##############################################"            
+                    
+        $DF -h "${_fs_dir_name_}" 2>/dev/null
+                                
+        if [ $? -ne 0 ]; then
+            log_msg -l "${LOGFILE}" -s "${_fs_dir_name_} \n\nNot mounted\n\n"
+            $ECHO "${_fs_dir_name_} " >> ${TEM_DIR}/fs_not_mounted
+        else
+            log_msg -l "${LOGFILE}" -s "Check for the permissions"    
+            _fs_permis_=`ls -ld ${_fs_dir_name_}`
+            _fs_service_=`$ECHO ${_fs_permis_} | $AWK '{print $1}'`
+            _fs_received_=`$ECHO ${_fs_service_} | chmod_format`
+            _length_=${#_fs_received_}
+            _sticky_bit_boolean_fs_expected_=${_permission_fs_:0:1}
+            if [ ${_sticky_bit_boolean_fs_expected_} -eq 1 ]; then
+                _fs_expected_=${_permission_fs_}
+            else
+                 _fs_expected_=${_permission_fs_:1}
+            fi
+            # Check if the permission received is greater than or equal to expected
+                for ((i=0; i < ${_length_}; ++i)); do
+                    _extract_received_=${_fs_received_:${i}:1}
+                    _extract_expected_=${_fs_expected_:${i}:1}
+                    if [ ${_extract_expected_} -gt ${_extract_received_} ]; then
+                        EXTRACT_VAL=1
+                    else
+                        EXTRACT_VAL=0
+                    fi
+                    $ECHO "${EXTRACT_VAL}" | $TEE -a ${TEM_DIR}/text1 > /dev/null
+                done
+            $ECHO `$CAT ${TEM_DIR}/text1` | $EGREP "1" > /dev/null
+            # Check for mounting with expected permission
+                if [ $? -ne 0 ]; then
+                    log_msg -t -l "${LOGFILE}" -s  "FS directories are mounted with expected permissions"
+                    printf '%-40s \t %30s\n' "${_fs_dir_name_}" "${_fs_received_}" >> ${TEM_DIR}/permission_mounted_fs
+                else
+                    log_msg -t -l "${LOGFILE}" -s  "MISMATCH found in directory permissions"
+                    printf '%-40s \t %-30s \t %-30s\n' "${_fs_dir_name_}" "${_fs_expected_}" "${_fs_received_}" >> ${TEM_DIR}/not_permission_mounted_fs
+                fi
+        fi
+    $RM -rf ${TEM_DIR}/text1
+    done
+}
+
+### Function: check_files ###
+#
+# Check and prints the temporary files 
+#
+# Arguments:
+#   none
+# Return Values:
+#    0:   SUCCESS 
+#   129: FAILURE : Directories not mounted
+#    130: FAILURE : Improper directory permission
+#    159: WARNING : Mismatch in directory permissions
+ 
+check_files()
+{
+# Displaying the summary
+log_msg -l "${LOGFILE}" -s "\n\n--------------------------------------------------------------------"
+printf "                            SUMMARY" | $TEE -a ${LOGFILE}
+log_msg -l "${LOGFILE}" -s "\n--------------------------------------------------------------------"
+
+# Checking the file system
+# Display the unmounted directories
+if [ -s "${TEM_DIR}/not_mounted" ] || [ -s "${TEM_DIR}/fs_not_mounted" ] || [ -s "${TEM_DIR}/not_mounted_data" ]; then
+        log_msg -l "${LOGFILE}" -s "\nERROR : Some directories are unmounted\n"
+        log_msg -l "${LOGFILE}" -s "\nUnmounted directory list :"
+        log_msg -l "${LOGFILE}" -s "Directory Name"
+        log_msg -l "${LOGFILE}" -s "----------------------\n"
+        if [ -s "${TEM_DIR}/not_mounted" ]; then
+            log_msg -l "${LOGFILE}" -s "`$CAT ${TEM_DIR}/not_mounted`"
+        fi
+        if [ -s "${TEM_DIR}/fs_not_mounted" ]; then
+            log_msg -l "${LOGFILE}" -s "`$CAT ${TEM_DIR}/fs_not_mounted`"
+        fi
+        if [ -s "${TEM_DIR}/not_mounted_data" ]; then
+            log_msg -l "${LOGFILE}" -s "`$CAT ${TEM_DIR}/not_mounted_data`"
+        fi
+    RET_CODE=129
+    
+# Check if the mounted directories are with expected permission,user and group or not        
+elif [ -s "${TEM_DIR}/not_properly_mounted" ] || [ -s "${TEM_DIR}/not_user_mounted" ] || [ -s "${TEM_DIR}/not_group_mounted" ] || [ -s "${TEM_DIR}/not_permission_mounted_fs" ]; then
+        log_msg -l "${LOGFILE}" -s "\nFollowing directories are mounted with mismatch in configurations" 
+        RET_CODE=130
+elif [ -s "${TEM_DIR}/data_dir_mounted_perms" ] || [ -s "${TEM_DIR}/data_dir_mounted_user" ] || [ -s "${TEM_DIR}/data_dir_mounted_group" ]; then
+        log_msg -l "${LOGFILE}" -s "\nFollowing directories are mounted with mismatch in configurations"
+        RET_CODE=159
+else
+        log_msg -l "${LOGFILE}" -s "Mounted with expected permissions"
+fi
+
+# Check if mounted directories are with proper permission
+if [ -s "${TEM_DIR}/not_properly_mounted" ]; then
+    $CAT ${TEM_DIR}/not_properly_mounted | $TEE -a ${TEM_DIR}/data_dir_mounted_perms > /dev/null
+fi
+
+# Check if mounted directories are with proper permission
+if [ -s "${TEM_DIR}/data_dir_mounted_perms" ]; then
+    log_msg -l "${LOGFILE}" -s "\n\nMismatch in directory id permission :\n"
+    printf '%-40s \t %-30s \t %-30s\n' "Directory Name" "Expected" "Received" | $TEE -a ${LOGFILE}
+    printf '%-40s \t %-30s \t %-30s\n' "----------------------" "----------------------" "----------------------" | $TEE -a ${LOGFILE}
+    printf '%-40s \t %-30s \t %-30s\n' "`$CAT ${TEM_DIR}/data_dir_mounted_perms`" | $TEE -a ${LOGFILE}
+fi
+if [ -s "$TEM_DIR/data_dir_mounted_user" ]; then
+    $CAT ${TEM_DIR}/data_dir_mounted_user | $TEE -a ${TEM_DIR}/not_user_mounted > /dev/null
+fi    
+
+if [ -s "$TEM_DIR/data_dir_mounted_group" ]; then
+    $CAT ${TEM_DIR}/data_dir_mounted_group | $TEE -a ${TEM_DIR}/not_group_mounted > /dev/null
+fi
+
+#  Check if mounted directories are with proper user 
+if [ -s "$TEM_DIR/not_user_mounted" ]; then
+    log_msg -l "${LOGFILE}" -s "\nMismatch in user id found in:\n"
+    printf '%-40s \t %-30s \t %-30s\n' "Directory Name" "Expected" "Received" | $TEE -a ${LOGFILE}
+    printf '%-40s \t %-30s \t %-30s\n' "----------------------" "----------------------" "----------------------" | $TEE -a ${LOGFILE}
+    printf '%-40s \t %-30s \t %-30s\n' "`$CAT ${TEM_DIR}/not_user_mounted`" | $TEE -a ${LOGFILE}
+else
+    log_msg -l "${LOGFILE}" -s "\nAll Directories are mounted with expected USER ID"
+fi 
+
+# Check if mounted directories are with proper group
+if [ -s "$TEM_DIR/not_group_mounted" ]; then
+    log_msg -l "${LOGFILE}" -s "\nMismatch in group id found in:\n"
+    printf '%-40s \t %-30s \t %-30s\n' "Directory Name" "Expected" "Received" | $TEE -a ${LOGFILE}
+    printf '%-40s \t %-30s \t %-30s\n' "----------------------" "----------------------" "----------------------" | $TEE -a ${LOGFILE}
+    printf '%-40s \t %-30s \t %-30s\n' "`$CAT ${TEM_DIR}/not_group_mounted`" | $TEE -a ${LOGFILE}
+else
+    log_msg -l "${LOGFILE}" -s "\nAll Directories are mounted with expected GROUP ID\n"    
+fi
+
+# Checking if FS directories are mounted with proper permission
+if [ -s "$TEM_DIR/not_permission_mounted_fs" ]; then
+    log_msg -l "${LOGFILE}" -s "\nMismatch in Permission found in :\n"
+    printf '%-40s \t %-30s \t %-30s\n' "Directory Name" "Expected" "Received" | $TEE -a ${LOGFILE}
+    printf '%-40s \t %-30s \t %-30s\n' "----------------------" "----------------------" "----------------------" | $TEE -a ${LOGFILE}
+    printf '%-40s \t %-30s \t %-30s\n' "`$CAT ${TEM_DIR}/not_permission_mounted_fs`" | $TEE -a ${LOGFILE}
+else    
+    log_msg -l "${LOGFILE}" -s "All FS directories are mounted with expected permissions\n"
+fi
+    
+
+}
+
+### Function: get_server_type ###
+#
+# To get the server type 
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+get_server_type()
+{
+#Getting the current server type
+CURR_SERVER_TYPE=`$CAT ${ENIQ_CONF_DIR}/installed_server_type`
+
+if [ ! "${CURR_SERVER_TYPE}" ]; then
+    _err_msg_="Could not read ${ENIQ_CONF_DIR}/installed_server_type"
+    abort_script "${_err_msg_}" 
+fi
+}
+
+ ### Function: chmod_format ###
+#
+# To change the permission from string to octal 
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+
+chmod_format() 
+{
+$SED 's/.\(.........\).*/\1/
+h;y/rwsxtSTlL-/IIIIIOOOOO/;x;s/..\(.\)..\(.\)..\(.\)/|\1\2\3/
+y/sStTlLx-/IIIIIIOO/;G
+s/\n\(.*\)/\1;OOO0OOI1OIO2OII3IOO4IOI5IIO6III7/;:k
+s/|\(...\)\(.*;.*\1\(.\)\)/\3|\2/;tk
+s/^0*\(..*\)|.*/\1/;q'
+}
+
+
+### Function: setup_env ###
+#
+# Setup up path environment
+# Imports the common lib files which imports common functions 
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+
+setup_env()
+{
+
+if [ ! "${ENIQ_BASE_DIR}" ]; then
+    ENIQ_BASE_DIR=/eniq
+fi
+
+# Main Directory for the Core Installation SW
+ENIQ_INST_DIR=${ENIQ_BASE_DIR}/installation
+
+# Installation config directory
+ENIQ_CONF_DIR=${ENIQ_INST_DIR}/config
+
+#Installation lib directory
+ENIQ_LIB_DIR=${ENIQ_INST_DIR}/core_install/lib/
+
+# Local logs directory
+ENIQ_PRECHECK_LOG_DIR=${ENIQ_BASE_DIR}/local_logs/precheck_logs
+
+#SunOS.ini path
+ENIQ_CONFIG_TEMP=/eniq/installation/config/SunOS.ini
+
+#Common function directory
+COMMON_FUNCS_LIB=${ENIQ_LIB_DIR}/common_functions.lib
+
+#Imports the common library functions
+if [ ! -f "${COMMON_FUNCS_LIB}" ]; then
+    _err_msg_="${COMMON_FUNCS_LIB} missing, this is required for this script, exiting!!!!"
+    abort_script "${_err_msg_}"
+fi
+
+. ${COMMON_FUNCS_LIB}
+
+if [ $? -ne 0 ]; then
+    _err_msg_="Importing functions of ${COMMON_FUNCS_LIB} failed, exiting!!!!"
+    abort_script "${_err_msg_}"
+fi
+}
+
+
+# ********************************************************************
+#
+#       Main body of program
+#
+# ********************************************************************
+#
+
+# Default user
+DEFAULT_USER=root
+
+# Check that the effective id of the user is root
+check_id ${DEFAULT_USER}
+
+# Set up environment variables for script.
+setup_env
+
+# Logfile path
+LOGFILE=${ENIQ_PRECHECK_LOG_DIR}/log_permission.log
+
+# Extract value variable declaration
+EXTRACT_VAL=0
+
+#Return code declaration
+RET_CODE=0 
+ 
+# Check Logfile
+chk_logfile
+
+#Create a temporary Directory
+TEM_DIR=/tmp/sunos.$$.$$
+
+$MKDIR -p ${TEM_DIR}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not create directory : ${TEM_DIR}"
+    abort_script "${_err_msg_}"
+fi
+
+#Get the server type 
+get_server_type
+ 
+#Check for the file size  
+chk_nas_file_mounts
+
+#Check the FS file system
+chk_fs_file_mounts
+
+#Print the temporary file  
+check_files
+
+log_msg -t -s "File mount check is completed. Check log ${LOGFILE}\n"
+
+$RM -rf ${TEM_DIR}
+if [ -s ${TEM_DIR} ]; then
+    _err_msg_="Could not remove ${TEM_DIR} directory"
+    abort_script "${_err_msg_}"
+fi
+
+exit ${RET_CODE}

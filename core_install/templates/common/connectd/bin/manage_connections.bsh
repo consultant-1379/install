@@ -1,0 +1,1911 @@
+#!/bin/bash
+# ********************************************************************
+# Ericsson Radio Systems AB                                     SCRIPT
+# ********************************************************************
+#
+#
+# (c) Ericsson Radio Systems AB 2018 - All rights reserved.
+#
+# The copyright to the computer program(s) herein is the property
+# of Ericsson Radio Systems AB, Sweden. The programs may be used 
+# and/or copied only with the written permission from Ericsson Radio 
+# Systems AB or in accordance with the terms and conditions stipulated 
+# in the agreement/contract under which the program(s) have been 
+# supplied.
+#
+# ********************************************************************
+# Name    : manage_connections.bsh
+# Date    : 12/10/2023
+# Revision: main/43
+# Purpose : This script will setup ENIQ Stats to allow eternal 
+#			servers to mount filesystems
+#
+# Usage   : manage_connections.bsh
+#
+# ********************************************************************
+#
+#   Command Section
+#
+# ********************************************************************
+AWK=/usr/bin/awk
+BASENAME=/usr/bin/basename
+BASH=/usr/bin/bash
+CAT=/usr/bin/cat
+CLEAR=/usr/bin/clear
+CP=/usr/bin/cp
+DATE=/usr/bin/date
+DIRNAME=/usr/bin/dirname
+ECHO='/usr/bin/echo -e'
+EGREP=/usr/bin/egrep
+EXPR=/usr/bin/expr
+GETENT=/usr/bin/getent
+GREP=/usr/bin/grep
+HEAD=/usr/bin/head
+ID=/usr/bin/id
+MKDIR=/usr/bin/mkdir
+PWD=/usr/bin/pwd
+RM=/usr/bin/rm
+SED=/usr/bin/sed
+SORT=/usr/bin/sort
+TAIL=/usr/bin/tail
+TEE=/usr/bin/tee
+TOUCH=/usr/bin/touch
+TPUT=/usr/bin/tput
+
+# ********************************************************************
+#
+#       Configuration Section
+#
+# ********************************************************************
+
+ENIQ_ROOT_DIR=/eniq
+
+# Default user
+DEFAULT_USER=root
+
+# File variables
+ENIQ_INI=niq.ini
+SUNOS_INI=SunOS.ini
+SOEM_INI=soem.ini
+SOEM_TEMPLATE=soem_template.env
+CONFIG_FILE=soem.env
+OSS_REF_NAME_FILE=".oss_ref_name_file"
+SOEM_REF_NAME_FILE=".soem_ref_name_file"
+
+# Flag values
+INSTALL_FLAG="-I"
+
+# Set the options for the -a parameter
+ACTION_VALS="add|expand|list|update"
+
+# Max number of supported soem nodes
+MAX_SOEM_CELL_NUM=80000
+MAX_CELL_NUM_PER_SOEM=20000
+
+# Port number range
+PORT_START_NUM=4051
+PORT_END_NUM=4100
+
+ENABLE_TUNNEL=""
+
+# ********************************************************************
+#
+#   functions
+#
+# ********************************************************************
+### Function: abort_script ###
+#
+#   This will is called if the script is aborted thru an error
+#   error signal sent by the kernel such as CTRL-C or if a serious
+#   error is encountered during runtime
+#
+# Arguments:
+#       $1 - Error message from part of program (Not always used)
+# Return Values:
+#       none
+abort_script()
+{
+	_err_time_=`$DATE '+%Y-%b-%d_%H.%M.%S'`
+
+	if [ "$1" ]; then
+		_err_msg_="${_err_time_} - $1"
+	else
+		_err_msg_="${_err_time_} - Script aborted...\n"    
+	fi
+
+	if [ "${LOGFILE}" ]; then
+		$ECHO "\n${_err_msg_}\n"|$TEE -a ${LOGFILE}
+	else
+		$ECHO "\n${_err_msg_}\n"
+	fi
+
+	cd $SCRIPTHOME
+
+	clean_up
+
+	if [ "$2" ]; then
+		${2}
+	else
+	   exit 1
+	fi
+}
+
+### Function: add_activate_with_host ###
+#
+# Add/activate features with a host
+#
+# Arguments:
+# $1 : host to use
+# $2 : OSS reference name file
+# Return Values:
+#   none
+add_activate_with_host()
+{
+	_host_to_use_=$1
+
+	# Check that the user specified a ENIQ HNAME format eg. eniq_oss_
+	$ECHO "\nChecking ${_host_to_use_} is in a valid format" | $TEE -a ${LOGFILE}
+	$ECHO ${_host_to_use_} | $EGREP "${CONN_ALIAS}[1-9][0-9]*"  >> /dev/null 2>&1
+	if [ $? -ne 0 ]; then
+		_err_msg_="${_host_to_use_} must be specified in the ENIQ HNAME format eg. ${CONN_ALIAS}1"
+		abort_script "$_err_msg_"
+	fi
+
+	# Have we previous OSS defined
+	if [ ! -s ${REF_NAME_FILE} ]; then
+		_err_msg_="No ${CONN_TYPE}'s are currently managed by this ENIQ server"
+		abort_script "$_err_msg_"
+	fi
+
+	# Is the Node managed
+	$ECHO "Checking ${_host_to_use_} is in ${REF_NAME_FILE}" | $TEE -a ${LOGFILE}
+	$CAT ${REF_NAME_FILE} | $GREP -w ${_host_to_use_} >> /dev/null 2>&1
+	if [ $? -ne 0 ]; then
+		_err_msg_="${_host_to_use_} does not seem to be currently managed by ENIQ server"
+		abort_script "$_err_msg_"
+	fi
+
+	# Check that the /etc/hosts file is a symbolic link. If not, get out
+	if [ ! -L /etc/hosts ]; then
+		_err_msg_="File /etc/hosts should be a symbolic link to /etc/inet/hosts"
+		abort_script "$_err_msg_"
+	fi
+
+	# Update Node server Name/IP
+	update_oss_server_det ${_host_to_use_} ${REF_NAME_FILE}
+
+	get_eniq_features_list ${_host_to_use_}
+
+	if [ -z "${NO_CONFIRM}" ]; then
+		setup_display_file ${TEM_DIR}/disp_file
+
+		# If there is no file then there is nothing to update
+		if [ -s  ${TEM_DIR}/disp_file ]; then
+			# Confirm that the User still wants to add the Node
+			confirm_user_input ${TEM_DIR}/disp_file
+
+			if [ "${USER_CONF}" == "N" -o "${USER_CONF}" == "n" ]; then
+				$RM -rf ${TEM_DIR}
+				$ECHO "\n\n"
+				exit 0
+			fi
+		else
+			$CLEAR
+			$ECHO "No update required....exiting\n\n"
+			$RM -rf ${TEM_DIR}
+			exit 0
+		fi
+	fi
+
+	if [ -s ${TEM_DIR}/feature_output_list ]; then
+		add_features_to_server "${TEM_DIR}/feature_output_list" ${_host_to_use_}
+	fi
+
+	if [ "${NEW_SRV_IP}" != "${OLD_SRV_IP}" ]; then
+		# Update the entry in the REF File
+		update_oss_ref_file ${REF_NAME_FILE} ${_host_to_use_} ${OLD_SRV_IP} ${NEW_SRV_IP}
+	fi	
+}
+
+### Function: add_activate_without_host ###
+#
+# Add/activate features without a host
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+add_activate_without_host()
+{
+	get_eniq_features_list
+
+	if [ -z "${NO_CONFIRM}" ]; then
+		setup_display_file ${TEM_DIR}/disp_file
+
+		# If there is no file then there is nothing to update
+		if [ -s  ${TEM_DIR}/disp_file ]; then
+			# Confirm that the User still wants to add the Node
+			confirm_user_input ${TEM_DIR}/disp_file
+
+			if [ "${USER_CONF}" == "N" -o "${USER_CONF}" == "n" ]; then
+				$RM -rf ${TEM_DIR}
+				$ECHO "\n\n"
+				exit 0
+			fi
+		else
+			$CLEAR
+			$ECHO "No update required....exiting\n\n"
+			$RM -rf ${TEM_DIR}
+			exit 0
+		fi
+	fi
+
+	if [ -s ${TEM_DIR}/feature_output_list ]; then
+		add_features_to_server "${TEM_DIR}/feature_output_list"
+	fi
+}
+
+### Function: add_features_to_server ###
+#
+# Add and Activate the required features for the Node
+#
+# Arguments:
+#       $1 - ENIQ HNAME for Node server
+# Return Values:
+#       none
+add_features_to_server()
+{
+	local _feature_list_file_=${1}	
+	local _eniq_hname_=${2}
+
+	if [ "${_eniq_hname_}" == "" ]; then
+		_eniq_hname_="NO"
+	fi
+
+	if [ ! -s ${ENIQ_ADMIN_BIN_DIR}/manage_features.bsh ]; then
+		_err_msg_="Failed to locate ENIQ TechPack installer script ${ENIQ_ADMIN_BIN_DIR}/manage_features.bsh"
+		abort_script "$_err_msg_"
+	fi
+
+	if [ ! -s ${ENIQ_ADMIN_BIN_DIR}/manage_eniq_services.bsh ]; then
+		_err_msg_="Failed to locate ENIQ service script ${ENIQ_ADMIN_BIN_DIR}/manage_eniq_services.bsh"
+		abort_script "$_err_msg_"
+	fi
+
+	# Ensure all services are online
+	$ECHO "Starting ENIQ services with command:" >> ${LOGFILE}
+	$ECHO "/usr/bin/bash ${ENIQ_ADMIN_BIN_DIR}/manage_eniq_services.bsh -a start -s ALL -N -l ${LOGFILE}" >> ${LOGFILE}
+	/usr/bin/bash ${ENIQ_ADMIN_BIN_DIR}/manage_eniq_services.bsh -a start -s ALL -N -l ${LOGFILE}
+	if [ $? -ne 0 ]; then
+		abort_script "Exiting...." 
+	fi
+
+	add_activate_features "${TEM_DIR}/feature_output_list" ${_eniq_hname_} ${ENIQ_ADMIN_BIN_DIR} "${INSTALL_FLAG}" ${BASE_SW_DIR} ${INSTALL_TYPE} ${LOGFILE} 
+	if [ $? -ne 0 ]; then
+		_err_msg_="Failed to manipulate the features"
+		abort_script "$_err_msg_" 
+	fi
+
+	# Store the ENIQ feature list for this Node
+	store_feature_det ${_feature_list_file_} "${ENIQ_CONF_DIR}/${ENIQ_INI}" ${TEM_DIR} ${LOGFILE}
+}
+
+### Function: add_managed_node ###
+#
+#   Add a new connection to be managed
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+add_managed_node()
+{
+	# Get the server details
+	get_server_details
+
+	# Update the env file
+	case ${CONN_TYPE} in
+		SOEM)   update_soem_files
+				;;
+		IPTNMS) update_iptnms_files
+				;;
+	esac
+
+	# Create tunnel
+	if [ "${CONN_TYPE}" == "SOEM" ]; then	
+		# Create structure for tunnel
+		if [ "${ENABLE_TUNNEL}" == "Y" -o "${ENABLE_TUNNEL}" == "y" ]; then
+			add_tunnel_info
+		fi
+	fi
+}
+
+### Function: add_tunnel_info ###
+#
+#   Create a directory structure for
+#   the ssh tunnel to use
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+add_tunnel_info()
+{
+	$ECHO "Beginning to setup ssh tunnel files..." | $TEE -a ${LOGFILE}
+		
+	$RM -f ${TEM_DIR}/tunnel_port_list_${CONN_TYPE} ${TEM_DIR}/port_data
+
+	# Directory containing details for that SOEM tunnel such as
+	# port number, mounted filesystems, etc
+	_tunnel_ref_=${ENIQ_CONNECTD_DIR}/mount_info/${NEXT_ALIAS}
+	if [ "${CONN_TYPE}" == "SOEM" ]; then
+		_tunnel_port_list_=${ENIQ_CONNECTD_DIR}/etc/tunnel_port_list_soem
+	else
+		_tunnel_port_list_=${ENIQ_CONNECTD_DIR}/etc/tunnel_port_list
+	fi	
+	# Populate a temp file with list of port numbers
+
+	for (( i=${PORT_START_NUM}; i<=${PORT_END_NUM}; i++ )); do
+		$ECHO ${i} >> ${TEM_DIR}/tunnel_port_list_${CONN_TYPE}
+		if [ $? -ne 0 ]; then
+			_err_msg_="Failed to add port number ${i} to ${TEM_DIR}/tunnel_port_list_${CONN_TYPE}"
+			abort_script "$_err_msg_"
+		fi
+	done
+
+	# Copy temp port info file to proper location
+	# if one doesn't already exist
+	if [ -s ${TEM_DIR}/tunnel_port_list_${CONN_TYPE} ]; then
+		$ECHO "Creating ${_tunnel_port_list_} file" | $TEE -a ${LOGFILE}
+		$CP ${TEM_DIR}/tunnel_port_list_${CONN_TYPE} ${_tunnel_port_list_}
+		if [ $? -ne 0 ]; then
+			_err_msg_="Failed to copy ${TEM_DIR}/tunnel_port_list_${CONN_TYPE} to ${_tunnel_port_list_}"
+			abort_script "$_err_msg_"
+		fi
+	fi
+
+
+
+	# Create directory for the Node if it doesn't exist
+	if [ ! -d ${_tunnel_ref_} ]; then
+		$ECHO "Creating ${_tunnel_ref_} directory" | $TEE -a ${LOGFILE}
+		$MKDIR -p ${_tunnel_ref_}
+		if [ $? -ne 0 ]; then
+			_err_msg_="Failed create ${_tunnel_ref_} directory"
+			abort_script "$_err_msg_"
+		fi
+	fi
+
+	# Create the disable_SOEM file
+	if [ ! -e ${_tunnel_ref_}/disable_${CONN_TYPE} ]; then
+		$ECHO "Creating ${_tunnel_ref_}/disable_${CONN_TYPE} file" | $TEE -a ${LOGFILE}
+		$TOUCH ${_tunnel_ref_}/disable_${CONN_TYPE}
+		if [ $? -ne 0 ]; then
+			_err_msg_="Failed to create ${_tunnel_ref_}/disable_${CONN_TYPE} file"
+			abort_script "$_err_msg_"
+		fi
+	fi
+
+	# Create the use_tunnel file
+	if [ ! -e ${_tunnel_ref_}/use_tunnel ]; then
+		$ECHO "Creating ${_tunnel_ref_}/use_tunnel file" | $TEE -a ${LOGFILE}
+		$TOUCH ${_tunnel_ref_}/use_tunnel
+		if [ $? -ne 0 ]; then
+			_err_msg_="Failed to create ${_tunnel_ref_}/use_tunnel file"
+			abort_script "$_err_msg_"
+		fi
+	fi
+
+	# Get the alias number so I can determine if it is the first SOEM alias or not.
+	_alias_num_=`$ECHO ${NEXT_ALIAS} | $AWK -F\_ '{print $NF}'`
+	if [ $? -ne 0 ]; then
+		_err_msg_="Failed to find alias number from ${NEXT_ALIAS}"
+		abort_script "$_err_msg_"
+	fi
+
+	# Create the port_data file if it doesn't exist with the
+	# port number for this particular SOEM
+	if [ ! -s ${_tunnel_ref_}/port_data ]; then
+		# Find a suitable port number by checking the port list file, and
+		# finding a port thats not already used by another SOEM
+		while read _port_number_; do
+			# if this is the first SOEM added, give it the first port number
+			if [ ${_alias_num_} -eq 1 ]; then
+				_port_=${_port_number_}
+				if [ "${_port_}" ]; then
+					break
+				fi
+			else
+				_used_port_=`$CAT ${ENIQ_CONNECTD_DIR}/mount_info/${CONN_ALIAS}*/port_data`
+				$ECHO ${_used_port_} | $GREP ${_port_number_} > /dev/null 2>&1
+				if [ $? -ne 0 ]; then
+					_port_=${_port_number_}
+					break
+				fi
+			fi
+		done < ${_tunnel_port_list_}
+
+		# We should have a unique Port number so we'll use that
+		$ECHO ${_port_} > ${TEM_DIR}/port_data
+		if [ $? -ne 0 ]; then
+			_err_msg_="Failed to add ${_port_} to ${TEM_DIR}/port_data"
+			abort_script "$_err_msg_"
+		fi
+
+		# Copy the temp port_data file to its permanent location
+		if [ -s ${TEM_DIR}/port_data ]; then
+			$ECHO "Creating ${_tunnel_ref_}/port_data file" | $TEE -a ${LOGFILE}
+			$CP ${TEM_DIR}/port_data ${_tunnel_ref_}/port_data
+			if [ $? -ne 0 ]; then
+				_err_msg_="Failed to copy ${TEM_DIR}/port_data to ${_tunnel_ref_}/port_data"
+				abort_script "$_err_msg_"
+			fi
+		fi
+	fi
+}
+
+### Function: check_files_scripts ###
+#
+#   Check that the required files/scripts exist
+#
+# Arguments:
+#       $1 : User ID name
+# Return Values:
+#   0 : Success
+#	1 : Failure
+check_files_scripts()
+{
+	# Make sure we have a connection details file
+	if [ ! -s ${ENIQ_CONNECTD_DIR}/etc/manage_connection.cfg ]; then
+		$ECHO "Could not find ${ENIQ_CONNECTD_DIR}/etc/manage_connection.cfg file" | $TEE -a ${LOGFILE}
+		return 1
+	fi
+
+	# Make sure we have the service names file
+	if [ ! -s ${CLI_CONF_DIR}/service_names ]; then
+		$ECHO "Could not find ${CLI_CONF_DIR}/service_names file" | $TEE -a ${LOGFILE}
+		return 1
+	fi
+
+	# Check we have all required ini files
+	if [ ! -s ${ENIQ_CONF_DIR}/${SUNOS_INI} ]; then
+		$ECHO "Could not find ${ENIQ_CONF_DIR}/${SUNOS_INI} file" | $TEE -a ${LOGFILE}
+		return 1
+	fi
+
+	if [ -s ${CLI_CONF_DIR}/${SOEM_INI} ]; then
+		SOEM_INI_FILE=${CLI_CONF_DIR}/${SOEM_INI}
+	elif [ -s ${ENIQ_TEMPL_DIR}/${SOEM_INI} ]; then
+		SOEM_INI_FILE=${ENIQ_TEMPL_DIR}/${SOEM_INI}
+	else		
+		_err_msg_="Could not find ${SOEM_INI} file in ${CLI_CONF_DIR} or ${ENIQ_TEMPL_DIR}"
+		abort_script "$_err_msg_"
+	fi
+
+	if [ ! -s ${ENIQ_ADMIN_BIN_DIR}/resize_nas_fs.bsh ]; then
+		$ECHO "Could not find ${ENIQ_ADMIN_BIN_DIR}/resize_nas_fs.bsh file" | $TEE -a ${LOGFILE}
+		return 1
+	fi
+
+	if [ ! -s ${ENIQ_ADMIN_BIN_DIR}/manage_features.bsh ]; then
+		$ECHO "Failed to locate ENIQ feature installer script ${ENIQ_ADMIN_BIN_DIR}/manage_features.bsh" | $TEE -a ${LOGFILE}
+		return 1
+	fi
+
+	if [ ! -s ${ENIQ_ADMIN_BIN_DIR}/manage_eniq_services.bsh ]; then
+		$ECHO "Failed to locate ENIQ service script ${ENIQ_ADMIN_BIN_DIR}/manage_eniq_services.bsh" | $TEE -a ${LOGFILE}
+		return 1
+	fi
+
+	return 0
+}
+
+### Function: check_id ###
+#
+#   Check that the effective id of the user is correct
+#   If not print error msg and exit.
+#
+# Arguments:
+#       $1 : User ID name
+# Return Values:
+#       none
+check_id()
+{
+	_check_id_=`$ID  | $AWK -F\( '{print $2}' | $AWK -F\) '{print $1}'`
+	if [ "$_check_id_" != "$1" ]; then
+		_err_msg_="You must be $1 to execute this script."
+		abort_script "${_err_msg_}"
+	fi
+
+	return 0
+}
+
+### Function: check_params ###
+#
+# Check Input Params
+#
+# Arguments:
+#	none
+# Return Values:
+#   0 : Success
+#	1 : Failure
+check_params()
+{
+	if [ ! "${BASE_SW_DIR}" -o ! "${ACTION}" ]; then
+		return 1
+	fi
+
+	# Check the -a parameter
+	$ECHO "${ACTION}" | $EGREP -Eo "${ACTION_VALS}" >> /dev/null 2>&1
+	if [ $? -ne 0 ]; then
+		return 1
+	fi
+
+	if [ "${CONN_TYPE}" != "SOEM" ]; then
+		if [ "${ACTION}" != "add" -a "${ACTION}" != "expand" ]; then
+			return 1
+		fi
+	fi
+}
+
+### Function: chk_create_logfile ###
+#
+# Check/Create Logfile
+#
+# Arguments:
+#   none
+# Return Values:
+#   0 : Success
+#	1 : Failure
+chk_create_logfile()
+{
+	$MKDIR -p `$DIRNAME ${LOGFILE}`
+	if [ $? -ne 0 ]; then
+		$ECHO "Could not create directory `$DIRNAME ${LOGFILE}`" | $TEE -a ${LOGFILE}
+		return 1
+	fi
+
+	$TOUCH -a ${LOGFILE}
+	if [ $? -ne 0 ]; then
+		$ECHO "Could not write to file ${LOGFILE}" | $TEE -a ${LOGFILE}
+		return 1
+	fi
+
+	return 0
+}
+
+### Function: clean_up ###
+#
+# Check Input Params
+#
+# Arguments:
+#	none
+# Return Values:
+#	none
+clean_up()
+{
+	# Removing all files created within the script
+	$RM -rf ${TEM_DIR}
+}
+
+### Function: confirm_user_input ###
+#
+# Confirm with user that values entered are correct
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+confirm_user_input()
+{
+	local _usr_conf_file_=$1
+	if [ ! "${_usr_conf_file_}" ]; then
+		_err_msg_="No display file available for user"
+		abort_script "${_err_msg_}"
+	fi
+
+	while :; do
+		$CLEAR
+		unset USER_CONF
+		$CAT ${_usr_conf_file_}
+		read USER_CONF
+
+		# If the User hit nothing
+		if [ ! "${USER_CONF}" ]; then
+			continue
+		fi
+
+		# Did the user input (Y/y)
+		if [ "${USER_CONF}" == "Y" -o "${USER_CONF}" == "y" -o "${USER_CONF}" == "N" -o "${USER_CONF}" == "n" ]; then
+			break
+		fi
+	done
+}
+
+### Function: expand_managed_node ###
+#
+#   expand connection
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+
+expand_managed_node()
+{
+	if [ "${CURR_SERVER_TYPE}" != "stats_engine" ]; then
+		_err_msg_="Expansion is only permitted on ENIQ Statistics engine server"
+		abort_script "${_err_msg_}"
+	else 
+		update_system_for_expansion ${CONN_TYPE}
+	fi
+}
+### Function: get_absolute_path ###
+#
+# Determine absolute path to software
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+get_absolute_path() 
+{
+	_dir_=`$DIRNAME $0`
+	SCRIPTHOME=`cd $_dir_ 2>/dev/null && pwd || $ECHO $_dir_`
+}
+
+### Function: get_alias_value ###
+#
+# Get the servers IP and hostname
+#
+# Arguments:
+#   none
+# Return Values:
+#   0 : Success
+#	1 : Failure
+get_alias_value()
+{
+	# Get the last used number
+	rm -rf /tmp/_serv_type_list.txt
+    for _line_ in `$CAT ${CLI_CONF_DIR}/service_names`; do
+		unset _count_ _serv_type_
+                local _count_ _serv_type_ _last_num_
+		
+		_count_=`$ECHO "${_line_}" | grep -o "::" | wc -l`
+		if [ "${_ip_type_}" == "IPv6" ] && [ "${_count_}" == 3 ]; then
+		    _serv_type_=`$ECHO ${_line_} | $AWK -F"::" '{print $4}'`
+		else
+			_serv_type_=`$ECHO ${_line_} | $AWK -F"::" '{print $3}'`
+	    fi
+		${_serv_type_} >> /tmp/_serv_type_list.txt
+	done
+		
+	# Get the last used number
+	_last_num_=`$CAT /tmp/_serv_type_list.txt | $SED "s|${CONN_ALIAS}||" | $SORT -k 1,1n | $TAIL -1`
+	
+	if [ ! "${_last_num_}" ]; then
+		$ECHO "Could not read last numeric value from ${CLI_CONF_DIR}/service_names" | $TEE -a ${LOGFILE}
+		return 1
+	fi
+
+	rm -rf /tmp/_serv_type_list.txt
+	# Check that I got a numeric value
+	$ECHO ${_last_num_} | $EGREP '[^0-9]' >> /dev/null 2>&1
+	if [ $? -eq 0 ]; then
+		NEXT_ALIAS="${CONN_ALIAS}1"
+	else
+		NEXT_ALIAS="${CONN_ALIAS}`$EXPR ${_last_num_} + 1`"
+	fi
+
+	$ECHO "\nAlias to use will be set to \"${NEXT_ALIAS}\"" >> ${LOGFILE}
+
+	return 0
+}
+
+### Function: get_connection_info ###
+#
+# Setup alias details and config file info
+# by asking the user to select what is being
+# connected
+#
+# Arguments:
+#   none
+# Return Values:
+#   0 : Success
+#	1 : Failure
+get_connection_info()
+{
+	local _conn_types_=`$CAT ${ENIQ_CONNECTD_DIR}/etc/manage_connection.cfg | $EGREP -v '^[[:blank:]]*#' | $AWK -F"::" '{print $1}'`
+	if [ ! "${_conn_types_}" ]; then
+		$ECHO "Could not read connection types from ${ENIQ_CONNECTD_DIR}/etc/manage_connection.cfg" | $TEE -a ${LOGFILE}
+		return 1
+	fi
+
+	# Build an array with the options
+	_num_=1
+	for _opt_ in ${_conn_types_}; do
+		# Store the details in the array
+		_conn_array_[${_num_}]=${_opt_}
+		let _num_=_num_+1
+	done
+
+	_cnt_=${#_conn_array_[@]}
+
+	# Create the display file
+	_disp_file_=${TEM_DIR}/disp_file
+	$RM -f ${_disp_file_}
+
+	$ECHO "\n\nAvailable connection types:" >> ${_disp_file_}
+	for (( i=1; i<=${_cnt_}; i++ )); do
+		$ECHO "[${i}]  ${_conn_array_[${i}]}" >> ${_disp_file_}
+	done
+	$ECHO "\nPlease select the system you wish to integrate" >> ${_disp_file_}
+
+	while :; do
+		unset CONN_TYPE
+		
+		$CLEAR
+		$CAT ${_disp_file_}
+		read _num_
+		
+		if [ ! "${_num_}" ]; then
+			continue
+		fi
+		
+		_numerror_=0
+		
+		$ECHO ${_num_} | $EGREP '[^0-9]' >> /dev/null 2>&1
+		if [ $? -eq 0 ]; then
+			_numerror_=1
+		fi
+		if [ ${_num_} -lt 1 -o ${_num_} -gt ${_cnt_} ]; then
+			_numerror_=1
+		fi
+		
+		if [ ${_numerror_} -eq 0 ]; then
+			CONN_TYPE="${_conn_array_[${_num_}]}"
+			break
+		fi
+	done
+
+	if [ "${CONN_TYPE}" == "SOEM" ]; then
+		REF_NAME_FILE=${CLI_CONF_DIR}/${SOEM_REF_NAME_FILE}
+	fi
+
+	unset CONN_ALIAS
+	CONN_ALIAS=`$CAT ${ENIQ_CONNECTD_DIR}/etc/manage_connection.cfg | $EGREP -v '^[[:blank:]]*#' | $EGREP "${CONN_TYPE}" | $AWK -F"::" '{print $2}'`
+	if [ ! "${CONN_ALIAS}" ]; then
+		$ECHO "Could not read alias information from ${ENIQ_CONNECTD_DIR}/etc/manage_connection.cfg" | $TEE -a ${LOGFILE}
+		return 1
+	fi
+
+	unset CONFIG_FILE
+	CONFIG_FILE=`$CAT ${ENIQ_CONNECTD_DIR}/etc/manage_connection.cfg | $EGREP -v '^[[:blank:]]*#' | $EGREP "${CONN_TYPE}" | $AWK -F"::" '{print $3}'`
+	if [ ! "${CONFIG_FILE}" ]; then
+		$ECHO "Could not read config file information from ${ENIQ_CONNECTD_DIR}/etc/manage_connection.cfg" | $TEE -a ${LOGFILE}
+		return 1
+	fi
+
+	return 0
+}
+
+### Function: get_eniq_features_list ###
+#
+# Get the list of ENIQ features to be installed
+#
+# Arguments:
+#       $1 - ENIQ HNAME for Node server
+# Return Values:
+#       none
+get_eniq_features_list()
+{
+	local _eniq_hname_=${1}
+
+	# Get directory where the ENIQ Features are stored on DVD/Jumpstart - eniq_techpacks
+	_eniq_feat_input_dir_=`iniget FEATURE_INFO -f ${CLI_CONF_DIR}/${ENIQ_INI} -v Feature_Input_Dir`
+	if [ ! "${_eniq_feat_input_dir_}" ]; then
+		_err_msg_="Could not read parameter Feature_Input_Dir from file\n${CLI_CONF_DIR}/${ENIQ_INI}"
+		abort_script "$_err_msg_"
+	fi
+
+	if [ "${CONN_TYPE}" == "SOEM" -o "${CONN_TYPE}" == "IPTNMS" ]; then
+	# Get file where the ENIQ Features are listed on DVD/Jumpstart - install_features
+		_tem_feat_input_file_=`iniget FEATURE_INFO -f ${CLI_CONF_DIR}/${ENIQ_INI} -v Soem_Feature_Input_File`
+	else
+		_tem_feat_input_file_=`iniget FEATURE_INFO -f ${CLI_CONF_DIR}/${ENIQ_INI} -v Feature_Input_File`
+	fi
+
+	if [ ! "${_tem_feat_input_file_}" ]; then
+		_err_msg_="Could not read parameter Feature_Input_File from file\n${CLI_CONF_DIR}/${ENIQ_INI}"
+		abort_script "$_err_msg_"
+	fi
+
+	# Does the feature input file exist?
+	_eniq_feat_input_file_="$BASE_SW_DIR/${_eniq_feat_input_dir_}/${_tem_feat_input_file_}"
+	if [ ! -s ${_eniq_feat_input_file_} ]; then
+		_err_msg_="Could not locate ENIQ Features input file\n${_eniq_feat_input_file_}"
+		abort_script "$_err_msg_"
+	fi
+
+	# Get Directory where the list of managed features will be stored
+	_feature_list_dir_=`iniget FEATURE_INFO -f ${ENIQ_CONF_DIR}/${ENIQ_INI} -v Feature_Interface_Dir`
+	if [ ! "${_feature_list_dir_}" ]; then
+		_err_msg_="Failed to read Parameter Feature_Interface_Dir from ${ENIQ_CONF_DIR}/${ENIQ_INI}"
+		abort_script "$_err_msg_"
+	fi
+
+	# Total Interface File
+	_eniq_total_feature_output_file_=${_feature_list_dir_}/total_feature_install_list
+	if [ ! -s ${_eniq_total_feature_output_file_} ]; then
+		_err_msg_="${_eniq_total_feature_output_file_} not found or empty"
+		abort_script "$_err_msg_"
+	fi
+
+	# Does the sentinel environment file exist?
+	if [ ! -s ${ENIQ_SENTINEL_ENV} ]; then
+		_err_msg_="${ENIQ_SENTINEL_ENV} not found or empty"
+		abort_script "$_err_msg_"
+	fi
+	. ${ENIQ_SENTINEL_ENV}
+
+	# Does the sentinel lsmon binary exist?
+	if [ ! -x ${ENIQ_SENTINEL_BIN_DIR}/lsmon ]; then
+		_err_msg_="${ENIQ_SENTINEL_BIN_DIR}/lsmon not found or not executable"
+		abort_script "$_err_msg_"
+	fi
+
+	# Get a list of licenced features
+	get_licenced_features ${LOGFILE} ${TEM_DIR} ${ENIQ_SENTINEL_BIN_DIR}/lsmon ${LSHOST}
+	if [ $? -ne 0 ]; then
+		_err_msg_="Could not generate a list of licences on ${LSHOST}"
+		abort_script "$_err_msg_"
+	fi
+
+	_working_list_=${TEM_DIR}/feature_work_list
+
+	# Build a list of features
+	# Was I supplied Feature in a file for a specific Node to be upgraded
+	if [ "${ENIQ_FEATURE_FILE}" ]; then
+		if [ ! -s ${ENIQ_FEATURE_FILE} ]; then
+			_err_msg_="Interface list file ${ENIQ_FEATURE_FILE} missing or empty"
+			abort_script "$_err_msg_"
+		fi
+		$CP ${ENIQ_FEATURE_FILE} ${_working_list_} 
+		if [ $? -ne 0 ]; then
+			_err_msg_="Could not copy ${ENIQ_FEATURE_FILE} to ${_working_list_}"
+			abort_script "$_err_msg_"
+		fi
+	# Was I supplied Techpacks to be updated
+	elif [ "${ENIQ_FEATURE}" ]; then
+		if [ "${ENIQ_FEATURE}" == "ALL" ]; then
+			$CP ${_eniq_total_feature_output_file_} ${_working_list_} 
+		else
+			_tem_list_=`$ECHO ${ENIQ_FEATURE}|$SED -e 's|,| |g'`
+			for _feat_ in ${_tem_list_}; do
+				_chk_feat_inst_=`$CAT ${_eniq_total_feature_output_file_}|$GREP -w ${_feat_}`
+				if [ $? -ne 0 ]; then
+					_err_msg_="Feature ${_feat_} cannot be updated as it has not been installed"
+					abort_script "$_err_msg_"
+				fi
+				$ECHO ${_chk_feat_inst_} >>  ${_working_list_}
+			done
+		fi
+	else
+		$CP ${_eniq_feat_input_file_} ${_working_list_}
+		if [ $? -ne 0 ]; then
+			_err_msg_="Could not copy ${_eniq_feat_input_file_} to ${_working_list_}"
+			abort_script "$_err_msg_"
+		fi
+		_build_list_=1
+	fi
+
+	unset FEATURE_ARRAY START_DATE_ARRAY END_DATE_ARRAY
+	# Build 3 arrays of all the ENIQ Features. One array for the description
+	# and the 2nd array for the file designation
+	_cnt_=${#_tem_feature_array_[@]}
+	_ptr_=0
+	for (( i=0; i<=${_cnt_}; i++)); do
+		_desc_=`$CAT ${_working_list_}|$EGREP "^[ ]*${_tem_feature_array_[${i}]}::"|$AWK -F"::" '{print $2}'`
+		if [ "${_desc_}" ]; then
+			let _ptr_=${_ptr_}+1
+			FEATURE_ARRAY[${_ptr_}]=${_tem_feature_array_[${i}]}
+			START_DATE_ARRAY[${_ptr_}]=${_tem_start_date_array_[${i}]}
+			END_DATE_ARRAY[${_ptr_}]=${_tem_end_date_array_[${i}]}
+			DESC_ARRAY[${_ptr_}]=${_desc_}
+		
+			# Assume feature has not already being installed/activated
+			_act_chk_array_[${_ptr_}]="0"
+		
+			# Has the Interface been activated already for the Node
+			if [ -s ${_eniq_total_feature_output_file_} ]; then
+				if [ "${_eniq_hname_}" ]; then
+					$CAT ${_eniq_total_feature_output_file_} | $EGREP "^[ 	]*${FEATURE_ARRAY[${_ptr_}]}::.*::${_eniq_hname_}[ 	]*$" >> /dev/null 2>&1
+					if [ $? -eq 0 ]; then
+						_act_chk_array_[${_ptr_}]="1"
+					fi
+				else
+					$CAT ${_eniq_total_feature_output_file_} | $EGREP "^[ 	]*${FEATURE_ARRAY[${_ptr_}]}::.*" >> /dev/null 2>&1
+					if [ $? -eq 0 ]; then
+						_act_chk_array_[${_ptr_}]="1"
+					fi
+				fi
+			fi
+			if [ ! "${FEATURE_ARRAY[${_ptr_}]}" -o ! "${START_DATE_ARRAY[${_ptr_}]}" -o ! "${END_DATE_ARRAY[${_ptr_}]}" -o ! "${DESC_ARRAY[${_ptr_}]}" ]; then
+				_err_msg_="Malformed license value"
+				abort_script "$_err_msg_"
+			fi
+		fi
+	done
+
+	if [ ${#START_DATE_ARRAY[@]} -eq 0 ]; then
+		_err_msg_="No valid ENIQ licenses read from License Server ${LSHOST}"
+		abort_script "$_err_msg_"
+	fi
+
+	# Get todays date
+	_now_date_=`$DATE '+%Y%m%d'`
+
+	# Create the Display file
+	_disp_file_=${TEM_DIR}/disp_file
+	_unlic_file_=${TEM_DIR}/unlicensed_file
+	$RM -f ${_disp_file_} ${_unlic_file_}
+
+	$ECHO "\nENIQ Feature List" >> ${_disp_file_}
+	$ECHO "=================" >> ${_disp_file_}
+
+	_cnt_=${#FEATURE_ARRAY[@]}
+	_menu_opt_=0
+	for (( i=1; i<=${_cnt_}; i++)); do
+		unset _act_
+
+		if [ ${_act_chk_array_[${i}]} -eq 1 ]; then
+			_act_="(*)"
+		fi
+
+		if [ ${START_DATE_ARRAY[${i}]} -gt ${_now_date_} -o ${END_DATE_ARRAY[${i}]} -lt ${_now_date_} ]; then
+			$ECHO "[N/A]  ${DESC_ARRAY[${i}]}  (E)" >> ${_unlic_file_}
+		else
+			let _menu_opt_=_menu_opt_+1
+			VALID_FEATURE_ARRAY[${_menu_opt_}]=${FEATURE_ARRAY[${i}]}
+			VALID_DESC_ARRAY[${_menu_opt_}]=${DESC_ARRAY[${i}]}
+			$ECHO "[${_menu_opt_}]  ${DESC_ARRAY[${i}]}  ${_act_}" >> ${_disp_file_}
+		fi
+	done
+
+	# Any unlicensed stuff to display
+	if [ -s ${_unlic_file_} ]; then
+		$ECHO "" >> ${_disp_file_}
+		$CAT ${_unlic_file_} >> ${_disp_file_}
+	fi
+
+	$ECHO "\nSelect range of ENIQ features to be installed using the format [n,n,n-n,n...n]" >> ${_disp_file_}
+	if [ "${_eniq_hname_}" ]; then
+		$ECHO "\tE.G. 1,2,3-8,9,10 (*) means feature already installed for ${_eniq_hname_}" >> ${_disp_file_}
+	else
+		$ECHO "\tE.G. 1,2,3-8,9,10 (*) means feature is already installed" >> ${_disp_file_}
+	fi
+
+	_cnt_=${#VALID_FEATURE_ARRAY[@]}
+	while :; do
+		$CLEAR
+		$CAT ${_disp_file_}
+		if [ "${HNAME_ACT}" == "update" ]; then
+			$ECHO "\nSelect 'None' if you do not wish to add any features"
+		fi
+		
+		$ECHO "\n\nSelect the ENIQ features numbers you wish to"
+		if [ "${_eniq_hname_}" ]; then
+			$ECHO "install & activate for ${_eniq_hname_} using the format [n,n,n-n,n...n]"
+		else
+			$ECHO "install & activate using the format [n,n,n-n,n...n]"
+		fi
+		read _opt_
+
+		# If the User hit nothing and there is a default. that will do
+		if [ ! "${_opt_}" ]; then
+			continue
+		fi
+		
+		if [ "${HNAME_ACT}" == "update" ]; then
+			if [ "${_opt_}" == "None" -o  "${_opt_}" == "none" ]; then
+				break
+			fi
+		fi
+		
+		$RM -f ${TEM_DIR}/feature_output_list1 ${TEM_DIR}/feature_selection
+		_numerror_=0
+
+		for _num_ in `$ECHO ${_opt_} | $SED -e 's| ||g' -e 's|,| |g'`; do
+			$ECHO ${_num_} | $EGREP '-' >> /dev/null 2>&1
+			if [ $? -eq 0 ]; then
+				_start_=`$ECHO ${_num_} | $AWK -F\- '{print $1}'`
+				if [ ! "${_start_}" ]; then
+					continue
+				fi
+				_end_=`$ECHO ${_num_} | $AWK -F\- '{print $2}'`
+				for (( _sel_=${_start_}; _sel_<=${_end_}; _sel_++ )); do
+					$ECHO ${_sel_} | $EGREP '[^0-9]' >> /dev/null 2>&1
+					if [ $? -eq 0 ]; then
+						_numerror_=1
+						break
+					fi
+					if [ ${_sel_} -lt 1 -o ${_sel_} -gt ${_cnt_} ]; then
+						_numerror_=1
+						break
+					fi
+					$ECHO ${_sel_} >> ${TEM_DIR}/feature_selection
+				done
+			else
+				$ECHO ${_num_} | $EGREP '[^0-9]' >> /dev/null 2>&1
+				if [ $? -eq 0 ]; then
+					_numerror_=1
+					break
+				fi
+				if [ ${_num_} -lt 1 -o ${_num_} -gt ${_cnt_} ]; then
+					_numerror_=1
+					break
+				fi
+				$ECHO ${_num_} >> ${TEM_DIR}/feature_selection
+			fi
+		done
+
+		# Okay I should have a valid choice now in the ${TEM_DIR}/feature_selection
+		# file, however it may need to be sorted and to remove duplicate numbers if
+		# the user entered duplicate values. Output deails to output file. I will
+		# output the desc as well as I might show the user
+		for i in `$CAT ${TEM_DIR}/feature_selection | $SORT -u`; do
+			if [ "${_eniq_hname_}" ]; then
+				$ECHO "${VALID_FEATURE_ARRAY[${i}]}::${VALID_DESC_ARRAY[${i}]}::${_eniq_hname_}" >> ${TEM_DIR}/feature_output_list1
+			else
+				$ECHO "${VALID_FEATURE_ARRAY[${i}]}::${VALID_DESC_ARRAY[${i}]}" >> ${TEM_DIR}/feature_output_list1
+			fi
+		done
+
+		if [ ${_numerror_} -eq 0 ]; then
+			break
+		fi
+	done
+
+	if [ -s ${TEM_DIR}/feature_output_list1 ]; then
+		# We need to put the list in order now and remove the duplicates.
+		while read _feat_detail_; do
+			_feat_=`$ECHO ${_feat_detail_}| $AWK -F"::" '{print $1}'`
+			$CAT ${TEM_DIR}/feature_output_list1 | $SORT -u | $EGREP "^${_feat_}::" >> ${TEM_DIR}/feature_output_list 2>/dev/null
+		done < ${_eniq_feat_input_file_}
+	fi
+}
+
+### Function: co_locate_options ###
+#
+# Get the co-locate confirmation menu
+#
+# Arguments:
+#   $1 - Server hostname/IP Address with conflict
+# Return Values:
+#   none
+co_locate_options()
+{
+	while :; do
+		unset _choice_
+		$ECHO "\n${1} already integrated for another service. Are you sure services are co-located in the server ${1}?"
+		$ECHO "\n[1] Yes"
+		$ECHO "[2] No"
+		read _choice_
+		
+		if [ ! "${_choice_}" ]
+		then
+			continue
+		elif [ ${_choice_} == 1 ]
+		then
+			break
+		elif [ ${_choice_} == 2 ]
+		then
+			_err_msg_="${1} already integrated"
+			abort_script "${_err_msg_}"
+		else
+			continue
+		fi
+	done
+}
+### Function: get_server_details ###
+#
+# Get the servers IP and hostname
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+get_server_details()
+{
+	while :; do
+		unset CONN_HOST_NAME _conn_hostname_
+		local _err_=0
+		$CLEAR
+		
+		$ECHO "\nPlease enter the hostname of the server being connected"
+		read _conn_hostname_
+
+		# If the User hit nothing...Loop
+		if [ ! "${_conn_hostname_}" ]; then
+			continue
+		fi
+		
+		$CAT ${CLI_CONF_DIR}/service_names | $EGREP "::${_conn_hostname_}::" >> /dev/null 2>&1
+		if [ $? -eq 0 ]; then
+			_err_=1
+			CONN_HOST_NAME=${_conn_hostname_}
+			break
+		fi
+		
+		CONN_HOST_NAME=${_conn_hostname_}
+		break
+	done
+
+	if [ ${_err_} -eq 1 ]
+	then
+		co_locate_options $CONN_HOST_NAME
+	fi
+
+	while :; do
+		unset CONN_SRV_IP _default_ip_
+		local _err_=0
+		$CLEAR
+		
+		_default_ip_=`$GETENT hosts ${CONN_HOST_NAME} | $AWK '{print $1}' | $HEAD -1`
+		
+		$ECHO "\nPlease enter the IP address of ${CONN_HOST_NAME}"
+		if [ "${_default_ip_}" ]; then
+			$ECHO "Hit enter for [${_default_ip_}]"
+		fi
+		read _conn_server_ip_
+
+		# If the User hit nothing...Loop
+		if [ ! "${_conn_server_ip_}" ]; then
+			if [ "${_default_ip_}" ]; then
+				CONN_SRV_IP=${_default_ip_}
+				break
+			fi
+			continue
+		fi
+		
+		validate_ip ${_conn_server_ip_}
+		if [ $? -ne 0 ]; then
+			continue
+		fi
+		
+		CONN_SRV_IP=${_conn_server_ip_}
+		break
+	done
+
+	$CAT ${CLI_CONF_DIR}/service_names | $EGREP "^${CONN_SRV_IP}::" >> /dev/null 2>&1
+	if [ $? -eq 0 ]; then
+		_err_=1
+	fi
+		
+	if [ "${CONN_TYPE}" == "SOEM" ]; then
+		# Is the IP already listed
+		if [ -s ${REF_NAME_FILE} ]; then
+			$CAT ${REF_NAME_FILE} | $GREP -w ${CONN_SRV_IP} >> /dev/null 2>&1
+			if [ $? -eq 0 ]; then
+				_err_msg_="${CONN_SRV_IP} already referenced in ${REF_NAME_FILE}"
+				abort_script "$_err_msg_"
+			fi
+		fi
+		$CAT /etc/hosts | $EGREP -v "^[[:blank:]]*#" | $EGREP -v "eniq_iptnms_" | $GREP -w ${CONN_SRV_IP} >> /dev/null 2>&1
+		if [ $? -eq 0 ]; then
+			_err_msg_="${CONN_SRV_IP} already reference in the /etc/hosts\nThis value must be unique and not used before"
+			abort_script "$_err_msg_"
+		fi	
+	fi
+
+	if [ ${_err_} -eq 1 ]
+	then
+		co_locate_options $CONN_SRV_IP
+	fi
+
+	if [ "${CONN_TYPE}" == "SOEM" ]; then
+		while :; do
+			unset SUPPORTED_NODE_NUM TOTAL_NODE_NUM ENABLE_TUNNEL
+			
+			local _soem_nodes_supported_=`iniget SOEM_GLOBAL_INFO -f ${SOEM_INI_FILE} -v TOTAL_NODE_NUM`
+			if [ ! "${_soem_nodes_supported_}" ]; then
+				_soem_nodes_supported_=0
+			fi
+			$CLEAR
+			
+			$ECHO "\nPlease enter the number of Soem nodes to be supported for ${CONN_HOST_NAME}\nThere are ${_soem_nodes_supported_} Soem nodes already supported (total max. ${MAX_SOEM_CELL_NUM})"
+			read _supp_node_num_
+		
+			# If the User hit nothing...Loop
+			if [ ! "${_supp_node_num_}" ]; then
+				continue
+			fi
+			
+			$ECHO "${_supp_node_num_}" | $EGREP '[^0-9]' >> /dev/null 2>&1
+			if [ $? -eq 0 ]; then
+				continue
+			fi
+			
+			if [ ${_supp_node_num_} -gt ${MAX_CELL_NUM_PER_SOEM} ]; then
+				CLEAR
+				$ECHO "\nTotal number of nodes exceeds ${MAX_CELL_NUM_PER_SOEM}.\nPress (enter) to input a new value"
+				read _any_
+				continue
+			fi
+			
+			local _new_node_supp_num_=`$EXPR ${_soem_nodes_supported_} + ${_supp_node_num_}`
+			
+			if [ ${_new_node_supp_num_} -le 0 -o ${_new_node_supp_num_} -gt ${MAX_SOEM_CELL_NUM} ]; then
+				_err_msg_="Total number of nodes exceeds ${MAX_SOEM_CELL_NUM}."
+				abort_script "$_err_msg_"			
+			fi
+			
+			SUPPORTED_NODE_NUM=${_supp_node_num_}
+			TOTAL_NODE_NUM=${_new_node_supp_num_}
+			break
+		done
+		
+		# Get the next available alias
+		get_alias_value
+		if [ $? -ne 0 ]; then
+			_err_msg_="Problem encountered when determining alias value for ${CONN_HOST_NAME}"
+			abort_script "${_err_msg_}"
+		fi
+		
+		$CLEAR
+		
+		get_eniq_features_list ${NEXT_ALIAS}
+		
+		
+		$ECHO "\n\nDo you wish to start ssh tunnel between ${NEXT_ALIAS} and ENIQ (Yy/Nn) \n"
+		read ENABLE_TUNNEL
+		
+	fi
+
+	if [ "${CONN_TYPE}" == "IPTNMS" ]; then
+
+		$CAT /etc/hosts | $GREP -v "^[[:blank:]]*#" | $EGREP "eniq_soem_" >> /dev/null 2>&1
+		if [ $? -ne 0 ]; then
+			_err_msg_="SOEM is not yet integrated so IPTNMS integration can not proceed on this server"
+			abort_script "$_err_msg_"
+		fi	
+		
+		# Get the next available alias
+		get_alias_value
+		if [ $? -ne 0 ]; then
+			_err_msg_="Problem encountered when determining alias value for ${CONN_HOST_NAME}"
+			abort_script "${_err_msg_}"
+		fi
+		
+		$CLEAR
+		
+		get_eniq_features_list ${NEXT_ALIAS}
+	fi
+
+	if [ -z "${NO_CONFIRM}" ]; then
+		setup_display_file ${TEM_DIR}/disp_file
+		if [ ! -s ${TEM_DIR}/disp_file ]; then
+			_err_msg_="${TEM_DIR}/disp_file does not exist, or is empty"
+			abort_script "${_err_msg_}"
+		fi
+
+		confirm_user_input ${_disp_file_}
+		
+		# If user hit N/n, exit
+		if [ "${USER_CONF}" == "N" -o "${USER_CONF}" == "n" ]; then
+			clean_up
+			exit 0
+		fi
+	fi
+}
+
+### Function: list_managed_node ###
+#
+#   List the connection(s)
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+list_managed_node()
+{
+	# Have we previous Node defined
+	if [ ! -s ${REF_NAME_FILE} ]; then
+		_err_msg_="No ${CONN_TYPE}'s are currently managed by this ENIQ server"
+		abort_script "$_err_msg_"
+	fi
+
+	$CLEAR
+
+	# Did User specify ENIQ HNAME
+	if [ ! "${HNAME_HOST}" ]; then
+		$CAT ${REF_NAME_FILE}
+	else
+		$CAT ${REF_NAME_FILE} | $GREP -w ${HNAME_HOST} > ${TEM_DIR}/list_disp_file
+		if [ $? -ne 0 ]; then
+			_err_msg_="No details found for ${HNAME_HOST} in ${REF_NAME_FILE}"
+			abort_script "$_err_msg_"
+		fi
+
+		$CAT ${TEM_DIR}/list_disp_file
+	fi
+	$ECHO ""
+}
+
+## Function: read_storage_type ###
+#
+# Determines the storage type of the system
+#
+# Arguments:
+#   none
+# Return Values:
+#   0 : Success
+#	1 : Failure
+read_storage_type()
+{
+	# Read the storage type
+	if [ -s ${ENIQ_CONF_DIR}/${SUNOS_INI} ]; then
+		STORAGE_TYPE=`iniget STOR_TYPE -f ${ENIQ_CONF_DIR}/${SUNOS_INI} -v STORAGE_TYPE`
+	else
+		if [ -s ${ENIQ_CONF_DIR}/san_details ]; then
+			STORAGE_TYPE=`$CAT ${ENIQ_CONF_DIR}/san_details | $EGREP "^STORAGE_TYPE=" | $AWK -F\= '{print $2}'`
+		fi
+	fi
+
+	if [ ! "${STORAGE_TYPE}" ]; then
+		$ECHO "Could not read STORAGE_TYPE param" | $TEE -a ${LOGFILE}
+		return 1
+	fi
+
+	return 0
+}
+
+### Function: resize_nas_fs ###
+#
+# Resize the NAS filesystem
+#
+# Arguments:
+#   none
+# Return Values:
+#   0 : Success
+#  >0 : Failure
+resize_nas_fs()
+{
+	local _new_fs_size_=$1
+	if [ ! "${_new_fs_size_}" ]; then
+		$ECHO "No filesystem size present" | $TEE -a ${LOGFILE}
+		return 1
+	fi
+
+	local _fs_name_=$2
+	if [ ! "${_fs_name_}" ]; then
+		_err_msg_="No filesystem name present" | $TEE -a ${LOGFILE}
+		return 1
+	fi
+
+	$ECHO "\nAttempting to resize ${_fs_name_} filesystem to ${_new_fs_size_}" | $TEE -a ${LOGFILE}
+	/usr/bin/bash ${ENIQ_ADMIN_BIN_DIR}/resize_nas_fs.bsh -a auto -f ${_fs_name_} -s ${_new_fs_size_} -q -N -l ${LOGFILE}
+	return $?
+}
+
+### Function: setup_display_file ###
+#
+# Confirm with user that values entered are correct
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+setup_display_file()
+{
+	# Create a display file for the user
+	local _disp_file_=${1}
+	$RM -rf ${_disp_file_}
+
+	let _field1_=_field1_+20
+	let _field2_=_field2_+20
+
+	_line1_str_="%-${_field1_}s%-${_field2_}s\n"
+	_line2_str_="\n%-${_field1_}s%-${_field2_}s\n"
+
+	$ECHO "Connection Information\n======================" >> ${_disp_file_}
+
+	printf "${_line1_str_}" "Server name:" "${CONN_HOST_NAME}" >> ${_disp_file_}
+	printf "${_line1_str_}" "IP Address:" "${CONN_SRV_IP}" >> ${_disp_file_}
+	printf "${_line1_str_}" "ENIQ ${CONN_TYPE} Alias:"   "${NEXT_ALIAS}" >> ${_disp_file_}
+	if [ "${CONN_TYPE}" != "IPTNMS" ]; then
+	printf "${_line1_str_}" "Num. of ${CONN_TYPE} nodes:" "${SUPPORTED_NODE_NUM}" >> ${_disp_file_}
+	printf "${_line2_str_}" "Total ${CONN_TYPE} nodes:"   "${TOTAL_NODE_NUM}" >> ${_disp_file_}
+	fi
+	if [ "${CONN_TYPE}" == "SOEM" ]; then
+		printf "${_line2_str_}" "Enable Tunnel:"   "${ENABLE_TUNNEL}" >> ${_disp_file_}
+	fi
+
+	_update_=0
+	if [ -s ${TEM_DIR}/feature_output_list ]; then
+		$ECHO "\nENIQ Feature List" >> ${_disp_file_}
+		$ECHO "-----------------" >> ${_disp_file_}
+		$CAT ${TEM_DIR}/feature_output_list | $AWK -F"::" '{print $2}' >> ${_disp_file_}
+			if [ "${ACTION}" == "update" ]; then
+				if [ "${NEW_SRV_IP}" != "${OLD_SRV_IP}" ]; then
+					$ECHO "Alias IP Address : \t$NEW_SRV_IP" >> ${_disp_file_}
+				fi
+				$ECHO "Alias :\t\t\t${HNAME_HOST}\n" >> ${_disp_file_}
+				$ECHO "\n\nDo you wish to continue to update the system" >> ${_disp_file_}
+				$ECHO "with the features above (Yy/Nn)\n" >> ${_disp_file_}
+				_update_=1  		
+			else
+				$ECHO "\nIs the information above correct? (Yy/Nn)" >> ${_disp_file_}
+				_update_=1
+			fi
+	else
+		$ECHO "\n\nDo you wish to continue to update the ${CONN_TYPE} Server details (Yy/Nn)\n" >> ${_disp_file_}
+	fi
+
+	# If there is nothing to upgrade then delete the disp file
+	if [ ${_update_} -eq 0 ]; then
+		$RM -f ${TEM_DIR}/disp_file
+	fi
+}
+
+### Function: setup_env ###
+#
+# Setup up path environment etc
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+setup_env()
+{
+	if [ ! "${ENIQ_BASE_DIR}" ]; then
+		ENIQ_BASE_DIR=${ENIQ_ROOT_DIR}
+	fi
+
+	CLI_CONF_DIR=${ENIQ_BASE_DIR}/sw/conf
+
+	# Connectd SW
+	ENIQ_CONNECTD_DIR=${ENIQ_BASE_DIR}/connectd
+	CONNECTD_SW=${ENIQ_CONNECTD_DIR}/bin
+	CONNECTD_MOUNT_INFO=${ENIQ_CONNECTD_DIR}/mount_info
+
+	# Installation Dir
+	ENIQ_INSTALLATION_DIR=${ENIQ_BASE_DIR}/installation
+	ENIQ_CONF_DIR=${ENIQ_INSTALLATION_DIR}/config
+	ENIQ_CORE_DIR=${ENIQ_INSTALLATION_DIR}/core_install
+
+	# Admin Dir
+	ENIQ_ADMIN_DIR=${ENIQ_BASE_DIR}/admin
+	ENIQ_ADMIN_BIN_DIR=${ENIQ_ADMIN_DIR}/bin
+
+	# File containing the type of Node installation. Eg. events or statistics
+	INST_TYPE_FILE=${ENIQ_CONF_DIR}/ericsson_use_config
+	if [ ! -s "${INST_TYPE_FILE}" ]; then
+		_err_msg_="ENIQ install type not defined in ${INST_TYPE_FILE}"
+		abort_script "${_err_msg_}"
+	fi
+	# Read the installation type - should be "events" or "stats"
+	INSTALL_TYPE=`$CAT ${INST_TYPE_FILE} | $AWK -F\= '{print $2}'`
+
+	# Templates Directory
+	ENIQ_TEMPL_DIR="${ENIQ_CORE_DIR}/templates/${INSTALL_TYPE}"
+
+	# Server Type
+	CURR_SERVER_TYPE=`$CAT $ENIQ_CONF_DIR/installed_server_type | $EGREP -v  '^[[:blank:]]*#' | $SED -e 's/ //g'`
+	if [ ! "${CURR_SERVER_TYPE}" ]; then
+		_err_msg_="Could not determine which server type this is"
+		abort_script "${_err_msg_}"
+	fi
+
+	# Sentinel Stuff
+	ENIQ_SENTINEL_DIR=${ENIQ_BASE_DIR}/sentinel
+	ENIQ_SENTINEL_BIN_DIR=${ENIQ_SENTINEL_DIR}/bin
+	ENIQ_SENTINEL_ENV=${ENIQ_SENTINEL_DIR}/etc/sentinel.env
+
+	if [ -x ${ENIQ_CORE_DIR}/lib/iniadd.pl ]; then
+		INIADD=${ENIQ_CORE_DIR}/lib/iniadd.pl
+	else
+		_err_msg_="${ENIQ_CORE_DIR}/lib/iniadd.pl is not found, or is not executable"
+		abort_script "${_err_msg_}" 
+	fi
+
+	# Source the common functions
+	if [ -s ${ENIQ_ADMIN_DIR}/lib/common_functions.lib ]; then
+		. ${ENIQ_ADMIN_DIR}/lib/common_functions.lib
+	else
+		_err_msg_="File ${ENIQ_ADMIN_DIR}/lib/common_functions.lib not found"
+		abort_script "${_err_msg_}"
+	fi
+
+	#Fetching IP Type from IPMP_INI file.
+    check_ip_type
+
+    if [ ! "${_ip_type_}" ]; then
+       _err_msg_="Could not read parameter _IP_TYPE_ from file ${ENIQ_CONF_DIR}/${IPMP_INI}"
+       abort_script "$_err_msg_"
+    fi
+	
+	SYSUSER=`iniget ENIQ_INSTALL_CONFIG -f ${ENIQ_CONF_DIR}/${SUNOS_INI} -v ENIQ_SYSUSER`
+	if [ ! "${SYSUSER}" ]; then
+		_err_msg_="Could not read parameter ENIQ_SYSUSER from ini file - {ENIQ_CONF_DIR}/${SUNOS_INI}"
+		abort_script "${_err_msg_}"
+	fi
+
+	SYSGRP=`$ID ${SYSUSER} | $AWK '{print $2}' | $AWK -F\( '{print $2}' | $AWK -F\) '{print $1}'`
+	if [ ! "${SYSGRP}" ]; then
+		_err_msg_="Could not determine group id of ${SYSUSER}"
+		abort_script "${_err_msg_}"
+	fi
+}
+
+### Function: update_ini_file ###
+#
+# Update the SunOS.ini file with the new directories
+#
+# Arguments:
+#   $1 : INI file to update
+# Return Values:
+#   0 : Success
+#	1 : Failure
+update_ini_file()
+{
+	local _ini_file_upd_=$1
+	local _connection_type_var_=$2
+	if [ ! -s ${_ini_file_upd_} -o ! ${_connection_type_var_} ]; then
+		$ECHO "No file containing update details found" | $TEE -a ${LOGFILE}
+		return 1
+	fi	
+
+	_curr_num_=`iniget ${_connection_type_var_} -f ${_ini_file_upd_} | $TAIL -1 | $AWK -F\_ '{print $NF}'` 
+	if [ ! "${_curr_num_}" ]; then
+		_curr_num_=0
+	fi
+	_nxt_num_=`$EXPR ${_curr_num_} + 1`
+
+	$RM -f ${TEM_DIR}/conn_ini.$$ ${TEM_DIR}/ins_det
+
+	if [ "${_connection_type_var_}" == "SOEM" ]; then
+		$ECHO "[${_connection_type_var_}_INFO_${_nxt_num_}]
+	Hostname=${CONN_HOST_NAME}
+	IP_Address=${CONN_SRV_IP}
+	${_connection_type_var_}_Alias=${NEXT_ALIAS}
+	Num_${_connection_type_var_}_Nodes=${SUPPORTED_NODE_NUM}" > ${TEM_DIR}/ins_det
+	fi
+
+	$INIADD -g ${_connection_type_var_} -p ${_connection_type_var_}_INFO_${_nxt_num_} -i ${_ini_file_upd_} -d ${TEM_DIR}/ins_det -o ${TEM_DIR}/conn_ini.$$
+	if [ $? -ne 0 ]; then
+		$ECHO "Error adding ${CONN_HOST_NAME} directory to ${_ini_file_upd_}" | $TEE -a ${LOGFILE}
+		return 1 
+	fi
+
+	$CP ${TEM_DIR}/conn_ini.$$ ${_ini_file_upd_}
+	if [ $? -ne 0 ]; then
+		$ECHO "Error copying ${TEM_DIR}/conn_ini.$$ to ${_ini_file_upd_}" | $TEE -a ${LOGFILE}
+		return 1 
+	fi	
+
+	return 0	
+}
+### Function: update_iptnms_files ###
+#
+# Update all IPTNMS related files
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+update_iptnms_files()
+{
+	if [ -s ${TEM_DIR}/feature_output_list ]; then
+		add_features_to_server "${TEM_DIR}/feature_output_list" ${NEXT_ALIAS}
+	fi
+
+	# Update the service_names file
+	$ECHO "\nAdding ${NEXT_ALIAS} to ${CLI_CONF_DIR}/service_names" | $TEE -a ${LOGFILE}
+	update_service_file ${CLI_CONF_DIR}/service_names ${CONN_SRV_IP} ${CONN_HOST_NAME} ${NEXT_ALIAS} "NULL_GRP"
+	if [ $? -ne 0 ]; then
+		_err_msg_="Failed to update ${CLI_CONF_DIR}/service_names with ${NEXT_ALIAS} details"
+		abort_script "${_err_msg_}"
+	fi
+}
+
+### Function: update_managed_node ###
+#
+#   List the Node(s)
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+update_managed_node()
+{
+	# Did User specify ENIQ HNAME and BASE_SW_DIR
+	if [ ! "${BASE_SW_DIR}" ]; then
+		usage_msg
+		abort_script
+	fi
+
+	unset _host_exists_
+	if [ -s ${REF_NAME_FILE} ]; then
+		if [ ! "${HNAME_HOST}" ]; then
+			usage_msg
+			abort_script
+		fi
+
+		$CAT ${REF_NAME_FILE} | $GREP -w ${HNAME_HOST} >> /dev/null 2>&1
+		if [ $? -ne 0 ]; then
+			_err_msg_="No details found for ${HNAME_HOST} in ${REF_NAME_FILE}"
+			abort_script "$_err_msg_"
+		fi
+		_host_exists_=1
+	else
+		_host_exists_=0
+	fi
+
+	if [ "${INSTALL_TYPE}" == "stats" ]; then
+		_host_exists_=1
+	fi
+
+	if [ ${_host_exists_} -eq 1 ]; then
+		add_activate_with_host ${HNAME_HOST} 
+		$ECHO "\nSuccessfully added selected features for ${HNAME_HOST}\n" | $TEE -a ${LOGFILE}
+	else
+		add_activate_without_host
+		$ECHO "\nSuccessfully added selected features\n" | $TEE -a ${LOGFILE}
+	fi
+}
+
+### Function: update_ref_file ###
+#
+# Update the oss_ref_name_file file 
+# with the new directories
+#
+# Arguments:
+#   $1 : File to update
+#	$2 : Alias
+#	$3 : IP address
+# Return Values:
+#   0 : Success
+#	1 : Failure
+update_ref_file()
+{
+	local _oss_ref_file_=$1	
+	local _alias_=$2
+	local _ip_addr_=$3
+
+	if [ -f ${_oss_ref_file_} ]; then 
+		$CAT ${_oss_ref_file_} | $EGREP -v "${_alias_}" > ${TEM_DIR}/oss_ref_updated_file
+		if [ $? -ne 0 ]; then
+			$ECHO "Could not remove existing entry for ${_alias_} from ${_oss_ref_file_}" | $TEE -a ${LOGFILE}
+			return 1 
+		fi
+	fi 
+
+	$ECHO "Adding \"${_alias_} ${_ip_addr_}\" to ${_oss_ref_file_}" | $TEE -a ${LOGFILE}
+	$ECHO "${_alias_} ${_ip_addr_}" >> ${TEM_DIR}/oss_ref_updated_file
+	if [ $? -ne 0 ]; then
+		$ECHO "Could not update ${_oss_ref_file_} with \"${_alias_}\" and  \"${_ip_addr_}\"" | $TEE -a ${LOGFILE}
+		return 1 
+	fi	
+
+	$CP ${TEM_DIR}/oss_ref_updated_file ${_oss_ref_file_}
+	if [ $? -ne 0 ]; then
+		$ECHO "Could not copy ${TEM_DIR}/oss_ref_updated_file to ${_oss_ref_file_}" | $TEE -a ${LOGFILE}
+		return 1 
+	fi
+
+	return 0	
+}
+
+### Function: update_soem_files ###
+#
+# Update all SOEM related files
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+update_soem_files()
+{
+	$CAT ${SOEM_INI_FILE} | $SED -e "s|<CHANGE><ENIQ_BASE_DIR>|${ENIQ_BASE_DIR}|g" > ${TEM_DIR}/${SOEM_INI}
+	if [ ! -s ${TEM_DIR}/${SOEM_INI} ]; then
+		_err_msg_="Could not create a tempory copy of ${SOEM_INI} file"
+		abort_script "${_err_msg_}"
+	fi
+
+	if [ -s ${TEM_DIR}/feature_output_list ]; then
+		add_features_to_server "${TEM_DIR}/feature_output_list" ${NEXT_ALIAS}
+	fi
+
+	# Set the total number of soem nodes in the ini file
+	iniset SOEM_GLOBAL_INFO -f ${TEM_DIR}/${SOEM_INI} TOTAL_NODE_NUM=${TOTAL_NODE_NUM}
+	if [ $? -ne 0 ]; then
+		_err_msg_="Could not set TOTAL_NODE_NUM to ${_new_tot_cell_num_} in ${SOEM_INI}"
+		abort_script "${_err_msg_}"
+	fi
+
+	# Update the SOEM ini file
+	update_ini_file ${TEM_DIR}/${SOEM_INI} ${CONN_TYPE}
+	$ECHO "Updating information in ${CLI_CONF_DIR}/${SOEM_INI}" | $TEE -a ${LOGFILE}
+	$CP ${TEM_DIR}/${SOEM_INI} ${CLI_CONF_DIR}/${SOEM_INI} 
+	if [ $? -ne 0 ]; then
+		_err_msg_="Could not copy ${TEM_DIR}/${SOEM_INI} to ${CLI_CONF_DIR}/${SOEM_INI}"
+		abort_script "${_err_msg_}"
+	fi
+	# Update the service_names file
+	$ECHO "\nAdding ${NEXT_ALIAS} to ${CLI_CONF_DIR}/service_names" | $TEE -a ${LOGFILE}
+	update_service_file ${CLI_CONF_DIR}/service_names ${CONN_SRV_IP} ${CONN_HOST_NAME} ${NEXT_ALIAS} "NULL_GRP"
+	if [ $? -ne 0 ]; then
+		_err_msg_="Failed to update ${CLI_CONF_DIR}/service_names with ${NEXT_ALIAS} details"
+		abort_script "${_err_msg_}"
+	fi
+
+	# Update the .soem_ref_name_file
+	update_ref_file ${CLI_CONF_DIR}/${SOEM_REF_NAME_FILE} ${NEXT_ALIAS} ${CONN_SRV_IP}
+	if [ $? -ne 0 ]; then
+		_err_msg_="Failed to update ${CLI_CONF_DIR}/${SOEM_REF_NAME_FILE} with ${NEXT_ALIAS} details"
+		abort_script "${_err_msg_}"
+	fi
+}
+
+### Function: usage_msg ###
+#
+#   Print out the usage message
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+usage_msg() 
+{
+	$CLEAR
+	$ECHO "
+	Usage: `$BASENAME $0` -a <add|expand|list|update> -d <path_to_eniq_base_sw> [ -b <eniq_base_dir> ] 
+							[ -l <path_to_logfile> ] [ -h <host name> ]
+						  
+	options:
+
+	-a  : 	Action. Must be one of the following:
+				  add     --> add connections
+				  list    --> List currently added connections.
+							  only supported for soem connections.
+				  update  --> Update connections
+							  only supported for soem connections.
+				  expand  --> expand connections
+				  
+	-b  : 	Optional parameter specifying the full path to where the ENIQ
+			BASEDIR directory is (eg. ${ENIQ_ROOT_DIR}). If not specified, then the 
+			script will assume the base directory is ${ENIQ_ROOT_DIR}
+			
+	-d  : 	Parameter specifying the full path to the directory
+			containing the ENIQ BASE SW directory structure. Under this
+			directory,this script will locate a file that contains a
+			list of features available for installation/activation.
+			EG. <path_base_dir_sw>/eniq_techpacks/feature_descriptions		
+
+	-l  : 	Optional parameter specifying the full path to a logfile.
+			If not specified, then the script will create its own logfile
+			in ${ENIQ_ROOT_DIR}/local_logs/connectd
+			
+	-h  : 	Parameter specifying the ENIQ HNAME. This is only required if an Node
+			has already been added to the ENIQ server
+	"
+}
+
+# ********************************************************************
+#
+#   Main body of program
+#
+# ********************************************************************
+#
+RUN_TIME=`$DATE '+%Y-%b-%d_%H.%M.%S'`
+
+# Determine absolute path to software
+get_absolute_path
+
+# Check that the effective id of the user is root
+check_id $DEFAULT_USER
+
+while getopts ":a:b:d:l:h:N" arg; do
+  case $arg in
+  	a) ACTION="$OPTARG" 
+       ;;
+    b) ENIQ_BASE_DIR="$OPTARG" 
+       ;;
+    d) BASE_SW_DIR="$OPTARG"
+       ;;   
+    l) LOGFILE="$OPTARG"
+       ;;
+    h) HNAME_HOST="$OPTARG"
+       ;;
+    N) NO_CONFIRM="YES"
+       ;;
+   \?) usage_msg
+       exit 1
+       ;;
+  esac
+done
+shift `expr $OPTIND - 1`
+
+# Setup up path environment etc
+setup_env
+
+if [ ! "${LOGFILE}" ]; then
+    LOGFILE=${ENIQ_BASE_DIR}/local_logs/connectd/manage_connections.log
+fi	
+  
+# Check/Create Logfile
+chk_create_logfile
+
+$ECHO "\n\n-------------------------------------------------------" >> ${LOGFILE}
+$ECHO "`$DATE '+%Y-%b-%d_%H.%M.%S'` - Beginning to setup connections with Eniq ${INSTALL_TYPE}" >> ${LOGFILE}
+$ECHO "-------------------------------------------------------" >> ${LOGFILE}
+
+# Get the required info for the connection
+get_connection_info
+if [ $? -ne 0 ]; then
+    _err_msg_="Problem encountered when determining which connection is required"
+    abort_script "${_err_msg_}"
+fi
+
+# Check Input Params
+check_params
+if [ $? -ne 0 ]; then
+    usage_msg
+	exit 1
+fi
+
+# Only continue if we're on the correct server type
+if [ "${INSTALL_TYPE}" == "stats" ]; then
+	$ECHO "\nScript has permissions to run on this stats server type" | $TEE -a ${LOGFILE}
+else
+	$ECHO "\nThis script should not be run on this server type" | $TEE -a ${LOGFILE}
+	exit 0
+fi
+
+# Check all required files exist
+check_files_scripts
+if [ $? -ne 0 ]; then
+    _err_msg_="Problem encountered checking for required files and scripts"
+    abort_script "${_err_msg_}"
+fi
+
+# Create a temporary Directory
+TEM_DIR=/tmp/manage_connections_${CONN_TYPE}.$$.$$
+$RM -rf ${TEM_DIR}
+$MKDIR -p ${TEM_DIR}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not create directory ${TEM_DIR}"
+    abort_script "${_err_msg_}"
+fi
+
+# Find out what type of storage we're using
+read_storage_type
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not determine the servers storage type"
+    abort_script "${_err_msg_}"
+fi
+
+if [ "${STORAGE_TYPE}" != "raw" -a "${ACTION}" == "expand" ]; then
+	_err_msg_="Expansion is only possible if system storage is \"raw\". Exiting..."
+    abort_script "${_err_msg_}"
+fi
+
+# Perform Required Action
+case ${ACTION} in
+    add)    add_managed_node
+            ;;
+    list)   list_managed_node
+            ;;
+    update) update_managed_node
+            ;;
+    expand) expand_managed_node
+            ;;
+    \?)     usage_msg
+            exit 1
+            ;;
+esac
+
+clean_up
+
+exit 0

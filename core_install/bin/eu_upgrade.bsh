@@ -1,0 +1,1109 @@
+#!/bin/bash
+# ********************************************************************
+# Ericsson Radio Systems AB                                     SCRIPT
+# ********************************************************************
+#
+#
+# (c) Ericsson Radio Systems AB 2012 - All rights reserved.
+#
+# The copyright to the computer program(s) herein is the property
+# of Ericsson Radio Systems AB, Sweden. The programs may be used
+# and/or copied only with the written permission from Ericsson Radio
+# Systems AB or in accordance with the terms and conditions stipulated
+# in the agreement/contract under which the program(s) have been
+# supplied.
+#
+# ********************************************************************
+# Name    : eu_upgrade.bsh
+# Date    : 19/10/2012
+# Revision: B.1
+# Purpose : Script used to automatically upgrade techpacks,
+#			platform modules, business objects, pre & post
+# 			and core install scripts found within an EU.
+#
+# Usage   : eu_upgrade.bsh
+#
+# ********************************************************************
+#
+#   Command Section
+#
+# ********************************************************************
+AWK=/usr/bin/awk
+BASENAME=/usr/bin/basename
+BASH=/usr/bin/bash
+BC=/usr/bin/bc
+BOOTADM=/usr/sbin/bootadm
+CAT=/usr/bin/cat
+CHMOD=/usr/bin/chmod
+CHOWN=/usr/bin/chown
+CLEAR=/usr/bin/clear
+CMP=/usr/bin/cmp
+CP=/usr/bin/cp
+CPIO=/usr/bin/cpio
+DATE=/usr/bin/date
+DIRNAME=/usr/bin/dirname
+DLADM=/usr/sbin/dladm
+DOMAINNAME=/usr/bin/domainname
+DTCONFIG=/usr/dt/bin/dtconfig
+DUMPADM=/usr/sbin/dumpadm
+ECHO=/usr/bin/echo
+EGREP=/usr/bin/egrep
+EJECT=/usr/bin/eject
+ENV=/usr/bin/env
+EXPR=/usr/bin/expr
+FIND=/usr/bin/find
+FLARCREATE=/usr/sbin/flarcreate
+FORMAT=/usr/sbin/format
+FUSER=/usr/sbin/fuser
+GEGREP=/usr/sfw/bin/gegrep
+GETENT=/usr/bin/getent
+GETTEXT=/usr/bin/gettext
+GREP=/usr/bin/grep
+GROUPADD=/usr/sbin/groupadd
+GTAR=/usr/sfw/bin/gtar
+GUNZIP=/usr/bin/gunzip
+GZCAT=/usr/bin/gzcat
+GZIP=/usr/bin/gzip
+HEAD=/usr/bin/head
+MYHOSTNAME=/usr/bin/hostname
+ID=/usr/bin/id
+IFCONFIG=/usr/sbin/ifconfig
+INIT=/usr/sbin/init
+LN=/usr/bin/ln
+LS=/usr/bin/ls
+MKDIR=/usr/bin/mkdir
+MORE=/usr/bin/more
+MOUNT=/usr/sbin/mount
+MV=/usr/bin/mv
+NAWK=/usr/bin/nawk
+NSLOOKUP=/usr/sbin/nslookup
+PGREP=/usr/bin/pgrep
+PING=/usr/sbin/ping
+PKGADD=/usr/sbin/pkgadd
+PKGINFO=/usr/bin/pkginfo
+PKGRM=/usr/sbin/pkgrm
+PRTCONF=/usr/sbin/prtconf
+PSRINFO=/usr/sbin/psrinfo
+PWD=/usr/bin/pwd
+REBOOT=/usr/sbin/reboot
+RM=/usr/bin/rm
+RCP=/usr/bin/rcp
+RSH=/usr/bin/rsh
+SED=/usr/bin/sed
+SEVEN_Z=/usr/bin/7z
+SLEEP=/usr/bin/sleep
+SORT=/usr/bin/sort
+STMSBOOT=/usr/sbin/stmsboot
+SU=/usr/bin/su
+SVCADM=/usr/sbin/svcadm
+SVCCFG=/usr/sbin/svccfg
+SVCS=/usr/bin/svcs
+SWAP=/usr/sbin/swap
+SYNC=/usr/sbin/sync
+TAIL=/usr/bin/tail
+TAR=/usr/sbin/tar
+TEE=/usr/bin/tee
+TOUCH=/usr/bin/touch
+TPUT=/usr/bin/tput
+TR=/usr/bin/tr
+UADMIN=/usr/sbin/uadmin
+UMOUNT=/usr/sbin/umount
+UNAME=/usr/bin/uname
+UNIQ=/usr/bin/uniq
+USERADD=/usr/sbin/useradd
+VOLD=/usr/sbin/vold
+WC=/usr/bin/wc
+YES=/usr/bin/yes
+ZFS=/usr/sbin/zfs
+ZPOOL=/usr/sbin/zpool
+
+# ********************************************************************
+#
+#       Configuration Section
+#
+# ********************************************************************
+
+# Default user
+DEFAULT_USER=root
+
+# tmp directory
+TMP=/tmp/eu_upgrade
+
+# Set version
+VERSION=version
+
+# Set cfg filename
+NMI_CFG=eu_upgrade.cfg
+
+# Set NIQ.rc file
+ENIQ_ENV=niq.rc
+
+# Set SunOS.ini file
+SUNOS_INI=SunOS.ini
+
+# Variables used in ENIQ version
+VERSION_DIR="version"
+ENIQ_STATUS="eniq_status"
+
+# Set ini file
+ENIQ_INI=niq.ini
+
+# Set SunOS.ini
+SUNOS_INI=SunOS.ini
+
+
+# ********************************************************************
+#
+#   Functions
+#
+# ********************************************************************
+### Function: abort_script ###
+#
+#   This will is called if the script is aborted thru an error
+#   signal sent by the kernel such as CTRL-C or if a serious
+#   error is encountered during runtime
+#
+# Arguments:
+#       $1 - Error message from part of program (Not always used)
+# Return Values:
+#       none
+abort_script()
+{
+_err_time_=`$DATE '+%Y-%b-%d_%H.%M.%S'`
+
+if [ "$1" ]; then
+    _err_msg_="${_err_time_} - $1"
+else
+    _err_msg_="${_err_time_} - ERROR : Script aborted...\n"
+fi
+
+if [ "${LOGFILE}" ]; then
+    $ECHO "\nERROR : $_err_msg_\n" | $TEE -a ${LOGFILE}
+else
+    $ECHO "\nERROR : $_err_msg_\n"
+fi
+cd $SCRIPTHOME
+$RM -rf ${TMP}
+exit 1
+}
+
+### Function: activate_interface ###
+#
+# 	Activate Interfaces
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+activate_interface()
+{
+# Function only to be run on stats/events coordinator
+if [ "${CURR_SERVER_TYPE}" == "eniq_stats" -o "${CURR_SERVER_TYPE}" == "stats_coordinator" -o "${CURR_SERVER_TYPE}" == "eniq_coordinator" -o "${CURR_SERVER_TYPE}" == "son_coordinator" -o "${CURR_SERVER_TYPE}" == "eniq_events" ]; then
+	insert_header_footer head "Entering activate interface stage " ${LOGFILE}
+	if [ ! -s ${ENIQ_INSTALLER}/activate_interface  ]; then
+	 	_err_msg_="Cannot locate ${ENIQ_INSTALLER}/activate_interface"
+		abort_script "$_err_msg_"
+	fi
+	
+	# Activate Interfaces
+	$ECHO "Activating interfaces. Please note this may take some time..." | $TEE -a ${LOGFILE}
+	$SU - ${SYSUSER} -c "cd ${ENIQ_INSTALLER}; ./${ACTIVATE_INTERFACE} -t ALL " >> /dev/null 2>&1
+	if [ $? -ne 0 ]; then
+		_err_msg_="Unable to run ${ENIQ_INSTALLER}; ./${ACTIVATE_INTERFACE} -t ALL"
+		abort_script "$_err_msg_"
+	fi
+	
+	insert_header_footer foot "Successfully activated all interfaces" ${LOGFILE}
+fi
+}
+
+### Function: check_bo_content ###
+#
+# 	Check for Business Object Content. Once located,
+#   Move to tmp location extract & move again
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+check_bo_content()
+{
+# Function only to be run on stats/events coordinator
+if [ "${CURR_SERVER_TYPE}" == "eniq_stats" -o "${CURR_SERVER_TYPE}" == "stats_coordinator" -o "${CURR_SERVER_TYPE}" == "eniq_coordinator" -o "${CURR_SERVER_TYPE}" == "son_coordinator" -o "${CURR_SERVER_TYPE}" == "eniq_events" ]; then
+	insert_header_footer head "Beginning Business Object Stage" ${LOGFILE}
+	# Check if there's BO scripts included in EU
+	$LS ${ENIQ_SOURCE_DIR}/${TP_DIR}/BO_*zip >> /dev/null 2>&1
+	if [ $? -ne 0 ]; then
+	    $ECHO "No Business Object files found in ${ENIQ_SOURCE_DIR}/${TP_DIR} that require upgrade."
+	    $ECHO "No Business Object Content Found" | $TEE -a ${LOGFILE}
+	else
+		TMP_BO_MODULE=${TMP}/BO_module/bo_tmp_dir.$$
+		$MKDIR -p ${TMP_BO_MODULE}
+
+		# Moving BO files to tmp location
+		$CP -R ${ENIQ_SOURCE_DIR}/${TP_DIR}/BO_*zip ${TMP_BO_MODULE}
+		if [ $? -ne 0 ]; then
+		    _err_msg_="Problem copying Business Object Content to ${TMP_BO_MODULE}"
+		    abort_script "$_err_msg_"
+		fi
+
+		# Create new directory where BO's will be stored
+		if [ ! -d ${ENIQ_INSTALLER}/boreports ]; then
+			$SU - ${SYSUSER} -c "$MKDIR ${ENIQ_INSTALLER}/boreports >> /dev/null 2>&1"
+			if [ $? -ne 0 ]; then
+			    _err_msg_="Unable to create ${ENIQ_INSTALLER}/boreports"
+			    abort_script "$_err_msg_"
+			fi
+		fi
+
+		# Decrypt BO
+		if [ -f ${ENIQ_INSTALLER}/extract_report_packages.bsh ]; then
+			$ECHO "Decrypting Business Object Content" | $TEE -a ${LOGFILE}
+			$SU - ${SYSUSER} -c "cd ${ENIQ_INSTALLER}; bash ${ENIQ_INSTALLER}/extract_report_packages.bsh ${TMP_BO_MODULE}/"
+			if [ $? -ne 0 ]; then
+			    _err_msg_="Problem occurred whilst executing ${ENIQ_INSTALLER}/extract_report_packages.bsh"
+			    abort_script "$_err_msg_"
+			fi
+		else
+		    _err_msg_="Not able to locate ${ENIQ_INSTALLER}/extract_report_packages.bsh"
+		    abort_script "$_err_msg_"
+		fi
+
+		# Move decrypted BO
+		if [ ! -d ${ENIQ_INSTALLER}/bouniverses ]; then
+			$MKDIR ${ENIQ_INSTALLER}/bouniverses
+			if [ $? -ne 0 ]; then
+			    _err_msg_="Unable to create ${ENIQ_INSTALLER}/bouniverses"
+			    abort_script "$_err_msg_"
+			fi
+		fi
+		$ECHO "Moving Business Object Content" | $TEE -a ${LOGFILE}
+		$CP -R ${ENIQ_INSTALLER}/boreports/BO_* ${ENIQ_INSTALLER}/bouniverses
+		if [ $? -ne 0 ]; then
+		    _err_msg_="Unable to copy ${ENIQ_INSTALLER}/boreports/BO_* to ${ENIQ_INSTALLER}/bouniverses"
+		    abort_script "$_err_msg_"
+		fi
+		$RM -rf ${ENIQ_INSTALLER}/boreports >> /dev/null 2>&1
+	fi
+	
+	insert_header_footer foot "Successfully Completed Business Object Stage" ${LOGFILE}
+fi
+}
+
+### Function: check_nmi_content ###
+#
+# 	check nmi content for the cfg file
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+check_nmi_content()
+{
+insert_header_footer head "Checking NMI Content" ${LOGFILE}
+# First we need to see if there's any nmi content - if not, bomb out
+if [  ! "$($LS -A ${ENIQ_SOURCE_DIR}/${NMI_DIR}/ | ${EGREP} -i tar.gz)" ]; then
+	$ECHO "No NMI Content found. Continuing ..."
+else
+	# Ensure there's only one gz file
+	if [[ ! "$($LS -A ${ENIQ_SOURCE_DIR}/${NMI_DIR}/ | ${EGREP} -i tar.gz | ${WC} -l)" -eq "1" ]]; then
+		 _err_msg_="There appears to be more then one tar.gz file within ${ENIQ_SOURCE_DIR}/${NMI_DIR}/"
+		 abort_script "$_err_msg_"
+	fi
+	$MKDIR $TMP/NMI_CONTENT
+	if [ $? -ne 0 ]; then
+	    _err_msg_="Unable to create tmp directory"
+	     abort_script "$_err_msg_"
+	fi
+	$CP -R ${ENIQ_SOURCE_DIR}/${NMI_DIR}/ ${TMP}/NMI_CONTENT
+	if [ $? -ne 0 ]; then
+	    _err_msg_="Unable to copy nmi contents to tmp directory"
+	     abort_script "$_err_msg_"
+	fi
+
+	# change dir & unzip
+	cd ${TMP}/NMI_CONTENT
+	$GUNZIP -c ${TMP}/NMI_CONTENT/install/*tar.gz | ${TAR} -xf -
+	if [ $? -ne 0 ]; then
+	    _err_msg_="Unable to uncompress tar file"
+	     abort_script "$_err_msg_"
+	fi
+
+	# change dir & unzip
+	cd ${TMP}/NMI_CONTENT/install
+	if [ $? -ne 0 ]; then
+	    _err_msg_="Unable to change directory to: ${TMP}/NMI_CONTENT/install"
+	     abort_script "$_err_msg_"
+	fi
+
+	${GUNZIP} -c ${TMP}/NMI_CONTENT/install/eniq_core_inst_sw_bundle.tar.gz | ${TAR} -xf -
+	if [ $? -ne 0 ]; then
+	    _err_msg_="Unable to uncompress tar file"
+	     abort_script "$_err_msg_"
+	fi
+
+	# set variable
+	NMI_PATH=${TMP}/NMI_CONTENT/install/core_install
+	# Check if the ENIQ_SOURCE_DIR contains file.cfg as its basename
+	$LS ${NMI_PATH}/etc/* | ${EGREP} -i "${NMI_CFG}"  >> /dev/null 2>&1
+	if [ $? -ne 0 ]; then
+	    _err_msg_="The path: ${NMI_FULL_PATH}/etc/ is missing the required cfg file."
+	     abort_script "$_err_msg_"
+	fi
+
+	# Check if cfg file exists
+	if [ ! -s ${NMI_PATH}/etc/${NMI_CFG} ]; then
+		_err_msg_="CFG file doesn't exist in ${ENIQ_SOURCE_DIR}."
+		abort_script "$_err_msg_"
+	fi
+	while read line ; do
+		# Ignore comments in cfg file
+		if [[ $line =~ ^#.* ]]; then
+			continue
+		fi
+		# Check if the line is empty
+		if [[ $line == "" ]]; then
+			return 1
+		fi
+		# Est each element of the cfg file
+		_script_=`$ECHO $line | $NAWK -F"::" '{print $1}'`
+		_source_=`$ECHO $line | $NAWK -F"::" '{print $2}'`
+		_destination_=`$ECHO $line | $NAWK -F"::" '{print $3}'`
+		if [ -z ${_script_} ] ; then
+			_err_msg_="Fault reading parameter ${_script_} from ${NMI_PATH}/etc/${NMI_CFG}"
+	    	abort_script "$_err_msg_"
+		fi
+
+		if [ -z ${_source_} ] ; then
+			_err_msg_="Fault reading parameter ${_source_} from ${NMI_PATH}/etc/${NMI_CFG}"
+	    	abort_script "$_err_msg_"
+		fi
+
+		if [ -z ${_destination_} ] ; then
+			_err_msg_="Fault reading parameter ${_destination_} from ${NMI_PATH}/etc/${NMI_CFG}"
+	    	abort_script "$_err_msg_"
+		fi
+
+		# Check to see if location is real/exists on machine
+		if [ ! -d ${_source_} ]; then
+	    		_err_msg_="${_source_} does not exist"
+	    		abort_script "$_err_msg_"
+	    fi
+
+	    # Check to see if file exists in suggested location
+		if [ ! -f ${_source_}/${_script_} ]; then
+			_err_msg_="${_script_} does not exist within ${_source_}"
+	    	abort_script "$_err_msg_"
+		fi
+
+	    # Check to see if location is real/exists on machine
+		if [ ! -d ${_destination_} ]; then
+	    		_err_msg_="${_destination_} does not exist"
+	    		abort_script "$_err_msg_"
+	    fi
+
+		_backup_req_=0
+		# Check to see if file exists in suggested location
+		if [ ! -f ${_destination_}/${_script_} ]; then
+			# Setting flag if backup doesn't need to be done,
+			# as file doesn't already exist [this should never happen - but might!!]
+			_backup_req_=1
+		fi
+
+		# Create backup [if required]
+		if [ ${_backup_req_} == "0" ]; then
+			if [ ! -d ${ENIQ_BACK_DIR} ]; then
+	    		mkdir ${ENIQ_BACK_DIR}
+	    		if [ $? -ne 0 ]; then
+				    _err_msg_="Unable to create ${ENIQ_BACK_DIR}."
+				     abort_script "$_err_msg_"
+				fi
+			fi
+			$CP ${_destination_}/${_script_} ${ENIQ_BACK_DIR}/${_script_}_`date '+%y%m%d-%H%M%S'`
+			if [ $? -ne 0 ]; then
+			    _err_msg_="Unable to create backup for ${_destination_}/${_script_}."
+			     abort_script "$_err_msg_"
+			fi
+			$ECHO "Backing up: ${_destination_}/${_script_} ${ENIQ_BACK_DIR}/${_script_}_`date '+%y%m%d-%H%M%S'`" | $TEE -a ${LOGFILE}
+		else
+			$ECHO "${_script_} does not require backup" | $TEE -a ${LOGFILE}
+		fi
+		# copy script to that location
+		$ECHO "Copying EU content: ${_script_} to ${_destination_}" | $TEE -a ${LOGFILE}
+		$CP ${_source_}/${_script_} ${_destination_}/
+		if [ $? -ne 0 ]; then
+		    _err_msg_="Failed creating copy from ${_source_}/${_script_} ${_destination_}/."
+		     abort_script "$_err_msg_"
+		fi
+	done < ${NMI_PATH}/etc/${NMI_CFG} | ${EGREP} -v "^$"
+fi
+
+insert_header_footer foot "Completed NMI Stage Successfully" ${LOGFILE}
+}
+
+
+
+
+### Function: check_id ###
+#
+#   Check that the effective id of the user is correct
+#   If not print error msg and exit.
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+check_id()
+{
+_check_id_=`$ID  | $AWK -F\( '{print $2}' | $AWK -F\) '{print $1}'`
+if [ "$_check_id_" != "$1" ]; then
+    _err_msg_="You must be $1 or have equal permissions to execute this script."
+    abort_script "$_err_msg_"
+fi
+}
+
+
+### Function: check_params ###
+#
+# Check Input Params
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+clean_up()
+{
+	insert_header_footer head "Beginning Cleanup" ${LOGFILE}
+	cd $SCRIPTHOME
+	$RM -rf ${TMP}
+	if [ $? -ne 0 ]; then
+	    _err_msg_="Failed to remove ${TMP}"
+	     abort_script "$_err_msg_"
+	fi
+	insert_header_footer foot "Completed Cleanup" ${LOGFILE}
+}
+
+### Function: check_params ###
+#
+# Check Input Params
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+check_params()
+{
+if [ ! "${ENIQ_SOURCE_DIR}" ]; then
+    usage_msg
+    exit 1
+fi
+}
+
+
+### Function: insert_header_footer ###
+#
+#   Insert a stage header/footer message
+#
+# Arguments:
+#   $1 : head/foot
+#   $2 : Message
+#   $3 : Logfile
+# Return Values:
+#   none
+insert_header_footer()
+{
+if [ $# -ne 3 ]; then
+    _err_msg_="3 Parameters must be passed to header/footer function"
+    abort_script "$_err_msg_"
+fi
+
+if [ "$1" != "head" -a "$1" != "foot" ]; then
+    _err_msg_="Only Param of head/foot is allowed...exiting!"
+    abort_script "$_err_msg_"
+fi
+_type_=$1
+
+_msg_=$2
+
+_logfile_=$3
+$MKDIR -p `$DIRNAME ${LOGFILE}`
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not create directory `$DIRNAME ${LOGFILE}`"
+    abort_script "$_err_msg_"
+fi
+
+$TOUCH -a ${_logfile_}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not write to file ${LOGFILE}"
+    abort_script "$_err_msg_"
+fi
+
+_time_=`$DATE '+%Y-%b-%d_%H.%M.%S'`
+if [ "$_type_" == "head" ]; then
+    $ECHO "\n-----------------------------------------------------" | $TEE -a ${LOGFILE}
+    $ECHO "-----------------------------------------------------" | $TEE -a ${LOGFILE}
+    $ECHO "$_time_ : $_msg_" | $TEE -a ${LOGFILE}
+    $ECHO "-----------------------------------------------------" | $TEE -a ${LOGFILE}
+fi
+
+if [ "$_type_" == "foot" ]; then
+        $ECHO "\n-----------------------------------------------------" | $TEE -a ${LOGFILE}
+        $ECHO "$_time_ : $_msg_" | $TEE -a ${LOGFILE}
+    $ECHO "-----------------------------------------------------" | $TEE -a ${LOGFILE}
+    $ECHO "-----------------------------------------------------\n" | $TEE -a ${LOGFILE}
+fi
+
+}
+
+
+
+### Function: install_techpacks ###
+#
+#   Install techpacks
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+install_techpacks()
+{
+# Run the tp_installer against feature_file and EU including -n
+$SU - ${SYSUSER} -c "cd ${ENIQ_INSTALLER}; $BASH ${TP_INSTALLER} -c ${TMP}/install_cxcs -p ${ENIQ_SOURCE_DIR}/${TP_DIR}/ -n"
+echo ${TMP}/features_to_be_managed
+if [ $? -ne 0 ]; then
+    _err_msg_="Fault appeared whilst executing: $BASH ${TP_INSTALLER} -c ${TMP}/install_cxcs -p ${ENIQ_SOURCE_DIR}/${TP_DIR}/ -n"
+    abort_script "$_err_msg_"
+fi
+}
+
+### Function: install_platform ###
+#
+#   Install platform modules
+#
+# Arguments:
+#       none
+# Return Values:
+#
+install_platform()
+{
+# Function only to be run on stats/events coordinator
+if [ "${CURR_SERVER_TYPE}" == "eniq_stats" -o "${CURR_SERVER_TYPE}" == "stats_coordinator" -o "${CURR_SERVER_TYPE}" == "eniq_coordinator" -o "${CURR_SERVER_TYPE}" == "son_coordinator" -o "${CURR_SERVER_TYPE}" == "eniq_events" ]; then
+	insert_header_footer head "Entering Platform Stage" ${LOGFILE}
+	
+	# Check if there's any content to be installed
+	$LS ${ENIQ_SOURCE_DIR}/${PLATFORM_DIR}/*zip >> /dev/null 2>&1
+	if [ $? -ne 0 ]; then
+	    $ECHO "No Platform Modules were found in ${ENIQ_SOURCE_DIR}/${PLATFORM_DIR} "
+	    return 1
+	fi
+	
+	_eniq_sw_inst_prog_=`iniget ENIQ_CLI -f ${ENIQ_CONF_DIR}/${SUNOS_INI} -v ENIQ_CLI_PROG`
+	# Check does the install_eniq.sh script exist within eu
+	if [ ! -s ${ENIQ_SOURCE_DIR}/${PLATFORM_DIR}/${_eniq_sw_inst_prog_} ]; then
+	    _err_msg_="Unable to source the file: ${_eniq_sw_inst_prog_} From: ${ENIQ_SOURCE_DIR}/${PLATFORM_DIR}"
+	    abort_script "$_err_msg_"
+	fi
+
+	# Get the partition plan
+	_eniq_partition_plan_=`iniget PARTITION_PLAN -f ${ENIQ_CONF_DIR}/${ENIQ_INI} -v Partition_Plan`
+	if [ ! "${_eniq_partition_plan_}" ]; then
+	    _err_msg_="Could not read parameter PARTITION_PLAN from ${ENIQ_CONF_DIR}/${ENIQ_INI} file"
+	    abort_script "$_err_msg_"
+	fi
+
+	if [ $TMP_ENIQ ]; then
+		$RM -rf $TMP_ENIQ >> /dev/null 2>&1
+	fi
+	
+	# Install Platform Modules
+	$ECHO "\nStarting to install platform modules with command"  | $TEE -a ${LOGFILE}
+	$ECHO "$SU - ${SYSUSER} -c \"${ENIQ_SOURCE_DIR}/${PLATFORM_DIR}/${_eniq_sw_inst_prog_} ${ENIQ_SOURCE_DIR}/${PLATFORM_DIR} ${_eniq_partition_plan_} ${CURR_SERVER_TYPE} eu\"" | $TEE -a ${LOGFILE}
+	$SU - ${SYSUSER} -c "${ENIQ_SOURCE_DIR}/${PLATFORM_DIR}/${_eniq_sw_inst_prog_} ${ENIQ_SOURCE_DIR}/${PLATFORM_DIR}  ${_eniq_partition_plan_} ${CURR_SERVER_TYPE} eu"
+	if [ $? -ne 0 ]; then
+	    _err_msg_="Failure in ${ENIQ_SOURCE_DIR}/${PLATFORM_DIR}/${_eniq_sw_inst_prog_} "
+	    abort_script "$_err_msg_"
+	fi
+
+	insert_header_footer foot "Completed Platform Stage Successfully" ${LOGFILE}
+fi
+}
+
+### Function: post_eu_task ###
+#
+# Install the core scripts
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+post_eu_task()
+{
+# Function only to be run on stats/events coordinator
+if [ "${CURR_SERVER_TYPE}" == "eniq_stats" -o "${CURR_SERVER_TYPE}" == "stats_coordinator" -o "${CURR_SERVER_TYPE}" == "eniq_coordinator" -o "${CURR_SERVER_TYPE}" == "son_coordinator" -o "${CURR_SERVER_TYPE}" == "eniq_events" ]; then
+	insert_header_footer head "Checking for Post-Upgrade Tasks" ${LOGFILE}
+
+		# Check is there anything in the post dir
+	if [ -d ${ENIQ_SOURCE_DIR}/${PRE_POST_DIR} ]; then
+		$LS ${ENIQ_SOURCE_DIR}/${PRE_POST_DIR}/post*  >> /dev/null 2>&1
+		if [ $? -eq 0 ]; then
+			# execute each script
+			for _exe_ in ${ENIQ_SOURCE_DIR}/${PRE_POST_DIR}/post*; do
+				$ECHO "Executing ${_exe_}"
+				# Change permissions
+				$CHMOD 755 ${_exe_}
+				if [ $? -ne 0 ]; then
+				    $ECHO "Failed to change access rights for ${_exe_}"
+				fi
+				${_exe_} -l ${LOGFILE}
+				if [ $? -ne 0 ]; then
+				    _err_msg_="Unable to execute ${_exe_}"
+				    abort_script "$_err_msg_"
+				fi
+			done
+		fi
+	fi
+
+	insert_header_footer foot "Completed Post-Upgrade Stage" ${LOGFILE}
+fi
+}
+
+### Function: pre_eu_checks ###
+#
+#   Check EU structure exists
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+pre_eu_checks()
+{
+$RM $TMP >> /dev/null 2>&1
+$MKDIR $TMP  >> /dev/null 2>&1
+
+# Ensure all directories exist
+if [ ! -d ${ENIQ_SOURCE_DIR}/${PRE_POST_DIR} -a ! -d ${ENIQ_SOURCE_DIR}/${TP_DIR}  -a ! -d ${ENIQ_SOURCE_DIR}/${NMI_DIR} -a ! -d ${ENIQ_SOURCE_DIR}/${PLATFORM_DIR} ]; then
+    _err_msg_="The path: ${ENIQ_SOURCE_DIR} appears to be incorrect.\nPlease ensure you are sourcing the correct path to the EU."
+    abort_script "$_err_msg_"
+fi
+
+# Check does the pre/psot directory exist
+if [ ! -d ${ENIQ_SOURCE_DIR}/${PRE_POST_DIR}/ ]; then
+    _err_msg_="The path: ${ENIQ_SOURCE_DIR}/${PRE_POST_DIR} is missing or is empty."
+    abort_script "$_err_msg_"
+fi
+
+# Check if the TP directory exist
+if [ ! -d ${ENIQ_SOURCE_DIR}/${TP_DIR}/ ]; then
+    _err_msg_="The path: ${ENIQ_SOURCE_DIR}/${TP_DIR} is missing or is empty."
+    abort_script "$_err_msg_"
+fi
+
+# Check if the NMI directory exist
+if [ ! -d ${ENIQ_SOURCE_DIR}/${NMI_DIR} ]; then
+    _err_msg_="The path: ${ENIQ_SOURCE_DIR}/${NMI_DIR} is missing or is empty."
+    abort_script "$_err_msg_"
+fi
+
+# Check if the Platform directory exist
+if [ ! -d ${ENIQ_SOURCE_DIR}/${PLATFORM_DIR} ]; then
+    _err_msg_="The path: ${ENIQ_SOURCE_DIR}/${PLATFORM_DIR} is missing or is empty."
+    abort_script "$_err_msg_"
+fi
+
+# Check if the Version directory exist
+if [ ! -d ${ENIQ_SOURCE_DIR}/${VERSION} ]; then
+    _err_msg_="The path: ${ENIQ_SOURCE_DIR}/${VERSION} is missing or is empty."
+    abort_script "$_err_msg_"
+fi
+
+# check does the total_feature_install_list file exist
+if [ ! -s ${FEATURE_LIST} ]; then
+    _err_msg_="The file: ${FEATURE_LIST} does not exist."
+    abort_script "$_err_msg_"
+fi
+
+# check does the feature_techpacks file exist
+if [ ! -s ${CLI_CONF_DIR}/${FEATURE_TP} ]; then
+    _err_msg_="The file: ${CLI_CONF_DIR}/${FEATURE_TP}} cannot be located."
+    abort_script "$_err_msg_"
+fi
+
+# Check does the tp_installer script exist
+if [ ! -s ${ENIQ_INSTALLER}/tp_installer ]; then
+	_err_msg_="The file: ${ENIQ_INSTALLER}/tp_installer cannot be found."
+    abort_script "$_err_msg_"
+fi
+
+if [ ! -s ${ENIQ_ADMIN_BIN_DIR}/manage_eniq_services.bsh ]; then
+    _err_msg_="Failed to locate ENIQ Service Manager script \n${ENIQ_ADMIN_BIN_DIR}/manage_eniq_services.bsh"
+    abort_script "$_err_msg_"
+fi
+
+VERSION_STATUS=`$CAT ${ENIQ_SOURCE_DIR}/${VERSION}/eniq_status`
+AOM_NUMBER=`$ECHO ${VERSION_STATUS} | cut -f3 -d" "`
+VERSION_PROPERTY=`$CAT ${ENIQ_SOURCE_DIR}/${VERSION}/eniq_status | $SED 's|/|_|g' | $SED 's/.* //' | head -1`
+if [ $? -eq 1 ];  then
+	_err_msg_="Format of VERSION/eniq_status file: ${VERSION_STATUS} is changed. Wrong AOM_NUMBER: ${AOM_NUMBER} is fetched"
+	abort_script "$_err_msg_"
+fi
+if [ -z "$AOM_NUMBER" ]; then
+	_err_msg_="AOM_NUMBER is empty"
+	abort_script "$_err_msg_"
+fi
+
+# If lockfile exists, We have to bomb out - sorry!
+if [ -f ${ENIQ_INSTALLER}/install_lockfile ]; then
+	_err_msg_="${ENIQ_INSTALLER}/install_lockfile exists. Check if there is another EU ongoing."
+    abort_script "$_err_msg_"
+fi
+
+}
+
+### Function: pre_eu_task ###
+#
+# Install the core scripts
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+pre_eu_task()
+{
+# Function only to be run on stats/events coordinator
+if [ "${CURR_SERVER_TYPE}" == "eniq_stats" -o "${CURR_SERVER_TYPE}" == "stats_coordinator" -o "${CURR_SERVER_TYPE}" == "eniq_coordinator" -o "${CURR_SERVER_TYPE}" == "son_coordinator" -o "${CURR_SERVER_TYPE}" == "eniq_events" ]; then
+	insert_header_footer head "Checking for any Pre-Upgrade Tasks" ${LOGFILE}
+
+		# Check is there anything in the pre dir
+	if [ -s ${ENIQ_SOURCE_DIR}/${PRE_POST_DIR} ]; then
+		$LS ${ENIQ_SOURCE_DIR}/${PRE_POST_DIR}/*  >> /dev/null 2>&1
+		if [ $? -eq 0 ]; then
+			# execute each script
+			for _exe_ in ${ENIQ_SOURCE_DIR}/${PRE_POST_DIR}/pre*; do
+				$ECHO "Executing ${_exe_}" | $TEE -a ${LOGFILE}
+				${_exe_} -l ${LOGFILE}
+				if [ $? -ne 0 ]; then
+				    _err_msg_="Unable to execute ${_exe_}"
+				    abort_script "$_err_msg_"
+				fi
+			done
+		fi
+	fi
+	
+	insert_header_footer foot "Completed Pre-Upgrade Stage" ${LOGFILE}
+fi
+}
+
+### Function: setup_env ###
+#
+# Setup up path environment etc
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+setup_env()
+{
+if [ ! "${ENIQ_BASE_DIR}" ]; then
+    ENIQ_BASE_DIR=/eniq
+fi
+
+# Main Directories for EU upgrade
+ENIQ_INST_DIR=${ENIQ_BASE_DIR}/installation
+ENIQ_CONF_DIR=${ENIQ_INST_DIR}/config
+ENIQ_CORE_DIR=${ENIQ_INST_DIR}/core_install
+ENIQ_BACK_DIR=${ENIQ_CONF_DIR}/eu_backup
+ENIQ_INSTALLER=${ENIQ_BASE_DIR}/sw/installer
+ENIQ_ADMIN_DIR=${ENIQ_BASE_DIR}/admin
+MAN_OSS=${ENIQ_ADMIN_DIR}/managed_oss
+CLI_CONF_DIR=${ENIQ_BASE_DIR}/sw/conf
+ENIQ_ADMIN_BIN_DIR=${ENIQ_ADMIN_DIR}/bin
+
+# Set the log directory
+ENIQ_LOG_DIR=${ENIQ_BASE_DIR}/local_logs
+LOGFILE_DIR="${ENIQ_LOG_DIR}/upgrade"
+
+# Source the common functions
+if [ -s ${ENIQ_CORE_DIR}/lib/common_functions.lib ]; then
+    . ${ENIQ_CORE_DIR}/lib/common_functions.lib
+else
+    _err_msg_="File $ENIQ_CORE_DIR/lib/common_functions.lib not found"
+    abort_script "$_err_msg_"
+fi
+
+# Location of ENIQ status file. This contains overall version of ENIQ
+ENIQ_STATUS_FILE=${ENIQ_ADMIN_DIR}/${VERSION_DIR}/${ENIQ_STATUS}
+
+# Set /tmp/eniq variable
+TMP_ENIQ=/tmp/eniq
+
+# Sentinel Stuff
+ENIQ_SENTINEL_DIR=${ENIQ_BASE_DIR}/sentinel
+ENIQ_SENTINEL_BIN_DIR=${ENIQ_SENTINEL_DIR}/bin
+ENIQ_SENTINEL_ENV=${ENIQ_SENTINEL_DIR}/etc/sentinel.env
+
+# Set SYSUSER
+SYSUSER=`iniget ENIQ_INSTALL_CONFIG -f ${ENIQ_CONF_DIR}/${SUNOS_INI} -v ENIQ_SYSUSER`
+if [ ! "${SYSUSER}" ]; then
+    _err_msg_="Could not read parameter ENIQ_SYSUSER from file\n${ENIQ_CONF_DIR}/${SUNOS_INI}"
+    abort_script "$_err_msg_"
+fi
+
+# Get total_feature_install_list
+FEATURE_LIST=`iniget FEATURE_INFO -f ${ENIQ_CONF_DIR}/${ENIQ_INI} -v Feature_Output_File`
+if [ ! "${FEATURE_LIST}" ]; then
+    _err_msg_="Could not read parameter Feature_Output_File from file\n${ENIQ_CONF_DIR}/${ENIQ_INI}"
+    abort_script "$_err_msg_"
+fi
+
+# Get FEATURE_TP
+FEATURE_TP=`iniget FEATURE_INFO -f ${ENIQ_CONF_DIR}/${ENIQ_INI} -v Feature_Mapping_File`
+if [ ! "${FEATURE_TP}" ]; then
+    _err_msg_="Could not read parameter Feature_Mapping_File from file\n${ENIQ_CONF_DIR}/${ENIQ_INI}"
+    abort_script "$_err_msg_"
+fi
+
+# Get install_eniq.sh
+INSTALL_ENIQ=`iniget ENIQ_CLI -f ${ENIQ_CONF_DIR}/${SUNOS_INI} -v ENIQ_CLI_PROG`
+if [ ! "${INSTALL_ENIQ}" ]; then
+    _err_msg_="Could not read parameter ENIQ_CLI_PROG from file\n${ENIQ_CONF_DIR}/${SUNOS_INI}"
+    abort_script "$_err_msg_"
+fi
+
+# Get TP_INSTALLER
+TP_INSTALLER=`iniget ENIQ_CLI -f ${ENIQ_CONF_DIR}/${SUNOS_INI} -v ENIQ_TP_INST_PROG`
+if [ ! "${TP_INSTALLER}" ]; then
+    _err_msg_="Could not read parameter ENIQ_TP_INST_PROG from file\n${ENIQ_CONF_DIR}/${SUNOS_INI}"
+    abort_script "$_err_msg_"
+fi
+
+# Get activate_interface
+ACTIVATE_INTERFACE=`iniget ENIQ_CLI -f ${ENIQ_CONF_DIR}/${SUNOS_INI} -v ENIQ_TP_ACT_PROG`
+if [ ! "${ACTIVATE_INTERFACE}" ]; then
+    _err_msg_="Could not read parameter ENIQ_TP_INST_PROG from file\n${ENIQ_CONF_DIR}/${SUNOS_INI}"
+    abort_script "$_err_msg_"
+fi
+
+# Get server type
+$ECHO "Determining installed server type" | $TEE -a ${LOGFILE}
+if [ ! -s $ENIQ_CONF_DIR/installed_server_type ]; then
+    _err_msg_="$ENIQ_CONF_DIR/installed_server_type missing or empty"
+    abort_script "$_err_msg_"
+fi
+CURR_SERVER_TYPE=`$CAT $ENIQ_CONF_DIR/installed_server_type | $GEGREP -v '^[[:blank:]]*#' | $SED -e 's/ //g'`
+if [ ! "${CURR_SERVER_TYPE}" ]; then
+    _err_msg_="Could not read server type from\n$ENIQ_CONF_DIR/installed_server_type"
+    abort_script "$_err_msg_"
+fi
+
+# Does the sentinel lsmon binary exist?
+if [ ! -x ${ENIQ_SENTINEL_BIN_DIR}/lsmon ]; then
+    _err_msg_="${ENIQ_SENTINEL_BIN_DIR}/lsmon not found or not executable"
+    abort_script "$_err_msg_"
+fi
+}
+
+### Function: techpack_contents ###
+#
+#   Install techpacks
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+techpack_contents()
+{
+# Function only to be run on stats/events coordinator
+if [ "${CURR_SERVER_TYPE}" == "eniq_stats" -o "${CURR_SERVER_TYPE}" == "stats_coordinator" -o "${CURR_SERVER_TYPE}" == "eniq_coordinator" -o "${CURR_SERVER_TYPE}" == "son_coordinator" -o "${CURR_SERVER_TYPE}" == "eniq_events" ]; then
+	insert_header_footer head "Beginning Techpack Stage" ${LOGFILE}
+
+	# Create a file based on tpi & pipe all the tp names to file
+	cd ${ENIQ_SOURCE_DIR}/${TP_DIR}/
+	if [ $? -ne 0 ]; then
+	    _err_msg_="Failed to change directory to ${ENIQ_SOURCE_DIR}/${TP_DIR}/"
+	    abort_script "$_err_msg_"
+	fi
+
+	$LS *tpi | ${SED} 's/_R[0-9]/ /g' | $NAWK '{print $1}'  > ${TMP_TP_FEATURE}/eu_techpacks.$$
+	if [ $? -ne 0 ]; then
+	    _err_msg_="Failed to pipe data to ${TMP_TP_FEATURE}/eu_techpacks.$$"
+	    abort_script "$_err_msg_"
+	fi
+
+	if [ ! -s ${TMP_TP_FEATURE}/eu_techpacks.$$ ]; then
+		$ECHO "No TP's to upgrade\n" | $TEE -a ${LOGFILE}
+	else
+		# create a list of cxc numbers
+		$TOUCH ${TMP}/install_cxcs
+		while read _line_; do
+		    _prod_name_=`$ECHO ${_line_} | $NAWK -F"::" '{print $1}'`
+			$ECHO ${_prod_name_} >> ${TMP}/install_cxcs
+		done < ${MAN_OSS}/total_feature_install_list
+
+		# Run the tp_installer against feature_file and EU including -n
+		$SU - ${SYSUSER} -c "cd ${ENIQ_INSTALLER}; $BASH ${TP_INSTALLER} -c ${TMP}/install_cxcs -p ${ENIQ_SOURCE_DIR}/${TP_DIR}/ -n"
+		if [ $? -ne 0 ]; then
+		    _err_msg_="Fault appeared whilst executing: $BASH ${TP_INSTALLER} -c ${TMP}/install_cxcs -p ${ENIQ_SOURCE_DIR}/${TP_DIR}/ -n"
+		    abort_script "$_err_msg_"
+		fi
+
+	fi
+	
+	insert_header_footer foot "Completed Techpack Stage Successfully" ${LOGFILE}
+fi
+}
+
+### Function: update_eniq_version_file ###
+#
+# Update the ENIQ version file
+#
+# Arguments:
+#	$1 : Location of new Eniq Version file
+# Return Values:
+#	none
+update_eniq_version_file()
+{
+# Function only to be run on stats/events coordinator
+if [ "${CURR_SERVER_TYPE}" == "eniq_stats" -o "${CURR_SERVER_TYPE}" == "stats_coordinator" -o "${CURR_SERVER_TYPE}" == "eniq_coordinator" -o "${CURR_SERVER_TYPE}" == "son_coordinator" -o "${CURR_SERVER_TYPE}" == "eniq_events" ]; then
+
+	$ECHO "Upgrading Eniq Version File" | $TEE -a ${LOGFILE}
+	if [ ! -s ${ENIQ_ADMIN_DIR}/bin/manage_eniq_status.bsh ]; then
+	    _err_msg_="Cannot update Eniq version file. \n${ENIQ_ADMIN_DIR}/bin/manage_eniq_status.bsh not found"
+	    abort_script "$_err_msg_"
+	fi
+
+	$BASH ${ENIQ_ADMIN_DIR}/bin/manage_eniq_status.bsh -d ${1} | $TEE -a ${LOGFILE}
+	if [  ${PIPESTATUS[0]} -ne 0 ]; then
+	   _err_msg_="Eniq version status updation failed."
+	    abort_script "$_err_msg_"
+	fi
+fi
+}
+
+### Function: usage_msg ###
+#
+#   Print out the usage message
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+usage_msg()
+{
+$ECHO "
+Usage: `$BASENAME $0` -f <eu_directory_path>  [ -l <logfile> ]
+
+options:
+
+-f  : Path where the eu is getting sourced from.
+	Example /tmp/eniq_base_sw
+
+-l  : Optional parameter specifying the full path to logfile.
+	If not specified, a logfile will be created in ${LOGFILE_DIR}
+"
+}
+
+
+# ********************************************************************
+#
+#   Main body of program
+#
+# ********************************************************************
+#
+RUN_TIME=`$DATE '+%Y-%b-%d_%H.%M.%S'`
+
+# Check that the effective id of the user is root
+check_id $DEFAULT_USER
+
+while getopts "f:l:" arg; do
+	case $arg in
+	    f) ENIQ_SOURCE_DIR="$OPTARG"
+	       ;;
+	    l) LOGFILE="$OPTARG"
+	       ;;
+	   \?) usage_msg
+	   	   exit 1
+	       ;;
+	esac
+done
+shift `expr $OPTIND - 1`
+
+# Set pre/post Directory
+PRE_POST_DIR=eniq_pp
+
+# Set NMI Directory
+NMI_DIR=install
+
+# Set Platform Directory
+PLATFORM_DIR=eniq_sw
+
+# Get directory where the ENIQ Features are stored
+TP_DIR=eniq_techpacks
+
+# Setup up path environment etc
+setup_env
+
+# Check Input Params
+check_params
+
+# Pre Checks
+pre_eu_checks
+
+
+# Ensure source directory has correct permissions
+# Change permissions
+$CHOWN root:root ${ENIQ_SOURCE_DIR}
+if [ $? -ne 0 ]; then
+    $ECHO "Failed to change ownership rights for ${ENIQ_SOURCE_DIR}. "
+fi
+
+$CHMOD 755 ${ENIQ_SOURCE_DIR}
+if [ $? -ne 0 ]; then
+   $ECHO "Failed to change access rights for ${ENIQ_SOURCE_DIR}. "
+fi
+
+# We need to change permissions here, as we are executing script within it
+$CHMOD 755 ${ENIQ_SOURCE_DIR}/${PLATFORM_DIR}
+if [ $? -ne 0 ]; then
+   $ECHO "Failed to change access rights for ${ENIQ_SOURCE_DIR}. Continuing..."
+fi
+
+# Log file
+if [ ! "${LOGFILE}" ]; then
+	$MKDIR -p ${LOGFILE_DIR}
+	LOGFILE="${LOGFILE_DIR}/ENIQ_${VERSION_PROPERTY}_EU_UPGRADE_`date '+%y%m%d-%H%M%S'`.log"
+fi
+
+# Begin EU Upgrade
+$CLEAR
+
+insert_header_footer head "Beginning EU Upgrade to version: `$CAT ${ENIQ_SOURCE_DIR}/version/eniq_status | $NAWK  '{ tot="";for (i=1; i<=NF; i++) if (i > 1) tot = tot " " $i;} END {print tot}'`" ${LOGFILE}
+
+# Check if we need to install any scripts pre eu
+pre_eu_task
+
+# Check NMI Content
+check_nmi_content
+
+# check and install Business objects
+check_bo_content
+
+# check and install techpack
+techpack_contents
+
+# check and install platform modules
+install_platform
+
+# Get and activate interfaces
+activate_interface
+
+# Check if we need to install any scripts post eu
+post_eu_task
+
+# Update the ENIQ version file
+update_eniq_version_file ${ENIQ_SOURCE_DIR}
+
+# cleanup
+clean_up
+insert_header_footer foot "Completed EU Upgrade" ${LOGFILE}
+
+exit 0

@@ -1,0 +1,586 @@
+#!/usr/bin/bash
+# ********************************************************************
+# Ericsson Radio Systems AB                                     SCRIPT
+# ********************************************************************
+#
+#
+# (c) Ericsson Radio Systems AB 2019 - All rights reserved.
+#
+# The copyright to the computer program(s) herein is the property
+# of Ericsson Radio Systems AB, Sweden. The programs may be used 
+# and/or copied only with the written permission from Ericsson Radio 
+# Systems AB or in accordance with the terms and conditions stipulated 
+# in the agreement/contract under which the program(s) have been 
+# supplied.
+#
+# ********************************************************************
+# Name    : data_migration_status.bsh 
+# Date    : 10/07/2019
+# Revision: \main\11
+# Purpose : This script extracts all  tables by date and measurement type.
+#            Each time the script is run only raw tables that have changed 
+#            from the previous run are extracted.  If an extract fails the 
+#            date used to track is reset to the successful previous run date.
+#    
+# Usage   :  bash data_migration_status.bsh -a [ACTION_TYPE]
+#
+# ********************************************************************
+#
+#     Command Section    
+#
+# ********************************************************************
+AWK=/usr/bin/awk
+BASENAME=/usr/bin/basename
+CAT=/usr/bin/cat
+CHMOD=/usr/bin/chmod
+CLEAR=/usr/bin/clear
+CP=/usr/bin/cp
+CUT=/usr/bin/cut
+DATE=/usr/bin/date
+DF=/usr/bin/df
+DIRNAME=/usr/bin/dirname
+ECHO=/usr/bin/echo
+EGREP=/usr/bin/egrep
+EXPAND=/usr/bin/expand
+EXPR=/usr/bin/expr
+FIND=/usr/bin/find
+GREP=/usr/bin/grep
+ID=/usr/bin/id
+LS=/usr/bin/ls
+MKDIR=/usr/bin/mkdir
+PRINTF=/usr/bin/printf
+PS=/usr/bin/ps
+RM=/usr/bin/rm
+SED=/usr/bin/sed
+SLEEP=/usr/bin/sleep
+SORT=/usr/bin/sort
+TAIL=/usr/bin/tail
+TEE=/usr/bin/tee
+TOUCH=/usr/bin/touch
+TR=/usr/bin/tr
+WC=/usr/bin/wc
+
+# Name of SunOS & ENIQ ini Files
+ENIQ_INI=niq.ini
+
+abort_script()
+{
+if [ "$1" ]; then
+    _err_msg_=$1
+else
+    _err_msg_="Script aborted.......\n"    
+fi
+$ECHO "ERROR :- $_err_msg_"  
+$RM -rf ${TEM_DIR}
+exit 1
+}
+
+### Function: get_absolute_path ###
+#
+# Determine absolute path to software
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+get_absolute_path()
+{
+_dir_=`$DIRNAME $0`
+SCRIPTHOME=`cd $_dir_ 2>/dev/null && pwd || $ECHO $_dir_`
+}
+
+### Function: setup_env ###
+#
+# Set up environment variables for script.
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+setup_env()
+{
+if [ ! "${ENIQ_BASE_DIR}" ]; then
+    # Directory on the root filesystem
+    ENIQ_BASE_DIR=/eniq
+fi
+
+ENIQ_LOG_DIR=${ENIQ_BASE_DIR}/local_logs
+
+# ENIQ Admin Directory
+ENIQ_ADMIN_DIR=${ENIQ_BASE_DIR}/admin
+
+# ENIQ Admin etc Directory
+ENIQ_ADMIN_ETC=${ENIQ_ADMIN_DIR}/etc
+
+DBEXTRACT_ENV_FILE=${ENIQ_ADMIN_ETC}/dbextract_load.env
+if [ ! ${DBEXTRACT_ENV_FILE} ]; then
+    _err_msg_="${DBEXTRACT_ENV_FILE} does not exists!"
+    abort_script "${_err_msg_}"
+fi
+    
+DEFAULT_USER=root
+
+RESULTS_DIR=`$CAT ${DBEXTRACT_ENV_FILE} | $GREP "RESULTSDIR=" | $GREP -v "^#" | $AWK -F"=" '{print $2}'`
+if [ ! "${RESULTS_DIR}" ]; then
+        _err_msg_="could not fetch RESULTSDIR value from file ${ENIQ_ADMIN_ETC}/dbextract_load.env"
+        abort_script "$_err_msg_"
+fi
+
+
+EXTRACT_OP_FILE=${RESULTS_DIR}/Extract_Output.txt
+IMPORT_OP_FILE=${RESULTS_DIR}/Load_output.txt
+$RM -rf ${EXTRACT_OP_FILE} ${IMPORT_OP_FILE}
+
+RUN_NUMBER=`$CAT ${DBEXTRACT_ENV_FILE} | $GREP "RUNNUMBER=" | $GREP -v "^#" | $AWK -F"=" '{print $2}'`
+if [ ! "${RUN_NUMBER}" ]; then
+        _err_msg_="could not fetch RUNNUMBER value from file ${ENIQ_ADMIN_ETC}/dbextract_load.env"
+        abort_script "$_err_msg_"
+fi
+
+EXTRACTS_DIR=`$CAT ${DBEXTRACT_ENV_FILE} | $GREP "EXTRACTS=" | $GREP -v "^#" | $AWK -F"=" '{print $2}'`
+if [ ! "${EXTRACTS_DIR}" ]; then
+    _err_msg_="could not fetch extract directory value from file ${ENIQ_ADMIN_ETC}/dbextract_load.env"
+    abort_script "$_err_msg_"
+fi
+}
+
+### Function: get_absolute_path ###
+#
+# Determine absolute path to software
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+get_absolute_path()
+{
+_dir_=`$DIRNAME $0`
+SCRIPTHOME=`cd $_dir_ 2>/dev/null && pwd || $ECHO $_dir_`
+SCRIPTNAME=`$BASENAME $0`
+}
+
+### Function: check_id ###
+#
+#   Check that the effective id of the user is correct
+#   If not print error msg and exit.
+#
+# Arguments:
+#       $1 : User ID name
+# Return Values:
+#       none
+check_id()
+{
+_check_id_=`$ID | $AWK -F\( '{print $2}' | $AWK -F\) '{print $1}'`
+if [ "$_check_id_" != "$1" ]; then
+    _err_msg_="You must be $1 to execute this script."
+    abort_script "${_err_msg_}"
+fi
+}
+
+
+### Function: status_show_export() ### 
+#
+# shows the status of extraction process 
+#
+# Arguments:
+#    none
+# Return Values:
+#    none
+status_show_export()
+{
+if [ -s "${RESULTS_DIR}/Extract_tables_${RUN_NUMBER}.txt" ]; then
+    _total_tables_=`$CAT ${RESULTS_DIR}/Extract_tables_${RUN_NUMBER}.txt | $WC -l | $TR -s " " " "`
+else
+    _total_tables_="Preparing list of tables to be extracted..."
+fi
+
+if [ -s "${RESULTS_DIR}/Extract_tables_${RUN_NUMBER}_date.txt" ]; then
+    _total_files_=`$CAT ${RESULTS_DIR}/Extract_tables_${RUN_NUMBER}_date.txt | $WC -l | $TR -s " " " "`
+else
+    _total_files_="Number of files to be extracted in progress..."
+fi
+
+if [ -s "${RESULTS_DIR}/DB_data.txt" ]; then
+    _total_db_size_=`$CAT ${RESULTS_DIR}/DB_data.txt | $GREP "DB_SIZE=" | $AWK -F"=" '{print $2}'`
+    (( _total_db_size_ = _total_db_size_ / 1024 / 1024 ))
+    _db_size_used_=`$CAT ${RESULTS_DIR}/DB_data.txt | $GREP "DB_SIZE_USED=" | $AWK -F"=" '{print $2}'`
+    (( _db_size_used_ = _db_size_used_ / 1024 / 1024 ))
+else
+    _total_db_size_="-"
+    _db_size_used_="-"
+fi
+
+_tot_space_=`$DF -kh ${EXTRACTS_DIR} | $TAIL -1 | $TR -s " " " " | $CUT -d" " -f2`
+_used_space_=`$DF -kh ${EXTRACTS_DIR} | $TAIL -1 | $TR -s " " " " | $CUT -d" " -f3`
+_available_space_=`$DF -kh ${EXTRACTS_DIR} | $TAIL -1 | $TR -s " " " " | $CUT -d" " -f4`
+
+_success_tbl_=0
+_fail_tbl_=0
+_pending_count_=0
+
+_no_status_=0
+
+if [ -s "${RESULTS_DIR}/Extract_tables_${RUN_NUMBER}_date.txt" ]; then
+    $CAT ${RESULTS_DIR}/Extract_tables_${RUN_NUMBER}_date.txt | $AWK -F"," '{print $2}' | $AWK -F"'" '{print $2}' | $SORT -u > ${TEM_DIR}/Extract_tables_${RUN_NUMBER}_date_sort.txt
+
+    _count_date_=`$CAT ${TEM_DIR}/Extract_tables_${RUN_NUMBER}_date_sort.txt | $WC -l | $TR -s " " " "`
+    _count_extract_=`$CAT ${RESULTS_DIR}/Extract_tables_${RUN_NUMBER}.txt | $WC -l`
+    (( _skip_table_ = ${_count_extract_} - ${_count_date_} ))
+
+    _success_count_=0
+    _Fail_count_=0
+    _extraction_progress_count_=0
+
+    while read line
+    do
+        _success_count_=0
+        _Fail_count_=0
+        _extraction_progress_count_=0
+
+        _success_extract_=0
+        _empty_extract_=0
+        _fail_extract_=0
+        _table_name_=$line
+        _count_date_file_=`$CAT ${RESULTS_DIR}/Extract_tables_${RUN_NUMBER}_date.txt | $GREP -w $_table_name_ | sort -u | wc -l`
+        _count_extract_info_file_=`$CAT ${RESULTS_DIR}/extract_info_${RUN_NUMBER}.txt | $GREP -w $_table_name_ | sort -u | wc -l`
+        if [ ${_count_date_file_} -eq ${_count_extract_info_file_} ]; then
+            $CAT  ${RESULTS_DIR}/extract_info_${RUN_NUMBER}.txt | $GREP -w ${_table_name_} | $AWK -F"|" '{print $1 $9}' > ${TEM_DIR}/extract_info_${RUN_NUMBER}_${_table_name_}.txt
+            while read line1
+            do    
+                _status_=`$ECHO $line1 | $AWK '{print $2}'`
+                if [ "${_status_}" == "Success" -o "${_status_}" == "Empty" ]; then
+                    let _success_count_='_success_count_+1'
+                elif [ "${_status_}" == "Error" ]; then
+                    let _Fail_count_='_Fail_count_+1'
+                else 
+                    let _no_status_='_no_status_+1'
+                fi
+                        done < ${TEM_DIR}/extract_info_${RUN_NUMBER}_${_table_name_}.txt
+
+                        if [ ${_success_count_} -eq ${_count_date_file_} ]; then
+                              _success_extract_=1
+                        elif [ ${_Fail_count_} -le ${_count_date_file_} ]; then
+                              _fail_extract_=1
+                        fi
+        else
+            if [ "${_process_}" ]; then
+                let _extraction_progress_count_='_extraction_progress_count_+1'
+            fi
+        fi
+    if [ $_success_extract_ -eq 1 ]; then
+        (( _success_tbl_ = _success_tbl_ + 1 ))
+    elif [ $_fail_extract_ -eq 1 ]; then 
+        (( _fail_tbl_ = _fail_tbl_ + 1 ))
+    else
+        (( _pending_count_ = _pending_count_ + 1 ))
+    fi
+
+    rm -rf ${TEM_DIR}/extract_info_${RUN_NUMBER}_${_table_name_}.txt
+    done < ${TEM_DIR}/Extract_tables_${RUN_NUMBER}_date_sort.txt
+else
+    $ECHO "Preparing list of tables to be extracted..."
+fi
+
+$PRINTF "\nTotal number of tables for selected feature(s)\t: ${_total_tables_}" >> ${EXTRACT_OP_FILE}
+$PRINTF "\nTotal number of files to be extracted\t: ${_total_files_}" >> ${EXTRACT_OP_FILE} 
+$PRINTF "\n\n">> ${EXTRACT_OP_FILE}
+$PRINTF "\nNumber of tables to be extracted\t: ${_count_date_}" >> ${EXTRACT_OP_FILE} 
+$PRINTF "\nTables extracted successfully\t: ${_success_tbl_}" >> ${EXTRACT_OP_FILE}
+$PRINTF "\nTables failed during extraction\t: ${_fail_tbl_}" >> ${EXTRACT_OP_FILE}
+#$PRINTF "\nTables pending for extraction\t: ${_pending_count_}" >> ${EXTRACT_OP_FILE}
+$PRINTF "\n\n">> ${EXTRACT_OP_FILE}
+$PRINTF "               \e[1;4;32mDatabase size\e[0m" >> ${EXTRACT_OP_FILE}
+$PRINTF "\nTotal DB size(SYSMAIN and IQMAIN)\t:  ${_total_db_size_}G" >> ${EXTRACT_OP_FILE}
+$PRINTF "\nDB size used\t\t:  ${_db_size_used_}G" >> ${EXTRACT_OP_FILE}
+$PRINTF "\n\n">> ${EXTRACT_OP_FILE}
+$PRINTF "               \e[1;4;32mExternal media details during Extract run\e[0m" >> ${EXTRACT_OP_FILE}
+$PRINTF "\nTotal space on media\t\t:  ${_tot_space_} " >> ${EXTRACT_OP_FILE}
+$PRINTF "\nSpace used on media\t\t:  ${_used_space_}" >> ${EXTRACT_OP_FILE}
+$PRINTF "\nSpace available on media\t\t:  ${_available_space_}" >> ${EXTRACT_OP_FILE}
+
+$CP ${EXTRACT_OP_FILE} ${RESULTS_DIR}/Extract_Status_${RUN_NUMBER}.txt
+if [ $? -ne 0 ]; then
+    $PRINTF "\n Could not copy status file ${EXTRACT_OP_FILE} for run ${RUN_NUMBER}" | $TEE -a ${LOGFILE}
+fi
+
+}
+
+usage_msg()
+{
+$PRINTF "\n[USAGE] : bash data_migration_status.bsh -a [export|import]\n"
+
+}
+
+
+### Function: status_show_import() ###
+#
+# shows the status of import process
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+status_show_import()
+{
+
+    $PRINTF "\nTotal number of active and historic files for import\t: ${_total_files_}" >> ${IMPORT_OP_FILE}
+    $PRINTF "\n\n" >> ${IMPORT_OP_FILE}
+    
+    if [ -s "${RESULTS_DIR}/load_info_active_${RUN_NUMBER}.txt" ]; then
+        _active_success_=`$GREP "Success" ${RESULTS_DIR}/load_info_active_${RUN_NUMBER}.txt | $AWK -F"|" '{print $2}' | $SORT -u | $WC -l`
+        _active_tmp_failure_=`$GREP "Error" ${RESULTS_DIR}/load_info_active_${RUN_NUMBER}.txt | $AWK -F"|" '{print $2}' | $SORT -u | $WC -l`
+        _active_partition_check_=`$GREP "StartDate not found" ${RESULTS_DIR}/load_info_active_${RUN_NUMBER}.txt | $AWK -F"|" '{print $2}' | $SORT -u | $WC -l`
+        _active_historic_=`$GREP "Historic file" ${RESULTS_DIR}/load_info_active_${RUN_NUMBER}.txt | $AWK -F"|" '{print $2}' | $SORT -u | $WC -l`
+
+        $GREP "Success" ${RESULTS_DIR}/load_info_active_${RUN_NUMBER}.txt | $AWK -F"|" '{print $2}' | $SORT -u > ${TEM_DIR}/a_success.txt
+        $GREP "Error" ${RESULTS_DIR}/load_info_active_${RUN_NUMBER}.txt | $AWK -F"|" '{print $2}' | $SORT -u > ${TEM_DIR}/a_fail.txt
+        _duplicate_count_=`$CAT ${TEM_DIR}/a_success.txt | $EGREP -f ${TEM_DIR}/a_fail.txt | $WC -l`
+
+        _active_failure_=`$EXPR ${_active_tmp_failure_} - ${_duplicate_count_}`
+
+        $PRINTF "\nActive files loaded successfully\t: ${_active_success_}" >> ${IMPORT_OP_FILE}
+        $PRINTF "\nActive files failed to load\t\t: ${_active_failure_}" >> ${IMPORT_OP_FILE}
+        $PRINTF "\nActive files for which partition does not exist\t: ${_active_partition_check_}" >> ${IMPORT_OP_FILE}
+        $PRINTF "\nHistoric files encountered during active run\t: ${_active_historic_}" >> ${IMPORT_OP_FILE}
+        $PRINTF "\n\n" >> ${IMPORT_OP_FILE}
+    fi
+
+    if [ -s "${RESULTS_DIR}/load_info_historic_${RUN_NUMBER}.txt" ]; then
+        _historic_success_=`$GREP "Success" ${RESULTS_DIR}/load_info_historic_${RUN_NUMBER}.txt | $AWK -F"|" '{print $2}' | $SORT -u | $WC -l`
+        _historic_tmp_fail_=`$GREP "Error" ${RESULTS_DIR}/load_info_historic_${RUN_NUMBER}.txt | $AWK -F"|" '{print $2}' | $SORT -u | $WC -l`
+        _historic_partition_check_=`$EGREP "StartDate not found|Partition rolled" ${RESULTS_DIR}/load_info_historic_${RUN_NUMBER}.txt | $AWK -F"|" '{print $2}' | $SORT -u | $WC -l`
+
+        $GREP "Success" ${RESULTS_DIR}/load_info_historic_${RUN_NUMBER}.txt | $AWK -F"|" '{print $2}' | $SORT -u > ${TEM_DIR}/h_success.txt
+        $GREP "Error" ${RESULTS_DIR}/load_info_historic_${RUN_NUMBER}.txt | $AWK -F"|" '{print $2}' | $SORT -u > ${TEM_DIR}/h_fail.txt
+        _h_duplicate_count_=`$CAT ${TEM_DIR}/h_success.txt | $EGREP -f ${TEM_DIR}/h_fail.txt | $WC -l`
+
+        _historic_fail_=`$EXPR ${_historic_tmp_fail_} - ${_h_duplicate_count_}`
+
+        $PRINTF "\nHistoric files loaded successfully\t: ${_historic_success_}" >> ${IMPORT_OP_FILE}
+        $PRINTF "\nHistoric files failed to load\t: ${_historic_fail_}" >> ${IMPORT_OP_FILE}
+        $PRINTF "\nHistoric files for which partition does not exist or has rolled over: ${_historic_partition_check_}" >> ${IMPORT_OP_FILE}
+        $PRINTF "\n\n" >> ${IMPORT_OP_FILE}
+    fi
+
+}
+
+check_paused()
+{
+
+if [ -f "${RESULTS_DIR}/pause_process.txt" ]; then
+    $PRINTF "\n\e[1;3;31mNOTE\e[0m : Extract/Import process has been currently paused for run number ${RUN_NUMBER}..." >> ${IMPORT_OP_FILE}
+fi
+
+}
+
+# ********************************************************************
+#
+#     Main body of program
+#
+# ********************************************************************
+
+#Get the absolute path of the script
+get_absolute_path
+
+# Set up environment variables for script.
+setup_env
+
+# Check that the effective id of the user is dcuser
+check_id $DEFAULT_USER
+
+while getopts ":a:l" arg; do
+  case $arg in
+    a) ACTION="$OPTARG"
+       ;;
+    l) LOGFILE="$OPTARG"
+       ;;
+   \?) _err_msg_="`$BASENAME $0` -s <stage>"
+       abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+       ;;
+  esac
+done
+shift `expr $OPTIND - 1`
+
+if [ -z "$ACTION" ]; then
+    usage_msg
+else
+    if [ "$ACTION" == "export" -o "$ACTION" == "import" ];then
+        $ECHO >/dev/null
+    else
+        usage_msg    
+    fi
+fi
+
+host=`hostname`
+
+# Log file
+if [ ! "${LOGFILE}" ]; then
+    $MKDIR -p ${ENIQ_LOG_DIR}/extract_load_status
+    LOGFILE="${ENIQ_LOG_DIR}/extract_load_status/${host}_extract_load_status.log"
+fi
+
+# Create a temporary Directory
+TEM_DIR=/tmp/extract_load_status.$$.$$
+$RM -rf ${TEM_DIR}
+$MKDIR -p ${TEM_DIR}
+$CHMOD 777 ${TEM_DIR}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not create directory $TEM_DIR"
+    abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+fi
+
+
+if [ "${ACTION}" == "export" ]; then
+     $PRINTF "\nExtracting information for files to be exported..... This may take approximately 10 minutes!" | $TEE -a ${LOGFILE}
+    while :
+    do
+        RUN_NUMBER=`$CAT ${DBEXTRACT_ENV_FILE} | $GREP "RUNNUMBER=" | $GREP -v "^#" | $AWK -F"=" '{print $2}'`
+        if [ ! "${RUN_NUMBER}" ]; then
+            _err_msg_="could not fetch RUNNUMBER value from file ${ENIQ_ADMIN_ETC}/dbextract_load.env"
+            abort_script "$_err_msg_"
+        fi
+        $PRINTF "\e[1;3;35m ****************************************************************\n\e[0m" >> ${EXTRACT_OP_FILE}
+        $PRINTF "   \e[1;4;44m EXTRACT SUMMARY FOR SERVER $host\e[0m" >> ${EXTRACT_OP_FILE}
+        $PRINTF "\n\e[1;3;35m ****************************************************************\n\e[0m" >> ${EXTRACT_OP_FILE}
+
+        if [ -f "${RESULTS_DIR}/.extract_process_running" ]; then
+            _process_=`$PS -ef | $EGREP -i "extractdb.bsh|eniq_data_migration.bsh|extracttable.bsh" | $GREP -v $GREP`
+            $LS ${RESULTS_DIR}/*_Extract_${RUN_NUMBER}.txt >> /dev/null 2>&1
+            _file_chk_=`$ECHO $?`
+            if [ "${_process_}" -a ${_file_chk_} -eq 0 ]; then
+                check_paused
+                status_show_export
+            elif [ "${_process_}" -a ${_file_chk_} -ne 0 ]; then
+                check_paused
+                if [ ${RUN_NUMBER} -gt 1 ]; then
+                    $PRINTF "\nPreparation for run ${RUN_NUMBER} of Extract is in progress...\nDisplaying status for previous run number $(( RUN_NUMBER = ${RUN_NUMBER} - 1 )) - \n" >> ${EXTRACT_OP_FILE}
+                    $LS ${RESULTS_DIR}/*_Extract_${RUN_NUMBER}.txt >> /dev/null 2>&1
+                    _file_chk_=`$ECHO $?`
+                    if [ ${_file_chk_} -eq 0 ]; then
+                        status_show_export
+                    else
+                        $PRINTF "\nStatus file does not exist for run number ${RUN_NUMBER}..." >> ${EXTRACT_OP_FILE}
+                    fi
+                else
+                    $PRINTF "\nPreparation for run ${RUN_NUMBER} of Extract is in progress...\n"  >> ${EXTRACT_OP_FILE}
+                fi
+            elif [ ! "${_process_}" -a ${_file_chk_} -eq 0 ]; then
+                $PRINTF "\nNo extract process currently running.. displaying status for RUNNUMBER ${RUN_NUMBER}\n" >> ${EXTRACT_OP_FILE}
+                status_show_export
+            else
+                if [ ${RUN_NUMBER} -gt 1 ]; then
+                    (( RUN_NUMBER = ${RUN_NUMBER} - 1 ))
+                    $LS ${RESULTS_DIR}/*_Extract_${RUN_NUMBER}.txt >> /dev/null 2>&1
+                    _file_chk_=`$ECHO $?`
+                    if [ ${_file_chk_} -eq 0 ]; then
+                        $PRINTF "\nPreparation for run ${RUN_NUMBER} of Extract is in progress...\nDisplaying status for previous run number ${RUN_NUMBER} - \n" >> ${EXTRACT_OP_FILE}
+                        status_show_export
+                    else
+                        $PRINTF "\nStatus file does not exist for run number ${RUN_NUMBER}..." >> ${EXTRACT_OP_FILE}
+                    fi
+
+                fi
+            fi
+        
+        else
+            $LS ${RESULTS_DIR}/*_Extract_${RUN_NUMBER}.txt >> /dev/null 2>&1
+            _file_chk_=`$ECHO $?`
+            if [ ${_file_chk_} -eq 0 ]; then
+                $PRINTF "\nNo extract process currently running...\n" >> ${EXTRACT_OP_FILE}
+                $PRINTF "\nDisplaying status for run number ${RUN_NUMBER} - \n" >> ${EXTRACT_OP_FILE}
+                status_show_export
+            else
+                if [ ${RUN_NUMBER} -gt 1 ]; then
+                    (( RUN_NUMBER = ${RUN_NUMBER} - 1 ))
+                    $LS ${RESULTS_DIR}/*_Extract_${RUN_NUMBER}.txt >> /dev/null 2>&1
+                    _file_chk_=`$ECHO $?`
+                    if [ ${_file_chk_} -eq 0 ]; then
+                        $PRINTF "\nNo extract process currently running..!\nDisplaying status for previous run number ${RUN_NUMBER} - \n" >> ${EXTRACT_OP_FILE}
+                        status_show_export
+                    else
+                        $PRINTF "\nStatus file does not exist for run number ${RUN_NUMBER}...\n" >> ${EXTRACT_OP_FILE}
+                    fi
+                else
+                    $PRINTF "\nStatus file does not exist for run number ${RUN_NUMBER}...\n" >> ${EXTRACT_OP_FILE}
+                fi
+            fi
+        fi
+    
+    $CLEAR
+    $PRINTF "\n\n" >> ${EXTRACT_OP_FILE} 
+    $CAT ${EXTRACT_OP_FILE} | $EXPAND -t29
+    $PRINTF "\n\n" >> ${EXTRACT_OP_FILE}
+    $SLEEP 10
+    done
+    
+elif [ "${ACTION}" == "import" ]; then
+    $PRINTF "\nExtracting information for number of files to be imported... this may take some time!" | $TEE -a ${LOGFILE}
+    IMPORTS=`$ECHO ${EXTRACTS_DIR} | $SED "s/:/ /g"` 
+    _total_files_=`$FIND ${IMPORTS} -name "*.gz" | $WC -l`
+    if [ ${_total_files_} -eq 0 ]; then
+    $PRINTF "No files to import in current run!\nChecking if import has been run on this server previously..."
+    fi
+    $PRINTF "\n\n" >> ${IMPORT_OP_FILE}
+    _process_active_=`$PS -ef | $GREP "active_loaddb.bsh" | $GREP -v $GREP | $GREP "bash"`
+    _process_historic_=`$PS -ef | $GREP "historic_loaddb.bsh" | $GREP -v $GREP | $GREP "bash"`
+    if [ "${_process_active_}" ]; then
+        while :;
+        do
+            $PRINTF "\n\n" >> ${IMPORT_OP_FILE}
+            $PRINTF "\e[1;3;35m ****************************************************************\n\e[0m" >> ${IMPORT_OP_FILE}
+            $PRINTF "   \e[1;4;44m IMPORT SUMMARY FOR SERVER $host\e[0m" >> ${IMPORT_OP_FILE}
+            $PRINTF "\n\e[1;3;35m ****************************************************************\n\e[0m" >> ${IMPORT_OP_FILE}
+            check_paused
+            status_show_import
+            $CLEAR
+            $CAT ${IMPORT_OP_FILE} | $EXPAND -t29
+            $PRINTF "\n\n"
+            $SLEEP 10
+        done
+    elif [ "${_process_historic_}" ]; then
+        while :;
+        do
+            $PRINTF "\e[1;3;35m ****************************************************************\n\e[0m" >> ${IMPORT_OP_FILE}
+            $PRINTF "   \e[1;4;44m IMPORT SUMMARY FOR SERVER $host\e[0m" >> ${IMPORT_OP_FILE}
+            $PRINTF "\n\e[1;3;35m ****************************************************************\n\e[0m" >> ${IMPORT_OP_FILE}
+            check_paused
+            status_show_import
+            $CLEAR
+            $CAT ${IMPORT_OP_FILE} | $EXPAND -t29
+            $PRINTF "\n\n"
+            $SLEEP 10
+        done
+    else
+        if [ ${RUN_NUMBER} -gt 1 ]; then
+        (( RUN_NUMBER = RUN_NUMBER - 1 ))
+            $PRINTF "\e[1;3;35m ****************************************************************\n\e[0m" >> ${IMPORT_OP_FILE}
+            $PRINTF "   \e[1;4;44m IMPORT SUMMARY FOR SERVER $host\e[0m" >> ${IMPORT_OP_FILE}
+            $PRINTF "\n\e[1;3;35m ****************************************************************\n\e[0m" >> ${IMPORT_OP_FILE}
+
+            $PRINTF "\nDisplaying status for previous run number ${RUN_NUMBER}...\n" >> ${IMPORT_OP_FILE}
+            status_show_import
+            $CLEAR
+            $PRINTF "\n\n"
+            $CAT ${IMPORT_OP_FILE} | $EXPAND -t29
+            $PRINTF "\n\n"
+        else
+            $PRINTF "\e[1;3;35m ****************************************************************\n\e[0m" >> ${IMPORT_OP_FILE}
+            $PRINTF "   \e[1;4;44m IMPORT SUMMARY FOR SERVER $host\e[0m" >> ${IMPORT_OP_FILE}
+            $PRINTF "\n\e[1;3;35m ****************************************************************\n\e[0m" >> ${IMPORT_OP_FILE}
+            if [ -s "${RESULTS_DIR}/load_info_active_${RUN_NUMBER}.txt" -o -s "${RESULTS_DIR}/load_info_historic_${RUN_NUMBER}.txt" ]; then
+                status_show_import
+            else
+                $PRINTF "\nImport has not been run on this server previously." >> ${IMPORT_OP_FILE}
+            fi
+            $CLEAR
+            $PRINTF "\n\n"
+            $CAT ${IMPORT_OP_FILE} | $EXPAND -t29
+            $PRINTF "\n\n"
+
+        fi
+
+    fi
+fi
+
+$RM -rf ${TEM_DIR}
+exit 0

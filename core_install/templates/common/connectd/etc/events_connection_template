@@ -1,0 +1,5 @@
+#
+# File layout description:
+# <user_choice> <ip_address_of stats> <filesystem_to_share>
+#
+STATS   <IP_ADDRESS>    northbound

@@ -1,0 +1,527 @@
+#!/bin/bash
+# ********************************************************************
+# Ericsson Radio Systems AB                                     SCRIPT
+# ********************************************************************
+#
+# (c) Ericsson Radio Systems AB 2021 - All rights reserved.
+#
+# The copyright to the computer program(s) herein is the property
+# of Ericsson Radio Systems AB, Sweden. The programs may be used
+# and/or copied only with the written permission from Ericsson Radio
+# Systems AB or in accordance with the terms and conditions stipulated
+# in the agreement/contract under which the program(s) have been
+# supplied.
+#
+# ********************************************************************
+# Name    : backup_bond_configuration.bsh
+# Date    : 04/02/2022
+# Revision: 1
+# Purpose : To automate the configuration of backup VLAN bond if not
+#           done while initial installation
+#
+# Usage   : backup_bond_configuration.bsh
+
+#
+# ********************************************************************
+#
+#   Command Section
+#
+# ********************************************************************
+
+AWK=/usr/bin/awk
+CAT=/usr/bin/cat
+DATE=/usr/bin/date
+DIRNAME=/usr/bin/dirname
+ECHO='/usr/bin/echo -e'
+EGREP=/usr/bin/egrep
+EXPR=/usr/bin/expr
+GREP=/usr/bin/grep
+ID=/usr/bin/id
+LS=/usr/bin/ls
+MKDIR=/usr/bin/mkdir
+MV=/usr/bin/mv
+MYHOSTNAME=/usr/bin/hostname
+NMCLI=/usr/bin/nmcli
+PRINTF=/usr/bin/printf
+RM=/usr/bin/rm
+SED=/usr/bin/sed
+TAIL=/usr/bin/tail
+TEE=/usr/bin/tee
+
+# ********************************************************************
+#
+#       Configuration Section
+#
+# ********************************************************************
+
+# Default user
+DEFAULT_USER=root
+
+# Default cache dir location
+DEF_CACHE_DIR="/var/tmp/OM_CACHE"
+
+# DVD LABEL or Jumpstart Directory where all ENIQ SW will reside
+ENIQ_BASE_SW=eniq_base_sw
+
+# File used to identify correct DVD
+ENIQ_BASE_SW_FILE_ID=".eniq_base_sw"
+
+# Cmd to exec a shell and drop user to it in case of an error
+EXEC_SHELL_CMD="exec /bin/bash -o emacs"
+
+# Name of SunOS & ENIQ ini Files
+BLK_STOR_INI=block_storage.ini
+ENIQ_ENV=niq.rc
+ENIQ_INI=niq.ini
+SYM_INI=sym_links.ini
+IPMP_INI=ipmp.ini
+LUN_MAP_INI=lun_map.ini
+RBAC_INI=RBAC.ini
+SUNOS_INI=SunOS.ini
+SENTINEL_INI=sentinel.ini
+STORAGE_INI=storage.ini
+TP_INI=input_parameters.ini
+ECS_INI=ecs.ini
+COORD_SYM_INI=coordinator_sym_links.ini
+CEP_MED_INI=cep_mediation.ini
+
+# Max size for FS swap partition in Mbytes
+MAX_16G_SWAP=16
+MAX_8G_SWAP=8
+
+ENIQ_STOP_SERVICES="scheduler engine webserver repdb dwhdb licmgr rmiregistry connectd"
+ENIQ_START_SERVICES="connectd rmiregistry licmgr repdb dwhdb engine scheduler webserver"
+
+# Variables used in ENIQ version
+ENIQ_VERSION_DIR="version"
+ENIQ_STATUS="eniq_status"
+
+# Location of WTMPX LOG File
+WTMPX_LOG_LOC=/var/adm/wtmpx
+
+#Location of nasplugin.conf file
+_NAS_PLUGINS_LOC=/ericsson/storage/plugins/filestore/etc
+
+# Location of interface directory
+INTF_DIR=/etc/sysconfig/network-scripts
+
+# ********************************************************************
+#
+#   Functions
+#
+# ********************************************************************
+### Function: abort_script ###
+#
+#   This will is called if the script is aborted thru an error
+#   signal sent by the kernel such as CTRL-C or if a serious
+#   error is encountered during runtime
+#
+# Arguments:
+#       $1 - Error message from part of program (Not always used)
+# Return Values:
+#       none
+
+
+abort_script()
+{
+_err_time_=`$DATE '+%Y-%b-%d_%H.%M.%S'`
+if [ "$1" ]; then
+    _err_msg_="${_err_time_} - $1"
+else
+    _err_msg_="${_err_time_} - ERROR : Script aborted.......\n"
+fi
+if [ "${LOGFILE}" ]; then
+    $ECHO -e "\nERROR : ${_err_msg_}\n" | $TEE -a ${LOGFILE}
+else
+    $ECHO -e "\nERROR : ${_err_msg_}\n"
+fi
+
+$RM -rf ${TEM_DIR}
+
+if [ "$2" ]; then
+    ${2}
+fi
+}
+
+### Function: backup_bond ###
+#
+# Asking user for backup bond formation
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+
+backup_bond()
+{
+
+insert_header_footer head "Entering get backup vlan information function" ${LOGFILE}
+
+# a list of interfaces
+$ECHO "\nBuilding list of available interfaces, please wait...\n"
+
+# find the list of interfaces
+$NMCLI con show | $AWK '{print $1,$2}' | $EGREP -v '*bond*|DEVICE|lo' > ${TEM_DIR}/interface_list
+
+if [ ! -s ${TEM_DIR}/interface_list ]; then
+    _err_msg_="Could not build a list of interfaces"
+    abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+fi
+
+    while :; do
+
+        $ECHO "\nDo you want to configure backup group (Y|N)"
+        read ans
+
+        if [ ! "${ans}" ]; then
+            continue
+
+        elif [ "${ans}" == "N" ]; then
+            _err_msg_="Exiting backup group configuration"
+            abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+
+        elif [ "${ans}" == "Y" ]; then
+            get_network_details
+
+        else
+            continue
+        fi
+
+    done
+
+}
+### Function: bond_configuration ###
+#
+# Configuring backup bond
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+
+bond_configuration()
+{
+
+$PRINTF '\33[H\33[2J'
+
+# Generating subnet value using NetMask IP
+subnet=`get_network_from_netmask ${backup_netmask}`
+if [ ! "${subnet}" ]; then
+    _err_msg_="Could not generate subnet value using NetMask IP"
+    abort_script "$_err_msg_" "${EXEC_SHELL_CMD}"
+fi
+
+# Generating bond name
+_next_bond_=`$LS -rt ${INTF_DIR}/ifcfg-bond[0-9] 2> /dev/null | $TAIL -1`
+_bond_count_=`$ECHO ${_next_bond_: -1}`
+# Increase count
+_bond_count_=`$EXPR ${_bond_count_} + 1`
+
+bond_name="bond${_bond_count_}"
+
+
+# moving configuration files
+$ECHO "\nMoving all interface configuration files to /etc/sysconfig/network-scripts"
+
+$MV /etc/sysconfig/network-scripts/ifcfg-$int1 /eniq/installation/config/ifcfg-$int1
+$MV /etc/sysconfig/network-scripts/ifcfg-$int2 /eniq/installation/config/ifcfg-$int2
+
+insert_header_footer head "Successfully gathered bond information" ${LOGFILE}
+
+$ECHO `$DATE '+%Y-%b-%d_%H.%M.%S'`" : Entering setup bond for backup vlan"
+$ECHO "-----------------------------------------------------"
+
+$NMCLI con add type bond con-name $bond_name ifname $bond_name mode active-backup ip4 $backup_ip/$subnet ipv4.never-default true ipv4.dns $dns_ip gw4 $backup_gateway arp-interval 2000 arp-ip-target $backup_client primary $int1
+
+$NMCLI con add type bond-slave ifname $int1 master $bond_name
+$NMCLI con add type bond-slave ifname $int2 master $bond_name
+
+$NMCLI connection up bond-slave-$int1
+$NMCLI connection up bond-slave-$int2
+
+$NMCLI connection up $bond_name
+
+insert_header_footer foot "Successfully setup bond" ${LOGFILE}
+
+update_ipmp
+
+}
+
+### Function: check_id ###
+#
+#   Check that the effective id of the user is correct
+#   If not print error msg and exit.
+#
+# Arguments:
+#       $1 : User ID name
+# Return Values:
+#       none
+
+check_id()
+{
+_check_id_=`$ID | $AWK -F\( '{print $2}' | $AWK -F\) '{print $1}'`
+
+if [ "$_check_id_" != "$1" ]; then
+    _err_msg_="You must be $1 to execute this script."
+    abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+fi
+}
+
+### Function: get_network_details ###
+#
+# Asking user to enter network details
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+
+get_network_details()
+{
+
+$PRINTF '\33[H\33[2J'
+
+$ECHO "\nAvailable Interfaces for Backup Group"
+$ECHO "-------------------------------------------"
+
+$CAT ${TEM_DIR}/interface_list
+
+    while :; do
+
+        $ECHO "\nSelect two group interfaces from the list above separated by a space (Example :<Interface_1> <Interface_2>)"
+        read int1 int2
+
+        if [[ ! "${int1}" || ! "${int2}" ]];then
+            continue
+
+        elif [[ ! `$GREP -w $int1 ${TEM_DIR}/interface_list 2>/dev/null` || ! `$GREP -w $int2 ${TEM_DIR}/interface_list 2>/dev/null` ]];then
+            echo "${int1} or ${int2} is not present in the list"
+            continue
+
+        else
+            break
+        fi
+
+    done
+
+
+$PRINTF '\33[H\33[2J'
+
+$ECHO "\nEnter the IP address of the Backup Group"
+read backup_ip
+$PRINTF '\33[H\33[2J'
+
+$ECHO "\nEnter the netmask address for the Backup Group"
+read backup_netmask
+$PRINTF '\33[H\33[2J'
+
+$ECHO "\nEnter the Gateway IP address of the Backup Group"
+read backup_gateway
+$PRINTF '\33[H\33[2J'
+
+$ECHO "\nEnter the IP address of at least one highly available servers in the same subnet as Backup Group"
+$ECHO "(OMBS Server IP Should be given as mandatory entry)"
+read backup_client
+$PRINTF '\33[H\33[2J'
+
+user_confirmation
+}
+
+
+### Function: insert_header_footer ###
+#
+#   Insert a stage header/footer message
+#
+# Arguments:
+#   $1 : head/foot
+#   $2 : Message
+#   $3 : Logfile
+# Return Values:
+#   none
+
+insert_header_footer()
+{
+if [ $# -ne 3 ]; then
+    _err_msg_="3 Parameters must be passed to header/footer function"
+    abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+fi
+if [ "$1" != "head" -a "$1" != "foot" ]; then
+    _err_msg_="Only Param of head/foot is allowed...exiting!"
+    abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+fi
+_type_=$1
+_msg_=$2
+_logfile_=$3
+$MKDIR -p `$DIRNAME ${_logfile_}`
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not create directory `$DIRNAME ${_logfile_}`"
+    abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+fi
+$TOUCH -a ${_logfile_}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not write to file ${_logfile_}"
+    abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+fi
+_time_=`$DATE '+%Y-%b-%d_%H.%M.%S'`
+if [ "$_type_" == "head" ]; then
+    $ECHO -e "\n-----------------------------------------------------" | $TEE -a ${_logfile_}
+    $ECHO "-----------------------------------------------------" | $TEE -a ${_logfile_}
+    $ECHO "$_time_ : $_msg_" | $TEE -a ${_logfile_}
+    $ECHO "-----------------------------------------------------" | $TEE -a ${_logfile_}
+fi
+if [ "$_type_" == "foot" ]; then
+    $ECHO -e "\n-----------------------------------------------------" | $TEE -a ${_logfile_}
+    $ECHO "$_time_ : $_msg_" | $TEE -a ${_logfile_}
+    $ECHO "-----------------------------------------------------" | $TEE -a ${_logfile_}
+    $ECHO -e "-----------------------------------------------------\n" | $TEE -a ${_logfile_}
+fi
+}
+
+### Function: setup_env ###
+#
+# Set up environment variables for script.
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+
+setup_env()
+{
+# Define root user's home
+    ROOT_HOME=/root
+
+# Setting the env HOME to /root for console run
+    export HOME=/root
+
+if [ ! "${ENIQ_BASE_DIR}" ]; then
+    # Directory on the root filesystem
+    ENIQ_BASE_DIR=/eniq
+fi
+
+# ENIQ Log Directory
+ENIQ_LOG_DIR=${ENIQ_BASE_DIR}/local_logs
+
+# Main Directory for the Core Installation SW
+ENIQ_INST_DIR=${ENIQ_BASE_DIR}/installation
+
+# ENIQ Config Directory
+ENIQ_CONF_DIR=${ENIQ_INST_DIR}/config
+
+# Source the common functions
+if [ -s /eniq/installation/core_install/lib/common_functions.lib ]; then
+    . /eniq/installation/core_install/lib/common_functions.lib
+else
+    _err_msg_= "common_functions.lib not found"
+    abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+fi
+
+HNAME=`${MYHOSTNAME}`
+
+#Fetching DNS IP
+dns_ip=`$CAT /etc/resolv.conf | $EGREP 'nameserver' | $AWK '{print $2}'`
+
+}
+
+### Function: update_ipmp ###
+#
+# Updating impm.ini file
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+
+update_ipmp()
+{
+$SED -z -i 's/BONDING_ENABLE=[YN]/BONDING_ENABLE=Y/3' ${ENIQ_CONF_DIR}/${IPMP_INI}
+$SED -z -i "s/IPMP_Group_Intf=*/IPMP_Group_Intf=$int1 $int2/3" ${ENIQ_CONF_DIR}/${IPMP_INI}
+$SED -z -i "s/IPMP_Group_IP=*/IPMP_Group_IP=$backup_ip/11" ${ENIQ_CONF_DIR}/${IPMP_INI}
+$SED -z -i "s/IPMP_Group_Netmask=*/IPMP_Group_Netmask=$backup_netmask/3" ${ENIQ_CONF_DIR}/${IPMP_INI}
+$SED -z -i "s/IPMP_Group_Gateway=*/IPMP_Group_Gateway=$backup_gateway/3" ${ENIQ_CONF_DIR}/${IPMP_INI}
+$SED -z -i "s/ARP_IP_TARGET=*/ARP_IP_TARGET=$backup_client/3" ${ENIQ_CONF_DIR}/${IPMP_INI}
+
+
+exit 0
+}
+
+
+### Function: user_confirmation ###
+#
+# Confirm network details from user
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+
+user_confirmation()
+{
+
+$ECHO "\nInterface Information"
+$ECHO "---------------------"
+
+$ECHO "\nBackup Group Interface: "$int1 $int2
+
+$ECHO "\nGroup Name : Backup Group"
+$ECHO "Backup Group IP : "$backup_ip
+$ECHO "Backup Group Netmask : "$backup_netmask
+$ECHO "Backup Group Gateway IP : "$backup_gateway
+$ECHO "Backup Group Highly Available Server IP :"$backup_client
+
+    while :; do
+
+        $ECHO "\nIs the information above correct (Y|N)"
+        read _ans_
+
+        if [ ! "${_ans_}" ]; then
+            continue
+
+        elif [ "${_ans_}" == "N" ]; then
+            get_network_details
+
+        elif [ "${_ans_}" == "Y" ]; then
+            bond_configuration
+
+        else
+            continue
+        fi
+
+    done
+}
+
+
+# ********************************************************************
+#
+#   Main body of program
+#
+# ********************************************************************
+#
+RUN_TIME=`$DATE '+%Y-%b-%d_%H.%M.%S'`
+
+# Check that the effective id of the user is root
+check_id $DEFAULT_USER
+
+# Set up environment variables for script.
+setup_env
+
+# Log file
+if [ ! "${LOGFILE}" ]; then
+    $MKDIR -p ${ENIQ_LOG_DIR}/backup_bond_configuration
+    LOGFILE="${ENIQ_LOG_DIR}/backup_bond_configuration/${HNAME}_backup_bond_configuration.log"
+fi
+
+# Create a temporary Directory
+TEM_DIR=/tmp/backup_bond_configuration.$$.$$
+$RM -rf ${TEM_DIR}
+$MKDIR -p ${TEM_DIR}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not create directory $TEM_DIR"
+    abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+fi
+
+# Configuring backup vlan bond
+backup_bond
+
+
+exit 0

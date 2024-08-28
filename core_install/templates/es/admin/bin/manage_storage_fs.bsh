@@ -1,0 +1,1649 @@
+#!/bin/bash
+# ********************************************************************
+# Ericsson Radio Systems AB                                     SCRIPT
+# ********************************************************************
+#
+#
+# (c) Ericsson Radio Systems AB 2018 - All rights reserved.
+#
+# The copyright to the computer program(s) herein is the property
+# of Ericsson Radio Systems AB, Sweden. The programs may be used
+# and/or copied only with the written permission from Ericsson Radio
+# Systems AB or in accordance with the terms and conditions stipulated
+# in the agreement/contract under which the program(s) have been
+# supplied.
+#
+# ********************************************************************
+# Name    : manage_storage_fs.bsh
+# Date    : 28/8/2019
+# Revision: \main\38
+# Purpose : Main wrapper script handling the upgrade of NAS filesystems
+#
+# Usage   : manage_storage_fs.bsh
+#
+# ********************************************************************
+#
+#   Command Section
+#
+# ********************************************************************
+AWK=/usr/bin/awk
+BASENAME=/usr/bin/basename
+BASH=/usr/bin/bash
+CAT=/usr/bin/cat
+CHOWN=/usr/bin/chown
+CP=/usr/bin/cp
+DATE=/usr/bin/date
+DIRNAME=/usr/bin/dirname
+ECHO='/usr/bin/echo -e'
+EGREP=/usr/bin/egrep
+ENV=/usr/bin/env
+EXPR=/usr/bin/expr
+GETENT=/usr/bin/getent
+GREP=/usr/bin/grep
+HEAD=/usr/bin/head
+MYHOSTNAME=/usr/bin/hostname
+ID=/usr/bin/id
+KILL=/usr/bin/kill
+MKDIR=/usr/bin/mkdir
+MOUNT=/usr/bin/mount
+PERL=/usr/bin/perl
+PWD=/usr/bin/pwd
+RM=/usr/bin/rm
+SED=/usr/bin/sed
+SLEEP=/usr/bin/sleep
+SORT=/usr/bin/sort
+SYSTEMCTL=/usr/bin/systemctl
+TAIL=/usr/bin/tail
+TEE=/usr/bin/tee
+TOUCH=/usr/bin/touch
+TR=/usr/bin/tr
+
+# ********************************************************************
+#
+#       Configuration Section
+#
+# ********************************************************************
+DEFAULT_USER=root
+
+# Coordinator server list
+CO_SERVER_TYPE="stats_coordinator|eniq_stats"
+
+# Name of SunOS & ENIQ ini Files
+IPMP_INI=ipmp.ini
+SUNOS_INI=SunOS.ini
+STORAGE_INI=storage.ini
+BLK_STORAGE_INI=block_storage.ini
+
+# FLAG to check new FS operations
+unset UPDATE_FLAG
+unset FS_OPER_FLAG
+
+# ********************************************************************
+#
+#   Functions
+#
+# ********************************************************************
+### Function: abort_script ###
+#
+#   This will is called if the script is aborted through an error
+#   signal sent by the kernel such as CTRL-C or if a serious
+#   error is encountered during runtime
+#
+# Arguments:
+#       $1 - Error message from part of program (Not always used)
+# Return Values:
+#       none
+abort_script()
+{
+_err_time_=`$DATE '+%Y-%b-%d_%H.%M.%S'`
+
+if [ "$1" ]; then
+    _err_msg_="${_err_time_} - $1"
+else
+    _err_msg_="${_err_time_} - Script aborted.......\n"
+fi
+
+if [ "${LOGFILE}" ]; then
+    $ECHO "\nERROR : $_err_msg_\n" | $TEE -a ${LOGFILE}
+else
+    $ECHO "\nERROR : $_err_msg_\n"
+fi
+
+cd $SCRIPTHOME
+$RM -rf ${TEM_DIR}
+
+exit 1
+}
+
+### Function: build_current_fs_list ###
+#
+# Get a list of current NAS FS
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+build_current_fs_list()
+{
+$RM -rf ${TEM_DIR}/storage_ini_curr_fs_list
+
+# Find the NASCLI
+get_nas_info
+
+# Get the pool name
+_nas_pool_=`iniget NAS_DETAILS -f ${ENIQ_CONF_DIR}/${SUNOS_INI} -v NAS_Primary_Storage_Pool`
+if [ ! "${_nas_pool_}" ]; then
+    _err_msg_="Failed to get NAS primary pool name from ${ENIQ_CONF_DIR}/${SUNOS_INI}"
+    abort_script "$_err_msg_"
+fi
+
+log_msg -s "\nBuilding NAS filesystem list from NAS pool ${_nas_pool_}" -l ${LOGFILE}
+log_msg -s "Please wait while this list is being built..." -l  ${LOGFILE}
+
+# Get snapshot names, and exclude them from the FS list if they exist
+_snap_list_=`$NASCLI list_snapshots - |  $AWK '{print $1}' | $AWK -F\/ '{print $NF}'`
+if [ "${_snap_list_}" ]; then
+    _snap_regex_=`$ECHO ${_snap_list_} | $SED -e 's/ /\|/g'`
+    $NASCLI list_fs - | $SED -e "s|${_nas_pool_}\/||g" | $EGREP -v ${_snap_regex_} > ${TEM_DIR}/storage_ini_curr_fs_list
+else
+    $NASCLI list_fs - | $SED -e "s|${_nas_pool_}\/||g" > ${TEM_DIR}/storage_ini_curr_fs_list
+fi
+
+if [ ! -s ${TEM_DIR}/storage_ini_curr_fs_list ]; then
+    _err_msg_="Could not build FS list from NAS pool ${_nas_pool_}"
+    abort_script "$_err_msg_"
+fi
+log_msg -q -s "Successfully built NAS filesystem list from NAS pool ${_nas_pool_}" -l ${LOGFILE}
+
+}
+
+### Function: build_new_fs_list ###
+#
+# Get a list of new NAS FS
+# from storage.ini templates
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+build_new_fs_list()
+{
+_err_=0
+$RM -rf ${TEM_DIR}/storage_ini.$$.$$ ${TEM_DIR}/storage_ini_new_fs_list
+
+# Has the user specified deployment=
+if [ -s ${ENIQ_CONF_DIR}/extra_params/deployment ]; then
+    _deployment_=`$CAT ${ENIQ_CONF_DIR}/extra_params/deployment | $TR '[:upper:]' '[:lower:]'`
+    
+    if [ "${_deployment_}" == "ft" ]; then
+        _ini_file_name_="${NEW_TEMPL_DIR}/storage_ini.ft"
+        if [ ! -s ${_ini_file_name_} ]; then
+            _err_msg_="${_ini_file_name_} not found, or is empty"
+            abort_script "$_err_msg_"
+        fi
+        
+        log_msg -q -s "Using values in ${_ini_file_name_} for comparison" -l ${LOGFILE}
+        $CAT ${_ini_file_name_} > ${TEM_DIR}/storage_ini.$$.$$
+        if [ ! -s ${TEM_DIR}/storage_ini.$$.$$ ]; then
+            _err_msg_="Could not copy information from ${_ini_file_name_}"
+            abort_script "$_err_msg_"
+        fi
+    elif [ "${_deployment_}" == "small" ]; then
+        _ini_file_name_="${NEW_TEMPL_DIR}/storage_ini.sml"
+        if [ ! -s ${_ini_file_name_} ]; then
+            _err_msg_="${_ini_file_name_} not found, or is empty"        
+            abort_script "$_err_msg_"
+        fi
+        
+        log_msg -q -s "Using values in ${_ini_file_name_} for comparison" -l ${LOGFILE}
+        $CAT ${_ini_file_name_} > ${TEM_DIR}/storage_ini.$$.$$
+        if [ ! -s ${TEM_DIR}/storage_ini.$$.$$ ]; then
+            _err_msg_="Could not copy information from ${_ini_file_name_}"
+            abort_script "$_err_msg_"
+        fi
+    elif [ "${_deployment_}" == "medium" ]; then
+        _ini_file_name_="${NEW_TEMPL_DIR}/storage_ini.med"
+        if [ ! -s ${_ini_file_name_} ]; then
+            _err_msg_="${_ini_file_name_} not found, or is empty"        
+            abort_script "$_err_msg_"
+        fi
+    
+        log_msg -q -s "Using values in ${_ini_file_name_} for comparison" -l ${LOGFILE}
+        $CAT ${_ini_file_name_} > ${TEM_DIR}/storage_ini.$$.$$
+        if [ ! -s ${TEM_DIR}/storage_ini.$$.$$ ]; then
+            _err_msg_="Could not copy information from ${_ini_file_name_}"
+            abort_script "$_err_msg_"
+        fi
+    elif [ "${_deployment_}" == "large" ]; then
+        _ini_file_name_="${NEW_TEMPL_DIR}/storage_ini.lrg"
+        if [ ! -s ${_ini_file_name_} ]; then
+            _err_msg_="${_ini_file_name_} not found, or is empty"        
+            abort_script "$_err_msg_"
+        fi
+         
+        log_msg -q -s "Using values in ${_ini_file_name_} for comparison" -l ${LOGFILE}
+        $CAT ${_ini_file_name_} > ${TEM_DIR}/storage_ini.$$.$$
+        if [ ! -s ${TEM_DIR}/storage_ini.$$.$$ ]; then
+            _err_msg_="Could not copy information from ${_ini_file_name_}"
+            abort_script "$_err_msg_"
+        fi
+    elif [ "${_deployment_}" == "extralarge" ]; then
+        _ini_file_name_="${NEW_TEMPL_DIR}/storage_ini.extralrg"
+        if [ ! -s ${_ini_file_name_} ]; then
+            _err_msg_="${_ini_file_name_} not found, or is empty"        
+            abort_script "$_err_msg_"
+        fi
+    
+        log_msg -q -s "Using values in ${_ini_file_name_} for comparison" -l ${LOGFILE}
+        $CAT ${_ini_file_name_} > ${TEM_DIR}/storage_ini.$$.$$
+        if [ ! -s ${TEM_DIR}/storage_ini.$$.$$ ]; then
+            _err_msg_="Could not copy information from ${_ini_file_name_}"
+            abort_script "$_err_msg_"
+        fi
+    else
+        _err_=1
+    fi
+else
+    _err_=1
+fi
+
+if [ ${_err_} -eq 1 ]; then
+    _err_msg_="Parameter \"deployment\" incorrectly specified"
+    abort_script "$_err_msg_"
+fi
+
+log_msg -s "Building a list of required NAS filesystems from ${_ini_file_name_}" -l ${LOGFILE}
+$CAT ${TEM_DIR}/storage_ini.$$.$$ | $EGREP "^FS_NAME" | $AWK -F"=" '{print $NF}' > ${TEM_DIR}/storage_ini_new_fs_list
+if [ ! -s ${TEM_DIR}/storage_ini_new_fs_list ]; then
+    _err_msg_="Could not copy filter information from ${TEM_DIR}/storage_ini.$$.$$"
+    abort_script "$_err_msg_"
+fi
+}
+
+### Function: check_files_and_scripts ###
+#
+#   Checks required files/scripts are present
+#
+# Arguments:
+#       $1 : User ID name
+# Return Values:
+#       none
+check_files_and_scripts()
+{
+log_msg -s "\nChecking for required files and scripts" -l ${LOGFILE}
+
+if [ -n "${UPGRADE_SW}" ] ; then
+    if [ ! -s ${CLI_CONF_DIR}/${STORAGE_INI} ]; then
+        _err_msg_="Cannot locate ${CLI_CONF_DIR}/${STORAGE_INI}"
+        abort_script "$_err_msg_"
+    fi
+fi
+
+if [ -n "${ROLLBACK_SW}" ] ; then
+    if [ ! -s ${ENIQ_CONF_DIR}/${STORAGE_INI} ]; then
+        _err_msg_="Cannot locate ${ENIQ_CONF_DIR}/${STORAGE_INI}"
+        abort_script "$_err_msg_"
+    fi
+fi
+
+if [ ! -s ${ENIQ_CONF_DIR}/${SUNOS_INI} ]; then
+    _err_msg_="Cannot locate ${ENIQ_CONF_DIR}/${SUNOS_INI}"
+    abort_script "$_err_msg_"
+fi
+
+if [ ! -s ${ENIQ_CONF_DIR}/${IPMP_INI} ]; then
+    _err_msg_="Cannot locate ${ENIQ_CONF_DIR}/${IPMP_INI}"
+    abort_script "$_err_msg_"
+fi
+
+log_msg -s "Required files and scripts successfully found" -l ${LOGFILE}
+}
+
+### Function: check_id ###
+#
+#   Check that the effective id of the user is correct
+#   If not print error msg and exit.
+#
+# Arguments:
+#       $1 : User ID name
+# Return Values:
+#       none
+check_id()
+{
+_check_id_=`$ID  | $AWK -F\( '{print $2}' | $AWK -F\) '{print $1}'`
+if [ "$_check_id_" != "$1" ]; then
+    _err_msg_="You must be $1 to execute this script."
+    abort_script "$_err_msg_"
+fi
+}
+
+### Function: chk_create_logfile ###
+#
+# Check/Create Logfile
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+chk_create_logfile()
+{
+$MKDIR -p `$DIRNAME ${LOGFILE}`
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not create directory `$DIRNAME ${LOGFILE}`"
+     abort_script "$_err_msg_"
+fi
+
+$TOUCH -a ${LOGFILE}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not write to file ${LOGFILE}"
+    abort_script "$_err_msg_"
+fi
+}
+
+### Function: disable_nasd_svc ###
+#
+# Disable NASd service
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+disable_nasd_svc()
+{
+    #Disable NASd
+    _nas_smf_str_=`iniget NAS_DAEMON -f ${ENIQ_CONF_DIR}/${SUNOS_INI} -v NAS_SERVICE_STR`
+
+    _nas_state_=`$SYSTEMCTL show ${_nas_smf_str_} -p ActiveState | $AWK -F "=" '{print $2}'`
+    if [ "${_nas_state_}" !=  "inactive" ]; then
+        $SYSTEMCTL stop ${_nas_smf_str_} >>/dev/null 2>&1
+        $SYSTEMCTL disable ${_nas_smf_str_} >>/dev/null 2>&1
+        _check_count_=500
+       
+        while [ ${_check_count_} -ne 0 ]
+        do
+            _nas_state_=`$SYSTEMCTL show ${_nas_smf_str_} -p ActiveState | $AWK -F "=" '{print $2}'`
+            if [ ${_nas_state_} == "inactive" ]; then
+                $ECHO "NASd service is inactive"
+                return 0
+            else
+               
+               $SYSTEMCTL reset-failed ${_nas_smf_str_} >>/dev/null 2>&1
+               $SYSTEMCTL stop ${_nas_smf_str_}
+               $SYSTEMCTL disable ${_nas_smf_str_}         
+               _nas_state_recheck_=`$SYSTEMCTL show ${_nas_smf_str_} -p ActiveState | $AWK -F "=" '{print $2}'`
+               if [ ${_nas_state_recheck_} == "inactive" ]; then
+                $ECHO "NASd service has been successfully disabled"
+               fi    
+            fi
+            $SLEEP 1
+            _check_count_=`expr ${_check_count_} - 1`
+        done
+        _err_msg_="NASd disable failed while updating new FS entry"
+        abort_script "${_err_msg_}"
+    else
+         $ECHO "NASd already in inactive state. Continue...."
+    fi
+}
+
+### Function: enable_nasd_svc ###
+#
+# Enable NASd service
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+enable_nasd_svc()
+{
+    #Enable NASd
+    _nas_cnt_=0
+    while [ ${_nas_cnt_} -lt 2 ] ; do
+        _nas_state_=`$SYSTEMCTL show ${_nas_smf_str_} -p ActiveState | $AWK -F "=" '{print $2}'`
+        if [ ${_nas_state_} != "active" ]; then
+            $SYSTEMCTL reset-failed ${_nas_smf_str_} >> /dev/null 2>&1
+            $SYSTEMCTL start ${_nas_smf_str_}
+            $SYSTEMCTL enable ${_nas_smf_str_}
+
+            if [ $? -ne 0 ]; then
+                _err_msg_="NASd service failed to enable"
+                abort_script "${_err_msg_}"
+            fi
+            _nas_state_recheck_=`$SYSTEMCTL show ${_nas_smf_str_} -p ActiveState | $AWK -F "=" '{print $2}'`
+            if [ ${_nas_state_recheck_} == "active" ]; then
+                $ECHO "NASd service has been successfully enabled"
+            fi            
+            let _nas_cnt_=_nas_cnt_+1
+        else
+            $ECHO "NASd service is in active state. Continue..."
+            break
+        fi
+        $SLEEP 60
+    done
+}
+
+### Function: get_nas_info ###
+#
+# Create any new filesystems
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+get_nas_info()
+{
+# Find the NASCLI
+_nas_sw_target_dir_=`iniget NAS_STORAGE_API -f ${ENIQ_CONF_DIR}/${SUNOS_INI} -v NAS_API_TARGET_DIR`
+if [ ! "${_nas_sw_target_dir_}" ]; then
+    _err_msg_="Failed to get NAS API target dir information from ${ENIQ_CONF_DIR}/${SUNOS_INI}"
+    abort_script "$_err_msg_"
+fi
+
+NASCLI=${_nas_sw_target_dir_}/bin/nascli
+if [ ! -s $NASCLI ]; then
+    _err_msg_="$NASCLI not found"
+    abort_script "$_err_msg_"
+fi    
+}
+
+### Function: get_storage_ip ###
+#
+# Create any new filesystems
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+get_storage_ip()
+{
+if [ -s ${ENIQ_CONF_DIR}/extra_params/deployment ]; then
+    _deployment_=`$CAT ${ENIQ_CONF_DIR}/extra_params/deployment`
+else
+    _err_msg_="Parameter \"deployment\" incorrectly specified, or is missing from boot command"
+    abort_script "$_err_msg_" "${EXEC_SHELL_CMD}"
+fi
+if [ -s ${ENIQ_CONF_DIR}/${IPMP_INI} ]; then
+    local _ipmp_ini_=${ENIQ_CONF_DIR}/${IPMP_INI}
+else
+    _err_msg_="IPMP ini file missing "
+    abort_script "$_err_msg_" "${EXEC_SHELL_CMD}"
+fi
+
+# Get the storage VLAN IP
+if [ "${_deployment_}" == "ft" ]; then
+    # we only configure 1 vlan i.e. the oss services vlan
+    $ECHO "deployment = ft"
+    _intf_list_=`iniget IPMP -f ${_ipmp_ini_} | $HEAD -1`
+    if [ ! "${_intf_list_}" ]; then
+        $ECHO "Could not get list of IPMP interfaces"
+        return 1
+    fi
+else
+    # we configure both services and storage vlans
+    _intf_list_=`iniget IPMP -f ${_ipmp_ini_}`
+    if [ ! "${_intf_list_}" ]; then
+        $ECHO "Could not get list of IPMP interfaces"
+        return 1
+    fi
+fi
+
+# Check if SFS to VA is performed or not
+_sfs_va_flag_=0
+
+_sfs_va_=`iniget SFS_TO_VA_MIGRATION_INDICATOR -f ${_ipmp_ini_} -v SFS_to_VA_Migrated`
+if [ "${_sfs_va_}" == "Y" ];then
+    _sfs_va_flag_=1
+    log_msg -s "\nSFS to VA migration has been performed for this deployment" -l ${LOGFILE}
+fi
+
+for _intf_ in ${_intf_list_}; do
+    _vlan_name_=`iniget ${_intf_} -f ${_ipmp_ini_} -v IPMP_Group_Name`
+    if [ ! "${_vlan_name_}" ]; then
+            _err_msg_="Could not read IPMP_Group_Name for ${_intf_} in ${ENIQ_CONF_DIR}/${IPMP_INI}"
+        abort_script "$_err_msg_"
+    fi
+    
+    # Choose ENM storage vlan if we have SFS to VA performed for non-ft deployment
+    if [ ${_sfs_va_flag_} -eq 1 -a "${_vlan_name_}" != "enm_stor_grp" -a "${_deployment_}" != "ft" ];then
+        continue
+    # Choose Storage vlan for non-ft deployment if available
+    elif [ ${_sfs_va_flag_} -eq 0 -a "${_vlan_name_}" != "stor_grp" -a  "${_deployment_}" != "ft" ]; then
+        continue
+    else
+	
+        INTF_IP=`iniget ${_intf_} -f ${_ipmp_ini_} -v IPMP_Group_IP`
+        if [ ! "$INTF_IP" ]; then
+            _err_msg_="Could not read IPMP_Group_IP value for ${_intf_} in ${ENIQ_CONF_DIR}/${IPMP_INI}"
+            abort_script "$_err_msg_"
+        fi
+        
+        # Reading value of IPMP_Group_Netmask from /eniq/installation/config/ipmp.ini
+        _net_mask_ip_=`iniget ${_intf_} -f ${ENIQ_CONF_DIR}/${IPMP_INI} -v IPMP_Group_Netmask`
+        if [ ! "${_net_mask_ip_}" ]; then
+            _err_msg_="Could not read IPMP_Group_Netmask value for ${_intf_} in ${ENIQ_CONF_DIR}/${IPMP_INI}"
+            abort_script "$_err_msg_"
+        fi
+
+        # Generating subnet value using NetMask IP
+        _subnet_=`get_network_from_netmask ${_net_mask_ip_}`
+        if [ ! "${_subnet_}" ]; then
+              _err_msg_="Could not generate subnet value using NetMask IP"
+              abort_script "$_err_msg_"
+        fi
+
+        # Reading NETMASKS based on vlan
+        if [ "${_vlan_name_}" == "enm_stor_grp" ]; then
+              _netmask_attr_="ENM_STOR_NETMASK"
+        elif [ "${_vlan_name_}" == "stor_grp" ]; then
+              _netmask_attr_="STOR_NETMASK"		   
+        fi
+		
+        if [ "${_deployment_}" == "ft" ]; then
+            # Reading Network IP from /etc/netmasks
+            _network_ip_=`$CAT /etc/netmasks | $GREP ${_net_mask_ip_} | $EGREP -v "#" | $AWK -F " " '{print $1}'`
+            if [ ! "${_network_ip_}" ]; then
+                _err_msg_="Could not read network IP from /etc/netmasks"
+                abort_script "$_err_msg_"    
+            fi
+        else
+            # Reading Network IP from ipmp ini
+            _network_ip_=`iniget ${_netmask_attr_} -f ${ENIQ_CONF_DIR}/${IPMP_INI} -v NETMASKS | $CUT -d":" -f1`
+            if [ ! "${_network_ip_}" ]; then
+                _err_msg_="Could not read Network IP from ${ENIQ_CONF_DIR}/${IPMP_INI}"
+                abort_script "$_err_msg_"
+            fi
+        fi
+        
+    fi
+done
+}
+
+### Function: nfs_subnet_share ###
+#
+#Checking if NAS File systems shared with individual 
+#host/storage IPs or with network IP.
+#Removing sharing with individual IPs if present and sharing NFS
+#over network during post upgrade.
+#Creating a file /eniq/installation/config/add_client_net_ip
+#to indicate that NFS has been shared over the network.
+# Arguments:
+#   none
+# Return Values:
+#   none
+nfs_subnet_share ()
+{
+if [ "${SERVER_TYPE}"=="CO" ]; then
+    log_msg -s "\nCreating a list of IPs with which NFS are shared currently" -l ${LOGFILE}
+    
+    if [ -s ${ENIQ_CONF_DIR}/extra_params/deployment ]; then
+        _deployment_=`$CAT ${ENIQ_CONF_DIR}/extra_params/deployment`
+    else
+        _err_msg_="Parameter \"deployment\" incorrectly specified, or is missing from boot command"
+        abort_script "$_err_msg_" "${EXEC_SHELL_CMD}"
+    fi
+    
+    # Set a variable for the number of NAS LUNs
+    _nas_sysid_=`iniget Storage_NAS_GENERAL -f ${ENIQ_CONF_DIR}/${STORAGE_INI} -v SYS_ID`
+    if [ ! "${_nas_sysid_}" ]; then
+          _err_msg_="Could not get NAS sysid value from ${ENIQ_CONF_DIR}/${STORAGE_INI}"
+          abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+    fi
+    
+    if [ -s ${TEM_DIR}/all_server_list ]; then
+         server_ip_list=`$CAT ${TEM_DIR}/all_server_list | $AWK  -F":" '{print $1}'`
+         if [ "${_deployment_}" != "ft" ]; then
+            for _IP_ in  $server_ip_list ; do
+                _storage_ip_=`run_remote_cmd "${_IP_}" "$CAT ${ENIQ_CONF_DIR}/${BLK_STORAGE_INI}" | $GREP BLK_STORAGE_INTERF_IP | $CUT -d"=" -f2 |$TR -d "\r"`
+                if [ ! "${_storage_ip_}" ]; then
+                    _err_msg_="could not retrieve storage IP from $_IP_ "
+                    abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+                fi
+                server_ip_list="${server_ip_list} ${_storage_ip_}"  
+                
+            done
+                
+         fi
+            
+    else
+         _err_msg_="Could not get ${TEM_DIR}/all_server_list"
+         abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+    fi
+    
+        
+    # Checking if NFS are shared already through Co-ordinator
+    ${NASCLI} list_shares - ${_nas_sysid_} | $AWK '{print $3}' > ${TEM_DIR}/ip_shares_list
+    if [ $? -ne 0 ]; then
+         _err_msg_="Problem encountered while listing shares using ${NASCLI}"
+         abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+    else
+         log_msg -q -s "Successfully built a list of existing shares with NAS\n" -l ${LOGFILE}
+    fi
+
+    
+    #Creating a list of client IP/storage IP with which NFS are shared  
+    log_msg -t -s "Checking if the NAS filesystems are shared with client IP or network IP" -l ${LOGFILE}    
+    for _IP_ in `$ECHO $server_ip_list`; do
+        $CAT ${TEM_DIR}/ip_shares_list | $EGREP $_IP_ >> /dev/null 2>&1
+        if [ $? -eq 0 ]; then
+            log_msg -q -s "\nNFS shared with $_IP_" -l ${LOGFILE}
+            $ECHO $_IP_ >> ${TEM_DIR}/unshare_ip_list
+            if [ $? -ne 0 ]; then
+                _err_msg_="Could not get a list of IPs to remove NFS sharing"
+                abort_script "$_err_msg_"
+            fi
+        fi
+    done
+        
+    if [ ! -f ${TEM_DIR}/unshare_ip_list -a ! -f /var/tmp/nas_share_removed ]; then
+         log_msg -t -s "\nNFS already shared over the subnet" -l ${LOGFILE}
+    fi
+
+    #Removing NFS sharing with client IPs if present    
+    if [ -s ${TEM_DIR}/unshare_ip_list -o -f /var/tmp/nas_share_removed ]; then
+    
+     # Get the storage VLAN IP
+         get_storage_ip
+        
+     if [ ! -f /var/tmp/nas_share_removed ]; then
+              while read _entry_; do
+              log_msg -s "Removing NFS sharing for server $_entry_" -l ${LOGFILE}
+              $NASCLI delete_client - ${_entry_}
+              if [ $? -ne 0 ]; then
+                   _err_msg_="Could not remove NFS sharing for ${_entry_}"
+                   abort_script "$_err_msg_"
+              fi
+          done < ${TEM_DIR}/unshare_ip_list
+              $TOUCH /var/tmp/nas_share_removed
+      fi
+        
+      # Sharing NFS over the subnet using network IP
+          log_msg -l ${LOGFILE} -s "Sharing NFS over the subnet ip ${_network_ip_}/${_subnet_}"
+      ${NASCLI} add_client - ${_network_ip_}/${_subnet_} - -
+      if [ $? -ne 0 ]; then
+           _err_msg_="Problem encountered adding ${_network_ip_}/${_subnet_} as a client of NAS"
+           abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+      else
+        log_msg -t -s "Successfully shared NAS file systems to subnet ${_network_ip_}/${_subnet_}" -l ${LOGFILE}
+        $TOUCH ${ENIQ_CONF_DIR}/add_client_net_ip
+      fi
+    fi
+
+
+    #Restarting NASd service on Non-Coordinator Blades
+    if [ -n "${_server_ip_}" ]; then
+        for _ip_address_ in `$ECHO ${_server_ip_}`; do
+            log_msg -s "\nRestarting NASd service on ${_ip_address_} server" -l ${LOGFILE}
+            run_remote_cmd "${_ip_address_}" "$SYSTEMCTL restart ${_nas_smf_str_}"
+            if [ $? -ne 0 ]; then
+                _err_msg_="ERROR while restarting NASd service on ${_ip_address_}"
+                abort_script "${_err_msg_}"
+            fi
+        done
+     fi
+fi
+}
+
+
+### Function: create_new_fs ###
+#
+# Create any new filesystems
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+create_new_fs()
+{
+if [ ! -s ${TEM_DIR}/storage_ini.$$.$$ -o ! -s ${TEM_DIR}/fs_process_list ]; then
+    _err_msg_="Required files for fs creation not found"
+    abort_script "$_err_msg_"
+fi
+
+# Find the NASCLI
+get_nas_info
+
+# Get the storage VLAN IP
+get_storage_ip
+
+$RM -rf ${TEM_DIR}/storage_ini_new
+
+_pri_pool_=`iniget Storage_NAS_GENERAL -f ${ENIQ_CONF_DIR}/${STORAGE_INI} -v POOL_PRI`
+_sec_pool_=`iniget Storage_NAS_GENERAL -f ${ENIQ_CONF_DIR}/${STORAGE_INI} -v POOL_SEC`
+if [ ! "${_pri_pool_}" -o ! "${_sec_pool_}" ]; then
+    _err_msg_="Could not read values from ${ENIQ_CONF_DIR}/${STORAGE_INI}"
+    abort_script "$_err_msg_"
+fi
+
+$CAT ${TEM_DIR}/storage_ini.$$.$$ | $SED -e "s|<CHANGE><ENIQ_POOL_ID>|${_pri_pool_}|g" \
+                                         -e "s|<CHANGE><ENIQ_SEC_POOL_ID>|${_sec_pool_}|g" \
+                                         -e "s|<CHANGE><ENIQ_BASE_DIR>|${ENIQ_BASE_DIR}|g" > ${TEM_DIR}/storage_ini_new
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not update values in ${TEM_DIR}/storage_ini.$$.$$"
+    abort_script "$_err_msg_"
+fi
+    
+# Get a list of parent tags of filesystems
+_storage_parent_tags_=`iniget Storage_NAS_FS_LIST -f ${TEM_DIR}/storage_ini_new`
+if [ ! "${_storage_parent_tags_}" ]; then
+    _err_msg_="Could not get a list of parent tags from ${TEM_DIR}/storage_ini_new"
+    abort_script "$_err_msg_"
+fi
+
+while read _entry_; do
+    for _parent_tag_ in ${_storage_parent_tags_}; do
+        $RM -rf ${TEM_DIR}/new_ini_block
+    
+        _fs_name_=`iniget ${_parent_tag_} -f ${TEM_DIR}/storage_ini_new -v FS_NAME`
+        if [ "${_fs_name_}" == "${_entry_}" ]; then
+            $ECHO "[${_parent_tag_}]" > ${TEM_DIR}/new_ini_block
+            iniget ${_parent_tag_} -f ${TEM_DIR}/storage_ini_new >> ${TEM_DIR}/new_ini_block
+            if [ -s ${TEM_DIR}/new_ini_block ]; then
+                _fs_size_=`iniget ${_parent_tag_} -f ${TEM_DIR}/new_ini_block -v FS_SIZE`
+                _fs_name_=`iniget ${_parent_tag_} -f ${TEM_DIR}/new_ini_block -v FS_NAME`
+                _share_opts_=`iniget ${_parent_tag_} -f ${TEM_DIR}/new_ini_block -v NFS_SHARE_OPTIONS`
+                if [ ! "${_fs_size_}" -o ! "${_fs_name_}" -o ! "${_share_opts_}" ]; then
+                    _err_msg_="Could not find FS name and size in ${TEM_DIR}/new_ini_block"
+                    abort_script "$_err_msg_" 
+                fi
+                
+                # Create the new FS
+                log_msg -s "\nCreating ${_fs_name_} on NAS" -l ${LOGFILE}
+                $NASCLI create_fs - ${_fs_size_} - ${_fs_name_}
+                if [ $? -ne 0 ]; then
+                    _err_msg_="Could not create ${_fs_name_}"
+                    abort_script "$_err_msg_" 
+                fi
+                
+                # Share out the new FS
+                log_msg -s "Adding $INTF_IP as a client of NAS for ${_fs_name_}" -l ${LOGFILE}
+                $NASCLI add_client - $INTF_IP ${_share_opts_} ${_fs_name_}
+                if [ $? -ne 0 ]; then
+                    _err_msg_="Could not share ${_fs_name_} to $INTF_IP"
+                    abort_script "$_err_msg_" 
+                fi
+
+                # Update storage.ini file
+                $RM -f ${TEM_DIR}/storage_ini_new_tmp >> /dev/null 2>&1
+                $INIADD -g Storage_NAS_FS_LIST -p ${_parent_tag_} -i ${TEM_DIR}/storage_ini_new -d ${TEM_DIR}/new_ini_block -o ${TEM_DIR}/storage_ini_new_tmp
+                if [ $? -ne 0 ]; then
+                    _err_msg_="Error adding ${_parent_tag_} to ${TEM_DIR}/storage_ini_new_tmp"
+                    abort_script "$_err_msg_" 
+                fi
+                
+                $CP ${TEM_DIR}/storage_ini_new_tmp ${TEM_DIR}/storage_ini_new
+                if [ $? -ne 0 ]; then
+                    _err_msg_="Could not update ${TEM_DIR}/storage_ini_new"
+                    abort_script "$_err_msg_" 
+                fi
+                
+                # Update the nasd config temp file, after new fs gets mounted
+                update_temp_nasd_config ${_parent_tag_} ${TEM_DIR}/storage_ini_new
+            fi
+        fi
+    done
+done < ${TEM_DIR}/fs_process_list
+
+$CP ${TEM_DIR}/storage_ini_new ${CLI_CONF_DIR}/${STORAGE_INI}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not copy ${TEM_DIR}/storage_ini_new to ${CLI_CONF_DIR}/${STORAGE_INI}"
+    abort_script "$_err_msg_" 
+fi
+
+# Update nasd config file
+update_nasd_config
+}
+
+### Function: update_sunos_ini ###
+#
+# Update SunOS.ini file to remove mediator entry
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+update_sunos_ini(){
+# Copy to Temp location
+$CP ${ENIQ_CONF_DIR}/${SUNOS_INI} ${TEM_DIR}/${SUNOS_INI}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not copy ${ENIQ_CONF_DIR}/${SUNOS_INI} to ${TEM_DIR}/${SUNOS_INI}. Exiting." | $TEE -a ${LOGFILE}
+    abort_script "${_err_msg_}"
+fi
+
+# Update SunOS.ini file
+if [ "${UPDATE_FLAG}" == "true" ]
+then
+    while read _read_fs_; do
+        _fs_found_=0
+        for _sunos_list_ in `iniget SunOS_DIRECTORY -f ${TEM_DIR}/${SUNOS_INI}`; do
+                iniget ${_sunos_list_} -f ${TEM_DIR}/${SUNOS_INI} -v path | $EGREP ${_read_fs_}
+                if [  $? -eq 0 ]; then
+                    _fs_found_=1
+                    break
+                fi
+        done
+
+        if [ ${_fs_found_} -eq 0 ]
+        then
+            cp ${ENIQ_CONF_DIR}/${STORAGE_INI} /var/tmp/STORAGE_INI_SAM
+            _fs_tag_=Storage_NAS_`$ECHO $_read_fs_ |$TR "[:lower:]" "[:upper:]" `
+            _mount_path_=`iniget ${_fs_tag_} -f ${ENIQ_CONF_DIR}/${STORAGE_INI} -v MOUNT_PATH`
+            _user_=`iniget ${_fs_tag_} -f ${ENIQ_CONF_DIR}/${STORAGE_INI} -v OWNER`
+            _group_=`iniget ${_fs_tag_} -f ${ENIQ_CONF_DIR}/${STORAGE_INI} -v GROUP` 
+            _last_used_=`$CAT ${TEM_DIR}/${SUNOS_INI} | $GREP SunOS_DIRECTORY_DIR_* | $GREP -v "\[*\]" | $TAIL -1 | $SED 's/[^0-9]*//g'` 
+            log_msg -q -s "VAL [_fs_tag_:$_fs_tag_ , _mount_path_=$_mount_path_ , _user_=$_user_ , _group_=$_group_ , _last_used_=$_last_used_" -l ${LOGFILE} 
+            ((_last_used_++))
+            _new_fs_="SunOS_DIRECTORY_DIR_${_last_used_}"
+            $ECHO "[${_new_fs_}]"                     >${TEM_DIR}/new_sunosini_block
+            $ECHO "path=${_mount_path_}"                 >>${TEM_DIR}/new_sunosini_block
+            $ECHO "perms=0755"                        >>${TEM_DIR}/new_sunosini_block
+            $ECHO "user=${_user_}"                       >>${TEM_DIR}/new_sunosini_block
+            $ECHO "group=${_group_}"                      >>${TEM_DIR}/new_sunosini_block
+
+            $INIADD -g SunOS_DIRECTORY -p ${_new_fs_} -i ${TEM_DIR}/${SUNOS_INI} -d ${TEM_DIR}/new_sunosini_block -o ${TEM_DIR}/${SUNOS_INI}_med
+            if [ $? -ne 0 ]; then
+                _err_msg_="Could not update ${TEM_DIR}/${SUNOS_INI}_med"
+                abort_script "${_err_msg_}"
+            fi    
+            # Copy new ini file into temp SunOS.ini file
+            $CP ${TEM_DIR}/${SUNOS_INI}_med ${TEM_DIR}/${SUNOS_INI}
+            if [ $? -ne 0 ]; then
+                _err_msg_="Could not copy ${TEM_DIR}/${SUNOS_INI}_med to ${TEM_DIR}/${SUNOS_INI}"
+                abort_script "$_err_msg_"
+            fi
+            $RM -f ${TEM_DIR}/${SUNOS_INI}_med >> /dev/null 2>&1
+        fi
+    done < ${TEM_DIR}/fs_process_list
+else
+    while read _read_fs_; do
+    for _sunos_list_ in `iniget SunOS_DIRECTORY -f ${TEM_DIR}/${SUNOS_INI}`; do
+        iniget ${_sunos_list_} -f ${TEM_DIR}/${SUNOS_INI} -v path | $EGREP ${_read_fs_}
+        if [  $? -eq 0 ]; then
+            $INIDEL -g SunOS_DIRECTORY -p ${_sunos_list_} -i ${TEM_DIR}/${SUNOS_INI} -o ${TEM_DIR}/${SUNOS_INI}_med
+            if [ $? -ne 0 ]; then
+                _err_msg_="Could not delete ${_sunos_list_} in ${TEM_DIR}/${SUNOS_INI}" | $TEE -a ${LOGFILE}
+                abort_script "${_err_msg_}"
+            fi
+            # Copy new ini file into temp SunOS.ini file
+            $CP ${TEM_DIR}/${SUNOS_INI}_med ${TEM_DIR}/${SUNOS_INI}
+            if [ $? -ne 0 ]; then
+                _err_msg_="Could not copy ${TEM_DIR}/${SUNOS_INI}_med to ${TEM_DIR}/${SUNOS_INI}" 
+                abort_script "$_err_msg_"
+            fi
+            $RM -f ${TEM_DIR}/${SUNOS_INI}_med >> /dev/null 2>&1
+            break
+        fi
+    done
+    done < ${TEM_DIR}/fs_process_list
+fi
+
+# Copy back to ${ENIQ_CONF_DIR}/${SUNOS_INI}
+$CP ${TEM_DIR}/${SUNOS_INI} ${ENIQ_CONF_DIR}/${SUNOS_INI}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not copy  ${TEM_DIR}/${SUNOS_INI} to ${ENIQ_CONF_DIR}/${SUNOS_INI}. Exiting." | $TEE -a ${LOGFILE}
+    abort_script "$_err_msg_"
+fi
+}
+
+### Function: delete_fs_rollback ###
+#
+# Dependent on the new config file created during 
+# upgrade - to be also with status completed
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+delete_fs_rollback()
+{
+if [ ! -s ${TEM_DIR}/fs_process_list ]; then
+    _err_msg_="${TEM_DIR}/fs_process_list file for filesystems rollback not found"
+    abort_script "$_err_msg_"
+fi
+
+# Find the NASCLI
+get_nas_info
+
+# Get the storage VLAN IP
+get_storage_ip
+
+# Get a list of parent tags of old filesystems from original storage.ini
+_storage_parent_tags_=`iniget Storage_NAS_FS_LIST -f ${TEM_DIR}/${STORAGE_INI}`
+if [ ! "${_storage_parent_tags_}" ]; then
+        _err_msg_="Could not get a list of parent tags from ${ENIQ_CONF_DIR}/${STORAGE_INI}"
+        abort_script "$_err_msg_"
+fi
+
+if [ ${SERVER_TYPE} == "CO" ]; then
+
+    #Removing unwanted NFS from NAS 
+    while read _entry_; do
+        log_msg -s "Removing ${_entry_} filesystem from NAS" -l ${LOGFILE}
+        $NASCLI delete_fs - ${_entry_} >> /dev/null 2>&1 &
+        #Creating a list of PIDs of above executed background processes
+        $ECHO $! >> ${TEM_DIR}/pid_list
+        if [ $? -ne 0 ]; then
+            _err_msg_="Could not create ${TEM_DIR}/pid_list"
+            abort_script "$_err_msg_"
+        fi
+    done < ${TEM_DIR}/fs_process_list
+
+    log_msg -s "Waiting for the unused NFS to get deleted from NAS" -l ${LOGFILE}
+    while [ -s ${TEM_DIR}/pid_list ]; do
+        for _PID_ in `$CAT ${TEM_DIR}/pid_list`; do
+            $KILL -0 ${_PID_} >> /dev/null 2>&1
+            if [ $? -ne 0 ]; then
+                $SED '/'"${_PID_}"'/d' ${TEM_DIR}/pid_list > ${TEM_DIR}/pid_list_new
+                if [ $? -ne 0 ]; then
+                    _err_msg_="Could not create ${TEM_DIR}/pid_list_new"
+                    abort_script "$_err_msg_"
+                fi
+
+                $CP ${TEM_DIR}/pid_list_new ${TEM_DIR}/pid_list
+                if [ $? -ne 0 ]; then
+                    _err_msg_="Could not copy ${TEM_DIR}/pid_list_new to ${TEM_DIR}/pid_list"
+                    abort_script "$_err_msg_"
+                fi
+             fi
+         done
+         $SLEEP 30
+     done
+fi
+
+# Removing the unwanted entries from storage.ini
+while read _entry_; do
+    for _parent_tag_ in ${_storage_parent_tags_}; do
+       _fs_name_=`iniget ${_parent_tag_} -f ${TEM_DIR}/${STORAGE_INI} -v FS_NAME`
+    _fs_mount_path=`iniget ${_parent_tag_} -f ${TEM_DIR}/${STORAGE_INI} -v MOUNT_PATH`
+    
+    if [ "${_fs_name_}" == "${_entry_}" ]; then
+             [ -f ${TEM_DIR}/${STORAGE_INI}_new ] && $RM -f ${TEM_DIR}/${STORAGE_INI}_new
+        log_msg -s "Removing ${_entry_} entries from ${TEM_DIR}/${STORAGE_INI}" -l ${LOGFILE}
+        ${INIDEL} -g Storage_NAS_FS_LIST -p ${_parent_tag_} -i ${TEM_DIR}/${STORAGE_INI} -o ${TEM_DIR}/${STORAGE_INI}_new
+        if [ $? -ne 0 ]; then
+                    _err_msg_="Could not delete ${_parent_tag_} from ${TEM_DIR}/${STORAGE_INI}"
+            abort_script "$_err_msg_"
+        fi
+
+        # Copy the new file to temp storage.ini file
+        $CP ${TEM_DIR}/${STORAGE_INI}_new ${TEM_DIR}/${STORAGE_INI}
+        if [ $? -ne 0 ]; then
+            _err_msg_="Could not copy ${TEM_DIR}/${STORAGE_INI}_new to ${TEM_DIR}/${STORAGE_INI}"
+            abort_script "$_err_msg_"
+        fi
+        
+        # Copy the new file to /eniq/installation/config/storage.ini file to share NFS over the network
+        $CP ${TEM_DIR}/${STORAGE_INI}_new ${ENIQ_CONF_DIR}/${STORAGE_INI}
+            if [ $? -ne 0 ]; then
+                     _err_msg_="Could not copy ${TEM_DIR}/${STORAGE_INI} to ${ENIQ_CONF_DIR}/${STORAGE_INI}"
+                     abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+                fi
+
+        log_msg -s "Removing ${_fs_name_} mount path from the system" -l ${LOGFILE}
+        $RM -rf ${_fs_mount_path}
+        if [ $? -ne 0 ]; then
+            _err_msg_="Could not able to remove ${_fs_mount_path}"
+            abort_script "$_err_msg_"
+        fi
+        break
+    fi
+    done
+done < ${TEM_DIR}/fs_process_list
+
+#Update SunOS.ini
+update_sunos_ini
+
+#Update nasd_config
+update_nasd_config
+
+}
+
+### Function: get_new_fs_list ###
+#
+# Get a list of new NAS filesystems
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+get_new_fs_list()
+{
+_current_fs_list_=$1
+_new_fs_list_=$2
+
+$RM -rf ${TEM_DIR}/fs_process_list
+
+while read _line_; do
+    $CAT ${_current_fs_list_} | $EGREP ${_line_} >> /dev/null 2>&1
+    if [ $? -ne 0 ]; then
+        $ECHO ${_line_} >> ${TEM_DIR}/fs_process_list
+    fi
+done < ${_new_fs_list_}
+
+if [ -s ${TEM_DIR}/fs_process_list ]; then
+    return 0
+else
+    return 1
+fi
+}
+
+### Function: get_absolute_path ###
+#
+# Determine absolute path to software
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+get_absolute_path()
+{
+_dir_=`$DIRNAME $0`
+SCRIPTHOME=`cd $_dir_ 2>/dev/null && pwd || $ECHO $_dir_`
+}
+
+
+
+### Function: setup_env ###
+#
+# Set up environment variables for script.
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+setup_env()
+{
+if [ ! "${ENIQ_BASE_DIR}" ]; then
+    # Directory on the root filesystem
+    ENIQ_BASE_DIR=/eniq
+fi
+
+# ENIQ Admin Directory
+ENIQ_ADMIN_DIR=${ENIQ_BASE_DIR}/admin
+
+# ENIQ Log Directory
+ENIQ_LOG_DIR=${ENIQ_BASE_DIR}/log
+
+# ENIQ Local Log Directory
+ENIQ_LOCAL_LOG_DIR=${ENIQ_BASE_DIR}/local_logs
+
+# ENIQ Admin Bin Directory
+ENIQ_ADMIN_BIN_DIR=${ENIQ_ADMIN_DIR}/bin
+
+# Main Directory for the Core Installation SW
+ENIQ_INST_DIR=${ENIQ_BASE_DIR}/installation
+
+# Main Directory for the Core Installation SW
+ENIQ_CORE_INST_DIR=${ENIQ_INST_DIR}/core_install
+
+# ENIQ Config Directory
+ENIQ_CONF_DIR=${ENIQ_INST_DIR}/config
+
+CLI_CONF_DIR=${ENIQ_BASE_DIR}/sw/conf
+
+# Source the common functions
+if [ -s $ENIQ_CORE_INST_DIR/lib/common_functions.lib ]; then
+    . $ENIQ_CORE_INST_DIR/lib/common_functions.lib
+else
+    _err_msg_="File $ENIQ_CORE_INST_DIR/lib/common_functions.lib not found"
+    abort_script "$_err_msg_"
+fi
+
+# File containing the type of installation
+INST_TYPE_FILE=${ENIQ_CONF_DIR}/ericsson_use_config
+if [ ! -s ${INST_TYPE_FILE} ]; then
+    _err_msg_="Could not locate file ${INST_TYPE_FILE}"
+    abort_script "$_err_msg_"
+fi
+
+# Read the installation type
+INSTALL_TYPE=`$CAT ${INST_TYPE_FILE} | $AWK -F\= '{print $2}'`
+
+# Templates Directory
+ENIQ_TEMPL_DIR="${ENIQ_CORE_DIR}/templates/${INSTALL_TYPE}"
+
+if [ "${UPGRADE_SW}" ]; then
+    NEW_TEMPL_DIR="${UPGRADE_SW}/core_install/templates/${INSTALL_TYPE}"
+fi
+
+if [ "${ROLLBACK_SW}" ]; then
+    NEW_TEMPL_DIR="${ROLLBACK_SW}/core_install/templates/${INSTALL_TYPE}"
+fi
+
+HNAME=`${MYHOSTNAME}`
+HOST_IP=`$GETENT hosts ${HNAME} | $AWK '{print $1}' | $HEAD -1`
+
+# Get the System User/Group. All directories are owned by this
+SYSUSER=`iniget ENIQ_INSTALL_CONFIG -f ${ENIQ_CONF_DIR}/${SUNOS_INI} -v ENIQ_SYSUSER`
+if [ ! "${SYSUSER}" ]; then
+    _err_msg_="Could not read parameter ENIQ_SYSUSER from file ${ENIQ_CONF_DIR}/${SUNOS_INI}"
+    abort_script "$_err_msg_"
+fi
+
+SYSGROUP=`$ID ${SYSUSER} | $AWK '{print $2}' | $AWK -F\( '{print $2}' | $AWK -F\) '{print $1}'`
+if [ ! "${SYSGROUP}" ]; then
+    _err_msg_="Could not determine group ID of ${SYSUSER}"
+    abort_script "$_err_msg_"
+fi
+
+CURR_SERVER_TYPE=`$CAT $ENIQ_CONF_DIR/installed_server_type | $EGREP -v '^[[:blank:]]*#' | $SED -e 's/ //g'`
+if [ ! "${CURR_SERVER_TYPE}" ]; then
+    _err_msg_="Could not determine which server type this is"
+    abort_script "$_err_msg_"
+fi
+
+$ECHO "${CURR_SERVER_TYPE}" | $EGREP "${CO_SERVER_TYPE}" >> /dev/null 2>&1
+if [ $? -eq 0 ]; then
+    SERVER_TYPE="CO"
+else
+    SERVER_TYPE="${CURR_SERVER_TYPE}"
+fi
+
+# Set up Variable to hold network path to SW
+if [ ! -s $SCRIPTHOME/../lib/iniadd.pl ]; then
+    _err_msg_="Cannot locate $SCRIPTHOME/../lib/iniadd"
+    abort_script "$_err_msg_"
+else
+    INIADD=$SCRIPTHOME/../lib/iniadd.pl
+fi
+
+if [ ! -s $SCRIPTHOME/../lib/inidel.pl ]; then
+    _err_msg_="Cannot locate $SCRIPTHOME/../lib/inidel"
+    abort_script "$_err_msg_"
+else
+    INIDEL=$SCRIPTHOME/../lib/inidel.pl
+fi
+
+# Has the installation to stop at any specific stage?
+if [ -s ${ENIQ_CONF_DIR}/extra_params/debug ]; then
+    set -xv
+    BASH="/usr/bin/bash -xv"
+fi
+
+NAS_TEMP=/tmp/NASd
+FILE_SYSTEMS_LIST=${NAS_TEMP}/NASd_FILE_SYSTEMS_LIST
+}
+
+### Function: update_nasd_config ###
+#
+# Update nasd config file
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+update_nasd_config()
+{
+$RM -rf ${TEM_DIR}/nasd_config_new
+
+if [ -s $ENIQ_BASE_DIR/smf/nasd/nasd_config ]; then
+    $CAT $ENIQ_BASE_DIR/smf/nasd/nasd_config | $EGREP -v '^[[:blank:]]*#' > ${TEM_DIR}/nasd_config_new
+    if [ $? -ne 0 ]; then
+        _err_msg_="Could not copy $ENIQ_BASE_DIR/smf/nasd/nasd_config to ${TEM_DIR}/nasd_config_new"
+        abort_script "$_err_msg_"
+    fi
+fi
+
+if [ "${UPGRADE_SW}" ]; then
+    $CAT ${TEM_DIR}/nasd_config | $EGREP -v '^[[:blank:]]*#' >> ${TEM_DIR}/nasd_config_new
+    if [ $? -ne 0 ]; then
+        _err_msg_="Could not update ${TEM_DIR}/nasd_config_new for updated mounts (upgrade/rollback)"
+        abort_script "$_err_msg_"
+    fi
+fi
+
+if [ "${ROLLBACK_SW}" ] ; then
+        while read _entry_ ; do
+                log_msg -s "Removing $_entry_ from nasd_config_new" -l ${LOGFILE}
+                $ECHO $_entry_ |$EGREP pmdata_eniq_oss_
+                if [ $? -ne 0 ] ;then
+                        $CAT ${TEM_DIR}/nasd_config_new | $EGREP -v "${_entry_}$" > ${TEM_DIR}/nasd_config_new_temp
+                else
+                        $CAT ${TEM_DIR}/nasd_config_new | $EGREP -v "${_entry_}" > ${TEM_DIR}/nasd_config_new_temp
+                fi
+                $CP ${TEM_DIR}/nasd_config_new_temp ${TEM_DIR}/nasd_config_new && $RM ${TEM_DIR}/nasd_config_new_temp
+                if [ $? -ne 0 ]; then
+                        _err_msg_="Could not update ${TEM_DIR}/nasd_config_new"
+                        abort_script "$_err_msg_"
+                fi
+        done < $TEM_DIR/fs_process_list
+fi
+
+# Update nasd config file
+log_msg -q -s "Updating $ENIQ_BASE_DIR/smf/nasd/nasd_config for updated mounts (upgrade/rollback)\n" -l ${LOGFILE}
+$CAT ${TEM_DIR}/nasd_config_new | $SORT -u > $ENIQ_BASE_DIR/smf/nasd/nasd_config
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not update $ENIQ_BASE_DIR/smf/nasd/nasd_config"
+    abort_script "$_err_msg_"
+fi
+
+$CP -rp ${ENIQ_BASE_DIR}/smf/nasd/nasd_config ${FILE_SYSTEMS_LIST}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not update ${FILE_SYSTEMS_LIST}"
+    abort_script "$_err_msg_"
+fi
+}
+
+### Function: restart_hostsync ###
+#
+# Restart HosySync service
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+restart_hostsync()
+{
+_hostsync_smf_str_=`iniget HOST_SYNC_DAEMON -f ${ENIQ_CONF_DIR}/${SUNOS_INI} -v HOST_SYNC_SERVICE_STR`
+
+if [ ! "${_hostsync_smf_str_}" ]; then
+    _err_msg_="Could not read host_syncd Service string from ${ENIQ_CONF_DIR}/${SUNOS_INI}"
+    abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+fi
+
+log_msg -s "Restarting ${_hostsync_smf_str_} service." -l ${LOGFILE}
+
+_service_state=`$SYSTEMCTL show ${_hostsync_smf_str_} -p ActiveState | $AWK -F "=" '{print $2}'`
+log_msg -s "The current status of ${_hostsync_smf_str_} is ${_service_state}" -l ${LOGFILE}
+$SYSTEMCTL restart ${_hostsync_smf_str_}
+if [ $? != 0 ]; then
+    _err_msg_="Could not restart ${_hostsync_smf_str_}."
+    abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+fi
+$SLEEP 30
+_service_state_recheck_=`$SYSTEMCTL show ${_hostsync_smf_str_} -p ActiveState | $AWK -F "=" '{print $2}'`
+if [ ${_service_state_recheck_} == "inactive" ]; then
+    $ECHO "${_hostsync_smf_str_} service failed to restart"
+fi
+
+log_msg -s "${_hostsync_smf_str_} service is restarted successfully." -l ${LOGFILE}
+}
+
+### Function: update_temp_nasd_config ###
+#
+# mounts new fs and updates temp nasd conf file with new entry
+#
+# Arguments:
+#   specific file system name and storage.ini file
+# Return Values:
+#   none
+update_temp_nasd_config()
+{
+_ini_parent_tag_=$1
+_ini_file_=$2
+
+_nas_alias_=`iniget ${_ini_parent_tag_} -f ${_ini_file_} -v NFS_HOST`
+_nas_dir_=`iniget ${_ini_parent_tag_} -f ${_ini_file_} -v SHARE_PATH`
+_mountpoint_=`iniget ${_ini_parent_tag_} -f ${_ini_file_} -v MOUNT_PATH`
+if [ ! "${_nas_alias_}" -o ! "${_mountpoint_}" -o ! "${_nas_dir_}" ]; then
+    _err_msg_= "Could not filter required mount info from ${_ini_file_}"
+    abort_script "$_err_msg_" 
+fi
+
+# Create the mountpoint if its not there
+if [ -n "${UPGRADE_SW}" ] ;then
+    if [ ! -d ${_mountpoint_} ]; then
+        log_msg -q -s "Making mountpoint - ${_mountpoint_}" -l $LOGFILE
+        $MKDIR -p ${_mountpoint_}
+        if [ $? -ne 0 ]; then
+            _err_msg_="Could not create ${_mountpoint_}"
+            abort_script "$_err_msg_" 
+        fi
+    fi
+
+    _mount_=0
+    log_msg -q -s "Checking if ${_mountpoint_} is already mounted" -l ${LOGFILE}
+    _mount_exists_=`$MOUNT | $GREP "${_mountpoint_}" | $AWK '{print $1}'`
+    if [ ! "${_mount_exists_}" ]; then
+        _mount_=1
+    fi
+
+    # Mount the filesystem
+    if [ ${_mount_} -eq 1 ]; then
+        log_msg -s "Mounting ${_nas_alias_}:${_nas_dir_} on ${_mountpoint_}" -l ${LOGFILE}
+        $MOUNT -t nfs ${_nas_alias_}:${_nas_dir_} ${_mountpoint_} >> /dev/null 2>&1
+        if [ $? -ne 0 ]; then
+            _err_msg_="Could not mount ${_nas_alias_}:${_nas_dir_} on ${_mountpoint_}"
+            abort_script "$_err_msg_"
+        fi
+        
+        log_msg -q -s "Changing ownership of ${_mountpoint_} to ${SYSUSER}:${SYSGROUP}" -l ${LOGFILE}
+
+     
+        $CHOWN ${SYSUSER}:${SYSGROUP} ${_mountpoint_} >> /dev/null 2>&1
+        if [ $? -ne 0 ]; then
+            _err_msg_="Could not change ownership of ${_mountpoint_} to ${SYSUSER}:${SYSGROUP}"
+            abort_script "$_err_msg_"
+        fi
+    else
+        log_msg -q -s "${_mountpoint_} is already mounted" -l ${LOGFILE}
+    fi
+
+    $ECHO "${_nas_alias_}::${_nas_dir_}::${_mountpoint_}" >> ${TEM_DIR}/nasd_config    
+fi
+}
+
+### Function: usage_msg ###
+#
+# Print out the usage message
+#
+# Arguments:
+#    none
+# Return Values:
+#    none
+usage_msg() 
+{
+$CLEAR
+$ECHO "
+Usage: `$BASENAME $0` { -p <eniq_upg_sw_dir> | -r <eniq_rollback_sw_dir> }
+                        [ -b <eniq_base_dir> ] [ -l <path_to_logfile> ]
+                      
+options:
+
+-b  : Optional parameter specifying the full path to where the ENIQ
+      BASEDIR directory is (eg. /eniq). If not specified, then the 
+      script will assume the the base directory is /eniq
+
+-p  : Parameter specifying the full path to the directory 
+      containing the ENIQ BASE SW directory structure to be used for upgrade.
+      This parameter can not be used in conjunction with \'-r\' parameter
+
+-r  : Parameter specifying the full path to the directory 
+      containing the ENIQ BASE SW directory structure to be used for rollback.
+      This parameter can not be used in conjunction with the \'-p\' parameter
+      
+-l  : Optional parameter specifying the full path to logfile. If not specified, a 
+      logfile will be created in ${ENIQ_BASE_DIR}/log/upgrade/nas_update.log
+"   
+ 
+}
+
+# ********************************************************************
+#
+#   Main body of program
+#
+# ********************************************************************
+#
+RUN_TIME=`$DATE '+%Y-%b-%d_%H.%M.%S'`
+
+# Determine absolute path to software
+get_absolute_path
+
+# Check that the effective id of the user is root
+check_id $DEFAULT_USER
+
+while getopts ":b:l:p:r:fa" arg; do
+  case $arg in
+    a) ACTION_TYPE="post_upgrade"
+       ;;    
+    b) ENIQ_BASE_DIR="$OPTARG"
+       ;;
+    l) LOGFILE="$OPTARG"
+       ;;
+    p) UPGRADE_SW="$OPTARG"
+       ;;      
+    r) ROLLBACK_SW="$OPTARG"    
+       ;;
+    f) FS_OPER_FLAG="Y"
+       ;;
+    \?) exit 1
+       ;;
+  esac
+done
+shift `expr $OPTIND - 1`
+
+# Check that we got the required params
+if [ ! "${UPGRADE_SW}" -a ! "${ROLLBACK_SW}" ]; then
+       usage_msg
+       exit 1
+fi 
+
+if [ "${UPGRADE_SW}" -a "${ROLLBACK_SW}" ]; then
+       usage_msg
+       exit 1
+fi 
+
+# Update the FS operations flag as per the action
+if [ "${FS_OPER_FLAG}" == "Y" ]; then
+    if [ "${UPGRADE_SW}" ]; then
+        UPDATE_FLAG="true"
+    else
+        UPDATE_FLAG="false" 
+    fi
+else
+    UPDATE_FLAG="false"
+fi
+
+# Set up environment variables for script.
+setup_env
+
+if [ ! "${LOGFILE}" ]; then
+    LOGFILE=${ENIQ_LOCAL_LOG_DIR}/installation/nas_update.log
+fi    
+
+# Check/Create Logfile
+chk_create_logfile
+
+log_msg -q -h -s "${RUN_TIME} - Updating NAS Filesystems" -l ${LOGFILE}
+
+# Check all required files/scripts exist on the server
+check_files_and_scripts
+
+# Create a temporary Directory
+TEM_DIR=/tmp/update_storage_ini.$$.$$
+$RM -rf ${TEM_DIR}
+$MKDIR -p ${TEM_DIR}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not create directory $TEM_DIR"
+    abort_script "$_err_msg_"
+fi
+
+# Restarting host_syncd service 
+restart_hostsync
+
+# Get a list of NAS filesystems from the templates SW
+build_new_fs_list
+
+# Get a list of the existing NAS filesystems
+build_current_fs_list
+
+# Upgrade mode
+if [ "${UPGRADE_SW}" ] ; then 
+    get_new_fs_list ${TEM_DIR}/storage_ini_curr_fs_list ${TEM_DIR}/storage_ini_new_fs_list
+    if [ $? -eq 0 ]; then
+        create_new_fs
+    else
+        log_msg -s "\nNo NAS filesystems need to be created" -l ${LOGFILE}
+    fi
+    
+    # Share out the new FS
+    if [ "${SERVER_TYPE}" != "CO" ]; then
+            $RM -rf ${TEM_DIR}/nasd_config    
+        
+            # Need to restart hostsync so that storage.ini is up to date
+        _hostsync_smf_str_=`iniget HOST_SYNC_DAEMON -f ${ENIQ_CONF_DIR}/${SUNOS_INI} -v HOST_SYNC_SERVICE_STR`
+        if [ ! "${_hostsync_smf_str_}" ]; then
+        _err_msg_="Could not read host_syncd Service string from ${ENIQ_CONF_DIR}/${SUNOS_INI}"
+        abort_script "$_err_msg_"
+        fi
+        
+         # Get the pool name
+        _nas_pool_=`iniget NAS_DETAILS -f ${ENIQ_CONF_DIR}/${SUNOS_INI} -v NAS_Primary_Storage_Pool`
+        if [ ! "${_nas_pool_}" ]; then
+            _err_msg_="Failed to get NAS primary pool name from ${ENIQ_CONF_DIR}/${SUNOS_INI}"
+            abort_script "$_err_msg_"
+        fi
+        
+        _storage_list_=`iniget Storage_NAS_FS_LIST -f ${ENIQ_CONF_DIR}/${STORAGE_INI}`
+        if [ ! "${_storage_list_}" ]; then
+            _err_msg_="Failed to get a list filesystems from ${ENIQ_CONF_DIR}/${STORAGE_INI}"
+            abort_script "$_err_msg_"
+        fi
+        
+            # Restart hostsync
+              restart_hostsync
+        
+            # Find the NASCLI
+            get_nas_info
+        
+            # Get the storage VLAN IP
+            get_storage_ip
+    
+        # List the current shares
+        log_msg -s "\nGathering a list of existing shares" -l ${LOGFILE}
+        $ECHO "Please wait while this list is being built..."       
+        $NASCLI list_shares - | $AWK '{print $1, $3}' > ${TEM_DIR}/list_shares
+        if [ ! -s ${TEM_DIR}/list_shares ]; then
+            _err_msg_="Failed to get a list of shares from the NAS"
+            abort_script "$_err_msg_"
+        fi
+                log_msg -q -s "Successfully built a list of existing shares\n" -l ${LOGFILE}
+         
+            _upd_flag_=0
+            for _fs_ in ${_storage_list_}; do
+            _fs_name_=`iniget ${_fs_} -f ${ENIQ_CONF_DIR}/${STORAGE_INI} -v FS_NAME`
+            _share_path_=`iniget ${_fs_} -f ${ENIQ_CONF_DIR}/${STORAGE_INI} -v SHARE_PATH`
+            _share_opts_=`iniget ${_fs_} -f ${ENIQ_CONF_DIR}/${STORAGE_INI} -v NFS_SHARE_OPTIONS`
+                _mount_path_=`iniget ${_fs_} -f ${ENIQ_CONF_DIR}/${STORAGE_INI} -v MOUNT_PATH`
+            if [ ! "${_fs_name_}" -o ! "${_share_path_}" -o ! "${_share_opts_}" ]; then
+            _err_msg_= "Could not filter required mount info from ${ENIQ_CONF_DIR}/${STORAGE_INI}"
+            abort_script "$_err_msg_" 
+            fi
+              
+            #Checking if the NFS is shared with host ip  
+            $EGREP "${_share_path_}+[[:blank:]]+${INTF_IP}/[0-9][0-9][[:blank:]]*$" ${TEM_DIR}/list_shares >> /dev/null 2>&1
+            if [ $? -ne 0 ]; then
+                    # Checking if the NFS is shared over network ip through Co-ordinator
+                    $EGREP "${_share_path_}+[[:blank:]]+${_network_ip_}/[0-9][0-9][[:blank:]]*$" ${TEM_DIR}/list_shares >> /dev/null 2>&1
+                    if [ $? -ne 0 ]; then 
+                #If NFS is not shared already, then sharing it with host ip 
+            log_msg -s "Adding ${INTF_IP} as a client of NAS for ${_fs_name_}" -l ${LOGFILE} 
+                $NASCLI add_client - ${INTF_IP} ${_share_opts_} ${_fs_name_}
+                if [ $? -ne 0 ]; then
+                    _err_msg_="Could not share ${_fs_name_} to ${INTF_IP}"
+                     abort_script "$_err_msg_" 
+                    fi
+                    _upd_flag_=1
+                    fi  
+
+                    if [ "${UPDATE_FLAG}" == "true" ]; then
+                        #$ECHO "${_mount_path_}" >> ${TEM_DIR}/fs_process_list 
+                        $ECHO "${_fs_name_}" >> ${TEM_DIR}/fs_process_list
+                    fi
+            fi
+            update_temp_nasd_config ${_fs_} ${ENIQ_CONF_DIR}/${STORAGE_INI}
+
+            done 
+            
+        if [ ${_upd_flag_} -eq 0 ]; then
+            log_msg -s "\nNo NAS shares need to be created" -l ${LOGFILE} 
+        fi
+
+        # Update NASd config file
+        update_nasd_config
+    fi
+
+        if [ "${UPDATE_FLAG}" == "true" ]; then
+       
+            # Disable NASd service 
+            disable_nasd_svc
+           
+            # Enable NASd service
+            enable_nasd_svc
+
+            # Check that NASd Milestone is online
+            check_nasd_milestone_online ${ENIQ_CONF_DIR} ${SUNOS_INI} ${ENIQ_BASE_DIR}
+            if [ $? -ne 0 ]; then
+                _err_msg_="NASd milestone is not in a correct state to proceed"
+                abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+            fi
+
+            if [ -f ${TEM_DIR}/fs_process_list ]; then
+                # Update SunOS.ini file
+                update_sunos_ini
+            fi 
+
+        fi
+fi
+
+# Rollback mode 
+if [ "${ROLLBACK_SW}" ] ; then
+    get_new_fs_list ${TEM_DIR}/storage_ini_new_fs_list ${TEM_DIR}/storage_ini_curr_fs_list
+    if [ $? -eq 0 ]; then
+        log_msg -s "List of filesystems to be processed:" -l ${LOGFILE}
+        $CAT $TEM_DIR/fs_process_list | $TEE -a ${LOGFILE}
+    else
+        log_msg -s "No NAS filesystems need to be removed" -l ${LOGFILE}
+    fi
+    
+        # Copy storage.ini to Temp location
+    $CP ${CLI_CONF_DIR}/${STORAGE_INI} ${TEM_DIR}/${STORAGE_INI}
+    if [ $? -ne 0 ]; then
+        _err_msg_="Could not copy ${CLI_CONF_DIR}/${STORAGE_INI} to ${TEM_DIR}/${STORAGE_INI}. Exiting." | $TEE -a ${LOGFILE}
+        abort_script "${_err_msg_}"
+    fi
+    
+    if [ "${SERVER_TYPE}" == "CO" ]; then
+        $PERL ${ENIQ_CORE_INST_DIR}/lib/get_ip_order.pl -f ${TEM_DIR}/all_server_list
+        if [ $? -ne 0 ]; then
+            _err_msg_="Could not get list of servers"
+            abort_script "${_err_msg_}"
+        fi
+        
+        _server_ip_=$($CAT ${TEM_DIR}/all_server_list | $EGREP -v 'stats_coordinator|eniq_stats' | $AWK -F":" '{print $1}')
+        #_service_command_="$BASH ${ENIQ_CORE_INST_DIR}/templates/${INSTALL_TYPE}/admin/bin/manage_storage_fs.bsh -r /eniq/installation"
+                _service_command_="$BASH ${ENIQ_CORE_INST_DIR}/templates/${INSTALL_TYPE}/admin/bin/manage_storage_fs.bsh -r /eniq/installation -l ${LOGFILE}"
+
+        # Run only on MultiBlade. Skip on Standalone.
+        if [ -n "${_server_ip_}" ]; then
+            for _ip_address_ in `$ECHO ${_server_ip_}`; do
+                log_msg -s "Running manage_storage_fs.bsh on ${_ip_address_} server" -l ${LOGFILE}
+                #run_remote_cmd "${_ip_address_}" "${_service_command_}" "${LOGFILE}"
+                                run_remote_cmd "${_ip_address_}" "${_service_command_}"
+                if [ $? -ne 0 ]; then
+                    _err_msg_="ERROR while running manage_storage_fs.bsh on ${_ip_address_}"
+                    abort_script "${_err_msg_}"
+                fi
+            done
+        fi
+    fi
+    
+    _nas_smf_str_=`iniget NAS_DAEMON -f ${ENIQ_CONF_DIR}/${SUNOS_INI} -v NAS_SERVICE_STR`
+ 
+        #Disable NASd
+        disable_nasd_svc 
+    
+    # Remove NAS filesystems
+    if [ -s $TEM_DIR/fs_process_list ]; then
+        delete_fs_rollback
+        fi
+    
+    #Share NFS over subnet
+        if [ "${ACTION_TYPE}" == "post_upgrade" -o -f ${ENIQ_CONF_DIR}/add_client_net_ip ]; then
+            nfs_subnet_share
+    fi
+   
+        #Enable NASd
+        enable_nasd_svc
+
+    # Check that NASd Milestone is online
+        check_nasd_milestone_online ${ENIQ_CONF_DIR} ${SUNOS_INI} ${ENIQ_BASE_DIR}
+        if [ $? -ne 0 ]; then
+            _err_msg_="NASd milestone not in a correct state to continue"
+            abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+        fi
+    
+    # Copy ${TEM_DIR}/${STORAGE_INI} to ${CLI_CONF_DIR}/${STORAGE_INI}
+    log_msg -s "Copying back ${TEM_DIR}/${STORAGE_INI} to ${CLI_CONF_DIR}/${STORAGE_INI}" -l ${LOGFILE}
+    $CP -p ${TEM_DIR}/${STORAGE_INI} ${CLI_CONF_DIR}/${STORAGE_INI}
+    if [ $? -ne 0 ]; then
+        _err_msg_="Could not copy ${TEM_DIR}/${STORAGE_INI} to ${CLI_CONF_DIR}/${STORAGE_INI}"
+        abort_script "$_err_msg_"
+    fi
+    
+    # Restart HosySync to sync storage.ini file between /eniq/sw/conf and /eniq/installation/config
+    restart_hostsync
+fi
+
+$RM -rf ${TEM_DIR}
+$RM -rf /var/tmp/nas_share_removed
+
+exit 0

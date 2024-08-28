@@ -1,0 +1,551 @@
+#!/bin/bash
+# ********************************************************************
+# Ericsson Radio Systems AB                                     SCRIPT
+# ********************************************************************
+#
+#
+# (c) Ericsson Radio Systems AB 2017 - All rights reserved.
+#
+# The copyright to the computer program(s) herein is the property
+# of Ericsson Radio Systems AB, Sweden. The programs may be used 
+# and/or copied only with the written permission from Ericsson Radio 
+# Systems AB or in accordance with the terms and conditions stipulated 
+# in the agreement/contract under which the program(s) have been 
+# supplied.
+#
+# ********************************************************************
+# Name    : post_upgrade_configuration.bsh
+# Date    : 12/10/2023
+# Revision: main\11
+# Purpose : Script that will centrally run the post_upgrade.bsh
+#			script across all nodes in the deployment.
+#
+# Usage   : post_upgrade_configuration.bsh [ -N ]
+#										
+#
+# ********************************************************************
+#
+# 	Command Section
+#
+# ********************************************************************
+AWK=/usr/bin/awk
+BASENAME=/usr/bin/basename
+CAT=/usr/bin/cat
+CHMOD=/usr/bin/chmod
+CHOWN=/usr/bin/chown
+CLEAR=/usr/bin/clear
+CP=/usr/bin/cp
+DATE=/usr/bin/date
+DIRNAME=/usr/bin/dirname
+DOMAINNAME=/usr/bin/domainname
+DTCONFIG=/usr/dt/bin/dtconfig
+ECHO=/usr/bin/echo
+EGREP=/usr/bin/egrep
+EJECT=/usr/bin/eject
+ENV=/usr/bin/env
+EXPR=/usr/bin/expr
+FIND=/usr/bin/find
+FORMAT=/usr/sbin/format
+FUSER=/usr/sbin/fuser
+GETENT=/usr/bin/getent
+GETTEXT=/usr/bin/gettext
+GREP=/usr/bin/grep
+GROUPADD=/usr/sbin/groupadd
+GTAR=/usr/sfw/bin/gtar
+GZCAT=/usr/bin/gzcat
+HEAD=/usr/bin/head
+MYHOSTNAME=/usr/bin/hostname
+ID=/usr/bin/id
+INIT=/usr/sbin/init
+LS=/usr/bin/ls
+MKDIR=/usr/bin/mkdir
+MORE=/usr/bin/more
+MV=/usr/bin/mv
+PGREP=/usr/bin/pgrep
+PING=/usr/sbin/ping
+PKGADD=/usr/sbin/pkgadd
+PKGINFO=/usr/bin/pkginfo
+PRTCONF=/usr/sbin/prtconf
+PWD=/usr/bin/pwd
+RM=/usr/bin/rm
+RCP=/usr/bin/rcp
+ROLES=/usr/bin/roles
+RSH=/usr/bin/rsh
+SED=/usr/bin/sed
+SLEEP=/usr/bin/sleep
+SORT=/usr/bin/sort
+SSH=/usr/bin/ssh
+SU=/usr/bin/su
+TAIL=/usr/bin/tail
+TEE=/usr/bin/tee
+TOUCH=/usr/bin/touch
+TPUT=/usr/bin/tput
+UADMIN=/usr/sbin/uadmin
+UNAME=/usr/bin/uname
+USERADD=/usr/sbin/useradd
+VOLD=/usr/sbin/vold
+WC=/usr/bin/wc
+ZFS=/usr/sbin/zfs
+ZPOOL=/usr/sbin/zpool
+
+# ********************************************************************
+#
+#       Configuration Section
+#
+# ********************************************************************
+
+# Default user
+DEFAULT_USER=root
+
+# Coordinator server list
+CO_SERVER_TYPE="eniq_coordinator|stats_coordinator|eniq_events|eniq_stats|eniq_iqw|son_coordinator|eniq_es"
+
+# ********************************************************************
+#
+#       Pre-execution Operations
+#
+# ********************************************************************
+
+
+# ********************************************************************
+#
+# 	Functions
+#
+# ********************************************************************
+### Function: abort_script ###
+#
+#   This will is called if the script is aborted thru an error
+#   error signal sent by the kernel such as CTRL-C or if a serious
+#   error is encountered during runtime
+#
+# Arguments:
+#       $1 - Error message from part of program (Not always used)
+# Return Values:
+#       none
+abort_script()
+{
+_err_time_=`$DATE '+%Y-%b-%d_%H.%M.%S'`	
+
+if [ "$1" ]; then
+    _err_msg_="${_err_time_} - $1"
+else
+    _err_msg_="${_err_time_} - Script aborted.......\n"    
+fi
+if [ "${LOGFILE}" ]; then
+    $ECHO "\nERROR : ${_err_msg_}\n" | $TEE -a ${LOGFILE}
+else
+    $ECHO "\nERROR : ${_err_msg_}\n"
+fi
+
+cd $SCRIPTHOME
+$RM -rf ${TEM_DIR}
+
+if [ "$2" ]; then
+    ${2}
+else
+   exit 1
+fi
+}
+
+### Function: check_files_scripts ###
+#
+# Check all required files and scripts exist
+#
+# Arguments:
+#	none
+# Return Values:
+#	none
+check_files_scripts()
+{
+log_msg -s "\nChecking for required files and scripts" -l $LOGFILE
+
+if [ ! -s ${POST_UPGRADE_SCRIPT} ]; then
+	_err_msg_="${POST_UPGRADE_SCRIPT} script not found"
+	abort_script "${_err_msg_}"
+fi
+
+if [ ! -s ${ENIQ_CORE_INST_DIR}/lib/get_ip_order.pl ]; then
+	_err_msg_="${ENIQ_CORE_INST_DIR}/lib/get_ip_order.pl script not found"
+	abort_script "${_err_msg_}"
+fi
+
+if [ ! -s ${UNPACK_CORE_SW} ]; then
+	_err_msg_="${UNPACK_CORE_SW} script not found"
+	abort_script "${_err_msg_}"
+fi
+
+}
+
+### Function: chk_create_logfile ###
+#
+# Check/Create Logfile
+#
+# Arguments:
+#	none
+# Return Values:
+#	none
+chk_create_logfile()
+{
+# The LOGFILE is set by default, and cannot be overwritten
+# This is a design decision so that the logs are centralled
+# controlled for this script
+LOGFILE=${LOGFILE_DIR}/post_upgrade.log
+	
+$MKDIR -p `$DIRNAME ${LOGFILE}`
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not create directory `$DIRNAME ${LOGFILE}`"
+     abort_script "${_err_msg_}"
+fi	
+
+$TOUCH -a ${LOGFILE}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not write to file ${LOGFILE}"
+    abort_script "${_err_msg_}"
+fi	
+}
+
+### Function: check_id ###
+#
+#   Check that the effective id of the user is correct
+#   If not print error msg and exit.
+#
+# Arguments:
+#       $1 : User ID name
+# Return Values:
+#       none
+check_id()
+{
+_check_id_=`$ID | $AWK -F\( '{print $2}' | $AWK -F\) '{print $1}'`
+if [ "$_check_id_" != "$1" ]; then
+    _err_msg_="You must be $1 to execute this script."
+    abort_script "${_err_msg_}"
+fi
+}
+
+### Function: get_absolute_path ###
+#
+# Determine absolute path to software
+#
+# Arguments:
+#	none
+# Return Values:
+#	none
+get_absolute_path() 
+{
+_dir_=`$DIRNAME $0`
+SCRIPTHOME=`cd $_dir_ 2>/dev/null && pwd || $ECHO $_dir_`
+}
+
+### Function: get_deployment_order ###
+#
+# Get the order of the deployment
+# for starting and stopping services
+#
+# Arguments:
+#	none
+# Return Values:
+#	none
+get_deployment_order()
+{
+$RM -rf ${TEM_DIR}/server_order_list
+
+log_msg -s "\nGetting the IP addresses of all servers in the deployment" -l $LOGFILE
+
+# Get an ordered list of servers based on the server_list file
+/usr/bin/perl ${ENIQ_CORE_INST_DIR}/lib/get_ip_order.pl -f ${TEM_DIR}/server_order_list
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not get an ordered list of servers"
+    abort_script "${_err_msg_}"
+fi
+}
+
+### Function: run_post_upgrade ###
+#
+# Run the post_upgrade script on all servers
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+run_post_upgrade()
+{
+local _server_det_file_=$1
+
+if [ ! "${NO_CONFIRM}" ]; then
+     user_confirm "run ${POST_UPGRADE_SCRIPT} and ${UNPACK_CORE_SW} " "${_server_det_file_}"
+     if [ "$USER_CONF" == "No" ]; then
+         $RM -rf ${TEM_DIR}
+         exit 0
+     fi    
+fi
+
+# Build up the command to use for stopping the services
+local _post_upg_cmd_="$BASH ${POST_UPGRADE_SCRIPT} -l ${LOGFILE}"
+
+for _line_ in `$CAT ${_server_det_file_}`; do
+	unset _ip_address_ _serv_hostname_ _count_
+	local _ip_address_ _serv_hostname_ _count_
+	_count_=`$ECHO "${_line_}" | grep -o "::" | wc -l`
+
+	if [ "${_ip_type_}" == "IPv6" ] && [ "${_count_}" == 3 ]; then
+		_ip_address_=`$ECHO ${_line_} | grep -oE '([a-fA-F0-9]{1,4}::?){1,7}[a-fA-F0-9]{1,4}' | head -n 1 | awk -F "::" '{ print $1 "::" $2}'`
+		_serv_hostname_=`$ECHO ${_line_} | $AWK -F"::" '{print $3}'`
+	else
+		_ip_address_=`$ECHO ${_line_} | $AWK -F"::" '{print $1}'`
+		_serv_hostname_=`$ECHO ${_line_} | $AWK -F"::" '{print $2}'`
+	fi
+	if [ ! "${_ip_address_}" -o ! "${_serv_hostname_}" ]; then
+		_err_msg_="Could not read required info from ${_server_det_file_}"
+		abort_script "${_err_msg_}"
+	fi
+	
+	# If the IP found in the order file matches my IP,
+	# then I better run the command locally - no need to ssh
+	log_msg -h -s "Running ${POST_UPGRADE_SCRIPT} on ${_serv_hostname_}" -l $LOGFILE 
+	if [ "${_ip_address_}" == "${HOST_IP}" ]; then
+		${_post_upg_cmd_}
+		if [ $? -ne 0 ]; then
+			_err_msg_="Issue encountered running ${POST_UPGRADE_SCRIPT} on ${_serv_hostname_}"
+			abort_script "${_err_msg_}"
+		fi
+	else
+		run_remote_cmd "${_serv_hostname_}" "${_post_upg_cmd_}" "$LOGFILE"
+		if [ $? -ne 0 ]; then
+			_err_msg_="Issue encountered running ${POST_UPGRADE_SCRIPT} on ${_serv_hostname_}"
+			abort_script "${_err_msg_}"
+		fi
+	fi
+done	
+}
+
+### Function: setup_env ###
+#
+# Set up environment variables for script.
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+setup_env()
+{
+if [ ! "${ENIQ_BASE_DIR}" ]; then
+    # Directory on the root filesystem
+    ENIQ_BASE_DIR=/eniq
+fi
+
+# ENIQ Log Directory
+ENIQ_LOG_DIR=${ENIQ_BASE_DIR}/log
+LOGFILE_DIR="${ENIQ_LOG_DIR}/upgrade"
+
+# Main Directory for the Core Installation SW
+ENIQ_INST_DIR=${ENIQ_BASE_DIR}/installation
+
+# Main Directory for the Core Installation SW
+ENIQ_CORE_INST_DIR=${ENIQ_INST_DIR}/core_install
+
+# ENIQ Config Directory
+ENIQ_CONF_DIR=${ENIQ_INST_DIR}/config
+
+# ENIQ Admin Directory
+ENIQ_ADMIN_DIR=${ENIQ_BASE_DIR}/admin
+
+# Get server type
+CURR_SERVER_TYPE=`$CAT $ENIQ_CONF_DIR/installed_server_type`
+if [ ! "${CURR_SERVER_TYPE}" ]; then
+    _err_msg_="Could not read $ENIQ_CONF_DIR/installed_server_type"
+    abort_script "${_err_msg_}" 
+fi
+
+$ECHO "${CURR_SERVER_TYPE}" | $EGREP "${CO_SERVER_TYPE}" >> /dev/null 2>&1
+if [ $? -eq 0 ]; then
+	SERVER_TYPE="CO"
+else
+	SERVER_TYPE="${CURR_SERVER_TYPE}"
+fi
+
+# File containing the type of OSS installation. Eg. oss or single
+INST_TYPE_FILE=${ENIQ_CONF_DIR}/ericsson_use_config
+if [ ! -s "${INST_TYPE_FILE}" ]; then
+    _err_msg_="ENIQ install type not defined in ${INST_TYPE_FILE}"
+    abort_script "${_err_msg_}"
+fi
+# Read the installation type
+INSTALL_TYPE=`$CAT ${INST_TYPE_FILE} | $AWK -F\= '{print $2}'`
+
+# Post upgrade config script
+POST_UPGRADE_SCRIPT="${ENIQ_ADMIN_DIR}/bin/post_upgrade.bsh"
+
+#unpack_core_se.bsh script
+
+UNPACK_CORE_SW="${ENIQ_CORE_INST_DIR}/bin/unpack_core_sw.bsh"
+
+HNAME=`${MYHOSTNAME}`
+HOST_IP=`$MYHOSTNAME -i | $AWK '{print $1}' | $HEAD -1`
+
+# File to hold current Upgrade stage information
+STAGEFILE=${ENIQ_CORE_INST_DIR}/etc/current_upgrade_stage
+STAGEFILE_PLATFORM_ONLY_UPGRADE=${ENIQ_CORE_INST_DIR}/etc/current_upgrade_platform_only_stage
+}
+
+### Function: usage_msg ###
+#
+#   Print out the usage message
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+usage_msg()
+{
+$CLEAR
+$ECHO "
+Usage: `$BASENAME $0` [ -b <eniq_base_dir> ] 
+
+options:
+    
+-b  : Optional parameter specifying the full path to where the ENIQ
+      BASEDIR directory is (eg. /eniq). If not specified, then the
+      script will assume the the base directory is /eniq
+"
+}
+
+### Function: user_confirm ###
+#
+# Get confirmation from user to proceed with snapshot action
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+user_confirm()
+{
+local _conf_msg_=$1
+local _server_det_file_=$2
+	
+while :; do
+    unset USER_CONF
+    $CLEAR
+    $ECHO "\nDeployed Servers\n================"
+	
+    rm -rf ${VAR_TMP_DIR}/server_hostname.txt
+	for _line_ in `$CAT ${_server_det_file_}`; do
+		unset _serv_hostname_ _count_
+		local _serv_hostname_ _count_
+		
+		_count_=`$ECHO "${_line_}" | grep -o "::" | wc -l`
+
+		if [ "${_ip_type_}" == "IPv6" ] && [ "${_count_}" == 3 ]; then
+			_serv_hostname_=`$ECHO ${_line_} | $AWK -F"::" '{print $3}'`
+		else
+			_serv_hostname_=`$ECHO ${_line_} | $AWK -F"::" '{print $2}'`
+		fi
+		if [ ! "${_serv_hostname_}" ]; then
+			_err_msg_="Could not read required info from ${_server_det_file_}"
+			abort_script "${_err_msg_}"
+		fi
+		$ECHO ${_serv_hostname_} >> ${VAR_TMP_DIR}/server_hostname.txt
+	done
+	$CAT ${VAR_TMP_DIR}/server_hostname.txt
+	
+    rm -rf ${VAR_TMP_DIR}/server_hostname.txt
+    $ECHO "\nAre you sure you wish to ${_conf_msg_} on the above servers?"
+    $ECHO "Enter [Yes | No] (case sensitive) : \c"
+    read USER_CONF
+    if [ "$USER_CONF" == "Yes" -o "$USER_CONF" == "No" ]; then
+         break
+    fi
+done
+}
+
+# ********************************************************************
+#
+# 	Main body of program
+#
+# ********************************************************************
+#
+# Determine absolute path to software
+get_absolute_path
+
+# Check that the effective id of the user is root
+check_id $DEFAULT_USER
+
+while getopts ":b:N" arg; do
+  case $arg in
+    b) 	ENIQ_BASE_DIR="$OPTARG"
+       	;;
+    N) 	NO_CONFIRM="YES" 
+       	;;
+   \?) 	usage_msg
+   		exit 1
+       	;;
+  esac
+done
+shift `expr $OPTIND - 1`
+
+# Set up environment variables for script.
+setup_env
+
+# Only run on the coordinator
+if [ "${SERVER_TYPE}" != "CO" ]; then
+	_err_msg_="$0 can not be executed on ${SERVER_TYPE} server types"
+    abort_script "${_err_msg_}"
+fi
+
+# Source the common functions
+if [ -s ${SCRIPTHOME}/../lib/common_functions.lib ]; then
+    . ${SCRIPTHOME}/../lib/common_functions.lib
+else
+    _err_msg_="File ${SCRIPTHOME}/../lib/common_functions.lib not found"
+    abort_script "${_err_msg_}" 
+fi
+
+#Fetching IP Type from ipmp.ini file.
+check_ip_type
+
+if [ ! "${_ip_type_}" ]; then
+    _err_msg_="Could not read parameter _IP_TYPE_ from file ${ENIQ_CONF_DIR}/${IPMP_INI}"
+    abort_script "$_err_msg_"
+fi
+
+# Check/Create Logfile
+chk_create_logfile
+
+# Create a temporary directory
+TEM_DIR=/tmp/manage_post_upgrade.$$.$$
+$RM -rf ${TEM_DIR}
+$MKDIR -p ${TEM_DIR}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not create directory ${TEM_DIR}"
+    abort_script "${_err_msg_}"
+fi
+
+# Check all required files and scripts exist
+check_files_scripts
+
+# Get the order to start and stop services
+get_deployment_order
+
+$CLEAR
+
+# Run the post upgrade on the blades
+run_post_upgrade ${TEM_DIR}/server_order_list
+
+log_msg -h -t -s "Deleting cached SW using ${UNPACK_CORE_SW}" -l $LOGFILE 
+$BASH ${UNPACK_CORE_SW} -a delete -N -l $LOGFILE
+if [ $? -ne 0 ]; then
+	_err_msg_="Execution of ${UNPACK_CORE_SW} failed"
+	abort_script "$_err_msg_"
+fi
+
+if [ ! "${NO_CONFIRM}" ]; then
+	$ECHO "\nLOGFILE: $LOGFILE\n\n"
+fi
+
+$RM -rf ${TEM_DIR}
+
+log_msg -t -s "Deleting current stage file of Upgrade" -l $LOGFILE
+$RM -rf ${STAGEFILE}
+$RM -rf ${STAGEFILE_PLATFORM_ONLY_UPGRADE}
+log_msg -t -q -s "Successfully deleted the current stage file of Upgrade" -l $LOGFILE
+
+exit 0

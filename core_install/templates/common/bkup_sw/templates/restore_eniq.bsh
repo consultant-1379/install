@@ -1,0 +1,2225 @@
+#!/bin/bash
+# ********************************************************************
+# Ericsson Radio Systems AB                                     SCRIPT
+# ********************************************************************
+#
+#
+# (c) Ericsson Radio Systems AB 2020 - All rights reserved.
+#
+# The copyright to the computer program(s) herein is the property
+# of Ericsson Radio Systems AB, Sweden. The programs may be used 
+# and/or copied only with the written permission from Ericsson Radio 
+# Systems AB or in accordance with the terms and conditions stipulated 
+# in the agreement/contract under which the program(s) have been 
+# supplied.
+#
+# ********************************************************************
+# Name    : restore_eniq.bsh
+# Date    : 09/10/2023
+# Revision: \main\96
+# Purpose : Main ENIQ script to handles restores. 
+#
+# Usage   : restore_eniq.bsh -s <restore_stage> [ -l <logfile> ]
+#
+# ********************************************************************
+#
+#   Command Section
+#
+# ********************************************************************
+AWK=/usr/bin/awk
+BASENAME=/usr/bin/basename
+BASH=/usr/bin/bash
+CAT=/usr/bin/cat
+CHMOD=/usr/bin/chmod
+CHROOT=/usr/sbin/chroot
+CLEAR=/usr/bin/clear
+CP=/usr/bin/cp
+CRONTAB=/usr/bin/crontab
+DATE=/usr/bin/date
+DF=/usr/bin/df
+DIRNAME=/usr/bin/dirname
+DRACUT=/usr/sbin/dracut
+ECHO='/usr/bin/echo -e'
+EFIBOOTMGR=/usr/sbin/efibootmgr
+EGREP=/usr/bin/egrep
+ENV=/usr/bin/env
+EXPR=/usr/bin/expr
+GETENT=/usr/bin/getent
+GREP=/usr/bin/grep
+GRUB2INSTALL=/sbin/grub2-install
+HEAD=/usr/bin/head
+HOSTNAME=/usr/bin/hostname
+ID=/usr/bin/id
+INIT=/usr/sbin/init
+LS=/usr/bin/ls
+MDADM=/usr/sbin/mdadm
+MKDIR=/usr/bin/mkdir
+MOUNT=/usr/sbin/mount
+MOUNTPOINT=/usr/bin/mountpoint
+MULTIPATH=/usr/sbin/multipath
+MV=/usr/bin/mv
+PASTE=/usr/bin/paste
+PWD=/usr/bin/pwd
+RM=/usr/bin/rm
+SED=/usr/bin/sed
+SLEEP=/usr/bin/sleep
+SORT=/usr/bin/sort
+SU=/usr/bin/su
+SYSTEMCTL=/usr/bin/systemctl
+TEE=/usr/bin/tee
+TOUCH=/usr/bin/touch
+TR=/usr/bin/tr
+UMOUNT=/usr/sbin/umount
+YUM=/usr/bin/yum
+
+
+# ********************************************************************
+#
+#       Configuration Section
+#
+# ********************************************************************
+
+# Name of SunOS & ENIQ ini Files
+BLK_STOR_INI=block_storage.ini
+ENIQ_INI=niq.ini
+SUNOS_INI=SunOS.ini
+STORAGE_INI=storage.ini
+SYM_LINK_INI=sym_links.ini
+COORD_SYM_INI=coordinator_sym_links.ini
+IPMP_INI=ipmp.ini
+RBAC_INI=RBAC.ini
+LUN_MAP_INI=lun_map.ini
+
+# Nmber of stages in Restore
+NUM_REST_STAGE=6
+
+# String that is common to all ENIQ Systemd IDs. I concatenate this and the
+# service name together to give me the Systemd ID eg. eniq-dwhdb
+SMF_ID_COMMON_STR="eniq-"
+
+# Eniq service identifiers. STOP & START order
+MANAGED_STR="ENIQ"
+
+# SENTINEL SERVICE
+SENTINEL_SMF_ID="licensing-sentinel.service"
+
+# NASd SERVICE
+NASd_SMF_ID="NASd.service"
+
+# NAS MILESTONE
+NAS_MILESTONE_SMF_ID="NAS-online.service"
+
+# ROLL-SNAP SERVICE 
+ROLL_SNAP="roll-snap.service"
+
+# Hostsync Service
+HOSTSYNC_SMF_ID="hostsync.service"
+
+# DDC Service
+DDC_SMF_ID="ddc.service"
+
+# Automount service Systemd ID
+AUTOMOUNT_SMF_ID="autofs.service"
+
+# LIVE-RW File system
+LIVE_RW="live-rw"
+
+_nas_sw_target_dir_="/ericsson/storage"
+
+# ********************************************************************
+#
+#   Functions
+#
+# ********************************************************************
+### Function: abort_script ###
+#
+#   This function will be called if the script is aborted through an 
+#   error signal sent by the kernel such as CTRL-C or if a serious
+#   error is encountered during runtime
+#
+# Arguments:
+#       $1 - Error message from part of program (Not always used)
+# Return Values:
+#       none
+abort_script()
+{
+if [ "$1" ]; then
+    _err_msg_="`$DATE '+%Y-%m-%d_%H.%M.%S'` - $1"
+else
+    _err_msg_="`$DATE '+%Y-%m-%d_%H.%M.%S'` - Script aborted.......\n"    
+fi
+
+if [ "${LOGFILE}" ]; then
+    $ECHO "\nERROR : ${_err_msg_}\n"|$TEE -a ${LOGFILE}
+else
+    $ECHO "\nERROR : ${_err_msg_}\n"
+fi
+
+cd ${SCRIPTHOME}
+
+if [ "$2" ]; then
+    exit ${2}
+else
+    exit 1
+fi
+}
+
+### Function: chk_create_logfile ###
+#
+# Check/Create Logfile
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+chk_create_logfile()
+{
+$MKDIR -p `$DIRNAME ${LOGFILE}`
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not create directory `$DIRNAME ${LOGFILE}`"
+    abort_script "${_err_msg_}"
+fi
+
+$TOUCH -a ${LOGFILE}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not write to file ${LOGFILE}"
+    abort_script "${_err_msg_}"
+fi
+
+if [ -s ${LOGFILE} ]; then
+    $ECHO "\n\n" >> ${LOGFILE}
+fi
+log_msg -h -t -l ${LOGFILE} -s "Restore stage $REST_STAGE started \n"
+}
+
+
+### Function: check_id ###
+#
+#   Check if the effective id of the user is correct
+#   If not print error message and exit.
+#
+# Arguments:
+#       $1 : User ID name
+# Return Values:
+#       none
+check_id()
+{
+_check_id_=`$ID  | $AWK -F\( '{print $2}' | $AWK -F\) '{print $1}'`
+if [ "${_check_id_}" != "$1" ]; then
+    _err_msg_="You must be $1 or have equal permissions to execute this script."
+    abort_script "${_err_msg_}" 
+fi
+}
+
+
+### Function: create_dir_and_mount ###
+#
+# Create and mount directory
+#
+# Arguments:
+#       $1 : target mount point 
+#       $2 : lv or disk 
+#        
+# Return Values:
+#       none
+create_dir_and_mount()
+{
+target=$1
+device=$2
+
+$MKDIR -p ${target}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not create ${target} directory"
+    abort_script "${_err_msg_}" 
+fi
+    
+# mount if the target is not already mounted
+$MOUNT | $GREP "^${device} on " | $GREP -w ${target} &>/dev/null
+if [ $? -ne 0 ]
+then
+    $MOUNT ${device} ${target} 
+    if [ $? -eq 0 ]
+    then
+        log_msg -l ${LOGFILE} -s  "${device} mounted successfully at ${target}"
+    else
+        _err_msg_="Can't mount ${device} at ${target}"        
+        abort_script "${_err_msg_}" 
+    fi
+else
+     log_msg -l ${LOGFILE} -s  "${device} is already mounted at ${target}. No need to mount again."
+fi
+  
+log_msg -l ${LOGFILE} -s "Cleanup ${target} directory before restoring data from OMBS...\n"
+$MOUNTPOINT -q ${target}
+if [ $? -eq 0 ];then
+    $RM -rf ${target}/*
+fi
+}
+
+
+### Function: disable_eniq_services ###
+#
+# Disable eniq services
+# 
+#
+# Arguments:
+#   $1 : Disk
+# Return Values:
+#   none
+disable_eniq_services()
+{
+# Check for smf config file
+_smf_contract_file_=${SCRIPTHOME}/installation/core_install/templates/${INSTALL_TYPE}/admin/etc/smf_contract_config 
+if [ ! -s ${_smf_contract_file_} ]; then
+    _err_msg_="Could not find ${_smf_contract_file_} file, or it is empty"
+    abort_script "${_err_msg_}" 
+fi
+
+# Get Services list
+$CAT ${_smf_contract_file_} | $EGREP "${CURR_SERVER_TYPE}" | $EGREP "${MANAGED_STR}" > ${TEM_DIR}/server_type_contracts
+if [ ! -s ${TEM_DIR}/server_type_contracts ]; then
+    _err_msg_="Could not parse ${CURR_SERVER_TYPE} from ${_smf_contract_file_}"
+    abort_script "${_err_msg_}"
+fi
+
+# Create a list of services for this server type
+while read _line_; do
+    _service_name_=`$ECHO ${_line_} | $AWK -F"::" '{print $3}'`
+    _service_opt_=`$ECHO ${_line_} | $AWK -F"::" '{print $4}'`
+    if [ "${_service_opt_}" == "Y" ]; then
+        if [ ! "${_service_list_}" ]; then
+            _service_list_=${_service_name_}
+        else
+            _service_list_="${_service_list_} ${_service_name_}"
+        fi
+    fi
+done < ${TEM_DIR}/server_type_contracts
+
+# Disable all the ENIQ services
+for _service_ in ${_service_list_}; do
+    log_msg -l ${LOGFILE} -s "Disabling service ${SMF_ID_COMMON_STR}${_service_}"
+    $SYSTEMCTL reset-failed ${SMF_ID_COMMON_STR}${_service_} >> /dev/null 2>&1
+    $SYSTEMCTL disable ${SMF_ID_COMMON_STR}${_service_} >> /dev/null 2>&1
+    _is_disabled_=`$SYSTEMCTL is-enabled ${SMF_ID_COMMON_STR}${_service_}`
+    if [ "${_is_disabled_}" != "disabled" ]; then
+        _err_msg_="Could not disable ${SMF_ID_COMMON_STR}${_service_}"
+        abort_script "${_err_msg_}" 
+    fi
+    $SYSTEMCTL stop ${SMF_ID_COMMON_STR}${_service_} >> /dev/null 2>&1
+    _service_state_=`$SYSTEMCTL show -p ActiveState ${SMF_ID_COMMON_STR}${_service_} | $AWK -F'=' '{print $2}'`
+    if [ "${_service_state_}" == "active" ]; then
+        _err_msg_="Could not stop ${SMF_ID_COMMON_STR}${_service_}"
+        abort_script "${_err_msg_}" 
+    fi
+    
+done
+
+# Disabling roll-snap service.
+    _service_state_=`$SYSTEMCTL show -p ActiveState ${SMF_ID_COMMON_STR}${ROLL_SNAP} | $AWK -F'=' '{print $2}'`
+    if [ "${_service_state_}" == "active" ]; then
+        $SYSTEMCTL disable ${SMF_ID_COMMON_STR}${ROLL_SNAP}
+        _is_disabled_=`$SYSTEMCTL is-enabled ${SMF_ID_COMMON_STR}${ROLL_SNAP}`
+        if [ "${_is_disabled_}" != "disabled" ]; then
+           _err_msg_="Could not disable ${SMF_ID_COMMON_STR}${ROLL_SNAP}"
+           abort_script "${_err_msg_}" 
+        fi
+        $SYSTEMCTL stop ${SMF_ID_COMMON_STR}${ROLL_SNAP}
+        $SLEEP 15
+        _service_state_=`$SYSTEMCTL show -p ActiveState ${SMF_ID_COMMON_STR}${ROLL_SNAP} | $AWK -F'=' '{print $2}'`
+        if [ "${_service_state_}" != "active" ]; then
+            log_msg -l ${LOGFILE} -s "Successfully disabled roll-snap service."
+        fi
+    fi
+}
+
+
+### Function: get_absolute_path ###
+#
+# Determine absolute path to software
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+get_absolute_path() 
+{
+_dir_=`$DIRNAME $0`
+SCRIPTHOME=`cd ${_dir_} 2>/dev/null && pwd || $ECHO ${_dir_}`
+}
+
+
+### Function: get_next_stage ###
+#
+# Get the Next stage to be run
+#
+# Arguments:
+#   $1 : Stage to be set to. Either numeric value or 'done'
+# Return Values:
+#   none
+get_next_stage()
+{
+if [ -s ${STAGEFILE} ]; then
+    NEXT_STAGE=`$CAT ${STAGEFILE} | $EGREP -v '^[     ]*#' |$EGREP  '^[     ]*([1-9]+|done)'`
+    if [ ! "${NEXT_STAGE}" ]; then
+        _err_msg_="Failed to read stage from ${STAGEFILE}, exiting."
+        abort_script "${_err_msg_}"
+    fi
+    
+    if [ "${NEXT_STAGE}" == "done" ]; then
+        return 0
+    else
+        $ECHO ${NEXT_STAGE} | $EGREP '[^0-9]' >> /dev/null 2>&1
+        if [ $? -eq 0 ]; then
+            _err_msg_="Non numeric value read from stage file ${STAGEFILE}"
+            abort_script "${_err_msg_}"
+        fi
+        
+        if [ ${NEXT_STAGE} -lt 1 -o ${NEXT_STAGE} -gt ${NUM_REST_STAGE} ]; then
+            _err_msg_="Numeric Stage range is 1 - ${NUM_REST_STAGE}."
+            abort_script "${_err_msg_}"
+        fi
+    fi
+else
+    $MKDIR -p `$DIRNAME ${STAGEFILE}`
+    if [ $? -ne 0 ]; then
+        _err_msg_="Failed to create directory `$DIRNAME ${STAGEFILE}`, exiting."
+        abort_script "${_err_msg_}"
+    fi
+    NEXT_STAGE=1
+fi
+}
+
+
+### Function: get_server_info ###
+#
+# Get server and storage type
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+get_server_info()
+{
+# Determine the current server type
+CURR_SERVER_TYPE=`$CAT ${SCRIPTHOME}/installation/config/installed_server_type | $EGREP -v '^[     ]*#' | $SED -e 's/ //g'`
+if [ ! "${CURR_SERVER_TYPE}" ]; then
+    _err_msg_="Could not determine the server type "
+    abort_script "${_err_msg_}"
+fi
+
+# Source the common functions
+if [ -s ${SCRIPTHOME}/installation/core_install/lib/common_functions.lib ]; then
+    . ${SCRIPTHOME}/installation/core_install/lib/common_functions.lib
+fi
+
+# Source the common functions
+if [ -s ${SCRIPTHOME}/installation/core_install/lib/common_inirator_functions.lib ]; then
+    . ${SCRIPTHOME}/installation/core_install/lib/common_inirator_functions.lib
+fi
+
+STORAGE_TYPE=`iniget STOR_TYPE -f ${SCRIPTHOME}/installation/config/${SUNOS_INI} -v STORAGE_TYPE`
+if [ ! "${STORAGE_TYPE}" ]; then
+    _err_msg_="Could not read STORAGE_TYPE param "
+    abort_script "${_err_msg_}"
+fi
+
+CO_SERVER=""
+if [ "${CURR_SERVER_TYPE}" == "son_coordinator" -o "${CURR_SERVER_TYPE}"  == "eniq_stats" -o "${CURR_SERVER_TYPE}" == "stats_coordinator" -o "${CURR_SERVER_TYPE}" == "eniq_es" ]; then
+    CO_SERVER="YES"
+fi
+
+# File containing the type of OSS installation. Eg. statistics
+INST_TYPE_FILE=${SCRIPTHOME}/installation/config/ericsson_use_config
+if [ ! -s "${INST_TYPE_FILE}" ]; then
+    _err_msg_="ENIQ install type not defined in ${INST_TYPE_FILE}"
+    abort_script "${_err_msg_}" 
+fi
+
+# Read the installation type
+INSTALL_TYPE=`$CAT ${INST_TYPE_FILE} | $AWK -F\= '{print $2}'`
+if [ ! "${INSTALL_TYPE}" ]; then
+    _err_msg_="Could not read INSTALL_TYPE param "
+    abort_script "${_err_msg_}"
+fi
+}
+
+
+### Function: recreate_reader_mpx ###
+#
+# Restore the multiplex on the reader
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+recreate_reader_mpx()
+{
+#set user values
+setup_users
+
+#setup the sybase env
+setup_sybase_env
+
+# Set up the stages that I need to run 
+stage_list="create_reader_mpx"
+
+# Run required stages
+for _i_ in ${stage_list}; do
+    ${SCRIPTHOME}/installation/core_install/bin/eniq_core_install.bsh -s ${_i_} -d ${BASE_SW_DIR} -n -R -l ${LOGFILE}
+    if [ $? -ne 0 ]; then
+        _err_msg_="Error running stage ${_i_} during ENIQ restore"
+        abort_script "${_err_msg_}"    
+    fi
+done
+
+# Ensure the reader is offline after the restore, so that Systemd can start it correctly later
+log_msg -t -l ${LOGFILE} -s "Stopping the dwh_reader database\n"
+$SU - ${SYSUSER} -c "${ENIQ_ADMIN_BIN_DIR}/dwh_reader stop"
+if [ $? -ne 0 ] ; then
+    _err_msg_="`$DATE +%d.%m.%y_%H:%M:%S` - Failed to stop dwh_reader"
+    abort_script "${_err_msg_}"
+fi
+}
+
+### Function: restore_eniq_smf ###
+#
+# Restore the eniq systemd directory
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+restore_eniq_smf()
+{
+# check target dir exists
+if [ -d ${ENIQ_BASE_DIR}/smf ]; then
+    # Restore the storage dir
+    $CP -rp ${SCRIPTHOME}/smf ${ENIQ_BASE_DIR}
+    if [ $? -ne 0 ]; then
+        _err_msg_="Could not restore ${SCRIPTHOME}/smf to ${ENIQ_BASE_DIR}"
+        abort_script "${_err_msg_}"
+    fi
+else
+    _err_msg_="Directory ${ENIQ_BASE_DIR}/smf does not exist"
+    abort_script "${_err_msg_}"
+fi
+}
+
+
+### Function: restore_stage_1 ###
+#
+# Perform 1st part of Eniq restore
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+restore_stage_1()
+{
+# Expected output is that root fs (/) to be on ramdisk. If it is not then need to check
+
+$DF -hk / |$GREP -v Filesystem |$GREP -w ${LIVE_RW} > /dev/null 2>&1
+ret=$?
+
+if [ ${ret} -ne 0 ]; then
+    _err_msg_="Current boot slice expected to be on ramdisk"
+    abort_script "${_err_msg_}"
+fi
+
+get_next_stage
+
+# Checks the status of the restore stage
+if [ "${NEXT_STAGE}" != "1" -a ! "${FORCE_RESTORE}" ]; then
+    if [ "${NEXT_STAGE}" = "done" ]; then
+        _err_msg_="Current restore seems to be completed"
+    else
+        _err_msg_="Current restore seems to be at stage ${NEXT_STAGE}"
+    fi
+    abort_script "${_err_msg_}"
+fi
+_recreate_run_count_=2
+
+if [ -d ${SCRIPTHOME}/${LVMDUMP_DIR} ]; then
+    if [ -s ${SCRIPTHOME}/recreate_root_disk_layout.bsh ]; then
+       while [ "${_recreate_run_count_}" -ne 0 ]; do
+          $BASH ${SCRIPTHOME}/recreate_root_disk_layout.bsh ${SCRIPTHOME}/${LVMDUMP_DIR} >>${LOGFILE}
+          if [ $? -ne 0 ]; then
+             _recreate_run_count_=$((_recreate_run_count_-1))
+          else
+             break;
+          fi
+       done
+    else
+        _err_msg_="${SCRIPTHOME}/recreate_root_disk_layout.bsh does not exist"
+        abort_script "${_err_msg_}"
+    fi
+else
+    _err_msg_="${SCRIPTHOME}/${LVMDUMP_DIR} LVM Dump directory does not exist"
+    abort_script "${_err_msg_}"    
+fi
+
+if [ ${_recreate_run_count_} -eq 0 ]; then
+     _err_msg_="Failed to recreate LVM structure for root"
+     abort_script "${_err_msg_}"
+fi
+
+_check_efi_=`$CAT ${LVM_CONFIG_DIR}/mounts | grep -w efi`
+if [ -z "$_check_efi_" ]; then
+	#Mount root lv
+	_root_lv_="/dev/mapper/vg_root-lv_root"
+	log_msg -l ${LOGFILE} -s "Mounting ${_root_lv_} on ${ROOT_MT_PT}...\n"
+	create_dir_and_mount ${ROOT_MT_PT} ${_root_lv_} 
+
+	#Mount var lv
+	_root_var_="/dev/mapper/vg_root-lv_var"
+	log_msg -l ${LOGFILE} -s "Mounting ${_root_var_} on ${ROOT_MT_PT}/var...\n"
+	create_dir_and_mount ${ROOT_MT_PT}/var ${_root_var_}
+
+	#Mount /boot mount point 
+	_boot_disk_=`/sbin/blkid | grep -w "ext4" | tr -d ":" | awk '{print $1}' | head -1`
+	_boot_mount_point_="${ROOT_MT_PT}/boot"
+	log_msg -l ${LOGFILE} -s "Mounting ${_boot_disk_} on ${_boot_mount_point_}...\n"
+	create_dir_and_mount ${_boot_mount_point_} ${_boot_disk_} 
+else
+	#Mount root lv
+	_root_lv_="/dev/mapper/vg_root-lv_root"
+	log_msg -l ${LOGFILE} -s "Mounting ${_root_lv_} on ${ROOT_MT_PT}...\n"
+	create_dir_and_mount ${ROOT_MT_PT} ${_root_lv_} 
+
+	#Mount var lv
+	_root_var_="/dev/mapper/vg_root-lv_var"
+	log_msg -l ${LOGFILE} -s "Mounting ${_root_var_} on ${ROOT_MT_PT}/var...\n"
+	create_dir_and_mount ${ROOT_MT_PT}/var ${_root_var_}
+
+	#Mount home lv
+	_root_home_="/dev/mapper/vg_root-lv_home"
+	log_msg -l ${LOGFILE} -s "Mounting ${_root_home_} on ${ROOT_MT_PT}/home...\n"
+	create_dir_and_mount ${ROOT_MT_PT}/home ${_root_home_}
+	
+	#Mount tmp lv
+	_root_tmp_="/dev/mapper/vg_root-lv_tmp"
+	log_msg -l ${LOGFILE} -s "Mounting ${_root_tmp_} on ${ROOT_MT_PT}/tmp...\n"
+	create_dir_and_mount ${ROOT_MT_PT}/tmp ${_root_tmp_}
+	
+	#Mount /var/log lv
+	_root_var_log_="/dev/mapper/vg_root-lv_var_log"
+	log_msg -l ${LOGFILE} -s "Mounting ${_root_var_log_} on ${ROOT_MT_PT}/var/log...\n"
+	create_dir_and_mount ${ROOT_MT_PT}/var/log ${_root_var_log_}
+	
+	#Mount /var/tmp lv
+	_root_var_tmp_="/dev/mapper/vg_root-lv_var_tmp"
+	log_msg -l ${LOGFILE} -s "Mounting ${_root_var_tmp_} on ${ROOT_MT_PT}/var/tmp...\n"
+	create_dir_and_mount ${ROOT_MT_PT}/var/tmp ${_root_var_tmp_}
+	
+	#Mount /boot mount point 
+	_boot_disk_=`/sbin/blkid | grep -w primary | tr -d ":" | awk '{print $1}' | head -2 | tail -1`
+	_boot_mount_point_="${ROOT_MT_PT}/boot"
+	log_msg -l ${LOGFILE} -s "Mounting ${_boot_disk_} on ${_boot_mount_point_}...\n"
+	create_dir_and_mount ${_boot_mount_point_} ${_boot_disk_}
+
+	#Mount /boot/efi mount point
+	_boot_disk_=`/sbin/blkid | grep -w primary | tr -d ":" | awk '{print $1}' | head -1`
+	_boot_mount_point_="${ROOT_MT_PT}/boot/efi"
+	log_msg -l ${LOGFILE} -s "Mounting ${_boot_disk_} on ${_boot_mount_point_}...\n"
+	create_dir_and_mount ${_boot_mount_point_} ${_boot_disk_}
+fi
+
+set_next_stage 2
+}
+
+### Function: restore_stage_2 ###
+#
+# Perform 2nd part of Eniq restore
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+restore_stage_2()
+{
+# Expected output is that root fs (/) to be on ramdisk. If it is not then need to check
+
+$DF -hk / |$GREP -v Filesystem |$GREP -w ${LIVE_RW} > /dev/null 2>&1
+ret=$?
+
+if [ ${ret} -ne 0 ]; then
+    _err_msg_="Current boot slice expected to be on ramdisk"
+    abort_script "${_err_msg_}"
+fi
+
+get_next_stage
+
+# Checks the status of the restore stage
+if [ "${NEXT_STAGE}" != "2" ]; then
+    if [ "${NEXT_STAGE}" = "done" ]; then
+        _err_msg_="Current restore seems to be completed"
+    else
+        _err_msg_="Current restore seems to be at stage ${NEXT_STAGE}"
+    fi
+    abort_script "${_err_msg_}"
+fi
+
+if [ ! -s ${ROOT_MT_PT}/etc/systemd/system ]; then
+    _err_msg_="Could not locate file ${ROOT_MT_PT}/etc/systemd/system\nPlease ensure restore is complete before running stage 2"
+    abort_script "${_err_msg_}"
+else
+    _services_backup_dir_=${ROOT_MT_PT}/etc/systemd/system/eniq_services_file_backup.$$
+    $MKDIR -p ${_services_backup_dir_}
+    for i in `ls ${ROOT_MT_PT}/etc/systemd/system | $EGREP "eniq-|NAS-|licensing-|hostsync|firstboot" `
+    do
+        #moving eniq specific services files to a backup directory
+        $CP -rp ${ROOT_MT_PT}/etc/systemd/system/$i ${_services_backup_dir_} >> /dev/null 2>&1
+        if [ $? -ne 0 ]; then
+            _err_msg_="Could not move ${ROOT_MT_PT}/etc/systemd/system/$i to ${_services_backup_dir_}"
+            abort_script "${_err_msg_}"
+        fi
+    done
+    log_msg -l ${LOGFILE} -s  "Successfully moved ${ROOT_MT_PT}/etc/systemd/system/$i to ${_services_backup_dir_}"
+fi
+
+if [ ! -s ${ROOT_MT_PT}/etc/fstab ]; then
+    _err_msg_="Error locating file ${ROOT_MT_PT}/etc/fstab\nPlease ensure restore is complete before running stage 2"
+    abort_script "${_err_msg_}"
+else
+    #creating copy of ${ROOT_MT_PT}/etc/fstab
+    $CP ${ROOT_MT_PT}/etc/fstab ${ROOT_MT_PT}/etc/fstab_orig.$$
+    
+    #removing eniq fs entries from ${ROOT_MT_PT}/etc/fstab
+    $CAT ${ROOT_MT_PT}/etc/fstab |$GREP -v "stats" >${TEM_DIR}/fstab_tmp 
+    if [ $? -ne 0 ]; then
+        _err_msg_="Failed to remove ENIQ FS entries from ${ROOT_MT_PT}/etc/fstab"
+        abort_script "${_err_msg_}"
+    else
+        $CP ${TEM_DIR}/fstab_tmp ${ROOT_MT_PT}/etc/fstab >> /dev/null 2>&1
+        if [ $? -ne 0 ]; then
+            _err_msg_="Failed to remove ENIQ FS entries from ${ROOT_MT_PT}/etc/fstab"
+            abort_script "${_err_msg_}"
+        else
+            log_msg -l ${LOGFILE} -s "Successfully removed ENIQ FS entries from ${ROOT_MT_PT}/etc/fstab"
+        fi
+    fi
+fi
+
+if [ ! -s ${ROOT_MT_PT}/etc/ssh ]; then
+    _err_msg_="Error locating file ${ROOT_MT_PT}/etc/ssh\nPlease ensure restore is complete before running stage 2"
+    abort_script "${_err_msg_}"
+else
+    for _entry_ in `$LS ${ROOT_MT_PT}/etc/ssh |$GREP ^ssh_host_.*key$`; do
+        $RM ${ROOT_MT_PT}/etc/ssh/${_entry_} >> /dev/null 2>&1
+        if [ $? -ne 0 ]; then
+            _err_msg_="Failed to remove ${_entry_} from ${ROOT_MT_PT}/etc/ssh"
+            abort_script "${_err_msg_}"	
+        fi
+    done
+    log_msg -l ${LOGFILE} -s "Successfully removed ssh_host_keys from ${ROOT_MT_PT}/etc/ssh"
+fi
+
+if [ ! -s /etc/rc.local ]; then
+    _err_msg_="Error locating file /etc/rc.local"
+    abort_script "${_err_msg_}"
+else
+    if [ -s ${ROOT_MT_PT}/etc/rc.d/rc.local ]; then
+        $CP ${ROOT_MT_PT}/etc/rc.d/rc.local ${ROOT_MT_PT}/etc/rc.d/rc.local_bkp.$$
+        $CP /etc/rc.local ${ROOT_MT_PT}/etc/rc.d/rc.local >> /dev/null 2>&1
+        if [ $? -ne 0 ]; then
+           _err_msg_="Failed to copy /etc/rc.local to ${ROOT_MT_PT}/etc/rc.d/rc.local"
+            abort_script "${_err_msg_}"
+        else
+            log_msg -l ${LOGFILE} -s "Successfully copied /etc/rc.local to ${ROOT_MT_PT}/etc/rc.d/rc.local"
+        fi
+    fi
+fi
+
+if [ -f ${ROOT_MT_PT}/etc/mdadm.conf ]; then
+    # Getting the new uuid value for /dev/md0 device
+    _new_uuid_=`$MDADM --detail --scan | $AWK '{print $NF}' | $AWK -F "=" '{print $2}'`
+    if [ ! ${_new_uuid_} ]; then
+        _err_msg_="Failed to get the UUID for /dev/md0 device"
+        abort_script "${_err_msg_}"
+    fi
+
+    # Getting the old uuid value for /dev/md0 device from /etc/mdadm.conf
+    _old_uuid_=`$CAT ${ROOT_MT_PT}/etc/mdadm.conf | $GREP ARRAY | $AWK '{print $NF}' | $AWK -F "=" '{print $2}'`
+    if [ ! ${_old_uuid_} ]; then
+        _err_msg_="Failed to get UUID for /dev/md0 device from ${ROOT_MT_PT}/etc/mdadm.conf"
+        abort_script "${_err_msg_}"
+    fi
+
+    # Updating /etc/mdadm.conf with new uuid of /dev/md0 device
+    log_msg -l ${LOGFILE} -s "Updating ${ROOT_MT_PT}/etc/mdadm.conf with new UUID ${_new_uuid_}"
+    $SED -i "s/${_old_uuid_}/${_new_uuid_}/g" ${ROOT_MT_PT}/etc/mdadm.conf
+    if [ $? -ne 0 ]; then
+        _err_msg_="Failed to update ${ROOT_MT_PT}/etc/mdadm.conf with ${_new_uuid_}"
+        abort_script "$_err_msg_"
+    fi
+
+    # Updating /tmp/root_disk/boot/grub2/grub.cfg with new uuid of /dev/md0 device
+    log_msg -l ${LOGFILE} -s "Updating ${ROOT_MT_PT}/boot/grub2/grub.cfg with new UUID ${_new_uuid_}"
+    _check_efi_=`$CAT ${LVM_CONFIG_DIR}/mounts | grep -w efi`
+    if [ -z "$_check_efi_" ]; then
+        $CP ${ROOT_MT_PT}/boot/grub2/grub.cfg ${TEM_DIR}/grub.cfg
+    else
+        $CP ${ROOT_MT_PT}/boot/efi/EFI/redhat/grub.cfg ${TEM_DIR}/grub.cfg
+    fi
+    $SED -i "s/${_old_uuid_}/${_new_uuid_}/g" ${TEM_DIR}/grub.cfg
+    if [ $? -ne 0 ]; then
+        _err_msg_="Failed to update ${TEM_DIR}/grub.cfg with ${_new_uuid_}"
+        abort_script "$_err_msg_"
+    fi
+
+    if [ -z "$_check_efi_" ]; then
+        $CP ${TEM_DIR}/grub.cfg ${ROOT_MT_PT}/boot/grub2/grub.cfg
+    else
+        $CP ${TEM_DIR}/grub.cfg ${ROOT_MT_PT}/boot/efi/EFI/redhat/grub.cfg
+    fi
+fi
+
+# Check the presence of GRUB2 Packages
+if [ ! -s ${GRUB_PKG_LOC} ]; then
+    #Installing RPM for GRUB2INSTALL
+    $YUM install -y grub2* 
+    if [ $? -ne 0 ]; then
+        _err_msg_="Failed to install rpm for grub2"
+        abort_script "$_err_msg_"
+    else
+        log_msg -l ${LOGFILE} -s "Successfully installed rpm for grub2"
+    fi
+else
+    log_msg -l ${LOGFILE} -s "GRUB2 Packages are already installed"
+fi
+ 
+#Copy the content of /usr/lib/grub from /tmp/rootdisk it to the required directory
+#modinfo.sh script helps in executing grub2install command
+$CP -r ${ROOT_MT_PT}/${GRUB_LIB} ${GRUB_LIB1}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not copy ${ROOT_MT_PT}/${GRUB_LIB} to ${GRUB_LIB1}"
+    abort_script "${_err_msg_}"
+fi
+
+_check_efi_=`$CAT ${LVM_CONFIG_DIR}/mounts | grep -w efi`
+if [ -z "$_check_efi_" ]; then
+      ${GRUB2INSTALL} --root-directory=${ROOT_MT_PT} ${ROOT_DISK} --recheck
+      if [ $? -ne 0 ]; then
+          _err_msg_="Failed to execute ${GRUB2INSTALL} command on ${ROOT_MT_PT}"
+          abort_script "${_err_msg_}"
+      else
+          log_msg -l ${LOGFILE} -s "Successfully executed grub-install"
+      fi
+else
+      #Change the boot order to Red hat Enterprise Linux
+      boot_order=`${EFIBOOTMGR} -v | $EGREP -w 'Lun:0' | $AWK '{print $1}' | $TR -d 'Boot|*' | $PASTE -s -d, -`
+      `${EFIBOOTMGR} -o ${boot_order}` >> /dev/null 2>&1
+      verify_boot_order=`${EFIBOOTMGR} -v | $GREP -w 'BootOrder' | $AWK '{print $2}'`
+      if [ ${boot_order} == ${verify_boot_order} ]; then
+         log_msg -l ${LOGFILE} -s "Bootorder has been set successfully."
+      else
+         _err_msg_="Failed to set the boot order"
+         abort_script "${_err_msg_}"
+      fi
+fi
+
+$CHROOT ${ROOT_MT_PT} $TOUCH /.autorelabel
+if [ $? -ne 0 ]; then
+    _err_msg_="Failed to execute $CHROOT command on ${ROOT_MT_PT}"
+    abort_script "${_err_msg_}"
+else
+    log_msg -l ${LOGFILE} -s "Successfully changed root to / from /tmp/root_disk"
+fi
+
+if [ -f ${ROOT_MT_PT}/etc/mdadm.conf ]; then
+## Adding mdadm module to initramfs before reboot
+    log_msg -l ${LOGFILE} -s "Updating mdadm module in initramfs using DRACUT"
+    $CHROOT ${ROOT_MT_PT} $DRACUT --force --add mdraid --include /etc/mdadm.conf  >> /dev/null 2>&1
+if [ $? -ne 0 ]; then
+    _err_msg_="Failed to add mdadm module to initramfs using DRACUT"
+    abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+fi
+fi
+
+$MKDIR -p ${ROOT_MT_PT}/logfiles
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not create ${ROOT_MT_PT}/logfiles folder"
+    abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+fi
+$CP -rp ${STAGEFILE} ${ROOT_MT_PT}/logfiles
+$CP -rp ${SCRIPTHOME}/log/restore_eniq.log ${ROOT_MT_PT}/logfiles
+
+
+}
+
+### Function: restore_stage_3 ###
+#
+# Perform 3rd part of Eniq restore
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+restore_stage_3()
+{
+
+$MKDIR -p ${SCRIPTHOME}/log/
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not create ${SCRIPTHOME}/log/ folder"
+    abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+fi
+
+$CP -rp /logfiles/restore_eniq.log ${SCRIPTHOME}/log/
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not Copy restore_eniq.log to ${SCRIPTHOME}/log/ folder"
+    abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+fi
+
+# Update Initramfs to persist mirror disk name
+$ECHO "Updating initramfs to persist mirror disk name using DRACUT"
+
+$DRACUT --force
+
+get_next_stage
+
+# Checks the status of the restore stage
+if [ "${NEXT_STAGE}" != "3" -a ! "${FORCE_RESTORE}" ]; then
+    if [ "${NEXT_STAGE}" = "done" ]; then
+        _err_msg_="Current restore seems to be completed"
+    else
+        _err_msg_="Current restore seems to be at stage ${NEXT_STAGE}"
+    fi
+    abort_script "${_err_msg_}"
+fi
+
+# get eniq server info
+get_server_info
+
+if [ ! "${NO_CONFIRM}" ]; then
+    if [ "${STORAGE_TYPE}" != "fs" ]; then
+        user_confirm "Are you sure you wish to continue?\n This will register ENIQ to the SAN and import all LUNs."
+    else
+        user_confirm "Are you sure you wish to continue?"
+    fi
+
+    if [ $USER_CONF == No ]; then
+        $RM -rf ${TEM_DIR}
+        exit 0
+    fi
+fi
+
+#Disable Eniq services
+disable_eniq_services
+
+# Disable SMF Services milestone and Sentinel
+smf_list="${DDC_SMF_ID} ${HOSTSYNC_SMF_ID} ${SENTINEL_SMF_ID}"
+for _smf_ in ${smf_list}; do
+    log_msg -l ${LOGFILE} -s "Disabling service ${_smf_}"
+    $SYSTEMCTL reset-failed ${_smf_} >> /dev/null 2>&1
+    $SYSTEMCTL disable  ${_smf_} >> /dev/null 2>&1
+    _is_disabled_=`$SYSTEMCTL is-enabled ${_smf_}`
+    if [ "${_is_disabled_}" != "disabled" ]; then
+        _err_msg_="Could not disable ${_smf_}"
+        abort_script "${_err_msg_}" 
+    fi
+    $SYSTEMCTL stop  ${_smf_} >> /dev/null 2>&1
+    _service_state_=`$SYSTEMCTL show -p ActiveState ${_smf_} | $AWK -F'=' '{print $2}'`
+    if [ "${_service_state_}" == "active" ]; then
+        _err_msg_="Could not start ${_smf_}"
+        abort_script "${_err_msg_}" 
+    fi
+done
+
+if [ "${STORAGE_TYPE}" != "fs" ]; then
+	# Disable SMF Services milestone and Sentinel
+	nas_list="${NASd_SMF_ID} ${NAS_MILESTONE_SMF_ID}"
+	for _nas_ in ${nas_list}; do
+		log_msg -l ${LOGFILE} -s "Disabling service ${_nas_}"
+		$SYSTEMCTL reset-failed ${_nas_} >> /dev/null 2>&1
+		$SYSTEMCTL disable  ${_nas_} >> /dev/null 2>&1
+		_is_disabled_=`$SYSTEMCTL is-enabled ${_nas_}`
+		if [ "${_is_disabled_}" != "disabled" ]; then
+			_err_msg_="Could not disable ${_nas_}"
+			abort_script "${_err_msg_}" 
+		fi
+		$SYSTEMCTL stop  ${_nas_} >> /dev/null 2>&1
+		_service_state_=`$SYSTEMCTL show -p ActiveState ${_nas_} | $AWK -F'=' '{print $2}'`
+		if [ "${_service_state_}" == "active" ]; then
+			_err_msg_="Could not start ${_nas_}"
+			abort_script "${_err_msg_}" 
+		fi
+	done
+fi
+# Clean the local logs dir, so FS can be mounted up later 
+$RM -rf ${ENIQ_LOG_DIR}/*
+
+# If the block_storage.ini exists move it to a new location
+if [ -f ${SCRIPTHOME}/installation/config/block_storage.ini ]; then
+    $MV ${SCRIPTHOME}/installation/config/block_storage.ini ${SCRIPTHOME}/installation/config/block_storage.ini.orig
+    if [ $? -ne 0 ]; then
+        _err_msg_="Could not move ${SCRIPTHOME}/installation/config/block_storage.ini to ${SCRIPTHOME}/installation/config/block_storage.ini.orig"
+        abort_script "${_err_msg_}"
+    fi
+fi
+
+if [ "${STORAGE_TYPE}" != "fs" ]; then
+    # Setting up the stages that needs to be run to configure the storage api (SAN)
+    stage_list="configure_storage_api"
+
+    # Run required stages
+    for _i_ in ${stage_list}; do
+        ${SCRIPTHOME}/installation/core_install/bin/eniq_core_install.bsh -s ${_i_} -d ${BASE_SW_DIR} -n -b ${SCRIPTHOME} -R -l ${LOGFILE}
+        if [ $? -ne 0 ]; then
+            _err_msg_="Error running stage ${_i_} during ENIQ restore"
+            abort_script "${_err_msg_}"    
+        fi
+    done
+
+fi
+
+set_next_stage 4
+}
+
+### Function: restore_stage_4 ###
+#
+# Perform 4th part of Eniq restore
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+restore_stage_4()
+{
+
+get_next_stage
+
+# Checks the status of the restore stage
+if [ "${NEXT_STAGE}" != "4" -a ! "${FORCE_RESTORE}" ]; then
+    if [ "${NEXT_STAGE}" = "done" ]; then
+        _err_msg_="Current restore seems to be completed"
+    else
+        _err_msg_="Current restore seems to be at stage ${NEXT_STAGE}"
+    fi
+    abort_script "${_err_msg_}"
+fi
+
+if [ ! "${NO_CONFIRM}" ]; then
+    user_confirm "Are you sure you wish to continue?\nAll filesystems will be destroyed"
+    if [ $USER_CONF == No ]; then
+        $RM -rf ${TEM_DIR}
+        exit 0
+    fi
+fi
+
+# Update the ini files if required
+#if [ -f ${SCRIPTHOME}/installation/core_install/bin/update_sunos_ini.bsh ]; then
+#    $BASH ${SCRIPTHOME}/installation/core_install/bin/update_sunos_ini.bsh -b ${SCRIPTHOME}
+#fi
+
+# get eniq server info
+get_server_info
+
+#Disable Eniq services
+disable_eniq_services
+
+# Disable NASd the NAS milestone and Sentinel
+smf_list="${SENTINEL_SMF_ID} ${NASd_SMF_ID} ${NAS_MILESTONE_SMF_ID}"
+for _smf_ in ${smf_list}; do
+    $SYSTEMCTL reset-failed ${_smf_} >> /dev/null 2>&1
+    $SYSTEMCTL disable  ${_smf_} >> /dev/null 2>&1
+    $SYSTEMCTL stop  ${_smf_} >> /dev/null 2>&1
+    _service_state=`$SYSTEMCTL show ${_smf_} -p ActiveState | $AWK -F= '{print $2}'`
+    if [ "${_service_state}" != "inactive" ]; then
+        _err_msg_="Could not disable ${_smf_} service"
+        abort_script "${_err_msg_}" 
+    fi
+done
+
+if [ "${CURR_SERVER_TYPE}" == "stats_engine" ]; then
+    # Am i a reader
+    READER_ALIAS=`$CAT ${SCRIPTHOME}/installation/config/service_names | $GREP -w "${HOST_IP}" | $GREP "dwh_" | $AWK -F"::" '{print $NF}'`
+    if [ ! ${READER_ALIAS} ]; then
+        # This is to make sure , IQ servers dont run the stages below.
+        _reader_=NO 
+    fi
+fi
+
+$CP -Rp ${SCRIPTHOME}/installation/config ${ENIQ_INST_DIR}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not copy ${SCRIPTHOME}/installation/config directory to ${ENIQ_INST_DIR}"
+    abort_script "${_err_msg_}" 
+fi
+
+$CP -Rp ${SCRIPTHOME}/installation/core_install ${ENIQ_INST_DIR}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not copy ${SCRIPTHOME}/installation/core_install directory to ${ENIQ_INST_DIR}"
+    abort_script "${_err_msg_}" 
+fi
+
+$CP ${ENIQ_CONF_DIR}/${SUNOS_INI} ${TEM_DIR}/${SUNOS_INI}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not copy ${ENIQ_CONF_DIR}/${SUNOS_INI} to ${TEM_DIR}/${SUNOS_INI}"
+    abort_script "${_err_msg_}" 
+fi
+
+if [ "${STORAGE_TYPE}" != "fs" ]; then
+    $CP ${ENIQ_CONF_DIR}/${STORAGE_INI} ${TEM_DIR}/${STORAGE_INI}
+    if [ $? -ne 0 ]; then
+    _err_msg_="Could not copy ${ENIQ_CONF_DIR}/${STORAGE_INI} to ${TEM_DIR}/${STORAGE_INI}"
+    abort_script "${_err_msg_}" 
+    fi
+
+   $CP ${ENIQ_CONF_DIR}/${IPMP_INI} ${TEM_DIR}/${IPMP_INI}
+    if [ $? -ne 0 ]; then
+        _err_msg_="Could not copy ${ENIQ_CONF_DIR}/${IPMP_INI} to ${TEM_DIR}/${IPMP_INI}"
+        abort_script "${_err_msg_}" 
+    fi
+
+    SAN_DEVICE=`iniget SAN_DEV -f ${SCRIPTHOME}/installation/config/${SUNOS_INI} -v SAN_DEVICE`
+	if [ ! "${SAN_DEVICE}" ]; then
+		_err_msg_="Could not read SAN_DEVICE param "
+		abort_script "${_err_msg_}"
+	fi
+	if [ "${SAN_DEVICE}" != "unityXT" ]; then
+		# Set up the NAS server, and its local users
+		common_setup_nas_filestore "${TEM_DIR}/${SUNOS_INI}" "${ENIQ_CONF_DIR}/ssh_input_file" "${ENIQ_CONF_DIR}/${IPMP_INI}" "${TEM_DIR}/${STORAGE_INI}" "${LOGFILE}"
+		if [ $? -ne 0 ]; then
+			_err_msg_=""
+			abort_script "${_err_msg_}"
+		fi
+    else
+   		common_setup_unity_filestore "${TEM_DIR}/${SUNOS_INI}" "${ENIQ_CONF_DIR}/ssh_input_file" "${ENIQ_CONF_DIR}/${IPMP_INI}" "${TEM_DIR}/${STORAGE_INI}" "${LOGFILE}"
+		if [ $? -ne 0 ]; then
+			_err_msg_=""
+			abort_script "${_err_msg_}"
+		fi
+	fi
+
+    if [ "${CO_SERVER}" != "YES" ]; then
+        # Mount the shared dir to read required files
+        _conf_dir_=`$BASENAME ${CLI_CONF_DIR}`
+        common_get_shared_files "${CURR_SERVER_TYPE}" "${TEM_DIR}/${SUNOS_INI}" "${TEM_DIR}/${STORAGE_INI}" "${ENIQ_CONF_DIR}/${IPMP_INI}" "${_conf_dir_}/${COORD_SYM_INI}" "${ENIQ_CONF_DIR}" "${LOGFILE}"
+        if [ $? -ne 0 ]; then
+            _err_msg_="Could not get required files from shared area"
+            abort_script "${_err_msg_}"
+        fi
+
+        # This is because the above stage syncs the file back to the /eniq/installation/config directory
+        # This data will be over written when we restore the eniq data at the end of this stage
+        $CP ${ENIQ_CONF_DIR}/${COORD_SYM_INI} ${SCRIPTHOME}/installation/config
+        if [ $? -ne 0 ]; then
+            _err_msg_="Could not copy ${ENIQ_CONF_DIR}/${COORD_SYM_INI} to ${SCRIPTHOME}/installation/config"
+            abort_script "${_err_msg_}" 
+        fi
+    fi
+fi
+
+if [ "${STORAGE_TYPE}" != "fs" ]; then
+    #Checking the presence of disks_partitioned config file, if Present remove it
+    #disks_partitioned file will be created in create_disk_partition stage
+    if [ -s ${SCRIPTHOME}/installation/config/disks_partitioned ]; then
+        $RM -rf ${SCRIPTHOME}/installation/config/disks_partitioned
+        if [ $? -ne 0 ]; then
+            _err_msg_="Could not remove ${SCRIPTHOME}/installation/config/disks_partitioned"
+            abort_script "${_err_msg_}"
+        fi
+        
+        $RM -rf ${ENIQ_CONF_DIR}/disks_partitioned
+        if [ $? -ne 0 ]; then
+            _err_msg_="Could not remove ${ENIQ_CONF_DIR}/disks_partitioned"
+            abort_script "${_err_msg_}"
+        fi
+    fi
+    
+    if [ "${CURR_SERVER_TYPE}" == "stats_iqr" ]; then
+        readonly MOUNT_OPTIONS_check="rw,soft,nordirplus"
+        NFS_ServerIP_check=`iniget Storage_NAS_SW -f ${SCRIPTHOME}/installation/config/storage.ini -v NFS_HOST`
+        if [ ! "${NFS_ServerIP_check}" ]; then
+            _err_msg_="Failed to get NFS_ServerIP_check from ${SCRIPTHOME}/installation/config/storage.ini"
+            abort_script "${_err_msg_}"
+        fi
+
+        NFS_Share_check=`iniget Storage_NAS_SW -f ${SCRIPTHOME}/installation/config/storage.ini -v SHARE_PATH`
+        if [ ! "${NFS_Share_check}" ]; then
+            _err_msg_="Failed to get NFS_Share_check from ${SCRIPTHOME}/installation/config/storage.ini"
+            abort_script "${_err_msg_}"
+        fi
+
+        NFS_MountPoint_check="/eniq/sw"
+
+        if [ ! -d  ${NFS_MountPoint_check} ] ; then
+            $MKDIR -p ${NFS_MountPoint_check}
+            if [ $? -ne 0 ]; then
+                _err_msg_="Could not create ${NFS_MountPoint_check} directory"
+                abort_script "${_err_msg_}"
+            fi
+        fi
+
+        $MOUNT -t nfs -o ${MOUNT_OPTIONS_check} ${NFS_ServerIP_check}:${NFS_Share_check} ${NFS_MountPoint_check}  >> /dev/null 2>&1
+        if [ $? -ne 0 ]; then
+            _err_msg_="Unable to mount ${NFS_Share_check} on ${NFS_MountPoint_check}"
+            abort_script "${_err_msg_}"
+        fi
+
+        $CP -rp ${NFS_MountPoint_check}/conf/${COORD_SYM_INI} ${SCRIPTHOME}/${COORD_SYM_INI}_CO
+        if [ $? -ne 0 ]; then
+            _err_msg_="Unable to Copy  CO ${COORD_SYM_INI} to ${SCRIPTHOME}/${COORD_SYM_INI}_CO"
+            abort_script "${_err_msg_}"
+        fi
+
+        $UMOUNT -l ${NFS_MountPoint_check}
+        if [ $? -ne 0 ]; then
+            _err_msg_="Error unmounting directory ${NFS_MountPoint_check}"
+            abort_script "${_err_msg_}"
+        fi
+
+        _dwh_main_list_check_=`iniget DWH_DBSPACES_MAIN -f ${SCRIPTHOME}/${COORD_SYM_INI}_CO`
+        if [ ! "${_dwh_main_list_check_}" ]; then
+            _err_msg_="Could not read any MAIN LUN details from ${SCRIPTHOME}/${COORD_SYM_INI}_CO"
+            abort_script "$_err_msg_" "${EXEC_SHELL_CMD}"
+        fi
+
+        _dwh_sysmain_list_check_=`iniget DWH_SYSTEM_MAIN -f ${SCRIPTHOME}/${COORD_SYM_INI}_CO`
+        if [ ! "${_dwh_main_list_check_}" ]; then
+            _err_msg_="Could not read  Sysmain LUN details from ${SCRIPTHOME}/${COORD_SYM_INI}_CO"
+            abort_script "$_err_msg_" "${EXEC_SHELL_CMD}"
+        fi
+
+        for _dwh_main_check_ in ${_dwh_main_list_check_} ${_dwh_sysmain_list_check_}; do
+            _wwn_check_=`iniget ${_dwh_main_check_} -f ${SCRIPTHOME}/${COORD_SYM_INI}_CO -v WWN`
+            if [ ! "${_wwn_check_}" ]; then
+                _err_msg_="Could not read any WWN number of Main Lun details from ${SCRIPTHOME}/${COORD_SYM_INI}_CO"
+                abort_script "$_err_msg_" "${EXEC_SHELL_CMD}"
+            fi
+
+            _wwn_multipath_check_=`$MULTIPATH -l | $EGREP -w ${_wwn_check_} | $AWK -F " " '{print $1}'`
+            if [ "${_wwn_multipath_check_}" ]; then
+                $ECHO ${_wwn_multipath_check_} >> ${SCRIPTHOME}/installation/config/disks_partitioned
+            fi
+
+        done
+        $RM -rf ${SCRIPTHOME}/${COORD_SYM_INI}_CO
+        $CP -Rp ${SCRIPTHOME}/installation/config/disks_partitioned  /eniq/installation/config/
+    fi
+    if [ -f ${SCRIPTHOME}/installation/config/create_disk_partition_completion.txt  ]; then
+        # Set up the stages that I need to run to update the sym_link.ini and SunOS.ini files with the correct disks/luns for FS and database sym links
+        stage_list_1="create_lun_map build_ini_file"
+    else
+        # Set up the stages that I need to run to update the sym_link.ini and SunOS.ini files with the correct disks/luns for FS and database sym links
+        stage_list_1="create_disk_partition create_lun_map build_ini_file"
+    fi
+
+    # Run required stages
+    for _i_ in ${stage_list_1}; do
+        ${SCRIPTHOME}/installation/core_install/bin/eniq_core_install.bsh -s ${_i_} -d ${BASE_SW_DIR} -n -b ${SCRIPTHOME} -R -l ${LOGFILE}
+        if [ $? -ne 0 ]; then
+            _err_msg_="Error running stage ${_i_} during ENIQ restore"
+            abort_script "${_err_msg_}"   
+        fi
+        
+        if [ "${_i_}" == "create_disk_partition" ]; then
+            $TOUCH ${SCRIPTHOME}/installation/config/create_disk_partition_completion.txt
+        fi
+    done
+    $CP -p ${SCRIPTHOME}/installation/config/disks_partitioned  /eniq/installation/config/
+    if [ $? -ne 0 ]; then
+        _err_msg_="Could not copy ${SCRIPTHOME}/installation/config/disks_partitioned to /eniq/installation/config/"
+        abort_script "${_err_msg_}" 
+    fi
+
+
+    $CP ${TMP_RESTORE}/${SYM_LINK_INI} ${SCRIPTHOME}/installation/config/
+    if [ $? -ne 0 ]; then
+        _err_msg_="Could not copy ${TMP_RESTORE}/${SYM_LINK_INI} to ${SCRIPTHOME}/installation/config/"
+        abort_script "${_err_msg_}" 
+    fi
+
+    $CP ${TMP_RESTORE}/${SUNOS_INI} ${SCRIPTHOME}/installation/config/
+    if [ $? -ne 0 ]; then
+        _err_msg_="Could not copy ${TMP_RESTORE}/${SUNOS_INI} to ${SCRIPTHOME}/installation/config/"
+        abort_script "${_err_msg_}" 
+    fi
+    
+    $CP ${TMP_RESTORE}/${ENIQ_INI} ${SCRIPTHOME}/installation/config/
+    if [ $? -ne 0 ]; then
+        _err_msg_="Could not copy ${TMP_RESTORE}/${ENIQ_INI} to ${SCRIPTHOME}/installation/config/"
+        abort_script "${_err_msg_}" 
+    fi
+    # This is because the II does not yet create the COORD_SYM_INI
+    if [ "${CO_SERVER}" == "YES" ]; then
+        $CP ${SCRIPTHOME}/installation/config/${SYM_LINK_INI} ${SCRIPTHOME}/installation/config/${COORD_SYM_INI}
+        if [ $? -ne 0 ]; then
+            _err_msg_="Could not copy ${SCRIPTHOME}/installation/config/${SYM_LINK_INI} to ${SCRIPTHOME}/installation/config/${COORD_SYM_INI}"
+            abort_script "${_err_msg_}" 
+        fi
+    fi
+else
+    #Checking the presence of disks_partitioned config file, if Present remove it
+    #disks_partitioned file will be created in create_disk_partition stage
+    if [ -s ${SCRIPTHOME}/installation/config/disks_partitioned ]; then
+        $RM -rf ${SCRIPTHOME}/installation/config/disks_partitioned
+        if [ $? -ne 0 ]; then
+            _err_msg_="Could not remove ${SCRIPTHOME}/installation/config/disks_partitioned"
+            abort_script "${_err_msg_}"
+        fi
+    fi
+    
+    $RM -rf ${ENIQ_CONF_DIR}/disks_partitioned
+    if [ $? -ne 0 ]; then
+        _err_msg_="Could not remove ${ENIQ_CONF_DIR}/disks_partitioned"
+        abort_script "${_err_msg_}"
+    fi
+
+    # Set up the stages that I need to run to update the sym_link.ini and SunOS.ini files with the correct disks/luns for FS and database sym links
+    stage_list_1="create_disk_partition "
+
+    # Run required stages
+    for _i_ in ${stage_list_1}; do
+        ${SCRIPTHOME}/installation/core_install/bin/eniq_core_install.bsh -s ${_i_} -d ${BASE_SW_DIR} -n -b ${SCRIPTHOME} -R -l ${LOGFILE}
+        if [ $? -ne 0 ]; then
+            _err_msg_="Error running stage ${_i_} during ENIQ restore"
+            abort_script "${_err_msg_}"   
+        fi
+    done
+
+    # This is because the II does not yet create the COORD_SYM_INI
+    if [ "${CO_SERVER}" == "YES" ]; then
+        $CP ${SCRIPTHOME}/installation/config/${SYM_LINK_INI} ${SCRIPTHOME}/installation/config/${COORD_SYM_INI}
+        if [ $? -ne 0 ]; then
+            _err_msg_="Could not copy ${SCRIPTHOME}/installation/config/${SYM_LINK_INI} to ${SCRIPTHOME}/installation/config/${COORD_SYM_INI}"
+            abort_script "${_err_msg_}" 
+        fi
+    fi
+fi
+
+
+$RM -rf ${ENIQ_BASE_DIR}/installation/core_install/
+$RM -rf ${SCRIPTHOME}/installation/config/create_disk_partition_completion.txt
+
+set_next_stage 5
+}
+
+
+### Function: restore_stage_5 ###
+#
+# Perform 5th part of Eniq restore
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+restore_stage_5()
+{
+get_next_stage
+
+# Checks the status of the restore stage
+if [ "${NEXT_STAGE}" != "5" -a ! "${FORCE_RESTORE}" ]; then
+    if [ "${NEXT_STAGE}" = "done" ]; then
+        _err_msg_="Current restore seems to be completed"
+    else
+        _err_msg_="Current restore seems to be at stage ${NEXT_STAGE}"
+    fi
+    abort_script "${_err_msg_}"
+fi
+
+# get eniq server info
+get_server_info
+if [ ! -f ${SCRIPTHOME}/stage5_II_stages_done.txt ]; then
+    $CP -rp ${SCRIPTHOME}/installation/config ${ENIQ_INST_DIR}
+    if [ $? -ne 0 ]; then
+        _err_msg_="Could not copy ${SCRIPTHOME}/installation/config directory to ${ENIQ_INST_DIR}"
+        abort_script "${_err_msg_}" 
+    fi
+    if [ "${STORAGE_TYPE}" != "fs" ]; then
+        if [ "${CO_SERVER}" == "YES" ]; then
+            # Setting up the stages that needs to be run
+            # If hidden file doesn't exist/empty use old method of nas shares 
+            if [ ! -f ${SCRIPTHOME}/installation/config/created_nas_filesystem.txt ]; then
+               stage_list_2="delete_nas_filesystems create_nas_filesystems"
+            fi
+    
+            if [ ! -s ${SCRIPTHOME}/installation/config/.nas_share.txt ]; then
+                stage_list_3="create_nas_shares create_volume_group create_logical_volume_filesystem create_directories"
+            else
+    
+                stage_list_3="create_volume_group create_logical_volume_filesystem create_directories"
+            fi
+        else
+            # Setting up the stages that needs to be run
+            # If hidden file doesnt exist use old method of nas shares
+			SAN_DEVICE=`iniget SAN_DEV -f ${SCRIPTHOME}/installation/config/${SUNOS_INI} -v SAN_DEVICE`
+			if [ ! "${SAN_DEVICE}" ]; then
+				_err_msg_="Could not read SAN_DEVICE param "
+				abort_script "${_err_msg_}"
+			fi
+			if [ "${SAN_DEVICE}" != "unityXT" ]; then
+				if [ ! -f ${SCRIPTHOME}/installation/config/.shared.txt ]; then
+					stage_list_2="create_nas_shares create_volume_group create_logical_volume_filesystem create_directories"
+				else
+					stage_list_2="create_volume_group create_logical_volume_filesystem create_directories"
+				fi
+			else
+				stage_list_2="create_nas_shares create_volume_group create_logical_volume_filesystem create_directories"
+			fi
+        fi
+    else 
+        # Setting up the stages that needs to be run
+        stage_list_3="create_volume_group create_logical_volume_filesystem create_directories"
+    fi
+    
+    if [[ ${stage_list_2} ]]; then
+        # Run required stages
+        for _i_ in ${stage_list_2}; do
+        ${SCRIPTHOME}/installation/core_install/bin/eniq_core_install.bsh -s ${_i_} -d ${BASE_SW_DIR} -n -b ${SCRIPTHOME} -R -l ${LOGFILE}
+            if [ $? -ne 0 ]; then
+                _err_msg_="Error running stage ${_i_} during ENIQ restore"
+                abort_script "${_err_msg_}"    
+            fi
+            
+            if [ "${_i_}" == "create_nas_filesystems" ]; then
+                $TOUCH ${SCRIPTHOME}/installation/config/created_nas_filesystem.txt
+            fi
+        done
+    fi
+    
+    if [ "${STORAGE_TYPE}" != "fs" -a "${CO_SERVER}" == "YES" ] && [ ! -f ${SCRIPTHOME}/installation/config/nas_shared_coordinator.txt ]; then
+        # execute shares
+		SAN_DEVICE=`iniget SAN_DEV -f ${SCRIPTHOME}/installation/config/${SUNOS_INI} -v SAN_DEVICE`
+		if [ ! "${SAN_DEVICE}" ]; then
+			_err_msg_="Could not read SAN_DEVICE param "
+			abort_script "${_err_msg_}"
+		fi
+		if [ "${SAN_DEVICE}" != "unityXT" ]; then
+			share_nas_clients
+			if [ $? -eq 0 ]; then
+			   $TOUCH ${SCRIPTHOME}/installation/config/nas_shared_coordinator.txt
+			fi
+		fi
+    fi
+    
+    # Run required stages
+    if [[ ${stage_list_3} ]]; then
+        for _i_ in ${stage_list_3}; do
+        ${SCRIPTHOME}/installation/core_install/bin/eniq_core_install.bsh -s ${_i_} -d ${BASE_SW_DIR} -n -b ${SCRIPTHOME} -R -l ${LOGFILE}
+            if [ $? -ne 0 ]; then
+                _err_msg_="Error running stage ${_i_} during ENIQ restore"
+                abort_script "${_err_msg_}"    
+            fi
+        done
+    fi
+    
+    $CP -rp ${SCRIPTHOME}/installation/config ${ENIQ_INST_DIR}
+    if [ $? -ne 0 ]; then
+        _err_msg_="Could not copy ${SCRIPTHOME}/installation/config directory to ${ENIQ_INST_DIR}"
+        abort_script "${_err_msg_}" 
+    fi
+    # Restore systemd dir
+    restore_eniq_smf
+    
+    $MKDIR -p ${ENIQ_BASE_DIR}/installation
+    $CP -rp ${SCRIPTHOME}/installation/core_install ${ENIQ_BASE_DIR}/installation
+    if [ $? -ne 0 ]; then
+        _err_msg_="Could not copy ${SCRIPTHOME}/installation/core_install ${ENIQ_BASE_DIR}/installation"
+        abort_script "${_err_msg_}" 
+    fi
+    $TOUCH ${SCRIPTHOME}/stage5_II_stages_done.txt
+fi
+
+if [ "${STORAGE_TYPE}" != "fs" ]; then
+    # Enable NASd to mount all the NAS file systems
+    
+    # Clear to ensure service is 'inactive'
+    $SYSTEMCTL reset-failed ${NASd_SMF_ID} >> /dev/null 2>&1
+    
+    # Starting the service state
+    $SYSTEMCTL start ${NASd_SMF_ID} >> /dev/null 2>&1
+    _service_state_=`$SYSTEMCTL show -p ActiveState ${NASd_SMF_ID} | $AWK -F'=' '{print $2}'`
+    if [ "${_service_state_}" != "active" ]; then
+        _err_msg_="Could not start ${NASd_SMF_ID}"
+        abort_script "${_err_msg_}" 
+    fi
+    
+    # Enabling the service
+    $SYSTEMCTL enable ${NASd_SMF_ID} >> /dev/null 2>&1
+    _is_enabled_=`$SYSTEMCTL is-enabled ${NASd_SMF_ID}`
+    if [ "${_is_enabled_}" != "enabled" ]; then
+        _err_msg_="Could not enable ${NASd_SMF_ID}"
+        abort_script "${_err_msg_}" 
+    fi
+
+    _service_state_=`$SYSTEMCTL show -p ActiveState ${NAS_MILESTONE_SMF_ID} | $AWK -F'=' '{print $2}'`
+    log_msg -t -l ${LOGFILE} -s "Please wait while the NAS milestone comes in active state...\n" 
+    while [ "${_service_state_}" != "active" ]; do
+        $SLEEP 2
+        _service_state_=`$SYSTEMCTL show -p ActiveState ${NAS_MILESTONE_SMF_ID} | $AWK -F'=' '{print $2}'`
+    done
+    log_msg -t -l ${LOGFILE} -s "NAS milestone started successfully...\n"
+fi
+
+# Set permissions on all mount points and f/s
+${SCRIPTHOME}/installation/core_install/bin/eniq_core_install.bsh -s change_mount_owners -d ${SCRIPTHOME} -n -b ${SCRIPTHOME} -R -l ${LOGFILE}
+if [ $? -ne 0 ]; then
+    _err_msg_="Error running stage change_mount_owners during ENIQ restore"
+    abort_script "${_err_msg_}"
+fi
+
+$RM -rf ${ENIQ_BASE_DIR}/installation/core_install/
+$RM -rf ${SCRIPTHOME}/installation/config/created_nas_filesystem.txt
+$RM -rf ${SCRIPTHOME}/installation/config/nas_shared_coordinator.txt
+$RM -rf ${ENIQ_BASE_DIR}/installation/config/created_nas_filesystem.txt
+$RM -rf ${ENIQ_BASE_DIR}/installation/config/nas_shared_coordinator.txt
+$RM -rf ${SCRIPTHOME}/stage5_II_stages_done.txt
+set_next_stage 6
+}
+
+### Function: restore_stage_6 ###
+#
+# Perform 6th part of Eniq restore
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+restore_stage_6()
+{
+# set user values
+setup_users
+
+# check and create .profile file
+setup_sysuser_profile
+
+get_next_stage
+
+# Checks the status of the restore stage
+if [ "${NEXT_STAGE}" != "6" -a ! "${FORCE_RESTORE}" ]; then
+    if [ "${NEXT_STAGE}" = "done" ]; then
+        _err_msg_="Current restore seems to be completed"
+    else
+        _err_msg_="Current restore seems to be at stage ${NEXT_STAGE}"
+    fi
+    abort_script "${_err_msg_}"
+fi
+
+if [ ! -s ${SCRIPTHOME}/installation/core_install/bin/update_sym_links_ini.bsh ]; then
+    _err_msg_="Cannot locate ${SCRIPTHOME}/installation/core_install/bin/update_sym_links_ini.bsh"
+    abort_script "${_err_msg_}"
+fi
+
+if [ ! "${NO_CONFIRM}" ]; then
+    user_confirm "Are you sure you wish to continue?\nDatabase sym links will be recreated."
+    if [ $USER_CONF == No ]; then
+        $RM -rf ${TEM_DIR}
+        exit 0
+    fi
+fi
+
+# get eniq server info
+get_server_info
+
+# Disable Eniq services
+disable_eniq_services
+
+$CP -Rp ${SCRIPTHOME}/installation/config ${ENIQ_CONF_DIR}
+
+if [ "${CURR_SERVER_TYPE}" == "stats_engine" ]; then
+    # Am i a reader
+    READER_ALIAS=`$CAT ${CLI_CONF_DIR}/service_names | $GREP -w "${HOST_IP}" | $GREP "dwh_" | $AWK -F"::" '{print $NF}'`
+    if [ ! ${READER_ALIAS} ]; then
+        # This is to make sure none IQ servers dont run the stages below.
+        _reader_=NO 
+    fi
+fi
+
+if [ "${STORAGE_TYPE}" != "fs" ]; then
+# Copy back in the updated ini files from stage 4
+	_file_list_="${IPMP_INI} ${SUNOS_INI} ${RBAC_INI}"
+	for _file_ in `$ECHO ${_file_list_}`; do
+		$CP ${SCRIPTHOME}/installation/config/${_file_} ${ENIQ_CONF_DIR}/${_file_}
+		if [ $? -ne 0 ]; then
+			_err_msg_="Could not copy ${SCRIPTHOME}/installation/config/${_file_} to ${ENIQ_CONF_DIR}/${_file_}"
+			abort_script "${_err_msg_}" 
+		fi
+	done
+else
+	_file_list_="${SUNOS_INI}"
+	for _file_ in `$ECHO ${_file_list_}`; do
+		$CP ${SCRIPTHOME}/installation/config/${_file_} ${ENIQ_CONF_DIR}/${_file_}
+		if [ $? -ne 0 ]; then
+			_err_msg_="Could not copy ${SCRIPTHOME}/installation/config/${_file_} to ${ENIQ_CONF_DIR}/${_file_}"
+			abort_script "${_err_msg_}" 
+		fi
+	done
+
+fi
+$RM -f ${TEM_DIR}/cont_message.$$ >> /dev/null 2&>1
+
+_user_input_=`$CAT ${ENIQ_BKUPSW_DIR}/etc/eniq_backup.conf |$GREP -w BKUP_OPTION_STR |$AWK -F= '{print $2}' 2>/dev/null`
+
+if [ "${STORAGE_TYPE}" != "fs" -a "${_reader_}" != "NO" ]; then
+    # Need to sync back the updated ini files
+    $CP ${SCRIPTHOME}/installation/config/${SYM_LINK_INI} ${ENIQ_CONF_DIR}/${SYM_LINK_INI} 
+    if [ $? -ne 0 ]; then
+        _err_msg_="Could not copy ${SCRIPTHOME}/installation/config/${SYM_LINK_INI} to ${ENIQ_CONF_DIR}/${SYM_LINK_INI}"
+        abort_script "${_err_msg_}" 
+    fi
+
+    $CP ${SCRIPTHOME}/installation/config/${COORD_SYM_INI} ${ENIQ_CONF_DIR}/${COORD_SYM_INI}
+    if [ $? -ne 0 ]; then
+        _err_msg_="Could not copy ${SCRIPTHOME}/installation/config/${COORD_SYM_INI} to ${ENIQ_CONF_DIR}/${COORD_SYM_INI}"
+        abort_script "${_err_msg_}" 
+    fi
+
+    $CP ${SCRIPTHOME}/installation/config/${LUN_MAP_INI} ${ENIQ_CONF_DIR}/${LUN_MAP_INI} 
+    if [ $? -ne 0 ]; then
+        _err_msg_="Could not copy ${SCRIPTHOME}/installation/config/${LUN_MAP_INI} to ${ENIQ_CONF_DIR}/${LUN_MAP_INI}"
+        abort_script "${_err_msg_}" 
+    fi
+
+    if [ "${CO_SERVER}" == "YES" ]; then
+        $CP ${SCRIPTHOME}/installation/config/${COORD_SYM_INI} ${CLI_CONF_DIR}/${COORD_SYM_INI}
+        if [ $? -ne 0 ]; then
+            _err_msg_="Could not copy ${SCRIPTHOME}/installation/config/${COORD_SYM_INI} to ${CLI_CONF_DIR}/${COORD_SYM_INI}"
+            abort_script "${_err_msg_}" 
+        fi
+		$CP ${SCRIPTHOME}/installation/config/${STORAGE_INI} ${CLI_CONF_DIR}/${STORAGE_INI}
+		if [ $? -ne 0 ]; then
+            _err_msg_="Could not copy ${SCRIPTHOME}/installation/config/${STORAGE_INI} ${CLI_CONF_DIR}/${STORAGE_INI}"
+            abort_script "${_err_msg_}" 
+        fi
+    fi
+
+    if [ -s ${SCRIPTHOME}/installation/config/iq_header_info ]; then
+        if [ ! -s ${ENIQ_CONF_DIR}/iq_header_info ]; then
+            $CP ${SCRIPTHOME}/installation/config/iq_header_info ${ENIQ_CONF_DIR}/iq_header_info
+            if [ $? -ne 0 ]; then
+                _err_msg_="Could not read System User from $ to ${ENIQ_CONF_DIR}/iq_header_info"
+                abort_script "${_err_msg_}" 
+            fi
+        fi
+    fi
+
+    if [ "${INSTALL_TYPE}" == "stats" -a "${_user_input_}" != "NoData" ]; then
+        # Update Sybase Sym Link Information if required
+        $BASH ${SCRIPTHOME}/installation/core_install/bin/update_sym_links_ini.bsh -N
+        if [ $? -ne 0 ]; then
+            _err_msg_="Error updating sym_links_ini during ENIQ restore"
+            abort_script "${_err_msg_}"
+        fi
+    fi
+    
+    
+      if [ "${INSTALL_TYPE}" == "stats" ]; then 
+        # Set up the stages that I need to run 
+        stage_list_1="create_db_sym_links"
+        # Run required stages
+        for _i_ in ${stage_list_1}; do 
+        ${SCRIPTHOME}/installation/core_install/bin/eniq_core_install.bsh -s ${_i_} -d ${BASE_SW_DIR} -n -R -l ${LOGFILE}
+            if [ $? -ne 0 ]; then
+                _err_msg_="Error running stage ${_i_} during ENIQ restore"
+                abort_script "${_err_msg_}"    
+            fi
+        done
+     fi
+fi
+
+if [ "${INSTALL_TYPE}" != "es" ]; then
+    if [ ! -s ${ENIQ_BASE_DIR}/bkup_sw/bin/recover_iq.bsh ]; then
+        _err_msg_="Could not locate ${ENIQ_BASE_DIR}/bkup_sw/bin/recover_iq.bsh"
+        abort_script "${_err_msg_}"
+    fi
+fi
+
+# get eniq server info
+get_server_info
+
+# Disable Eniq services
+disable_eniq_services
+
+# Enable required services
+smf_list="${HOSTSYNC_SMF_ID}"
+for _smf_ in ${smf_list}; do
+    log_msg -l ${LOGFILE} -s "Enabling service ${_smf_}"
+    $SYSTEMCTL reset-failed ${_smf_} >> /dev/null 2>&1
+    $SYSTEMCTL enable ${_smf_} >> /dev/null 2>&1
+    _is_enabled_=`$SYSTEMCTL is-enabled ${_smf_}`
+    if [ "${_is_enabled_}" != "enabled" ]; then
+        _err_msg_="Could not enable ${_smf_}"
+        abort_script "${_err_msg_}" 
+    fi
+
+    $SYSTEMCTL start ${_smf_} >> /dev/null 2>&1
+    _service_state_=`$SYSTEMCTL show -p ActiveState ${_smf_} | $AWK -F'=' '{print $2}'`
+    if [ "${_service_state_}" != "active" ]; then
+        _err_msg_="Could not start ${_smf_}"
+        abort_script "${_err_msg_}" 
+    fi
+done
+
+if [ "${CO_SERVER}" == "YES" ]; then
+    # Enable Sentinel
+    _smf_list_="${SENTINEL_SMF_ID}"
+    for _smf_ in ${_smf_list_}; do
+        log_msg -l ${LOGFILE} -s "Enabling service ${_smf_}"
+        $SYSTEMCTL reset-failed ${_smf_} >> /dev/null 2>&1
+        $SYSTEMCTL enable ${_smf_} >> /dev/null 2>&1
+        _is_enabled_=`$SYSTEMCTL is-enabled ${_smf_}`
+        if [ "${_is_enabled_}" != "enabled" ]; then
+            _err_msg_="Could not enable ${_smf_}"
+            abort_script "${_err_msg_}" 
+        fi
+
+        $SYSTEMCTL start ${_smf_} >> /dev/null 2>&1
+        _service_state_=`$SYSTEMCTL show -p ActiveState ${_smf_} | $AWK -F'=' '{print $2}'`
+        if [ "${_service_state_}" != "active" ]; then
+            _err_msg_="Could not start ${_smf_}"
+           abort_script "${_err_msg_}" 
+        fi
+    done
+    
+    if [ "${INSTALL_TYPE}" != "es" ]; then
+        setup_sybase_env
+
+        if [ ! -s ${ENIQ_BASE_DIR}/bkup_sw/bin/repdb_restore.bsh ]; then
+            _err_msg_="File ${ENIQ_BASE_DIR}/bkup_sw/bin/repdb_restore.bsh not found"
+            abort_script "${_err_msg_}"
+        fi 
+    
+        # Restore the Repository Database
+        log_msg -t -l ${LOGFILE} -s "Restoring the Repository database\n"
+        $SU - ${SYSUSER} -c "$BASH ${ENIQ_BASE_DIR}/bkup_sw/bin/repdb_restore.bsh -c ${CLI_CONF_DIR}"
+        if [ $? -ne 0 ]; then
+            _err_msg_="Could not restore Repository database"
+            abort_script "${_err_msg_}"
+        fi
+    fi
+
+    if [ "${INSTALL_TYPE}" == "stats" ]; then
+        if [  "${_user_input_}" != "NoData" ]; then
+            $BASH ${ENIQ_BASE_DIR}/bkup_sw/bin/recover_iq.bsh -N
+            if [ $? -ne 0 ]; then
+                _err_msg_="Execution of /eniq/bkup_sw/bin/recover_iq.bsh failed"
+                abort_script "${_err_msg_}"
+            fi
+        else
+            #Disabling cron entries for dcuser
+            $CRONTAB -u ${SYSUSER} -l >${SCRIPTHOME}/${SYSUSER}_cron_file.txt
+            $SED '/monitor_heap.bsh/s!^!#!;/count_repbd_dwhdb_conn.bsh/s!^!#!;/monitor_cache_usage.bsh/s!^!#!' ${SCRIPTHOME}/${SYSUSER}_cron_file.txt >${SCRIPTHOME}/${SYSUSER}_cron_file_tmp.txt
+            $SU - ${SYSUSER} -c "$CRONTAB ${SCRIPTHOME}/${SYSUSER}_cron_file_tmp.txt"
+            if [ $? -ne 0 ]; then
+                _err_msg_="`$DATE +%d.%m.%y_%H:%M:%S` -  Failed to disable cron entry"
+                abort_script "${_err_msg_}"
+            fi 
+
+            # Start the repdb so we can get the passwords
+            log_msg -t -l ${LOGFILE} -s "Starting the repository database\n"
+            $SU - ${SYSUSER} -c "${ENIQ_ADMIN_BIN_DIR}/repdb start"
+            if [ $? -ne 0 ] ; then
+                _err_msg_="`$DATE +%d.%m.%y_%H:%M:%S` -  Failed to start repdb"
+                abort_script "${_err_msg_}"
+            else
+                log_msg -t -l ${LOGFILE} -s "Repository database is now online"
+            fi
+
+            #Recreate the dwhdb (IQ) Database
+            $RM -rf ${ENIQ_BASE_DIR}/database/dwh_main/*
+            # Set up the stages that I need to run
+            stage_list="create_dwhdb"
+ 
+            if [ "${CURR_SERVER_TYPE}" == "stats_coordinator" ]; then
+                stage_list="${stage_list} create_iq_mpx"
+            fi
+ 
+            # Run required stages
+            for _i_ in ${stage_list}; do
+                ${SCRIPTHOME}/installation/core_install/bin/eniq_core_install.bsh -s ${_i_} -d ${BASE_SW_DIR} -n -R -l ${LOGFILE}
+                if [ $? -ne 0 ]; then
+                    _err_msg_="Error running stage ${_i_} during ENIQ restore"
+                    abort_script "${_err_msg_}"
+                fi
+            done
+        
+            # Need to start repdb,dwhdb,licmgr and engine
+            # Enable all the ENIQ services
+            log_msg -l ${LOGFILE} -s "Starting the repdb,dwhdb and engine ENIQ services "
+            $BASH ${ENIQ_ADMIN_DIR}/bin/manage_eniq_services.bsh -a start -s dwhdb -N | $TEE -a ${LOGFILE}
+			status=(${PIPESTATUS[@]})
+            pipe_status0=${status[0]}
+            pipe_status1=${status[1]}
+            if [ "${pipe_status0}" -ne 0 ]; then
+                _err_msg_="Failed to start ENIQ DB services."
+                abort_script "${_err_msg_}"
+            fi
+
+            $SLEEP 120
+            $BASH ${ENIQ_ADMIN_DIR}/bin/manage_eniq_services.bsh -a start -s licmgr -N | $TEE -a ${LOGFILE}
+			status=(${PIPESTATUS[@]})
+            pipe_status0=${status[0]}
+            pipe_status1=${status[1]}
+            if [ "${pipe_status0}" -ne 0 ]; then
+                _err_msg_="Failed to start ENIQ service."
+                abort_script "${_err_msg_}"
+            fi
+        fi
+    fi
+else
+    if [ "${CURR_SERVER_TYPE}" == "stats_iqr" ]; then
+        # Am i a reader
+        READER_ALIAS=`$CAT ${CLI_CONF_DIR}/service_names | $GREP -w "${HOST_IP}" | $GREP "dwh_" | $AWK -F"::" '{print $NF}'`
+        if [ ${READER_ALIAS} ]; then
+            recreate_reader_mpx 
+        fi
+    fi
+fi
+
+# Enable the automounter
+$SYSTEMCTL reset-failed ${AUTOMOUNT_SMF_ID} >> /dev/null 2>&1
+$SYSTEMCTL enable ${AUTOMOUNT_SMF_ID} >> /dev/null 2>&1
+_is_enabled_=`$SYSTEMCTL is-enabled ${AUTOMOUNT_SMF_ID}`
+if [ "${_is_enabled_}" != "enabled" ]; then
+    _err_msg_="Could not enable ${AUTOMOUNT_SMF_ID}"
+    abort_script "${_err_msg_}" 
+fi
+
+$SYSTEMCTL start ${AUTOMOUNT_SMF_ID} >> /dev/null 2>&1
+_service_state_=`$SYSTEMCTL show -p ActiveState ${AUTOMOUNT_SMF_ID} | $AWK -F'=' '{print $2}'`
+if [ "${_service_state_}" != "active" ]; then
+    _err_msg_="Could not start ${AUTOMOUNT_SMF_ID}"
+    abort_script "${_err_msg_}" 
+fi
+
+# Enable DDC
+log_msg -l ${LOGFILE} -s "Enabling service ${DDC_SMF_ID}"
+$SYSTEMCTL reset-failed ${DDC_SMF_ID} >> /dev/null 2>&1
+$SYSTEMCTL enable ${DDC_SMF_ID} >> /dev/null 2>&1
+_is_enabled_=`$SYSTEMCTL is-enabled ${DDC_SMF_ID}`
+if [ "${_is_enabled_}" != "enabled" ]; then
+    _err_msg_="Could not enable ${DDC_SMF_ID}"
+    abort_script "${_err_msg_}" 
+fi
+
+$SYSTEMCTL start ${DDC_SMF_ID} >> /dev/null 2>&1
+_service_state_=`$SYSTEMCTL show -p ActiveState ${DDC_SMF_ID} | $AWK -F'=' '{print $2}'`
+if [ "${_service_state_}" != "active" ]; then
+    _err_msg_="Could not start ${DDC_SMF_ID}"
+    abort_script "${_err_msg_}" 
+fi
+
+# Need to remove the roll and backup snapshot flags
+# This is so that after a restore we can take a new snapshot
+ROLL_SNAP_FILE_INDICATOR="/eniq/bkup_sw/etc/.create_rolling_snapshot"
+ROLL_SNAP_PROGRESS_INDICATOR="/eniq/bkup_sw/etc/.rolling_snapshot_in_progress"
+BKUP_SNAP_FILE_INDICATOR="/eniq/bkup_sw/etc/.create_backup_snapshot"
+BKUP_SNAP_PROGRESS_INDICATOR="/eniq/bkup_sw/etc/.rolling_backup_in_progress"
+
+$RM -f ${ROLL_SNAP_FILE_INDICATOR} ${ROLL_SNAP_PROGRESS_INDICATOR} ${BKUP_SNAP_FILE_INDICATOR} ${BKUP_SNAP_PROGRESS_INDICATOR}
+
+${SCRIPTHOME}/installation/core_install/bin/eniq_core_install.bsh -s create_directories -l ${LOGFILE}
+if [ $? -ne 0 ]; then
+    _err_msg_="Error running stage create_directories during ENIQ restore stage 6"
+    abort_script "${_err_msg_}"    
+fi
+
+# Change the permission of some directories as per the pre-check
+$CHMOD 770 ${ENIQ_BASE_DIR}/data/rejected
+
+set_next_stage done
+
+}
+
+### Function: set_next_stage ###
+#
+# Set up the stage to be run
+#
+# Arguments:
+#   $1 : Stage to be set to. Either numeric value or 'done'
+# Return Values:
+#   none
+set_next_stage()
+{
+_stage_time_=`$DATE '+%Y-%b-%d_%H.%M.%S'`
+$ECHO "# Setting new stage at ${_stage_time_}" > ${STAGEFILE} | $TEE -a ${LOGFILE}
+$ECHO "${1}" >> ${STAGEFILE} | $TEE -a ${LOGFILE}
+}
+
+### Function: setup_env ###
+#
+# Setup up path environment etc
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+setup_env()
+{
+REST_CONF_FILE="${SCRIPTHOME}/etc/eniq_restore.conf"
+if [ ! -s ${REST_CONF_FILE} ]; then
+    _err_msg_="Could not locate file ${REST_CONF_FILE}"
+    abort_script "${_err_msg_}"
+fi
+
+BMR_PATH=`$CAT ${REST_CONF_FILE}|$EGREP '^[     ]*BMR_PATH=' | $AWK -F"=" '{print $2}'`
+if [ ! "${BMR_PATH}" ]; then
+    _err_msg_="Could not read BMR_PATH param from ${REST_CONF_FILE}"
+    abort_script "${_err_msg_}"
+fi
+
+ROOT_MT_PT=`$CAT ${REST_CONF_FILE} | $EGREP '^[     ]*ROOT_MT_PT=' | $AWK -F"=" '{print $2}'`
+if [ ! "${ROOT_MT_PT}" ]; then
+    _err_msg_="Could not read ROOT_MT_PT param from ${REST_CONF_FILE}"
+    abort_script "${_err_msg_}"
+fi
+
+LVMDUMP_DIR=`$CAT ${REST_CONF_FILE} | $EGREP '^[     ]*LVMDUMP_DIR=' | $AWK -F"=" '{print $2}'`
+if [ ! "${LVMDUMP_DIR}" ]; then
+    _err_msg_="Could not read LVMDUMP_DIR param from ${REST_CONF_FILE}"
+    abort_script "${_err_msg_}"
+fi
+
+ROOT_DISK=`$CAT ${REST_CONF_FILE} | $EGREP '^[     ]*ROOT_DISK=' | $AWK -F"=" '{print $2}'`
+if [ ! "${ROOT_DISK}" ]; then
+    _err_msg_="Could not read ROOT_DISK param from ${REST_CONF_FILE}"
+    abort_script "${_err_msg_}"
+fi
+
+if [ ! "${ENIQ_BASE_DIR}" ]; then
+    # Directory on the root filesystem
+    ENIQ_BASE_DIR=/eniq
+fi
+
+
+#Library Files of GRUB2 Packages
+GRUB_LIB="/usr/lib/grub"
+GRUB_LIB1="/usr/lib/"
+
+TMP_RESTORE="/tmp/restore_get_disk_info"
+#GRUB2 Packages Location
+GRUB_PKG_LOC="/usr/sbin/grub2-install"
+
+# ENIQ Admin Directory
+ENIQ_ADMIN_DIR=${ENIQ_BASE_DIR}/admin
+
+# ENIQ Log Directory
+ENIQ_LOG_DIR=${ENIQ_BASE_DIR}/local_logs
+
+# ENIQ Admin Bin Directory
+ENIQ_ADMIN_BIN_DIR=${ENIQ_ADMIN_DIR}/bin
+
+# ENIQ Installer Directory
+ENIQ_INSTALLER_DIR=${ENIQ_BASE_DIR}/sw/installer
+
+# ENIQ SW conf
+CLI_CONF_DIR=${ENIQ_BASE_DIR}/sw/conf
+
+# Main Directory for the Core Installation SW
+ENIQ_INST_DIR=${ENIQ_BASE_DIR}/installation
+
+# Main Directory for the Core Installation SW
+ENIQ_CORE_INST_DIR=${ENIQ_INST_DIR}/core_install
+
+# Main Binary Directory for the Core Installation SW
+ENIQ_INST_BIN_DIR=${ENIQ_CORE_INST_DIR}/bin
+
+# ENIQ Config Directory
+ENIQ_CONF_DIR=${ENIQ_INST_DIR}/config
+
+# ENIQ Backup software directory
+ENIQ_BKUPSW_DIR=${ENIQ_BASE_DIR}/bkup_sw
+
+# ENIQ Backup Conf File
+ENIQ_BKUP_CONF_FILE="${ENIQ_BKUPSW_DIR}/etc/eniq_backup.conf"
+
+# ENIQ home
+ENIQ_HOME_DIR=${ENIQ_BASE_DIR}/home
+
+# File containing the type of OSS installation. Eg. statistics
+INST_TYPE_FILE=${ENIQ_CONF_DIR}/ericsson_use_config
+
+LVM_CONFIG_DIR=${SCRIPTHOME}/root_disk_lvmdump/config
+
+# Source the common functions
+if [ -s ${ENIQ_CORE_INST_DIR}/lib/common_functions.lib ]; then
+    . ${ENIQ_CORE_INST_DIR}/lib/common_functions.lib
+fi
+
+# Source the common functions
+if [ -s ${SCRIPTHOME}/installation/core_install/lib/common_functions.lib ]; then
+    . ${SCRIPTHOME}/installation/core_install/lib/common_functions.lib
+fi 
+
+SYSGRP=`$ID ${SYSUSER}|$AWK '{print $2}'|$AWK -F\( '{print $2}'|$AWK -F\) '{print $1}'`
+if [ ! "${SYSGRP}" ]; then
+    _err_msg_="Could not determine group id of ${SYSUSER}"
+    abort_script "${_err_msg_}"
+fi
+
+HNAME=`${HOSTNAME}`
+HOST_IP=`${HOSTNAME} -i | $AWK '{print $1}' | $HEAD -1`
+}
+
+### Function: setup_sysuser_profile ###
+#
+# Set up .profile file for sysuser
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+setup_sysuser_profile()
+{
+# Check whether .profile file exists
+$LS -la ${ENIQ_HOME_DIR}/${SYSUSER}/.profile >> /dev/null 2>&1
+if [ $? -eq 0 ]; then
+    return 0
+else
+    $ECHO ".profile doesn't exist on ${ENIQ_HOME_DIR}/${SYSUSER} Creating new .profile..."
+    _stage_="update_sysuser_file"
+    ${SCRIPTHOME}/installation/core_install/bin/eniq_core_install.bsh -n -s ${_stage_} -l ${LOGFILE}
+    if [ $? -ne 0 ]; then
+        _err_msg_="Could not create .profile file"
+        abort_script "${_err_msg_}"
+    fi
+fi
+}
+
+### Function: setup_users ###
+#
+# Set up system users
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+setup_users()
+{
+SYSUSER=`iniget ENIQ_INSTALL_CONFIG -f ${ENIQ_CONF_DIR}/${SUNOS_INI} -v ENIQ_SYSUSER`
+if [ ! "${SYSUSER}" ]; then
+    _err_msg_="Could not read System User from ${CLI_CONF_DIR}/${ENIQ_INI}"
+    abort_script "${_err_msg_}"
+fi
+
+SYSGRP=`$ID ${SYSUSER}|$AWK '{print $2}'|$AWK -F\( '{print $2}'|$AWK -F\) '{print $1}'`
+if [ ! "${SYSGRP}" ]; then
+    _err_msg_="Could not determine group id of ${SYSUSER}"
+    abort_script "${_err_msg_}"
+fi
+}
+
+
+### Function: setup_sybase_env ###
+#
+# Set up Sybase environment
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+setup_sybase_env()
+{
+# set user values
+setup_users
+$SU - ${SYSUSER} >> /dev/null -c "$ENV > ${TEM_DIR}/sybase_det.$$" #>> /dev/null 2>&1
+
+# Source the environment
+set -a
+. ${TEM_DIR}/sybase_det.$$ >> /dev/null 2>&1
+set +a
+
+if [ ! "${SYBASE}" ]; then 
+    _err_msg_="Could not determine Sybase environment variable \${SYBASE}"
+    abort_script "${_err_msg_}"
+fi
+}
+
+
+### Function: share_nas_clients ###
+#
+# Generate all file systems to share
+# 
+# Arguments:none
+#   none
+# Return Values:
+#   none
+share_nas_clients() 
+{ 
+_nas_sw_target_dir_=`iniget NAS_STORAGE_API -f ${SCRIPTHOME}/installation/config/SunOS.ini -v NAS_API_TARGET_DIR`
+if [ ! "${_nas_sw_target_dir_}" ]; then
+    _err_msg_="Failed to get NAS API target dir information from ${_ini_file_}"
+    abort_script "${_err_msg_}"
+fi
+
+_nascli_=${_nas_sw_target_dir_}/bin/nascli
+if [ ! -x ${_nascli_} ]; then
+    _err_msg_="${_nascli_} not found or not executable"
+    abort_script "${_err_msg_}"
+fi
+
+_nas_sysid_=`iniget Storage_NAS_GENERAL -f ${SCRIPTHOME}/installation/config/${STORAGE_INI} -v SYS_ID`
+if [ ! "${_nas_sysid_}" ]; then
+    _err_msg_="Could not read SYS_ID param "
+    abort_script "${_err_msg_}"
+fi
+
+_nascli_shares_=${SCRIPTHOME}/installation/config/.nas_share.txt
+_ip_list_=`$CAT ${_nascli_shares_}|$AWK '{print $1}'|$SORT -u`
+for _ip_ in ${_ip_list_}; do
+    _share_opt_list_=`$CAT ${_nascli_shares_}|$EGREP "^${_ip_}[[:blank:]]+"|$AWK '{print $2}'|$SORT -u`
+    for _share_opt_ in ${_share_opt_list_}; do
+        _fs_list_=`$CAT ${_nascli_shares_}|$EGREP "^${_ip_}[[:blank:]]+${_share_opt_}"|$AWK '{print $3}'|$SORT -u`
+        _nascli_cmd_=`$ECHO "${_nascli_} -s add_client ${_nas_sysid_} ${_ip_} ${_share_opt_} \`$ECHO ${_fs_list_}\`"`
+        ${_nascli_cmd_}
+        if [ $? -ne 0 ]; then
+            _err_msg_="Problem encountered executing\n${_nascli_cmd_}"
+            abort_script "${_err_msg_}"
+        fi
+    done
+done
+}
+
+
+### Function: usage_msg ###
+#
+#   Print out the usage message
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+usage_msg()
+{
+$ECHO "
+Usage: `$BASENAME $0` -s <restore_stage> [ -l <logfile> ]
+
+options:
+
+-l  : Optional parameter specifying logfile where the script output will be appended to.
+
+-s  : Eniq Restore Stage. Numeric value between 1 and ${NUM_REST_STAGE}.
+"
+}
+
+### Function: user_confirm ###
+#
+# Get confirmation from user to proceed with snapshot action
+#
+# Arguments:
+#       $1 : Message string
+# Return Values:
+#       none
+user_confirm()
+{
+while :; do
+    unset USER_CONF
+    $CLEAR
+    $ECHO "\n${1}"
+    $ECHO "Enter [Yes | No] (case sensitive) : \c"
+
+    read USER_CONF
+    if [ "$USER_CONF" == "Yes" -o "$USER_CONF" == "No" ]; then
+        break
+    fi
+done
+}
+
+
+# ********************************************************************
+#
+#   Main body of program
+#
+# ********************************************************************
+#
+RUN_TIME=`$DATE '+%Y-%b-%d_%H.%M.%S'`
+
+# Determine absolute path to software
+get_absolute_path
+
+# Check that the effective id of the user is root
+check_id root
+
+while getopts ":Fl:NRs:" arg; do
+  case $arg in
+    F)  FORCE_RESTORE="YES" 
+        ;;
+    l)  LOGFILE="$OPTARG" 
+        ;;
+    N)  NO_CONFIRM="YES" 
+        ;;
+    R)  REMOVE_SVM="YES" 
+        ;;
+    s)  REST_STAGE="$OPTARG" 
+        ;;
+   \?)  usage_msg
+        exit 1
+        ;;
+  esac
+done
+shift `expr $OPTIND - 1`
+
+if [ ! "${REMOVE_SVM}" ]; then
+    if [ ! "${REST_STAGE}" ]; then
+        usage_msg
+        abort_script
+    fi
+
+    $ECHO ${REST_STAGE} | $EGREP '[^0-9]' >> /dev/null 2>&1
+    if [ $? -eq 0 ]; then
+        usage_msg
+        abort_script
+    fi
+
+    if [ ${REST_STAGE} -lt 1 -o ${REST_STAGE} -gt ${NUM_REST_STAGE} ]; then
+        usage_msg
+        abort_script
+    fi
+fi
+
+# Setup up path environment etc
+setup_env
+ 
+# Default Logfile location
+DEF_LOGFILE="${SCRIPTHOME}/log/restore_eniq.log"
+
+# Set up default logfile if required
+if [ ! "${LOGFILE}" ]; then
+    LOGFILE="${DEF_LOGFILE}"
+fi
+
+chk_create_logfile
+
+# Create a temporary Directory
+TEM_DIR=/tmp/restore_eniq.$$.$$
+$RM -rf ${TEM_DIR}
+$MKDIR -p ${TEM_DIR}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not create directory ${TEM_DIR}"
+    abort_script "${_err_msg_}"
+fi
+$CHMOD 777 ${TEM_DIR}
+
+# File to hold stage information
+STAGEFILE=${SCRIPTHOME}/eniq_restore_stage
+
+# Do required Stages
+case "${REST_STAGE}" in
+    1)  restore_stage_1
+        ;;
+
+    2)  restore_stage_2
+        ;;
+
+    3)  restore_stage_3
+        ;;
+
+    4)  restore_stage_4
+        ;;
+
+    5)  restore_stage_5
+        ;;
+
+    6)  restore_stage_6
+        ;;
+
+
+    *)  : # SHOULD NOT GET HERE
+        ;;
+esac
+
+log_msg -h -t -l ${LOGFILE} -s "\nRestore Stage $REST_STAGE completed"
+
+$RM -rf ${TEM_DIR}
+
+exit 0

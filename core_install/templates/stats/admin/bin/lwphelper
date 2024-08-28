@@ -1,0 +1,182 @@
+#!/bin/bash
+# ----------------------------------------------------------------------
+# Ericsson Network IQ FLS control script
+#
+# Usage: /eniq/admin/bin/lwphelper start|stop|status
+#
+# ----------------------------------------------------------------------
+# Copyright (c) 2021 AB Ericsson By  All rights reserved.
+# ----------------------------------------------------------------------
+
+# ********************************************************************
+#
+#       Configuration Section
+#
+# ********************************************************************
+
+. /eniq/home/dcuser/.profile
+
+if [ ${LOGNAME} != "dcuser"  ] ; then
+  echo "This script must be executed as dcuser"
+  exit 32
+fi
+
+if [ -z "${CONF_DIR}" ] ; then
+  echo "ERROR: CONF_DIR is not set"
+  exit 1
+fi
+
+if [ ! -f ${CONF_DIR}/niq.rc ] ; then
+	echo "ERROR: ${CONF_DIR}/niq.rc not found"
+  exit 1
+fi
+
+. ${CONF_DIR}/niq.rc
+
+_dir_=`/usr/bin/dirname $0`
+SCRIPTHOME=`cd $_dir_ 2>/dev/null && pwd || echo $_dir_`
+
+if [ -s $SCRIPTHOME/../lib/common_functions.lib ]; then
+    . $SCRIPTHOME/../lib/common_functions.lib
+else
+        echo "Could not find $SCRIPTHOME/../lib/common_functions.lib"
+        exit 63
+fi
+
+. ${BIN_DIR}/common_variables.lib
+
+if [ -s ${CONF_DIR}/dwh.ini ]; then
+  ETLC_USER=`iniget ETLC -v UserName -f ${CONF_DIR}/dwh.ini`
+  START_COUNT=`iniget ETLC -v SchedulerStartCount -f ${CONF_DIR}/dwh.ini`
+  START_DELAY=`iniget ETLC -v SchedulerStartDelay -f ${CONF_DIR}/dwh.ini`
+  STOP_COUNT=`iniget ETLC -v SchedulerStopCount -f ${CONF_DIR}/dwh.ini`
+  STOP_DELAY=`iniget ETLC -v SchedulerStopDelay -f ${CONF_DIR}/dwh.ini`
+else
+  ETLC_USER=`iniget ETLC -v UserName -f ${CONF_DIR}/niq.ini`
+  START_COUNT=`iniget ETLC -v SchedulerStartCount -f ${CONF_DIR}/niq.ini`
+  START_DELAY=`iniget ETLC -v SchedulerStartDelay -f ${CONF_DIR}/niq.ini`
+  STOP_COUNT=`iniget ETLC -v SchedulerStopCount -f ${CONF_DIR}/niq.ini`
+  STOP_DELAY=`iniget ETLC -v SchedulerStopDelay -f ${CONF_DIR}/niq.ini`
+fi
+
+PNAME=lwphelper
+
+LOGD=${LOG_DIR}/engine/lwphelper
+${MKDIR} -p $LOGD
+
+_common_=`${FIND} ${PLATFORM_DIR}/common-*/dclib/common.jar`
+
+_classpath_=$_common_
+_codebase_=-Djava.rmi.server.codebase=file:///$_common_
+_ignore_stubs_=-Djava.rmi.server.ignoreStubClasses=true
+_main_class_=com.ericsson.eniq.common.lwp.LwpServer
+
+#_debug_=-Xdebug -Xrunjdwp:transport=dt_socket,server=y,suspend=n,address=55123
+
+get_pid()
+{
+	_process_=`${PS} -auxwww | ${GREP} -v ${GREP} | ${GREP} pname=${PNAME}`
+	if [ $? -ne 0 ] ; then
+		${ECHO} "LWPH isnt running"
+		return 1
+	fi
+	${ECHO} ${_process_} | ${NAWK} '{print $2}'
+	return 0
+}
+
+status()
+{
+	# ping the rmi objects..
+	${RT_DIR}/java/bin/java -d64 -Dpname=${PNAME} -Xmx64M $_debug_ \
+		$_ignore_stubs_ $_codebase_ -DCONF_DIR=${CONF_DIR} \
+		-cp $_classpath_ $_main_class_ "ping" 2> /dev/null
+
+	_return_=$?
+
+		${ECHO} ""
+		if [ ${_return_} -eq 0 ] ; then
+			${ECHO} "LWPHelper is running"
+		else
+			${ECHO} "LWPHelper is not running"
+		fi
+		
+	exit ${_return_}	
+}
+
+start()
+{
+	_log_=${LOGD}/start_lwph_`${DATE} '+%y%m%d_%H%M%S'`.log
+	
+  xLWP=`${PS} -ef | ${GREP} java | ${GREP} "pname=${PNAME}" | $NAWK '{print $2}'`
+  if [ ! -z "${xLWP}" ] ; then
+    ${ECHO} "Killing previous LWPH instance in PID ${xLWP}" >> ${_log_}
+    kill -9 ${xLWP} 2>&1 | ${TEE} -a ${_log_}
+    ${ECHO} "Previous LWPH killed" >> ${_log_}
+  fi
+  
+	_pid_=`get_pid`
+	if [ $? -eq 0 ] ; then
+		${ECHO} "LWPH already running as process $_pid_" | ${TEE} -a $_log_
+		return
+	fi
+	${RT_DIR}/java/bin/java -d64 -Dpname=${PNAME} $_debug_ \
+	-Xmx128M -XX:+ExitOnOutOfMemoryError \
+	$_ignore_stubs_ $_codebase_ -DCONF_DIR=${CONF_DIR} -DLOG_DIR=${LOG_DIR} \
+	-Djava.util.logging.config.file=${CONF_DIR}/engineLogging.properties \
+	-cp $_classpath_ $_main_class_ & >> $_log_ 2>&1
+	
+	${ECHO} "LWPH forked" | ${TEE} -a $_log_
+	
+	cnt=0
+
+  while [ ${cnt} -lt ${START_COUNT} ] ; do
+    sleep ${START_DELAY}
+
+    ${ECHO} "Checking LWPH status..." >> ${_log_}
+	${BIN_DIR}/lwphelper status >> ${_log_} 2>&1
+
+	if [ $? -eq 0 ] ; then
+	      ${ECHO} "LWPH service successfully started" >> ${_log_}
+	      exit 0     
+	else
+	      ${ECHO} "LWPH service not started yet" >> ${_log_}
+	      let cnt=cnt+1
+	fi
+
+ done
+
+  ${ECHO} "LWPH service failed to start" >> ${_log_}
+
+  exit 55
+}
+
+stop(){
+	_log_=${LOGD}/stop_lwph_`${DATE} '+%y%m%d_%H%M%S'`.log
+	_pid_=`get_pid`
+	if [ $? -eq 1 ] ; then
+		${ECHO} "LWPH is not running" | ${TEE} -a $_log_
+		return
+	fi
+	${ECHO} "Stopping pid $_pid_" | ${TEE} -a $_log_
+	COUNT=1
+	while kill "$_pid_" > /dev/null 2>&1 ; do
+		if [ $COUNT -le 10 ] ; then
+               COUNT='expr $COUNT + 1'
+		sleep 1
+         else
+			kill -9 "$_pid_" > /dev/null 2>&1 
+		fi	
+	done
+	${ECHO} "LWPH process ${_pid_} stopped." | ${TEE} -a $_log_
+}
+
+case "$1" in
+	start)	start
+			;;
+	stop)	stop
+			;;
+	status)	status
+			;;
+	*)		${ECHO} "Usage: $0 start|stop|status"
+			exit 2
+esac

@@ -1,0 +1,323 @@
+#!/bin/bash
+# ********************************************************************
+# Ericsson Radio Systems AB                                     SCRIPT
+# ********************************************************************
+#
+# (c) Ericsson Radio Systems AB 2021 - All rights reserved.
+#
+# The copyright to the computer program(s) herein is the property
+# of Ericsson Radio Systems AB, Sweden. The programs may be used
+# and/or copied only with the written permission from Ericsson Radio
+# Systems AB or in accordance with the terms and conditions stipulated
+# in the agreement/contract under which the program(s) have been
+# supplied.
+#
+# ********************************************************************
+# Name    : add_temp_dbspaces.bsh
+# Date    : 16/04/2021
+# Revision: main\14
+# Purpose : Create the dwhdb temp dbspaces
+#
+# Usage   : add_temp_dbspaces.bsh -c <path_to_cli_conf> -d <niq.ini_file_location>
+#                               [-l <logfile>]
+#
+# ********************************************************************
+#
+#   Command Section
+#
+# ********************************************************************
+AWK=/usr/bin/awk
+BASENAME=/usr/bin/basename
+CAT=/usr/bin/cat
+DATE=/usr/bin/date
+DIRNAME=/usr/bin/dirname
+ECHO='/usr/bin/echo -e'
+EGREP=/usr/bin/egrep
+EXPR=/usr/bin/expr
+FIND=/usr/bin/find
+GREP=/usr/bin/grep
+PWD=/usr/bin/pwd
+RM=/usr/bin/rm
+TEE=/usr/bin/tee
+
+# Name of SunOS ini File
+SUNOS_INI=SunOS.ini
+
+# ********************************************************************
+#
+#   Functions
+#
+# ********************************************************************
+### Function: abort_script ###
+#
+#   This will is called if the script is aborted thru an error
+#   signal sent by the kernel such as CTRL-C or if a serious
+#   error is encountered during runtime
+#
+# Arguments:
+#       $1 - Error message from part of program (Not always used)
+# Return Values:
+#       none
+abort_script()
+{
+if [ "$1" ]; then
+    _err_msg_=$1
+else
+    _err_msg_="$TIMESTAMP - ERROR : Script aborted.......\n"
+fi
+
+if [ "${LOGFILE}" ]; then
+    $ECHO "\n$TIMESTAMP - ERROR : $_err_msg_\n" | $TEE -a ${LOGFILE} 
+else
+    $ECHO "\n$TIMESTAMP - ERROR : $_err_msg_\n"
+fi
+$RM -rf ${CONN_STR_USER_ENC}
+exit 55
+}
+
+### Function: get_absolute_path ###
+#
+# Determine absolute path to software
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+get_absolute_path()
+{
+_dir_=`$DIRNAME $0`
+SCRIPTHOME=`cd $_dir_ 2>/dev/null && pwd || $ECHO $_dir_`
+}
+
+### Function: setup_variables ###
+#
+# Set up some script variables
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+setup_variables()
+{
+if [ ! "${ENIQ_BASE_DIR}" ]; then
+    # Directory on the root filesystem
+    ENIQ_BASE_DIR=/eniq
+fi
+
+# Tmp directory
+TEM=/var/tmp
+
+# Admin Directory
+ENIQ_ADMIN_DIR=${ENIQ_BASE_DIR}/admin
+
+# Main Directory for the Core Installation SW
+ENIQ_INST_DIR=${ENIQ_BASE_DIR}/installation
+
+# Main Directory for the Core Installation SW
+ENIQ_CORE_INST_DIR=${ENIQ_INST_DIR}/core_install
+
+# Config dir
+ENIQ_CONF_DIR=${ENIQ_INST_DIR}/config
+
+# Set the Connect DB parameters
+
+DWH_PORT=`iniget DWH -v PortNumber -f ${ENIQ_INI}`
+DWH_ENG=`iniget DWH -v ServerName -f ${ENIQ_INI}`
+if [ ! "${DWH_PORT}" -o ! "${DWH_ENG}" ]; then
+	_err_msg_="Could not read IQ values from ${ENIQ_INI}"
+	abort_script "$_err_msg_"
+fi
+
+DBA_PASSWORD=`inigetpassword DB -f ${ENIQ_INI} -v DBAPassword`
+if [ ! ${DBA_PASSWORD} ]; then
+    if [ -f ${ENIQ_BASE_DIR}/sw/installer/dbusers ]; then
+        DBA_PASSWORD=`${ENIQ_BASE_DIR}/sw/installer/dbusers dba dwhrep`
+        if [ ! "${DBA_PASSWORD}" ] ; then
+            _err_msg_="Could not get dwhdb DBA Password"
+            abort_script "$_err_msg_"
+        fi
+    else
+        err_msg_="Could not get dwhdb DBA Password"
+        abort_script "$_err_msg_"
+    fi
+fi
+
+CONN_STR_USER_DBA="-c \"uid=dba;pwd=${DBA_PASSWORD};eng=${DWH_ENG};links=tcpip{host=${DWH_ENG};port=${DWH_PORT};dobroadcast=no;verify=no}\""
+CONN_STR_USER_ENC=/tmp/conn_strn_encrypt.`uuidgen`
+
+# encrypt the connection string.
+get_encrypt_file "${CONN_STR_USER_DBA}" "${CONN_STR_USER_ENC}"
+
+# Read the storage type
+if [ -s ${ENIQ_CONF_DIR}/${SUNOS_INI} ]; then
+    STORAGE_TYPE=`iniget STOR_TYPE -f ${ENIQ_CONF_DIR}/${SUNOS_INI} -v STORAGE_TYPE`
+else
+    if [ -s ${ENIQ_CONF_DIR}/san_details ]; then
+        STORAGE_TYPE=`$CAT ${ENIQ_CONF_DIR}/san_details | $EGREP "^STORAGE_TYPE=" | $AWK -F\= '{print $2}'`
+    fi
+fi
+
+if [ ! "${STORAGE_TYPE}" ]; then
+    _err_msg_="Could not read STORAGE_TYPE param "
+    abort_script "${_err_msg_}"
+fi
+}
+
+### Function: usage_msg ###
+#
+# Usage
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+usage_msg()
+{
+$ECHO "
+Usage: `$BASENAME $0` -c <conf dir> -d <niq.ini file> -s <sym_links.ini> [-l <logfile>]
+
+options:
+
+-l : Optional parameter specifying what logfile to us
+
+-c : Conf dir where niq.rc resides
+
+-d : Path to the niq.ini file.
+
+-s : Path to the sym_links.ini file.
+"
+}
+
+# ********************************************************************
+#
+#   Main body of program
+#
+# ********************************************************************
+#
+TIMESTAMP=`$DATE +%d.%m.%y_%H:%M:%S`
+
+# Determine absolute path to software
+get_absolute_path
+
+while getopts ":l:c:d:s:" arg; do
+    case $arg in
+	l)  LOGFILE="$OPTARG"
+	    ;;
+	c)  CONF_DIR="$OPTARG"
+	    ;;
+	d)  ENIQ_INI="$OPTARG"
+	    ;;
+	s)  SYM_INI="$OPTARG"
+	    ;;
+	\?) usage_msg
+	exit 1
+	;;
+    esac
+done
+shift `expr $OPTIND - 1`
+
+# Source the common functions
+if [ -s $SCRIPTHOME/../lib/common_functions.lib ]; then
+    . $SCRIPTHOME/../lib/common_functions.lib
+else
+    _err_msg_="File $SCRIPTHOME/../lib/common_functions.lib not found"
+    abort_script "$_err_msg_"
+fi
+
+# Check required files and scripts exist
+if [ ! -s ${CONF_DIR}/niq.rc ]; then
+    _err_msg_="$TIMESTAMP - File ${CONF_DIR}/niq.rc not found, or is empty"
+    abort_script "$_err_msg_"
+else
+    #$ECHO "Sourcing ${CONF_DIR}/niq.rc" 
+    . ${CONF_DIR}/niq.rc
+fi
+
+if [ ! "$LOGFILE" ] ; then
+	LOGFILE=${LOG_DIR}/iq/add_temp_dbspaces_${TIMESTAMP}.log
+fi
+
+if [ -z "$CONF_DIR" ] ; then
+        log_msg -s "$TIMESTAMP - ERROR: CONF_DIR is not set" -l ${LOGFILE}
+	exit 2
+fi
+
+if [ ! -f ${ENIQ_INI} ]; then
+        log_msg -s "${ENIQ_INI} does not exists" -l ${LOGFILE}
+	exit 3
+fi
+
+if [ ! -f ${SYM_INI} ]; then
+        log_msg -s "${SYM_INI} does not exists" -l ${LOGFILE}
+	exit 3
+fi
+
+# set up variables
+setup_variables
+
+DBSPACE=IQ_SYSTEM_TEMP
+_cnt_=0
+
+_dbfile_list_=`iniget DWH_DBSPACES_TEMP -f ${SYM_INI}`
+if [ ! "${_dbfile_list_}" ]; then
+    _err_msg_="`$DATE +%d.%m.%y_%H:%M:%S` - Could not find any temp dbspaces in ${SYM_INI}"
+    abort_script "$_err_msg_"
+fi
+
+for _space_ in ${_dbfile_list_}; do
+    let _cnt_=_cnt_+1
+    _dbfile_=`iniget ${_space_} -f ${SYM_INI} -v Path`
+    _dbsize_=`iniget ${_space_} -f ${SYM_INI} -v Size`
+    DBFILE=`$ECHO ${_dbfile_}|$AWK -F\/ '{print $NF}'|$AWK -F\. '{print $1}'`
+    _cnt_=`$ECHO ${DBFILE}|$AWK -F\_ '{print $2}'`
+
+    # Check if server is up
+    ${IQDIR}/bin64/dbping -q @${CONN_STR_USER_ENC} >> ${LOGFILE} 2>&1
+    if [ $? -ne 0 ] ; then
+	${ENIQ_ADMIN_DIR}/bin/${DWH_ENG} start
+	if [ $? -ne 0 ]; then
+	    _err_msg_="Failure to start IQ server ${DWH_ENG}"
+	    abort_script "$_err_msg_"
+	fi
+    fi
+
+    #Check to see if dbspace already exists
+    ${IQDIR}/bin64/dbisql @${CONN_STR_USER_ENC} "sp_iqfile; OUTPUT to /var/tmp/temp_exp_${_cnt_}.log" >> /dev/null 2>&1
+    $GREP -w ${_dbfile_} /var/tmp/temp_exp_${_cnt_}.log >> /dev/null 2>&1
+    if [ $? -eq 0 ]; then
+        log_msg -t -l ${LOGFILE} -q -s "DBFILE ${_dbfile_} already exists. Skipping....." 
+        rm -f /var/tmp/temp_exp_${_cnt_}.log
+	continue
+    fi
+   
+    #Check to see if file exists. If present will remove before adding in dbspace
+    if [ "${STORAGE_TYPE}" == "fs" ]; then
+	if [ -f ${_dbfile_} ]; then
+		log_msg -t -l ${LOGFILE} -q -s "FILE ${_dbfile_} exists. Removing....."
+		$RM ${_dbfile_}
+		if [ $? -eq 0 ]; then
+       			log_msg -t -l ${LOGFILE} -q -s "FILE ${_dbfile_} removed."
+   		else
+			_err_msg_="Failed to remove FILE ${_dbfile_}"
+			abort_script "$_err_msg_"	
+		fi
+    	fi
+    fi
+	
+    log_msg -s "Adding dbfile '${_dbfile_}' to ${DBSPACE}" -l ${LOGFILE} 
+    $ECHO "ALTER DBSPACE ${DBSPACE}" >  ${ENIQ_ADMIN_DIR}/sql/add_dbspace_file_${_cnt_}.sql
+    $ECHO "ADD FILE ${DBFILE} '${_dbfile_}'" >> ${ENIQ_ADMIN_DIR}/sql/add_dbspace_file_${_cnt_}.sql
+    if [ "${_dbsize_}" ]; then
+	$ECHO "SIZE ${_dbsize_} MB" >> ${ENIQ_ADMIN_DIR}/sql/add_dbspace_file_${_cnt_}.sql
+    fi
+
+    ${IQDIR}/bin64/dbisql @${CONN_STR_USER_ENC} -q ${ENIQ_ADMIN_DIR}/sql/add_dbspace_file_${_cnt_}.sql
+    if [ $? -ne 0 ]; then
+	_err_msg_="Adding dbfile '${_dbfile_}' to ${DBSPACE} failed"
+	abort_script "$_err_msg_"
+    fi
+done
+
+$RM -rf ${CONN_STR_USER_ENC}
+
+exit 0

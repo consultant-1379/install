@@ -1,0 +1,574 @@
+#!/bin/bash
+# ********************************************************************
+# Ericsson Radio Systems AB                                     SCRIPT
+# ********************************************************************
+#
+#
+# (c) Ericsson Radio Systems AB 2012 - All rights reserved.
+#
+# The copyright to the computer program(s) herein is the property
+# of Ericsson Radio Systems AB, Sweden. The programs may be used
+# and/or copied only with the written permission from Ericsson Radio
+# Systems AB or in accordance with the terms and conditions stipulated
+# in the agreement/contract under which the program(s) have been
+# supplied.
+#
+# ********************************************************************
+# Name    : create_async_share_cmds.bsh
+# Date    : 13/02/2014
+# Revision: A
+# Purpose : script to change some filesystem from sync to async.
+#
+# Usage   : create_async_share_cmds.bsh
+#
+# ********************************************************************
+#
+#   Command Section
+#
+# ********************************************************************
+
+# ********************************************************************
+#
+#   Command Section
+#
+# ********************************************************************
+AWK=/usr/bin/awk
+BASENAME=/usr/bin/basename
+BASH=/usr/bin/bash
+BC=/usr/bin/bc
+BOOTADM=/usr/sbin/bootadm
+CAT=/usr/bin/cat
+CHMOD=/usr/bin/chmod
+CHOWN=/usr/bin/chown
+CLEAR=/usr/bin/clear
+CMP=/usr/bin/cmp
+CP=/usr/bin/cp
+CPIO=/usr/bin/cpio
+DATE=/usr/bin/date
+DIRNAME=/usr/bin/dirname
+DLADM=/usr/sbin/dladm
+DOMAINNAME=/usr/bin/domainname
+DTCONFIG=/usr/dt/bin/dtconfig
+DUMPADM=/usr/sbin/dumpadm
+ECHO=/usr/bin/echo
+EGREP=/usr/bin/egrep
+EJECT=/usr/bin/eject
+ENV=/usr/bin/env
+EXPR=/usr/bin/expr
+FIND=/usr/bin/find
+FLARCREATE=/usr/sbin/flarcreate
+FORMAT=/usr/sbin/format
+FUSER=/usr/sbin/fuser
+GEGREP=/usr/sfw/bin/gegrep
+GETENT=/usr/bin/getent
+GETTEXT=/usr/bin/gettext
+GREP=/usr/bin/grep
+GROUPADD=/usr/sbin/groupadd
+GTAR=/usr/sfw/bin/gtar
+GZCAT=/usr/bin/gzcat
+GZIP=/usr/bin/gzip
+HEAD=/usr/bin/head
+MYHOSTNAME=/usr/bin/hostname
+ID=/usr/bin/id
+IFCONFIG=/usr/sbin/ifconfig
+INIT=/usr/sbin/init
+LN=/usr/bin/ln
+LS=/usr/bin/ls
+MKDIR=/usr/bin/mkdir
+MORE=/usr/bin/more
+MOUNT=/usr/sbin/mount
+MV=/usr/bin/mv
+NAWK=/usr/bin/nawk
+NSLOOKUP=/usr/sbin/nslookup
+PGREP=/usr/bin/pgrep
+PING=/usr/sbin/ping
+PKGADD=/usr/sbin/pkgadd
+PKGINFO=/usr/bin/pkginfo
+PKGRM=/usr/sbin/pkgrm
+PRTCONF=/usr/sbin/prtconf
+PSRINFO=/usr/sbin/psrinfo
+PWD=/usr/bin/pwd
+REBOOT=/usr/sbin/reboot
+RM=/usr/bin/rm
+RCP=/usr/bin/rcp
+RSH=/usr/bin/rsh
+SED=/usr/bin/sed
+SEVEN_Z=/usr/bin/7z
+SLEEP=/usr/bin/sleep
+SORT=/usr/bin/sort
+SSH=/usr/bin/ssh
+STMSBOOT=/usr/sbin/stmsboot
+SU=/usr/bin/su
+SVCADM=/usr/sbin/svcadm
+SVCCFG=/usr/sbin/svccfg
+SVCS=/usr/bin/svcs
+SWAP=/usr/sbin/swap
+SYNC=/usr/sbin/sync
+TAIL=/usr/bin/tail
+TAR=/usr/sbin/tar
+TEE=/usr/bin/tee
+TOUCH=/usr/bin/touch
+TPUT=/usr/bin/tput
+TR=/usr/bin/tr
+UADMIN=/usr/sbin/uadmin
+UMOUNT=/usr/sbin/umount
+UNAME=/usr/bin/uname
+USERADD=/usr/sbin/useradd
+VOLD=/usr/sbin/vold
+WC=/usr/bin/wc
+YES=/usr/bin/yes
+ZFS=/usr/sbin/zfs
+ZPOOL=/usr/sbin/zpool
+
+# ********************************************************************
+#
+#       Configuration Section
+#
+# ********************************************************************
+
+# Default user
+DEFAULT_USER=root
+
+IPMP_INI=ipmp.ini
+
+NASCONSOLE_USER=storadm
+
+NAS_ADDR=nasconsole
+NAS_MAS_USR=master
+
+NEW_SHARE_OPTS="rw,async,no_root_squash"
+# ********************************************************************
+#
+#   Functions
+#
+# ********************************************************************
+### Function: abort_script ###
+#
+#   This will is called if the script is aborted thru an error
+#   signal sent by the kernel such as CTRL-C or if a serious
+#   error is encountered during runtime
+#
+# Arguments:
+#       $1 - Error message from part of program (Not always used)
+# Return Values:
+#       none
+abort_script()
+{
+_err_time_=`$DATE '+%Y-%b-%d_%H.%M.%S'`
+
+if [ "$1" ]; then
+    _err_msg_="${_err_time_} - $1"
+else
+    _err_msg_="${_err_time_} - ERROR : Script aborted.......\n"
+fi
+
+if [ "${LOGFILE}" ]; then
+    $ECHO "\nERROR : $_err_msg_\n" | $TEE -a ${LOGFILE}
+else
+    $ECHO "\nERROR : $_err_msg_\n"
+fi
+
+cd $SCRIPTHOME
+$RM -rf ${TEM_DIR}
+
+if [ "$2" ]; then
+
+    exit $2
+else
+   exit 1
+fi
+}
+
+### Function: check_id ###
+#
+#   Check that the effective id of the user is correct
+#   If not print error msg and exit.
+#
+# Arguments:
+#       $1 : User ID name
+# Return Values:
+#       none
+check_id()
+{
+_check_id_=`$ID | $AWK -F\( '{print $2}' | $AWK -F\) '{print $1}'`
+if [ "$_check_id_" != "$1" ]; then
+    _err_msg_="You must be $1 to execute this script."
+    abort_script "$_err_msg_" "${EXEC_SHELL_CMD}"
+fi
+}
+
+### Function: chk_create_logfile ###
+#
+# Check/Create Logfile
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+chk_create_logfile()
+{
+$MKDIR -p `$DIRNAME ${LOGFILE}`
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not create directory `$DIRNAME ${LOGFILE}`"
+     abort_script "$_err_msg_"
+fi  
+
+$TOUCH -a ${LOGFILE}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not write to file ${LOGFILE}"
+    abort_script "$_err_msg_"
+fi  
+}
+
+
+### Function: get_absolute_path ###
+#
+# Determine absolute path to software
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+get_absolute_path()
+{
+_dir_=`$DIRNAME $0`
+SCRIPTHOME=`cd $_dir_ 2>/dev/null && pwd || $ECHO $_dir_`
+}
+### Function: logit ###
+#
+#  Logs Messages to default logfile "LOGFILE"
+#
+# Arguments     :  log_message
+
+logit()
+{
+    local _log_msg
+    if [ -n "${1}" ]; then
+        _log_msg=" `$DATE '+%Y-%b-%d_%H.%M.%S'`:: ${1}"
+    else
+        _log_msg="Error in Script $0 at `$DATE '+%Y-%b-%d_%H.%M.%S'`\n"
+    fi
+        $ECHO "\n${_log_msg}\n"
+}
+
+
+### Function: setup_env ###
+#
+# Set up environment variables for script.
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+setup_env()
+{
+if [ ! "${ENIQ_BASE_DIR}" ]; then
+    # Directory on the root filesystem
+    ENIQ_BASE_DIR=/eniq
+fi
+
+# Main Directory for the Core Installation SW
+ENIQ_INST_DIR=${ENIQ_BASE_DIR}/installation
+
+# Main Directory for the Core Installation SW
+ENIQ_CORE_INST_DIR=${ENIQ_INST_DIR}/core_install
+
+# LIB Directory for the Core Installation SW
+ENIQ_CORE_INST_LIB_DIR=${ENIQ_INST_DIR}/core_install/lib
+
+# ENIQ Config Directory
+ENIQ_CONF_DIR=${ENIQ_INST_DIR}/config
+
+# ENIQ SW Conf Directory
+ENIQ_SW_CONF=${ENIQ_BASE_DIR}/sw/conf
+# STORAGE FILE
+STORAGE_INI=storage.ini
+
+# Set the log directory
+LOG_DIR=${ENIQ_BASE_DIR}/local_logs
+LOGFILE_DIR="$LOG_DIR/async_fs"
+
+# Source the common functions
+if [ -s ${ENIQ_CORE_INST_LIB_DIR}/common_functions.lib ]; then
+    . ${ENIQ_CORE_INST_LIB_DIR}/common_functions.lib
+else
+    _err_msg_="File ${ENIQ_CORE_INST_LIB_DIR}/common_functions.lib not found"
+    abort_script "$_err_msg_" 
+fi
+
+if [ -s ${ENIQ_CORE_INST_LIB_DIR}/common_core_install_functions.lib ]; then
+    . ${ENIQ_CORE_INST_LIB_DIR}/common_core_install_functions.lib
+else
+    _err_msg_="File ${ENIQ_CORE_INST_LIB_DIR}/common_core_install_functions.lib not found"
+    abort_script "$_err_msg_"
+fi
+
+if [ -s ${ENIQ_CORE_INST_LIB_DIR}/common_inirator_functions.lib ]; then
+    . ${ENIQ_CORE_INST_LIB_DIR}/common_inirator_functions.lib
+else
+    _err_msg_="File ${ENIQ_CORE_INST_LIB_DIR}/common_inirator_functions.lib not found"
+    abort_script "$_err_msg_"
+fi
+
+PORT_PING=${ENIQ_CORE_INST_DIR}/lib/port_ping.pl
+if [ ! -x $PORT_PING ]; then
+    _err_msg_="$PORT_PING not found or not executable"
+    abort_script "$_err_msg_" "${EXEC_SHELL_CMD}"
+fi
+
+FILENAME=`$BASENAME $0`
+
+}
+
+
+### Function: usage_msg ###
+#
+#   Print out the usage message
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+usage_msg()
+{
+$CLEAR
+$ECHO "
+Usage: `$BASENAME $0` [ -r ]
+
+options:
+
+-r  : Parameter specifying to actually run the share cmds
+
+"
+}
+
+
+# ********************************************************************
+#
+#   Main body of program
+#
+# ********************************************************************
+#
+# Determine absolute path to software
+get_absolute_path
+
+# Check that the effective id of the user is root
+check_id $DEFAULT_USER
+
+while getopts ":r" arg; do
+  case $arg in
+    r) RUN_SHARE_CMDS="YES"
+       ;;
+   \?) usage_msg
+       exit 1
+       ;;
+  esac
+done
+shift `expr $OPTIND - 1`
+
+if [ ! "${RUN_SHARE_CMDS}" ]; then
+    usage_msg
+    exit 1
+fi
+
+
+# Set up environment variables for script.
+setup_env
+
+
+
+
+
+logit "${FILENAME} Started	"
+
+${PORT_PING} ${NAS_ADDR} >> /dev/null 2>&1
+if [ $? -ne 0 ]; then
+    _err_msg_="${NAS_ADDR} is not alive"
+    abort_script "$_err_msg_" 
+fi
+
+_nas_sysid_=`iniget Storage_NAS_GENERAL -f ${ENIQ_CONF_DIR}/${STORAGE_INI} -v SYS_ID`
+if [ ! "${_nas_sysid_}" ]; then
+    _err_msg_="Could not get NAS sysid value from ${ENIQ_CONF_DIR}/${STORAGE_INI}"
+    abort_script "$_err_msg_"
+fi
+
+if [ ! -s /eniq/sw/conf/service_names ]; then
+    _err_msg_="/eniq/sw/conf/service_names is missing or empty"
+    abort_script "$_err_msg_"
+fi
+
+# Create a temporary Directory
+TEM_DIR=/tmp/create_async_cmds.$$.$$
+$RM -rf ${TEM_DIR}
+$MKDIR -p ${TEM_DIR}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not create directory $TEM_DIR"
+    abort_script "$_err_msg_"
+fi
+
+if [ -s ${ENIQ_CONF_DIR}/extra_params/deployment ]; then
+    _deployment_=`$CAT ${ENIQ_CONF_DIR}/extra_params/deployment`
+else
+    _err_msg_="Parameter \"deployment\" incorrectly specified"
+    abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+fi
+if [ -s ${ENIQ_CONF_DIR}/${IPMP_INI} ]; then
+        _ipmp_ini_=${ENIQ_CONF_DIR}/${IPMP_INI}
+        else
+                 _err_msg_="IPMP ini file missing "
+                 abort_script "$_err_msg_" "${EXEC_SHELL_CMD}"
+fi
+
+_ip_err_=0
+
+if [ "${_deployment_}" == "ft" ]; then
+    # we only configure 1 vlan i.e. the oss services vlan
+        $ECHO "deployment = ft"
+        _ip_list_=`iniget IPMP -f ${_ipmp_ini_} | $HEAD -1`
+    if [ ! "${_ip_list_}" ]; then
+        $ECHO "Could not get list of IPMP interfaces"
+        _ip_err_=1
+    fi
+else
+    # we configure both services and storage vlans
+        _ip_list_=`iniget IPMP -f ${_ipmp_ini_}`
+    if [ ! "${_ip_list_}" ]; then
+        $ECHO "Could not get list of IPMP interfaces"
+        _ip_err_=1
+    fi
+fi
+
+if [ ${_ip_err_} -ne 0 ]; then
+    _err_msg_=""
+    abort_script "$_err_msg_"
+fi
+
+    logit "Getting a list Existing Shares....Please Wait"
+    $SU - ${NASCONSOLE_USER} -c "$SSH -q -o BatchMode=yes -o StrictHostKeyChecking=no -n ${NAS_MAS_USR}@${NAS_ADDR} \"nfs share show\"" > ${TEM_DIR}/share_show
+    if [ $? -ne 0 ]; then
+	_err_msg_="Could not get a list of shares from ${NAS_MAS_USR}@${NAS_ADDR}"
+	abort_script "$_err_msg_"
+    fi
+
+
+if [ ! -s ${TEM_DIR}/share_show ]; then
+    _err_msg_="No list of shares returned from ${NAS_MAS_USR}@${NAS_ADDR}"
+    abort_script "$_err_msg_"
+fi
+
+for _intf_ in ${_ip_list_}; do
+
+	_vlan_name_=`iniget ${_intf_} -f ${_ipmp_ini_} -v IPMP_Group_Name`
+
+    if [ ! "${_vlan_name_}" ]; then
+        $ECHO "Could not read IPMP_Group_Name for ${_intf_} in ${_ipmp_ini_}"
+        abort_script "$_err_msg_"
+    fi
+	
+	if [  "${_deployment_}" == "ft" ]; then
+		logit "INFORMATION: No filesystems to update , FT environment"
+		$RM -rf  ${TEM_DIR}
+		exit 0
+	fi
+	
+	if [ "${_vlan_name_}" == "oss_grp" -a  "${_deployment_}" != "ft" ]; then
+	    _intf_ip_del=`iniget ${_intf_} -f ${_ipmp_ini_} -v IPMP_Group_IP`
+	fi 
+done
+# Set up a regex to match what I want
+_regex_="/vx/${_nas_sysid_}-etldata_-[0-9]+|/vx/${_nas_sysid_}-eventdata-[0-9]+|/vx/${_nas_sysid_}-northbound"
+
+# Set up a regex to matchasync filesystems
+_regex_async_="\([^\(]*[,]*async\,[^\)]*\)$"
+
+# Get a list of filesystems I want to update shares on
+$CAT ${TEM_DIR}/share_show | $GEGREP -v "(${_regex_async_})" | $NAWK '{print $1}' |$GEGREP "(${_regex_})" |$SORT -u > ${TEM_DIR}/update_fs
+$CAT ${TEM_DIR}/share_show | $GEGREP -w $_intf_ip_del | $NAWK  '{print $1}' > ${TEM_DIR}/remove_fs
+
+if [ ! -s ${TEM_DIR}/update_fs ]; then
+	if [ ! -s ${TEM_DIR}/remove_fs ];then
+	    logit "INFORMATION: No filesystems to update share options"
+		$RM -rf  ${TEM_DIR}
+		exit 0
+	fi
+fi
+_regex_fs_="EVENTDATA|ETLDATA|NORTHBOUND"
+_fs_name_list=`iniget Storage_NAS_FS_LIST -f ${ENIQ_SW_CONF}/${STORAGE_INI} | $GEGREP "(${_regex_fs_})"`
+
+if [ ! "${_fs_name_list}" ]; then
+    _err_msg_="Could not get Storage_NAS_FS_LIST value from ${ENIQ_CONF_DIR}/${STORAGE_INI}"
+    abort_script "$_err_msg_"
+fi
+
+for _fs_ in `$CAT ${TEM_DIR}/update_fs`; do
+		for _intf_ in ${_ip_list_}; do
+		
+			 _vlan_name_=`iniget ${_intf_} -f ${_ipmp_ini_} -v IPMP_Group_Name`
+
+                        if [ ! "${_vlan_name_}" ]; then
+                                $ECHO "Could not read IPMP_Group_Name for ${_intf_} in ${_ipmp_ini_}"
+                                abort_script "$_err_msg_"
+                        fi
+						
+                        if [ "${_vlan_name_}" != "stor_grp" -a  "${_deployment_}" != "ft" ]; then
+                                continue
+                                else
+                                        _intf_ip_=`iniget ${_intf_} -f ${_ipmp_ini_} -v IPMP_Group_IP`
+                                        if [ ! "${_intf_ip_}" ]; then
+                                                $ECHO "Could not read IPMP_Group_IP value for ${_intf_} in ${_ipmp_ini_}"
+                                                abort_script "$_err_msg_"
+                                        fi
+                        fi
+			
+			logit "Updating share options on ${_fs_} for ${_intf_}"
+			logit "$SU - ${NASCONSOLE_USER} -c \"$SSH -q -o BatchMode=yes -o StrictHostKeyChecking=no -n ${NAS_MAS_USR}@${NAS_ADDR} \"nfs share add ${NEW_SHARE_OPTS} ${_fs_} ${_intf_ip_}/32\"\"" 
+			$SU - ${NASCONSOLE_USER} -c "$SSH -q -o BatchMode=yes -o StrictHostKeyChecking=no -n ${NAS_MAS_USR}@${NAS_ADDR} \"nfs share add ${NEW_SHARE_OPTS} ${_fs_} ${_intf_ip_}/32\""
+			if [ $? -ne 0 ]; then
+				abort_script ""
+			else
+				logit "Updating ini file.." 
+				for _fs_name_ in ${_fs_name_list}; do
+					_share_path_=`iniget ${_fs_name_} -f  ${ENIQ_SW_CONF}/${STORAGE_INI} -v SHARE_PATH`
+					if [ "${_share_path_}" == "${_fs_}" ]; then
+						logit "iniset ${_fs_name_} -f ${ENIQ_SW_CONF}/${STORAGE_INI} NFS_SHARE_OPTIONS=${NEW_SHARE_OPTS}" 
+						iniset ${_fs_name_} -f ${ENIQ_SW_CONF}/${STORAGE_INI} NFS_SHARE_OPTIONS=${NEW_SHARE_OPTS}
+						if [ $? -ne 0 ]; then
+							logit "WARNING: Failed on iniset ${_nas_fs_ini} -f ${ENIQ_SW_CONF}/${STORAGE_INI} -v NFS_SHARE_OPTIONS "
+						fi
+					fi
+
+				done
+			fi
+		done
+done
+
+for _fs_ in `$CAT ${TEM_DIR}/remove_fs`; do
+		for _intf_ in ${_ip_list_}; do
+		
+			 _vlan_name_=`iniget ${_intf_} -f ${_ipmp_ini_} -v IPMP_Group_Name`
+
+                        if [ ! "${_vlan_name_}" ]; then
+                                $ECHO "Could not read IPMP_Group_Name for ${_intf_} in ${_ipmp_ini_}"
+                                abort_script "$_err_msg_"
+                        fi
+						
+                        if [ "${_vlan_name_}" == "oss_grp" -a  "${_deployment_}" != "ft" ]; then
+				_intf_ip_del=`iniget ${_intf_} -f ${_ipmp_ini_} -v IPMP_Group_IP`
+				logit "Updating share options on ${_fs_} for ${_intf_ip_del}"
+				logit "$SU - ${NASCONSOLE_USER} -c \"$SSH -q -o BatchMode=yes -o StrictHostKeyChecking=no -n ${NAS_MAS_USR}@${NAS_ADDR} \"nfs share delete ${_fs_} ${_intf_ip_del}/32\"\""
+				$SU - ${NASCONSOLE_USER} -c "$SSH -q -o BatchMode=yes -o StrictHostKeyChecking=no -n ${NAS_MAS_USR}@${NAS_ADDR} \"nfs share delete ${_fs_} ${_intf_ip_del}/32\"" 
+				break
+                        fi			
+		done
+done
+
+logit "${FILENAME} Finished "
+
+$RM -rf ${TEM_DIR}
+
+exit 0
+
+
+
+

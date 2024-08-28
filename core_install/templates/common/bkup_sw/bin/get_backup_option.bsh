@@ -1,0 +1,290 @@
+#!/bin/bash
+# ********************************************************************
+# Ericsson Radio Systems AB                                     SCRIPT
+# ********************************************************************
+#
+#
+# (c) Ericsson Radio Systems AB 2019 - All rights reserved.
+#
+# The copyright to the computer program(s) herein is the property
+# of Ericsson Radio Systems AB, Sweden. The programs may be used
+# and/or copied only with the written permission from Ericsson Radio
+# Systems AB or in accordance with the terms and conditions stipulated
+# in the agreement/contract under which the program(s) have been
+# supplied.
+#
+# ********************************************************************
+# Name    : get_backup_option.bsh
+# Date    : 23/10/2023 
+# Revision: main\9
+# Purpose : To get backup option from user while performing prebackup
+#
+# Usage   : get_backup_option.bsh
+#
+# ********************************************************************
+#
+#       Command Section
+#
+# ********************************************************************
+AWK=/usr/bin/awk
+CAT=/usr/bin/cat
+CP=/usr/bin/cp
+CLEAR=/usr/bin/clear
+DATE=/usr/bin/date
+ECHO='/usr/bin/echo -e'
+EXPR=/usr/bin/expr
+GETENT=/usr/bin/getent
+GREP=/usr/bin/grep
+HEAD=/usr/bin/head
+ID=/usr/bin/id
+MKDIR=/usr/bin/mkdir
+MYHOSTNAME=/usr/bin/hostname
+RM=/usr/bin/rm
+SCP=/usr/bin/scp
+SED=/usr/bin/sed
+TEE=/usr/bin/tee
+PERL=/usr/bin/perl
+WC=/usr/bin/wc
+
+# ********************************************************************
+#
+#   Functions
+#
+# ********************************************************************
+### Function: abort_script ###
+#
+#   This function is called if the script is aborted thru an error
+#   signal sent by the kernel or if a serious
+#   error is encountered during runtime
+#
+# Arguments:
+#       $1 - Error message from part of program (Not always used)
+# Return Values:
+#       none
+abort_script()
+{
+_err_time_=`$DATE '+%Y-%b-%d_%H.%M.%S'`
+
+if [ "$1" ]; then
+    _err_msg_="${_err_time_} - $1"
+else
+    _err_msg_="${_err_time_} - ERROR : Script aborted.......\n"
+fi
+
+if [ "${LOGFILE}" ]; then
+    $ECHO "\nERROR : ${_err_msg_}\n" | $TEE -a ${LOGFILE}
+else
+    $ECHO "\nERROR : ${_err_msg_}\n"
+fi
+
+$RM -rf ${TEM_DIR}
+
+if [ "$2" ]; then
+    ${2}
+else
+   exit 1
+fi
+
+}
+
+### Function: setup_env ###
+#
+# Setup up path environment etc
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+setup_env()
+{
+ENIQ_BASE_DIR=/eniq
+
+# ENIQ BKUP SW Directory
+ENIQ_BKUP_DIR=${ENIQ_BASE_DIR}/bkup_sw
+
+# ENIQ BKUP SW etc Directory 
+ENIQ_BKUP_ETC_DIR=${ENIQ_BKUP_DIR}/etc
+
+# ENIQ Core install directory
+ENIQ_CORE_INST_DIR=${ENIQ_BASE_DIR}/installation/core_install
+
+# Hostname Information
+HNAME=`${MYHOSTNAME}`
+
+# Source the common functions
+if [ -s ${ENIQ_BASE_DIR}/admin/lib/common_functions.lib ]; then
+    . ${ENIQ_BASE_DIR}/admin/lib/common_functions.lib
+else
+    _err_msg_="File ${ENIQ_BASE_DIR}/admin/lib/common_functions.lib not found"
+    abort_script "$_err_msg_"
+fi
+
+# Log file directory path
+LOGDIR=${ENIQ_BASE_DIR}/local_logs/backup_logs/
+if [ ! -d ${LOGDIR} ]
+then
+    $MKDIR -p ${ENIQ_BASE_DIR}/local_logs/backup_logs/
+fi
+# Log File 
+LOGFILE=${LOGDIR}/get_backup_option.log
+
+# SCP command
+SCP_CMD="$SCP -rp -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
+
+GET_IP_ORDER=${ENIQ_CORE_INST_DIR}/lib/get_ip_order.pl
+
+if [ ! -f ${GET_IP_ORDER} ]; then
+    _err_msg_="Could not find ${ENIQ_CORE_INST_DIR}/lib/get_ip_order.pl script"
+    abort_script "$_err_msg_"
+fi
+
+#Check IP Type
+check_ip_type
+if [ ! "${_ip_type_}" ]; then
+    _err_msg_="Could not read parameter _ip_type_ from ipmp.ini file"
+    abort_script "$_err_msg_"
+fi
+}
+
+### Function: user_input ###
+#
+# Get input from user for backup option 
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+user_input()
+{
+while :; do
+    unset USER_INPUT
+
+    $ECHO "\nSelect one of the following backup option"
+    $ECHO "[1] Full System Backup"
+    $ECHO "[2] No Data Backup" 
+
+    read OPTION 
+    case ${OPTION} in
+        1) USER_INPUT="FullData"  
+           break
+           ;;
+        2) USER_INPUT="NoData"
+           break
+           ;;
+        *) $ECHO "Invalid option ${OPTION}"
+           ;;
+    esac
+
+done
+
+BACKUP_TYPE="${USER_INPUT}"
+
+
+log_msg -s "User selected option is ${BACKUP_TYPE}\n" -l ${LOGFILE}
+
+}
+
+### Function: check_id ###
+#
+#   Check that the effective id of the user is correct
+#   If not print error msg and exit.
+#
+# Arguments:
+#       $1 : User ID name
+# Return Values:
+#       none
+check_user()
+{
+_check_id_=`$ID  | $AWK -F\( '{print $2}' | $AWK -F\) '{print $1}'`
+if [ "$_check_id_" != "$1" ]; then
+    _err_msg_="You must be $1 to execute this script."
+    exit_script "$_err_msg_"
+fi
+}
+
+# ********************************************************************
+#
+#       Main body of program
+#
+# ********************************************************************
+# Check that the effective id of the user is root
+check_user root
+
+# Setup up path environment etc
+setup_env
+
+# Create a temporary Directory
+TEM_DIR=/tmp/get_backup_option.$$.$$
+$RM -rf ${TEM_DIR}
+$MKDIR -p ${TEM_DIR}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not create directory ${TEM_DIR}"
+    abort_script "$_err_msg_" "${EXEC_SHELL_CMD}"
+fi
+
+
+#Get input from user for backup option 
+user_input
+
+_tag_list_="BKUP_OPTION_STR="
+_tag_value_=($USER_INPUT)
+_count_=0
+
+$PERL ${GET_IP_ORDER} -f ${TEM_DIR}/server_order_list
+for _tag_ in ${_tag_list_}
+do
+
+     for _line_ in `$CAT ${TEM_DIR}/server_order_list`; do 
+        _count1_=`$ECHO "${_line_}" | $GREP -o "::" | $WC -l`
+        if [ "${_ip_type_}" == "IPv6" -a "${_count1_}" == 3 ]; then
+                _server_=`$ECHO ${_line_} | $AWK -F"::" '{print $3}'`
+        else
+                _server_=`$ECHO ${_line_} | $AWK -F"::" '{print $2}'`
+        fi
+
+           if [ "${_server_}" == "${HNAME}" ]; then
+               $CP -rp ${ENIQ_BKUP_ETC_DIR}/eniq_backup.conf ${TEM_DIR}/eniq_backup.conf >/dev/null 
+               if [ $? -ne 0 ]; then
+                   _err_msg_="Failed to copy ${ENIQ_BKUP_ETC_DIR}/eniq_backup.conf from ${_server_}"
+                   abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+               fi               
+           else
+               ${SCP_CMD} ${_server_}:${ENIQ_BKUP_ETC_DIR}/eniq_backup.conf ${TEM_DIR}/eniq_backup.conf >/dev/null 2>&1
+               if [ $? -ne 0 ]; then
+                   _err_msg_="Failed to copy ${ENIQ_BKUP_ETC_DIR}/eniq_backup.conf from ${_server_}"
+                   abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+              fi
+           fi
+           $CAT ${TEM_DIR}/eniq_backup.conf | $GREP ${_tag_}  >/dev/null
+           if [ $? -eq 0 ]; then
+                 $SED -e 's|^[       ]*'${_tag_}'.*|'${_tag_}''${_tag_value_[$_count_]}'|' ${TEM_DIR}/eniq_backup.conf >${TEM_DIR}/eniq_backup.conf_temp
+                 $CP ${TEM_DIR}/eniq_backup.conf_temp  ${TEM_DIR}/eniq_backup.conf >/dev/null
+           else
+                 $ECHO "${_tag_}${_tag_value_[$_count_]}" >> ${TEM_DIR}/eniq_backup.conf
+           fi
+
+           if [ $? -ne 0 ]; then
+                 _err_msg_="Failed to put ${_tag_} in ${TEM_DIR}/eniq_backup.conf"
+                 abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}" 
+           fi
+
+           if [ "${_server_}" == "${HNAME}" ]; then
+               $CP -rp ${TEM_DIR}/eniq_backup.conf ${ENIQ_BKUP_ETC_DIR}/eniq_backup.conf >/dev/null 
+               if [ $? -ne 0 ]; then
+                   _err_msg_="Failed to copy ${TEM_DIR}/eniq_backup.conf to ${ENIQ_BKUP_ETC_DIR}/eniq_backup.conf on ${_server_}"
+                   abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+               fi    
+            else   
+                ${SCP_CMD} ${TEM_DIR}/eniq_backup.conf ${_server_}:${ENIQ_BKUP_ETC_DIR}/eniq_backup.conf >/dev/null 2>&1
+                if [ $? -ne 0 ]; then
+                    _err_msg_="Failed to copy ${TEM_DIR}/eniq_backup.conf to ${ENIQ_BKUP_ETC_DIR}/eniq_backup.conf on ${_server_}"
+                    abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+                fi
+           fi    
+     done 
+     _count_=`$EXPR $_count_ + 1`
+done
+
+$RM -rf ${TEM_DIR}
+
+exit 0

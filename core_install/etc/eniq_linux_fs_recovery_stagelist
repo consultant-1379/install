@@ -1,0 +1,7 @@
+stop_eniq_services
+recover_backup_files
+restore_solaris_files
+create_fls_enm_zfs
+start_eniq_services
+post_recovery 
+cleanup_recovery

@@ -1,0 +1,1083 @@
+#!/bin/bash
+# ********************************************************************
+# Ericsson Radio Systems AB                                     SCRIPT
+# ********************************************************************
+#
+#
+# (c) Ericsson Radio Systems AB 2018 - All rights reserved.
+#
+# The copyright to the computer program(s) herein is the property
+# of Ericsson Radio Systems AB, Sweden. The programs may be used 
+# and/or copied only with the written permission from Ericsson Radio 
+# Systems AB or in accordance with the terms and conditions stipulated 
+# in the agreement/contract under which the program(s) have been 
+# supplied.
+#
+# ********************************************************************
+# Name    : upgrade_sybase_sql_anywhere.bsh
+# Date    : 16/02/2023
+# Revision: main\19
+# Purpose : This script will update the Sybase SQL Anwhere SW on the ENIQ server
+#
+# Usage   : upgrade_sybase_sql_anywhere.bsh -d <eniq_sw_dir> [ -b <eniq_base_dir> ]
+#                     [ -l <path_to_logfile> ] [ -T ] 
+#
+# ********************************************************************
+#
+#   Command Section
+#
+# ********************************************************************
+AWK=/usr/bin/awk
+BASENAME=/usr/bin/basename
+CAT=/usr/bin/cat
+CHMOD=/usr/bin/chmod
+CHOWN=/usr/bin/chown
+CLEAR=/usr/bin/clear
+CP=/usr/bin/cp
+CUT=/usr/bin/cut
+DATE=/usr/bin/date
+DIRNAME=/usr/bin/dirname
+ECHO=/usr/bin/echo
+EGREP=/usr/bin/egrep
+ENV=/usr/bin/env
+EXPR=/usr/bin/expr
+FIND=/usr/bin/find
+GETENT=/usr/bin/getent
+GREP=/usr/bin/grep
+GTAR=/usr/bin/gtar
+ID=/usr/bin/id
+LS=/usr/bin/ls
+MKDIR=/usr/bin/mkdir
+PS=/usr/bin/ps
+PWD=/usr/bin/pwd
+RM=/usr/bin/rm
+SED=/usr/bin/sed
+SU=/usr/bin/su
+SYSTEMCTL=/usr/bin/systemctl
+TEE=/usr/bin/tee
+TOUCH=/usr/bin/touch
+UNAME=/usr/bin/uname
+
+# ********************************************************************
+#
+#       Configuration Section
+#
+# ********************************************************************
+# Name of SunOS & ENIQ ini Files
+ENIQ_ENV=niq.rc
+ENIQ_INI=niq.ini
+SUNOS_INI=SunOS.ini
+SYM_INI=sym_links.ini
+
+# DVD LABEL or Jumpstart Directory where all ENIQ SW will reside
+ENIQ_BASE_SW=eniq_base_sw
+
+EBF_DIR="./EBF"
+EBF_FILE_ID="${EBF_DIR}/version/asa_version"
+
+# Get the architecture of the server.
+# Need to upgrade the correct sybase version - sparc or x86
+SUN_ARCH=`$UNAME -p`
+
+VERSION_FILE_ID="./version/asa_version"
+VERSION_FILE_NAME="asa_version"
+
+# ********************************************************************
+#
+#       Pre-execution Operations
+#
+# ********************************************************************
+
+# ********************************************************************
+#
+#   Functions
+#
+# ********************************************************************
+### Function: abort_script ###
+#
+#   This will is called if the script is aborted thru an error
+#   error signal sent by the kernel such as CTRL-C or if a serious
+#   error is encountered during runtime
+#
+# Arguments:
+#       $1 - Error message from part of program (Not always used)
+# Return Values:
+#       none
+abort_script()
+{
+if [ -s ${TEM_DIR}/${VERSION_FILE_NAME} ]; then
+    log_msg -s "Reverting the Sybase SQL Anywhere version file to version before upgrade" -l ${LOGFILE}
+    $MV ${TEM_DIR}/${VERSION_FILE_NAME} ${ORIG_SYB_SQL_ANY_TGT_DIR}/${VERSION_FILE_ID}
+    if [ $? -ne 0 ]; then
+        log_msg -s="Could not revert the old Sybase SQL Anywhere version file ${VERSION_FILE_NAME}" -l ${LOGFILE}
+    fi
+fi
+
+if [ "$1" ]; then
+    _err_msg_=$1
+else
+    _err_msg_="Script aborted.......\n"    
+fi
+if [ "${LOGFILE}" ]; then
+    $ECHO "\n$_err_msg_\n"|$TEE -a ${LOGFILE}
+else
+    $ECHO "\n$_err_msg_\n"
+fi
+
+cd $SCRIPTHOME
+$RM -rf ${TEM_DIR}
+$RM -rf ${conn_str_enc}
+
+if [ "$2" ]; then
+    ${2}
+else
+   exit 1
+fi
+$RM -rf ${TEM_DIR}
+}
+
+### Function: chk_create_logfile ###
+#
+# Check/Create Logfile
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+chk_create_logfile()
+{
+$MKDIR -p `$DIRNAME ${LOGFILE}`
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not create directory `$DIRNAME ${LOGFILE}`"
+     abort_script "$_err_msg_"
+fi  
+
+$TOUCH -a ${LOGFILE}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not write to file ${LOGFILE}"
+    abort_script "$_err_msg_"
+fi
+
+$CHMOD 777 ${LOGFILE}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not update ${LOGFILE} file permissions to 777"
+	abort_script "$_err_msg_"
+fi
+  
+}
+
+### Function: check_id ###
+#
+#   Check that the effective id of the user is correct
+#   If not print error msg and exit.
+#
+# Arguments:
+#       $1 : User ID name
+# Return Values:
+#       none
+check_id()
+{
+_check_id_=`$ID  | $AWK -F\( '{print $2}' | $AWK -F\) '{print $1}'`
+if [ "$_check_id_" != "$1" ]; then
+    _err_msg_="You must be $1 to execute this script."
+    abort_script "$_err_msg_"
+fi
+}
+
+### Function: check_ebf_upg_required ###
+#
+#   Check if SQL anywhere ebf upgrade is requiired
+#   If not print error msg and exit.
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+check_ebf_upg_required()
+{
+$ECHO "Entering Function: check_ebf_upg_required"
+
+$ECHO "Exiting Function: check_ebf_upg_required"
+}
+
+### Function: check_sql_any_sw_upg_required ###
+#
+#   Check if SQL anywhere upgrade is requiired
+#   If not print error msg and exit.
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+check_sql_any_sw_upg_required()
+{
+# If I do not have a version file, then assume this version is newer.
+if [ ! -s ${ORIG_SYB_SQL_ANY_TGT_DIR}/${VERSION_FILE_ID} ]; then
+    $ECHO "Upgrade of Sybase ASA Required" >> ${TEM_DIR}/upgrade_disp_file
+    SQL_ANY_SW_UPGRADE_REQ=YES
+    return 0
+fi
+
+# Get ASA revision info
+_old_disp_asa_ver_=`$CAT ${ORIG_SYB_SQL_ANY_TGT_DIR}/${VERSION_FILE_ID} | $EGREP '^[[:blank:]]*VERSION::' | $AWK -F"::" '{print $2}' | $CUT -d"." -f1-3`
+_old_asa_ver_=`$ECHO ${_old_disp_asa_ver_} | $SED -e 's|\.||g'`
+if [ ! "${_old_asa_ver_}" ]; then
+    _err_msg_="Could not read ASA Version from ${ORIG_SYB_SQL_ANY_TGT_DIR}/${VERSION_FILE_ID}"
+    abort_script "$_err_msg_" 
+fi
+
+$ECHO ${_old_asa_ver_} | $EGREP '[^0-9]' >> /dev/null 2>&1
+if [ $? -eq 0 ]; then
+    _err_msg_="Invalid ASA Version found in ${ORIG_SYB_SQL_ANY_TGT_DIR}/${VERSION_FILE_ID}"
+    abort_script "$_err_msg_" 
+fi
+
+_old_esd_num_=`$CAT ${ORIG_SYB_SQL_ANY_TGT_DIR}/${VERSION_FILE_ID}|$EGREP '^[[:blank:]]*ESD::'|$SED -e 's/\.//g'|$AWK -F"::" '{print $2}'`
+if [ "${_old_esd_num_}" ]; then
+    $ECHO ${_old_esd_num_}|$EGREP '[^0-9]' >> /dev/null 2>&1
+    if [ $? -eq 0 ]; then
+        _err_msg_="Invalid ESD value found in ${ORIG_SYB_SQL_ANY_TGT_DIR}/${VERSION_FILE_ID}"
+        abort_script "$_err_msg_" 
+    fi
+fi
+
+# Extract the version file from the SYBASE SW bundle
+cd ${TEM_DIR}
+log_msg -s "Extracting ASA version file(s) from ${SYB_SQL_ANY_FILE}...Please Wait" -l ${LOGFILE}
+$GTAR -zxf ${SYB_SQL_ANY_FILE} ${VERSION_FILE_ID}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not extract ${SYB_SQL_ANY_FILE}"
+    abort_script "$_err_msg_" 
+fi
+    
+NEW_SW_ESD_NUM=`$CAT ${VERSION_FILE_ID}|$EGREP '^[[:blank:]]*ESD::'|$SED -e 's/\.//g'|$AWK -F"::" '{print $2}'`
+if [ "${NEW_SW_ESD_NUM}" ]; then
+    $ECHO ${NEW_SW_ESD_NUM}|$EGREP '[^0-9]' >> /dev/null 2>&1
+    if [ $? -eq 0 ]; then
+        _err_msg_="Invalid ESD value found in extracted version file ${VERSION_FILE_ID}"
+        abort_script "$_err_msg_" 
+    fi
+fi
+
+_new_disp_asa_ver_=`$CAT ${VERSION_FILE_ID} | $EGREP '^[[:blank:]]*VERSION::' | $AWK -F"::" '{print $2}'`
+_new_asa_ver_=`$ECHO ${_new_disp_asa_ver_} | $SED -e 's|\.||g'`
+if [ ! "${_new_asa_ver_}" ]; then
+    _err_msg_="Could not read ASA Version from extracted version file ${VERSION_FILE_ID}"
+    abort_script "$_err_msg_" 
+fi
+
+$ECHO ${_new_asa_ver_}|$EGREP '[^0-9]' >> /dev/null 2>&1
+if [ $? -eq 0 ]; then
+    _err_msg_="Invalid ASA Version found in extracted version file ${VERSION_FILE_ID}"
+    abort_script "$_err_msg_" 
+fi
+
+$RM -f ${TEM_DIR}/upgrade_disp_file
+
+# Get IQ revision info
+if [ "${_old_esd_num_}" ]; then
+    _out_str_="Current Sybase ASA version ${_old_disp_asa_ver_} / ESD ${_old_esd_num_}\n"
+else 
+    _out_str_="Current Sybase ASA version ${_old_disp_asa_ver_}\n"
+fi
+$ECHO ${_out_str_} >> ${TEM_DIR}/upgrade_disp_file
+
+# If the new ASA version is greated then upgrade. EBF upgrade is 
+# assumed then
+if [ ${_new_asa_ver_} -gt ${_old_asa_ver_} ]; then
+    SQL_ANY_SW_UPGRADE_REQ=YES
+    $ECHO "New Sybase SQL Anywhere version ${_new_disp_asa_ver_} / ESD ${NEW_SW_ESD_NUM}\n" >> ${TEM_DIR}/upgrade_disp_file
+    return 0
+fi
+
+if [ "${NEW_SW_ESD_NUM}" ]; then
+    _out_str_="New Sybase SQL Anywhere version ${_new_disp_asa_ver_} / ESD ${NEW_SW_ESD_NUM}\n"
+else 
+    _out_str_="New Sybase SQL Anywhere version ${_new_disp_asa_ver_}\n"
+fi
+$ECHO ${_out_str_} >> ${TEM_DIR}/upgrade_disp_file
+ 
+# If the ASA versions are the same, compare the ESD numbers
+if [ ${_new_asa_ver_} -eq ${_old_asa_ver_} ]; then
+    if [ "${NEW_SW_ESD_NUM}" ]; then
+        if [ "${_old_esd_num_}" ]; then
+            if [ ${NEW_SW_ESD_NUM} -gt ${_old_esd_num_} ]; then
+                SQL_ANY_SW_UPGRADE_REQ=YES
+                return 0
+            fi
+        else 
+            # Assume this is newer version
+            SQL_ANY_SW_UPGRADE_REQ=YES
+            return 0
+        fi
+    fi
+fi
+}
+
+### Function: check_templates_dir ###
+#
+# Check that I have a templates directory associated with 
+# my installation type
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+check_templates_dir()
+{
+if [ ! -s "${INST_TYPE_FILE}" ]; then
+    _err_msg_="ENIQ install type not defined in ${INST_TYPE_FILE}"
+    abort_script "$_err_msg_"
+fi
+# Read the installation type 
+INSTALL_TYPE=`$CAT ${INST_TYPE_FILE} | $AWK -F"=" '{print $2}'`
+
+# Templates Directory
+ENIQ_TEMPL_DIR="`$DIRNAME ${SCRIPTHOME}`/templates/${INSTALL_TYPE}"
+
+# Do we have a templates dir for the install type
+if [ ! -d ${ENIQ_TEMPL_DIR} ]; then
+    _err_msg_="Template directory ${ENIQ_TEMPL_DIR} not found"
+    abort_script "$_err_msg_" 
+fi
+}
+
+### Function: get_absolute_path ###
+#
+# Determine absolute path to software
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+get_absolute_path()
+{
+_dir_=`$DIRNAME $0`
+SCRIPTHOME=`cd $_dir_ 2>/dev/null && pwd || $ECHO $_dir_`
+}
+
+### Function: install_sybase_sql_any ###
+#
+# Install the binaries
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+install_sybase_sql_any()
+{
+if [ ! "${SYB_SQL_ANY_TGT_DIR}" ]; then
+	_err_msg_="Could not Determine the SYB_SQL_ANY_TGT_DIR"
+	abort_script "$_err_msg_"
+fi
+
+cd ${SYB_SQL_ANY_TGT_DIR}
+if [ $? -ne 0 ]; then
+	_err_msg_="Could not change diretory to ${_tgt_dir_}"
+	abort_script "$_err_msg_" "${EXEC_SHELL_CMD}"
+fi
+
+$ECHO "Removing old SW"
+$RM -rf ${SYB_SQL_ANY_TGT_DIR}/*
+
+$ECHO "Installing Sybase SQL Anywhere SW"
+$GTAR -zxf ${SYB_SQL_ANY_FILE}
+if [ $? -ne 0 ]; then
+    _err_msg_="Failed to install Sybase SQL Anywhere SW...exiting!"
+    abort_script "$_err_msg_"
+fi
+
+# Okay I need to locate the files that I have to update path in
+# I build this SW bundle in a different path than I installed it
+if [ ! -s ${SYB_SQL_ANY_TGT_DIR}/file_change_list.txt ]; then
+   $RM -f ${TEM_DIR}/file_change_list.txt
+   $ECHO "Determining Files that need to be updated...Please Wait"
+   $FIND ${SYB_SQL_ANY_TGT_DIR} -type f -exec $EGREP -l "<CHANGE><ASA_SYB_DIR>" {} \; >> ${TEM_DIR}/file_change_list.txt
+   $CP ${TEM_DIR}/file_change_list.txt ${SYB_SQL_ANY_TGT_DIR}/file_change_list.txt
+fi
+
+# Okay Have I any files to change?
+if [ -s ${SYB_SQL_ANY_TGT_DIR}/file_change_list.txt ]; then
+    for _file_ in `$CAT ${SYB_SQL_ANY_TGT_DIR}/file_change_list.txt`; do
+        $RM -f ${TEM_DIR}/file.$$.$$
+        if [ -s ${SYB_SQL_ANY_TGT_DIR}/${_file_} ]; then
+            $ECHO "Updating ${SYB_SQL_ANY_TGT_DIR}/${_file_}"
+            $CAT ${_file_} |$SED -e "s|<CHANGE><ASA_SYB_DIR>|${SYB_SQL_ANY_TGT_DIR}|g" >  ${TEM_DIR}/file.$$.$$
+            if [ $? -ne 0 ]; then
+                _err_msg_="Failed to update <CHANGE><ASA_SYB_DIR> ${SYB_SQL_ANY_TGT_DIR}/${_file_}"
+                abort_script "$_err_msg_"
+            fi
+            $CP ${TEM_DIR}/file.$$.$$ ${_file_}
+            if [ $? -ne 0 ]; then
+                _err_msg_="Failed to update file ${SYB_SQL_ANY_TGT_DIR}/${_file_}"
+                abort_script "$_err_msg_"
+            fi
+        fi
+    done
+    $RM -f ${SYB_SQL_ANY_TGT_DIR}/file_change_list.txt
+fi
+
+# Okay Have I any files to change?
+if [ -s ${SYB_SQL_ANY_TGT_DIR}/link_change_list.txt ]; then
+    $RM -f ${TEM_DIR}/link_change_list.txt
+    $CAT ${SYB_SQL_ANY_TGT_DIR}/link_change_list.txt \
+    |$SED -e "s|<CHANGE><ASA_SYB_DIR>|${SYB_SQL_ANY_TGT_DIR}|g" > ${TEM_DIR}/link_change_list.txt
+    /bin/bash ${TEM_DIR}/link_change_list.txt
+    if [ $? -ne 0 ]; then
+    	_err_msg_="Error running commands in ${TEM_DIR}/link_change_list.txt"
+    	abort_script "$_err_msg_" "${EXEC_SHELL_CMD}"
+	fi
+    $RM -f ${SYB_SQL_ANY_TGT_DIR}/link_change_list.txt
+fi
+
+DIR_LIST=`$LS -a ${SYB_SQL_ANY_TGT_DIR}`
+for DIR_NAME in ${DIR_LIST}; do
+    if [[ ${DIR_NAME} != *ckpt* ]] && [ ${DIR_NAME} != "." ] && [ ${DIR_NAME} != ".." ]; then
+        $CHOWN -Rh ${SYSUSER}:${SYSGRP} ${SYB_SQL_ANY_TGT_DIR}/${DIR_NAME} >> /dev/null 2>&1
+        if [ $? -ne 0 ]; then
+            _err_msg_="Could not change ownership of ${SYB_SQL_ANY_TGT_DIR}/${DIR_NAME} to ${SYSUSER}:${SYSGRP}"
+            abort_script "$_err_msg_" "${EXEC_SHELL_CMD}"
+        fi
+    fi
+done
+}
+
+### Function: sybase_sql_any_ebf_upgrade ###
+#
+# Upgrade EBF
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+sybase_sql_any_ebf_upgrade()
+{
+$ECHO "Entering Function: sybase_sql_any_ebf_upgrade"
+$ECHO "Exiting Function: sybase_sql_any_ebf_upgrade"
+}
+
+### Function: setup_env ###
+#
+# Setup up path environment etc
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+setup_env()
+{
+if [ ! "${ENIQ_BASE_DIR}" ]; then
+    ENIQ_BASE_DIR=/eniq
+fi
+
+#Temp directory.
+TEM=/tmp
+
+# ENIQ Admin Directory
+ENIQ_ADMIN_DIR=${ENIQ_BASE_DIR}/admin
+
+# CLI Conf dir
+CLI_CONF_DIR=${ENIQ_BASE_DIR}/sw/conf
+if [ ! -s ${CLI_CONF_DIR}/${ENIQ_ENV} ]; then
+    _err_msg_="Could not locate file ${CLI_CONF_DIR}/${ENIQ_ENV}"
+    abort_script "$_err_msg_"
+fi
+
+# ENIQ Admin Bin Directory
+ENIQ_ADMIN_BIN_DIR=${ENIQ_ADMIN_DIR}/bin
+
+ENIQ_CONF_DIR=${ENIQ_BASE_DIR}/installation/config
+if [ ! -s ${ENIQ_CONF_DIR}/ericsson_use_config ]; then
+    _err_msg_="Could not locate file ${ENIQ_CONF_DIR}/ericsson_use_config"
+    abort_script "$_err_msg_"
+fi
+
+# File containing the type of OSS installation. Eg. stats
+INST_TYPE_FILE=${ENIQ_CONF_DIR}/ericsson_use_config
+
+# Main Directory for the Core Installation SW
+ENIQ_INST_DIR=${ENIQ_BASE_DIR}/installation/core_install
+
+# Set the log directory
+LOG_DIR=${ENIQ_BASE_DIR}/log
+LOGFILE_DIR="$LOG_DIR/sybase_asa"
+
+CURR_SERVER_TYPE=`$CAT $ENIQ_CONF_DIR/installed_server_type | $EGREP -v '^[[:blank:]]*#' | $SED -e 's/ //g'`
+if [ ! "${CURR_SERVER_TYPE}" ]; then
+	_err_msg_="Could not determine which server type this is"
+    abort_script "$_err_msg_"
+fi
+}
+
+### Function: setup_sybase_env ###
+#
+# Set up Sybase environment
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+setup_sybase_env()
+{
+$SU - ${SYSUSER} >> /dev/null -c "$ENV |$EGREP '^(SYBASE|ASDIR|IQDIR|ASALOGDIR|SQLANY)' > $TEM_DIR/sybase_det.$$" >> /dev/null 2>&1
+
+# Source the environment
+set -a
+. $TEM_DIR/sybase_det.$$ >> /dev/null 2>&1
+set +a
+
+if [ ! "${SYBASE}" ]; then 
+    _err_msg_="Could not determine Sybase environment variable \${SYBASE}"
+    abort_script "$_err_msg_"
+fi
+
+DBISQL="$(ls /eniq/sybase_iq/IQ-*/bin64/dbisql)"
+
+if [ ! -x "$DBISQL" ]; then
+   _err_msg_="$DBISQL commands not found or not executable."
+    abort_script "$_err_msg_"
+fi
+}
+        
+### Function: usage_msg ###
+#
+#   Print out the usage message
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+usage_msg() 
+{
+$CLEAR
+$ECHO "
+Usage: `$BASENAME $0` -d <eniq_sw_dir> [ -b <eniq_base_dir> ] [ -l <path_to_logfile> ] [ -T ]
+                      
+options:
+
+-b  : Optional parameter specifying the full path to where the ENIQ
+      BASEDIR directory is (eg. /eniq). If not specified, then the 
+      script will assume the the base directory is 
+      ../../<directory_that_this_script_is_in>
+
+-d  : Parameter specifying the full path to the directory 
+      containing the ENIQ BASE SW directory structure. Under this
+      directory, this script will locate a directory that contains a list of 
+      all the TechPacks that will be used in addition of new TechPacks or the
+      or updating of existing TechPacks.
+      EG. <path_base_dir_sw>/${ENIQ_INTERF_INPUT_DIR}/techpack_description
+
+-l  : Optional parameter specifying the full path to logfile. If not specified, a 
+      logfile will be created in ${LOGFILE_DIR}
+
+-T  : Optional Parameter specifying the script should run in Test Mode. This
+      means that the script will only report if upgrade is required or not.
+"
+}
+
+### Function: upd_user_profile ###
+#
+#   Update the SYSTEM USER profile file
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+upd_user_profile()
+{
+_iq_dir_=`iniget SYBASE_IQ -f ${ENIQ_CONF_DIR}/${SUNOS_INI} -v SYBASE_IQ_TARGET_DIR`
+_bin_dir_=`$CAT ${ENIQ_CONF_DIR}/${ENIQ_ENV}|$EGREP '^[[:blank:]]*BIN_DIR=' |$AWK -F\= '{print $2}'`
+_rt_dir_=`$CAT ${ENIQ_CONF_DIR}/${ENIQ_ENV}|$EGREP '^[[:blank:]]*RT_DIR=' |$AWK -F\= '{print $2}'`
+_asa_tgt_dir_=`iniget SYBASE_ASA -f ${ENIQ_CONF_DIR}/${SUNOS_INI} -v SYBASE_ASA_TARGET_DIR`
+
+# Get a list of users to be updated
+_user_list_=`iniget SunOS_USER -f ${ENIQ_CONF_DIR}/${SUNOS_INI}`
+for _user_ in ${_user_list_}; do
+    _user_name_=`iniget ${_user_} -f ${ENIQ_CONF_DIR}/${SUNOS_INI} -v name`
+    $GETENT passwd ${_user_name_} >> /dev/null 2>&1
+    if [ $? -ne 0 ]; then
+        _err_msg_="User ${_user_name_} not created"
+        abort_script "$_err_msg_" 
+    fi
+    
+    _sys_home_=`$GETENT passwd ${_user_name_}|$AWK -F\: '{print $6}'`
+    if [ ! "${_sys_home_}" ]; then
+        _err_msg_="Error reading  ${_user_name_} home area from /etc/passwd"
+        abort_script "$_err_msg_" 
+    fi
+
+    if [ ! -s ${_iq_dir_}/IQ.sh ]; then
+		_err_msg_="Could not locate ${_iq_dir_}/IQ.sh"
+		abort_script "$_err_msg_" 
+    fi
+    _sybase_ocs_=`$CAT ${_iq_dir_}/IQ.sh |$EGREP '^[[:blank:]]*SYBASE_OCS=' |$AWK -F\= '{print $2}'`
+
+    if [ -f ${_sys_home_}/.bash_profile ]; then
+		$CP ${_sys_home_}/.bash_profile ${_sys_home_}/.bash_profile.bkup
+    fi
+
+    $CP ${ENIQ_TEMPL_DIR}/${SUN_ARCH}/skel_dir/.bash_profile ${_sys_home_}/.bash_profile
+
+    $CAT ${_sys_home_}/.bash_profile | $SED -e "s|<CHANGE><IQ_SYB_DIR>|${_iq_dir_}|g"      	\
+										-e "s|<CHANGE><ASA_SYB_DIR>|${_asa_tgt_dir_}|g" \
+										-e "s|<CHANGE><CONF_DIR>|${CLI_CONF_DIR}|g"     \
+										-e "s|<CHANGE><BIN_DIR>|${_bin_dir_}|g"         \
+										-e "s|<CHANGE><RT_DIR>|${_rt_dir_}|g"           \
+										-e "s|\(SYBASE_OCS=\)\(.*OCS-.*\)|\1${_sybase_ocs_}|g" >  ${TEM_DIR}/.bash_profile
+    
+    $CP ${TEM_DIR}/.bash_profile ${_sys_home_}/.bash_profile
+done
+}
+
+### Function: update_dboptions ###
+#
+# Update database dboptions
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+update_dboptions()
+{
+# Change ownership of dboptions file
+$CHOWN $SYSUSER:$SYSGRP ${ENIQ_ADMIN_DIR}/sql/*
+
+local _db_="repdb"
+
+$ECHO "Ensuring ${_db_} is stopped."
+bash ${ENIQ_ADMIN_BIN_DIR}/manage_eniq_services.bsh -a stop -s ${_db_} -N
+
+$SU - ${SYSUSER} -c "bash ${SCRIPTHOME}/dboptions_${_db_}.bsh -l ${LOGFILE} -c ${CLI_CONF_DIR} -d ${CLI_CONF_DIR}/${ENIQ_INI}"
+if [ $? -ne 0 ]; then
+	_err_msg_="${SCRIPTHOME}/dboptions_${_db_}.bsh was not successful\n" 
+	abort_script "$_err_msg_"
+fi
+
+# Adding robustness to ensure that the repdb is stopped if started via the administrator script /eniq/admin/bin/repdb using ${SCRIPTHOME}/dboptions_${_db_}.bsh
+_repdb_process_pid_=`$PS -eaf|$GREP dbsrv|$GREP -v grep|$AWK '{print $2}'`
+_service_state_=`$SYSTEMCTL show -p ActiveState eniq-repdb |$CUT -d= -f2`
+if [  "${_repdb_process_pid_}" -a "${_service_state_}" == "inactive" ]; then
+	log_msg -s "Ensuring ${_db_} is stopped.\n" -l ${LOGFILE}
+	$SU - ${SYSUSER} -c "${ENIQ_ADMIN_BIN_DIR}/${_db_} stop"
+	if [ $? -ne 0 ]; then
+		_err_msg_="Failed to stop ${_db_} \n" 
+		abort_script "$_err_msg_"
+	fi
+fi
+
+bash ${ENIQ_ADMIN_BIN_DIR}/manage_eniq_services.bsh -a start -s ${_db_} -N
+if [ $? -ne 0 ]; then
+	_err_msg_="Failed to start ${_db_} after running dboptions_${_db_}.bsh.\n" 
+	abort_script "$_err_msg_"
+fi
+}
+
+### Function: upgrade_database ###
+#
+# Upgrade the databases
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+upgrade_database()
+{
+_dba_pass_=`inigetpassword DB -f ${ENIQ_CONF_DIR}/${ENIQ_INI} -v DBAPassword`
+if [ ! ${_dba_pass_} ]; then
+    if [ -f ${ENIQ_BASE_DIR}/sw/installer/dbusers ]; then
+        $SU - ${SYSUSER} >> /dev/null -c "${ENIQ_BASE_DIR}/sw/installer/dbusers dba dwh > ${TEM_DIR}/password"
+        _dba_pass_=`$CAT ${TEM_DIR}/password`
+        if [ ! "${_dba_pass_}" ] ; then
+            _err_msg_="`$DATE +%d.%m.%y_%H:%M:%S` - Could not get dwhdb DBA Password"
+            abort_script "$_err_msg_"
+        fi
+    else
+        err_msg_="`$DATE +%d.%m.%y_%H:%M:%S` - Could not read DBA password from ${CLI_CONF_DIR}/${ENIQ_INI}"
+        abort_script "$_err_msg_"
+    fi
+fi
+
+# Upgrade the databases
+_db_=repdb
+_ini_sect_=REP
+
+$ECHO "Starting Database ${_db_}"
+bash ${ENIQ_ADMIN_BIN_DIR}/manage_eniq_services.bsh -a start -s ${_db_} -N
+
+# Get the port number associated with the database 
+_db_port_=`iniget ${_ini_sect_} -f ${ENIQ_CONF_DIR}/${ENIQ_INI} -v PortNumber`
+if [ ! "${_db_port_}" ]; then
+	_err_msg_="Could not read port number of ${_db_} from ${ENIQ_CONF_DIR}/${ENIQ_INI}"
+	abort_script "$_err_msg_"
+fi  
+
+$ECHO "Upgrading Database ${_db_} to ${1}"
+
+
+	
+conn_str="-c \"uid=dba;pwd=${_dba_pass_} -host localhost -port ${_db_port_} -onerror exit -nogui\""
+conn_str_enc=${TEM}/conn_str_sql_encrypt.txt.`uuidgen`
+
+# encrypt the connection string.
+get_encrypt_file "${conn_str}" "${conn_str_enc}"
+
+$SU - $SYSUSER -c '. /eniq/sybase_iq/SYBASE.sh;"$DBISQL @${conn_str_enc} \"ALTER DATABASE UPGRADE;\" "' > ${TEM_DIR}/alter_repdb_output.txt 2>&1
+_sqlcode_val_=`$CAT ${TEM_DIR}/alter_repdb_output.txt | $GREP SQLCODE | $CUT -d',' -f1 |  $CUT -d'=' -f2`
+if [[ "${_sqlcode_val_}" && ${_sqlcode_val_} -ne "-308" ]]; then
+    _err_msg_="Database ${_db_} not upgraded"
+    abort_script "$_err_msg_" 
+fi
+
+#Removing the backed up Sybase SQL Anywhere version file since upgrade is successful
+if [ -f ${TEM_DIR}/${VERSION_FILE_NAME} ]; then
+    log_msg -s "Removing old Sybase SQL Anywhere version file from ${TEM_DIR}" -l ${LOGFILE}
+    $RM -f ${TEM_DIR}/${VERSION_FILE_NAME}       
+fi
+$ECHO "\n"
+}
+
+### Function: user_confirm_upgrade ###
+#
+# Get confirmation from user to proceed with snapshot action
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+user_confirm_upgrade()
+{
+while :; do
+    unset USER_CONF
+    $CLEAR
+    if [ -s ${TEM_DIR}/upgrade_disp_file ]; then
+        $CAT ${TEM_DIR}/upgrade_disp_file
+    fi
+    $ECHO "\nAre you sure you wish to upgrade Sybase SQL Anywhere"
+    $ECHO "This will involve the stopping of all running ENIQ services/processes"
+    $ECHO "Enter [Yes | No] (case sensitive) : \c"
+    read USER_CONF
+    if [ "$USER_CONF" == "Yes" -o "$USER_CONF" == "No" ]; then
+        break
+    fi
+done
+}
+
+# ********************************************************************
+#
+#   Main body of program
+#
+# ********************************************************************
+#
+# Save the time of running. I do this here as I want all
+# dates and time to be the same
+RUN_TIME=`$DATE '+%Y-%b-%d_%H.%M.%S'`
+
+# Determine absolute path to software
+get_absolute_path
+
+# Check that the effective id of the user is root
+check_id root
+
+while getopts ":b:d:Fl:Ns:t:T" arg; do
+  case $arg in
+    b) ENIQ_BASE_DIR="$OPTARG" 
+       ;;
+    d) BASE_SW_DIR="$OPTARG"
+       ;;
+    F) FORCE_UPG="YES"
+       ;;
+    l) LOGFILE="$OPTARG" 
+       ;;
+    N) NO_CONFIRM="YES"
+       ;;
+    s) SYB_SQL_ANY_FILE="$OPTARG" 
+       ;;
+    t) SYB_SQL_ANY_TGT_DIR="$OPTARG" 
+       ;;
+    T) TEST_MODE="YES"
+       ;;
+   \?) usage_msg
+       exit 1
+       ;;
+  esac
+done
+shift `expr $OPTIND - 1`
+
+# Setup up path environment etc
+setup_env
+
+if [ ! "${BASE_SW_DIR}" ]; then
+    usage_msg
+    exit 1
+fi
+
+if [ ! -d ${BASE_SW_DIR} ]; then
+    _err_msg_="Directory ${BASE_SW_DIR} not found"
+    abort_script "$_err_msg_"
+fi
+
+# Source the common functions
+if [ -s $ENIQ_INST_DIR/lib/common_functions.lib ]; then
+    . $ENIQ_INST_DIR/lib/common_functions.lib
+else
+    _err_msg_="File $ENIQ_INST_DIR/lib/common_functions.lib not found"
+    abort_script "$_err_msg_"
+fi
+
+
+if [ ! "${LOGFILE}" ]; then
+	LOGFILE=${LOGFILE_DIR}/upgrade_sybase_asa.log
+fi	
+
+# Check/Create Logfile
+chk_create_logfile
+
+_upgrade_asa_=0
+# Only run on coordinator servers
+if [ "${CURR_SERVER_TYPE}" == "eniq_stats" -o "${CURR_SERVER_TYPE}" == "stats_coordinator" ]; then
+	_upgrade_asa_=0
+else
+	_upgrade_asa_=1
+fi
+
+if [ ${_upgrade_asa_} -eq 1 ]; then
+	log_msg -s "Sybase ASA upgrade script should not be run on ${CURR_SERVER_TYPE} server types" -t -l ${LOGFILE}
+	exit 0
+fi
+
+log_msg -s "Starting Sybase ASA upgrade" -t -q -h -l ${LOGFILE}
+
+# Check that I have a templates directory associated with 
+# my installation type
+check_templates_dir
+
+
+if [ ! -s ${ENIQ_ADMIN_BIN_DIR}/manage_eniq_services.bsh ]; then 
+    _err_msg_="File ${ENIQ_ADMIN_BIN_DIR}/manage_eniq_services.bsh not found"
+    abort_script "$_err_msg_"
+fi
+
+if [ ! -s ${SCRIPTHOME}/dboptions_repdb.bsh ]; then 
+    _err_msg_="File ${SCRIPTHOME}/dboptions_repdb.bsh not found"
+    abort_script "$_err_msg_"
+fi
+
+# Stop all runing ENIQ services
+$BASH ${ENIQ_ADMIN_BIN_DIR}/manage_eniq_services.bsh -a stop -s ALL -u -N -l ${LOGFILE}
+if [ $? -ne 0 ]; then
+    _err_msg_="Error running ${ENIQ_ADMIN_BIN_DIR}/manage_eniq_services.bsh"
+    abort_script "$_err_msg_"
+fi  
+
+if [ ! "${SYB_SQL_ANY_FILE}" ]; then
+    _src_dir_=`iniget SYBASE_ASA -f ${ENIQ_CONF_DIR}/${SUNOS_INI} -v SYBASE_ASA_SOURCE_DIR`
+    if [ ! "${_src_dir_}" ]; then
+        _err_msg_="Could not read SYBASE_ASA_SOURCE_DIR parameter from ${ENIQ_CONF_DIR}/${SUNOS_INI}"
+        abort_script "$_err_msg_"
+    fi
+
+    _sw_bndl_=`iniget SYBASE_ASA -f ${ENIQ_CONF_DIR}/${SUNOS_INI} -v SYBASE_ASA_SW_BUNDLE`
+    if [ ! "${_sw_bndl_}" ]; then
+        _err_msg_="Could not read SYBASE_ASA_SW_BUNDLE parameter from ${ENIQ_CONF_DIR}/${SUNOS_INI}"
+        abort_script "$_err_msg_"
+    fi
+
+    SYB_SQL_ANY_FILE="${BASE_SW_DIR}/${_src_dir_}/${INSTALL_TYPE}/sw/${SUN_ARCH}/${_sw_bndl_}"
+	
+    # Check that the bundle exists
+    if [ ! -s ${SYB_SQL_ANY_FILE} ]; then
+        SYB_SQL_ANY_FILE="${BASE_SW_DIR}/${_src_dir_}/common/sw/${SUN_ARCH}/${_sw_bndl_}"
+        if [ ! -s ${SYB_SQL_ANY_FILE} ]; then
+            _err_msg_="Sybase ASA SW bundle could not be found in ${BASE_SW_DIR}/${_src_dir_}/common/sw/${SUN_ARCH} or ${BASE_SW_DIR}/${_src_dir_}/${INSTALL_TYPE}/sw/${SUN_ARCH}"
+            abort_script "$_err_msg_" "${EXEC_SHELL_CMD}"
+        fi
+    fi
+	
+    $ECHO "Using Sybase SQL Anywhere binaries in ${SYB_SQL_ANY_FILE}" 
+fi
+
+ORIG_SYB_SQL_ANY_TGT_DIR=`iniget SYBASE_ASA -f ${ENIQ_CONF_DIR}/${SUNOS_INI} -v SYBASE_ASA_TARGET_DIR`
+if [ ! "${ORIG_SYB_SQL_ANY_TGT_DIR}" ]; then
+    _err_msg_="Could not read SYBASE_ASA_TARGET_DIR parameter from ${ENIQ_CONF_DIR}/${SUNOS_INI}"
+    abort_script "$_err_msg_"
+fi
+
+if [ ! "${SYB_SQL_ANY_TGT_DIR}" ]; then
+    SYB_SQL_ANY_TGT_DIR=${ORIG_SYB_SQL_ANY_TGT_DIR}
+fi
+
+# Create a temporary Directory
+TEM_DIR=/tmp/upgrade_sybase_anywhere.$$.$$
+$RM -rf ${TEM_DIR}
+$MKDIR -p ${TEM_DIR}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not create directory ${TEM_DIR}"
+    abort_script "$_err_msg_"
+fi  
+$CHMOD 777 ${TEM_DIR}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not update directory ${TEM_DIR} permissions"
+    abort_script "$_err_msg_"
+fi  
+
+SQL_ANY_SW_UPGRADE_REQ=NO
+SQL_ANY_EBF_UPGRADE_REQ=NO
+if [ "${TEST_MODE}" ]; then
+    check_sql_any_sw_upg_required
+    # Do I need to check if EBF required.
+    if [ "${SQL_ANY_EBF_UPGRADE_REQ}" == "NO" ]; then
+        check_ebf_upg_required
+    fi
+    if [ -s ${TEM_DIR}/upgrade_disp_file ]; then
+        $ECHO "\n\n"
+        $CAT ${TEM_DIR}/upgrade_disp_file
+    else
+        $ECHO "No Sybase SQL Anywhere upgrade required" 
+    fi
+    cd ${SCRIPTHOME}
+    $RM -rf ${TEM_DIR}
+    exit 0    
+fi
+
+#Taking a backup of Sybase SQL Anywhere version file
+if [ -s ${ORIG_SYB_SQL_ANY_TGT_DIR}/${VERSION_FILE_ID} ]; then
+    log_msg -s "Taking a backup of Sybase SQL Anywhere version file in ${TEM_DIR}" -l ${LOGFILE}
+    $CP -p ${ORIG_SYB_SQL_ANY_TGT_DIR}/${VERSION_FILE_ID} ${TEM_DIR}
+    if [ $? -ne 0 ]; then
+        log_msg -s  "Failed to keep a copy of the Sybase SQL Anywhere version file in ${TEM_DIR}" -l ${LOGFILE}
+        abort_script "$_err_msg_"
+    fi
+fi
+
+# Check if I need to upgrade unless forced by parameter
+if [ ! "${FORCE_UPG}" ]; then
+    check_sql_any_sw_upg_required
+else
+    SQL_ANY_SW_UPGRADE_REQ=YES
+fi
+
+cd ${SCRIPTHOME}
+
+if [ "${SQL_ANY_SW_UPGRADE_REQ}" == "YES" -o "${SQL_ANY_EBF_UPGRADE_REQ}" == "YES" ]; then
+    if [ ! "${NO_CONFIRM}" ]; then
+        user_confirm_upgrade
+        if [ $USER_CONF == No ]; then
+            SQL_ANY_SW_UPGRADE_REQ=NO
+        fi    
+    fi
+fi
+
+CLI_CONF_DIR=`$CAT ${ENIQ_CONF_DIR}/${ENIQ_ENV} | $EGREP "^[[:blank:]]*CONF_DIR="|$AWK -F\= '{print $2}'|$SED -e 's|"||g'`
+if [ ! "${CLI_CONF_DIR}" ]; then
+    _err_msg_="Could not read CONF_DIR parameter from ${ENIQ_CONF_DIR}/${ENIQ_INI}"
+    abort_script "$_err_msg_" "${EXEC_SHELL_CMD}"
+fi
+
+# Get the System User/Group. All directories are owned by this
+SYSUSER=`iniget ENIQ_INSTALL_CONFIG -f ${ENIQ_CONF_DIR}/${SUNOS_INI} -v ENIQ_SYSUSER`
+if [ ! "${SYSUSER}" ]; then
+    _err_msg_="Could not read SYSUSER param from ${ENIQ_CONF_DIR}/${SUNOS_INI}"
+    abort_script "$_err_msg_"
+fi
+
+SYSGRP=`$ID ${SYSUSER}|$AWK '{print $2}'|$AWK -F\( '{print $2}'|$AWK -F\) '{print $1}'`
+if [ ! "${SYSGRP}" ]; then
+    _err_msg_="Could not read SYSGRP param from ${ENIQ_CONF_DIR}/${SUNOS_INI}"
+    abort_script "$_err_msg_"
+fi
+
+if [ "${SQL_ANY_SW_UPGRADE_REQ}" == "YES" -o "${SQL_ANY_EBF_UPGRADE_REQ}" == "YES" ]; then
+    if [ "${SQL_ANY_SW_UPGRADE_REQ}" == "YES" ]; then
+        # Stop all ENIQ servies
+        bash ${ENIQ_ADMIN_BIN_DIR}/manage_eniq_services.bsh -a stop -s repdb,dwhdb -N
+        if [ $? -ne 0 ]; then
+        	_err_msg_="Error running ${ENIQ_ADMIN_BIN_DIR}/manage_eniq_services.bsh"
+            abort_script "$_err_msg_"
+        fi  
+
+        # Install the SW
+        ${SCRIPTHOME}/eniq_core_install.bsh -d ${BASE_SW_DIR} -n -s install_sybase_asa -u -l ${LOGFILE}
+	    if [ $? -ne 0 ]; then
+	        _err_msg_="Failed installing Sql Anywhere stage - install_sybase_asa"
+	        abort_script "$_err_msg_"
+	    fi
+        
+        # Update the SYSTEM USER profile file
+        upd_user_profile
+        
+        # Set up Sybase environment
+        setup_sybase_env
+        
+	    upgrade_database "${_out_str_}"
+	
+        _asa_ver_=`$CAT ${SYB_SQL_ANY_TGT_DIR}/${VERSION_FILE_ID}|$EGREP '^[[:blank:]]*VERSION::'|$AWK -F"::" '{print $2}'`
+        _esd_num_=`$CAT ${SYB_SQL_ANY_TGT_DIR}/${VERSION_FILE_ID}|$EGREP '^[[:blank:]]*ESD::'|$AWK -F"::" '{print $2}'`
+    fi
+
+    if [ "${SQL_ANY_EBF_UPGRADE_REQ}" == "YES" ]; then
+        # Stop all ENIQ servies
+        bash ${ENIQ_ADMIN_BIN_DIR}/manage_eniq_services.bsh -a stop -s ALL -N
+        if [ $? -ne 0 ]; then
+           abort_script "$_err_msg_"
+        fi  
+        
+        # Do I need to extract the EBF directory
+        if [ "${SQL_ANY_SW_UPGRADE_REQ}" == "NO" ]; then
+            $RM -rf ${SYB_SQL_ANY_TGT_DIR}/${EBF_DIR}
+            cd ${SYB_SQL_ANY_TGT_DIR}
+            log_msg -s "Extracting EBF directory from ${SYB_SQL_ANY_FILE}...Please Wait" -l ${LOGFILE}
+            
+            # Extract the files
+	    	$GTAR -zxf ${SYB_SQL_ANY_FILE} ${EBF_DIR}
+            if [ $? -ne 0 ]; then
+               _err_msg_="Could not extract EBF files from ${SYB_SQL_ANY_FILE}"
+               abort_script "$_err_msg_"
+            fi
+            
+            $CHOWN -Rh ${SYSUSER}:${SYSGRP} ${SYB_SQL_ANY_TGT_DIR}/${EBF_DIR} >> /dev/null 2>&1
+            cd $SCRIPTHOME
+        fi
+
+        if [ ! "${DBISQL}" -o ! "${SYBASE}" ]; then
+            # Set up Sybase environment
+            setup_sybase_env
+        fi
+
+        # Ugrade Sybase Sql Anwhere with EBF
+	sybase_sql_any_ebf_upgrade
+
+        _asa_ver_=`$CAT ${SYB_SQL_ANY_TGT_DIR}/${VERSION_FILE_ID}|$EGREP '^[[:blank:]]*VERSION::'|$AWK -F"::" '{print $2}'`
+        _esd_num_=`$CAT ${SYB_SQL_ANY_TGT_DIR}/${EBF_FILE_ID}|$EGREP '^[[:blank:]]*ESD::'|$AWK -F"::" '{print $2}'`
+        
+        # Update the version file
+        $CAT ${SYB_SQL_ANY_TGT_DIR}/${VERSION_FILE_ID}|$SED -e "s|\(.*ESD::\).*|\1${_esd_num_}|" > ${TEM_DIR}/version_file.$$
+        $CP ${TEM_DIR}/version_file.$$ ${SYB_SQL_ANY_TGT_DIR}/${VERSION_FILE_ID}
+    fi
+    log_msg -s "Successfully upgraded Sybase SQL Anywhere to ${_asa_ver_} ESD ${_esd_num_}\n" -l ${LOGFILE}
+else
+    log_msg -s "No Sybase SQL Anywhere upgrade required\n" -l ${LOGFILE}
+fi
+
+# Update dboptions
+log_msg -s "Running default ENIQ options into the database.\n"  -l ${LOGFILE}
+update_dboptions
+
+
+# Truncating the repdb transaction log and renaming from repdb.log to repdb.tran
+log_msg -s "Truncating the repdb transaction log & renaming to repdb.tran if need.\n" -l ${LOGFILE}
+bash ${ENIQ_ADMIN_BIN_DIR}/transaction_log_admin.bsh -t repdb -u -R -l ${LOGFILE} -N
+
+$RM -rf ${TEM_DIR}
+
+$RM -rf ${conn_str_enc}
+
+log_msg -t -s "Successfully executed upgrade_sybase_sql_anywhere.bsh" -l ${LOGFILE}
+
+$ECHO "Changing permission of the ${LOGFILE} to 644" | $TEE -a ${LOGFILE}
+$CHMOD 644 ${LOGFILE}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not update ${LOGFILE} file permissions to 644"
+        abort_script "$_err_msg_"
+fi
+
+exit 0

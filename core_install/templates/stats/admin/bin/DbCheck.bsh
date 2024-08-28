@@ -1,0 +1,2636 @@
+#!/usr/bin/bash
+#********************************************************************
+# Ericsson Radio Systems AB SCRIPT
+#********************************************************************
+#
+# (c) Ericsson Radio Systems AB 2022 - All rights reserved.
+#
+# The copyright to the computer program(s) herein is the property
+# of Ericsson Radio Systems AB, Sweden. The programs may be used
+# and/or copied only with the written permission from Ericsson Radio
+# Systems AB or in accordance with the terms and conditions stipulated
+# in the agreement/contract under which the program(s) have been
+# in the agreement/contract under which the program(s) have been
+# supplied.
+#
+#********************************************************************
+# Name     : DbCheck.bsh
+# Date     : 06/10/2023
+# Revision : /main/37
+# Purpose  : Objective of the package is to enable users to validate
+#            the data in their database. It is not as robust as
+#            sp_iqchekdb but is expected to take less time to execute.
+#            It only validates the catalog and the FP indexes.
+#
+#            The DBCheck script can be run to validate incremental
+#            changes as well as full database.
+#            To validate the full database use the f option
+# Usage    : DbCheck.bsh -a <db_allocation||verify_tables||iqmsg_check> [ -f ] [ -l ] [-N]
+#
+#********************************************************************
+#
+#       Command Section
+#
+#********************************************************************
+
+AWK=/usr/bin/awk
+BASENAME=/usr/bin/basename
+CAT=/usr/bin/cat
+CHMOD=/usr/bin/chmod
+CHOWN=/usr/bin/chown
+COLUMN=/usr/bin/column
+CP=/usr/bin/cp
+CUT=/usr/bin/cut
+DATE=/usr/bin/date
+DIRNAME=/usr/bin/dirname
+ECHO=/usr/bin/echo
+EGREP=/usr/bin/egrep
+ENV=/usr/bin/env
+EXPR=/usr/bin/expr
+FIND=/usr/bin/find
+GREP=/usr/bin/grep
+ID=/usr/bin/id
+LS=/usr/bin/ls
+MKDIR=/usr/bin/mkdir
+MKTEMP=/usr/bin/mktemp
+MV=/usr/bin/mv
+PERL=/usr/bin/perl
+PS=/usr/bin/ps
+RM=/usr/bin/rm
+SED=/usr/bin/sed
+SLEEP=/usr/bin/sleep
+SU=/usr/bin/su
+SUDO=/usr/bin/sudo
+SYSTEMCTL=/usr/bin/systemctl
+SSH=/usr/bin/ssh
+TAIL=/usr/bin/tail
+TEE=/usr/bin/tee
+TOUCH=/usr/bin/touch
+TR=/usr/bin/tr
+WC=/usr/bin/wc
+
+### Function: abort_script ###
+#
+# This Function will abort the script if any issues or errors.
+#
+# Arguments:
+#       none
+# Return Values:
+
+abort_script()
+{
+if [ "$1" ]; then
+    _err_msg_=$1
+else
+    _err_msg_="Script aborted.......\n"
+fi
+$ECHO "$_err_msg_"
+cd $SCRIPTHOME
+$RM -rf  ${DBCC_SNAP_FILE_INDICATOR} ${TEM_DIR}
+$RM -rf ${_connection_string_enc}
+exit 1
+}
+
+### Function: get_absolute_path ###
+#
+# Determine absolute path to software
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+get_absolute_path()
+{
+_dir_=`$DIRNAME $0`
+SCRIPTHOME=`cd $_dir_ 2>/dev/null && pwd || $ECHO $_dir_`
+}
+
+### Function: check_id ###
+#
+#   Check that the effective id of the user is correct
+#   If not print error msg and exit.
+#
+# Arguments:
+#       $1 : User ID name
+# Return Values:
+#       none
+check_id()
+{
+
+_get_id_=`$ENV |$GREP -w SUDO_USER | $EGREP "^[[:blank:]]*SUDO_USER="|$AWK -F\= '{print $2}'|$SED -e 's|"||g'`
+
+_check_id_=`$ID | $AWK -F\( '{print $2}' | $AWK -F\) '{print $1}'`
+
+_check_group_=`$ID $_get_id_ | $AWK -F\( '{print $3}' | $AWK -F\) '{print $1}'`
+
+
+    if [ "${_get_id_}" == "" ]; then
+
+        if [ "${_check_id_}" == "root" ]; then
+           # Set 1 for true
+           _user_root=1
+
+        else
+           _err_msg_="You must be root or admin to execute this script."
+           abort_script "${_err_msg_}"
+        fi
+          else
+            if [ "${_check_group_}" == "ENIQ_ADMIN_ROLE" ]; then
+               # Set 0 for false
+               _user_root=0
+
+            else
+               _err_msg_="You must be root or admin to execute this script." 
+               abort_script "${_err_msg_}"
+            fi
+    fi
+}
+
+### Function: change_all_cache ###
+#
+# Modifies the cache values in niq.ini
+#
+# Arguments:
+#       none
+# Return Values:
+#        Updated cache values in niq.ini file.
+
+change_all_cache()
+{
+# Flag is updated as changes required in niq.ini
+_cache_change_flag_=1
+_dwhdb_st_chg_flag_=0
+_conf_file_bkup_flag_=0
+
+if [ "$FULLRUN" == "YES" ]; then
+        log_msg -l ${LOGFILE} -t -s "Catalog update required. Engine will be changed to NoLoads and DWHDB will be restarted with new cache values.\n"
+        engine_profile
+        # Set engine status to NoLoads.
+        if [ "$_engine_online_flag_" -eq 1 ]; then
+                engine_change NoLoads
+                # Save engine's original profile, required later to revert
+                eng_previous_profile=$_eng_profile_
+        fi
+
+        # Stop DWHDB before updating niq.ini
+        dwhdb_action stop
+        _dwhdb_st_chg_flag_=1
+elif [ "$ACTION" == "db_allocation" ]; then
+        log_msg -l ${LOGFILE} -t -s "Catalog update required. DWHDB will be started with new cache values.\n"
+fi
+
+# Back up original conf files before updating niq.ini
+_conf_file_list_="${CLI_CONF_DIR}/${ENIQ_INI}"
+for conf_file in $_conf_file_list_
+do
+        $CP -p ${conf_file} ${conf_file}_$TIMESTAMP1 >> /dev/null 2>&1
+        if [ $? -ne 0 ]; then
+                restore_services
+                _err_msg_="Could not copy original ${conf_file}"
+                abort_script "$_err_msg_"
+        fi
+        log_msg -l ${LOGFILE} -t -s "Backed up original file ${conf_file} to ${conf_file}_$TIMESTAMP1\n"
+done
+_conf_file_bkup_flag_=1
+
+log_msg -t -s "Updating IQ caches in niq.ini\n" -l ${LOGFILE}
+log_msg -l ${LOGFILE} -q -s "Updating the ini setting with command:"
+
+log_msg -l ${LOGFILE} -q -s "${BASH} ${ENIQ_CORE_BIN_DIR}/set_core_memcache.bsh -d ${ENIQ_CONF_DIR} -m -T 45 -M 15 -L 20 -C 20 -f -l ${LOGFILE}"
+${BASH} ${ENIQ_CORE_BIN_DIR}/set_core_memcache.bsh -d ${ENIQ_CONF_DIR} -m -T 45 -M 15 -L 20 -C 20 -f -l ${LOGFILE}
+if [ $? -ne 0 ]; then
+        restore_services
+        _err_msg_="Failed to update the IQ caches in niq.ini"
+        abort_script "$_err_msg_"
+fi
+
+# Flag updated when cache values updated in niq.ini
+_cache_change_flag_=2
+
+# Get dwhdb service status
+_dwhdbstate_=`$SYSTEMCTL show -p ActiveState ${_dwhdb_service_name_} |$CUT -d= -f2`
+if [ "$_dwhdbstate_" == "" ]; then
+        restore_services
+        _err_msg_="Could not get ${_dwhdb_service_name_} current state at `$DATE`"
+        abort_script "$_err_msg_"
+fi
+
+if [ "${_dwhdbstate_}" == "inactive" ]; then
+
+        # When action=db_allocation
+                if [ "$ACTION" == "db_allocation" ]; then
+
+                    # Starting DWHDB to reflect new Catalog cache value while running db_allocation
+                    dwhdb_action start
+                    if [ "$_cache_change_flag_" -eq 2 ]; then
+                          log_msg -l ${LOGFILE} -t -s "DWHDB started successfully with new cache values\n"
+                    fi
+                    # Flag for trap is updated to 1 as DWHDB state is changed for the first time.
+                    _dwhdb_st_chg_flag_=1
+
+
+                # When FULLRUN of verify_tables
+                elif [ "$FULLRUN" == "YES" -a "$_cache_change_flag_" == 2 ]; then
+
+                    # Starting DWHDB after caches updated in niq.ini
+                    dwhdb_action start
+                    log_msg -l ${LOGFILE} -t -s "DWHDB started successfully with new cache values\n"
+                    _dwhdb_st_chg_flag_=2
+
+                    # Reverting engine profile to previous value
+                    engine_profile
+                    if [ "$_eng_profile_" != "Normal" -a "$_engine_change_flag_" == 1 ]; then
+                        engine_change $eng_previous_profile
+                    elif [ "$_engine_online_flag_" -eq 0 ]; then
+                        log_msg -l ${LOGFILE} -t -s "Engine is not online and cannot revert profile.\n"
+                    elif [ "$_engine_change_flag_" == 0 -o "$_eng_profile_" == "Normal" ]; then
+                        log_msg -l ${LOGFILE} -t -s "Engine profile was already $eng_previous_profile, no need to revert\n"
+                    fi
+
+
+                fi
+elif [ "${_dwhdbstate_}" == "active" ]; then
+
+        # When action=db_allocation
+        if [ "$ACTION" == "db_allocation" ]; then
+
+                # Restarting DWHDB to reflect new Catalog cache value while running db_allocation
+                dwhdb_action stop
+                dwhdb_action start
+                if [ "$_cache_change_flag_" -eq 2 ]; then
+                        log_msg -l ${LOGFILE} -t -s "DWHDB re-started successfully with new cache values\n"
+                fi
+                # Flag for trap is updated to 1 as DWHDB state is changed for the first time.
+                _dwhdb_st_chg_flag_=1
+
+        fi
+
+fi
+
+}
+
+### Function: checktable ###
+#
+# This function validates one table at a time from the Check_tables.txt. The sql is generated from the check_table_sql template. This sql
+# file is removed at the end of run. Thus, presence of the sql file in $TEM_DIR/CheckDb indicates running process
+#
+# Arguments:
+#       Gets the table name and the owner of the table from Check_tables.txt
+# Return Values:
+#       none
+
+checktable()
+{
+# Create temporary sql file to log tablelist
+SqlFile=`$MKTEMP ${WORKTMPDIR}/ChkTabSql.XXXXXXXX`
+if [ $? -ne 0 ]; then
+        restore_services
+        _err_msg_="Could not create ${WORKTMPDIR}/ChkTabSql.XXXXXXXX file at `$DATE`"
+        abort_script "$_err_msg_"
+else
+    $CHMOD 755 $SqlFile >> /dev/null 2>&1
+    if [ $? -ne 0 ]; then
+        restore_services
+        _err_msg_="Could not change permissions for $SqlFile file at `$DATE`"
+        abort_script "$_err_msg_"
+    fi
+fi
+
+# Log users and tables into tablelist
+user=`$ECHO $1 | $CUT -d',' -f1 | $SED "s/'//g"`
+table=`$ECHO $1 | $CUT -d',' -f2 | $SED "s/'//g"`
+check_table_sql="select now();output to '$TEM_DIR/${table}_start_time' format fixed;sp_iqcheckdb 'check table ${user}.${table}'; output to $RESULTSDIR/checktableerror_$table.log format fixed;select now();output to '$TEM_DIR/${table}_end_time' format fixed"
+$ECHO "$check_table_sql" >> $SqlFile
+if [ $? -ne 0 ]; then
+        restore_services
+        _err_msg_="Could not generate $SqlFile at `$DATE`"
+        abort_script "$_err_msg_"
+fi
+
+# Executing the SQL to check the table consistency
+$SU - $SYSUSER -c "$DBISQL @${_connection_string_enc} $SqlFile 2> $RESULTSDIR/checktableerror_$table.log 1> /dev/null" > /dev/null 2>&1
+if [ $? -ne 0 ]; then
+    $GREP -w "SQLCODE=-100" $RESULTSDIR/checktableerror_$table.log > /dev/null 2>&1
+    if [ $? -eq 0 ];then
+        if [ $_check_count -eq 2 ];then
+            log_msg -l ${LOGFILE} -t -q -s "Check table failed for - "$table". DWHDB may not be running.\n"
+            $ECHO "'${user}','${table}'" >> $RESULTSDIR/NotCheckedTables.log
+            if [ $? -ne 0 ];then
+                log_msg -l ${LOGFILE} -t -q -s "Could not log $table in $RESULTSDIR/NotCheckedTables.log file\n"
+            else
+                $SED -i "/'$table'/c\'${user}','${table}'|NA|NA|Failed to perform second level check. DWHDB may not be running" $TEM_DIR/CheckedTables_${TIMESTAMP}.log
+                if [ $? -ne 0 ];then
+                    log_msg -l ${LOGFILE} -t -q -s "Could not modifiy details for $table in $TEM_DIR/CheckedTables_${TIMESTAMP}.log\n"
+                fi
+            fi
+        else
+            $ECHO "'${user}','${table}'" >> $RESULTSDIR/SecondLevelCheckTable.log
+            $ECHO "$1|NA|NA|Performing second level check. DWHDB may not be running." >> $TEM_DIR/CheckedTables_${TIMESTAMP}.log
+            log_msg -l ${LOGFILE} -t -s "Error validating $user.$table ...DWHDB may not be running. \nPushing table into $RESULTSDIR/SecondLevelCheckTable.log and performing second level check on this table\n\n"
+        fi
+    else
+        if [ $_check_count -eq 2 ];then
+            log_msg -l ${LOGFILE} -t -q -s "Check table failed for - "$table".\n"
+            $ECHO "'${user}','${table}'" >> $RESULTSDIR/NotCheckedTables.log
+            if [ $? -ne 0 ];then
+                log_msg -l ${LOGFILE} -t -q -s "Could not log $table in $RESULTSDIR/NotCheckedTables.log file\n"
+            else
+                $SED -i "/'$table'/c\'${user}','${table}'|NA|NA|Failed to perform second level check. Kindly refer to $RESULTSDIR/NotCheckedTables.log for further details." $TEM_DIR/CheckedTables_${TIMESTAMP}.log
+                if [ $? -ne 0 ];then
+                    log_msg -l ${LOGFILE} -t -q -s "Could not modifiy details for $table in $TEM_DIR/CheckedTables_${TIMESTAMP}.log\n"
+                fi
+            fi
+        else
+            $ECHO "'${user}','${table}'" >> $RESULTSDIR/SecondLevelCheckTable.log
+            $ECHO "$1|NA|NA|Performing second level check." >> $TEM_DIR/CheckedTables_${TIMESTAMP}.log
+            log_msg -l ${LOGFILE} -t -s "Error validating $user.$table ...\nPushing table into $RESULTSDIR/SecondLevelCheckTable.log and performing second level check on this table\n\n"
+        fi
+    fi
+fi
+# Check for the errors in SqlFile
+$GREP -w "No Errors Detected" $RESULTSDIR/checktableerror_$table.log > /dev/null 2>&1
+# The table name is pushed into finished log only if not in error
+if [ $? -eq 0 ]; then
+    if [ ${_check_count} -eq 2 ]; then
+        $ECHO "$1" >> $TEM_DIR/CheckedTablesSecondLevel_${TIMESTAMP}.log
+        if [ $? -ne 0 ]; then
+            _err_msg_="Could not push $user.$table into file $TEM_DIR/CheckedTablesSecondLevel_${TIMESTAMP}.log at `$DATE`"
+            abort_script "$_err_msg_"
+        fi
+        $SED -i "/'$table'/c\'${user}','${table}'|`$CAT $TEM_DIR/${table}_start_time`|`$CAT $TEM_DIR/${table}_end_time`|No Errors Detected" $TEM_DIR/CheckedTables_${TIMESTAMP}.log
+        if [ $? -ne 0 ];then
+            log_msg -l ${LOGFILE} -t -q -s "Could not modifiy details for $table in $TEM_DIR/CheckedTables_${TIMESTAMP}.log\n"
+        fi
+    else
+        $ECHO "$1" >> $TEM_DIR/CheckedTablesFirstLevel_${TIMESTAMP}.log
+        $ECHO "$1|`$CAT $TEM_DIR/${table}_start_time`|`$CAT $TEM_DIR/${table}_end_time`|No Errors Detected" >> $TEM_DIR/CheckedTables_${TIMESTAMP}.log
+        if [ $? -ne 0 ]; then
+            restore_services
+            _err_msg_="Could not push $user.$table into file $TEM_DIR/CheckedTables_${TIMESTAMP}.log at `$DATE`"
+            abort_script "$_err_msg_"
+        fi
+    fi
+else
+    $CAT $RESULTSDIR/checktableerror_$table.log | $GREP -ivw "Inconsistent Index Count" | $GREP -iwv "Non-Completed Index Count" > $TEM_DIR/checktableerror_${table}_1.log
+    $SED -i 's/*//g' $TEM_DIR/checktableerror_${table}_1.log
+    #Checking if Inconsistent indexes are present in check table 
+        $GREP -iw "Inconsistent Index" $TEM_DIR/checktableerror_${table}_1.log > /dev/null 2>&1
+        if [ $? -eq 0 ]; then
+            $CAT $TEM_DIR/checktableerror_${table}_1.log | $GREP -iw "Inconsistent Index" | $AWK '{print $NF}' | $AWK -F "." '{print $NF}' >> $TEM_DIR/InconsistentIndex_${table}.log
+            if [ $_check_count -eq 2 ];then
+                $SED -i "/'$table'/d" $TEM_DIR/CheckedTables_${TIMESTAMP}.log
+                for _index_ in `$CAT $TEM_DIR/InconsistentIndex_${table}.log`; do
+                    $ECHO "'${user}','${table}','${_index_}'" >> $RESULTSDIR/IndexError.log
+                    $ECHO "'${user}','${table}','${_index_}'|NA|NA|Performing third level check" >> $TEM_DIR/CheckedTables_${TIMESTAMP}.log
+                    log_msg -l ${LOGFILE} -t -s "Error validating $user.$table.${_index_} ... \nPushing index into $RESULTSDIR/IndexError.log and performing third level check on this index\n\n"
+                done
+                $ECHO "$1" >> $TEM_DIR/CheckedTablesSecondLevel_${TIMESTAMP}.log
+            else
+                for _index_ in `$CAT $TEM_DIR/InconsistentIndex_${table}.log`; do
+                    $ECHO "'${user}','${table}','${_index_}'" >> $RESULTSDIR/IndexError.log
+                    $ECHO "'${user}','${table}','${_index_}'|NA|NA|Performing third level check" >> $TEM_DIR/CheckedTables_${TIMESTAMP}.log
+                    log_msg -l ${LOGFILE} -t -s "Error validating $user.$table.${_index_} ... \nPushing index into $RESULTSDIR/IndexError.log and performing third level check on this index\n\n"
+                done
+                $ECHO "$1" >> $TEM_DIR/CheckedTablesFirstLevel_${TIMESTAMP}.log
+            fi
+         else
+                #Checking if non-completed indexes are present in check table 
+                $GREP -iw "Non-Completed Index" $TEM_DIR/checktableerror_${table}_1.log > /dev/null 2>&1
+                if [ $? -eq 0 ];then
+                        if [ $_check_count -eq 2 ];then
+                                $ECHO "'${user}','${table}'" >> $RESULTSDIR/NotCheckedTables.log
+                                if [ $? -ne 0 ];then
+                                        log_msg -l ${LOGFILE} -t -q -s "Could not log $table in $RESULTSDIR/NotCheckedTables.log file\n"
+                                else
+                                        $SED -i "/'$table'/c\'${user}','${table}'|NA|NA|Failed to perform second level check. Non-Completed index found." $TEM_DIR/CheckedTables_${TIMESTAMP}.log
+                                        if [ $? -ne 0 ];then
+                                                log_msg -l ${LOGFILE} -t -q -s "Could not modifiy details for $table in $TEM_DIR/CheckedTables_${TIMESTAMP}.log\n"
+                                        fi
+                                fi
+                        else
+                                $ECHO "'${user}','${table}'" >> $RESULTSDIR/SecondLevelCheckTable.log
+                                $ECHO "$1|NA|NA|Performing second level check. Not completed index found." >> $TEM_DIR/CheckedTables_${TIMESTAMP}.log
+                                log_msg -l ${LOGFILE} -t -s "Error validating $user.$table ...Not completed indexes are present. \nPushing table into $RESULTSDIR/SecondLevelCheckTable.log and performing second level check on this table\n\n"
+                        fi
+                fi
+    fi
+fi
+
+$RM -f $RESULTSDIR/checktableerror_$table.log
+if [ -f "$RESULTSDIR/checktableerror_$table.log" ]; then
+        log_msg -l ${LOGFILE} -t -s "Unable to remove $RESULTSDIR/checktableerror_$table.log file"
+fi
+
+$RM -f $TEM_DIR/${table}_start_time $TEM_DIR/${table}_end_time
+if [ -f "$TEM_DIR/${table}_start_time" ]; then
+        log_msg -l ${LOGFILE} -t -s "Unable to remove $TEM_DIR/${table}_start_time"
+fi
+
+if [ -f "$TEM_DIR/${table}_end_time" ]; then
+        log_msg -l ${LOGFILE} -t -s "Unable to remove $TEM_DIR/${table}_end_time"
+fi
+
+# Remove SQL File
+$RM -f $SqlFile
+if [ -f "$SqlFile" ]; then
+    log_msg -l ${LOGFILE} -t -s "Could not delete $SqlFile"
+fi
+}
+
+### Function: check_user_id ###
+#
+#   Check that the effective id of the user is correct
+#   If not print error msg and exit.
+#
+# Arguments:
+#       $1 : User ID name
+# Return Values:
+#       none
+#check_user_id()
+#{
+#_check_id_=`$ID | $AWK -F\( '{print $2}' | $AWK -F\) '{print $1}'`
+#if [ "$_check_id_" != "$1" ]; then
+#    _err_msg_="You must be $1 to execute this script"
+#    abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+#fi
+#}
+
+### Function: clear_dwhdb_failed_state ###
+#
+# Clears the dwhdb database from a failed state
+#
+# Arguments:
+#       $1 = stop / start
+# Return Values:
+#       None
+#
+clear_dwhdb_failed_state ()
+{
+_dwhdb_action_="$1"
+
+log_msg -l ${LOGFILE} -t -s "Found ${_dwhdb_service_name_} in ${_dwhdbstate_} state during service ${_dwhdb_action_}. Clearing the ${_dwhdbstate_} state and attempting to ${_dwhdb_action_} the ${_dwhdb_service_name_} service."
+$SYSTEMCTL reset-failed ${_dwhdb_service_name_}
+
+_dwhdbstate_=`$SYSTEMCTL show -p ActiveState ${_dwhdb_service_name_} |$CUT -d= -f2`
+if [ "${_dwhdbstate_}" == "inactive" ]; then
+      if [ "${_dwhdb_action_}" == "start" ]; then
+              /usr/bin/bash ${ENIQ_ADMIN_BIN_DIR}/manage_eniq_services.bsh -a start -s dwhdb -N -l ${LOGFILE}
+
+              _dwhdbstate_=`$SYSTEMCTL show -p ActiveState ${_dwhdb_service_name_} |$CUT -d= -f2`   
+              if [ "${_dwhdbstate_}" != "active" ]; then
+                    restore_backup_file
+                    revert_eng_profile
+                    _err_msg_="Could not get the current state for ${_dwhdb_service_name_} or ${_dwhdb_service_name_} is still in ${_dwhdbstate_} at `$DATE`. Kindly contact Ericsson support\n"
+                    abort_script "$_err_msg_"
+              elif [ "${_dwhdbstate_}" == "active" ]; then
+                    log_msg -l ${LOGFILE} -t -s "${_dwhdb_service_name_} has started successfully\n"
+              fi
+      elif [ "${_dwhdb_action_}" == "stop" ]; then
+              log_msg -l ${LOGFILE} -t -s "${_dwhdb_service_name_} stopped successfully\n"
+      fi
+else
+      restore_backup_file
+      revert_eng_profile
+      _err_msg_="${_dwhdb_service_name_} is in ${_dwhdbstate_} state at `$DATE`. Kindly contact Ericsson support\n"
+      abort_script "$_err_msg_"
+fi
+}
+
+### Function: dballoc ###
+#
+# Validating the catalog. Running sp_iqcheck 'allocation database'
+#
+# Arguments:
+#       none
+# Return Values:
+#       DB allocation statistics
+
+dballoc()
+{
+# Set environment for this run
+setup_env
+
+# Flag updates whenever db_allocation run is aborted manually (i.e. ctrl C/D)
+_rs_dba_stg_flag_=0
+
+# Set engine status to NoLoads.
+engine_profile
+if [ "$_eng_profile_" != "NoLoads" -a "$_engine_online_flag_" == 1 ]; then
+        engine_change NoLoads
+
+        # Save engine's original profile, required later to revert
+        eng_previous_profile=$_eng_profile_
+fi
+
+# Adjust all caches.
+change_all_cache
+
+# Set engine to previous state
+        $SLEEP 10
+        engine_profile
+        if [ "$_engine_change_flag_" == 1 -a "$_eng_profile_" != "Normal" -a "$_eng_profile_" != "$eng_previous_profile" ]; then
+            log_msg -l ${LOGFILE} -t -s "Engine profile is not in previous state $eng_previous_profile. Reverting its profile.\n"
+            engine_change $eng_previous_profile
+            if [ $? -ne 0 ]; then
+                log_msg -l ${LOGFILE} -t -s "Could not revert the engine to previous state i.e. $eng_previous_profile\n"
+            fi
+        fi
+
+# Flag to confirm catalog validation completed
+_cat_valid_flag_=0
+
+# Validate the catalog.
+log_msg -l ${LOGFILE} -t -s "Started validating Catalog. It will take time depending on the number of database objects to scan.\n"
+$ECHO "sp_iqcheckdb 'allocation database'" >$TEM_DIR/checkcatalog.sql
+if [ $? -ne 0 ]; then
+    restore_services
+    _err_msg_="Error logging in file $TEM_DIR/checkcatalog.sql at `$DATE`"
+    abort_script "$_err_msg_"
+fi
+log_msg -l ${LOGFILE} -q -s "Logged the sql in $TEM_DIR/checkcatalog.sql\n"
+
+# Change permissions of checkcatalog.sql file to
+$CHMOD 755 $TEM_DIR/checkcatalog.sql >> /dev/null 2>&1
+if [ $? -ne 0 ]; then
+     log_msg -l ${LOGFILE} -s "Could not change permissions of file $TEM_DIR/checkcatalog.sql\n"
+fi
+
+# Execute the sql commands
+$SU - $SYSUSER -c "$DBISQL @${_connection_string_enc} $TEM_DIR/checkcatalog.sql" > $RESULTSDIR/CatalogCheck.log
+if [ $? -ne 0 ]; then
+    restore_services
+    _err_msg_="Error validating the catalog."
+    abort_script "$_err_msg_"
+fi
+log_msg -l ${LOGFILE} -t -s "Catalog Validation completed and result is logged in $RESULTSDIR/CatalogCheck.log\n"
+
+# Check if any errors in allocation result
+$EGREP "^\*|  Errors Detected" $RESULTSDIR/CatalogCheck.log
+
+if [ $? -eq 0 ]; then
+     log_msg -l ${LOGFILE} -s "Errors detected in allocation result.\nKindly contact Ericsson support\n"
+    _dbcc_err_flag_rollsnap_=1
+
+    # Modify the respective variables in dbcheck.env
+    err_modify_env
+
+else
+     log_msg -l ${LOGFILE} -q -s "No errors found in allocation output. Restoring original conf files\n"
+fi
+
+# Flag updated when catalog validation completed
+_cat_valid_flag_=1
+
+# Set engine status to NoLoads.
+engine_profile
+if [ "$_eng_profile_" != "NoLoads" -a "$_engine_online_flag_" == 1 ]; then
+        engine_change NoLoads
+
+        # Save engine's original profile, required later to revert
+        eng_previous_profile=$_eng_profile_
+fi
+
+# Restoring the configuration files
+restore_services
+
+# If no errors found while current run, set the status back to zero.
+if [ "$_dbcc_err_flag_rollsnap_" == 0 ]; then
+    $SED "s/db_allocation_ERR_RUN_COUNT=$OLD_ERR_RUN_COUNT/db_allocation_ERR_RUN_COUNT=0/;s/db_allocation_LASTRUN_STATE=$OLD_LASTRUN_STATE/db_allocation_LASTRUN_STATE=PASS/;s/$db_allocation_LASTRUN_TIMESTAMP/$TIMESTAMP/" < ${DBCCENV} > $temp_file
+fi
+if [ ! -s "$temp_file" ]; then
+        log_msg -l ${LOGFILE} -t -s "Failed to update the file $temp_file"
+else
+        $MV $temp_file $DBCCENV >> /dev/null 2>&1
+        if [ $? -ne 0 ]; then
+                restore_services
+                _err_msg_="Could not replace $temp_file to $DBCCENV"
+        abort_script "$_err_msg_"
+        fi
+        log_msg -l ${LOGFILE} -t -s "Modified dbcheck.env file successfully for next run\n"
+fi
+
+# Flag to update given actions (dballoc) completed
+_action_complete_flag_=1
+
+# Check for damaged index in iqmsg log on available server(s)
+iqmsg_chk
+}
+
+### Function: dbcc_exit ###
+#
+# Exits the script with restoring services whenever manually aborted i.e. Ctrl C/D
+#
+# Arguments:
+#       none
+# Return Values:
+#       None
+#
+dbcc_exit()
+{
+if [ "$ACTION" == "db_allocation" -o "$FULLRUN" == "YES" ]; then
+        if [ "$_dbcc_exit_flag_" -eq 0 ]; then
+                $ECHO "\n  *****************************************\n Ctrl-C/Ctrl-\ was hit at `$DATE`\n  *****************************************\n\n Restoring required services for this run\n" | $TEE -a ${LOGFILE}
+                _dbcc_exit_flag_=1
+
+                # Restoring services
+                if [ "$_action_complete_flag_" -eq 0 ]; then
+                        restore_services
+                        log_msg -l ${LOGFILE} -t -q -s "Ctrl-C was hit while $ACTION was in progress. Restored required services successfully"
+                elif [ "$_action_complete_flag_" -eq 1 ]; then
+                        log_msg -l ${LOGFILE} -t -q -s "Ctrl-C was hit after $ACTION completed successfully. Simply exited the script"
+
+
+
+                fi
+        else
+            $ECHO "\n***************************************\n Ctrl-C/Ctrl-\ was hit at `$DATE`\n***************************************\n\n Exiting now...\n" | $TEE -a ${LOGFILE}
+        fi
+fi
+# Removing DBCC flag indicator.
+
+    $RM -rf ${DBCC_SNAP_FILE_INDICATOR}
+    # To check the existence of {DBCC_SNAP_FILE_INDICATOR}
+    if [ -f ${DBCC_SNAP_FILE_INDICATOR} ]; then
+           log_msg -s "\nWARNING: ${DBCC_SNAP_FILE_INDICATOR} file not removed. This file must be deleted manually before proceeding further" -l ${LOGFILE}
+
+    fi
+}
+
+### Function: dwhdb_action ###
+#
+# Stops/starts the dwhdb database
+#
+# Arguments:
+#       Yes
+# Return Values:
+#       None
+#
+dwhdb_action()
+{
+# Get current dwhdb status
+_dwhdbstate_=`$SYSTEMCTL show -p ActiveState ${_dwhdb_service_name_} |$CUT -d= -f2`
+if [ "$_dwhdbstate_" == "" ]; then
+        restore_backup_file
+        revert_eng_profile
+        _err_msg_="Could not get the current state for ${_dwhdb_service_name_} at `$DATE`"
+        abort_script "$_err_msg_"
+fi
+
+#When dwhdb action is start
+if [ "$1" == "start" -a "$_dwhdb_start_flag_" == 0 ]; then
+        if [ "${_dwhdbstate_}" == "inactive" ]; then
+                /usr/bin/bash ${ENIQ_ADMIN_BIN_DIR}/manage_eniq_services.bsh -a start -s dwhdb -N -l ${LOGFILE}
+                if [ $? -ne 0 ]; then
+                        log_msg -l ${LOGFILE} -t -s "Could not start ${_dwhdb_service_name_}. Checking further\n"
+
+                        # Get current dwhdb status
+                        _dwhdbstate_=`$SYSTEMCTL show -p ActiveState ${_dwhdb_service_name_} |$CUT -d= -f2`
+
+                        if [ "${_dwhdbstate_}" == "activating" ]; then
+                                log_msg -l ${LOGFILE} -t -s "Found ${_dwhdb_service_name_} in ${_dwhdbstate_} state during service $1"
+                                log_msg -l ${LOGFILE} -t -s "Waiting for 300 seconds before checking the ${_dwhdb_service_name_} state again."
+                                $SLEEP 300
+
+                                _dwhdbstate_=`$SYSTEMCTL show -p ActiveState ${_dwhdb_service_name_} |$CUT -d= -f2`
+                                if [ "${_dwhdbstate_}" == "active" ]; then
+                                      log_msg -l ${LOGFILE} -t -s "${_dwhdb_service_name_} has started successfully\n"
+                                elif [ "${_dwhdbstate_}" == "failed" ]; then
+                                        clear_dwhdb_failed_state "$1"
+                                elif [ "${_dwhdbstate_}" != "failed" -o "${_dwhdbstate_}" != "active" ]; then
+                                      restore_backup_file
+                                      revert_eng_profile
+                                      _err_msg_="${_dwhdb_service_name_} is in ${_dwhdbstate_} state at `$DATE`. Kindly contact Ericsson support\n"
+                                      abort_script "$_err_msg_"
+                                
+                                fi
+                        fi
+                       
+                else
+                        _dwhdbstate_=`$SYSTEMCTL show -p ActiveState ${_dwhdb_service_name_} |$CUT -d= -f2`
+                        if [ "${_dwhdbstate_}" == "active" ]; then
+                                log_msg -l ${LOGFILE} -t -s "${_dwhdb_service_name_} has started successfully\n"
+                        fi
+                fi
+        else
+                if [ "$_dwhdb_start_flag_" -eq 0 ]; then
+                      _dwhdb_start_flag_=1
+                      log_msg -l ${LOGFILE} -q -t -s "${_dwhdb_service_name_} is expected to be inactive. Current state is ${_dwhdbstate_}"
+                      while [ "${_dwhdbstate_}" == "activating" ]
+                      do
+                              $SLEEP 10
+                              _dwhdbstate_=`$SYSTEMCTL show -p ActiveState ${_dwhdb_service_name_} |$CUT -d= -f2`
+                      done
+                      if [ "${_dwhdbstate_}" == "active" ]; then
+                          log_msg -l ${LOGFILE} -t -s "${_dwhdb_service_name_} is up now\n"
+                      fi
+                fi
+        fi
+
+#When dwhdb action is stop
+elif [ "$1" == "stop" ]; then
+        if [ "${_dwhdbstate_}" == "active" ]; then
+              stop_dwhdb
+        elif [ "${_dwhdbstate_}" == "activating" ]; then
+                log_msg -l ${LOGFILE} -t -s "Found ${_dwhdb_service_name_} in ${_dwhdbstate_} state during service $1"
+                log_msg -l ${LOGFILE} -t -s "Waiting for 300 seconds before checking the ${_dwhdb_service_name_} state again."
+                $SLEEP 300
+
+                _dwhdbstate_=`$SYSTEMCTL show -p ActiveState ${_dwhdb_service_name_} |$CUT -d= -f2`
+                if [ "${_dwhdbstate_}" == "failed" ]; then
+                      clear_dwhdb_failed_state "$1"
+                elif [ "${_dwhdbstate_}" == "active" ]; then
+                        stop_dwhdb
+                elif [ "${_dwhdbstate_}" != "failed" -o "${_dwhdbstate_}" != "active" ]; then
+                        revert_eng_profile
+                        _err_msg_="${_dwhdb_service_name_} is in ${_dwhdbstate_} state at `$DATE`. Kindly contact Ericsson support\n"
+                        abort_script "$_err_msg_"
+                fi
+        elif [ "${_dwhdbstate_}" == "failed" ]; then
+                clear_dwhdb_failed_state "$1"
+        elif [ "$_dwhdbstate_" == "inactive" -a "$_dwhdb_stop_flag_" == 0 ]; then
+                log_msg -l ${LOGFILE} -t -s "${_dwhdb_service_name_} is already inactive. Proceeding further"
+        fi
+fi
+}
+
+### Function: engine_profile ###
+#
+# Checking the engine state and gives engine current profile
+#
+# Arguments:
+#       none
+# Return Values:
+#       Engine current profile
+engine_profile()
+{
+# Getting engine current state from remote engine server
+if [ "${_user_root}" == 1 ]; then
+		# Execute Root command
+		_cmd_1_="$SYSTEMCTL show -p ActiveState eniq-engine |$CUT -d= -f2"
+else
+		# Execute non root admin user command	
+		_cmd_1_="$SUDO $SYSTEMCTL show -p ActiveState eniq-engine |$CUT -d= -f2"
+fi 
+_engine_ip_=`$GREP -w engine /etc/hosts | $AWK {'print $1'}`
+SERVER_IP="$_engine_ip_"
+_engine_state_=$($remote_conn_string $SERVER_IP "${_cmd_1_}")
+if [ "$_engine_state_" == "" ]; then
+        _err_msg_="Could not get eniq-engine current state from server $_engine_ip_ at `$DATE`.Restoring services\n"
+        restore_services
+        abort_script "$_err_msg_"
+fi
+
+#Getting current engine profile
+if [ "${_engine_state_}" == "active" ]; then
+        _engine_online_flag_=1
+		if [ "${_user_root}" == 1 ]; then
+				# Execute Root command
+				_cmd_2_="$SU - $SYSUSER -c \"engine \"status\" \"dcuser\"\""
+		else
+				# Execute non root admin user command	
+				_cmd_2_="$SUDO $SU - $SYSUSER -c \"engine \"status\" \"dcuser\"\""
+		fi  
+        _eng_profile_=$($remote_conn_string $SERVER_IP "${_cmd_2_} | $GREP \"Current Profile: \" | $AWK {'print \$3'}")
+        if [ "$_eng_profile_" == "" ]; then
+                restore_services
+                _err_msg_="Could not get engine current profile from server $_engine_ip_ at `$DATE`.Restoring services\n"
+                abort_script "$_err_msg_"
+        else
+                log_msg -l ${LOGFILE} -t -s "Engine current profile on server $_engine_ip_ is $_eng_profile_"
+
+                if [ "$_engine_change_flag_" == 0 -a "${_eng_profile_}" == "Normal" ]; then
+                # Save engine's original profile, required later to revert
+                eng_previous_profile=$_eng_profile_
+                fi
+        fi
+else
+        log_msg -l ${LOGFILE} -t -s "Engine on server $_engine_ip_ is not online\n"
+        _engine_online_flag_=0
+fi
+}
+
+### Function: engine_change ###
+#
+# Checking the engine state and changing it as requested
+#
+# Arguments:
+#       none
+# Return Values:
+#       Changing engine state to NoLoads
+engine_change()
+{
+if [ "${_engine_state_}" == "active" ]; then
+          if [ "$ACTION" == "db_allocation" -o "$FULLRUN" == "YES" ]; then
+                # Check the user input for engine profile
+                if [ "$1" == "NoLoads" -a "$_eng_profile_" != "NoLoads" ]; then
+                        log_msg -l ${LOGFILE} -t -s "Engine change required."
+
+                        # Change engine Profile to NoLoads on engine server
+                        if [ "${_user_root}" == 1 ]; then
+							# Execute Root command
+							_cmd_4_="$SU - $SYSUSER -c \"engine -e changeProfile 'NoLoads'\""
+
+						else
+							# Execute non root admin user command	
+							_cmd_4_="$SUDO $SU - $SYSUSER -c \"engine -e changeProfile 'NoLoads'\""
+						fi 
+                        $remote_conn_string $SERVER_IP "${_cmd_4_}" > /dev/null
+
+                        # Flag updates first time when engine state change
+                        _engine_change_flag_=1
+
+                        _eng_profile_chk_=$($remote_conn_string $SERVER_IP "${_cmd_2_} | $GREP \"Current Profile: \" | $AWK {'print \$3'}")
+                        while [ "$_eng_profile_chk_" != "NoLoads" ]
+                        do
+                                $SLEEP 5
+                                _eng_profile_chk_=$($remote_conn_string $SERVER_IP "${_cmd_2_} | $GREP \"Current Profile: \" | $AWK {'print \$3'}")
+                        done
+
+                        log_msg -l ${LOGFILE} -t -s "Engine profile on server $_engine_ip_ changed from $_eng_profile_ to NoLoads successfully."
+                        log_msg -l ${LOGFILE} -t -s "Checking execution slots status"
+
+                        # Check for execution slots until empty
+                        if [ "${_user_root}" == 1 ]; then
+								# Execute Root command
+								_cmd_3_="$SU - $SYSUSER -c \"engine -e showSetsInExecutionSlots \"slots\" \"dcuser\"\""
+						
+						else
+								# Execute non root admin user command	
+								_cmd_3_="$SUDO $SU - $SYSUSER -c \"engine -e showSetsInExecutionSlots \"slots\" \"dcuser\"\""
+						fi  
+                        exec_count=$($remote_conn_string $SERVER_IP "${_cmd_3_} |$EGREP -w '(Loader|Count)'| $WC -l")
+                        while [ $exec_count -ne 0 ]
+                        do
+                                log_msg -l ${LOGFILE} -t -q -s "Execution slot on server $_engine_ip_ is not empty, waiting until it gets empty"
+                                $SLEEP 30
+                                exec_count=$($remote_conn_string $SERVER_IP "${_cmd_3_} |$EGREP -w '(Loader|Count)'| $WC -l")
+                        done
+                        log_msg -l ${LOGFILE} -t -s "Execution slot is empty now on server $_engine_ip_.\n"
+
+                elif [ "$_engine_online_flag_" -eq 0 ]; then
+                        log_msg -l ${LOGFILE} -t -s "Engine was not online and profile was not changed.\n"
+
+                elif [ "$1" == "$eng_previous_profile" -a "$_engine_online_flag_" == 1 ]; then
+                        if [ "$_engine_change_flag_" -eq 1 -o "$_engine_change_flag_" -eq 0 ]; then
+                                log_msg -l ${LOGFILE} -t -s "Reverting engine profile on server $_engine_ip_ to previous state i.e. $eng_previous_profile\n"
+                               	if [ "${_user_root}" == 1 ]; then
+										# Execute Root command
+										_cmd_5_="$SU - $SYSUSER -c \"engine -e changeProfile '$eng_previous_profile'\""
+								else
+										# Execute non root admin user command	
+										_cmd_5_="$SUDO $SU - $SYSUSER -c \"engine -e changeProfile '$eng_previous_profile'\""
+								fi
+                                $remote_conn_string $SERVER_IP "${_cmd_5_}" > /dev/null
+
+                        elif [ "$_verify_complete_flag_" == 1 -o "$_cat_valid_flag_" == 1 -a "$_engine_change_flag_" == 2 ]; then
+                                log_msg -l ${LOGFILE} -t -s "$ACTION is completed. Reverting the engine profile on server $_engine_ip_ to previous state i.e. $eng_previous_profile\n"
+                                if [ "${_user_root}" == 1 ]; then
+										# Execute Root command
+										_cmd_6_="$SU - $SYSUSER -c \"engine -e changeProfile '$eng_previous_profile'\""
+								else
+										# Execute non root admin user command	
+										_cmd_6_="$SUDO $SU - $SYSUSER -c \"engine -e changeProfile '$eng_previous_profile'\""
+								fi 
+                                $remote_conn_string $SERVER_IP "${_cmd_6_}" > /dev/null
+                        else
+                                restore_services
+                                _err_msg_="Script aborted at `$DATE`. Reverted the engine profile on server $_engine_ip_ to previous state i.e. $eng_previous_profile"
+                                abort_script "$_err_msg_"
+                        fi
+                        log_msg -l ${LOGFILE} -t -s "Engine on server $_engine_ip_ is set back to ${eng_previous_profile}\n"
+                        _engine_change_flag_=2
+                elif [ "$1" == "NoLoads" -a "$_eng_profile_" == "NoLoads" ]; then
+
+                        # Engine already in NoLoads
+                        _no_engine_change_="yes"
+                        log_msg -l ${LOGFILE} -t -s "Engine profile on server $_engine_ip_ is already $_eng_profile_, change not required"
+                        _engine_change_flag_=0
+                fi
+        fi
+fi
+}
+
+### Function: err_modify_env() ###
+#
+# Modify the dbcheck.env file with respective to action performed.
+#
+# Arguments:
+#       None
+# Return Values:
+#       Respective variables are modified in dbcheck.env file
+
+err_modify_env()
+{
+# Updating variables in dbcheck.env when errors reported while Action was performed and rolling snapshot should be disabled if state is fail.
+_lastrun_status_=`$GREP -w ${ACTION}_LASTRUN_STATE ${DBCCENV} | $AWK -F\\= '{print $2}'`
+if [ "$_lastrun_status_" == "" ]; then
+    restore_services
+    _err_msg_="ERROR: Could not read ${ACTION} previous run state from ${DBCCENV}. Exiting ... "
+        abort_script "$_err_msg_"
+
+# When last run was pass , change to fail
+elif [ "$_lastrun_status_" == "PASS" ]; then
+
+    # Modifying environment when failed after "pass" state.
+    if [ "$ACTION" == "verify_tables" ]; then
+            $SED "s/RUNNUMBER=$RUNNUMBER/RUNNUMBER=$OLD_RUNNUMBER/;s/$LASTDBCHECK/$runstart/;s/${ACTION}_LASTRUN_STATE=$OLD_LASTRUN_STATE/${ACTION}_LASTRUN_STATE=FAIL/;s/${ACTION}_LASTRUN_TIMESTAMP=$OLD_LASTRUN_TIMESTAMP/${ACTION}_LASTRUN_TIMESTAMP=$TIMESTAMP1/;s/${ACTION}_ERR_RUN_COUNT=$OLD_ERR_RUN_COUNT/${ACTION}_ERR_RUN_COUNT=1/" < ${DBCCENV} > $temp_file
+    elif [ "$ACTION" == "db_allocation" ]; then
+    $SED "s/${ACTION}_LASTRUN_STATE=$OLD_LASTRUN_STATE/${ACTION}_LASTRUN_STATE=FAIL/;s/${ACTION}_LASTRUN_TIMESTAMP=$OLD_LASTRUN_TIMESTAMP/${ACTION}_LASTRUN_TIMESTAMP=$TIMESTAMP/;s/${ACTION}_ERR_RUN_COUNT=$OLD_ERR_RUN_COUNT/${ACTION}_ERR_RUN_COUNT=1/" < ${DBCCENV} > $temp_file
+
+    else
+        $SED "s/IQMSG_LASTCHKDT=$OLD_IQMSG_LASTCHKDT/IQMSG_LASTCHKDT=$_runstart_iqmsg_/;s/IQMSG_LASTCHK_FULLDT=$OLD_IQMSG_LASTCHK_FULLDT/IQMSG_LASTCHK_FULLDT=$_runstart_iqmsg_fulldt_/;s/${ACTION}_LASTRUN_STATE=$OLD_LASTRUN_STATE/${ACTION}_LASTRUN_STATE=FAIL/;s/${ACTION}_LASTRUN_TIMESTAMP=$OLD_LASTRUN_TIMESTAMP/${ACTION}_LASTRUN_TIMESTAMP=$TIMESTAMP/;s/${ACTION}_ERR_RUN_COUNT=$OLD_ERR_RUN_COUNT/${ACTION}_ERR_RUN_COUNT=1/" < ${DBCCENV} > $temp_file
+    fi
+# When last run was fail and current run also failed.
+elif [ "$_lastrun_status_" == "FAIL" ]; then
+
+    #How old is this error, reported by Action of DbCheck.bsh
+    NEW_ERR_RUN_COUNT=`$EXPR $OLD_ERR_RUN_COUNT + 1`
+         log_msg -l ${LOGFILE} -t -s "\nALERT: ${ACTION} status is already FAIL and that error was reported $NEW_ERR_RUN_COUNT run(s) back, dated $OLD_LASTRUN_TIMESTAMP\n"
+
+    # Modifying environment when status is already FAIL.
+           if [ "$ACTION" == "verify_tables" ]; then
+            $SED "s/RUNNUMBER=$RUNNUMBER/RUNNUMBER=$OLD_RUNNUMBER/;s/$LASTDBCHECK/$runstart/;s/${ACTION}_ERR_RUN_COUNT=$OLD_ERR_RUN_COUNT/${ACTION}_ERR_RUN_COUNT=$NEW_ERR_RUN_COUNT/" < ${DBCCENV} > $temp_file
+        elif [ "$ACTION" == "db_allocation" ]; then
+            $SED "s/${ACTION}_ERR_RUN_COUNT=$OLD_ERR_RUN_COUNT/${ACTION}_ERR_RUN_COUNT=$NEW_ERR_RUN_COUNT/" < ${DBCCENV} > $temp_file
+        else
+            $SED "s/IQMSG_LASTCHKDT=$OLD_IQMSG_LASTCHKDT/IQMSG_LASTCHKDT=$_runstart_iqmsg_/;s/IQMSG_LASTCHK_FULLDT=$OLD_IQMSG_LASTCHK_FULLDT/IQMSG_LASTCHK_FULLDT=$_runstart_iqmsg_fulldt_/;s/${ACTION}_ERR_RUN_COUNT=$OLD_ERR_RUN_COUNT/${ACTION}_ERR_RUN_COUNT=$NEW_ERR_RUN_COUNT/" < ${DBCCENV} > $temp_file
+    fi
+fi
+}
+
+### Function: excludeindex ###
+#
+# This function excludes the index from the $RESULTSDIR/IndexError.log file if the same is present
+# in the $RESULTSDIR/NotVerifiedIndex.log or if there are no errors after performing a third level check
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+excludeindex()
+{
+$SED /${_index_name_}/d $RESULTSDIR/IndexError.log  >/$RESULTSDIR/IndexError_tmp.log
+if [ $? -ne 0 ]; then
+        restore_services
+        _err_msg_="Could not replace ${_index_name_} from $RESULTSDIR/IndexError.log file at `$DATE`"
+        abort_script "$_err_msg_"
+fi
+
+$MV $RESULTSDIR/IndexError_tmp.log $RESULTSDIR/IndexError.log >> /dev/null 2>&1
+if [ $? -ne 0 ]; then
+        restore_services
+        _err_msg_="Could not move $RESULTSDIR/IndexError_tmp.log to $RESULTSDIR/IndexError.log at `$DATE`"
+        abort_script "$_err_msg_"
+fi
+}
+
+### Function: gettablist ###
+#
+# Get the list of tables modified since last complete check or if run with -f option gets the list of all dc tables in the database.
+#
+# Arguments:
+#       -f
+# Return Values:
+#       list of tables to be checked
+
+gettablist()
+{
+# In case of full run.
+if  [ "$FULLRUN" == "YES" ];  then
+        $ECHO "select  c.user_name, a.table_name from systab a , sysiqtab b, sysuser c , systable d where a.table_id= b.table_id and a.table_id=d.table_id and c.user_id = a.creator and d.table_type = 'BASE' order by b.update_time; output to '${ENIQ_ADMIN_DIR}/sql/Check_tables.txt';"> $TEM_DIR/extr_tabs.sql
+        log_msg -l ${LOGFILE} -t -s "Performing fullrun\n"
+else
+      $ECHO "IF (select count (*) from sysserver where srvname like 'remote_repdb') = 0
+BEGIN
+create server remote_repdb class 'asaodbc' using 'Driver=libdbodbc16_r.so;CommLinks=tcpip(host=repdb:2641);ServerName=repdb'
+END;
+
+IF (select count(*) from systab where table_name like 'repdb_DWHPartition') = 0
+BEGIN
+create existing table dc.repdb_DWHPartition at 'remote_repdb.repdb.dwhrep.DWHPartition'
+END;
+
+select c.user_name, a.table_name from systab a , sysiqtab b, sysuser c , systable d where a.table_id = b.table_id and a.table_id=d.table_id and b.update_time > '"${LASTDBCHECK}"' and c.user_id = a.creator and d.table_type = 'BASE' and  a.table_name  not like 'LOG|_%' escape '|'
+union all
+select 'dc',TABLENAME FROM dc.repdb_DWHPartition where tablename like 'LOG|_%' escape '|' and ( endtime > today()-3 and starttime <= today() or endtime is null ) ># ${ENIQ_ADMIN_DIR}/sql/Check_tables.txt
+
+IF (select count (*) from systab where table_name like 'repdb_DWHPartition') = 1
+BEGIN
+drop table dc.repdb_DWHPartition
+END;
+
+IF (select count (*) from sysserver where srvname like 'remote_repdb') = 1
+BEGIN
+drop server remote_repdb
+END;"> $TEM_DIR/extr_tabs.sql
+fi
+
+# Change permissions of extr_tabs.sql file to
+$CHMOD 755 $TEM_DIR/extr_tabs.sql >> /dev/null 2>&1
+if [ $? -ne 0 ]; then
+     log_msg -l ${LOGFILE} -s "Could not change permissions of file $TEM_DIR/extr_tabs.sql\n"
+fi
+
+$SU - $SYSUSER -c "$DBISQL @${_connection_string_enc}  $TEM_DIR/extr_tabs.sql > /dev/null"
+if [ $? -ne 0 ]; then
+        restore_services
+        _err_msg_="Error logging on to DWHDB database to get table list and output it"
+        abort_script "$_err_msg_"
+fi
+
+if [ "$FULLRUN" != "YES" ];  then
+    if [ -f "$RESULTSDIR/NotCheckedTables.log" ]; then
+        _last_run_not_checked_table_count_=`$CAT $RESULTSDIR/NotCheckedTables.log | $GREP -w 'dc'| $WC -l`
+        if [ ${_last_run_not_checked_table_count_} -gt 0 ]; then
+            log_msg -l ${LOGFILE} -t -s "The below ${_last_run_not_checked_table_count_} table(s) from the last run have not been checked. The same will be checked in this run.\n"
+            $CAT $RESULTSDIR/NotCheckedTables.log | $TEE -a ${LOGFILE}
+            for _not_checked_table_ in `$CAT $RESULTSDIR/NotCheckedTables.log`;
+            do
+                $GREP -w "${_not_checked_table_}" $RESULTSDIR/NotCheckedTables.log >> /dev/null 2>&1
+                if [ $? -eq 0 ]; then
+                    $ECHO "${_not_checked_table_}" >> ${ENIQ_ADMIN_DIR}/sql/Check_tables.txt
+                    if [ $? -ne 0 ]; then
+                        restore_services
+                        _err_msg_="Failed to add not checked table(s) to the table list to be checked"
+                        abort_script "$_err_msg_"
+                    fi
+                fi
+            done
+        fi
+    fi
+
+    if [ -f "$RESULTSDIR/IndexError.log" ]; then
+        $CAT $RESULTSDIR/IndexError.log | $CUT -d ',' -f1,2 --output-delimiter=',' | sort | uniq > $TEM_DIR/LastRunTableError.log
+        _last_run_error_table_count_=`$CAT $TEM_DIR/LastRunTableError.log | $WC -l`
+        if [ ${_last_run_error_table_count_} -gt 1 ]; then
+            log_msg -l ${LOGFILE} -t -s "The below table(s) have detected errors in last run. The same will be checked in this run."
+            $CAT ${TEM_DIR}/LastRunTableError.log | $TEE -a ${LOGFILE}
+            for _error_table_ in `< $TEM_DIR/LastRunTableError.log`;
+            do
+                $GREP -w "${_error_table_}" $TEM_DIR/LastRunTableError.log >> /dev/null 2>&1
+                if [ $? -eq 0 ]; then
+                    $ECHO "${_error_table_}" >> ${ENIQ_ADMIN_DIR}/sql/Check_tables.txt
+                    if [ $? -ne 0 ]; then
+                        restore_services
+                        _err_msg_="Failed to add error table(s) to the table list to be checked"
+                        abort_script "$_err_msg_"
+                    fi
+                fi
+            done
+        fi
+    fi
+fi
+}
+
+### Function: iqmsg_chk() ###
+#
+#Runs a command on a remote sever and returns the damaged index msg,if any, in iqmsg log from the command
+#
+# Arguments:
+#
+# Return Values:
+#      : Return value from the command
+iqmsg_chk()
+{
+if [ "$ACTION" == "iqmsg_check" ]; then
+        setup_env
+fi
+
+# Set below variables when action is verify_tables
+ACTION=iqmsg_check
+temp_file=$TEM_DIR/tempf4
+OLD_LASTRUN_STATE=$iqmsg_check_LASTRUN_STATE
+OLD_LASTRUN_TIMESTAMP=$iqmsg_check_LASTRUN_TIMESTAMP
+OLD_ERR_RUN_COUNT=$iqmsg_check_ERR_RUN_COUNT
+
+log_msg -l ${LOGFILE} -t -s "Checking iqmsg logfiles for damaged index msgs on server(s)\n"
+
+# Get an ordered list of servers based on the server_list file
+$PERL ${ENIQ_CORE_INST_DIR}/lib/get_ip_order.pl -f ${TEM_DIR}/service_order
+if [ $? -ne 0 ]; then
+        _err_msg_="Could not get an ordered list of servers at `$DATE`"
+        abort_script "$_err_msg_"
+fi
+
+# To check installed type. If single or multi server
+CURR_SERVER_TYPE=`$CAT $ENIQ_CONF_DIR/installed_server_type`
+if [ $? -ne 0 ]; then
+        _err_msg_="Could not read installed server type at `$DATE`"
+        abort_script "$_err_msg_"
+fi
+
+# Checking blade type, if rack or blade installation
+_blade_type_=`$GREP -w STORAGE_TYPE $ENIQ_CONF_DIR/san_details | $AWK -F"=" '{print $2}'`
+if [ "$_blade_type_" == "" ]; then
+        log_msg -l ${LOGFILE} -q -s "Could not read blade type\n"
+fi
+if [ "${CURR_SERVER_TYPE}" == "eniq_stats" ]; then
+        if [ "$_blade_type_" == "fs" ]; then
+                log_msg -l ${LOGFILE} -s "This is a RACK server. Will check iqmsg files on local server \n"
+        elif [ "$_blade_type_" == "raw" ]; then
+                log_msg -l ${LOGFILE} -s "This is a Blade installation. Will check iqmsg files on local server \n"
+        fi
+        if [ "${_ip_type_}" == "IPv4" ]; then
+			$CAT ${TEM_DIR}/service_order | $AWK -F\:: '{print $1}' > ${TEM_DIR}/IQ_node_list
+		fi
+		
+		if [ "${_ip_type_}" == "IPv6" ]; then
+			 > ${TEM_DIR}/IQ_node_list
+			for _line_ in `$CAT ${TEM_DIR}/service_order`; do
+				unset _ip_address_ _count_
+		
+				local _count_=`$ECHO "${_line_}" | grep -o "::" | wc -l`
+
+				if [ "${_count_}" == 3 ]; then
+					local _ip_address_=`$ECHO ${_line_} | grep -oE '([a-fA-F0-9]{1,4}::?){1,7}[a-fA-F0-9]{1,4}' | head -n 1 | awk -F "::" '{ print $1 "::" $2}'`
+				else
+					local _ip_address_=`$ECHO ${_line_} | $AWK -F\:: '{print $1}'`
+				fi
+				
+				$ECHO "${_ip_address_}" >> ${TEM_DIR}/IQ_node_list
+			done	
+		fi
+        if [ $? -ne 0 ]; then
+                _err_msg_="Could not get IP of coordiantor server from IQ node list"
+                abort_script "$_err_msg_"
+        fi
+
+# Run remote commands if multi-server
+elif [ "$CURR_SERVER_TYPE" == "stats_coordinator" ]; then
+        log_msg -l ${LOGFILE} -s "This is a Multi-Server installation. Will check iqmsg files on all IQ nodes.\n"
+
+        # Get IQ node's IP(s) from service order file
+        if [ "${_ip_type_}" == "IPv4" ]; then
+			$EGREP "reader|iqr|coordinator|eniq_stats" ${TEM_DIR}/service_order | $AWK -F\:: '{print $1}' > ${TEM_DIR}/IQ_node_list
+		fi
+		
+		if [ "${_ip_type_}" == "IPv6" ]; then
+			 > ${TEM_DIR}/IQ_node_list
+			for _line_ in `$CAT ${TEM_DIR}/service_order | $EGREP "reader|iqr|coordinator|eniq_stats"`; do
+				unset _ip_address_ _count_
+		
+				local _count_=`$ECHO "${_line_}" | grep -o "::" | wc -l`
+
+				if [ "${_count_}" == 3 ]; then
+					local _ip_address_=`$ECHO ${_line_} | grep -oE '([a-fA-F0-9]{1,4}::?){1,7}[a-fA-F0-9]{1,4}' | head -n 1 | awk -F "::" '{ print $1 "::" $2}'`
+				else
+					local _ip_address_=`$ECHO ${_line_} | $AWK -F\:: '{print $1}'`
+				fi
+				
+				$ECHO "${_ip_address_}" >> ${TEM_DIR}/IQ_node_list
+			done
+		fi
+        if [ $? -ne 0 ]; then
+                _err_msg_="Could not get the IQ node's list from service_order"
+                abort_script "$_err_msg_"
+        fi
+        log_msg -l ${LOGFILE} -s "The IQ nodes to check are \n`$CAT ${TEM_DIR}/IQ_node_list`\n\nProceeding with damaged index msg check on servers one by one"
+else
+        _err_msg_="`$DATE` : Matching value for installed server type not found!"
+        abort_script "$_err_msg_"
+fi
+
+# Get coordinator IP from service order file
+count_co=`$EGREP "coordinator|eniq_stats" ${TEM_DIR}/service_order | grep -o "::" | wc -l`
+
+if [ "${_ip_type_}" == "IPv6" -a "${count_co}" == 3 ]; then
+	_coord_srv_=`$EGREP "coordinator|eniq_stats" ${TEM_DIR}/service_order | grep -oE '([a-fA-F0-9]{1,4}::?){1,7}[a-fA-F0-9]{1,4}' | head -n 1 | awk -F "::" '{ print $1 "::" $2}'`
+else
+	_coord_srv_=`$EGREP "coordinator|eniq_stats" ${TEM_DIR}/service_order | $AWK -F\:: '{print $1}'`
+fi
+if [ $? -ne 0 ]; then
+        _err_msg_="`$DATE` : Could not get IP of coordinator server from service order file"
+        abort_script "$_err_msg_"
+fi
+
+# Read for damaged index msg. in iqmsg log file on IQ node(s)
+for _iq_node_ in `$CAT ${TEM_DIR}/IQ_node_list`;
+do
+        # Flag to check if coord server than run commands locally
+        _coord_srv_flag_=0
+
+        # Initialize the iqmsg files list
+        > ${TEM_DIR}/iqmsg_files_list
+
+        # Get iqmsg file list from coordinator server.
+        if [ "$_coord_srv_" == "$_iq_node_" ]; then
+
+                # Flag updates is iq_node is corodiantor server IP
+                _coord_srv_flag_=1
+                log_msg -l ${LOGFILE} -s "\n$_iq_node_ is coordinator server type."
+
+                # Check if multiple iqmsg logs present on cordinator server under log and local_log folders
+                $LS -1 $ENIQ_ARCHIEVE_IQMSG_PATH/*iqmsg* 1> ${TEM_DIR}/iqmsg_files_list 2> /dev/null
+                if [ $? -ne 0 ]; then
+                    log_msg -l ${LOGFILE} -t -s "Could not list iqmsg logs or they are not present under folder $ENIQ_ARCHIEVE_IQMSG_PATH!"
+                fi
+
+                $LS -1 $ENIQ_IQMSG_PATH/dwh*.iqmsg* >> ${TEM_DIR}/iqmsg_files_list
+                if [ $? -ne 0 ]; then
+                        log_msg -l ${LOGFILE} -t -s "Could not list iqmsg logs or they are not present under folder $ENIQ_IQMSG_PATH!"
+                fi
+        else
+                SERVER_IP="$_iq_node_"
+
+                # List the iqmsg file(s)
+                if [ "${_user_root}" == 1 ]; then
+					# Execute Root command
+					$remote_conn_string $SERVER_IP "$LS -1 $ENIQ_IQMSG_PATH/dwh*.iqmsg*" >> ${TEM_DIR}/iqmsg_files_list
+			
+				else
+					# Execute non root admin user command	
+					$remote_conn_string $SERVER_IP "$SUDO $LS -1 $ENIQ_IQMSG_PATH/dwh*.iqmsg*" >> ${TEM_DIR}/iqmsg_files_list
+				fi 
+                if [ $? -ne 0 ]; then
+                        log_msg -l ${LOGFILE} -t -s "Could not list iqmsg logs or they are not present under folder $ENIQ_IQMSG_PATH!"
+                fi
+                log_msg -l ${LOGFILE} -s "\n$_iq_node_ is reader server."
+        fi
+
+        # Check the previous state of iqmsg log check.
+        if [ "$IQMSG_LASTCHKDT" -eq 0 ]; then
+                log_msg -l ${LOGFILE} -s "This is first time the iqmsg log is being checked for damaged index msg\n"
+        else
+                log_msg -l ${LOGFILE} -s "Last time iqmsg log for damaged index was checked on $IQMSG_LASTCHK_FULLDT Hrs.\nNow it will check for damaged index msg after $IQMSG_LASTCHK_FULLDT Hrs"
+        fi
+
+        _multi_iqmsg_count_=`$WC -l ${TEM_DIR}/iqmsg_files_list | $AWK '{print $1}'`
+        if [ $? -ne 0 ]; then
+                _err_msg_="Could not get the count of iqmsg files"
+                abort_script "$_err_msg_"
+        elif [[ "${_multi_iqmsg_count_}" =~ ^[0-9]+$ ]] ; then
+                        if [ "${_multi_iqmsg_count_}" -eq 1 ]; then
+                                log_msg -l ${LOGFILE} -s "There is only $_multi_iqmsg_count_ iqmsg file on server, listed below"
+                        else
+                                log_msg -l ${LOGFILE} -s "There are total $_multi_iqmsg_count_ iqmsg files on server, listed below"
+                        fi
+        else
+                _err_msg_="Could not get the count of iqmsg files"
+                abort_script "$_err_msg_"
+        fi
+        log_msg -l ${LOGFILE} -s "\n`$CAT ${TEM_DIR}/iqmsg_files_list`\n"
+
+        if [ "$_multi_iqmsg_count_" -gt 0 ]; then
+                log_msg -l ${LOGFILE} -t -s "Checking for damaged index in all available iqmsg logs"
+
+                for _iqmsg_file_ in `$CAT ${TEM_DIR}/iqmsg_files_list`;
+                do
+                        _search_string_="You may have a damaged index"
+
+                        # initialize damage_msg_file file
+                        > $TEM_DIR/damage_msg_file
+
+                        $CHMOD 755 $TEM_DIR/damage_msg_file >> /dev/null 2>&1
+                        if [ $? -ne 0 ];then
+                                log_msg -l ${LOGFILE} -t -s "Could not change the permission of $TEM_DIR/damage_msg_file file to 755"
+                        else
+                                log_msg -l ${LOGFILE} -q -s "Successfully changed permissions of $TEM_DIR/damage_msg_file file to 755"
+                        fi
+
+                        # Get the damaged index msg file, if present, in iqmsg log.
+                        if [ "$_coord_srv_flag_" -eq 1 ]; then
+
+                                # Changing iqmsg file permissions to 755
+                                $CHMOD 755 $_iqmsg_file_ >> /dev/null 2>&1
+                                if [ $? -ne 0 ];then
+                                        log_msg -l ${LOGFILE} -t -s "Could not change the permission of $_iqmsg_file_ file to 755"
+                                else
+                                        log_msg -l ${LOGFILE} -q -s "Successfully changed permissions of $_iqmsg_file_ file to 755"
+                                fi
+
+                                # Checking if damaged index msg in iqmsg log
+                                $GREP -w "$_search_string_" $_iqmsg_file_ > $TEM_DIR/damage_msg_file
+                                 if [ $? -gt 1  ]; then
+                                        log_msg -l ${LOGFILE} -t -s "Could not read the damaged index msg in file $_iqmsg_file_"
+                                fi
+
+                                # Revert the file permissions of iqmsg log to 640
+                                $CHMOD 640 $_iqmsg_file_ >> /dev/null 2>&1
+                                if [ $? -ne 0 ]; then
+                                        log_msg -l ${LOGFILE} -t -s "Could not revert the permission of $_iqmsg_file_ file to 640"
+                                else
+                                        log_msg -l ${LOGFILE} -q -s "Successfully reverted permissions of $_iqmsg_file_ file to 640"
+                                fi
+
+                        else
+                                # Changing iqmsg file permissions to 755
+                                if [ "${_user_root}" == 1 ]; then
+										# Execute Root command
+										$remote_conn_string $SERVER_IP "$CHMOD 755 $_iqmsg_file_"
+								else
+										# Execute non root admin user command	
+										$remote_conn_string $SERVER_IP "$SUDO $CHMOD 755 $_iqmsg_file_"
+								fi 
+                                if [ $? -ne 0 ];then
+                                        log_msg -l ${LOGFILE} -t -s "Could not change the permission of $_iqmsg_file_ file to 755"
+                                else
+                                        log_msg -l ${LOGFILE} -q -s "Successfully changed permissions of $_iqmsg_file_ file to 755"
+                                fi
+                                if [ "${_user_root}" == 1 ]; then
+										# Execute Root command
+										$remote_conn_string $SERVER_IP "$GREP \"$_search_string_\" $_iqmsg_file_" > $TEM_DIR/damage_msg_file
+								
+								else
+										# Execute non root admin user command	
+										$remote_conn_string $SERVER_IP "$SUDO $GREP \"$_search_string_\" $_iqmsg_file_" > $TEM_DIR/damage_msg_file
+								fi
+                                if [ $? -gt 1 ]; then
+                                        log_msg -l ${LOGFILE} -q -s "Could not read the damaged index msg in file $_iqmsg_file_"
+                                fi
+
+                                # Revert the file permissions of iqmsg log to 640
+                                if [ "${_user_root}" == 1 ]; then
+										# Execute Root command
+										$remote_conn_string $SERVER_IP "$CHMOD 640 $_iqmsg_file_"
+								else
+										# Execute non root admin user command	
+										$remote_conn_string $SERVER_IP "$SUDO $CHMOD 640 $_iqmsg_file_"
+								fi 
+                                if [ $? -ne 0 ]; then
+                                        log_msg -l ${LOGFILE} -s "Could not revert the permission of $_iqmsg_file_ file to 640"
+                                else
+                                        log_msg -l ${LOGFILE} -q -s "Successfully reverted permissions of $_iqmsg_file_ file to 640"
+                                fi
+                        fi
+
+                        # Get the number of damaged index msgs from iqmsg log.
+                        _iqmsg_status_=` $WC -l $TEM_DIR/damage_msg_file | $AWK '{print $1}'`
+
+                        # If no damaged index msg found then revert the iqmsg file permissions and abort
+                        if [ "$_iqmsg_status_" == "" ]; then
+                                log_msg -l ${LOGFILE} -s "Could not get the count of damaged index msg in file $_iqmsg_file_"
+                        fi
+
+                        # If iqmsg_status is greater than 0 then check for timestamp of msg. and list all.
+                        if [[ "${_iqmsg_status_}" =~ ^[1-9]+$ ]]; then
+                                log_msg -l ${LOGFILE} -t -s "There are damaged index msgs in file $_iqmsg_file_ and count is $_iqmsg_status_ "
+
+                                # Get the timestamp from iqmsg file for damanged index msg.
+                                _iqmsg_fulldt_=`$CAT $TEM_DIR/damage_msg_file | $AWK '{print $2,$3}'`
+                                if [ "$_iqmsg_fulldt_" == "" ]; then
+                                        log_msg -l ${LOGFILE} -t -s "Could not get the date from iqmsg log $_iqmsg_file_ file"
+                                else
+                                        log_msg -l ${LOGFILE} -q -s "The timestamp for damaged index msgs is/are \n$_iqmsg_fulldt_"
+                                fi
+
+                                # Convert the date format from iqmsg so as to compare it with last iqmsg check
+                                _iqmsg_date_=$($ECHO ${_iqmsg_fulldt_:(-15)} | tr -d '/ :.')
+                                _iqmsg_latest_fulldt_=$($ECHO ${_iqmsg_fulldt_:(-15)})
+                                if [ "$_iqmsg_date_" == "" ]; then
+                                        log_msg -l ${LOGFILE} -t -s "Could not evaluate the date"
+                                else
+                                        log_msg -q -l ${LOGFILE} -s "The latest timestamp of damaged index msgs is ${_iqmsg_latest_fulldt_}"
+                                fi
+
+                                   # Modify environment file after checking iqmsg log
+                                OLD_IQMSG_LASTCHKDT=$IQMSG_LASTCHKDT
+                                OLD_IQMSG_LASTCHK_FULLDT=$IQMSG_LASTCHK_FULLDT
+
+                                # if timestamp of iqmsg is greater than last iqmsg check, then need to contact support team.
+                                if [ "$_iqmsg_date_" -gt "$IQMSG_LASTCHKDT" ]; then
+                                    log_msg -l ${LOGFILE} -t -s "ERROR: Damaged index msg found in $_iqmsg_file_ on server $_iq_node_!\nKindly contact Ericsson support\n"
+                                    _dbcc_err_flag_rollsnap_=2
+
+                                    # Modify the respective variables in dbcheck.env
+                                    err_modify_env
+
+                                # if timestamp of iqmsg is less than last iqmsg check, then its older msg. and already addressed.
+                                elif [ "$_iqmsg_date_" -lt "$IQMSG_LASTCHKDT" ]; then
+                                        log_msg -l ${LOGFILE} -t -s "No damage index msgs after timestamp $_runstart_iqmsg_fulldt_ in $_iqmsg_file_ on server $_iq_node_\n"
+                                fi
+                        elif [ "$_iqmsg_status_" -eq 0 ]; then
+                                log_msg -l ${LOGFILE} -t -s "No damaged index errors found in $_iqmsg_file_ on server $_iq_node_\n"
+                        fi
+                done
+        else
+            log_msg -l ${LOGFILE} -t -s "iqmsg log not found on server $_iq_node_ ! \n"
+        fi
+done
+
+# If no errors found while current run, set the status back to zero.
+if [ "$_dbcc_err_flag_rollsnap_" -lt 2 ]; then
+
+$SED "s/IQMSG_LASTCHKDT=$IQMSG_LASTCHKDT/IQMSG_LASTCHKDT=$_runstart_iqmsg_/;s/IQMSG_LASTCHK_FULLDT=$IQMSG_LASTCHK_FULLDT/IQMSG_LASTCHK_FULLDT=$_runstart_iqmsg_fulldt_/;s/iqmsg_check_ERR_RUN_COUNT=$OLD_ERR_RUN_COUNT/iqmsg_check_ERR_RUN_COUNT=0/;s/iqmsg_check_LASTRUN_STATE=$OLD_LASTRUN_STATE/iqmsg_check_LASTRUN_STATE=PASS/;s/$OLD_LASTRUN_TIMESTAMP/$_runstart_iqmsg_fulldt_/" < ${DBCCENV} > $temp_file
+fi
+if [ ! -s "$temp_file" ]; then
+        log_msg -l ${LOGFILE} -t -s "Failed to update the file $temp_file"
+else
+        $MV $temp_file $DBCCENV >> /dev/null 2>&1
+        if [ $? -ne 0 ]; then
+                _err_msg_="Could not replace $temp_file to $DBCCENV"
+                abort_script "$_err_msg_"
+        fi
+        log_msg -l ${LOGFILE} -t -s "Modified dbcheck.env file successfully for next run of iqmsg_check\n"
+fi
+
+# Removing DBCC flag indicator.
+
+    $RM -rf ${DBCC_SNAP_FILE_INDICATOR}
+    # To check the existence of {DBCC_SNAP_FILE_INDICATOR}
+    if [ -f ${DBCC_SNAP_FILE_INDICATOR} ]; then
+        log_msg -s "\nWARNING: ${DBCC_SNAP_FILE_INDICATOR} file not removed. This file must be deleted manually before proceeding further" -l ${LOGFILE}
+    fi
+    if [ -f ${ENIQ_ADMIN_ETC_DIR}/upgrade_II_dbcc_flag_indicator ]; then
+          $RM -rf ${ENIQ_ADMIN_ETC_DIR}/upgrade_II_dbcc_flag_indicator
+          if [ -f ${ENIQ_ADMIN_ETC_DIR}/upgrade_II_dbcc_flag_indicator ]; then
+            log_msg -s "\nWARNING: ${ENIQ_ADMIN_ETC_DIR}/upgrade_II_dbcc_flag_indicator file not removed. This file must be deleted manually before proceeding further" -l ${LOGFILE}
+     fi
+    fi
+
+
+# Remove hushlogin file.
+if [ "$_action_complete_flag_" == 1 -o "$ACTION" == "iqmsg_check" ]; then
+    $RM -f $ENIQ_BASE_DIR/home/dcuser/.hushlogin >> /dev/null 2>&1
+    if [ -f "$ENIQ_BASE_DIR/home/dcuser/.hushlogin" ]; then
+        log_msg -l ${LOGFILE} -t -s "Could not delete $ENIQ_BASE_DIR/home/dcuser/.hushlogin file"
+    fi
+fi
+log_msg -l ${LOGFILE} -s "* * * This run is completed successfully at `$DATE` * * *\n"
+}
+
+### Function: restore_backup_file ###
+#
+# Restoring the backup of .ini file
+#
+# Arguments:
+#       none
+# Return Values:
+#       Restoring .ini file
+
+restore_backup_file()
+{
+# Restore configuration files only when these when changed/updated while this run
+if [ "$_cache_change_flag_" -eq 2 ]; then
+
+        # Restore to original configuration files
+        for conf_file in $_conf_file_list_
+        do
+            if  [ "$_restore_bkup_flag_" == 0 ]; then
+                if [ ! -s ${conf_file}_$TIMESTAMP1 ]; then
+                    log_msg -l ${LOGFILE} -t -s "Backup file ${conf_file}.backup not found\n"
+                else
+                    $MV ${conf_file}_$TIMESTAMP1 ${conf_file} >> /dev/null 2>&1
+                    if [ $? -ne 0 ]; then
+                        _err_msg_="Could not restore original ${conf_file}"
+                        abort_script "$_err_msg_"
+                    fi
+                    log_msg -l ${LOGFILE} -t -s "Restored original ${conf_file}\n"
+                fi
+            else
+                log_msg -l ${LOGFILE} -s "Backup files already restored\n"
+            fi
+        done
+        _restore_bkup_flag_=1
+fi
+}
+
+### Function: restore_services ###
+#
+# Restores disabled/changed services/profiles back to previous one depending on action performed.
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+#
+restore_services()
+{
+# If action is db_allocation, will restore conf. files and start ENIQ services
+if [ "$ACTION" == "db_allocation" ]; then
+
+    # Restore original configuration files if updated
+    if [ "$_cache_change_flag_" == 2 -o "$_conf_file_bkup_flag_" -eq 1 ]; then
+          restore_backup_file
+          _rs_dba_stg_flag_=1
+    fi
+
+    # Restarting dwhdb to reflect original Catalog cache value while running db_allocation.
+    if [ "$_dwhdb_st_chg_flag_" -eq 1 -o  "$_rs_dba_stg_flag_" == 1 ]; then
+        dwhdb_action stop
+        dwhdb_action start
+        _rs_dba_stg_flag_=2
+
+    fi
+
+    # Set engine to previous state
+    $SLEEP 10
+    engine_profile
+    if [ "$_engine_change_flag_" == 1 -a "$_eng_profile_" != "Normal" -a "$_eng_profile_" != "$eng_previous_profile" ]; then
+          log_msg -l ${LOGFILE} -t -s "Engine profile is not in previous state $eng_previous_profile. Reverting its profile.\n"
+          engine_change $eng_previous_profile
+          if [ $? -ne 0 ]; then
+                  log_msg -l ${LOGFILE} -t -s "Could not revert the engine to previous state i.e. $eng_previous_profile\n"
+          fi
+    fi
+        
+    if [ "$_rs_dba_stg_flag_" -eq 2 ]; then
+          log_msg -l ${LOGFILE} -t -s "Restored required services successfully"
+    fi
+
+# If action is verify_tables,change engine, restore conf. files and restart dwhdb
+elif [ "$FULLRUN" == "YES" -a "$_cache_change_flag_" == 1 -o "$_cache_change_flag_" == 2 ]; then
+        # Restore original configuration files
+        if [ "$_cache_change_flag_" -eq 2 -o "$_conf_file_bkup_flag_" -eq 1 ]; then
+               restore_backup_file
+               _rs_vt_stg_flag_=1
+        fi
+
+        if [ ! -f $ENIQ_ADMIN_ETC_DIR/dbcc_restart_service_stop_indicator ]; then
+           # Set engine status to NoLoad,if not already, before stopping dwhdb.
+           $SLEEP 10
+           engine_profile
+           if [ "${_eng_profile_}" != "" ]; then
+                log_msg -l ${LOGFILE} -t -s "Engine current profile is $_eng_profile_"
+           fi
+
+           if [ "$_rs_vt_stg_flag_" == 1 -a "$_eng_profile_" != "NoLoads" -a "$_engine_online_flag_" == 1 ]; then
+               engine_change NoLoads
+               # Save engine's original profile, required later to revert
+               eng_previous_profile=$_eng_profile_
+           fi
+        
+           # Stopping dwhdb
+           if [ "$_dwhdb_st_chg_flag_" -eq 2 ]; then
+               if [ "$_db_chk_flag_" -eq 1 ]; then
+                   $SLEEP 60
+               fi
+               dwhdb_action stop
+               _dwhdb_st_chg_flag_=3
+               _rs_vt_stg_flag_=2
+           fi
+        
+        
+           # Starting dwhdb to reflect original configuration
+           if [ "$_rs_vt_stg_flag_" == 2 -o "$_dwhdb_st_chg_flag_" == 3 -o "$_dwhdb_st_chg_flag_" == 1 ]; then
+                   dwhdb_action start
+           fi
+        
+           # Setting Engine back to $eng_profile state
+           $SLEEP 10
+           engine_profile
+           if [ "$_engine_change_flag_" == 1 -o "$_engine_change_flag_" == 0 ] && [ "$_eng_profile_" != "Normal" -a "$eng_previous_profile" != "NoLoads" ]; then
+                 engine_change $eng_previous_profile
+           fi
+           log_msg -l ${LOGFILE} -t -s "Restored required services successfully\n"
+        fi
+fi
+
+# Delete hushlogin file.
+$RM -f $ENIQ_BASE_DIR/home/dcuser/.hushlogin >> /dev/null 2>&1
+if [ $? -ne 0 ]; then
+    log_msg -l ${LOGFILE} -t -s "Could not delete $ENIQ_BASE_DIR/home/dcuser/.hushlogin file"
+fi
+}
+
+### Function: remove_old_logs ###
+#
+# removes old logs that exceed the max number of logs to be kept and cleans tmp sql files created during run.
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+#
+remove_old_logs()
+{
+_log_file_=$1
+
+_number_of_logs_present_=`$LS $RESULTSDIR|$GREP ${_log_file_} |$WC -l`
+if [ $? -ne 0 ]; then
+     log_msg -l ${LOGFILE} -t -q -s "Could not evaluate ${_number_of_logs_present_}\n"
+fi
+
+# Check for the old results directory.
+if [ ${_number_of_logs_present_} -gt 0 ]; then
+
+    _number_of_logs_remove_=`$EXPR ${_number_of_logs_present_} - $MAXNUMLOG`
+    if [ ! ${_number_of_logs_remove_} ]; then
+        log_msg -l ${LOGFILE} -t -q -s "Could not evaluate ${_number_of_logs_remove_}\n"
+    fi
+
+    # Removing old RESULTSDIR
+    if  [[ ${_number_of_logs_present_} -gt $MAXNUMLOG ]]
+    then
+        for fileTOremove in $($LS -t ${RESULTSDIR}/${_log_file_}*.log | $TAIL -${_number_of_logs_remove_})
+        do
+            $RM $fileTOremove;
+            if [ $? -ne 0 ]; then
+                log_msg -l ${LOGFILE} -t -q -s "Could not delete old logs ${RESULTSDIR}/DbCheck_*.log\n"
+            fi
+            log_msg -l ${LOGFILE} -t -q -s "Deleted old logs ${RESULTSDIR}/DbCheck_*.log\n"
+        done
+    fi
+fi
+
+# Remove temp sql files
+$RM -rf $TEM_FILES
+if [ $? -ne 0 ]; then
+    log_msg -l ${LOGFILE} -t -q -s "Could not delete temp directory $TEM_DIR\n"
+fi
+}
+
+### Function: revert_eng_profile ###
+#
+# Reverting engine back to it's previous profile
+#
+# Arguments:
+#       Yes
+# Return Values:
+#       None
+#
+revert_eng_profile()
+{
+# Setting Engine back to $eng_profile state
+$SLEEP 10
+engine_profile
+if [ "$_engine_change_flag_" == 1 -o "$_engine_change_flag_" == 0 ] && [ "$_eng_profile_" != "Normal" -a "$eng_previous_profile" != "NoLoads" ]; then
+      engine_change $eng_previous_profile
+fi
+}
+
+### Function: setup_env ###
+#
+# Setup up path environment etc
+#
+# Arguments:
+#       none
+# Return Values:
+#       DWH_port,DWH_eng and DBA password
+
+setup_env()
+{
+# Configuration files.
+ENIQ_INI=niq.ini
+SUNOS_INI=SunOS.ini
+_niq_ini_bkup_="$CLI_CONF_DIR/niq_backup.ini"
+
+#Temp directory.
+TEM=/tmp
+
+# Temporary dwhdb cfg file
+_dwhdb_temp_cfg_="$DWHDB_CFG_DIR/dwhdb.cfg.tmp"
+
+# ENIQ directories
+ENIQ_BASE_DIR=/eniq
+ENIQ_SW_DIR=${ENIQ_BASE_DIR}/sw
+CLI_CONF_DIR=${ENIQ_BASE_DIR}/sw/conf
+DWHDB_CFG_DIR=$ENIQ_BASE_DIR/database/dwh_main
+ENIQ_CONF_DIR=$ENIQ_BASE_DIR/installation/config
+ENIQ_ADMIN_DIR=$ENIQ_BASE_DIR/admin
+ENIQ_ADMIN_ETC_DIR=$ENIQ_ADMIN_DIR/etc
+ENIQ_CORE_INST_DIR=$ENIQ_BASE_DIR/installation/core_install
+ENIQ_IQMSG_PATH=$ENIQ_BASE_DIR/local_logs/iq
+ENIQ_LOG_DIR=$ENIQ_BASE_DIR/log
+ENIQ_ARCHIEVE_IQMSG_PATH=$ENIQ_LOG_DIR/sw_log/iq
+ENIQ_ADMIN_BIN_DIR=$ENIQ_ADMIN_DIR/bin
+ENIQ_CORE_BIN_DIR=$ENIQ_CORE_INST_DIR/bin
+
+# Sybase directory
+DBISQL="$($LS $ENIQ_BASE_DIR/sybase_iq/IQ-*/bin64/dbisql)"
+SYBENV=$ENIQ_BASE_DIR/sybase_iq/IQ-*
+SYBSOURCE=$SYBENV/IQ-*.sh
+DBCCENV=$ENIQ_ADMIN_ETC_DIR/dbcheck.env
+
+# Temporary directory
+TEM_DIR=/tmp/dbconschk.$$.$$
+TEM_FILES=/tmp/dbconschk*
+
+# Source the common functions
+if [ -s ${SCRIPTHOME}/../lib/common_functions.lib ]; then
+    . ${SCRIPTHOME}/../lib/common_functions.lib
+else
+    _err_msg_="File ${SCRIPTHOME}/../lib/common_functions.lib not found"
+    abort_script "${_err_msg_}" 
+fi
+
+#Set the flag to indicate DBCC has been executed
+
+_service_status_=`$PS ax | $GREP -wv grep | $GREP -c DbCheck`
+DBCC_SNAP_FILE_INDICATOR="$ENIQ_ADMIN_BIN_DIR/.dbcc_progress_indicator"
+if [ -f ${DBCC_SNAP_FILE_INDICATOR} ]; then
+        if [ "$_service_status_" -gt "2" ]; then
+                log_msg -t -s "DBCC already appears to be in progress, File ${DBCC_SNAP_FILE_INDICATOR} exists"
+                exit 1
+        else
+                $RM ${DBCC_SNAP_FILE_INDICATOR}
+        fi
+fi
+
+# Set flag that
+$TOUCH ${DBCC_SNAP_FILE_INDICATOR}
+
+# Get DB server name
+DWH_ENG=`iniget DWH -v ServerName -f ${CLI_CONF_DIR}/niq.ini`
+if [ "$DWH_ENG" == "dwhdb" ]; then
+     server_type='DWH'
+else
+    _err_msg_="Could not read server name from ${CLI_CONF_DIR}/${ENIQ_INI}"
+    abort_script "$_err_msg_"
+fi
+
+# Get DB port
+DWH_PORT=`iniget ${server_type} -v PortNumber -f ${CLI_CONF_DIR}/niq.ini`
+if [ ! "${DWH_PORT}" -o ! "${DWH_ENG}" ]; then
+    _err_msg_="Could not read port number from ${CLI_CONF_DIR}/${ENIQ_INI}"
+    abort_script "$_err_msg_"
+fi
+
+# Get the DB Password
+DBA_PASSWORD=`inigetpassword DB -f ${CLI_CONF_DIR}/${ENIQ_INI} -v DBAPassword`
+if [ ! ${DBA_PASSWORD} ]; then
+  if [ -f ${ENIQ_BASE_DIR}/sw/installer/dbusers ]; then
+       DBA_PASSWORD=`${ENIQ_BASE_DIR}/sw/installer/dbusers dba dwh`
+     if [ ! "${DBA_PASSWORD}" ] ; then
+          _err_msg_="Could not get dwhdb DBA Password"
+          abort_script "$_err_msg_"
+     fi
+  fi
+fi
+
+
+
+# Initialize the connection string for dwhdb
+_connection_string_="-nogui -onerror exit -c \"eng=${DWH_ENG};links=tcpip{host=localhost;port=${DWH_PORT}};uid=dba;pwd=${DBA_PASSWORD}\""
+_connection_string_enc=${TEM}/conn_str_Dbcheck_encrypt.txt.`uuidgen`
+
+# encrypt the connection string.
+get_encrypt_file "${_connection_string_}" "${_connection_string_enc}"
+
+# Initialize the environmental variables
+. "$DBCCENV"
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not source dbcheck.env"
+    abort_script "$_err_msg_"
+fi
+
+# Source the sybase environment
+SYBSOURCE=$SYBENV/IQ-*.sh
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not find sybase.sh file under $SYBENV"
+    abort_script "$_err_msg_"
+fi
+. ${SYBSOURCE} >> /dev/null
+sybase_env_variables_ec=$?
+if [ $sybase_env_variables_ec -ne 0 ]; then
+    _err_msg_="Could not source sybase environment"
+    abort_script "$_err_msg_"
+fi
+
+# Get the System User and Group. All directories are owned by this
+SYSUSER=`iniget ENIQ_INSTALL_CONFIG -f ${ENIQ_CONF_DIR}/${SUNOS_INI} -v ENIQ_SYSUSER`
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not read SYSUSER param from ${ENIQ_CONF_DIR}/${SUNOS_INI}"
+    abort_script "$_err_msg_"
+fi
+
+SYSGRP=`$ID ${SYSUSER}|$AWK '{print $2}'|$AWK -F\( '{print $2}'|$AWK -F\) '{print $1}'`
+if [ ! "${SYSGRP}" ]; then
+    _err_msg_="Could not read SYSGRP param from ${ENIQ_CONF_DIR}/${SUNOS_INI}"
+    abort_script "$_err_msg_"
+fi
+
+# Remove old logs and clean up temp sql
+if [ -d "$RESULTSDIR" ]; then
+    remove_old_logs "DbCheck_"
+    remove_old_logs "CheckedTables_"
+    remove_old_logs "verifyindexerror_"
+fi
+
+# Set up temporary directory
+$MKDIR -m 1777 -p ${TEM_DIR} >> /dev/null 2>&1
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not create directory ${TEM_DIR}"
+    abort_script "$_err_msg_"
+fi
+
+# Setup results directory
+if [ ! -d "$RESULTSDIR" ]; then
+    $MKDIR -p $RESULTSDIR >> /dev/null 2>&1
+    if [ $? -ne 0 ]; then
+         _err_msg_="Could not create directory $RESULTSDIR"
+         abort_script "$_err_msg_"
+    fi
+
+fi
+
+$CHMOD 1777 $RESULTSDIR >> /dev/null 2>&1
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not change permission of $RESULTSDIR"
+    abort_script "$_err_msg_"
+fi
+
+$CHOWN -R $SYSUSER:$SYSGRP $RESULTSDIR >> /dev/null 2>&1
+if [ $? -ne 0 ]; then
+         _err_msg_="Could not change ownership of $RESULTSDIR"
+         abort_script "$_err_msg_"
+fi
+
+# Setup logfile if not given by user
+if [ ! "${LOGFILE}" ] ; then
+    LOGFILE=${RESULTSDIR}/DbCheck_${TIMESTAMP}.log
+fi
+
+$TOUCH -a ${LOGFILE}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not write to file ${LOGFILE}"
+    abort_script "$_err_msg_"
+fi
+
+$ECHO "Changing permission of the ${LOGFILE} to 644" | $TEE -a ${LOGFILE}
+$CHMOD 644 ${LOGFILE} >> /dev/null 2>&1
+if [ $? -ne 0 ]; then
+        _err_msg_="Could not change ${LOGFILE} file permission to 644"
+        abort_script "$_err_msg_"
+fi
+$CHOWN $SYSUSER:$SYSGRP ${LOGFILE} >> /dev/null 2>&1
+if [ $? -ne 0 ]; then
+     _err_msg_="Could not change ownership of log file"
+     abort_script "$_err_msg_"
+fi
+log_msg -l ${LOGFILE} -s "Started logging in file ${LOGFILE}\n"
+log_msg -l ${LOGFILE} -s "User has run $ACTION\n"
+
+# Remote connection string used while running commands remotely
+	if [ "${_user_root}" == 1 ]; then
+
+		remote_conn_string="$SSH  -o StrictHostKeyChecking=no -o BatchMode=yes -q -l root"               
+    else
+		remote_conn_string="$SUDO -u $_get_id_ $SSH -o StrictHostKeyChecking=no -o BatchMode=yes -q -l $_get_id_"                      
+              
+	fi
+
+
+# Set below variables when action is db_allocation
+if [ "${ACTION}" == "db_allocation" ]; then
+        temp_file=$TEM_DIR/tempf2
+
+        # Modify the environment for next run
+        OLD_LASTRUN_STATE=$db_allocation_LASTRUN_STATE
+        OLD_LASTRUN_TIMESTAMP=$db_allocation_LASTRUN_TIMESTAMP
+        OLD_ERR_RUN_COUNT=$db_allocation_ERR_RUN_COUNT
+
+# Set below variables when action is verify_tables
+elif [ "${ACTION}" == "verify_tables" ]; then
+        temp_file=$TEM_DIR/tempf3
+        OLD_LASTRUN_STATE=$verify_tables_LASTRUN_STATE
+        OLD_LASTRUN_TIMESTAMP=$verify_tables_LASTRUN_TIMESTAMP
+    OLD_ERR_RUN_COUNT=$verify_tables_ERR_RUN_COUNT
+fi
+
+# Turn off the banner messages while this run
+$TOUCH $ENIQ_BASE_DIR/home/dcuser/.hushlogin
+if [ $? -ne 0 ]; then
+        log_msg -l ${LOGFILE} -q -s "Could not supress welcome messages\n"
+fi
+
+#Fetching IP Type from IPMP_INI file.
+check_ip_type
+
+if [ ! "${_ip_type_}" ]; then
+    _err_msg_="Could not read parameter _IP_TYPE_ from file ${ENIQ_CONF_DIR}/${IPMP_INI}"
+    abort_script "$_err_msg_"
+fi
+
+log_msg -l ${LOGFILE} -t -s "Environment for this run is set successfully\n"
+
+}
+
+### Function: stop_dwhdb ###
+#
+# Stops the dwhdb database if service state is active
+#
+# Arguments:
+#       None
+# Return Values:
+#       None
+#
+stop_dwhdb()
+{
+/usr/bin/bash ${ENIQ_ADMIN_BIN_DIR}/manage_eniq_services.bsh -a stop -s dwhdb -N -l ${LOGFILE}
+_dwhdbstate_=`$SYSTEMCTL show -p ActiveState ${_dwhdb_service_name_} |$CUT -d= -f2`
+if [ "${_dwhdbstate_}" == "inactive" ]; then
+        log_msg -l ${LOGFILE} -t -s "${_dwhdb_service_name_} stopped successfully\n" 
+elif [ "${_dwhdbstate_}" == "failed" ]; then
+        clear_dwhdb_failed_state "$1"
+fi
+}
+
+### Function: usage_msg ###
+#
+#   Print out the usage message
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+usage_msg()
+{
+$ECHO "
+Usage:`$BASENAME $0` -a {db_allocation|verify_tables|iqmsg_check} [-f] [-l] [-N]
+
+options:
+
+-a  : Action. Must be either
+        db_allocation  --> To validate the catalog by executing sp_iqcheckdb allocation database
+        verify_tables  --> To verify the errorneous indexes and executes sp_iqcheckdb verify index
+        iqmsg_check    --> To check for the damaged index in available iqmsg files on IQ nodes
+-f  : To perform full run for table verification and to be passed with verify_tables
+-l  : To generate logfile other than default path
+-N  : To get user confirmation while running FULL RUN of verify_tables
+"
+}
+
+### Function: user_confirm ###
+#
+#   Print out the usage message
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+user_confirm()
+{
+while :; do
+    unset USER_CONF
+    $CLEAR
+    $ECHO "\nALERT: User opted for Full run, this will restart few ENIQ services, namely, engine and DWHDB."
+    $ECHO "\nAre you sure you wish to proceed with Full run of table verification at this time?"
+    $ECHO "Enter [Yes | No] (case sensitive) : \c"
+    read USER_CONF
+
+    if [ "$USER_CONF" == "Yes" ]; then
+        break
+    elif [ "$USER_CONF" == "No" ]; then
+                # Removing DBCC flag indicator.
+                 $RM -rf ${DBCC_SNAP_FILE_INDICATOR}
+                 # To check the existence of {DBCC_SNAP_FILE_INDICATOR}
+                 if [ -f ${DBCC_SNAP_FILE_INDICATOR} ]; then
+        log_msg -s "\nWARNING: ${DBCC_SNAP_FILE_INDICATOR} file not removed. This file must be deleted manually before proceeding further" -l ${LOGFILE}
+
+                 fi
+        echo "User does not want to proceed with fullrun this time. Exiting..."
+        break
+    fi
+done
+}
+
+### Function: verifyindex ###
+#
+# This function validates one index at a time from the IndexError.log. The sql is generated from the verify_index_sql template. This sql
+# file is removed at the end of run. Thus, presence of the sql file in $TEM_DIR/CheckDb indicates running process
+#
+# Arguments:
+#       Gets the index name, table name and the owner of the table from IndexError.log
+# Return Values:
+#       none
+
+verifyindex()
+{
+# Create temporary sql file to log tablelist
+SqlFile=`$MKTEMP ${WORKTMPDIR}/VerifyIndexSql.XXXXXXXX`
+if [ $? -ne 0 ]; then
+        restore_services
+        _err_msg_="Could not create ${WORKTMPDIR}/VerifyIndexSql.XXXXXXXX file at `$DATE`"
+        abort_script "$_err_msg_"
+else
+    $CHMOD 755 $SqlFile >> /dev/null 2>&1
+    if [ $? -ne 0 ]; then
+        restore_services
+        _err_msg_="Could not change permissions for $SqlFile file at `$DATE`"
+        abort_script "$_err_msg_"
+    fi
+fi
+User=`$ECHO $1 | $CUT -d',' -f1 | $SED "s/'//g"`
+Table=`$ECHO $1 | $CUT -d',' -f2 | $SED "s/'//g"`
+Index=`$ECHO $1 | $CUT -d',' -f3 | $SED "s/'//g"`
+
+log_msg -h -l $RESULTSDIR/verifyindexerror_${TIMESTAMP}.log -q -t -s "Verifying ${User}.${Table}.${Index}"
+verify_index_sql="select now();output to '$TEM_DIR/${Index}_start_time' format fixed;sp_iqcheckdb 'verify index ${User}.${Table}.${Index}'; output to $RESULTSDIR/verifyindexerror_$Index.log format fixed;select now();output to '$TEM_DIR/${Index}_end_time' format fixed" 
+$ECHO "$verify_index_sql" > $SqlFile
+
+# Executing the SQL to verify the index consistency
+log_msg -l ${LOGFILE} -q -s "Running verify index on index ${Index}\nResults will be logged in $RESULTSDIR/verifyindexerror_$Index.log\n\n"
+$SU - $SYSUSER -c "$DBISQL @${_connection_string_enc} $SqlFile 2> $RESULTSDIR/verifyindexerror_$Index.log 1> /dev/null"
+if [ $? -ne 0 ]; then
+    $GREP -w "SQLCODE=-100" $RESULTSDIR/verifyindexerror_$Index.log > /dev/null 2>&1
+    if [ $? -eq 0 ];then
+        log_msg -l ${LOGFILE} -t -q -s "Verify index failed for - "$Index". DWHDB may not be running.\n"
+        $ECHO "'${User}','${Table}'" >> $TEM_DIR/NotVerifiedTables.log
+        $ECHO "${1}" >> $RESULTSDIR/NotVerifiedIndex.log
+        if [ $? -ne 0 ];then
+            log_msg -l ${LOGFILE} -t -q -s "Could not log $Index in $RESULTSDIR/NotVerifiedIndex.log file\n"
+        else
+            $SED -i "/'$Index'/c\'${User}','${Table}','${Index}'|NA|NA|Failed to perform third level check. DWHDB may not be running" $TEM_DIR/CheckedTables_${TIMESTAMP}.log
+            if [ $? -ne 0 ];then
+                log_msg -l ${LOGFILE} -t -q -s "Could not modifiy details for $Index in $TEM_DIR/CheckedTables_${TIMESTAMP}.log\n"
+            fi
+        fi
+    else
+        $SED -i "/'$Index'/c\'${User}','${Table}','${Index}'|NA|NA|Failed to perform third level check. Kindly refer to $RESULTSDIR/verifyindexerror_'${TIMESTAMP}'.log for further details." $TEM_DIR/CheckedTables_${TIMESTAMP}.log
+        if [ $? -ne 0 ];then
+            log_msg -l ${LOGFILE} -t -q -s "Could not modifiy details for $Index in $TEM_DIR/CheckedTables_${TIMESTAMP}.log\n"
+        fi
+    fi
+fi
+
+$CAT $RESULTSDIR/verifyindexerror_$Index.log >> $RESULTSDIR/verifyindexerror_${TIMESTAMP}.log
+if [ $? -ne 0 ]; then
+    log_msg -l ${LOGFILE} -t -q -s "Could not copy content to $RESULTSDIR/verifyindexerror_${TIMESTAMP}.log\n"
+fi
+
+$GREP -w "No Errors Detected" $RESULTSDIR/verifyindexerror_$Index.log > /dev/null 2>&1
+if [ $? -eq 0 ]; then
+    $ECHO "$1" >> $TEM_DIR/ExcludeIndex.txt
+    $SED -i "/'$Index'/c\'${User}','${Table}','${Index}'|`$CAT $TEM_DIR/${Index}_start_time`|`$CAT $TEM_DIR/${Index}_end_time`|No Errors Detected" $TEM_DIR/CheckedTables_${TIMESTAMP}.log
+    if [ $? -ne 0 ];then
+        log_msg -l ${LOGFILE} -t -q -s "Could not modifiy details for $Index in $TEM_DIR/CheckedTables_${TIMESTAMP}.log\n"
+    fi
+else
+    #Checking if non-completed indexes are present in verify index 
+    $GREP -iw "Non-Completed Index" $RESULTSDIR/verifyindexerror_$Index.log > /dev/null 2>&1
+    if [ $? -eq 0 ];then
+        log_msg -l ${LOGFILE} -t -q -s "Verify index failed for - "$Index". Not completed index found.\n"
+        $ECHO "'${User}','${Table}'" >> $TEM_DIR/NotVerifiedTables.log
+        $ECHO "$1" >> $RESULTSDIR/NotVerifiedIndex.log
+        if [ $? -ne 0 ];then
+            log_msg -l ${LOGFILE} -t -q -s "Could not log $Index in $RESULTSDIR/NotVerifiedIndex.log file\n"
+        else
+            $SED -i "/'$Index'/c\'${User}','${Table}','${Index}'|NA|NA|Failed to perform third level check. Not completed index found" $TEM_DIR/CheckedTables_${TIMESTAMP}.log
+            if [ $? -ne 0 ];then
+                log_msg -l ${LOGFILE} -t -q -s "Could not modifiy details for $Index in $TEM_DIR/CheckedTables_${TIMESTAMP}.log\n"
+            fi
+        fi
+    else
+        $GREP -iw "Inconsistent Index" $RESULTSDIR/verifyindexerror_$Index.log > /dev/null 2>&1
+        if [ $? -eq 0 ];then
+            $SED -i "/'$Index'/c\'${User}','${Table}','${Index}'|`$CAT $TEM_DIR/${Index}_start_time`|`$CAT $TEM_DIR/${Index}_end_time`|Errors Detected" $TEM_DIR/CheckedTables_${TIMESTAMP}.log
+            if [ $? -ne 0 ];then
+                log_msg -l ${LOGFILE} -t -q -s "Could not modifiy details for $Index in $TEM_DIR/CheckedTables_${TIMESTAMP}.log\n"
+            fi
+        fi
+    fi
+    # If index exists in $RESULTSDIR/NotVerifiedIndex.log, then it will be removed from $RESULTSDIR/IndexError.log
+    if [ -s "$RESULTSDIR/NotVerifiedIndex.log" ]; then
+        $GREP -w $1 $RESULTSDIR/NotVerifiedIndex.log > /dev/null 2>&1
+        if [ $? -eq 0 ]; then
+            $ECHO "$1" >> $TEM_DIR/ExcludeIndex.txt
+        fi
+    fi
+fi
+
+$RM -rf $TEM_DIR/${Index}_start_time $TEM_DIR/${Index}_end_time
+if [ -f "$TEM_DIR/${Index}_start_time" ]; then
+        log_msg -l ${LOGFILE} -t -s "Unable to remove $TEM_DIR/${Index}_start_time"
+fi
+
+if [ -f "$TEM_DIR/${Index}_end_time" ]; then
+        log_msg -l ${LOGFILE} -t -s "Unable to remove $TEM_DIR/${Index}_end_time"
+fi
+
+# Remove SQL File
+$RM -rf $SqlFile
+if [ -f "$SqlFile" ]; then
+    log_msg -l ${LOGFILE} -t -s "Could not delete $SqlFile"
+fi
+}
+
+
+### Function: verifytables ###
+#
+# This function validates one table at a time from the Check_tables.txt. The sql is generated from the check_table_sql template. Ths sql
+# file is removed at the end of run. Thus, presence of the sql file in $TEM_DIR/CheckDb indicates running process
+#
+# Arguments:
+#       Takes a table name and the owner of the table from Check_tables.txt
+# Return Values:
+#       none
+
+verifytables()
+{
+_check_count=0
+unchecked_tables=0
+unverified_tables=0
+index_error=0
+# Set environment for this run
+setup_env
+
+# Check if first fullrun or not.
+if [ "$RUNNUMBER" -eq 0 ];then
+        FULLRUN="YES"
+        if [ ! "${NO_CONFIRM}" ]; then
+            user_confirm
+            if [ "$USER_CONF" == "No" ]; then
+                $RM -rf ${TEM_DIR}
+                exit 0
+            fi
+        fi
+        log_msg -l ${LOGFILE} -s "This is a full run.\nAll tables will be checked,i.e. tables updated after $LASTDBCHECK, will be checked\n"
+elif [ "$RUNNUMBER" -ne 0 -a "$FULLRUN" != "YES" ]; then
+        log_msg -l ${LOGFILE} -s "\nThis is a delta run. Only those tables will be checked which are updated after previous run i.e. after $LASTDBCHECK\n"
+elif [ "$RUNNUMBER" -ne 0 -a "$FULLRUN" == "YES" ]; then
+        FULLRUN="YES"
+        if [ ! "${NO_CONFIRM}" ]; then
+            user_confirm
+            if [ "$USER_CONF" == "No" ]; then
+                $RM -rf ${TEM_DIR}
+                exit 0
+            fi
+        fi
+        log_msg -l ${LOGFILE} -s "Full run is enforced. All tables will be checked.\n"
+fi
+
+
+# Flag to check if verify_tables completes and if fullrun
+_verify_complete_flag_=0
+_db_chk_flag_=0
+
+# Change cache temporarily and restarts dwhdb to reflect these changes for firstrun/fullrun
+if [ "$FULLRUN" == "YES" ]; then
+
+        # Flag updates whenever verify_tables run is aborted manually (i.e. ctrl C/D)
+        _rs_vt_stg_flag_=0
+        change_all_cache
+fi
+
+
+# Initialize the CheckedTables and table error log
+log_msg -l ${LOGFILE} -t -q -s "Initializing Checked tables log\n"
+
+# Truncating and adding header information to CheckedTables_${TIMESTAMP}.log file in TableName|StartTime|EndTime format
+$ECHO "TableName|StartTime|EndTime|Status" > $TEM_DIR/CheckedTables_${TIMESTAMP}.log
+$TOUCH $TEM_DIR/CheckedTablesSecondLevel_${TIMESTAMP}.log
+
+count_checked_files=0
+
+# Save start date
+$ECHO "select now();output to '$TEM_DIR/nowdate';" >$TEM_DIR/getnow.sql
+ls -lrt $TEM_DIR/getnow.sql
+$CHMOD 644 $TEM_DIR/getnow.sql
+ls -lrt $TEM_DIR/getnow.sql
+$SU - $SYSUSER -c "${DBISQL} @${_connection_string_enc} $TEM_DIR/getnow.sql > /dev/null"
+if [ $? -ne 0 ]; then
+        restore_services
+        _err_msg_="Error logging on to database to get start date at `$DATE`"
+        abort_script "$_err_msg_"
+fi
+
+runstart=`$SED "s/'//g"< $TEM_DIR/nowdate`
+if [ $? -ne 0 ]; then
+    log_msg -l ${LOGFILE} -t -q -s "Could not log the starttime\n"
+fi
+$RM -f $TEM_DIR/nowdate
+if [ -f "$TEM_DIR/nowdate" ]; then
+    log_msg -l ${LOGFILE} -t -q -s "Could not delete $TEM_DIR/nowdate\n"
+fi
+
+# Get Table List to validate
+log_msg -l ${LOGFILE} -s "Getting Table List to validate ...\n"
+gettablist
+NumTab=`$WC -l ${ENIQ_ADMIN_DIR}/sql/Check_tables.txt | $AWK '{print $1}'`
+if [ "$NumTab" == "" ]; then
+    log_msg -l ${LOGFILE} -t -q -s "Could not read ${ENIQ_ADMIN_DIR}/sql/Check_tables.txt \n"
+fi
+
+$ECHO ""> $RESULTSDIR/IndexError.log
+$ECHO ""> $RESULTSDIR/SecondLevelCheckTable.log
+
+# Variables required to be modified for next run
+OLD_RUNNUMBER=$RUNNUMBER
+let 'OLD_RUNNUMBER = OLD_RUNNUMBER + 1'
+
+if [ "$NumTab" -gt 0 ]; then
+    # Get all the engine properties for debugging
+    log_msg -l ${LOGFILE} -t -q -s "Collecting IQ Engine Statistics"
+    $SU - $SYSUSER -c "${DBISQL} @${_connection_string_enc} \"call sa_eng_properties();OUTPUT TO ${LOGFILE} APPEND\""  >> /dev/null 2>&1
+    log_msg -l ${LOGFILE} -t -s "$NumTab Tables to Check\n"
+    # Clean up the old working tmp directory.
+    $RM -rf ${WORKTMPDIR}
+    if [ -d "${WORKTMPDIR}" ]; then
+        log_msg -l ${LOGFILE} -t -q -s "Could not delete old copy of directory ${WORKTMPDIR}\n"
+    fi
+    # Create working tmp directory
+    $MKDIR -p -m 1777 ${WORKTMPDIR} >> /dev/null 2>&1
+    if [ $? -ne 0 ]; then
+        restore_services
+        _err_msg_="Could not create directory ${WORKTMPDIR} at `$DATE`"
+        abort_script "$_err_msg_"
+    fi
+    # Clean up the NotCheckedTables.log if it exists from the previous run
+    $RM -f $RESULTSDIR/NotCheckedTables.log
+    if [ -f "$RESULTSDIR/NotCheckedTables.log" ]; then
+       log_msg -l ${LOGFILE} -t -s "Could not remove $RESULTSDIR/NotCheckedTables.log file"
+    fi
+    
+    # Clean up the NotVerifiedIndex.log if it exists from the previous run
+    $RM -f $RESULTSDIR/NotVerifiedIndex.log
+    if [ -f "$RESULTSDIR/NotVerifiedIndex.log" ]; then
+       log_msg -l ${LOGFILE} -t -s "Could not remove $RESULTSDIR/NotVerifiedIndex.log file"
+    fi
+    
+    let '_check_count = _check_count + 1'
+    # loop to move through table list in check_tables.txt
+    for table_name in `< ${ENIQ_ADMIN_DIR}/sql/Check_tables.txt`
+    do
+        Pruns=0
+        while [ 1 = 1 ]
+        do
+            Pruns=`$LS ${WORKTMPDIR} | $WC -l`
+            if [ "$Pruns" -lt "${MAXPARALLEL}" ]; then
+                # First Check : Check all tables and push clear tables in CheckedTables.log
+                checktable ${table_name} &
+                let count_checked_files=$count_checked_files+1
+                if [ "$count_checked_files" == "" ]; then
+                    log_msg -l ${LOGFILE} -t -q -s "Could not increment the count_checked_files\n"
+                fi
+                if [ $count_checked_files -ge $MAXNUMOUT ]
+                    then
+                    log_msg -l ${LOGFILE} -t -s "`$CAT $TEM_DIR/CheckedTablesFirstLevel_${TIMESTAMP}.log| $WC -l`/$NumTab Tables Checked\n"
+                    count_checked_files=0
+                fi
+                break
+            else
+                $SLEEP 5
+            fi
+        done
+    done
+
+    while [ 1 = 1 ]
+    do
+        Pruns=`$LS ${WORKTMPDIR} | $WC -l`
+        if [ "$Pruns" -eq 0 ];  then
+            break
+        else
+            log_msg -l ${LOGFILE} -t -s "`$CAT $TEM_DIR/CheckedTablesFirstLevel_${TIMESTAMP}.log| $WC -l`/$NumTab Tables Checked\n"
+            $SLEEP 5
+            $PS -ef | $GREP -w $main_pid | $GREP -iw "dbcheck.bsh" | $GREP -wv "grep" | $WC -l > $TEM_DIR/pid_count.txt
+            _count_=`$CAT $TEM_DIR/pid_count.txt`
+            $ECHO "Pid count:$_count_."
+            if [ "$_count_" -eq 1 ];then
+                $ECHO "Removing temporary files present under ${WORKTMPDIR}."
+                $RM -rf ${WORKTMPDIR}/*
+                if [ $? -ne 0 ]; then
+                    log_msg -l ${LOGFILE} -t -q -s "Could not cleanup WORKTMPDIR directory $WORKTMPDIR\n"
+                fi
+                break
+            fi
+        fi
+    done
+    log_msg -l ${LOGFILE} -t -s "Completed checking `$CAT $TEM_DIR/CheckedTablesFirstLevel_${TIMESTAMP}.log| $WC -l`/$NumTab tables\n"
+
+    # Get the number of tables showing errors from first level checktable
+    _no_of_table_errors_first_chk_=`$WC -l $RESULTSDIR/SecondLevelCheckTable.log | $AWK '{print $1}'`
+    if [ "$_no_of_table_errors_first_chk_" == "" ]; then
+        restore_services
+        _err_msg_="Could not get total number of lines in $RESULTSDIR/SecondLevelCheckTable.log at `$DATE`"
+        abort_script "$_err_msg_"
+    fi
+    if [  "${_no_of_table_errors_first_chk_}" -gt 1 ];then
+        log_msg -l ${LOGFILE} -t -s "Logging intermediate report for the checked tables\n"
+        $COLUMN -t -s\| $TEM_DIR/CheckedTables_${TIMESTAMP}.log >> ${LOGFILE}
+        count_checked_files=0
+        NumchkTab=`$EXPR $_no_of_table_errors_first_chk_ - 1`
+        if [ "$NumchkTab" == "" ]; then
+            restore_services
+            _err_msg_="Could not evaluate table count in $RESULTSDIR/SecondLevelCheckTable.log at `$DATE`"
+            abort_script "$_err_msg_"
+        fi
+        log_msg -l ${LOGFILE} -t -s "$NumchkTab tables present in $RESULTSDIR/SecondLevelCheckTable.log, performing second level of check i.e. check table on these tables\n"
+        let '_check_count = _check_count + 1'
+        # loop to move through table list in SecondLevelCheckTable.log
+        for table_name in `< $RESULTSDIR/SecondLevelCheckTable.log`
+        do
+            Pruns=0
+            while [ 1 = 1 ]
+            do
+                Pruns=`$LS ${WORKTMPDIR} | $WC -l`
+                if [ "$Pruns" -lt "${MAXPARALLEL}" ]; then
+
+                    # Second Check : Check all tables and push clear tables in SecondLevelCheckTable.log
+                    checktable ${table_name} &
+                    let count_checked_files=$count_checked_files+1
+                    if [ "$count_checked_files" == "" ]; then
+                        log_msg -l ${LOGFILE} -t -q -s "Could not increment the count_checked_files\n"
+                    fi
+                    if [ $count_checked_files -ge $MAXNUMOUT ]; then
+                        log_msg -l ${LOGFILE} -t -s "`$CAT $TEM_DIR/CheckedTablesSecondLevel_${TIMESTAMP}.log| $WC -l`/$NumchkTab Tables Checked\n"
+                        count_checked_files=0
+                    fi
+                    break
+                else
+                    $SLEEP 5
+                fi
+            done
+        done
+
+        while [ 1 = 1 ]
+        do
+            Pruns=`$LS ${WORKTMPDIR} | $WC -l`
+            if [ "$Pruns" -eq 0 ];  then
+                break
+            else
+                log_msg -l ${LOGFILE} -t -s "`$CAT $TEM_DIR/CheckedTablesSecondLevel_${TIMESTAMP}.log| $WC -l`/$NumchkTab Tables Checked\n"
+                $SLEEP 5
+                $PS -ef | $GREP -w $main_pid | $GREP -iw "dbcheck.bsh" | $GREP -wv "grep" | $WC -l > $TEM_DIR/pid_count.txt
+                _count_=`$CAT $TEM_DIR/pid_count.txt`
+                $ECHO "Pid count:$_count_."
+                if [ "$_count_" -eq 1 ];then
+                    $ECHO "Removing temporary files present under ${WORKTMPDIR}."
+                    $RM -rf ${WORKTMPDIR}/*
+                    if [ $? -ne 0 ]; then
+                        log_msg -l ${LOGFILE} -t -q -s "Could not cleanup WORKTMPDIR directory $WORKTMPDIR\n"
+                    fi
+                    break
+                fi
+            fi
+        done
+    log_msg -l ${LOGFILE} -t -s "Completed checking `$CAT $TEM_DIR/CheckedTablesSecondLevel_${TIMESTAMP}.log| $WC -l`/$NumchkTab tables in second level check\n"
+    fi
+    # Get the number of indexes showing errors from checktable
+    _no_of_index_errors_=`$WC -l $RESULTSDIR/IndexError.log | $AWK '{print $1}'`
+    if [ "$_no_of_index_errors_" == "" ]; then
+        restore_services
+        _err_msg_="Could not get total number of lines in $RESULTSDIR/IndexError.log at `$DATE`"
+        abort_script "$_err_msg_"
+    fi
+
+    # Running sp_iqcheckdb 'verify index' on each index and outputting to
+    # verifyindexerror log in $RESULTSDIR
+    if [ "${_no_of_index_errors_}" -gt 1 ]; then
+        log_msg -l ${LOGFILE} -t -s "Logging intermediate report for checked tables\n"
+        $COLUMN -t -s\| $TEM_DIR/CheckedTables_${TIMESTAMP}.log >> ${LOGFILE}
+        _index_verify_count_=`$EXPR $_no_of_index_errors_ - 1`
+        if [ "$_index_verify_count_" == "" ]; then
+            restore_services
+            _err_msg_="Could not evaluate index count in $RESULTSDIR/IndexError.log at `$DATE`"
+            abort_script "$_err_msg_"
+        fi
+        log_msg -l ${LOGFILE} -t -s "$_index_verify_count_ indexes present in $RESULTSDIR/IndexError.log, performing third level of check i.e. verify index on these indexes\n"
+        $RM -rf $RESULTSDIR/verifyindexerror*.log
+        for index_name in `< $RESULTSDIR/IndexError.log`
+        do
+            Pruns=0
+            while [ 1 = 1 ]
+            do
+                Pruns=`$LS ${WORKTMPDIR} | $WC -l`
+                if [ "$Pruns" -lt 2 ]; then
+                    # Third Check : Verifying the indexes from IndexError.log
+                    verifyindex ${index_name} &
+                    break
+                else
+                    $SLEEP 5
+                fi
+            done
+        done
+
+        while [ 1 = 1 ]
+        do
+            Pruns=`$LS ${WORKTMPDIR} | $WC -l`
+            if [ "$Pruns" -eq 0 ];  then
+                break
+            else
+                $SLEEP 5
+                $PS -ef | $GREP -w $main_pid | $GREP -iw "dbcheck.bsh" | $GREP -wv "grep" | $WC -l > $TEM_DIR/pid_count.txt
+                _count_=`$CAT $TEM_DIR/pid_count.txt`
+                $ECHO "Pid count:$_count_."
+                if [ "$_count_" -eq 1 ];then
+                    $ECHO "Removing temporary files present under ${WORKTMPDIR}."
+                    $RM -rf ${WORKTMPDIR}/*
+                    if [ $? -ne 0 ]; then
+                        log_msg -l ${LOGFILE} -t -q -s "Could not cleanup WORKTMPDIR directory $WORKTMPDIR\n"
+                    fi
+                    break
+                fi
+            fi
+        done
+
+        if [ -s "$TEM_DIR/ExcludeIndex.txt" ]; then
+            for _index_name_ in `$CAT $TEM_DIR/ExcludeIndex.txt`; do
+                excludeindex
+            done
+        fi
+
+        # After third check, if any index still in IndexError.log, NotVerifiedIndex.log report to sysadmin
+        if [ -f $RESULTSDIR/IndexError.log ]; then
+            error_check=$($WC $RESULTSDIR/IndexError.log | $AWK '{print $3}')
+            if [ "$error_check" -gt 1 ]; then
+                index_error=1
+            elif [ -s $RESULTSDIR/NotVerifiedIndex.log ]; then
+                unverified_tables=1
+            else
+                log_msg -l ${LOGFILE} -t -s "No errors found in verify index output. Modifying dbcheck.env\n"
+            fi
+        fi
+    fi
+
+    # Generating a report of the tables checked
+    $COLUMN -t -s\| $TEM_DIR/CheckedTables_${TIMESTAMP}.log >> $RESULTSDIR/CheckedTables_${TIMESTAMP}.log
+    if [ $? -ne 0 ]; then
+        log_msg -l ${LOGFILE} -t -s "Failed to generate the report of the tables checked\n"
+    fi
+
+    log_msg -l ${LOGFILE} -t -s "Logging final report for the checked tables\n"
+    $COLUMN -t -s\| $TEM_DIR/CheckedTables_${TIMESTAMP}.log >> ${LOGFILE}
+    if [ $? -ne 0 ]; then
+        log_msg -l ${LOGFILE} -t -s "Failed to log the report of the tables checked\n"
+    fi
+
+    # Get all the engine properties for debugging
+    log_msg -l ${LOGFILE} -t -q -s "Collecting IQ Engine Statistics\n"
+    $SU - $SYSUSER -c "${DBISQL} @${_connection_string_enc} \"call sa_eng_properties();OUTPUT TO ${LOGFILE} APPEND\""  >> /dev/null 2>&1
+elif [ "$NumTab" -eq 0 ]; then
+    log_msg -l ${LOGFILE} -t -s "No table changed since last check - $LASTDBCHECK. Modifying dbcheck.env file\n"
+fi
+
+_db_chk_flag_=1
+
+if [ -s "$RESULTSDIR/NotCheckedTables.log" ]; then
+    _not_checked_table_count_=`$CAT $RESULTSDIR/NotCheckedTables.log | $GREP -w 'dc'| $WC -l`
+    if [ ${_not_checked_table_count_} -gt 0 ]; then
+        unchecked_tables=1
+        log_msg -l ${LOGFILE} -t -s "The below tables have not been checked in second level check. The same will be picked up in the next DBCC run\n"
+        $CAT $RESULTSDIR/NotCheckedTables.log | $TEE -a ${LOGFILE}
+    fi
+fi
+
+if [ -s "$RESULTSDIR/NotVerifiedIndex.log" ]; then
+    _not_verified_index_count_=`$CAT $RESULTSDIR/NotVerifiedIndex.log | $GREP -w 'dc'| $WC -l`
+    if [ ${_not_verified_index_count_} -gt 0 ]; then
+        unverified_tables=1
+        log_msg -l ${LOGFILE} -t -s "The below indexes have not been verified. Corresponding tables will be picked up in the next DBCC run\n"
+        $CAT $RESULTSDIR/NotVerifiedIndex.log | $TEE -a ${LOGFILE}
+        $CAT $TEM_DIR/NotVerifiedTables.log | sort | uniq >> $RESULTSDIR/NotCheckedTables.log
+    fi
+fi
+
+if [ "$unchecked_tables" -eq 1 -o "$unverified_tables" -eq 1 -o "$index_error" -eq 1 ]; then
+    if [ "$unchecked_tables" -eq 1 -o "$unverified_tables" -eq 1 ] && [ "$index_error" -eq 1 ]; then
+        log_msg -l ${LOGFILE} -t -s "DbCheck failed! Errors detected in indexes from $RESULTSDIR/IndexError.log as per verify index output. Also, unchecked tables found in $RESULTSDIR/NotCheckedTables.log.\nKindly contact Ericsson support\n"
+    elif [ "$unchecked_tables" -eq 1 -o "$unverified_tables" -eq 1 ]; then
+        log_msg -l ${LOGFILE} -t -s "DbCheck failed! Unchecked tables found in $RESULTSDIR/NotCheckedTables.log.\n"
+    else
+        log_msg -l ${LOGFILE} -t -s "DbCheck failed! Errors detected in indexes from $RESULTSDIR/IndexError.log as per verify index output.\nKindly contact Ericsson support\n"
+    fi
+    _dbcc_err_flag_rollsnap_=1
+    # Modify the respective variables in dbcheck.env for next run.
+    err_modify_env
+fi
+
+if [ -s "$RESULTSDIR/IndexError.log" ]; then
+    _err_index_=`$CAT $RESULTSDIR/IndexError.log | $GREP -v "SQLCODE=" | $GREP -v '^$' | $WC -l`
+    if [ $_err_index_ -eq 0 ]; then
+        _not_verified_index_=`$CAT $RESULTSDIR/IndexError.log | $GREP "SQLCODE=" | $AWK '{print $1}' | $CUT -d ',' -f2`
+        if [ ! -z ${_not_verified_index_} ]; then
+            log_msg -l ${LOGFILE} -t -s "DbCheck not ran for indexes ${_not_verified_index_}\n"
+        fi
+    else
+        log_msg -l ${LOGFILE} -t -s "Errors detected in file $RESULTSDIR/IndexError.log\n"
+    fi
+fi
+
+if [ "$FULLRUN" == "YES" -a "$_cache_change_flag_" == 2 ]; then
+
+    # Restarting dwhdb with original configurations with putting engine in NoLoads, if catalog cache changes made
+    $SLEEP 30
+    restore_services
+    _action_complete_flag_=1
+fi
+
+# If no errors found while current run, set the status back to zero.
+if [ "$_dbcc_err_flag_rollsnap_" == 0 ]; then
+    $SED "s/RUNNUMBER=$RUNNUMBER/RUNNUMBER=$OLD_RUNNUMBER/;s/$LASTDBCHECK/$runstart/;s/verify_tables_ERR_RUN_COUNT=$OLD_ERR_RUN_COUNT/verify_tables_ERR_RUN_COUNT=0/;s/verify_tables_LASTRUN_STATE=$OLD_LASTRUN_STATE/verify_tables_LASTRUN_STATE=PASS/;s/$verify_tables_LASTRUN_TIMESTAMP/$TIMESTAMP1/" < ${DBCCENV} > $temp_file
+fi
+if [ ! -s "$temp_file" ]; then
+    log_msg -l ${LOGFILE} -t -s "Failed to update the file $temp_file"
+else
+    $MV $temp_file $DBCCENV >> /dev/null 2>&1
+    if [ $? -ne 0 ]; then
+        restore_services
+        _err_msg_="Could not replace $temp_file to $DBCCENV"
+        abort_script "$_err_msg_"
+    fi
+    log_msg -l ${LOGFILE} -t -s "Modified dbcheck.env file successfully for next run\n"
+fi
+
+# Flag updates when verify_tables is completed and dwhdb is back with previous configuration
+_verify_complete_flag_=1
+log_msg -l ${LOGFILE} -t -s "DbCheck completed.\n"
+
+# Check for damaged index in iqmsg log on available server(s)
+iqmsg_chk
+
+}
+
+#********************************************************************
+#
+#       Main body of program
+#
+#********************************************************************
+
+TIMESTAMP=`$DATE +%d.%m.%y_%H:%M:%S`
+TIMESTAMP1=`$DATE +%d.%m.%Y_%H:%M`
+main_pid=`$ECHO $$`
+# Determine absolute path to software
+get_absolute_path
+
+# Log date in below format for checking iqmsg log for damaged index
+_runstart_iqmsg_fulldt_=`$DATE "+%m-%d_%H:%M:%S"`
+_runstart_iqmsg_=`$ECHO $_runstart_iqmsg_fulldt_ |tr -d ' _:-'`
+
+# Flag to check if dbcc_exit was ran i.e. if ctrl-c is hit.
+_dbcc_exit_flag_=0
+_dwhdb_start_flag_=0
+_dwhdb_stop_flag_=0
+_restore_bkup_flag_=0
+
+# Flag to log engine profile and state flag
+_engine_change_flag_=0
+_engine_online_flag_=0
+
+# Flag to check if dbcc reports error by any ACTION
+_dbcc_err_flag_rollsnap_=0
+
+# DWHDB Service name
+_dwhdb_service_name_="eniq-dwhdb"
+
+trap 'dbcc_exit; exit' SIGINT SIGQUIT
+$SLEEP 1
+
+check_id
+
+# Check that the effective id of the user is root
+#check_user_id root
+
+# Check the input parameters
+if [ $# -lt 1 ];  then
+        usage_msg
+        exit 1
+fi
+
+# Get  values on runtime
+while getopts "a:fNl:" arg;
+do
+        case $arg in
+                a)      ACTION="$OPTARG"
+                        ;;
+                f)      FULLRUN="YES"
+                        if [ "$ACTION" != "verify_tables" ]; then
+                              usage_msg
+                              _err_msg_="Invalid option with -a. Fullrun only when verifying tables"
+                              abort_script "$_err_msg_"
+                        fi
+                        ;;
+                N)      NO_CONFIRM="YES"
+                        ;;
+                l)      LOGFILE="$OPTARG"
+                        ;;
+                \?)     $ECHO "Invalid option(s) passed"
+                        usage_msg
+                        exit 1
+                        ;;
+        esac
+done
+shift `$EXPR $OPTIND - 1`
+
+# Flag to update given actions (dballoc or verify tables full run) completed
+_action_complete_flag_=0
+DBCC_FULL_RUN_INDICATOR="/eniq/admin/etc/dbcc_full_run_indicator"
+
+# Get the value for -a
+case "${ACTION}" in
+        db_allocation)  dballoc
+                        ;;
+        verify_tables)  _runnumber_status_=`$GREP RUNNUMBER= /eniq/admin/etc/dbcheck.env | $AWK -F\= '{print $2}'`
+                        if [ "$_runnumber_status_" == "" ]; then
+                              _err_msg_="Could not read the RUNNUMBER value from /eniq/admin/etc/dbcheck.env"
+                              abort_script "$_err_msg_"
+                        fi
+
+                        if [ -f ${DBCC_FULL_RUN_INDICATOR} ]; then
+                               if [ ${_runnumber_status_} -eq 0 ]; then
+                                       $ECHO "This is a Full DBCC run. The indicator file /eniq/admin/etc/dbcc_full_run_indicator is already present so that the consistency check does not execute in cron." | $TEE -a ${LOGFILE}
+                                       exit 1
+                               else
+                                       verifytables
+                               fi
+
+                         else
+                               verifytables
+                         fi
+                        ;;
+          iqmsg_check)  iqmsg_chk
+                        ;;
+                    *)  usage_msg
+                        _err_msg_="Invalid argument passed for -a"
+                        abort_script "${_err_msg_}"
+                        ;;
+esac
+
+$RM -rf $TEM_DIR
+$RM -rf ${WORKTMPDIR}
+if [ $? -ne 0 ]; then
+    log_msg -l ${LOGFILE} -t -q -s "Could not delete temp directory $TEM_DIR\n"
+fi
+
+$RM -rf ${_connection_string_enc}
+
+exit 0

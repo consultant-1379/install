@@ -1,0 +1,17 @@
+#
+# This file contains PM Data symbolic links filesystem to be mounted on ENIQ server by connectd daemon
+#
+# NFS		Hostname or ip          Shared Data                 	Mount Point relative
+# Resource	of nfs server           Filesystem                  	to PM_SYM_LINKS_DIR
+#
+# <OSS/NAS>	<NFS Server>            <NFS Share>                 	<Mount Point>
+# OSS		events_oss_1			/ossrc/data/pmMediation/pmData 	/
+#
+OSS			<IP>					/ossrc/data/pmMediation/pmData	/
+NAS			<IP>					/vx/<OSS_POOL_ID>-eniq_pm_vol	/
+SOEM 		        <IP> 					/opt/data/soemdata   /
+ENM			<IP>					<PMLINKS_DIR>	/
+vENM                    <IP>                                    <PMLINKS_DIR>                          /
+
+
+

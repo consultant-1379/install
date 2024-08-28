@@ -1,0 +1,446 @@
+#!/bin/bash
+# ********************************************************************
+# Ericsson Radio Systems AB                                     SCRIPT
+# ********************************************************************
+#
+#
+# (c) Ericsson Radio Systems AB 2020 - All rights reserved.
+#
+# The copyright to the computer program(s) herein is the property
+# of Ericsson Radio Systems AB, Sweden. The programs may be used
+# and/or copied only with the written permission from Ericsson Radio
+# Systems AB or in accordance with the terms and conditions stipulated
+# in the agreement/contract under which the program(s) have been
+# supplied.
+#
+# ********************************************************************
+# Name    : extracttable.bsh
+# Date    : 29/01/2020
+# Revision: \main\8
+# Purpose :  This script is used to extract tables. The sql is generated from
+#        the template. The sql file is removed at the end of run
+#         Thus, presence of the sql file(s) in the indicates running process
+#          
+# Usage   :  bash extracttable.bsh    
+#
+# ********************************************************************
+AWK=/usr/bin/awk
+CAT=/usr/bin/cat
+DATE=/usr/bin/date
+ECHO=/usr/bin/echo
+GREP=/usr/bin/grep
+GZIP=/usr/bin/gzip
+KILL=/usr/bin/kill
+LS=/usr/bin/ls
+MKDIR=/usr/bin/mkdir
+MV=/usr/bin/mv
+RM=/usr/bin/rm
+SED=/usr/bin/sed
+SLEEP=/usr/bin/sleep
+SU=/usr/bin/su
+TAIL=/usr/bin/tail
+TEE=/usr/bin/tee
+TR=/usr/bin/tr
+TOUCH=/usr/bin/touch
+WC=/usr/bin/wc
+
+# Name of ENIQ ini Files
+ENIQ_INI=niq.ini
+
+# ********************************************************************
+#
+#  TRAP handling
+#
+# ********************************************************************
+trap "trap_stop_extracttable" KILL
+
+trap_stop_extracttable()
+{
+    $ECHO "Received a KILL SIGNAL from parent.. Killing extracttable.bsh" | $TEE -a $RESULTSDIR/ExtractedTables_${RUNNUMBER}.log
+    _err_msg_="Killing extracttable.bsh"
+    abort_script "$_err_msg_"
+}
+
+abort_script()
+{
+if [ "$1" ]; then
+    _err_msg_=$1
+else
+    _err_msg_="Script aborted.......\n"
+fi
+$ECHO "$_err_msg_.. Thread aborted"  | $TEE -a $RESULTSDIR/ExtractedTables_${RUNNUMBER}.log
+
+$RM -rf ${EXTRACT_TMPDIR}
+exit 1
+}
+
+extract_files()
+{
+if  [[ "${Table}" == DIM_* ]] || [[ "${Table}" == SELECT_* ]] || [[ "${Table}" == PM_* ]] || [[ "${Table}" == DC_Z_ALARM_* ]] || [[ "${Table}" == LOG_BusyhourHistory ]]
+then
+    dbisql ${connection_string} "$($CAT $RESULTSDIR/countTable_dim.template |$SED "s/USER/$User/g"| $SED "s/TABLE/${Table}/g"  | $SED "s/date_holder/${date_holder}/g" | $SED "s|TMPDIR|${EXTRACT_TMPDIR}|g")" > /dev/null 2>>$RESULTSDIR/ErrorExtractingTable_${RUNNUMBER}.log
+    count_db=$(cat ${EXTRACT_TMPDIR}/count_${Table}_${date_holder}.txt)
+elif  [[ "${Table}" == *_PDP_SESSION_RAW_* ]]
+then
+    dbisql ${connection_string} "$($CAT $RESULTSDIR/countTable_pdp_session.template |$SED "s/USER/$User/g"| $SED "s/TABLE/${Table}/g"  | $SED "s/date_holder/${date_holder}/g" | $SED "s|TMPDIR|${EXTRACT_TMPDIR}|g")" > /dev/null 2>>$RESULTSDIR/ErrorExtractingTable_${RUNNUMBER}.log
+    count_db=$(cat ${EXTRACT_TMPDIR}/count_${Table}_${date_holder}.txt)
+elif [[ "${Table}" == Monitor_Heap ]] || [[ "${Table}" == Monitor_db ]] || [[ "${Table}" == dwh_repdb_count ]]
+then
+    $ECHO "${Table} not to be extracted.. Skipping!" >> $RESULTSDIR/ErrorExtractingTable_${RUNNUMBER}.log
+    exit 0
+else
+    dbisql ${connection_string} "$($CAT $RESULTSDIR/countTable.template |$SED "s/USER/$User/g"| $SED "s/TABLE/${Table}/g"  | $SED "s/date_holder/${date_holder}/g" | $SED "s|TMPDIR|${EXTRACT_TMPDIR}|g")" > /dev/null 2>>$RESULTSDIR/ErrorExtractingTable_${RUNNUMBER}.log
+    count_db=$(cat ${EXTRACT_TMPDIR}/count_${Table}_${date_holder}.txt)
+fi
+rm -f ${EXTRACT_TMPDIR}/count_${Table}_${date_holder}.txt
+
+echo ${Table} | grep -i raw >/dev/null
+if [ $? -eq 0 ]; then
+    raw_table="YES"
+else
+    raw_table="NO"
+fi
+
+if [ "$count_db" -eq "$count_file" -a "$raw_table" == "YES" ] 
+then
+    $ECHO "Table extract for ${User}.${Table} on ${date_holder} has not changed." | $TEE -a $RESULTSDIR/ExtractedTables_${RUNNUMBER}.log
+    status="Success"
+    _size_=`$LS -lth ${extract_dir}/${User}_${Table}xyz${date_holder}.gz | $TR -s " " " " | $AWK -F" " '{print $5}'`
+else
+    rm -f ${extract_dir}/${User}_${Table}xyz${date_holder}.gz
+    dbisql ${connection_string}   $SqlFile > /dev/null 2>>$RESULTSDIR/ErrorExtractingTable_${RUNNUMBER}.log
+    # The table name is pushed into finished log only if not in error
+    if [ $? -eq 0 ]
+    then
+        if [ -s ${extract_dir}/${User}_${Table}xyz${date_holder} ]
+        then
+            $ECHO ${table_details} Extracted. Starting to Zip file | $TEE -a $RESULTSDIR/ExtractedTables_${RUNNUMBER}.log
+            $TOUCH $EXTRACT_TMPDIR/temp_zip_${User}_${Table}xyz${date_holder}
+            $ECHO ${table_details} >> $RESULTSDIR/ExtractedTables_${RUNNUMBER}.log
+            $GZIP -f ${extract_dir}/${User}_${Table}xyz${date_holder}
+            $RM -f $EXTRACT_TMPDIR/temp_zip_${User}_${Table}xyz${date_holder}
+            $ECHO ${table_details}. Finishing zipping file | $TEE -a $RESULTSDIR/ExtractedTables_${RUNNUMBER}.log
+            $ECHO "${User}.${Table} | ${date_holder}" >> ${RESULTSDIR}/Success_Extract_${RUNNUMBER}.txt
+            status="Success"
+            _size_=`$LS -lth ${extract_dir}/${User}_${Table}xyz${date_holder}.gz | $TR -s " " " " | $AWK -F" " '{print $5}'`
+        else
+            $ECHO "Table ${Table} held no data for date ${date_holder}. So cleaning empty extract." | $TEE -a $RESULTSDIR/ExtractedTables_${RUNNUMBER}.log
+            $ECHO "${User}.${Table} | ${date_holder}" >> ${RESULTSDIR}/Empty_Extract_${RUNNUMBER}.txt
+            $RM -f ${extract_dir}/${User}_${Table}xyz${date_holder}
+            status="Empty"
+            _size_=0
+        fi
+        
+        $GREP ${table_details} $RESULTSDIR/FinishedTables_date_${RUNNUMBER}.list >> /dev/null 2>&1
+        if [ $? -ne 0 ]; then
+            $ECHO ${table_details} >> $RESULTSDIR/FinishedTables_date_${RUNNUMBER}.list
+        fi
+        
+    else
+        $ECHO "Error Extracting ${table_details} ..." | $TEE -a $RESULTSDIR/ErrorExtractingTable_${RUNNUMBER}.log 
+        $ECHO "${User}.${Table} | ${date_holder}" >> $RESULTSDIR/Failure_Extract_${RUNNUMBER}.txt
+        $ECHO Check $RESULTSDIR/ErrorExtractingTable_${RUNNUMBER}.log  
+        $ECHO ${table_details} $RESULTSDIR/ExtractedTables_${RUNNUMBER}.list
+        $GREP ${table_details} $RESULTSDIR/FinishedTables_date_${RUNNUMBER}.list >> /dev/null 2>&1
+        if [ $? -ne 0 ]; then
+            $ECHO ${table_details} >> $RESULTSDIR/FinishedTables_date_${RUNNUMBER}.list
+        fi
+        status="Error"
+        _size_="-"
+    fi
+fi
+}
+
+### Function: set_conf_value ###
+#
+#   Common function to set value in file
+#   having the param=value format
+#
+# Arguments:
+#       $1 : Parameter name
+#       $2 : Value
+#       $3 : File name
+# Return Values:
+#       none
+set_conf_value()
+{
+if [ $# -ne 3 ];then
+    _err_msg_="Incorrect number of parameters passed to set_conf_value"
+    abort_script "${_err_msg_}"
+fi
+
+_param_=$1
+_value_=$2
+_file_=$3
+
+TEM_DIR=/tmp
+
+# Update param=value
+# Check if the param exists in file
+
+$GREP "^${_param_}=" ${_file_} >> /dev/null 2>&1
+if [ $? -ne 0 ];then
+    $ECHO "${_param_}=${_value_}" >> ${_file_}
+else
+    #$CAT ${_file_} | $SED 's/"${_param_}=*"/"${_param_}=${_value_}"/' > ${TEM_DIR}/updated_file.$$.$$
+    $CAT ${_file_} | $SED -e 's|'${_param_}'=.*|'${_param_}=${_value_}'|' > ${TEM_DIR}/updated_file.$$.$$
+    if [ $? -ne 0 ];then
+        _err_msg_="Failed to update ${_param_} value in ${_file_}"
+        abort_script "${_err_msg_}"
+    fi
+    $MV ${TEM_DIR}/updated_file.$$.$$ ${_file_}
+    if [ $? -ne 0 ];then
+        _err_msg_="Failed to save ${_param_} value in ${_file_}"
+        abort_script "${_err_msg_}"    
+    fi
+fi
+}
+
+
+
+setup_env()
+{
+ENIQ_BASE_DIR=/eniq
+ENIQ_SW_DIR=${ENIQ_BASE_DIR}/sw
+ENIQ_BKUPSW_DIR=${ENIQ_BASE_DIR}/bkup_sw
+CLI_CONF_DIR=${ENIQ_BASE_DIR}/sw/conf
+ENIQ_ADMIN_DIR=${ENIQ_BASE_DIR}/admin
+ENIQ_ADMIN_ETC=${ENIQ_ADMIN_DIR}/etc
+ENIQ_CORE_BIN_DIR=${ENIQ_BASE_DIR}/installation/core_install/bin/
+
+ENIQ_CONF_DIR=${ENIQ_BASE_DIR}/installation/config
+if [ ! -s ${ENIQ_CONF_DIR}/SunOS.ini ]; then
+    _err_msg_="Could not locate file ${ENIQ_CONF_DIR}/SunOS.ini"
+    abort_script "$_err_msg_"
+fi
+
+# Source the common functions
+if [ -s ${ENIQ_BASE_DIR}/admin/lib/common_functions.lib ]; then
+    . ${ENIQ_BASE_DIR}/admin/lib/common_functions.lib
+else
+    _err_msg_="File ${ENIQ_BASE_DIR}/admin/lib/common_functions.lib not found"
+    abort_script "$_err_msg_"
+fi
+
+    
+DWH_PORT=`iniget DWH -v PortNumber -f ${CLI_CONF_DIR}/${ENIQ_INI}`
+DWH_ENG=`iniget DWH -v ServerName -f ${CLI_CONF_DIR}/${ENIQ_INI}`
+if [ ! "${DWH_PORT}" -o ! "${DWH_ENG}" ]; then
+        _err_msg_="Could not read db values from ${CLI_CONF_DIR}/${ENIQ_INI}"
+        abort_script "$_err_msg_"
+fi
+
+DBA_PASSWORD=`inigetpassword DB -f ${CLI_CONF_DIR}/${ENIQ_INI} -v DBAPassword`
+if [ ! ${DBA_PASSWORD} ]; then
+  if [ -f ${ENIQ_BASE_DIR}/sw/installer/dbusers ]; then
+            DBA_PASSWORD=`${ENIQ_BASE_DIR}/sw/installer/dbusers dba dwh`
+     if [ ! "${DBA_PASSWORD}" ] ; then
+                _err_msg_="Could not get dwhdb DBA Password"
+                abort_script "$_err_msg_"
+     fi
+   fi
+fi
+
+DBEXTRACT_ENV_FILE=${ENIQ_ADMIN_ETC}/dbextract_load.env
+
+_dwh_eng_=`iniget DWH -f ${ENIQ_CONF_DIR}/${ENIQ_INI} -v ServerName`
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not read server name  from ${CLI_CONF_DIR}/${ENIQ_INI}"
+    abort_script "$_err_msg_"
+fi
+
+#Initialising the connection string for dwhdb
+connection_string="-nogui -onerror exit -c \"eng=${DWH_ENG};links=tcpip{host=localhost;port=${DWH_PORT}};uid=dba;pwd=${DBA_PASSWORD}\""
+
+
+. /eniq/sybase_iq/IQ-*/IQ-*.sh >> /dev/null
+sybase_env_variables_ec=$?
+if [ $sybase_env_variables_ec -ne 0 ]; then
+    _err_msg_="Could not source sybase environment"
+    abort_script "$_err_msg_"
+fi
+
+IQISQL=$(which iqisql)
+}
+
+
+##################################
+## Main body of the program
+##################################
+setup_env
+SqlFile=`mktemp -t ExtTabSql.XXXXXXXXXX`
+start_date=`$DATE +'%Y-%m-%d %H:%M:%S'`
+
+table_details=$1
+
+User=`$ECHO ${table_details} | cut -d',' -f1 | $SED "s/'//g"`
+Table=`$ECHO ${table_details} | cut -d',' -f2 | $SED "s/'//g"`
+date_holder=`$ECHO ${table_details} | cut -d',' -f3 | $SED "s/'//g"`
+
+if [ -z "$date_holder" ];
+then
+    date_holder=$(date +'%Y-%m-%d')
+fi
+
+
+avail_space=$(df -k $EXTRACTS | $AWK '{print $4}'|tail -n+2)
+if [ $avail_space -lt 15943040 ]; then
+    $ECHO "Running out of space in the extract folder" | $TEE -a $RESULTSDIR/ErrorExtractingTable_${RUNNUMBER}.log
+    $ECHO "Error Extracting $User.$Table ..." | $TEE -a $RESULTSDIR/ErrorExtractingTable_${RUNNUMBER}.log 
+    $ECHO Check $RESULTSDIR/ErrorExtractingTable_${RUNNUMBER}.log 
+    status="Error"
+    $ECHO "${Table} \t | ${extract_dir}/${User}_${Table}xyz${date_holder}.gz | - \t | - \t | - \t | - \t | - \t | ${date_holder} \t | ${status}" >> ${RESULTSDIR}/extract_info_${RUNNUMBER}.txt
+    $RM -f $SqlFile
+    exit 200
+fi
+
+$GREP $date_holder $RESULTSDIR/distinct_date.txt >/dev/null
+if [ $? -ne 0 ]
+then
+    $ECHO $date_holder>>$RESULTSDIR/distinct_date.txt
+fi
+
+extract_dir=${EXTRACTS}/${date_holder}
+
+
+if [ ! -d ${extract_dir} ]
+then
+    $MKDIR -p ${extract_dir}
+    if [ $? -ne 0 ]  
+    then
+        echo "Failed to create ${extract_dir} folder to run extract for ${User}_${Table}xyz${date_holder}. Exiting extract" | $TEE -a $RESULTSDIR/ExtractedTables_${RUNNUMBER}.log
+        $RM -f $SqlFile
+        exit 1
+    else
+        echo ${extract_dir} created | $TEE -a $RESULTSDIR/ExtractedTables_${RUNNUMBER}.log
+    fi
+fi
+
+number=`$ECHO ${Table: -2}`
+
+if  [[ "${Table}" == DIM_* ]] || [[ "${Table}" == SELECT_* ]] || [[ "${Table}" == PM_* ]] || [[ "${Table}" == DC_Z_ALARM_* ]]
+then
+    if [[ "${Table}" == DIM_E_ENERGY_NODE ]] || [[ "${Table}" == DIM_E_LTE_OPTIMIZATION_NODE ]] || [[ "${Table}" == DIM_E_VOWIFI_NODE ]] || [[ "${Table}" == DIM_E_LTE_OPTIMIZATION_CELL ]] || [[ "${Table}" == DIM_E_LTE_OPTIMIZATION_CELL_RELATION ]]
+    then
+        case ${Table} in
+            DIM_E_ENERGY_NODE|DIM_E_LTE_OPTIMIZATION_NODE|DIM_E_VOWIFI_NODE) auto_incr_col="NODE_ID"
+                ;;
+            DIM_E_LTE_OPTIMIZATION_CELL) auto_incr_col="CELL_ID"
+                ;;
+            DIM_E_LTE_OPTIMIZATION_CELL_RELATION) auto_incr_col="CELL_RELATION_ID"
+                ;;
+        esac
+        $CAT $RESULTSDIR/ExtractTable_dim.template |$SED "s/USER/$User/g"| $SED "s:EXTRACTS:${extract_dir}:g" | $SED "s/TABLE/${Table}/g" | $SED "s/date_holder/${date_holder}/g" | $SED "s/extract_data/extract_data where ${auto_incr_col} != 0/g" > $SqlFile
+    else
+        $CAT $RESULTSDIR/ExtractTable_dim.template |$SED "s/USER/$User/g"| $SED "s:EXTRACTS:${extract_dir}:g" | $SED "s/TABLE/${Table}/g" | $SED "s/date_holder/${date_holder}/g" > $SqlFile
+    fi
+elif  [[ "${Table}" == *_PDP_SESSION_RAW_* ]]
+then
+    $CAT $RESULTSDIR/ExtractTable_pdp_session.template |$SED "s/USER/$User/g"| $SED "s:EXTRACTS:${extract_dir}:g" | $SED "s/TABLE/${Table}/g"  | $SED "s/date_holder/${date_holder}/g"  > $SqlFile
+elif [[ "${Table}" == Monitor_Heap ]] || [[ "${Table}" == Monitor_db ]] || [[ "${Table}" == dwh_repdb_count ]]
+then
+    $ECHO "Skipping extract of ${Table}, not required" >> $RESULTSDIR/ExtractedTables_${RUNNUMBER}.log
+    $GREP ${Table} $RESULTSDIR/FinishedTables_date_${RUNNUMBER}.list >> /dev/null 2>&1
+    if [ $? -ne 0 ]; then
+        $ECHO ${Table} >> $RESULTSDIR/FinishedTables_date_${RUNNUMBER}.list
+    fi
+    exit 0
+elif [[ "${Table}" == LOG_BusyhourHistory ]]
+then
+     $CAT $RESULTSDIR/ExtractTable_dim.template |$SED "s/USER/$User/g"| $SED "s:EXTRACTS:${extract_dir}:g" | $SED "s/TABLE/${Table}/g" | $SED "s/date_holder/${date_holder}/g" |$SED 's|\\n|\&\\n|g' > $SqlFile 
+else
+    $CAT $RESULTSDIR/ExtractTable.template |$SED "s/USER/$User/g"| $SED "s:EXTRACTS:${extract_dir}:g" | $SED "s/TABLE/${Table}/g"  | $SED "s/date_holder/${date_holder}/g"  > $SqlFile
+fi
+
+count_break=0
+ec_no=$(dwhdb status | grep "dwhdb is running OK" >/dev/null;echo $?)
+while [[ ${ec_no} -ne 0 ]]
+do
+    $ECHO "$($DATE +'%Y-%m-%d %H:%M:%S'): Pausing extract of $User.$Table as dwhdb is not running."  | $TEE -a $RESULTSDIR/ExtractedTables_${RUNNUMBER}.log
+    $SLEEP 60
+    ec_no=$(dwhdb status | grep "dwhdb is running OK" >/dev/null;echo $?)
+    let count_break=$count_break+1
+    if [[ count_break -ge 20 ]]
+    then
+        $ECHO "$($DATE +'%Y-%m-%d %H:%M:%S'): Failed Extracting $User.$Table as dwhdb has been down for too long." | $TEE -a $RESULTSDIR/ExtractedTables_${RUNNUMBER}.log   
+        status="Error"
+        $ECHO "${Table} \t | ${extract_dir}/${User}_${Table}xyz${date_holder}.gz | - \t | - \t | - \t | - \t | - \t | ${date_holder} \t | ${status}" >> ${RESULTSDIR}/extract_info_${RUNNUMBER}.txt
+        $RM -f $SqlFile 
+        exit 201
+    fi
+done
+
+if [ ! -e ${extract_dir}/${User}_${Table}xyz${date_holder}.gz ]
+then
+    _zip_status_=`$CAT ${RESULTSDIR}/extract_info_${RUNNUMBER}.txt |$GREP ${User}_${Table}xyz${date_holder}.gz |$AWK -F "|" '{print $NF}' |$TR -d "^ "`
+    
+    if [ "${_zip_status_}" == "Success" -o "${_zip_status_}" == "Empty" ];then
+        count_file=`$CAT ${RESULTSDIR}/extract_info_${RUNNUMBER}.txt |$GREP ${extract_dir}/${User}_${Table}xyz${date_holder}.gz |$AWK -F "|" '{print $7}' |$TR -d "^ "`
+        
+        extract_files
+        
+    else
+        dbisql ${connection_string}   $SqlFile > /dev/null 2>>$RESULTSDIR/ErrorExtractingTable_${RUNNUMBER}.log
+        # The table name is pushed into finished log only if not in error
+        if [ $? -eq 0 ]
+        then
+            if [ -s ${extract_dir}/${User}_${Table}xyz${date_holder} ]
+            then
+                $ECHO ${table_details} Extracted. Starting to Zip file | $TEE -a $RESULTSDIR/ExtractedTables_${RUNNUMBER}.log
+                $TOUCH $EXTRACT_TMPDIR/temp_zip_${User}_${Table}xyz${date_holder}
+                $ECHO ${table_details} >> $RESULTSDIR/ExtractedTables_${RUNNUMBER}.log
+                $GZIP -f ${extract_dir}/${User}_${Table}xyz${date_holder}
+                $RM -f $EXTRACT_TMPDIR/temp_zip_${User}_${Table}xyz${date_holder}
+                $ECHO ${table_details}. Finishing zipping file | $TEE -a $RESULTSDIR/ExtractedTables_${RUNNUMBER}.log
+                $ECHO "${User}.${Table} | ${date_holder}" >> ${RESULTSDIR}/Success_Extract_${RUNNUMBER}.txt
+                count_file=$(/usr/bin/gunzip -c ${extract_dir}/${User}_${Table}xyz${date_holder}.gz | wc -l )
+                status="Success"
+                _size_=`$LS -lth ${extract_dir}/${User}_${Table}xyz${date_holder}.gz | $TR -s " " " " | $AWK -F" " '{print $5}'`
+            else
+                $ECHO "Table ${Table} held no data for date ${date_holder}. So cleaning empty extract." | $TEE -a $RESULTSDIR/ExtractedTables_${RUNNUMBER}.log
+                $ECHO "${User}.${Table} | ${date_holder}" >> ${RESULTSDIR}/Empty_Extract_${RUNNUMBER}.txt
+                $RM -f ${extract_dir}/${User}_${Table}xyz${date_holder}
+                count_file=0
+                status="Empty"
+                _size_=0
+            fi
+            $GREP ${table_details} $RESULTSDIR/FinishedTables_date_${RUNNUMBER}.list >> /dev/null 2>&1
+            if [ $? -ne 0 ]; then
+                $ECHO ${table_details} >> $RESULTSDIR/FinishedTables_date_${RUNNUMBER}.list
+            fi
+            
+        else
+            $ECHO "Error Extracting ${table_details} ..." | $TEE -a $RESULTSDIR/ErrorExtractingTable_${RUNNUMBER}.log 
+            $ECHO "${User}.${Table} | ${date_holder}" >> $RESULTSDIR/Failure_Extract_${RUNNUMBER}.txt
+            $ECHO Check $RESULTSDIR/ErrorExtractingTable_${RUNNUMBER}.log  
+            $ECHO ${table_details} $RESULTSDIR/ExtractedTables_${RUNNUMBER}.list
+            $GREP ${table_details} $RESULTSDIR/FinishedTables_date_${RUNNUMBER}.list >> /dev/null 2>&1
+            if [ $? -ne 0 ]; then
+                $ECHO ${table_details} >> $RESULTSDIR/FinishedTables_date_${RUNNUMBER}.list
+            fi
+            count_file=0
+            status="Error"
+            _size_="-"
+        fi
+    fi
+else
+    count_file=$(/usr/bin/gunzip -c ${extract_dir}/${User}_${Table}xyz${date_holder}.gz | wc -l )
+    
+    extract_files
+fi
+
+#Removing the file whose zip could not be created
+if [ -f ${extract_dir}/${User}_${Table}xyz${date_holder} ]; then
+    $RM ${extract_dir}/${User}_${Table}xyz${date_holder}
+    if [ $? -eq 0 ]; then
+        $ECHO "$($DATE +'%Y-%m-%d %H:%M:%S'): Failed to create zip of ${extract_dir}/${User}_${Table}xyz${date_holder}, so removing the file" | $TEE -a $RESULTSDIR/ExtractedTables_${RUNNUMBER}.log 
+    else
+        $ECHO "$($DATE +'%Y-%m-%d %H:%M:%S'): Failed to remove ${extract_dir}/${User}_${Table}xyz${date_holder}, please remove this file manually" | $TEE -a $RESULTSDIR/ExtractedTables_${RUNNUMBER}.log
+    fi
+fi
+
+$RM -f $SqlFile 
+end_date=`$DATE +'%Y-%m-%d %H:%M:%S'`
+
+## Format -- "TABLE_NAME \t | FILE_NAME \t |  SIZE \t | E_START_TIME \t | E_END_TIME \t | ROW_COUNT_DB \t | ROW_COUNT_FILE \t | DATE \t | STATUS" >> ${RESULTSDIR}/extract_info.txt
+$ECHO "${Table} \t | ${extract_dir}/${User}_${Table}xyz${date_holder}.gz | ${_size_} \t | ${start_date} \t | ${end_date} \t | ${count_db} \t | ${count_file} \t | ${date_holder} \t | ${status}" >> ${RESULTSDIR}/extract_info_${RUNNUMBER}.txt

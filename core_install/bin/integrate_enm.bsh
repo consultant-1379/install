@@ -1,0 +1,176 @@
+#!/bin/bash
+# ********************************************************************
+# Ericsson Radio Systems AB                                     SCRIPT
+# ********************************************************************
+#
+#
+# (c) Ericsson Radio Systems AB 2022 - All rights reserved.
+#
+# The copyright to the computer program(s) herein is the property
+# of Ericsson Radio Systems AB, Sweden. The programs may be used
+# and/or copied only with the written permission from Ericsson Radio
+# Systems AB or in accordance with the terms and conditions stipulated
+# in the agreement/contract under which the program(s) have been
+# supplied.
+#
+# ********************************************************************
+# Name    : integrate_enm.bsh
+# Date    : 12/10/2023
+# Revision: \main\9
+# Purpose : Main wrapper script handling the mounting of OSS and ENM
+#
+# Usage   : integrate_enm.bsh
+#
+# ********************************************************************
+#
+#   Command Section
+#
+# ********************************************************************
+AWK=/usr/bin/awk
+BASH=/usr/bin/bash
+CAT=/usr/bin/cat
+ECHO='/usr/bin/echo -e'
+EGREP=/usr/bin/egrep
+RM=/usr/bin/rm
+LS=/usr/bin/ls
+
+
+run_remote_engine()
+{
+        if [ "${CURR_SERVER_TYPE}" = "stats_coordinator" ]; then
+
+           run_remote_cmd "${ENGINE_HOST_NAME}" "$1" "$LOGFILE"
+
+        else
+
+           $1
+
+        fi
+}
+
+abort_script()
+{
+_err_time_=`$DATE '+%Y-%b-%d_%H.%M.%S'`
+
+if [ "$1" ]; then
+    _err_msg_=$1
+else
+    _err_msg_="${_err_time_} - ERROR : Script aborted.......\n"
+fi
+
+if [ "${LOGFILE}" ]; then
+    $ECHO "\n${_err_time_} - ERROR : $_err_msg_\n" | $TEE -a ${LOGFILE}
+else
+    $ECHO "\n${_err_time_} - ERROR : $_err_msg_\n"
+fi
+
+$RM -rf ${TEM_DIR}
+
+run_remote_engine "$RM  /tmp/enm_mode_fls" > /dev/null 2>&1
+
+exit 1
+}
+
+
+setup_env()
+{
+#Eniq base directory
+ENIQ_BASE_DIR=/eniq
+
+ENIQ_LOG_DIR=${ENIQ_BASE_DIR}/local_logs
+
+# Main Directory for the Core Installation SW
+ENIQ_INST_DIR=${ENIQ_BASE_DIR}/installation
+
+# Main Directory for the Core Installation SW
+ENIQ_CORE_INST_DIR=${ENIQ_INST_DIR}/core_install
+
+# ENIQ Config Directory
+ENIQ_CONF_DIR=${ENIQ_INST_DIR}/config
+
+FLS_CONFIG_FILE=${ENIQ_CONF_DIR}/fls_conf
+
+# Source the common functions
+if [ -s $ENIQ_CORE_INST_DIR/lib/common_functions.lib ]; then
+    . $ENIQ_CORE_INST_DIR/lib/common_functions.lib
+else
+    _err_msg_="File $ENIQ_CORE_INST_DIR/lib/common_functions.lib not found"
+    abort_script "$_err_msg_"
+fi
+
+# Source the common functions
+if [ -s $ENIQ_CORE_INST_DIR/lib/common_functions.lib ]; then
+    . $ENIQ_CORE_INST_DIR/lib/common_functions.lib
+else
+    _err_msg_="File $ENIQ_CORE_INST_DIR/lib/common_functions.lib not found"
+    abort_script "$_err_msg_"
+fi
+
+CURR_SERVER_TYPE=`$CAT ${ENIQ_CONF_DIR}/installed_server_type`
+
+CONNECTD_DIR=${ENIQ_BASE_DIR}/connectd/bin
+
+ENGINE_HOST_NAME=`$CAT /etc/hosts |$EGREP -w engine |$AWK '{print $2}'`
+}
+
+### Function: check_server_type ###
+#
+#   Check the server type is equal to coordinator or not.
+#   If not print error msg and exit.
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+check_server_type()
+{
+if [ "$CURR_SERVER_TYPE" != "stats_coordinator" -a "$CURR_SERVER_TYPE" != "eniq_stats" ]; then
+    _err_msg_="You must be Coordinator to execute this script."
+    abort_script "$_err_msg_"
+fi
+}
+
+# **********************************************************************
+#
+# ********************** Main body of program  *************************
+#
+# **********************************************************************
+#
+setup_env
+
+check_server_type
+
+LOGFILE=${ENIQ_LOG_DIR}/mount_oss_enm.log
+
+# Removing the indicator file before starting the script
+run_remote_engine "$RM /tmp/enm_mode_fls" > /dev/null 2>&1
+
+log_msg -h -s "Starting to execute script ${CONNECTD_DIR}/mount_server.bsh on engine server" -l ${LOGFILE}
+
+run_remote_engine "$BASH ${CONNECTD_DIR}/mount_server.bsh"
+if [ $? -ne 0 ];then
+    _err_msg_="Could not execute $BASH ${CONNECTD_DIR}/mount_server.bsh on engine server "
+    abort_script "$_err_msg_"
+fi
+log_msg -h -s "Successfully completed ${CONNECTD_DIR}/mount_server.bsh" -l ${LOGFILE}
+
+run_remote_engine "$LS /tmp/enm_mode_fls" > /dev/null 2>&1
+if [ $? -eq 0 ];then
+         log_msg -s "/tmp/enm_mode_fls file found on engine" -l ${LOGFILE}
+        _oss_aliasname_=`run_remote_engine "$CAT /tmp/enm_mode_fls " | $TR -d "\r"` 2>/dev/null
+    if [ -z "${_oss_aliasname_}" ];then
+        _err_msg_="Could not get OSS Alias name"
+         abort_script "$_err_msg_"
+    fi
+        
+        log_msg -s "Starting to execute script using below command:" -l ${LOGFILE}
+        log_msg -s "$BASH ${ENIQ_CORE_INST_DIR}/bin/configure_enm_mode.bsh -a fls -n ${_oss_aliasname_} -e" -l ${LOGFILE}
+
+        $BASH ${ENIQ_CORE_INST_DIR}/bin/configure_enm_mode.bsh -a fls -n ${_oss_aliasname_} -e
+    if [ $? -ne 0 ];then
+          _err_msg_="Could not execute ${ENIQ_CORE_INST_DIR}/bin/configure_enm_mode.bsh "    
+        abort_script "$_err_msg_"
+    fi
+        log_msg -s "Successfully completed ${ENIQ_CORE_INST_DIR}/bin/configure_enm_mode.bsh" -l ${LOGFILE} 
+fi
+log_msg -s "Successfully completed OSS Mount Configuration\n" -l ${LOGFILE}

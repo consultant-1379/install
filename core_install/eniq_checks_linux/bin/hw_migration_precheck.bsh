@@ -1,0 +1,437 @@
+#!/bin/bash
+# ********************************************************************
+#
+# (c) Ericsson Radio Systems AB 2020 - All rights reserved.
+#
+# The copyright to the computer program(s) herein is the property
+# of Ericsson Radio Systems AB, Sweden. The programs may be used
+# and/or copied only with the written permission from Ericsson Radio
+# Systems AB or in accordance with the terms and conditions stipulated
+# in the agreement/contract under which the program(s) have been
+# supplied.
+#
+# ********************************************************************
+#
+# Name    : hw_migration_prechecks.bsh
+# Date    : 15/10/2023
+# Revision: \main\4
+#
+# Purpose : 1. This script will support Pre-checks for vnx to unity migration.
+#
+# ********************************************************************
+#
+#   Command Section
+#
+# ********************************************************************
+
+AWK=/usr/bin/awk
+CAT=/usr/bin/cat
+CUT=/usr/bin/cut
+CP=/usr/bin/cp
+DATE=/usr/bin/date
+DIRNAME=/usr/bin/dirname
+ECHO='/usr/bin/echo -e'
+GETENT=/usr/bin/getent
+GREP=/usr/bin/grep
+HEAD=/usr/bin/head
+MYHOSTNAME=/usr/bin/hostname
+ID=/usr/bin/id
+PERL=/usr/bin/perl
+RM=/usr/bin/rm
+WC=/usr/bin/wc
+### Function: abort_script ###
+#
+#   This will be called if the script is aborted by an error
+#   which is encountered during runtime
+#
+# Arguments:
+#       $1 - Error message from part of program (Not always used)
+# Return Values:
+#       none
+abort_script()
+{
+_err_time_=`$DATE '+%Y-%b-%d_%H.%M.%S'`
+
+if [ "$1" ]; then
+    _err_msg_="${_err_time_} - $1"
+else
+    _err_msg_="${_err_time_} - ERROR : Script aborted.......\n"
+fi
+
+if [ "${LOGFILE}" ]; then
+    $ECHO "\nERROR : ${_err_msg_}\n" | $TEE -a ${LOGFILE}
+else
+    $ECHO "\nERROR : ${_err_msg_}\n"
+fi
+
+
+$RM -rf ${TEM_DIR}
+
+exit 1
+}
+
+### Function: check_create_logfiles ###
+#
+# Check/Create Logfile
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+check_create_logfiles()
+{
+
+if [ ! "${LOGFILE}" ]; then
+    LOGFILE=${ENIQ_LOCAL_LOGS}/precheck_logs/hw_migration_prechecks.log
+fi
+
+$MKDIR -p `$DIRNAME ${LOGFILE}`
+if [ $? -ne 0 ]; then
+        log_msg -s "Could not create directory `$DIRNAME ${LOGFILE}`." -l "${LOGFILE}"
+        exit 1
+fi
+
+$TOUCH -a ${LOGFILE}
+if [ $? -ne 0 ]; then
+    log_msg -s "Could not create file ${LOGFILE}." -l "${LOGFILE}"
+fi
+
+}
+
+
+### Function: check_id ###
+#
+#   Check that the effective id of the user is correct
+#   If not print error msg and exit.
+#
+# Arguments:
+#       $1 : User ID name
+# Return Values:
+#       0 for success; 1 for failure;
+check_id()
+{
+_check_id_=`$ID  | $AWK -F\( '{print $2}' | $AWK -F\) '{print $1}'`
+if [ "${_check_id_}" != "$1" ]; then
+    log_msg -s "ERROR:: You must be ROOT to execute Script $0 - exiting ." -l "${LOGFILE}"
+fi
+}
+
+### Function: check_ini_file ###
+#
+# Check there should not present blank line in SunOS.ini and block_storage.ini file
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+check_ini_file()
+{
+
+log_msg -h -t -s "Starting Pre-check :INI File Formatting on ${HNAME}" -l "${LOGFILE}"
+
+# ini file list
+ini_file_list="${SUNOS_INI} ${BLOCK_STORAGE_INI}"
+# start reading file one by one
+for _ini_file_ in ${ini_file_list}; do  >> /dev/null 2>&1
+    $CP -p ${_ini_file_} ${_ini_file_}_test
+    log_msg -s "start checking ${_ini_file_} file." -l "${LOGFILE}"
+    # start reading  file
+    local _blank_line_exists_=false
+    # use to read faulty file
+    local  i=0
+    # start reading file 
+    while IFS= read -r line; do  >> /dev/null 2>&1
+        # if previous line is blank and current line is blank
+        if [ "${_blank_line_exists_}" == true ] && [ -z "${line}" ];then
+            $ECHO "hello"  > /dev/null
+        else
+            # if previous line is blank and current line is not blank 
+            if [ ! -z "${line}" ] && [ ${_blank_line_exists_} == true ] ;then
+                if [[ "$line" =~ ['\['] ]];then
+                    $ECHO "found"  >> /dev/null 2>&1
+                elif  [[ "$line" =~ ['^;'] ]];then
+                    $ECHO "found"  >> /dev/null 2>&1
+                else
+                    log_msg -s "ERROR:: Formatting issue with ${_ini_file_} file. " -l "${LOGFILE}"
+                    log_msg -s "INFO :: Blank line exists on line number:- ${i} Remove blank line." -l "${LOGFILE}"
+                    local error=false
+                fi
+            fi
+        fi
+        # set flag for line is blank or not
+        if [ -z ${line} ];then
+            _blank_line_exists_=true
+        else
+            _blank_line_exists_=false
+        fi
+         i=$((i+1))
+    done < ${_ini_file_}_test
+log_msg -s "Checked ${ini_file} file." -l "${LOGFILE}"
+$RM -rf ${_ini_file_}_test
+done >> /dev/null 2>&1
+
+
+if [ "${error}" ==  false ];then
+    log_msg  -t -s "ERROR::ini file are not configured properly .Check logfile ${LOGFILE}" -l "${LOGFILE}"
+else
+    log_msg  -t -s "SUCCESS :: All configuration files successfully checked." -l "${LOGFILE}"
+fi
+}
+
+### Function: check_oss_mount_point ###
+#
+# Check oss mount point
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+check_oss_mount_point()
+{
+
+log_msg -h -t -s "Starting Pre-check : OSS Mount Point." -l "${LOGFILE}"
+local success=true
+#check server type
+if [ "${CURR_SERVER_TYPE}" == "stats_coordinator" -o "${CURR_SERVER_TYPE}" == "eniq_stats" ]; then
+    if [ -f ${FLS_CONF} ]; then
+        oss_mount_point=`$CAT ${FLS_CONF}`
+        if [ -z "${oss_mount_point}" ];then
+            log_msg -s "INFO :: OSS mount point not found in ${FLS_CONF} file." -l "${LOGFILE}"
+        else
+            local file_list="${SUNOS_INI_VNX} ${SUNOS_INI} "
+            for _file_ in ${file_list};do
+                local _count_ _ip_address__ _serv_hostname_
+                _count_=`echo ${_file_} |grep -o "::" | wc -l`
+                for _oss_alias_ in ${oss_mount_point}; do 
+                    for _line_ in `$CAT ${VAR_TMP_DIR}/server_order_list`;do
+                        if [ "${_ip_type_}" == "IPv6" ] && [ "${_count_}" == 3 ]; then
+                            _ip_address__=`$ECHO ${_line_} |$GREP -oE '([a-fA-F0-9]{1,4}::?){1,7}[a-fA-F0-9]{1,4}' | $HEAD -n 1 | $AWK -F "::" '{ print $1 "::" $2}'`
+                            _serv_hostname_=`$ECHO ${_line_} | $AWK -F"::" '{print $3}'`
+                        else
+                            _ip_address__=`$ECHO ${_line_} | $AWK -F"::" '{print $1}'`
+                            _serv_hostname_=`$ECHO ${_line_} | $AWK -F"::" '{print $2}'`
+                        fi
+                        if [ "${_ip_address__}" != "${HOST_IP}" ]; then
+                                oss_alias_=`run_remote_cmd "${_serv_hostname_}" " $CAT ${_file_} | $GREP -w ${_oss_alias_}"`
+                                $ECHO ${oss_alias_} | $GREP -w ${_oss_alias_} > /dev/null 2>&1;
+                                if [ $? -ne 0 ]; then 
+                                     log_msg -s "FAILURE :: ${_oss_alias_} mount point not found in ${_file_} on server ${_serv_hostname_}." -l "${LOGFILE}"
+                                     success=false
+                                fi
+                        else
+                                 $CAT ${_file_} | $GREP -w ${_oss_alias_} > /dev/null 2>&1;
+                                 if [ $? -ne 0 ]; then 
+                                     log_msg -s "FAILURE :: ${_oss_alias_} mount point not found in ${_file_} on server ${_serv_hostname_}." -l "${LOGFILE}"
+                                     success=false
+                                 fi
+                        fi
+                    done   
+                done
+            done
+        fi
+    else
+        log_msg -s "INFO :: ${FLS_CONF} file not present on server.FLS is not configured" -l "${LOGFILE}"
+    fi
+fi
+
+if [ "${success}" == true ];then
+    log_msg -t -s "SUCCESS :: All OSS entries checked." -l "${LOGFILE}"
+fi
+}
+
+### Function: get_absolute_path ###
+#
+# Determine absolute path to software
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+get_absolute_path()
+{
+_dir_=`$DIRNAME $0`
+SCRIPTHOME=`cd $_dir_ 2>/dev/null && pwd || $ECHO $_dir_`
+}
+
+
+### Function: get_deployment_order ###
+#
+# Get the order of the deployment
+# for performing required functionality based on action type
+#
+# Arguments: none
+#
+# Return Values: none
+get_deployment_order()
+{
+$RM -rf ${VAR_TMP_DIR}/server_order_list
+
+# Get an ordered list of servers based on the server_list file
+$PERL ${ENIQ_CORE_INST_DIR}/lib/get_ip_order.pl -f ${VAR_TMP_DIR}/server_order_list
+if [ $? -ne 0 ]; then
+    log_msg -s "WARNING :: Could not get an ordered list of servers" -l "${LOGFILE}"
+fi
+}
+
+### Function: setup_env ###
+#
+# Set up environment variables for script.
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+setup_env()
+{
+
+#Eniq Base Directory
+ENIQ_BASE_DIR=/eniq
+
+#Eniq Installation Directory
+ENIQ_INST_DIR=${ENIQ_BASE_DIR}/installation
+
+# Main Directory for the Core Installation SW
+ENIQ_CORE_INST_DIR=${ENIQ_INST_DIR}/core_install
+
+# Eniq installation config directory
+ENIQ_INST_CONFIG=${ENIQ_INST_DIR}/config
+
+# FLS CONFIG file
+FLS_CONF=${ENIQ_INST_CONFIG}/fls_conf
+
+ENIQ_LOCAL_LOGS=${ENIQ_BASE_DIR}/local_logs
+
+CORE_INST_TEMPLATE=${ENIQ_CORE_INST_DIR}/templates
+
+CORE_INST_TEMPLATE_STATS=${CORE_INST_TEMPLATE}/stats
+
+READER_TYPE=${ENIQ_INST_CONFIG}/install_reader_type
+
+
+SUNOS_INI=${ENIQ_INST_CONFIG}/SunOS.ini
+NIQ_INI=${ENIQ_INST_CONFIG}/niq.ini
+BLOCK_STORAGE_INI=${ENIQ_INST_CONFIG}/block_storage.ini
+SUNOS_INI_VNX=${CORE_INST_TEMPLATE_STATS}/SunOS.ini_vnx
+IPMP_INI=${ENIQ_INST_CONFIG}/ipmp.ini
+
+# Var directory 
+VAR=/var
+
+ENIQ_SW_CONF=${ENIQ_BASE_DIR}/sw/conf
+
+ENIQ_ADMIN_DIR=${ENIQ_BASE_DIR}/admin
+
+
+MIGRATION_LIB=${ENIQ_INST_DIR}/core_install/lib
+#Var tmp diectory
+VAR_TMP_DIR=${VAR}/tmp
+# Cmd to exec a shell and drop user to it in case of an error
+EXEC_SHELL_CMD="exec /bin/bash -o emacs"
+
+# Source the common functions
+_common_functions_list_="common_functions.lib common_core_install_functions.lib common_migration_functions.lib"
+for _lib_file_ in ${_common_functions_list_}; do
+    if [ -s ${SCRIPTHOME}/../../lib/${_lib_file_} ]; then
+      . ${SCRIPTHOME}/../../lib/${_lib_file_}
+    else
+      _err_msg_="File ${SCRIPTHOME}/../../lib/${_lib_file_} not found"
+      abort_script "${_err_msg_}" 
+    fi
+done
+
+# Get current server type
+CURR_SERVER_TYPE=`$CAT ${ENIQ_INST_CONFIG}/installed_server_type | $EGREP -v  '^[[:blank:]]*#' | $SED -e 's/ //g'`
+if [ ! "${CURR_SERVER_TYPE}" ]; then
+    log_msg -s "WARNING :: Could not determine which server type this is" -l "${LOGFILE}"
+    exit 1
+fi
+
+DEFAULT_USER=root
+
+# Hostname Information
+HNAME=`${MYHOSTNAME}`
+HOST_IP=`${MYHOSTNAME} -i | $AWK '{print $1}' `
+
+# Source the common functions
+if [ -s ${ENIQ_BASE_DIR}/admin/lib/common_functions.lib ]; then
+    . ${ENIQ_BASE_DIR}/admin/lib/common_functions.lib
+else
+    _err_msg_="File ${ENIQ_BASE_DIR}/admin/lib/common_functions.lib not found"
+    abort_script "$_err_msg_"
+fi
+
+
+#get ip type 
+if [ -f ${ENIQ_CONF_DIR}/ip_type ]; then
+   _ip_type_=`$CAT ${ENIQ_CONF_DIR}/ip_type`
+   if [ ! "${_ip_type_}" ]; then
+       _err_msg_="Could not read parameter _ip_type_ from file ${ENIQ_CONF_DIR}/${IPMP_INI}"
+       abort_script "$_err_msg_"
+   fi
+fi
+}
+
+
+# ********************************************************************
+#
+#   Main body of program
+#
+# ********************************************************************
+#
+
+RUN_TIME=`$DATE '+%Y-%b-%d_%H.%M.%S'`
+
+#get Absolute Path
+get_absolute_path
+
+#setup environment
+setup_env
+
+#Check User
+check_id $DEFAULT_USER
+
+#chk_create_logfile
+check_create_logfiles
+
+if [ "${CURR_SERVER_TYPE}" == "stats_coordinator" -o "${CURR_SERVER_TYPE}" == "eniq_stats" ]; then
+    # Get server list
+    get_deployment_order 
+    
+    log_msg  -h -t -s "Pre-Checkes started  " -l "${LOGFILE}"
+
+    # get SAN details
+    if [ -f ${ENIQ_INST_CONFIG}/san_details ];then
+        SAN_DEVICE=`$CAT ${ENIQ_INST_CONFIG}/san_details | $GREP -w SAN_DEVICE | $CUT -f 2 -d =`
+        if [ "${SAN_DEVICE}" == "vnx" ];then
+            # check oss mont points 
+            check_oss_mount_point
+        fi
+    else
+        log_msg -s "WARNING : Could not find ${ENIQ_INST_CONFIG}/san_details file to get hardware type" -l "${LOGFILE}"
+    fi
+
+    for _line_ in `$CAT ${VAR_TMP_DIR}/server_order_list`;do
+        _count_=`echo ${_line_} |grep -o "::" | wc -l`
+        if [ "${_ip_type_}" == "IPv6" ] && [ "${_count_}" == 3 ]; then
+             _ip_address__=`$ECHO ${_line_} |$GREP -oE '([a-fA-F0-9]{1,4}::?){1,7}[a-fA-F0-9]{1,4}' | $HEAD -n 1 | $AWK -F "::" '{ print $1 "::" $2}'`
+             _serv_hostname_=`$ECHO ${_line_} | $AWK -F"::" '{print $3}'`
+        else
+             _ip_address__=`$ECHO ${_line_} | $AWK -F"::" '{print $1}'`
+             _serv_hostname_=`$ECHO ${_line_} | $AWK -F"::" '{print $2}'`
+        fi 
+        if [ "${_ip_address__}" == "${HOST_IP}" ]; then
+            # check ini files
+            check_ini_file
+        else
+            run_remote_cmd "${_serv_hostname_}" "$BASH ${SCRIPTHOME}/hw_migration_precheck.bsh" "$LOGFILE"
+            if [ $? -ne 0 ]; then 
+                log_msg -s "FAILURE :: Could not run file on other servers." -l "${LOGFILE}"
+            fi
+        fi
+    done
+    log_msg -h -t -s "Pre-Checkes completed" -l "${LOGFILE}"
+else
+    # check ini files on secondary blades
+    check_ini_file
+fi
+exit 0

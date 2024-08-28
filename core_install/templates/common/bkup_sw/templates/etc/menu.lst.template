@@ -1,0 +1,17 @@
+# default menu entry to boot
+default 0
+#
+# menu timeout in second before default OS is booted
+# set to -1 to wait for user input
+timeout 10
+#
+#---------- ADDED BY BOOTADM - DO NOT EDIT ----------
+title <CHANGE><GRUB_ID_STR>
+kernel /platform/i86pc/multiboot
+module /platform/i86pc/boot_archive
+#---------------------END BOOTADM--------------------
+#---------- ADDED BY BOOTADM - DO NOT EDIT ----------
+title <CHANGE><GRUB_ID_STR> failsafe
+kernel /boot/multiboot kernel/unix -s
+module /boot/x86.miniroot-safe
+#---------------------END BOOTADM--------------------

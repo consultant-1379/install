@@ -1,0 +1,1001 @@
+#!/bin/bash
+# ********************************************************************
+# Ericsson Radio Systems AB                                     SCRIPT
+# ********************************************************************
+#
+#
+# (c) Ericsson Radio Systems AB 2022 - All rights reserved.
+#
+# The copyright to the computer program(s) herein is the property
+# of Ericsson Radio Systems AB, Sweden. The programs may be used 
+# and/or copied only with the written permission from Ericsson Radio 
+# Systems AB or in accordance with the terms and conditions stipulated 
+# in the agreement/contract under which the program(s) have been 
+# supplied.
+#
+# ********************************************************************
+# Name    : cleanup_sybase_logs.bsh
+# Date    : 11/09/2023
+# Revision: /main/19
+# Purpose : This script will cleanup after a successful ENIQ Backup
+#           snapshot has been taken. 
+#           It will delete all listed file from the archive directories.
+#
+# Usage   : cleanup_sybase_logs.bsh [ -l <path_to_logfile> ] [ -N ] -q
+#           
+# ********************************************************************
+#
+#  Command Section
+#
+# ********************************************************************
+AWK=/usr/bin/awk
+BASENAME=/usr/bin/basename
+CAT=/usr/bin/cat
+CHMOD=/usr/bin/chmod
+CLEAR=/usr/bin/clear
+DATE=/usr/bin/date
+DIRNAME=/usr/bin/dirname
+ECHO='/usr/bin/echo -e'
+EGREP=/usr/bin/egrep
+ENV=/usr/bin/env
+EXPR=/usr/bin/expr
+FIND=/usr/bin/find
+HEAD=/usr/bin/head
+ID=/usr/bin/id
+MKDIR=/usr/bin/mkdir
+MV=/usr/bin/mv
+RM=/usr/bin/rm
+SED=/usr/bin/sed
+SU=/usr/bin/su
+TEE=/usr/bin/tee
+TOUCH=/usr/bin/touch
+
+# ********************************************************************
+#
+#       Configuration Section
+#
+# ********************************************************************
+# Flag to determine whether to compress log or not (Must be y/n)
+COMPRESS_LOG=y
+
+# Name of SunOS & ENIQ ini Files
+ENIQ_ENV=niq.rc
+ENIQ_INI=niq.ini
+SUNOS_INI=SunOS.ini
+STORAGE_INI=storage.ini
+
+# Number of log files to keep
+NUM_LOGS=10
+
+# Size in kbytes that the log file is allowed to grow to
+SIZE_LOGS=204800
+
+LOG_RETENTION=90
+STATS_IQMSG_RETENTION=90
+
+LOG_STRINGS="srvlog* stderr"
+
+# ********************************************************************
+#
+#       Pre-execution Operations
+#
+# ********************************************************************
+unset SNAP_QUIET
+
+# ********************************************************************
+#
+# 	functions
+#
+# ********************************************************************
+### Function: abort_script ###
+#
+#   This will is called if the script is aborted through an error
+#   error signal sent by the kernel such as CTRL-C or if a serious
+#   error is encountered during runtime
+#
+# Arguments:
+#       $1 - Error message from part of program (Not always used)
+# Return Values:
+#       none
+abort_script()
+{
+if [ "$1" ]; then
+    _err_msg_=$1
+else
+    _err_msg_="Script aborted.......\n"    
+fi
+
+# Check if log_msg() is defined, else define log()
+type log_msg > /dev/null 2>&1
+if [ $? -gt 0 ]; then
+    if [ "${LOGFILE}" ]; then
+	if [ ! "${SNAP_QUIET}" ]; then
+	    $ECHO "\n${_err_msg_}\n" |$TEE -a ${LOGFILE}
+        else
+            $ECHO "\n${_err_msg_}\n" >> ${LOGFILE}
+        fi
+    else
+          $ECHO "\n${_err_msg_}\n"  
+   fi
+else
+    if [ "${LOGFILE}" ]; then
+        log_msg -s "\n${_err_msg_}\n" -l ${LOGFILE} ${SNAP_QUIET}
+    else
+        log_msg -s "\n${_err_msg_}\n" ${SNAP_QUIET}
+    fi
+fi
+
+cd $SCRIPTHOME
+
+$RM -rf  ${TEM_DIR}
+$RM -rf ${rep_conn_str_enc}
+$RM -rf ${conn_str_dwh_enc}
+$RM -rf ${conn_str_rep_enc}
+
+if [ "$2" ]; then
+    exit ${2}
+else
+   exit 1
+fi
+}
+
+### Function: check_id ###
+#
+#   Check that the effective id of the user is correct
+#   If not print error msg and exit.
+#
+# Arguments:
+#       $1 : User ID name
+# Return Values:
+#       none
+check_id()
+{
+_check_id_=`$ID  | $AWK -F\( '{print $2}' | $AWK -F\) '{print $1}'`
+if [ "$_check_id_" != "$1" ]; then
+    _err_msg_="You must be $1 to execute this script."
+    abort_script "$_err_msg_"
+fi
+}
+
+### Function: chk_create_logfile ###
+#
+# Check/Create Logfile
+#
+# Arguments:
+#	none
+# Return Values:
+#	none
+chk_create_logfile()
+{
+$MKDIR -p `$DIRNAME ${LOGFILE}`
+if [ $? -ne 0 ]; then
+    unset LOGFILE
+    _err_msg_="Could not create directory `$DIRNAME ${LOGFILE}`"
+     abort_script "$_err_msg_"
+fi	
+
+$TOUCH -a ${LOGFILE}
+if [ $? -ne 0 ]; then
+    unset LOGFILE
+    _err_msg_="Could not write to file ${LOGFILE}"
+    abort_script "$_err_msg_"
+fi	
+
+if [ -s ${LOGFILE} ]; then
+    log_msg -l ${LOGFILE} -s "\n\n" -q         
+fi
+
+log_msg -t -l ${LOGFILE} -s "Sybase log cleanup started.\n" -h -q
+}
+
+### Function: delete_iq_admin_logs ###
+#
+# Delete old iq admin log files
+#
+# Arguments:
+#	$1 : file string to searsh for
+#	$2 : directory where the logs exist
+#	$3 : no of days old the logs to be removed
+#       $4 : Flag to indicate quiet/verbose operation
+#
+# Return Values:
+#	none
+delete_iq_admin_logs()
+{
+local _file_ _dir_ _age_
+
+_string_=${1}
+_dir_=${2}
+_age_=${3}
+if [ "${4}" ]; then
+    _bkup_quiet_="-q"
+fi
+
+ log_msg -t -s "Checking for ${_string_} files to delete."  -l ${LOGFILE} ${SNAP_QUIET}
+
+$FIND ${_dir_} -name "${_string_}*" -mtime +${_age_} -exec ls {} \; > ${TEM_DIR}/${_string_}_list
+if [ -s ${TEM_DIR}/${_string_}_list ]; then
+    for _file_ in `$CAT ${TEM_DIR}/${_string_}_list`; do
+        log_msg -t -s "Removing old log file ${_file_}.\n"  -l ${LOGFILE} ${SNAP_QUIET}
+        $RM ${_file_}
+        if [ $? -ne 0 ]; then
+            _err_msg_="Could not delete old log file ${_file_}"
+            abort_script "$_err_msg_"
+        fi 
+    done
+else
+    log_msg -t -s "No logs files for ${_string_} found to delete.\n"  -l ${LOGFILE} ${SNAP_QUIET}
+fi
+
+}
+
+### Function: delete_old_logs ###
+#
+# Delete old log files
+#
+# Arguments:
+#	$1 : file string to searsh for
+#	$2 : directory where the logs exist
+#	$3 : no of days old the logs to be removed
+#       $4 : Flag to indicate quiet/verbose operation
+#
+# Return Values:
+#	none
+delete_old_logs()
+{
+local _file_ _dir_ _age_
+
+_string_=${1}
+_dir_=${2}
+_age_=${3}
+if [ "${4}" ]; then
+    _bkup_quiet_="-q"
+fi
+
+$FIND ${_dir_} -name "*.${_string_}*" -mtime +${_age_} -exec ls {} \; > ${TEM_DIR}/${_string_}_list
+if [ -s ${TEM_DIR}/${_string_}_list ]; then
+    for _file_ in `$CAT ${TEM_DIR}/${_string_}_list`; do
+        log_msg -t -s "Removing old log file ${_file_}.\n"  -l ${LOGFILE} ${SNAP_QUIET}
+        $RM ${_file_}
+        if [ $? -ne 0 ]; then
+            _err_msg_="Could not delete old log file ${_file_}"
+            abort_script "$_err_msg_"
+        fi 
+    done
+else
+    log_msg -t -s "No logs files for ${_string_} found to delete.\n"  -l ${LOGFILE} ${SNAP_QUIET}
+fi
+
+}
+
+### Function: housekeep_iqmsg_logs ###
+#
+# Move old log files to the NAS
+#
+# Arguments:
+#	$1 : directory where the logs exist
+#	$2 : Directory to place the log files
+#	$2 : Flag to indicate quiet/verbose operation
+#
+# Return Values:
+#	none
+housekeep_iqmsg_logs()
+{
+local _file_ _dir_ _tgt_dir_
+
+_dir_=${1}
+_tgt_dir_=${2}
+if [ "${3}" ]; then
+    _bkup_quiet_="-q"
+fi
+
+RUN_TIME=`$DATE '+%Y-%m-%d_%H.%M.%S'`
+
+log_msg -t -s "Checking for rotated logs for iqmsg to move."  -l ${LOGFILE} ${SNAP_QUIET}
+
+$FIND ${_dir_} -name "*.iqmsg.*" -exec ls {} + > ${TEM_DIR}/iqmsg_list
+if [ -s ${TEM_DIR}/iqmsg_list ]; then
+    for _file_ in `$CAT ${TEM_DIR}/iqmsg_list`; do
+        _name_=`$ECHO ${_file_} | $AWK -F"/" '{print $NF}'`
+        log_msg -t -s "Moving old log file ${_file_} to ${_tgt_dir_}/${_name_}_${RUN_TIME}." -l ${LOGFILE} ${SNAP_QUIET}
+        $MV ${_file_} ${_tgt_dir_}/${_name_}_${RUN_TIME}
+        if [ $? -ne 0 ]; then
+            _err_msg_="Could not move log file ${_file_}"
+            abort_script "$_err_msg_"
+        fi 
+    done
+else
+    log_msg -t -s "No logs files for iqmsg found to move."  -l ${LOGFILE} ${SNAP_QUIET}
+fi
+
+}
+
+### Function: housekeep_engine_logs ###
+#
+# Move old log files to the NAS
+#
+# Arguments:
+#	$1 : directory where the logs exist
+#	$2 : Directory to place the log files
+#	$3 : Flag to indicate quiet/verbose operation
+#
+# Return Values:
+#	none
+housekeep_engine_logs()
+{
+local _file_ _dir_ _tgt_dir_
+
+_dir_=${1}
+_tgt_dir_=${2}
+if [ "${3}" ]; then
+    _bkup_quiet_="-q"
+fi
+
+log_msg -t -s "Checking for engine logs _msg.log to move."  -l ${LOGFILE} ${SNAP_QUIET}
+
+$FIND ${_dir_} -name "*_msg.log*" -exec ls {} + > ${TEM_DIR}/msg_log_list
+if [ -s ${TEM_DIR}/msg_log_list ]; then
+    for _entry_ in `$CAT ${TEM_DIR}/msg_log_list`; do
+        _file_=`$ECHO ${_entry_} | $AWK -F"/" '{print $NF}'`
+        _dir1_=`$ECHO ${_file_} | $AWK -F":" '{print $1}'`
+        _dir2_=`$ECHO ${_file_} | $AWK -F":" '{print $2}'`
+        _new_file_name_=`$ECHO ${_file_} | $AWK -F":" '{print $3}'`
+
+        #_name_=`$ECHO ${_file_} | $AWK -F"/" '{print $NF}'`
+        #_new_name_=`$ECHO ${_name_} | $SED -e 's|_[0-9]*_msg.log||g'`
+        log_msg -t -s "Moving old log file ${_entry_} to ${_tgt_dir_}/${_dir1_}/${_dir2_}/${_new_file_name_}." -l ${LOGFILE} ${SNAP_QUIET}
+        $MKDIR -p `$DIRNAME ${_tgt_dir_}/${_dir1_}/${_dir2_}/${_new_file_name_}`
+        if [ $? -ne 0 ]; then
+            _err_msg_="Could not create directory `$DIRNAME ${_tgt_dir_}/${_dir1_}/${_dir2_}/${_new_file_name_}`"
+            abort_script "$_err_msg_"
+        fi	
+        $MV ${_entry_} ${_tgt_dir_}/${_dir1_}/${_dir2_}/${_new_file_name_}
+        if [ $? -ne 0 ]; then
+            _err_msg_="Could not move log file ${_entry_}"
+            abort_script "$_err_msg_"
+        fi 
+    done
+else
+    log_msg -t -s "No engine logs files for _msg.log found to move."  -l ${LOGFILE} ${SNAP_QUIET}
+fi
+
+}
+
+### Function: housekeep_local_iq_logs ###
+#
+# Move old log files to the NAS
+#
+# Arguments:
+#	$1 : file string to searsh for
+#	$2 : directory where the logs exist
+#	$3 : Directory to place the log files
+#	$4 : Flag to indicate quiet/verbose operation
+#
+# Return Values:
+#	none
+housekeep_local_iq_logs()
+{
+local _file_ _dir_ _age_ _latest_
+
+_string_=${1}
+_dir_=${2}
+_tgt_dir_=${3}
+if [ "${4}" ]; then
+    _bkup_quiet_="-q"
+fi
+
+RUN_TIME=`$DATE '+%Y-%m-%d_%H.%M.%S'`
+
+log_msg -t -s "Checking for ${_string_} log files to move."  -l ${LOGFILE} ${SNAP_QUIET}
+
+$FIND ${_dir_} -name "*.${_string_}" -exec ls -lart {} + | $HEAD -n -1 | $AWK '{print $NF}' > ${TEM_DIR}/${_string_}_list
+if [ -s ${TEM_DIR}/${_string_}_list ]; then
+    for _file_ in `$CAT ${TEM_DIR}/${_string_}_list`; do
+        _name_=`$ECHO ${_file_} | $AWK -F"/" '{print $NF}'`
+        log_msg -t -s "Moving old log file ${_file_} to ${_tgt_dir_}/${_name_}_${RUN_TIME}." -l ${LOGFILE} ${SNAP_QUIET}
+        $MV ${_file_} ${_tgt_dir_}/${_name_}_${RUN_TIME}
+        if [ $? -ne 0 ]; then
+            _err_msg_="Could not move log file ${_file_}"
+            abort_script "$_err_msg_"
+        fi 
+    done
+else
+    log_msg -t -s "No logs files for ${_string_} found to move."  -l ${LOGFILE} ${SNAP_QUIET}
+fi
+
+}
+
+### Function: get_absolute_path ###
+#
+# Determine absolute path to software
+#
+# Arguments:
+#	none
+# Return Values:
+#	none
+get_absolute_path()
+{
+_dir_=`$DIRNAME $0`
+SCRIPTHOME=`cd $_dir_ 2>/dev/null && pwd || $ECHO $_dir_`
+}
+
+### Function: setup_env ###
+#
+# Setup up path environment etc
+#
+# Arguments:
+#	none
+# Return Values:
+#	none
+setup_env()
+{
+ENIQ_BASE_DIR=/eniq
+
+ADMIN_BIN=${ENIQ_BASE_DIR}/admin/bin
+
+ADMIN_SQL=${ENIQ_BASE_DIR}/admin/sql
+
+CONF_DIR=${ENIQ_BASE_DIR}/sw/conf
+
+BKUP_DIR=${ENIQ_BASE_DIR}/bkup_sw
+
+ENIQ_CONF_DIR=${ENIQ_BASE_DIR}/installation/config
+
+# ENIQ Log Directory
+ENIQ_LOG_DIR=${ENIQ_BASE_DIR}/local_logs
+
+IQ_LOG_DIR=${ENIQ_BASE_DIR}/log/sw_log/iq/
+
+IQ_LOADER_DIR=${ENIQ_BASE_DIR}/log/sw_log/iqloader
+
+# Source the common functions
+if [ -s ${SCRIPTHOME}/../lib/common_functions.lib ]; then
+    . ${SCRIPTHOME}/../lib/common_functions.lib
+else
+    _err_msg_="File ${SCRIPTHOME}/../lib/common_functions.lib not found"
+    abort_script "${_err_msg_}" 
+fi
+
+BKUP_IQ_DB_FILESYS_LIST="${BKUP_DIR}/etc/iq_filesystem_list"
+if [ ! -s ${BKUP_IQ_DB_FILESYS_LIST} ]; then
+    _err_msg_="Could not locate file ${BKUP_IQ_DB_FILESYS_LIST}"
+    abort_script "$_err_msg_"
+fi
+
+BKUP_ASA_DB_FILESYS_LIST="${BKUP_DIR}/etc/asa_filesystem_list"
+if [ ! -s ${BKUP_ASA_DB_FILESYS_LIST} ]; then
+    _err_msg_="Could not locate file ${BKUP_ASA_DB_FILESYS_LIST}"
+    abort_script "$_err_msg_"
+fi
+
+# List of iq databases to be backed up
+BACKUP_IQ_DB_LIST=`$CAT ${BKUP_IQ_DB_FILESYS_LIST}|$EGREP -v '^[ 	]*#'    \
+                     |$EGREP "::"|$AWK -F"::" '{print $1}'`
+if [ ! "${BACKUP_IQ_DB_LIST}" ]; then
+    _err_msg_="Could not read BACKUP_IQ_DB_LIST param from ${BKUP_DB_FILESYS_LIST}"
+    abort_script "$_err_msg_"
+fi
+
+# List of asa databases to be backed up
+BACKUP_ASA_DB_LIST=`$CAT ${BKUP_ASA_DB_FILESYS_LIST}|$EGREP -v '^[ 	]*#'    \
+                     |$EGREP "::"|$AWK -F"::" '{print $1}'`
+if [ ! "${BACKUP_ASA_DB_LIST}" ]; then
+    _err_msg_="Could not read BACKUP_ASA_DB_LIST param from ${BKUP_DB_FILESYS_LIST}"
+    abort_script "$_err_msg_"
+fi
+
+
+# Get the System User/Group. All directories are owned by this
+SYSUSER=`iniget ENIQ_INSTALL_CONFIG -f ${ENIQ_CONF_DIR}/${SUNOS_INI} -v ENIQ_SYSUSER`
+if [ ! "${SYSUSER}" ]; then
+    _err_msg_="Could not read parameter ENIQ_SYSUSER from file ${ENIQ_CONF_DIR}/${SUNOS_INI}"
+    abort_script "$_err_msg_" "${EXEC_SHELL_CMD}"
+fi
+
+_sysgrp_=`$ID ${SYSUSER} | $AWK '{print $2}' | $AWK -F\( '{print $2}' | $AWK -F\) '{print $1}'`
+if [ ! "${_sysgrp_}" ]; then
+    _err_msg_="Could not determine group ID of ${_sysgrp_}"
+    abort_script "$_err_msg_" "${EXEC_SHELL_CMD}"
+fi
+
+# Determine the current server type
+CURR_SERVER_TYPE=`$CAT $ENIQ_CONF_DIR/installed_server_type | $EGREP -v '^[     ]*#' | $SED -e 's/ //g'`
+if [ ! "${CURR_SERVER_TYPE}" ]; then
+        _err_msg_="Could not determine which server type this is"
+    abort_script "$_err_msg_"
+fi
+
+# File containing the type of ENIQ installation. Eg. statistics
+INST_TYPE_FILE=${ENIQ_CONF_DIR}/ericsson_use_config
+if [ ! -s "${INST_TYPE_FILE}" ]; then
+    _err_msg_="ENIQ install type not defined in ${INST_TYPE_FILE}"
+    abort_script "${_err_msg_}"
+fi
+# Read the installation type - should be "stats"
+INSTALL_TYPE=`$CAT ${INST_TYPE_FILE} | $AWK -F\= '{print $2}'`
+if [ ! "${INSTALL_TYPE}" ]; then
+    _err_msg_="Could not determine INSTALL_TYPE "
+    abort_script "$_err_msg_"
+fi
+
+#Fetching IP Type from ipmp.ini file.
+check_ip_type
+
+if [ ! "${_ip_type_}" ]; then
+    _err_msg_="Could not read parameter _IP_TYPE_ from file ${ENIQ_CONF_DIR}/${IPMP_INI}"
+    abort_script "$_err_msg_"
+fi
+}
+
+### Function: test_asa_login ###
+#
+# Test that I can log into sybase ASA
+#
+# Arguments:
+#	$1 : Database to check
+#	$2 : Flag to indicate rolling snapshot or not (0/1)
+#	$3 : Flag to indicate quiet/verbose operation
+# Return Values:
+#	none
+test_asa_login()
+{
+local _bkup_quiet_ _db_up_res_code_ _roll_snap_flag_ 
+local _dbspace_list_ _dbspace_err_
+
+_dblist_=${1}
+if [ "${2}" ]; then
+    _bkup_quiet_="-q"
+fi
+
+_db_up_res_code_=0
+
+for _db_ in ${_dblist_}; do
+    # Is the database up. If not assume it is safe to backup
+    log_msg -t -s "Testing database ${_db_} is running." -l ${LOGFILE} ${_bkup_quiet_}
+
+
+    INI_SECTION=`$CAT ${BKUP_ASA_DB_FILESYS_LIST}|$EGREP -v '^[ 	]*#'    \
+                     |$EGREP "^[ 	]*${_db_}::"|$AWK -F"::" '{print $2}'`
+
+    if [ ! "${INI_SECTION}" ]; then
+	_err_msg_="Could not read INI_SECTION param for ${_db_} from ${BKUP_DB_FILESYS_LIST}"
+	abort_script "$_err_msg_"
+    fi
+
+    REP_PORT=`iniget ${INI_SECTION} -f ${CONF_DIR}/${ENIQ_INI} -v PortNumber`
+    REP_ENG=`iniget ${INI_SECTION} -f ${CONF_DIR}/${ENIQ_INI} -v ServerName`
+    if [ ! "${REP_PORT}" -o ! "${REP_ENG}" ]; then
+        _err_msg_="Could not read repdb values from ${CONF_DIR}/${ENIQ_INI}"
+        abort_script "$_err_msg_"
+    fi
+    DBA_PASSWORD=`inigetpassword DB -f ${CONF_DIR}/${ENIQ_INI} -v DBAPassword`
+    if [ ! ${DBA_PASSWORD} ]; then
+        if [ -f ${ENIQ_BASE_DIR}/sw/installer/dbusers ]; then
+            DBA_PASSWORD=`${ENIQ_BASE_DIR}/sw/installer/dbusers dba etlrep`
+            if [ ! "${DBA_PASSWORD}" ] ; then
+                _err_msg_="Could not get repdb DBA Password"
+                abort_script "$_err_msg_"
+            fi
+        else
+            _err_msg_="Could not get repdb DBA Password"
+            abort_script "$_err_msg_"
+        fi
+    fi
+
+    #Removing existing encrypted files.
+    $RM -rf ${rep_conn_str_enc}
+
+    #Initialising the connection string
+    rep_conn_str="-c \"con=$REP_ENG;eng=$REP_ENG;uid=dba;pwd=${DBA_PASSWORD};links=tcpip(host=localhost;port=$REP_PORT)\""
+    rep_conn_str_enc=${TEM_DIR}/_conn_str_cleanup_encrypt.`uuidgen`
+
+    #encrypt the connection string.
+    get_encrypt_file "${rep_conn_str}" "${rep_conn_str_enc}"
+
+    ${SQLANY}/bin64/dbping -q @${rep_conn_str_enc} 2>/dev/null
+      
+    if [ $? -ne 0 ]; then
+        # If this is a rolling snapshot then all databases must be up
+        if [ ${_roll_snap_flag_} -eq 1 ]; then
+             _err_msg_="Rolling Snapshot not possible.\nDatabase ${_db_} is not running"
+             abort_script "$_err_msg_"
+        else
+             _db_up_res_code_=1
+             log_msg -s "Database ${_db_} is not running" -l ${LOGFILE} ${_bkup_quiet_}
+	    continue
+	fi
+    fi
+
+    log_msg -t -s "Testing login of database ${_db_}.\n" -l ${LOGFILE} ${_bkup_quiet_}
+    ${IQDIR}/bin64/dbisql -q @${rep_conn_str_enc} sa_disk_free_space
+     
+    if [ $? -ne 0 ]; then
+    	_err_msg_="Error logging on to database ${_db_} on ASA server."
+    	abort_script "$_err_msg_"
+    fi    
+
+done
+}
+
+### Function: test_iq_login ###
+#
+# Test that I can log into Sybase IQ
+#
+# Arguments:
+#	$1 : Database to check
+#	$2 : Flag to indicate rolling snapshot or not (0/1)
+#	$3 : Flag to indicate quiet/verbose operation
+# Return Values:
+#	none
+test_iq_login()
+{
+local _bkup_quiet_ _db_up_res_code_ _roll_snap_flag_ 
+local _dbspace_list_ _dbspace_err_
+
+_dblist_=${1}
+if [ "${2}" ]; then
+    _bkup_quiet_="-q"
+fi
+
+_db_up_res_code_=0
+
+for _db_ in ${_dblist_}; do
+    # Is the database up. If not assume it is safe to backup
+    log_msg -t -s "Testing database ${_db_} is running." -l ${LOGFILE} ${_bkup_quiet_}
+
+    INI_SECTION=`$CAT ${BKUP_IQ_DB_FILESYS_LIST}|$EGREP -v '^[ 	]*#'    \
+                     |$EGREP "^[ 	]*${_db_}::"|$AWK -F"::" '{print $2}'`
+
+    if [ ! "${INI_SECTION}" ]; then
+	_err_msg_="Could not read INI_SECTION param for ${_db_} from ${BKUP_DB_FILESYS_LIST}"
+	abort_script "$_err_msg_"
+    fi
+
+    DWH_PORT=`iniget ${INI_SECTION} -f ${CONF_DIR}/${ENIQ_INI} -v PortNumber`
+    DWH_ENG=`iniget ${INI_SECTION} -f ${CONF_DIR}/${ENIQ_INI} -v ServerName`
+    if [ ! "${DWH_PORT}" -o ! "${DWH_ENG}" ]; then
+        _err_msg_="Could not read db values from ${CONF_DIR}/${ENIQ_INI}"
+        abort_script "$_err_msg_"
+    fi
+
+    DBA_PASSWORD=`inigetpassword DB -f ${CONF_DIR}/${ENIQ_INI} -v DBAPassword`
+    if [ ! ${DBA_PASSWORD} ]; then
+        if [ -f ${ENIQ_BASE_DIR}/sw/installer/dbusers ]; then
+            DBA_PASSWORD=`${ENIQ_BASE_DIR}/sw/installer/dbusers dba dwh`
+            if [ ! "${DBA_PASSWORD}" ] ; then
+                _err_msg_="Could not get dwhdb DBA Password"
+                abort_script "$_err_msg_"
+            fi
+        else
+            _err_msg_="Could not get dwhdb DBA Password"
+            abort_script "$_err_msg_"
+        fi
+    fi
+
+    #Removing existing encrypted files.
+    $RM -rf ${conn_str_dwh_enc}
+
+    #Initialising the connection string
+    conn_str_dwh="-c \"con=$DWH_ENG;eng=$DWH_ENG;links=tcpip{host=$DWH_ENG;port=${DWH_PORT};dobroadcast=none;verify=no};uid=dba;pwd=${DBA_PASSWORD}\""
+    conn_str_dwh_enc=${TEM_DIR}/_conn_str_cleanup_encrypt_dwh.`uuidgen`
+
+    # encrypt the connection string.
+    get_encrypt_file "${conn_str_dwh}" "${conn_str_dwh_enc}"
+    ${IQDIR}/bin64/dbping -q @${conn_str_dwh_enc}  2>/dev/null      
+
+    if [ $? -ne 0 ]; then
+        # If this is a rolling snapshot then all databases must be up
+        if [ ${_roll_snap_flag_} -eq 1 ]; then
+            _err_msg_="Rolling Snapshot not possible.\nDatabase ${_db_} is not running"
+            abort_script "$_err_msg_"
+        else
+            _db_up_res_code_=1
+            log_msg -t -s "Database ${_db_} is not running." -l ${LOGFILE} ${_bkup_quiet_}
+            continue
+        fi
+    fi
+
+    log_msg -t -s "Testing login of database ${_db_}.\n" -l ${LOGFILE} ${_bkup_quiet_}
+    ${IQDIR}/bin64/dbisql @${conn_str_dwh_enc} sp_iqdbspace >> /dev/null 2>&1
+    if [ $? -ne 0 ]; then
+    	_err_msg_="Error logging on to database ${_db_} on IQ server."
+    	abort_script "$_err_msg_"
+    fi
+
+done
+
+}
+
+### Function: truncate_asa_transaction_log ###
+#
+# Truncate the sybase ASA transaction log
+#
+# Arguments:
+#   $1 : Database to check
+#   $2 : Flag to indicate quiet/verbose operation
+# Return Values:
+#   none
+truncate_asa_transaction_log()
+{
+local _bkup_quiet_
+
+_dblist_=${1}
+if [ "${2}" ]; then
+    _bkup_quiet_="-q"
+fi
+
+log_msg -t -s "Truncating the Sybase ASA transaction Logs.\n"  -l ${LOGFILE} ${SNAP_QUIET}
+#Removing existing encrypted files.
+$RM -rf ${conn_str_rep_enc}
+
+#Initialising the connection string
+conn_str_rep="-c \"con=$REP_ENG;eng=$REP_ENG;links=tcpip{host=$REP_ENG;port=${REP_PORT};dobroadcast=none;verify=no};uid=dba;pwd=${DBA_PASSWORD}\""
+conn_str_rep_enc=${TEM_DIR}/_conn_str_cleanup_encrypt_dbbackup.`uuidgen`
+
+# encrypt the connection string.
+get_encrypt_file "${conn_str_rep}" "${conn_str_rep_enc}"
+${SQLANY}/bin64/dbbackup -xo -q @${conn_str_rep_enc}
+if [ $? -ne 0 ]; then
+     _err_msg_="Error encountered during truncation of the sybase ASA transaction log"
+     abort_script "$_err_msg_"
+fi
+}
+
+### Function: truncate_iq_transaction_log ###
+#
+# Truncate the sybase IQ transaction log
+#
+# Arguments:
+#	$1 : Database to check
+#	$2 : Flag to indicate quiet/verbose operation
+# Return Values:
+#	none
+truncate_iq_transaction_log()
+{
+local _bkup_quiet_
+
+_dblist_=${1}
+if [ "${2}" ]; then
+    _bkup_quiet_="-q"
+fi
+
+log_msg -t -s "Truncating the Sybase IQ transaction Logs."  -l ${LOGFILE} ${SNAP_QUIET}
+${IQDIR}/bin64/dbbackup -xo -q @${conn_str_dwh_enc}
+if [ $? -ne 0 ]; then
+     _err_msg_="Error encountered during truncation of the Sybase IQ transaction log"
+     abort_script "$_err_msg_"
+fi 
+}
+
+### Function: truncate_reader_transaction_log ###
+#
+# Truncate the reader sybase IQ transaction log
+#
+# Arguments:
+#	$1 : Database to check
+#	$2 : Flag to indicate quiet/verbose operation
+# Return Values:
+#	none
+truncate_reader_transaction_log()
+{
+local _bkup_quiet_
+
+_dblist_=${1}
+if [ "${2}" ]; then
+    _bkup_quiet_="-q"
+fi
+_reader_number_=2
+_check_flag_=1
+READER_PORT=`iniget DWH_READER_SETTINGS -v PortNumber -f ${CONF_DIR}/${ENIQ_INI}`
+while [ ${_check_flag_} -ne 0 ]; do
+_reader_name_="dwh_reader_${_reader_number_}"
+_count_=`$CAT ${ENIQ_CONF_DIR}/service_names | $GREP dwh_reader_${_reader_number_} | grep -o "::" | wc -l`
+if [ "${_ip_type_}" == "IPv6" ] && [ "${_count_}" == 3 ]; then
+	_Reader_value_=`$CAT ${ENIQ_CONF_DIR}/service_names | $GREP dwh_reader_${_reader_number_} | $AWK -F"::" '{print $4}'`
+else
+	_Reader_value_=`$CAT ${ENIQ_CONF_DIR}/service_names | $GREP dwh_reader_${_reader_number_} | $AWK -F"::" '{print $3}'`
+fi
+if [[ ${_reader_name_} -eq ${_Reader_value_} ]] && [[ ${_reader_number_} -ge 1 ]]; then
+	
+    # removing old connection strings
+    $RM -rf ${TEM_DIR}/_conn_str_cleanup_encrypt_${_reader_number_}.txt.*
+    
+    # Initialising the connection string
+    CONN_STR_READER="-c \"con=${_reader_name_};eng=${_reader_name_};links=tcpip{host=${_reader_name_};port=${READER_PORT};dobroadcast=none;verify=no};uid=dba;pwd=${DBA_PASSWORD}\""
+    CONN_STR_READER_ENC=${TEM_DIR}/_conn_str_cleanup_encrypt_${_reader_number_}.txt.$$
+    
+    # get the encrypted connection string.
+    get_encrypt_file "${CONN_STR_READER}" "${CONN_STR_READER_ENC}"
+    
+    # Truncating transactional logs.
+    log_msg -t -s "Truncating the Sybase IQ reader transaction Logs on ${_reader_name_}."  -l ${LOGFILE} ${SNAP_QUIET}
+    ${IQDIR}/bin64/dbbackup -xo -q @${CONN_STR_READER_ENC}
+    if [ $? -ne 0 ]; then
+     _err_msg_="Error encountered during truncation of the Sybase IQ transaction log on ${_reader_name_}"
+     abort_script "$_err_msg_"
+    fi
+    let _reader_number_=_reader_number_-1
+    continue
+else
+    _check_flag_=0
+fi
+
+done
+}
+
+### Function: user_confirm ###
+#
+# Get confirmation from user to proceed with snapshot action
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+user_confirm()
+{
+while :; do
+    unset USER_CONF
+    $CLEAR
+    log_msg -s "\nAre you sure you wish to delete the sybase log files"    
+    log_msg -s "Enter [Yes | No] (case sensitive) : \c"    
+
+    read USER_CONF
+    if [ "$USER_CONF" == "Yes" -o "$USER_CONF" == "No" ]; then
+        break
+    fi
+done
+}
+
+# ********************************************************************
+#
+# 	Main body of program
+#
+# ********************************************************************
+#
+# Save the time of running. I do this here as I want all
+# dates and time to be the same
+RUN_TIME=`$DATE '+%Y-%m-%d_%H.%M.%S'`
+
+# Determine absolute path to software
+get_absolute_path
+
+# Check that the effective id of the user is root
+check_id root
+
+while getopts ":l:Nq" arg; do
+  case $arg in
+    l) LOGFILE="$OPTARG" 
+       ;;
+    N) NO_CONFIRM="YES"
+       ;;
+    q) SNAP_QUIET="-q"
+       ;;
+   \?) _err_msg_="`$BASENAME $0` [ -l <path_to_logfile> ] [ -N ] -q"
+       abort_script "$_err_msg_"
+       ;;
+  esac
+done
+shift `$EXPR $OPTIND - 1`
+
+# Setup up path environment etc
+setup_env
+
+# Default Logfile location
+DEF_LOGFILE="${ENIQ_LOG_DIR}/cleanup_iq_logs/cleanup_iq_logs.log"
+
+# Set up default logfile if required
+if [ ! "${LOGFILE}" ]; then
+    LOGFILE="${DEF_LOGFILE}"
+fi
+
+# Check/Create Logfile
+chk_create_logfile
+    
+# Create a temporary Directory
+TEM_DIR=/tmp/clean_iq_logs.$$.$$
+$RM -rf ${TEM_DIR}
+$MKDIR -p ${TEM_DIR}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not create directory ${TEM_DIR}"
+    abort_script "$_err_msg_"
+fi	
+
+$CHMOD 1707 ${TEM_DIR}
+
+# Setup sybase env
+$SU - ${SYSUSER} >> /dev/null -c "$ENV > $TEM_DIR/sybase_det.$$" >> /dev/null 2>&1
+
+# Source the environment
+set -a
+. $TEM_DIR/sybase_det.$$ >> /dev/null 2>&1
+set +a	
+
+ASA_DIR=/eniq/sql_anywhere
+if [ -s ${ASA_DIR}/bin64/sa_config.sh ]; then
+	. ${ASA_DIR}/bin64/sa_config.sh >> /dev/null 2>&1
+else
+	_err_msg_="File ${ASA_DIR}/bin64/sa_config.sh not found or empty"
+	abort_script "$_err_msg_"
+fi
+if [ ! "$NO_CONFIRM" ]; then
+    user_confirm 
+    if [ $USER_CONF == No ]; then
+		$RM -rf ${TEM_DIR}
+		exit 0
+    fi
+fi
+
+if [ "${CURR_SERVER_TYPE}" == "stats_coordinator" -o "${CURR_SERVER_TYPE}" == "eniq_stats" ]; then
+    _coord_="YES"
+fi
+
+if [ "${_coord_}" == "YES" ]; then  
+    # Test that I can log into Sybase IQ and ASA
+    test_iq_login "${BACKUP_IQ_DB_LIST}" ${SNAP_QUIET}
+    if [ $? -ne 0 ]; then
+        _err_msg_="Could not Log into Sybase IQ Database"
+        abort_script "$_err_msg_"
+    fi
+
+    test_asa_login "${BACKUP_ASA_DB_LIST}" ${SNAP_QUIET}
+    if [ $? -ne 0 ]; then
+        _err_msg_="Could notLog into Sybase ASA Database"
+        abort_script "$_err_msg_"
+    fi
+
+    #Truncate the IQ transaction log file
+    truncate_iq_transaction_log "${BACKUP_IQ_DB_LIST}" ${SNAP_QUIET}
+
+    #Truncate the ASA transaction log file
+    truncate_asa_transaction_log "${BACKUP_ASA_DB_LIST}" ${SNAP_QUIET}
+
+    #Truncate the reader IQ transaction log file	
+    if [ "${CURR_SERVER_TYPE}" == "stats_coordinator" ]; then
+        truncate_reader_transaction_log
+    fi
+
+    # Move rotated iqmsg logs to NAS
+    housekeep_iqmsg_logs ${ENIQ_LOG_DIR}/iq ${IQ_LOG_DIR} ${SNAP_QUIET}
+   
+    #Delete old iqmsg files
+    if [ "${INSTALL_TYPE}" == "stats" ]; then
+           delete_old_logs "iqmsg." ${IQ_LOG_DIR} ${STATS_IQMSG_RETENTION} ${SNAP_QUIET}
+    fi
+ 
+    #Delete old logs for stderr and srvlog
+    for _string_ in ${LOG_STRINGS}; do
+        housekeep_local_iq_logs "${_string_}" ${ENIQ_LOG_DIR}/iq ${IQ_LOG_DIR} ${SNAP_QUIET}
+        delete_old_logs "${_string_}" ${IQ_LOG_DIR} ${LOG_RETENTION} ${SNAP_QUIET}
+    done
+
+    #Delete old iq stop/start admin logs
+    delete_iq_admin_logs "stop_dwh" ${IQ_LOG_DIR} ${LOG_RETENTION} ${SNAP_QUIET}
+    delete_iq_admin_logs "start_dwh" ${IQ_LOG_DIR} ${LOG_RETENTION} ${SNAP_QUIET}
+    delete_iq_admin_logs "pstack_dwh" ${IQ_LOG_DIR} ${LOG_RETENTION} ${SNAP_QUIET}
+
+    # Move the engine logs to the NAS
+    housekeep_engine_logs ${ENIQ_LOG_DIR}/iq ${IQ_LOADER_DIR} ${SNAP_QUIET}
+else
+    # Move rotated iqmsg logs to NAS
+    housekeep_iqmsg_logs ${ENIQ_LOG_DIR}/iq ${IQ_LOG_DIR} ${SNAP_QUIET}
+
+    #Moving readers iq srvlog and stderr logs to NAS
+    for _string_ in ${LOG_STRINGS}; do
+      housekeep_local_iq_logs "${_string_}" ${ENIQ_LOG_DIR}/iq ${IQ_LOG_DIR} ${SNAP_QUIET}    
+    done
+fi
+
+log_msg -t -l ${LOGFILE} -s "Sybase log cleanup finished." -h -q
+
+# Rotate and compress the logs if necessary
+rotate_compress_logs ${LOGFILE} ${NUM_LOGS} ${SIZE_LOGS} ${COMPRESS_LOG}
+
+$RM -rf ${INPUT_LIST}
+$RM -rf ${TEM_DIR}
+$RM -rf ${rep_conn_str_enc}
+$RM -rf ${conn_str_dwh_enc}
+$RM -rf ${conn_str_rep_enc}
+
+exit 0
+
+

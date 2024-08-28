@@ -1,0 +1,127 @@
+#!/bin/bash
+
+SYS_USER=dcuser
+export SYS_USER
+
+DATA_DIR=<CHANGE><ENIQ_BASE_DIR>/data
+export DATA_DIR
+
+PMDATA_DIR=<CHANGE><ENIQ_BASE_DIR>/data/pmdata
+export PMDATA_DIR
+
+FMDATA_DIR=<CHANGE><ENIQ_BASE_DIR>/fmdata
+export FMDATA_DIR
+
+EVENTDATA_DIR=<CHANGE><ENIQ_BASE_DIR>/data/eventdata
+export EVENTDATA_DIR
+
+EVENTS_BACKUP_DIR=<CHANGE><ENIQ_BASE_DIR>/backup
+export EVENTS_BACKUP_DIR
+
+ETLDATA_DIR=<CHANGE><ENIQ_BASE_DIR>/data/etldata
+export ETLDATA_DIR
+
+EVENTS_ETLDATA_DIR=<CHANGE><ENIQ_BASE_DIR>/data/etldata_
+export EVENTS_ETLDATA_DIR
+
+ARCHIVE_DIR=<CHANGE><ENIQ_BASE_DIR>/archive
+export ARCHIVE_DIR
+
+LOG_DIR=<CHANGE><ENIQ_BASE_DIR>/log/sw_log
+export LOG_DIR
+
+REJECTED_DIR=<CHANGE><ENIQ_BASE_DIR>/data/rejected
+export REJECTED_DIR
+
+REFERENCE_DIR=<CHANGE><ENIQ_BASE_DIR>/data/reference
+export REFERENCE_DIR
+
+DWH_DIR=<CHANGE><ENIQ_BASE_DIR>/database/dwh_main
+export DWH_DIR
+
+DWH_READER_DIR=<CHANGE><ENIQ_BASE_DIR>/database/dwh_reader
+export DWH_READER_DIR
+
+DWH_TEMP_DIR=<CHANGE><ENIQ_BASE_DIR>/database/dwh_temp_dbspace
+export DWH_TEMP_DIR
+
+REP_DIR=<CHANGE><ENIQ_BASE_DIR>/database/rep_main
+export REP_DIR
+
+REP_TEMP_DIR=<CHANGE><ENIQ_BASE_DIR>/database/rep_temp
+export REP_TEMP_DIR
+
+BIN_DIR=<CHANGE><ENIQ_BASE_DIR>/sw/bin
+export BIN_DIR
+
+CONF_DIR=<CHANGE><ENIQ_BASE_DIR>/sw/conf
+export CONF_DIR
+
+INSTALLER_DIR=<CHANGE><ENIQ_BASE_DIR>/sw/installer
+export INSTALLER_DIR
+
+PLATFORM_DIR=<CHANGE><ENIQ_BASE_DIR>/sw/platform
+export PLATFORM_DIR
+
+IQ_DIR=<CHANGE><ENIQ_BASE_DIR>/sybase_iq
+export IQ_DIR
+
+ASA_DIR=<CHANGE><ENIQ_BASE_DIR>/sql_anywhere
+export ASA_DIR
+
+IQLOGDIR=<CHANGE><ENIQ_BASE_DIR>/log/sw_log/iq
+export IQLOGDIR
+
+ASALOGDIR=<CHANGE><ENIQ_BASE_DIR>/log/sw_log/asa
+export ASALOGDIR
+
+RT_DIR=<CHANGE><ENIQ_BASE_DIR>/sw/runtime
+export RT_DIR
+
+ADMIN_BIN=<CHANGE><ENIQ_BASE_DIR>/admin/bin
+export ADMIN_BIN
+
+ENIQ_ADMIN_DIR=<CHANGE><ENIQ_BASE_DIR>/admin
+export ENIQ_ADMIN_DIR
+
+SMF_BIN_DIR=<CHANGE><ENIQ_BASE_DIR>/smf/bin
+export SMF_BIN_DIR
+
+SENTINEL_DIR=<CHANGE><ENIQ_BASE_DIR>/sentinel
+export SENTINEL_DIR
+
+GLASSFISH_DIR=<CHANGE><ENIQ_BASE_DIR>/glassfish
+export GLASSFISH_DIR
+
+MZ_HOME=<CHANGE><ENIQ_BASE_DIR>/mediation_sw/mediation_gw
+export MZ_HOME
+
+MEDIATION_INTER=<CHANGE><ENIQ_BASE_DIR>/mediation_inter
+export MEDIATION_INTER
+
+ENIQ_CONF_DIR=<CHANGE><ENIQ_BASE_DIR>/installation/config
+export ENIQ_CONF_DIR
+
+PMDATA_SOEM_DIR=<CHANGE><ENIQ_BASE_DIR>/data/pmdata_soem
+export PMDATA_SOEM_DIR
+
+PMDATA_SIM_DIR=<CHANGE><ENIQ_BASE_DIR>/data/pmdata_sim
+export PMDATA_SIM_DIR
+
+ANT_OPTS="$ANT_OPTS -d64 "
+export ANT_OPTS 
+
+if [ -s <CHANGE><ENIQ_BASE_DIR>/sentinel/etc/sentinel.env ]; then
+    . <CHANGE><ENIQ_BASE_DIR>/sentinel/etc/sentinel.env
+fi
+
+
+TMP=<CHANGE><ENIQ_BASE_DIR>/database/tmp/iq
+export TMP
+
+IQTMP16=<CHANGE><ENIQ_BASE_DIR>/database/tmp/iq
+export IQTMP16
+
+SATMP16=<CHANGE><ENIQ_BASE_DIR>/database/tmp/iq
+export SATMP16
+

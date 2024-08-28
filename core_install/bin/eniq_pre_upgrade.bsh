@@ -1,0 +1,252 @@
+#!/usr/bin/bash
+#********************************************************************
+# Ericsson Radio Systems AB SCRIPT
+#********************************************************************
+#
+# (c) Ericsson Radio Systems AB 2022 - All rights reserved.
+#
+# The copyright to the computer program(s) herein is the property
+# of Ericsson Radio Systems AB, Sweden. The programs may be used
+# and/or copied only with the written permission from Ericsson Radio
+# Systems AB or in accordance with the terms and conditions stipulated
+# in the agreement/contract under which the program(s) have been
+# in the agreement/contract under which the program(s) have been
+# supplied.
+#
+#********************************************************************
+# Name     : eniq_pre_upgrade.bsh
+# Date     : 06/09/2023
+# Revision : \main\8
+# Purpose  : A script to execute all ENIQ Pre-upgrade steps
+#
+# Usage    : eniq_pre_upgrade.bsh
+#
+#********************************************************************
+#
+#
+# Fetch inputs from the user
+#
+#
+#********************************************************************
+
+AWK='/usr/bin/awk'
+ECHO='/usr/bin/echo -e'
+CP='/usr/bin/cp'
+DATE='/usr/bin/date'
+RM='/usr/bin/rm'
+SED='/usr/bin/sed'
+BASH='/usr/bin/bash'
+PYTHON='/usr/bin/python'
+GREP='/usr/bin/grep'
+CAT='/usr/bin/cat'
+SUDO='/usr/bin/sudo'
+TEE=/usr/bin/tee
+
+LOGFILE='/eniq/local_logs/eniq_pre_upgrade.log'
+
+ENIQ_CONF_PATH='/eniq/installation/config'
+
+CURR_SERVER_TYPE=`$CAT ${ENIQ_CONF_PATH}/installed_server_type | egrep -v '^[[:blank:]]*#' | $SED -e 's/ //g'`
+
+SCRIPTHOME="/eniq/admin/"
+
+if [ -s $SCRIPTHOME/lib/common_functions.lib ]; then
+    . $SCRIPTHOME/lib/common_functions.lib
+else
+   $ECHO "$SCRIPTHOME/lib/common_functions.lib not found or empty" | $TEE -a ${LOGFILE}
+fi
+
+abort_script()
+{
+ABORT_TIME=`${DATE} '+%Y-%b-%d_%H.%M.%S'`
+if [ "$1" ]; then
+    _err_msg_=$1
+else
+    _err_msg_="$ABORT_TIME - ERROR : Script aborted.......\n"
+fi
+
+if [ "${LOGFILE}" ]; then
+    $ECHO "\n${ABORT_TIME} - ERROR : $_err_msg_\n" | $TEE -a ${LOGFILE}
+else
+    $ECHO "\n${ABORT_TIME} - ERROR : $_err_msg_\n"
+fi
+
+exit 1
+}
+
+upg_sw_dir=`iniget inputs -f ${ENIQ_CONF_PATH}/upgrade_params.ini -v upg_sw_dir`
+
+ENIQ_CHECKS_PATH='/eniq/installation/core_install/eniq_checks/bin'
+
+ENIQ_INST_PATH='/eniq/installation/core_install/bin'
+find $ENIQ_INST_PATH/manage_ombs_policies.bsh >> /dev/null 2>&1
+if [ $? -ne 0 ]; then
+    $ECHO "Finding manage_ombs_policies.bsh script to required directory" | $TEE -a ${LOGFILE}
+    ENIQ_INST_PATH=/var/tmp/upgrade/$upg_sw_dir/core_install/bin
+    find $ENIQ_INST_PATH/manage_ombs_policies.bsh >> /dev/null 2>&1
+    if [ $? -ne 0 ]; then
+        $ECHO "Failed to find manage_ombs_policies.bsh file." | $TEE -a ${LOGFILE}
+    fi
+fi
+
+script=$ENIQ_INST_PATH/manage_ombs_policies.bsh
+
+i=1
+
+$ECHO "\n=====================================================\n" | $TEE -a ${LOGFILE}
+
+$ECHO `date` | $TEE -a ${LOGFILE}
+
+$ECHO "\n=====================================================\n" | $TEE -a ${LOGFILE}
+
+ombs_choice=`iniget inputs -f ${ENIQ_CONF_PATH}/upgrade_params.ini -v ombs_configuration`
+ombs_policies=`iniget inputs -f ${ENIQ_CONF_PATH}/upgrade_params.ini -v ombs_policies_configuration`
+if [[ $ombs_choice == 'Yes' && $ombs_policies == 'No' ]]; then
+
+	$ECHO "\nStarting to Disable OMBS Policies\n"| $TEE -a ${LOGFILE}
+
+	ombs_pass=`iniget inputs -f ${ENIQ_CONF_PATH}/upgrade_params.ini -v ombs_pass`
+	ombs_uname=`iniget inputs -f ${ENIQ_CONF_PATH}/upgrade_params.ini -v ombs_uname`
+	ombs_host_name=`iniget inputs -f ${ENIQ_CONF_PATH}/upgrade_params.ini -v ombs_backup_ip`
+
+	#ombs_pass=`$ECHO $ombs_pass | openssl enc -base64 -d`
+        passphrase=`$CAT /eniq/sw/conf/strong_passphrase`
+        ombs_pass=`$ECHO $ombs_pass | openssl enc -aes-256-ctr -md sha512 -a -d -salt -pass pass:${passphrase}`
+
+	ombs_action_type='disable'
+
+	if [ "${CURR_SERVER_TYPE}" == "stats_coordinator" ]; then
+			
+			$CAT /eniq/installation/config/upgrade_params.ini | $GREP "eniq_mb*" | $SED 's/=/ /g' | $AWK '{print $2}' > hostnames.txt
+
+			while [[ $i -le 4 ]]
+			do
+				eniq_hostname=`$CAT hostnames.txt | head -n $i | tail -n 1`
+
+				$CP -rp ${ENIQ_INST_PATH}/manage_ombs_policies.bsh ${ENIQ_INST_PATH}/manage_ombs_policies_bkp.bsh
+					$ECHO "eniq_hostname=$eniq_hostname" >> tmp.txt
+					$CAT ${ENIQ_INST_PATH}/manage_ombs_policies.bsh |  $SED -e 's/action_type=enable/action_type=disable/g' >> tmp.txt
+				$CP -rp tmp.txt ${ENIQ_INST_PATH}/manage_ombs_policies.bsh
+					$RM -rf tmp.txt
+
+					CMD="ssh -o StrictHostKeyChecking=no  ${ombs_uname}\@${ombs_host_name} "
+
+					/usr/bin/expect<<END
+					set force_conservative 0
+					spawn bash  -c "${CMD} ${SUDO} su - root -- -c /bin/bash < ${script} "
+					expect  "* password: "
+					send -- "${ombs_pass}\r"
+					expect  "*$*"
+					expect eof
+					
+END
+
+	if [ $? -eq 0 ]; then
+		$ECHO "\nSuccessfully Disabled OMBS Policies\n" | $TEE -a ${LOGFILE}
+        ombs_action_type='disable'
+        iniset inputs -f ${ENIQ_CONF_PATH}/upgrade_params.ini -v ombs_action_type=$ombs_action_type
+        if [[ $? -ne 0 ]];then
+                $ECHO "Could not set action_type value in ini file." | $TEE -a ${LOGFILE}
+        fi
+	fi
+
+
+	$CP -rp ${ENIQ_INST_PATH}/manage_ombs_policies_bkp.bsh ${ENIQ_INST_PATH}/manage_ombs_policies.bsh
+	i=`$EXPR $i + 1`
+
+		done
+		
+	$RM -rf hostname.txt
+	$ECHO "\n=====================================================\n" | $TEE -a ${LOGFILE}
+
+	elif [ "${CURR_SERVER_TYPE}" == "eniq_stats" ]; then
+
+			eniq_hostname=`iniget inputs -f '/eniq/installation/config/upgrade_params.ini' -v eniq_hostname`
+
+			$CP -rp ${ENIQ_INST_PATH}/manage_ombs_policies.bsh ${ENIQ_INST_PATH}/manage_ombs_policies_bkp.bsh
+			$ECHO "eniq_hostname=$eniq_hostname" >> tmp.txt
+			$CAT ${ENIQ_INST_PATH}/manage_ombs_policies.bsh |  $SED -e 's/action_type=enable/action_type=disable/g' >> tmp.txt
+			$CP -rp tmp.txt ${ENIQ_INST_PATH}/manage_ombs_policies.bsh
+			$RM -rf tmp.txt
+
+
+	CMD="ssh -o StrictHostKeyChecking=no  ${ombs_uname}\@${ombs_host_name} "
+
+	/usr/bin/expect<<END
+	set force_conservative 0
+	spawn bash  -c "${CMD} ${SUDO} su - root -- -c /bin/bash < ${script} "
+	expect  "* password: "
+	send -- "${ombs_pass}\r"
+	expect  "*$*"
+	expect eof
+
+END
+
+	if [ $? -eq 0 ]; then
+		$ECHO "\nSuccessfully Disabled OMBS Policies\n" | $TEE -a ${LOGFILE}
+        ombs_action_type='disable'
+        iniset inputs -f ${ENIQ_CONF_PATH}/upgrade_params.ini -v ombs_action_type=$ombs_action_type
+        if [[ $? -ne 0 ]];then
+                $ECHO "Could not set action_type value in ini file." | $TEE -a ${LOGFILE}
+        fi
+	fi
+	
+	$CP -rp ${ENIQ_INST_PATH}/manage_ombs_policies_bkp.bsh ${ENIQ_INST_PATH}/manage_ombs_policies.bsh
+
+	fi
+
+	$ECHO "\n=====================================================\n" | $TEE -a ${LOGFILE}
+
+elif [[ $ombs_choice == 'Yes' && $ombs_policies == 'Yes' ]]; then
+		
+	$ECHO "Skipping this stage as OMBS Policies are manually disabled" | $TEE -a ${LOGFILE}
+
+else
+		
+	$ECHO "Skipping this stage as OMBS Server is Not Configured" | $TEE -a ${LOGFILE}
+
+fi
+
+$RM -rf manage_ombs_policies_bkp.bsh
+
+
+$ECHO "\nStarting to Copy Precheck scripts\n" | $TEE -a ${LOGFILE}
+$BASH /var/tmp/upgrade/$upg_sw_dir/core_install/bin/unpack_core_sw.bsh -a copy_precheck_sw -p $upg_sw_dir
+if [[ $? -eq 0 ]];then
+	$ECHO "Updated Precheck Scripts Successfully" | $TEE -a ${LOGFILE}
+fi
+$ECHO "\n=====================================================\n" | $TEE -a ${LOGFILE}
+
+$ECHO "\nStarting ENIQ Prechecks\n" | $TEE -a ${LOGFILE}
+$BASH ${ENIQ_CHECKS_PATH}/eniq_checks.bsh
+if [[ $? -eq 0 ]];then
+	$ECHO "Prechecks Execution Completed Successfully" | $TEE -a ${LOGFILE}
+else
+    $ECHO "Prechecks Execution Unsuccessful" | $TEE -a ${LOGFILE}
+fi
+$ECHO "\n=====================================================\n" | $TEE -a ${LOGFILE}
+
+$ECHO "\nStarting to take OS Configuration Backup\n" | $TEE -a ${LOGFILE}
+
+ENIQ_CONF_DIR=/eniq/installation/config
+
+OM_SW_DIR=`iniget inputs -v om_sw -f ${ENIQ_CONF_DIR}/upgrade_params.ini`
+if [ ! "${OM_SW_DIR}" ]; then
+    _err_msg_="Could not determine OM SW DIR from ${ENIQ_CONF_DIR}/upgrade_params.ini"
+    abort_script "$_err_msg_"
+fi
+
+NFS_PATCH_OSBACKUP="${OM_SW_DIR}/om_linux/patch/bin/nfs_patch_osbackup.py add"
+
+$PYTHON ${NFS_PATCH_OSBACKUP}
+OS_configuration_backup=$?
+
+if [ ${OS_configuration_backup} -ne 0 ]; then
+	_err_msg_="Could not take OS Configuration Backup. Fix the issue and rerun the Script."
+	abort_script "$_err_msg_"
+else
+	$ECHO "\nOS Configuration Backup is successful\n" | $TEE -a ${LOGFILE}
+fi
+
+$ECHO "\n=====================================================\n" | $TEE -a ${LOGFILE}
+

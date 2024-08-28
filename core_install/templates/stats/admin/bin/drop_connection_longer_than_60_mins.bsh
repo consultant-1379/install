@@ -1,0 +1,227 @@
+#!/bin/bash
+# ********************************************************************
+# Ericsson Radio Systems AB                                     SCRIPT
+# ********************************************************************
+#
+#
+# (c) Ericsson Radio Systems AB 2021 - All rights reserved.
+#
+# The copyright to the computer program(s) herein is the property
+# of Ericsson Radio Systems AB, Sweden. The programs may be used
+# and/or copied only with the written permission from Ericsson Radio
+# Systems AB or in accordance with the terms and conditions stipulated
+# in the agreement/contract under which the program(s) have been
+# supplied.
+#
+# ********************************************************************
+# Name    :  drop_connection_longer_than_60_mins.bsh
+# Date    :  11/22/2022
+# Revision:  \Statistics_21.4_21.4.8.EU1_Linux/2
+# Purpose :  To drop hung or active load connections which are in the
+#            system for longer than 60 minutes
+#
+#
+# Usage   :  {dcuser}: bash /eniq/admin/bin/drop_connection_longer_than_60_mins.bsh
+#
+# ********************************************************************
+#
+# Command Section
+#
+# ********************************************************************
+AWK=/usr/bin/awk
+CAT=/usr/bin/cat
+DATE=/usr/bin/date
+ECHO=/usr/bin/echo
+GREP=/usr/bin/grep
+ID=/usr/bin/id
+MKDIR=/usr/bin/mkdir
+RM=/usr/bin/rm
+TEE=/usr/bin/tee
+TOUCH=/usr/bin/touch
+
+#Temp directory.
+TEM=/tmp
+
+CORE_INSTALL_LIB=/eniq/admin/lib/
+CONFIG_DIR=/eniq/sw/conf
+ENIQ_INI=$CONFIG_DIR/niq.ini
+
+# ********************************************************************
+#
+#   Functions
+#
+# ********************************************************************
+
+## Function: abort_script ###
+#
+#   This will is called if the script is aborted thru an error
+#   signal sent by the kernel such as CTRL-C or if a serious
+#   error is encountered during runtime
+#
+# Arguments:
+#       $1 - Error message from part of program (Not always used)
+# Return Values:
+#       none
+abort_script()
+{
+  _err_time_=`$DATE '+%Y-%b-%d_%H.%M.%S'`
+  
+  if [ "$1" ]; then
+      _err_msg_="${_err_time_} - $1"
+  else
+      _err_msg_="${_err_time_} - ERROR : Script aborted.......\n"
+  fi
+  
+  if [ "${LOGFILE}" ]; then
+      $ECHO -e "\nERROR : ${_err_msg_}\n" | $TEE -a ${LOGFILE}
+  else
+      $ECHO -e "\nERROR : ${_err_msg_}\n"
+  fi
+  
+  $RM -rf $TEM/Connections_Greater_Than_60mins.txt
+  $RM -rf $TEM/load_connection_list.txt
+  $RM -rf ${conn_str_enc}
+  $RM -rf ${conn_str_reader_enc}
+  
+  exit 1
+}
+
+### Function: check_id ###
+#
+#   Check that the effective id of the user is correct
+#   If not print error msg and exit.
+#
+# Arguments:
+#       $1 : User ID name
+# Return Values:
+#       none
+check_id()
+{
+_check_id_=`$ID  | $AWK -F\( '{print $2}' | $AWK -F\) '{print $1}'`
+if [ "$_check_id_" != "$1" ]; then
+    _err_msg_="You must be $1 to execute this script."
+    abort_script "$_err_msg_"
+fi
+}
+
+## Function: get_connection_string ###
+#
+#   This will be called to create connection string for
+#   sybase connection
+#
+#
+# Arguments:
+#       $1 - Server to which connection is required
+# 
+# Return Values: none
+get_connection_string()
+{
+  if [ $1 == "dwhdb" ]; then
+	 
+	 
+	 conn_str="-c \"eng="$1";links=tcpip{host="$1";port="$DWH_PORT_CO"};uid=dba;pwd="$DBA_PASSWORD"\""
+	 conn_str_enc=${TEM}/conn_str_sixty_encrypt.`uuidgen`
+	 
+	 # encrypt the connection string.
+	 get_encrypt_file "${conn_str}" "${conn_str_enc}"
+
+     ConnString="dbisql -nogui -onerror exit @${conn_str_enc}"
+  else
+	 
+	 
+	 conn_str_reader="-c \"eng="$1";links=tcpip{host="$1";port="$DWH_PORT_READER"};uid=dba;pwd="$DBA_PASSWORD"\""
+	 conn_str_reader_enc=${TEM}/conn_str_sixty_mins_encrypt.txt.`uuidgen`
+	 
+	 # encrypt the connection string.
+	 get_encrypt_file "${conn_str_reader}" "${conn_str_reader_enc}"
+
+	 
+     ConnString="dbisql -nogui -onerror exit @${conn_str_reader_enc}"
+  fi
+}
+
+# ********************************************************************
+#
+#   Main body of program
+#
+# ********************************************************************
+#
+
+
+# Check that the effective id of the user is root
+check_id "dcuser"
+
+LOGFILE=/eniq/log/sw_log/iq/drop_connection_longer_than_60_mins.log
+
+$TOUCH ${LOGFILE}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not write to file ${LOGFILE}"
+    abort_script "$_err_msg_"
+fi
+
+if [ ! -s $CORE_INSTALL_LIB/common_functions.lib ]; then
+    _err_msg_="Cannot locate $CORE_INSTALL_LIB/common_functions.lib"
+    abort_script "$_err_msg_"
+else
+   . $CORE_INSTALL_LIB/../lib/common_functions.lib
+fi
+
+CURR_SERVER_TYPE=`$CAT /eniq/installation/config/installed_server_type`
+DWH_PORT_CO=`iniget DWH -v PortNumber -f ${ENIQ_INI}`
+DWH_PORT_READER=`iniget DWH_READER_SETTINGS -v PortNumber -f ${ENIQ_INI}`
+DBA_PASSWORD=`inigetpassword DB -f ${ENIQ_INI} -v DBAPassword`
+
+if [ "${CURR_SERVER_TYPE}" == "stats_coordinator" ]; then
+      SERVER="dwh_reader_1"
+      get_connection_string $SERVER
+elif [ "${CURR_SERVER_TYPE}" == "eniq_stats" ] ; then
+      SERVER="dwhdb"
+      get_connection_string $SERVER
+elif [ "${CURR_SERVER_TYPE}" == "stats_iqr" ] ; then
+      ## Execute drop external connection script
+      bash /eniq/admin/bin/drop_external_connections.bsh
+      exit 0
+else
+      exit 0
+fi
+
+$ConnString "select ConnHandle as ConnHandleToInclude from sp_iqcontext() where Userid = 'DC' and CmdLine like '%LOAD INTO TABLE%'; output to $TEM/load_connection_list.txt" 2>>${LOGFILE}
+if [ $? -ne 0 ]; then
+     _err_msg_="Could not get list of load connections"
+     abort_script "$_err_msg_"
+fi
+
+$ConnString "select conn.ConnHandle from sp_iqconnection() conn where DATEDIFF(mi,conn.LastReqTime,now()) >= 60; output to $TEM/Connections_Greater_Than_60mins.txt" 2>>${LOGFILE}
+if [ $? -ne 0 ]; then
+     _err_msg_="Could not get list of connections running for longer than 60 minutes"
+     abort_script "$_err_msg_"
+fi
+
+if [ -s $TEM/load_connection_list.txt ]; then
+    for _conn_ in `$CAT $TEM/load_connection_list.txt`
+    do
+        $GREP -w ${_conn_} $TEM/Connections_Greater_Than_60mins.txt
+        if [ $? -eq 0 ]; then
+            message="Dropping load connection with connection handle:${_conn_}, since it is running for longer than 60 minutes"
+            log_msg -t -q -s "$message" -l ${LOGFILE}
+            $ConnString "drop connection ${_conn_}" 2>>${LOGFILE}
+        else
+            message="No load connection with connection handle:${_conn_} exists in the system which is running for longer than 60 minutes"
+            log_msg -t -q -s "$message" -l ${LOGFILE}
+        fi
+    done
+else
+    log_msg -t -q -s "No connection with ConnHandle exists" -l ${LOGFILE}
+fi
+
+
+$RM -rf $TEM/Connections_Greater_Than_60mins.txt
+$RM -rf $TEM/load_connection_list.txt
+$RM -rf ${conn_str_enc}
+$RM -rf ${conn_str_reader_enc}
+
+## Execute drop external connection script
+bash /eniq/admin/bin/drop_external_connections.bsh
+
+
+exit 0

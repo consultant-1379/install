@@ -1,0 +1,465 @@
+#!/bin/bash
+# ********************************************************************
+# Ericsson Radio Systems AB                                     SCRIPT
+# ********************************************************************
+#
+#
+# (c) Ericsson Radio Systems AB 2021 - All rights reserved.
+#
+# The copyright to the computer program(s) herein is the property
+# of Ericsson Radio Systems AB, Sweden. The programs may be used
+# and/or copied only with the written permission from Ericsson Radio
+# Systems AB or in accordance with the terms and conditions stipulated
+# in the agreement/contract under which the program(s) have been
+# supplied.
+#
+# ********************************************************************
+# Name    : repdb_backup.bsh
+# Date    : 21/07/2022
+# Revision: main\16
+# Purpose : Backup the repdb
+#
+# Usage   : repdb_backup.bsh -c <path_to_cli_conf> [-l <logfile>]
+#
+# ********************************************************************
+#
+#   Command Section
+#
+# ********************************************************************
+AWK=/usr/bin/awk
+BASENAME=/usr/bin/basename
+CAT=/usr/bin/cat
+CHMOD=/usr/bin/chmod
+CP=/usr/bin/cp
+DATE=/usr/bin/date
+DIRNAME=/usr/bin/dirname
+ECHO='/usr/bin/echo -e'
+EXPR=/usr/bin/expr
+GREP=/usr/bin/grep
+ID=/usr/bin/id
+LS=/usr/bin/ls
+MKDIR=/usr/bin/mkdir
+PWD=/usr/bin/pwd
+RM=/usr/bin/rm
+SLEEP=/usr/bin/sleep
+TEE=/usr/bin/tee
+TOUCH=/usr/bin/touch
+WC=/usr/bin/wc
+
+# ********************************************************************
+#
+#       Configuration Section
+#
+# ********************************************************************
+# Flag to determine whether to compress log or not (Must be y/n)
+COMPRESS_LOG=n
+
+# Name of SunOS & ENIQ ini Files
+DWH_INI=dwh.ini
+ENIQ_ENV=niq.rc
+ENIQ_INI=niq.ini
+SUNOS_INI=SunOS.ini
+
+# Number of log files to keep
+NUM_LOGS=10
+
+# Size in kbytes that the log file is allowed to grow to
+SIZE_LOGS=2048000
+
+
+# ********************************************************************
+#
+#   Functions
+#
+# ********************************************************************
+### Function: abort_script ###
+#
+#   This will is called if the script is aborted thru an error
+#   signal sent by the kernel such as CTRL-C or if a serious
+#   error is encountered during runtime
+#
+# Arguments:
+#       $1 - Error message from part of program (Not always used)
+# Return Values:
+#       none
+abort_script()
+{
+if [ "$1" ]; then
+    _err_msg_=$1
+else
+    _err_msg_="`$DATE +%d.%m.%y_%H:%M:%S` - ERROR : Script aborted.......\n"
+fi
+
+if [ "${LOGFILE}" ]; then
+    $ECHO "\n`$DATE +%d.%m.%y_%H:%M:%S` - ERROR : $_err_msg_\n" | $TEE -a ${LOGFILE}
+else
+    $ECHO "\n`$DATE +%d.%m.%y_%H:%M:%S` - ERROR : $_err_msg_\n"
+fi
+$RM -rf ${TEM_DIR}
+$RM -rf ${BACKUP_COPY_STR_USER_DBA_enc}
+$RM -rf ${VALIDATE_STR_USER_DBA_enc}
+$RM -rf ${CONN_STR_USER_DBA_enc}
+exit 55
+}
+
+### Function: check_id ###
+#
+#   Check that the effective id of the user is correct
+#   If not print error msg and exit.
+#
+# Arguments:
+#       $1 : User ID name
+# Return Values:
+#       none
+check_id()
+{
+_check_id_=`$ID  | $AWK -F\( '{print $2}' | $AWK -F\) '{print $1}'`
+if [ "$_check_id_" != "$1" ]; then
+    _err_msg_="You must be $1 to execute this script."
+    abort_script "$_err_msg_"
+fi
+}
+
+### Function: chk_create_logfile ###
+#
+# Check/Create Logfile
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+chk_create_logfile()
+{
+$MKDIR -p `$DIRNAME ${LOGFILE}`
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not create directory `$DIRNAME ${LOGFILE}`"
+    abort_script "$_err_msg_"
+fi
+
+$TOUCH -a ${LOGFILE}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not write to file ${LOGFILE}"
+    abort_script "$_err_msg_"
+fi
+}
+
+### Function: get_absolute_path ###
+#
+# Determine absolute path to software
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+get_absolute_path()
+{
+_dir_=`$DIRNAME $0`
+SCRIPTHOME=`cd $_dir_ 2>/dev/null && pwd || $ECHO $_dir_`
+}
+
+### Function: setup_variables ###
+#
+# Set up some script variables
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+setup_env()
+{
+# Check required files and scripts exist
+if [ ! -s ${CONF_DIR}/niq.rc ]; then
+    _err_msg_="File ${CONF_DIR}/niq.rc not found, or is empty"
+    abort_script "$_err_msg_"
+else
+    $ECHO "`$DATE +%d.%m.%y_%H:%M:%S` - Sourcing ${CONF_DIR}/niq.rc"
+    . ${CONF_DIR}/niq.rc
+fi
+
+if [ -z "$CONF_DIR" ] ; then
+    _err_msg_="`$DATE +%d.%m.%y_%H:%M:%S` - ERROR: CONF_DIR is not set"
+    abort_script "$_err_msg_"
+fi
+
+if [ ! -f ${CONF_DIR}/${ENIQ_INI} ]; then
+    _err_msg_="${CONF_DIR}/${ENIQ_INI} does not exists"
+    abort_script "$_err_msg_"
+fi
+
+if [ ! "${ENIQ_BASE_DIR}" ]; then
+    # Directory on the root filesystem
+    ENIQ_BASE_DIR=/eniq
+fi
+
+# Main Directory for the Core Installation SW
+ENIQ_INST_DIR=${ENIQ_BASE_DIR}/installation
+
+# Main Directory for the Core Installation SW
+ENIQ_CORE_INST_DIR=${ENIQ_INST_DIR}/core_install
+
+# Config dir
+ENIQ_CONF_DIR=${ENIQ_INST_DIR}/config
+
+# Backup dir
+ASA_BKUP_DIR=${ENIQ_BASE_DIR}/backup/repdb_bkup
+
+# Source the common functions
+if [ -s $ENIQ_CORE_INST_DIR/lib/common_functions.lib ]; then
+    . $ENIQ_CORE_INST_DIR/lib/common_functions.lib
+else
+    _err_msg_="File $ENIQ_CORE_INST_DIR/lib/common_functions.lib not found"
+    abort_script "$_err_msg_"
+fi
+
+# Check that the efective id of the user is ${IQ_USER}
+IQ_USER=`iniget DB -v IQUserName -f ${ENIQ_CONF_DIR}/${ENIQ_INI}`
+
+#Check if variable is empty
+if [ -z "${IQ_USER}" ]; then
+    _err_msg_="${IQ_USER} is NULL."
+    abort_script "$_err_msg_"
+fi
+
+# Need to start the Util Server
+UTIL_PORT=`iniget DB -v UtilServerPort -f ${CONF_DIR}/${ENIQ_INI}`
+REP_ENG=`iniget REP -v ServerName -f ${CONF_DIR}/${ENIQ_INI}`
+REP_PORT=`iniget REP -f ${CONF_DIR}/${ENIQ_INI} -v PortNumber`
+if [ ! "${UTIL_PORT}"  -o ! "${REP_ENG}" -o ! "${REP_PORT}"  ]; then
+    _err_msg_="Could not read repdb values from ${CONF_DIR}/${ENIQ_INI}"
+    abort_script "$_err_msg_"
+fi
+
+REP_VALIDATION_PORT=`iniget REP -f ${CONF_DIR}/${ENIQ_INI} -v Validation_PortNumber`
+if [ ! "${REP_VALIDATION_PORT}" ]; then
+    _err_msg_="Could not read repdb validation port number from ${CONF_DIR}/${ENIQ_INI}"
+    abort_script "$_err_msg_"
+fi
+
+DBA_PASSWORD=`inigetpassword DB -v DBAPassword -f ${CONF_DIR}/${ENIQ_INI}`
+if [ ! ${DBA_PASSWORD} ]; then
+    if [ -f ${ENIQ_BASE_DIR}/sw/installer/dbusers ]; then
+        DBA_PASSWORD=`${ENIQ_BASE_DIR}/sw/installer/dbusers dba etlrep`
+        if [ ! "${DBA_PASSWORD}" ] ; then
+            _err_msg_="Could not get repdb DBA Password from dbusers script"
+            abort_script "$_err_msg_"
+        fi
+    else
+        _err_msg_="Could not get repdb DBA Password from ${CONF_DIR}/${ENIQ_INI}"
+        abort_script "$_err_msg_"
+    fi
+fi
+
+CONN_STR_USER_DBA="-c \"uid=dba;pwd=${DBA_PASSWORD};eng=${REP_ENG};dbn=${REP_ENG};links=tcpip(host=localhost;port=$REP_PORT)\""
+CONN_STR_USER_DBA_enc=/tmp/str_db.`uuidgen`
+# encrypt the connection string.
+get_encrypt_file "${CONN_STR_USER_DBA}" "${CONN_STR_USER_DBA_enc}"
+
+VALIDATE_STR_USER_DBA="-c \"uid=dba;pwd=${DBA_PASSWORD};server=repdb1;dbn=repdb1\""
+VALIDATE_STR_USER_DBA_enc=/tmp/validate_st.`uuidgen`
+
+# encrypt the connection string.
+get_encrypt_file "${VALIDATE_STR_USER_DBA}" "${VALIDATE_STR_USER_DBA_enc}"
+
+BACKUP_COPY_STR_USER_DBA="-c \"eng=repdb1;dbn=repdb1;uid=dba;pwd=${DBA_PASSWORD};links=tcpip(host=localhost;port=${REP_VALIDATION_PORT})\""
+BACKUP_COPY_STR_USER_DBA_enc=/tmp/bckup_str_enc.`uuidgen`
+# encrypt the connection string.
+get_encrypt_file "${BACKUP_COPY_STR_USER_DBA}" "${BACKUP_COPY_STR_USER_DBA_enc}"
+
+# Get the System User/Group. All directories are owned by this
+SYSUSER=`iniget ENIQ_INSTALL_CONFIG -f ${ENIQ_CONF_DIR}/${SUNOS_INI} -v ENIQ_SYSUSER`
+if [ ! "${SYSUSER}" ]; then
+    _err_msg_="Could not read System User from ${CLI_CONF_DIR}/${ENIQ_INI}"
+    abort_script "$_err_msg_"
+fi
+
+if [ -s ${ASA_DIR}/bin64/sa_config.sh ]; then
+	. ${ASA_DIR}/bin64/sa_config.sh >> /dev/null 2>&1
+else
+	_err_msg_="File ${ASA_DIR}/bin64/sa_config.sh not found or empty"
+	abort_script "$_err_msg_"
+fi
+
+}
+
+### Function: usage_msg ###
+#
+# Usage message
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+usage_msg()
+{
+$ECHO "
+Usage: `$BASENAME $0` -c <conf dir> [-l <logfile>]
+
+Options:
+
+-l : Optional parameter specifying what logfile to use
+
+-c : Path to Conf Dir 
+"
+}
+
+# ********************************************************************
+#
+#   Main body of program
+#
+# ********************************************************************
+#
+#
+TIMESTAMP=`$DATE +%d.%m.%y_%H:%M:%S`
+
+# Determine absolute path to software
+get_absolute_path
+
+while getopts ":l:c:" arg; do
+    case $arg in
+        l) LOGFILE="$OPTARG"
+            ;;
+        c) CONF_DIR="$OPTARG"
+            ;;
+        \?) usage_msg
+            exit 1
+            ;;
+    esac
+done
+shift `expr $OPTIND - 1`
+
+# Set up variables
+setup_env
+
+if [ ! "$LOGFILE" ] ; then
+    LOGFILE=${LOG_DIR}/asa/backup_repdb_${TIMESTAMP}.log
+fi
+
+check_id ${IQ_USER}
+
+chk_create_logfile
+
+# Create a temporary Directory
+TEM_DIR=/tmp/repdb_backup.$$.$$
+$RM -rf ${TEM_DIR}
+$MKDIR -p ${TEM_DIR}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not create directory ${TEM_DIR}"
+    abort_script "$_err_msg_"
+fi	
+$CHMOD 750 ${TEM_DIR}
+
+$ECHO "`$DATE +%d.%m.%y_%H:%M:%S` - Starting DB Backup" | $TEE -a ${LOGFILE}
+
+# Verify that DB is online
+$ECHO "`$DATE +%d.%m.%y_%H:%M:%S` - Verifing that the DB is online" | $TEE -a ${LOGFILE}
+${SQLANY}/bin64/dbping -q @${CONN_STR_USER_DBA_enc}
+if [ $? -ne 0 ] ; then
+    _err_msg_="Could not ping repdb database"
+    abort_script "$_err_msg_"
+fi
+
+_count_=1
+_retry_=4
+
+while [ ${_count_} -le ${_retry_} ]; do
+    # Backup the database
+    $ECHO "`$DATE +%d.%m.%y_%H:%M:%S` - Performing the database backup" | $TEE -a ${LOGFILE}
+    ${SQLANY}/bin64/dbbackup -s -y @${CONN_STR_USER_DBA_enc} ${ASA_BKUP_DIR} >> ${LOGFILE} 2>&1
+    if [ $? -ne 0 ] ; then
+        _err_msg_="Could not backup repdb database"
+        abort_script "$_err_msg_"
+    fi
+
+    # Backup the .cfg file also
+    if [ -f ${ASA_BKUP_DIR}/repdb.cfg ]; then
+        $RM -rf ${ASA_BKUP_DIR}/repdb.cfg >> /dev/null 2>&1
+    fi
+
+    $ECHO "`$DATE +%d.%m.%y_%H:%M:%S` - Backing up the database cfg file" | $TEE -a ${LOGFILE}
+    $CP $REP_DIR/repdb.cfg ${ASA_BKUP_DIR} >> /dev/null 2>&1
+    if [ $? -ne 0 ]; then
+        _err_msg_="Could not backup $REP_DIR/repdb.cfg to ${ASA_BKUP_DIR}"
+        abort_script "$_err_msg_"
+    fi
+
+    $ECHO "`$DATE +%d.%m.%y_%H:%M:%S` - Making a temporary copy of the backup files" | $TEE -a ${LOGFILE}
+    $RM -rf ${ASA_BKUP_DIR}/repdb1.db ${ASA_BKUP_DIR}/repdb1.log ${ASA_BKUP_DIR}/repdb1.tran
+
+    $CP -pf ${ASA_BKUP_DIR}/repdb.db ${ASA_BKUP_DIR}/repdb1.db
+    if [ $? -ne 0 ]; then
+        _err_msg_="Could not copy backup file $REP_DIR/repdb.db to ${ASA_BKUP_DIR}repdb1.db"
+        abort_script "$_err_msg_"
+    fi
+
+    if [ -f ${ASA_BKUP_DIR}/repdb.log ]; then
+		$CP -pf ${ASA_BKUP_DIR}/repdb.log ${ASA_BKUP_DIR}/repdb1.tran
+		repdb_log_name=repdb.log
+		copy_command_return=$?
+	fi
+	if [ -f ${ASA_BKUP_DIR}/repdb.tran ]; then
+		$CP -pf ${ASA_BKUP_DIR}/repdb.tran ${ASA_BKUP_DIR}/repdb1.tran
+		repdb_log_name=repdb.tran
+		copy_command_return=$?
+	fi
+    if [ ${copy_command_return} -ne 0 ]; then
+        _err_msg_="Could not copy backup file $REP_DIR/${repdb_log_name} to ${ASA_BKUP_DIR}/${repdb_log_name}"
+        abort_script "$_err_msg_"
+    fi
+	
+    $ECHO "`$DATE +%d.%m.%y_%H:%M:%S` - Setting transaction log for ${ASA_BKUP_DIR}/repdb1.db" | $TEE -a ${LOGFILE}
+    ${SQLANY}/bin64/dblog -t ${ASA_BKUP_DIR}/repdb1.tran ${ASA_BKUP_DIR}/repdb1.db >> ${LOGFILE} 2>&1
+    if [ $? -ne 0 ]; then
+        _err_msg_="Could not set transaction log for ${ASA_BKUP_DIR}/repdb1.db to ${ASA_BKUP_DIR}/repdb1.log"
+        abort_script "$_err_msg_"
+    fi
+
+    $ECHO "`$DATE +%d.%m.%y_%H:%M:%S` - Starting the backup copy of the database" | $TEE -a ${LOGFILE}
+    if [ -f ${SQLANY}/bin64/dbsrv17 ]
+    then
+       ${SQLANY}/bin64/dbsrv17 -ud @${ASA_BKUP_DIR}/repdb.cfg -n repdb1 -x tcpip{port=${REP_VALIDATION_PORT}}  ${ASA_BKUP_DIR}/repdb1.db >> ${LOGFILE} 2>&1
+    else
+       ${SQLANY}/bin64/dbsrv16 -ud @${ASA_BKUP_DIR}/repdb.cfg -n repdb1 -x tcpip{port=${REP_VALIDATION_PORT}}  ${ASA_BKUP_DIR}/repdb1.db >> ${LOGFILE} 2>&1
+    fi
+
+    if [ $? -ne 0 ]; then
+        _err_msg_="Could not start the database copy ${ASA_BKUP_DIR}/repdb1.db"
+        abort_script "$_err_msg_"
+    fi
+
+    $ECHO "`$DATE +%d.%m.%y_%H:%M:%S` - Attempt number ${_count_} at validating the repdb database backup" | $TEE -a ${LOGFILE}
+    ${SQLANY}/bin64/dbvalid -fx @${VALIDATE_STR_USER_DBA_enc} >> ${LOGFILE} 2>&1
+    if [ $? -eq 0 ]; then
+        $ECHO "`$DATE +%d.%m.%y_%H:%M:%S` - Stopping the backup copy of the database" | $TEE -a ${LOGFILE}
+        ${SQLANY}/bin64/dbstop -y @${BACKUP_COPY_STR_USER_DBA_enc} >> ${LOGFILE} 2>&1
+        if [ $? -ne 0 ]; then
+            _err_msg_="Could not shutdown the backup copy of the database repdb1"
+            abort_script "$_err_msg_"
+        fi
+		$RM -rf ${ASA_BKUP_DIR}/repdb1.db ${ASA_BKUP_DIR}/repdb1.tran
+        break
+    fi
+
+    $ECHO "`$DATE +%d.%m.%y_%H:%M:%S` - Stopping the backup copy of the database" | $TEE -a ${LOGFILE}
+    ${SQLANY}/bin64/dbstop -y @${BACKUP_COPY_STR_USER_DBA_enc} >> ${LOGFILE} 2>&1
+    if [ $? -ne 0 ]; then
+        _err_msg_="Could not shutdown the backup copy of the database repdb1"
+        abort_script "$_err_msg_"
+    fi
+
+    $ECHO "`$DATE +%d.%m.%y_%H:%M:%S` - Removing Temporary Copy of the backup files" | $TEE -a ${LOGFILE}
+
+    let _count_=${_count_}+1
+    sleep 20
+done
+
+if [ ${_count_} -gt ${_retry_} ]; then
+    _err_msg_="Could not backup repdb database"
+    abort_script "$_err_msg_"
+fi
+
+$RM -rf ${TEM_DIR}
+$RM -rf ${BACKUP_COPY_STR_USER_DBA_enc}
+$RM -rf ${VALIDATE_STR_USER_DBA_enc}
+$RM -rf ${CONN_STR_USER_DBA_enc}
+
+exit 0

@@ -1,0 +1,19 @@
+[Unit]
+Description=The Eniq Lwphelper Service
+Requires=eniq-rmiregistry.service
+
+[Service]
+Type=forking
+User=dcuser
+Group=dc5000
+ExecStart=/eniq/smf/bin/eniq_smf_start_stop.sh -a start -s lwphelper
+ExecStop=/eniq/smf/bin/eniq_smf_start_stop.sh -a stop -s lwphelper
+Restart=always
+RestartSec=15
+StartLimitInterval=150
+StartLimitBurst=3
+TimeoutStartSec=0
+TimeoutStopSec=150
+
+[Install]
+WantedBy=multi-user.target eniq-rmiregistry.service

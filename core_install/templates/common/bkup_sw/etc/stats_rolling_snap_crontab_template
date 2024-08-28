@@ -1,0 +1,38 @@
+######################################################
+# This contains the entry that will be added to the
+# root crontab when rolling snapshot has been enabled
+# It has the standard crontab format of
+#
+# A crontab file consists of lines of  six  fields  each.  The
+# fields  are  separated by spaces or tabs. The first five are
+# integer patterns that specify the following:
+#
+# 	minute (0-59),
+# 	hour (0-23),
+# 	day of the month (1-31),
+# 	month of the year (1-12),
+# 	day of the week (0-6 with 0=Sunday).
+#
+# The sixth field of a line in a crontab file is a string that
+# is  executed  by the shell at the specified times.
+# The command executing should not produce and standard or error output
+# The insert_roll_snap_crontab function inserts the crontab entries
+# The 8th field MUST contain the name of the script to be executed 
+# There must be a check to see if the script exists before trying to run the command 
+# Due to the fact that the NAS could go down, we do not want to keep getting the error script not found
+# Comments are preceded by '#' 
+######################################################
+0 13,23 * * 1,3,5 [ -x <CHANGE><ENIQ_BASE_DIR>/bkup_sw/bin/trigger_roll_snap.bsh ] && <CHANGE><ENIQ_BASE_DIR>/bkup_sw/bin/trigger_roll_snap.bsh >> /dev/null 2>&1
+0 11,23 * * 0,2,4,6 [ -x <CHANGE><ENIQ_BASE_DIR>/bkup_sw/bin/trigger_roll_snap.bsh ] && <CHANGE><ENIQ_BASE_DIR>/bkup_sw/bin/trigger_roll_snap.bsh >> /dev/null 2>&1
+0 0,12 * * * [ -s <CHANGE><ENIQ_BASE_DIR>/admin/bin/defrag_eniq_sfs.bsh ] && /usr/bin/su - storadm >> /dev/null -c "/usr/bin/bash <CHANGE><ENIQ_BASE_DIR>/admin/bin/defrag_eniq_sfs.bsh -r >> /dev/null 2>&1"
+0 3,9,15,21 * * * [ -x <CHANGE><ENIQ_BASE_DIR>/admin/bin/cleanup_sybase_logs.bsh ] && <CHANGE><ENIQ_BASE_DIR>/admin/bin/cleanup_sybase_logs.bsh -N -q >> /dev/null 2>&1
+10 00 * * 0 [ -x <CHANGE><ENIQ_BASE_DIR>/admin/bin/manageSanDataCollection.bsh ] && <CHANGE><ENIQ_BASE_DIR>/admin/bin/manageSanDataCollection.bsh -m enable >> /dev/null 2>&1
+0 1 * * * [ -x <CHANGE><ENIQ_BASE_DIR>/admin/bin/cleanup_log_files.bsh ] && /usr/bin/bash <CHANGE><ENIQ_BASE_DIR>/admin/bin/cleanup_log_files.bsh >> /dev/null 2>&1
+00,15,30,45 * * * * [ -x <CHANGE><ENIQ_BASE_DIR>/admin/bin/drop_idle_connection.bsh ] && /usr/bin/su - dcuser -c "/bin/bash <CHANGE><ENIQ_BASE_DIR>/admin/bin/drop_idle_connection.bsh" >> /dev/null 2>&1
+00,15,30,45 * * * * [ -x <CHANGE><ENIQ_BASE_DIR>/admin/bin/drop_connection_longer_than_60_mins.bsh ] && /usr/bin/su - dcuser -c "/bin/bash <CHANGE><ENIQ_BASE_DIR>/admin/bin/drop_connection_longer_than_60_mins.bsh" >> /dev/null 2>&1
+0 1 * * * [ -x <CHANGE><ENIQ_BASE_DIR>/installation/core_install/bin/hardware_replacement_backup.bsh ] && /usr/bin/bash <CHANGE><ENIQ_BASE_DIR>/installation/core_install/bin/hardware_replacement_backup.bsh >> /dev/null 2>&1 
+0 0,4,8,12,16,20 * * * [ -x <CHANGE><ENIQ_BASE_DIR>/admin/bin/queryUserConf_db_sync.bsh ] && <CHANGE><ENIQ_BASE_DIR>/admin/bin/queryUserConf_db_sync.bsh >> /dev/null 2>&1
+0 1 * * * [ -x <CHANGE><ENIQ_BASE_DIR>/sw/bin/collect_certificates.bsh ] && /usr/bin/bash <CHANGE><ENIQ_BASE_DIR>/sw/bin/collect_certificates.bsh >> /dev/null 2>&1
+0 15 * * * [ -s <CHANGE><ENIQ_BASE_DIR>/admin/bin/triggerBitmapCheck.bsh ] && /bin/bash <CHANGE><ENIQ_BASE_DIR>/admin/bin/triggerBitmapCheck.bsh >> /dev/null 2>&1
+* * * * * [ -s <CHANGE><ENIQ_BASE_DIR>/admin/bin/dwh_dir_perm_check.bsh ] && /bin/bash <CHANGE><ENIQ_BASE_DIR>/admin/bin/dwh_dir_perm_check.bsh >> /dev/null 2>&1
+0 5,11,17,23 * * * [ -s <CHANGE><ENIQ_BASE_DIR>/admin/bin/sp_diag.bsh ] &&  /usr/bin/su - dcuser -c "/bin/bash <CHANGE><ENIQ_BASE_DIR>/admin/bin/sp_diag.bsh" >> /dev/null 2>&1

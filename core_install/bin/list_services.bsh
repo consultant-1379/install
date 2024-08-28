@@ -1,0 +1,248 @@
+# ********************************************************************
+#
+# (c) Ericsson Radio Systems AB 2019 - All rights reserved.
+#
+# The copyright to the computer program(s) herein is the property
+# of Ericsson Radio Systems AB, Sweden. The programs may be used
+# and/or copied only with the written pe$RMission from Ericsson Radio
+# Systems AB or in accordance with the te$RMs and conditions stipulated
+# in the agreement/contract under which the program(s) have been
+# supplied.
+#
+# ********************************************************************
+# Name    : list_services.bsh
+# Date    : 10/01/2019
+# Revision: 6
+# Purpose : Script to print services and their status.
+#
+# Usage   : list_services.sh
+#
+# ********************************************************************
+#
+#   Command Section
+#
+# ********************************************************************
+
+AWK=/usr/bin/awk
+BASENAME=/usr/bin/basename
+CAT=/usr/bin/cat
+ECHO='/usr/bin/echo -e'
+GREP=/usr/bin/grep
+LS=/usr/bin/ls
+MKDIR=/usr/bin/mkdir
+PASTE=/usr/bin/paste
+PRINTF=/usr/bin/printf
+RM=/usr/bin/rm
+SYSTEMCTL=/usr/bin/systemctl
+
+
+# ********************************************************************
+#
+#       Configuration Section
+#
+# ********************************************************************
+
+SERVICE_FILES_PATH1=`$LS /usr/lib/systemd/system/*.service`
+SERVICE_FILES_PATH2=`$LS /etc/systemd/system/*.service`
+
+
+#create a temporary Directory
+TMP_DIR=/tmp/core_installation.$$.$$
+$RM -rf ${TMP_DIR}
+$MKDIR -p ${TMP_DIR}
+if [ $? -ne 0 ]; then
+    $ECHO "Could not create directory ${TMP_DIR}"
+fi
+
+### Function: display_services ###
+#
+#   Print out services
+#
+# Arguments:
+#   $1 - Name of service or initial characters of service name for particular services 
+# Return Values:
+#   none
+display_services()
+{
+
+$PRINTF '%-45s %-15s %-10s %-10s %-30s %-40s\n'  "UNIT" "STATE" "STATUS" "SUB_STATE" "STATETIME" "DESCRIPTION" > ${TMP_DIR}/temp_file1
+
+
+if [ "$_list_all_" == "YES" ]; then
+	$LS $SERVICE_FILES_PATH1 > ${TMP_DIR}/temp_service_list1
+	$LS $SERVICE_FILES_PATH2 >> ${TMP_DIR}/temp_service_list1
+fi
+
+if [ "$_list_single_" == "YES"  ]; then
+	$LS $SERVICE_FILES_PATH1 | $GREP -i -e "${_pattern_}" > ${TMP_DIR}/temp_service_list1
+
+	if [ ! $? -eq 0  ]; then
+
+            _flag1_="NO"
+        fi
+	$LS $SERVICE_FILES_PATH2 | $GREP -i -e "${_pattern_}" >> ${TMP_DIR}/temp_service_list1
+
+	if [ ! $? -eq 0  ]; then
+
+            _flag2_="NO"
+        fi
+	
+	if [[ ${_flag1_} == "NO" && ${_flag2_} == "NO" ]]; then
+	
+	$ECHO "Mentioned service name not found"
+	exit 1
+	fi
+
+fi
+
+
+for _unit_ in `$CAT ${TMP_DIR}/temp_service_list1 | $AWK -F "/" '{print $NF}'`; do
+    $SYSTEMCTL show ${_unit_} >> /dev/null 2>&1
+	if [ $? -eq 0 ]; then
+
+        _enable_=`$SYSTEMCTL is-enabled ${_unit_}`
+	 if [ ! "${_enable_}" ]; then
+
+            _enable_="---"
+
+         fi
+			    
+	_active_=`$SYSTEMCTL show -p ActiveState ${_unit_} | $AWK -F "=" '{print $2}'`
+       	if [ ! "${_active_}" ]; then
+   
+	            _active_="---"
+     
+        elif [ ${_active_} == "active" ]; then
+			
+                _statetime_=`$SYSTEMCTL show -p ActiveEnterTimestamp ${_unit_} | $AWK -F "=" '{print $2}'`
+
+	elif [ ${_active_} == "inactive" ]; then
+			
+		if [ ${_enable_} == "enabled" ]; then
+			_statetime_=`$SYSTEMCTL show -p InactiveEnterTimestamp ${_unit_} | $AWK -F "=" '{print $2}'`
+		else
+			_statetime_="---"
+		fi
+	elif [ ${_active_} == "failed" ]; then
+                 	_statetime_=`$SYSTEMCTL show -p InactiveEnterTimestamp ${_unit_} | $AWK -F "=" '{print $2}'`
+		
+	fi
+	
+	if [ ! "${_statetime_}" ]; then
+
+		_statetime_="---"
+	
+	fi
+        
+        _sub_=`$SYSTEMCTL show -p SubState ${_unit_} | $AWK -F "=" '{print $2}'`
+        
+	 if [ ! "${_sub_}" ]; then
+
+             _sub_="---"
+
+         fi
+
+	 _Description_=`$SYSTEMCTL show -p Description ${_unit_} | $AWK -F "=" '{print $2}'`
+	 if [ ! "${_Description_}" ]; then
+
+             _Description_="---"
+
+         fi
+	
+	$PRINTF '%-45s %-15s %-10s %-10s %-30s %-40s\n'  "${_unit_}" "${_active_}" "${_enable_}" "${_sub_}" "${_statetime_}" "${_Description_}" >> ${TMP_DIR}/temp_file1
+	
+fi
+done
+
+if [ "$_list_details_" == "YES" ]; then
+
+    $CAT ${TMP_DIR}/temp_file1
+
+else
+
+    awk '{ print $1,$2 }' ${TMP_DIR}/temp_file1 > ${TMP_DIR}/temp_file2
+    $CAT ${TMP_DIR}/temp_file2 | column -t > ${TMP_DIR}/temp_file3
+    $CAT ${TMP_DIR}/temp_file3
+fi
+
+}
+
+
+
+### Function: usage_msg ###
+#
+#   Print out the usage message
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+usage_msg()
+{
+$PRINTF '\33[H\33[2J'
+$ECHO "
+Usage: `$BASENAME $0` [ [ -a ] or [ -s <service name> ] [Optional: -d] ]
+
+options:
+
+-a  : Parameter to print all present services
+
+-s  : Parameter specifying the keywords in service name to print
+      only those services using pattern match
+      e.g. -s NAS
+-d  : Optional parameter, passed along with -a or -s to check detailed status
+
+"
+}
+
+# ********************************************************************
+# Main body of program
+# ********************************************************************
+
+if [[ $# -lt 1 || $# -gt 3 ]]; then
+    usage_msg
+    exit 1
+fi
+
+_list_details_="NO"
+_list_single_="NO"
+_list_all_="NO"
+_flag1_="YES"
+_flag2_="YES"
+while getopts "s:ad" arg; do
+ case $arg in
+
+    d) _list_details_="YES"
+       ;;
+
+    a) _list_all_="YES"
+       ;;
+
+    s) _list_single_="YES"
+       _pattern_="$OPTARG"
+       ;;
+    
+   *) usage_msg
+       ;;
+  esac
+done
+
+if [ "$_list_all_" == "YES" ]; then
+    display_services
+    exit 0
+fi
+if [ -z $_pattern_ ]; then
+       usage_msg
+       exit 1 
+fi
+
+
+if [ "$_list_single_" == "YES"  ]; then
+        display_services _pattern_
+fi
+
+
+
+$RM -rf ${TMP_DIR}
+exit 0
+

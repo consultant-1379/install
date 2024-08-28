@@ -1,0 +1,421 @@
+#!/bin/bash
+# ********************************************************************
+# Ericsson Radio Systems AB                                     SCRIPT
+# ********************************************************************
+#
+#
+# (c) Ericsson Radio Systems AB 2001 - All rights reserved.
+#
+# The copyright to the computer program(s) herein is the property
+# of Ericsson Radio Systems AB, Sweden. The programs may be used 
+# and/or copied only with the written permission from Ericsson Radio 
+# Systems AB or in accordance with the terms and conditions stipulated 
+# in the agreement/contract under which the program(s) have been 
+# supplied.
+#
+# ********************************************************************
+# Name    : rollback_archive_data.bsh
+# Date    : 12/03/2013
+# Revision: E1
+# Purpose : This script will rollback all the data from the archive
+#           directory to the eventdata directory              
+#
+# Usage   : rollback_archive_data.bsh [ -l <path_to_logfile> ] [ -N ] -q
+#
+# ********************************************************************
+#
+# 	Command Section
+#
+# ********************************************************************
+AWK=/usr/bin/awk
+BASENAME=/usr/bin/basename
+CAT=/usr/bin/cat
+CHMOD=/usr/bin/chmod
+CHOWN=/usr/bin/chown
+CLEAR=/usr/bin/clear
+CMP=/usr/bin/cmp
+CP=/usr/bin/cp
+CPIO=/usr/bin/cpio
+DATE=/usr/bin/date
+DIRNAME=/usr/bin/dirname
+DOMAINNAME=/usr/bin/domainname
+DTCONFIG=/usr/dt/bin/dtconfig
+ECHO=/usr/bin/echo
+EGREP=/usr/bin/egrep
+EJECT=/usr/bin/eject
+ENV=/usr/bin/env
+EXPR=/usr/bin/expr
+FIND=/usr/bin/find
+FLARCREATE=/usr/sbin/flarcreate
+FORMAT=/usr/sbin/format
+FUSER=/usr/sbin/fuser
+GETENT=/usr/bin/getent
+GETTEXT=/usr/bin/gettext
+GREP=/usr/bin/grep
+GROUPADD=/usr/sbin/groupadd
+GTAR=/usr/sfw/bin/gtar
+GZCAT=/usr/bin/gzcat
+HEAD=/usr/bin/head
+HOSTNAME=/usr/bin/hostname
+ID=/usr/bin/id
+INIT=/usr/sbin/init
+LS=/usr/bin/ls
+MKDIR=/usr/bin/mkdir
+MORE=/usr/bin/more
+MOUNT=/usr/sbin/mount
+MV=/usr/bin/mv
+NAWK=/usr/bin/nawk
+PGREP=/usr/bin/pgrep
+PING=/usr/sbin/ping
+PKGADD=/usr/sbin/pkgadd
+PKGINFO=/usr/bin/pkginfo
+PRTCONF=/usr/sbin/prtconf
+PSRINFO=/usr/sbin/psrinfo
+PWD=/usr/bin/pwd
+RM=/usr/bin/rm
+RCP=/usr/bin/rcp
+RSH=/usr/bin/rsh
+SED=/usr/bin/sed
+SLEEP=/usr/bin/sleep
+SORT=/usr/bin/sort
+SPLIT=/usr/bin/split
+SU=/usr/bin/su
+SVCADM=/usr/sbin/svcadm
+SVCCFG=/usr/sbin/svccfg
+SVCS=usr/bin/svcs
+SWAP=/usr/sbin/swap
+SYNC=/usr/sbin/sync
+TAIL=/usr/bin/tail
+TEE=/usr/bin/tee
+TOUCH=/usr/bin/touch
+TPUT=/usr/bin/tput
+UADMIN=/usr/sbin/uadmin
+UNAME=/usr/bin/uname
+UNIQ=/usr/bin/uniq
+USERADD=/usr/sbin/useradd
+VOLD=/usr/sbin/vold
+WC=/usr/bin/wc
+XARGS=/usr/bin/xargs
+ZFS=/usr/sbin/zfs
+ZPOOL=/usr/sbin/zpool
+
+
+# ********************************************************************
+#
+#       Configuration Section
+#
+# ********************************************************************
+# Flag to determine whether to compress log or not (Must be y/n)
+COMPRESS_LOG=n
+
+# Name of SunOS & ENIQ ini Files
+ENIQ_ENV=niq.rc
+ENIQ_INI=niq.ini
+SUNOS_INI=SunOS.ini
+STORAGE_INI=storage.ini
+
+# Number of log files to keep
+NUM_LOGS=10
+
+# Size in kbytes that the log file is allowed to grow to
+SIZE_LOGS=204800
+
+
+# ********************************************************************
+#
+#       Pre-execution Operations
+#
+# ********************************************************************
+unset SNAP_QUIET
+
+# ********************************************************************
+#
+# 	functions
+#
+# ********************************************************************
+### Function: abort_script ###
+#
+#   This will is called if the script is aborted thru an error
+#   error signal sent by the kernel such as CTRL-C or if a serious
+#   error is encountered during runtime
+#
+# Arguments:
+#       $1 - Error message from part of program (Not always used)
+# Return Values:
+#       none
+abort_script()
+{
+if [ "$1" ]; then
+    _err_msg_=$1
+else
+    _err_msg_="Script aborted.......\n"    
+fi
+
+# Check if log_msg() is defined, else define log()
+type log_msg > /dev/null 2>&1
+if [ $? -gt 0 ]; then
+    if [ "${LOGFILE}" ]; then
+	if [ ! "${SNAP_QUIET}" ]; then
+	    $ECHO "\n${_err_msg_}\n" |$TEE -a ${LOGFILE}
+	else
+	    $ECHO "\n${_err_msg_}\n" >> ${LOGFILE}
+        fi
+    else
+	$ECHO "\n${_err_msg_}\n"
+    fi
+else
+    if [ "${LOGFILE}" ]; then
+	log_msg -s "\n${_err_msg_}\n" -l ${LOGFILE} ${SNAP_QUIET}
+    else
+	log_msg -s "\n${_err_msg_}\n" ${SNAP_QUIET}
+    fi
+fi
+
+cd $SCRIPTHOME
+
+$RM -rf  ${TEM_DIR}
+
+if [ "$2" ]; then
+    exit ${2}
+else
+   exit 1
+fi
+}
+
+### Function: check_id ###
+#
+#   Check that the effective id of the user is correct
+#   If not print error msg and exit.
+#
+# Arguments:
+#       $1 : User ID name
+# Return Values:
+#       none
+check_id()
+{
+_check_id_=`$ID  | $AWK -F\( '{print $2}' | $AWK -F\) '{print $1}'`
+if [ "$_check_id_" != "$1" ]; then
+    _err_msg_="You must be $1 to execute this script."
+    abort_script "$_err_msg_"
+fi
+}
+
+### Function: chk_create_logfile ###
+#
+# Check/Create Logfile
+#
+# Arguments:
+#	none
+# Return Values:
+#	none
+chk_create_logfile()
+{
+$MKDIR -p `$DIRNAME ${LOGFILE}`
+if [ $? -ne 0 ]; then
+    unset LOGFILE
+    _err_msg_="Could not create directory `$DIRNAME ${LOGFILE}`"
+     abort_script "$_err_msg_"
+fi	
+
+$TOUCH -a ${LOGFILE}
+if [ $? -ne 0 ]; then
+    unset LOGFILE
+    _err_msg_="Could not write to file ${LOGFILE}"
+    abort_script "$_err_msg_"
+fi	
+
+if [ -s ${LOGFILE} ]; then
+    $ECHO "\n\n" >> ${LOGFILE}
+fi
+$ECHO "----------------------------------------------------------------" >> ${LOGFILE}
+$ECHO "----------------------------------------------------------------" >> ${LOGFILE}
+$ECHO "Archive Rollback Started at ${RUN_TIME}\n" >> ${LOGFILE}
+}
+
+### Function: get_absolute_path ###
+#
+# Determine absolute path to software
+#
+# Arguments:
+#	none
+# Return Values:
+#	none
+get_absolute_path()
+{
+_dir_=`$DIRNAME $0`
+SCRIPTHOME=`cd $_dir_ 2>/dev/null && pwd || $ECHO $_dir_`
+}
+
+### Function: setup_env ###
+#
+# Setup up path environment etc
+#
+# Arguments:
+#	none
+# Return Values:
+#	none
+setup_env()
+{
+ENIQ_BASE_DIR=/eniq
+
+ADMIN_BIN=${ENIQ_BASE_DIR}/admin/bin
+
+ADMIN_SQL=${ENIQ_BASE_DIR}/admin/sql
+
+CONF_DIR=${ENIQ_BASE_DIR}/sw/conf
+
+ENIQ_CONF_DIR=${ENIQ_BASE_DIR}/installation/config
+
+# ENIQ Log Directory
+ENIQ_LOG_DIR=${ENIQ_BASE_DIR}/local_logs
+
+DATA_DIR=${ENIQ_BASE_DIR}/data/
+
+PMDATA_DIR=${DATA_DIR}/pmdata
+
+# Source the common functions
+if [ -s ${ENIQ_BASE_DIR}/admin/lib/common_functions.lib ]; then
+    . ${ENIQ_BASE_DIR}/admin/lib/common_functions.lib
+else
+    _err_msg_="File ${ENIQ_BASE_DIR}/admin/lib/common_functions.lib not found"
+    abort_script "$_err_msg_"
+fi
+
+}
+
+### Function: user_confirm ###
+#
+# Get confirmation from user to proceed with snapshot action
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+user_confirm()
+{
+while :; do
+    unset USER_CONF
+    $CLEAR
+    $ECHO "\nAre you sure you wish to rollback the archive files"
+    $ECHO "Enter [Yes | No] (case sensitive) : \c"
+
+    read USER_CONF
+    if [ "$USER_CONF" == "Yes" -o "$USER_CONF" == "No" ]; then
+        break
+    fi
+done
+}
+
+# ********************************************************************
+#
+# 	Main body of program
+#
+# ********************************************************************
+#
+# Save the time of running. I do this here as I want all
+# dates and time to be the same
+RUN_TIME=`$DATE '+%Y-%m-%d_%H.%M.%S'`
+
+# Determine absolute path to software
+get_absolute_path
+
+# Check that the effective id of the user is root
+check_id root
+
+while getopts ":l:Nq" arg; do
+  case $arg in
+    l) LOGFILE="$OPTARG" 
+       ;;
+    N) NO_CONFIRM="YES"
+       ;;
+    q) SNAP_QUIET="-q"
+       ;;
+   \?) _err_msg_="`$BASENAME $0` [ -l <path_to_logfile> ] [ -N ] -q"
+       abort_script "$_err_msg_"
+       ;;
+  esac
+done
+shift `expr $OPTIND - 1`
+
+# Setup up path environment etc
+setup_env
+
+# Default Logfile location
+DEF_LOGFILE="${ENIQ_LOG_DIR}/rolling_snapshot_logs/rollback_archive.log"
+
+# Set up default logfile if required
+if [ ! "${LOGFILE}" ]; then
+    LOGFILE="${DEF_LOGFILE}"
+fi
+
+# Check/Create Logfile
+chk_create_logfile
+
+
+# Create a temporary Directory
+TEM_DIR=/tmp/rollback_archive_data.$$.$$
+$RM -rf ${TEM_DIR}
+$MKDIR -p ${TEM_DIR}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not create directory ${TEM_DIR}"
+    abort_script "$_err_msg_"
+fi	
+
+if [ ! "$NO_CONFIRM" ]; then
+    user_confirm 
+    if [ $USER_CONF == No ]; then
+	$RM -rf ${TEM_DIR}
+	exit 0
+    fi
+fi
+
+# Ensure eventdata directory exists
+if [ ! -s ${PMDATA_DIR}/eventdata ]; then
+    _err_msg_="${PMDATA_DIR}/eventdata does not exist, or is empty"
+    abort_script "${_err_msg_}"
+fi
+
+# Get a list of Archive directories
+log_msg -s "`$DATE +%d.%m.%y_%H:%M:%S` - Generating a list of PM Data Archive to Rollback" -l ${LOGFILE} ${SNAP_QUIET}
+# Find and Clear PM Data Archive
+$FIND ${PMDATA_DIR}/eventdata -type d -name "archive" >> ${TEM_DIR}/archive_list.txt
+for _dir_ in `$CAT ${TEM_DIR}/archive_list.txt`; do
+
+    _chk_=`$LS ${_dir_} | $WC -l | $SED -e 's| ||g'`
+    
+    if [ "${_chk_}" == 0 ]; then
+        continue
+    fi
+    
+    cd $_dir_
+    if [ $? -ne 0 ]; then
+        _err_msg_="Failed to cd to $_dir_"
+        abort_script "$_err_msg_"
+    fi
+
+    _target_dir_=`cd ${_dir_}/../;pwd`
+
+    log_msg -s "`$DATE +%d.%m.%y_%H:%M:%S` - Moving directory contents $_dir_ to ${_target_dir_}\n"  -l ${LOGFILE} ${SNAP_QUIET}
+    #$MV * ${_target_dir_}
+    #$FIND . -type f -mtime -10000m -exec $MV {} ${_target_dir_} \; 
+    $LS $1 | $XARGS -i mv $1{} ${_target_dir_}/{}
+    if [ $? -ne 0 ]; then
+        _err_msg_="Failed to Rollback the Archive Directory $_dir_ to ${_target_dir_}"
+        abort_script "$_err_msg_"
+    else
+        log_msg -s "`$DATE +%d.%m.%y_%H:%M:%S` - Successfully Rolledback directory contents $_dir_ to ${_target_dir_}\n"  -l ${LOGFILE} ${SNAP_QUIET}
+    fi
+done
+
+RUN_TIME=`$DATE '+%Y-%m-%d_%H.%M.%S'`
+$ECHO "\n\nArchive Rollback Finished at ${RUN_TIME}\n" | $TEE -a ${LOGFILE}
+$ECHO "----------------------------------------------------------------" >> ${LOGFILE}
+$ECHO "----------------------------------------------------------------" >> ${LOGFILE}
+
+
+# Rotate and compress the logs if necessary
+rotate_compress_logs ${LOGFILE} ${NUM_LOGS} ${SIZE_LOGS} ${COMPRESS_LOG}
+
+$RM -rf ${INPUT_LIST}
+$RM -rf ${TEM_DIR}
+exit 0

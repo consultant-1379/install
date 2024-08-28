@@ -1,0 +1,338 @@
+#!/usr/bin/bash
+#********************************************************************
+# Ericsson Radio Systems AB SCRIPT
+#********************************************************************
+#
+# (c) Ericsson Radio Systems AB 2019 - All rights reserved.
+#
+# The copyright to the computer program(s) herein is the property
+# of Ericsson Radio Systems AB, Sweden. The programs may be used
+# and/or copied only with the written permission from Ericsson Radio
+# Systems AB or in accordance with the terms and conditions stipulated
+# in the agreement/contract under which the program(s) have been
+# in the agreement/contract under which the program(s) have been
+# supplied.
+#
+#********************************************************************
+# Name     : feature_lic.bsh
+# Date     : 15/09/2022
+# Revision : \main\7
+# Purpose  : This script is to check if Feature Licenses are valid.
+#
+# Usage    : feature_lic.bsh
+# Exit Values:
+#    0   : Success : All features have valid license.
+#    3   : FAILURE : Abort Script.
+#    79  : FAILURE : Unable to Switch to dcuser.
+#    80  : FAILURE : Connection to the license manager failed.
+#    81  : FAILURE : Could not retrieve License info.
+#    219 : Warning : All features have invalid license.
+#    220 : Warning : Some features have invalid license.
+#********************************************************************
+#
+#       Command Section
+#
+#********************************************************************
+AWK=/usr/bin/awk
+CAT=/usr/bin/cat
+DATE=/usr/bin/date
+ECHO='/usr/bin/echo -e'
+GREP=/usr/bin/grep
+ID=/usr/bin/id
+MKDIR=/usr/bin/mkdir
+RM=/usr/bin/rm
+SU=/usr/bin/su
+TEE=/usr/bin/tee
+TOUCH=/usr/bin/touch
+
+# ********************************************************************
+#
+#       Configuration Section
+#
+# ********************************************************************
+
+# Default user
+DEFAULT_USER=root
+
+#Present Working Directory
+CURR_DIR=`pwd`
+
+# ********************************************************************
+#
+#   Functions
+#
+# ********************************************************************
+
+### Function: abort_script ###
+#
+#   This function will be called if the script is aborted thru an error
+#   signal sent by the kernel such as CTRL-C or if a serious
+#   error is encountered during runtime
+#
+# Arguments:
+#       $1 - Error message from part of program (Not always used)
+# Return Values:
+#       none
+abort_script()
+{
+_err_time_=`$DATE '+%Y-%b-%d_%H.%M.%S'`
+
+if [ "$1" ]; then
+    _err_msg_="${_err_time_} - $1"
+else
+    _err_msg_="${_err_time_} - ERROR : Script aborted.......\n"
+fi
+
+if [ "${LOGFILE}" ]; then
+    $ECHO "\nERROR : ${_err_msg_}" | $TEE -a ${LOGFILE}
+else
+    $ECHO "\nERROR : ${_err_msg_}"
+fi
+cleanup
+exit 3
+}
+
+
+### Function: check_id ###
+#
+#   Check that the effective id of the user is correct
+#   If not print error msg and exit.
+#
+# Arguments:
+#       $1 : User ID name
+# Return Values:
+#       none
+check_id()
+{
+_check_id_=`$ID | $AWK -F\( '{print $2}' | $AWK -F\) '{print $1}'`
+if [ "$_check_id_" != "$1" ]; then
+    _err_msg_="You must be $1 to execute this script."
+    abort_script "${_err_msg_}"
+fi
+}
+
+
+### Function: cleanup ###
+#
+# Cleanup of temporary directory
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+cleanup()
+{
+if [ -f "$LOGFILE" ] ;then
+    log_msg  -t -s "Cleaning up the temporary directory." -l ${LOGFILE}
+fi
+$RM -rf ${TEM_DIR}
+
+}
+
+
+### Function: is_valid ###
+#
+# Validates the License
+#
+# Arguments:
+#   $1=License Number
+# Return Values:
+#   none
+
+is_valid(){
+
+log_msg -t -s "Checking license validity for $1." -l $LOGFILE
+_feature_=`$CAT ${TEM_DIR}/feature_description.txt | $GREP -A 2 "$1" | $GREP Description | $AWK -F":" '{print $2}'`
+$SU - dcuser -c "licmgr -isvalid $1"  > /dev/null 2>&1
+if [ "$?" == 0 ] ;then
+    log_msg -t -s "License for $1 is valid.\n" -l $LOGFILE
+    log_msg -q -s "$1:${_feature_}" -l  ${TEM_DIR}/f_lic_valid.txt
+elif [ "$?" == 1 ] ;then
+    log_msg -t -s "License for $1 is not valid.\n" -l $LOGFILE
+    log_msg -q -s "$1:${_feature_}" -l ${TEM_DIR}/f_lic_invalid.txt
+fi
+}
+
+### Function: setup_env ###
+#
+# Set up environment variables for script.
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+setup_env()
+{
+# ENIQ Base Directory
+ENIQ_BASE_DIR=/eniq
+
+# ENIQ LIB Directory
+LIB_DIR=/lib
+
+
+# ENIQ Core Installation Directory
+ENIQ_INST_DIR=${ENIQ_BASE_DIR}/installation
+
+# ENIQ Core Installation SW
+ENIQ_CORE_INST_DIR=${ENIQ_INST_DIR}/core_install
+
+# ENIQ Log Directory
+ENIQ_LOG_DIR=${ENIQ_BASE_DIR}/local_logs
+
+# ENIQ Precheck Log Directory
+ENIQ_PRECHK_LOG_DIR=${ENIQ_LOG_DIR}/precheck_logs
+
+# ENIQ Config Directory
+ENIQ_CONF_DIR=${ENIQ_INST_DIR}/config
+
+
+# Source the common functions
+if [ -s ${ENIQ_CORE_INST_DIR}/${LIB_DIR}/common_functions.lib ]; then
+    . ${ENIQ_CORE_INST_DIR}/${LIB_DIR}/common_functions.lib
+else
+    _err_msg_="File ${ENIQ_CORE_INST_DIR}/${LIB_DIR}/common_functions.lib not found"
+    abort_script "${_err_msg_}"
+fi
+
+if [ -s ${ENIQ_CORE_INST_DIR}/${LIB_DIR}/common_core_install_functions.lib ]; then
+    . ${ENIQ_CORE_INST_DIR}/${LIB_DIR}/common_core_install_functions.lib
+else
+    _err_msg_="File ${ENIQ_CORE_INST_DIR}/${LIB_DIR}/common_core_install_functions.lib not found"
+    abort_script "${_err_msg_}"
+fi
+
+if [ -s ${ENIQ_CORE_INST_DIR}/${LIB_DIR}/common_inirator_functions.lib ]; then
+    . ${ENIQ_CORE_INST_DIR}/${LIB_DIR}/common_inirator_functions.lib
+else
+    _err_msg_="File ${ENIQ_CORE_INST_DIR}/${LIB_DIR}/common_inirator_functions.lib not found"
+    abort_script "${_err_msg_}"
+fi
+
+# File containing the type of OSS installation. Eg. events or statistics
+INST_TYPE_FILE=${ENIQ_CONF_DIR}/ericsson_use_config
+if [ ! -s "${INST_TYPE_FILE}" ]; then
+    _err_msg_="ENIQ install type not defined in ${INST_TYPE_FILE}"
+    abort_script "${_err_msg_}"
+fi
+
+# Read the installation type - should be "stats"
+INST_TYPE=`$CAT ${INST_TYPE_FILE} | $AWK -F\= '{print $2}'`
+
+}
+
+
+
+
+
+# ********************************************************************
+#
+#   Main body of program
+#
+# ********************************************************************
+
+# Ctrl+C
+trap "abort_script" INT
+
+
+# Check that the effective id of the user is root
+check_id $DEFAULT_USER
+
+
+# Set up environment variables for script.
+setup_env
+
+
+# Log file
+LOGFILE="${ENIQ_PRECHK_LOG_DIR}/flic_val.log"
+if [ ! -d "${ENIQ_PRECHK_LOG_DIR}" ]; then
+   $MKDIR -p ${ENIQ_PRECHK_LOG_DIR}
+   $TOUCH $LOGFILE
+else
+    if [ -e "${LOGFILE}" ]; then
+        $RM -rf $LOGFILE
+    fi
+    $TOUCH $LOGFILE
+fi
+
+
+# Create a temporary Directory
+
+TEM_DIR=/tmp/feature_license.$$.$$
+$RM -rf ${TEM_DIR}
+$MKDIR -p ${TEM_DIR}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not create directory $TEM_DIR"
+    abort_script "${_err_msg_}"
+fi
+
+
+if [ "$INST_TYPE" == "stats" ] ;then
+    _starter_lic_="CXC4012419"
+fi
+
+#  To get the list of applied Licenses ,excluding starter License
+$SU - dcuser -c "licmgr -getlicinfo" > ${TEM_DIR}/feature_description.txt
+_status_="$?"
+if [ "${_status_}" != 0 ] ;then
+    if [ "${_status_}" == 1 ] ;then
+         log_msg -t -s "ERROR:Unable to Switch to dcuser.Exiting from the script." -l $LOGFILE
+         cleanup
+         exit 79
+    elif [ "${_status_}" == 2 ] ;then
+         log_msg -t -s "ERROR:Connection to the license manager failed.Exiting from the script." -l $LOGFILE
+         cleanup
+         exit 80
+    else
+         log_msg -t -s "ERROR:Could not retrieve information from License manager." -l $LOGFILE
+         cleanup
+         exit 81
+    fi
+fi
+$CAT ${TEM_DIR}/feature_description.txt | $GREP "Feature name" | $GREP -v ${_starter_lic_} | $AWK -F ":" '{print $2}' > ${TEM_DIR}/feature_license_list.txt
+
+# To recursively check the validity of each licence
+
+if [ -s ${TEM_DIR}/feature_license_list.txt ] ;then
+    while read -r _line_
+    do
+    if [ ! -z ${_line_} ] ;then
+       is_valid ${_line_}
+    else
+       continue
+    fi
+    done < ${TEM_DIR}/feature_license_list.txt
+else
+    log_msg -t -s "INFO:No Feature Licenses are applied" -l $LOGFILE
+    cleanup
+    exit 0
+fi
+
+if [ -s $TEM_DIR/f_lic_valid.txt ] && [ ! -s $TEM_DIR/f_lic_invalid.txt ] ;then
+        log_msg -t -s "INFO:All Feature Licenses are valid.\n" -l $LOGFILE
+        log_msg -s "-------------------------------------------------------------" -l $LOGFILE
+        log_msg -s "VALID LICENSES:" -l $LOGFILE
+        log_msg -s "-------------------------------------------------------------" -l $LOGFILE
+        log_msg -s "`$CAT $TEM_DIR/f_lic_valid.txt`" -l $LOGFILE
+        cleanup
+        exit 0
+elif [ ! -s $TEM_DIR/f_lic_valid.txt ] && [ -s $TEM_DIR/f_lic_invalid.txt ] ;then
+        log_msg -t -s "WARN:All Feature Licenses are invalid.\n" -l $LOGFILE
+        log_msg -s "-------------------------------------------------------------" -l $LOGFILE
+        log_msg -s "INVALID LICENSES:" -l $LOGFILE
+        log_msg -s "-------------------------------------------------------------" -l $LOGFILE
+        log_msg -s "`$CAT $TEM_DIR/f_lic_invalid.txt`" -l $LOGFILE
+        cleanup
+        exit 219
+elif [ -s $TEM_DIR/f_lic_valid.txt ] && [ -s $TEM_DIR/f_lic_invalid.txt ] ;then
+        log_msg -t -s "WARN:Some feature licenses are not valid.\n" -l $LOGFILE
+        log_msg -s "\n-------------------------------------------------------------" -l $LOGFILE
+        log_msg -s "VALID LICENSES:" -l $LOGFILE
+        log_msg -s "-------------------------------------------------------------" -l $LOGFILE
+        log_msg -s "`$CAT $TEM_DIR/f_lic_valid.txt`" -l $LOGFILE
+        log_msg -s "\n-------------------------------------------------------------" -l $LOGFILE
+        log_msg -s "INVALID LICENSES:" -l $LOGFILE
+        log_msg -s "-------------------------------------------------------------" -l $LOGFILE
+        log_msg -s "`$CAT $TEM_DIR/f_lic_invalid.txt`" -l $LOGFILE
+        cleanup
+        exit 220
+fi

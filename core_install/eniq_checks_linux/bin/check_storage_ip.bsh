@@ -1,0 +1,521 @@
+#!/bin/bash
+# ********************************************************************
+# Ericsson Radio Systems AB SCRIPT
+# ********************************************************************
+#
+#
+# (c) Ericsson Radio Systems AB 2019 - All rights reserved.
+#
+# The copyright to the computer program(s) herein is the property
+# of Ericsson Radio Systems AB, Sweden. The programs may be used
+# and/or copied only with the written permission from Ericsson Radio
+# Systems AB or in accordance with the terms and conditions stipulated
+# in the agreement/contract under which the program(s) have been
+# supplied.
+#
+# ********************************************************************
+# Name    : check_storage_ip.bsh
+# Date    : 09/10/2023
+# Revision: \main\5
+# Purpose : This script is to check the storage IP.
+#
+# Usage   : check_storage_ip.bsh
+# ********************************************************************
+#
+#   Command Section
+#
+# ********************************************************************
+
+AWK=/usr/bin/awk
+BASH=/usr/bin/bash
+CAT=/usr/bin/cat
+CHMOD=/usr/bin/chmod
+DATE=/usr/bin/date
+DIRNAME=/usr/bin/dirname
+ECHO='/usr/bin/echo -e'
+EGREP=/usr/bin/egrep
+GETENT=/usr/bin/getent
+HEAD=/usr/bin/head
+ID=/usr/bin/id
+MKDIR=/usr/bin/mkdir
+MYHOSTNAME=/usr/bin/hostname
+PING=/usr/sbin/ping
+RM=/usr/bin/rm
+SED=/usr/bin/sed
+SSH=/usr/bin/ssh
+TEE=/usr/bin/tee
+TR=/usr/bin/tr
+TOUCH=/usr/bin/touch
+
+
+# Name of SunOS & ENIQ ini Files
+BLK_STOR_INI=block_storage.ini
+IPMP_INI=ipmp.ini
+STORAGE_INI=storage.ini
+SUNOS_INI=SunOS.ini
+
+#### RETURN CODE ENUM's ####
+SUCCESS=0
+FAILED=1
+WARNING=2
+RACK_NOT_APPLICABLE=16
+VALUE_MISSING=133
+INVALID_IP=135
+VALUE_MISMATCH=136
+PING_FAILD=139
+
+
+### Function: abort_script 
+#                                                                     
+#   This will be called if the script is aborted through an error     
+#   signal sent by the kernel such as CTRL-C or if a serious          
+#   error is encountered during runtime                               
+#                                                                     
+# Arguments:                                                          
+#       $1 - Error message from part of program (Not always used)     
+# Return Values:                                                      
+#       none                                                          
+
+abort_script()
+{
+    _err_time_=`$DATE '+%Y-%b-%d_%H.%M.%S'`
+
+    if [ "$1" ]; then
+        _err_msg_="${_err_time_} - $1"
+    else
+        _err_msg_="${_err_time_} - ERROR : Script aborted.......\n"
+    fi
+
+    if [ "${LOGFILE}" ]; then
+        $ECHO "\nERROR : ${_err_msg_}\n" | $TEE -a ${LOGFILE}
+    else
+        $ECHO "\nERROR : ${_err_msg_}\n"
+    fi
+
+    $RM -rf ${TEM_DIR}
+    exit 3
+}
+
+### Function: check_id ###
+#
+#   Check that the effective id of the user is correct
+#   If not print error message and exit.
+#
+# Arguments:
+#       $1 : User ID name
+# Return Values:
+#       none
+
+check_id()
+{
+local _check_id_=`$ID  | $AWK -F\( '{print $2}' | $AWK -F\) '{print $1}'`
+
+if [ "${_check_id_}" != "$1" ]; then
+    _err_msg_="You must be $1 to execute this script."
+    abort_script "$_err_msg_"
+fi
+}
+
+### Function: chk_logfile ###
+#
+# Check Logfile
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+
+chk_logfile()
+{
+
+if [ ! -d ${ENIQ_PRECHECK_LOG_DIR}  ]
+    then
+    $MKDIR -p ${ENIQ_PRECHECK_LOG_DIR}
+    if [ $? -ne 0 ]; then
+    _err_msg_="Could not create directory : ${ENIQ_PRECHECK_LOG_DIR}"
+    abort_script "${_err_msg_}" 
+    fi
+fi
+ 
+if [ -s ${LOGFILE}  ]
+    then
+    $RM -rf ${LOGFILE} 
+    if [ -s ${LOGFILE}  ]
+    then
+        _err_msg_="Warning : Could not remove older ${LOGFILE}"
+        abort_script "$_err_msg_"
+    fi
+fi
+
+ 
+$TOUCH ${LOGFILE}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not write to file ${LOGFILE}"
+    abort_script "$_err_msg_"
+fi
+
+$ECHO "Changing permission of the ${LOGFILE} to 644" | $TEE -a ${LOGFILE}
+$CHMOD 644 ${LOGFILE}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not change the permissions of the ${LOGFILE} file to 644"
+    abort_script "$_err_msg_"
+fi
+}
+
+### Function: check_IP ###
+#
+# Checking eniq storage IP is pinging.
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+
+check_ip()
+{
+
+log_msg -l ${LOGFILE} -q -t -s "Checking storage IP of ${HNAME} on ${SERVER_TYPE}"
+
+
+if  [ ! -f ${ENIQ_CONF_DIR}/${BLK_STOR_INI} ]; then
+    log_msg -l ${LOGFILE} -q -t -s "Could not locate ${BLK_STOR_INI} file."
+    exit ${VALUE_MISSING}
+fi
+
+if  [ ! -f ${ENIQ_CONF_DIR}/${IPMP_INI} ]; then
+   log_msg -l ${LOGFILE} -q -t -s "Could not locate ${IPMP_INI} file"
+    exit ${VALUE_MISSING}
+fi
+
+if [ "${SAN_DEVICE}" == "vnx" ]; then
+    _agent_ip_=`$CAT ${PLUGINS_LOC}/${SAN_DEVICE}/etc/clariion.conf | $EGREP -w agentip | $AWK -F"=>" '{print $2}' | $SED -e "s/[-' ]//g"`
+
+    if [ ! ${_agent_ip_} ]; then
+        log_msg -l ${LOGFILE} -q -t -s "Could not read parameter agentip from file - ${PLUGINS_LOC}/${SAN_DEVICE}/etc/clariion.conf"
+        exit ${VALUE_MISSING}
+    fi
+fi
+
+_interf_ip_=`iniget BLK_STORAGE_INTERF -f ${ENIQ_CONF_DIR}/${BLK_STOR_INI} -v BLK_STORAGE_INTERF_IP`
+if [ ! "${_interf_ip_}" ]; then
+    log_msg -l ${LOGFILE} -q -t -s "Could not read parameter BLK_STORAGE_INTERF_IP from file - ${ENIQ_CONF_DIR}/${BLK_STOR_INI}"
+    exit ${VALUE_MISSING}
+fi
+
+if [ "${_deployment_}" == "ft" ]; then
+    _ipmp_ip_=`iniget IPMP_INTF_1 -f ${ENIQ_CONF_DIR}/${IPMP_INI} -v IPMP_Group_IP`
+else
+    _ipmp_ip_=`iniget IPMP_INTF_2 -f ${ENIQ_CONF_DIR}/${IPMP_INI} -v IPMP_Group_IP`
+fi
+if [ ! "${_ipmp_ip_}" ]; then
+    log_msg -l ${LOGFILE} -q -t -s "Could not read parameter IPMP_Group_IP from file - ${ENIQ_CONF_DIR}/${IPMP_INI}"
+    exit ${VALUE_MISSING}
+fi
+
+if [ "${SAN_DEVICE}" == "vnx" ]; then
+    if [ "${_ipmp_ip_}" == "${_interf_ip_}" ]; then 
+        if [ "${_ipmp_ip_}" != "${_agent_ip_}" ]; then
+            log_msg -l ${LOGFILE} -q -t -s "Storage IP in does not match in ${IPMP_INI} and clariion.conf. IP is invalid"
+            exit ${INVALID_IP}
+        fi
+    else
+        log_msg -l ${LOGFILE} -q -t -s "Storage IP does not match in ${IPMP_INI} and ${BLK_STOR_INI}. IP is invalid"
+        exit ${INVALID_IP}
+    fi
+else
+    if [ "${_ipmp_ip_}" != "${_interf_ip_}" ]; then 
+        log_msg -l ${LOGFILE} -q -t -s "Storage IP does not match in ${IPMP_INI} and ${BLK_STOR_INI}. IP is invalid"
+        exit ${INVALID_IP}
+    fi
+fi
+
+
+#check storage info
+check_storage_info
+
+#check storage IP Ping
+check_ip_ping
+
+#Return code declaration
+RET_CODE=0 
+
+}
+
+
+### Function: check_ip_ping ###
+#
+# Check the eniq storage IP files.
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+
+check_ip_ping()
+{
+
+$PING -c1 ${_ipmp_ip_}
+if [ $? -ne 0 ]; then
+    log_msg -l ${LOGFILE} -q -t -s "Could not ping IPMP_Group_IP from file - ${ENIQ_CONF_DIR}/${IPMP_INI}"
+    exit ${PING_FAILD}
+fi
+log_msg -l ${LOGFILE} -q -t -s "Ping completed successfully on ${_ipmp_ip_}."
+
+$PING -c1 ${_spa_ip_}
+if [ $? -ne 0 ]; then
+    log_msg -l ${LOGFILE} -q -t -s "Could not ping BLK_STORAGE_IP_SPA from file - ${ENIQ_CONF_DIR}/${BLK_STOR_INI}"
+    exit ${PING_FAILD}
+fi
+log_msg -l ${LOGFILE} -q -t -s "Ping completed successfully on ${_spa_ip_}."
+
+if [ "${SAN_DEVICE}" == "vnx" ]; then
+    $PING -c1 ${_spb_ip_}
+    if [ $? -ne 0 ]; then
+        log_msg -l ${LOGFILE} -q -t -s "Could not ping BLK_STORAGE_IP_SPB from file - ${ENIQ_CONF_DIR}/${BLK_STOR_INI}"
+        exit ${PING_FAILD}
+    fi
+    log_msg -l ${LOGFILE} -q -t -s "Ping completed successfully on ${_spb_ip_}."
+fi
+
+}
+
+
+### Function: check_storage_info ###
+#
+# Check the eniq storage IP files.
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+
+check_storage_info()
+{
+
+#Fetching the block_storage_name and block_storage_group_name 
+
+if [ "${SAN_DEVICE}" == "vnx" ]; then
+    _blk_stor_name_ini_=`iniget BLK_STORAGE_DEV_DETAILS_1 -f ${ENIQ_CONF_DIR}/${BLK_STOR_INI} -v BLK_STORAGE_NAME`
+    _blk_stor_grp_name_ini_=`iniget BLK_STORAGE_DEV_DETAILS_1 -f ${ENIQ_CONF_DIR}/${BLK_STOR_INI} -v BLK_STORAGE_GROUP_NAME`
+    if [ ! ${_blk_stor_name_ini_} ] || [ ! ${_blk_stor_grp_name_ini_} ]; then
+        log_msg -l ${LOGFILE} -q -t -s "Could not read parameter from file - ${ENIQ_CONF_DIR}/${BLK_STOR_INI}"
+        exit ${VALUE_MISSING}
+    fi
+
+    _blk_stor_name_san_=`$CAT ${PLUGINS_LOC}/${SAN_DEVICE}/etc/clariion.conf | $AWK 'NR==4{print $1}' | $SED "s/'//g"`
+    _blk_stor_grp_name_san_=`$CAT ${PLUGINS_LOC}/${SAN_DEVICE}/etc/clariion.conf | $EGREP -w 'sg' | $AWK -F"=>" '{print $2}' | $TR  -d ",' "`
+    if [ ! ${_blk_stor_name_san_} ] || [ ! ${_blk_stor_grp_name_san_} ]; then
+        log_msg -l ${LOGFILE} -q -t -s "Could not read parameter from file - ${PLUGINS_LOC}/${SAN_DEVICE}/etc/clariion.conf"
+        exit ${VALUE_MISSING}
+    fi
+
+    if [ ${_blk_stor_name_ini_} != ${_blk_stor_name_san_} ]; then
+        log_msg -l ${LOGFILE} -q -t -s "Block storage name entry does not match in ${BLK_STOR_INI} and clariion.conf"
+        exit ${VALUE_MISMATCH}
+    fi
+
+    if [ ${_blk_stor_grp_name_ini_} != ${_blk_stor_grp_name_san_} ]; then
+        log_msg -l ${LOGFILE} -q -t -s "Block storage group name entry does not match in ${BLK_STOR_INI} and clariion.conf"
+        exit ${VALUE_MISMATCH}
+    fi
+
+    _spa_ip_=`iniget BLK_STORAGE_DEV_DETAILS_1 -f ${ENIQ_CONF_DIR}/${BLK_STOR_INI} -v BLK_STORAGE_IP_SPA`
+    _spb_ip_=`iniget BLK_STORAGE_DEV_DETAILS_1 -f ${ENIQ_CONF_DIR}/${BLK_STOR_INI} -v BLK_STORAGE_IP_SPB`
+    if [ ! "${_spa_ip_}" -o ! "${_spb_ip_}"  ]; then
+        log_msg -l ${LOGFILE} -q -t -s "Could not read parameter  BLK_STORAGE_IP_SPA or  BLK_STORAGE_IP_SPB from file - ${ENIQ_CONF_DIR}/${BLK_STOR_INI}"
+        exit ${VALUE_MISSING}
+    fi
+    
+    _blk_stor_spa_=`$CAT ${PLUGINS_LOC}/${SAN_DEVICE}/etc/clariion.conf | $EGREP -w 'spa' | $AWK -F"=>" '{print $2}' | $TR  -d ",' "`
+    _blk_stor_spb_=`$CAT ${PLUGINS_LOC}/${SAN_DEVICE}/etc/clariion.conf | $EGREP -w 'spb' | $AWK -F"=>" '{print $2}' | $TR  -d ",' "`
+    if [ ! "${_blk_stor_spa_}" -o ! "${_blk_stor_spb_}"  ]; then
+        log_msg -l ${LOGFILE} -q -t -s "Could not read SPA and SPB parameter form ${PLUGINS_LOC}/${SAN_DEVICE}/etc/clariion.conf"
+        exit ${VALUE_MISSING}
+    fi
+    
+    if [ ${_spa_ip_} != ${_blk_stor_spa_} ]; then
+        log_msg -l ${LOGFILE} -q -t -s "Storage SPA IP does not match in ${BLK_STOR_INI} and clariion.conf"
+        exit ${VALUE_MISMATCH}
+    fi
+    
+    if [ ${_spb_ip_} != ${_blk_stor_spb_} ]; then
+        log_msg -l ${LOGFILE} -q -t -s "Storage SPB IP does not match in ${BLK_STOR_INI} and clariion.conf"
+        exit ${VALUE_MISMATCH}
+    fi
+
+else 
+    _blk_cs_grp_id_=`iniget BLK_STORAGE_DEV_DETAILS_1 -f ${ENIQ_CONF_DIR}/${BLK_STOR_INI} -v BLK_CONSISTENCY_GROUP_ID`
+    _cs_grp_id_=`$CAT ${PLUGINS_LOC}/${SAN_DEVICE}/etc/unity.conf | $EGREP -w 'csgrpid' | $AWK -F"=>" '{print $2}' | $TR  -d ",' "`
+    if [ ${_blk_cs_grp_id_} != ${_cs_grp_id_} ]; then
+        log_msg -l ${LOGFILE} -q -t -s "Consistency group ID does not match does not match in ${BLK_STOR_INI} and clariion.conf"
+        exit ${VALUE_MISMATCH}
+    fi
+    
+    _spa_ip_=`iniget BLK_STORAGE_DEV_DETAILS_1 -f ${ENIQ_CONF_DIR}/${BLK_STOR_INI} -v BLK_STORAGE_IP_SPA`
+    _blk_stor_spa_=`$CAT ${PLUGINS_LOC}/${SAN_DEVICE}/etc/unity.conf| $EGREP -w 'sp' | $AWK -F"=>" '{print $2}' | $TR  -d ",' "`
+    if [ ${_spa_ip_} != ${_blk_stor_spa_} ]; then
+        log_msg -l ${LOGFILE} -q -t -s "Storage SP IP does not match in ${BLK_STOR_INI} and unity.conf"
+        exit ${VALUE_MISMATCH}
+    fi
+    
+fi 
+
+}
+
+
+### Function: get_absolute_path ###
+#
+# Determine absolute path to software
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+get_absolute_path()
+{
+_dir_=`$DIRNAME $0`
+SCRIPTHOME=`cd $_dir_ 2>/dev/null && pwd || $ECHO $_dir_`
+}
+
+### Function: setup_env ###
+#
+# Setup up path environment
+# Imports the common lib files which imports common functions 
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+
+setup_env()
+{
+if [ ! "${ENIQ_BASE_DIR}" ]; then
+    ENIQ_BASE_DIR=/eniq
+fi
+
+# var tmp directory
+VAR_TMP=/var/tmp
+
+# Main Directory for the Core Installation SW
+ENIQ_INST_DIR=${ENIQ_BASE_DIR}/installation
+
+# ENIQ LIB Directory
+LIB_DIR=/lib
+
+# Local logs directory
+ENIQ_PRECHECK_LOG_DIR=${ENIQ_BASE_DIR}/local_logs/precheck_logs
+
+# Eniq core install directory
+ENIQ_CORE_INST_DIR=${ENIQ_INST_DIR}/core_install
+
+# Eniq core install config directory
+ENIQ_CONF_DIR=${ENIQ_INST_DIR}/config
+
+
+# Ericsson storage plugin directory
+PLUGINS_LOC=/ericsson/storage/san/plugins/
+
+#SAN Device details 
+SAN_DEVICE=`$CAT ${ENIQ_CONF_DIR}/san_details | $EGREP "^SAN_DEVICE=" | $AWK -F\= '{print $2}'`
+
+# Install Serevr Type 
+SERVER_TYPE=`${CAT} ${ENIQ_CONF_DIR}/installed_server_type`
+
+# Source the common functions
+if [ -s ${SCRIPTHOME}/../../lib/common_functions.lib ]; then
+    . ${SCRIPTHOME}/../../lib/common_functions.lib
+else
+    _err_msg_="File ${SCRIPTHOME}/../../lib/common_functions.lib not found"
+    abort_script "${_err_msg_}" 
+fi
+
+if [ -s ${ENIQ_CORE_INST_DIR}/${LIB_DIR}/common_core_install_functions.lib ]; then
+    . ${ENIQ_CORE_INST_DIR}/${LIB_DIR}/common_core_install_functions.lib
+else
+    _err_msg_="File ${ENIQ_CORE_INST_DIR}/${LIB_DIR}/common_core_install_functions.lib not found"
+    abort_script "${_err_msg_}"
+fi
+
+if [ -s ${ENIQ_CORE_INST_DIR}/${LIB_DIR}/common_inirator_functions.lib ]; then
+    . ${ENIQ_CORE_INST_DIR}/${LIB_DIR}/common_inirator_functions.lib
+else
+    _err_msg_="File ${ENIQ_CORE_INST_DIR}/${LIB_DIR}/common_inirator_functions.lib not found"
+    abort_script "${_err_msg_}"
+fi
+
+if [ -s ${ENIQ_CONF_DIR}/extra_params/deployment ]; then
+    _deployment_=`$CAT ${ENIQ_CONF_DIR}/extra_params/deployment`
+else
+    _err_msg_="Parameter \"deployment\" incorrectly specified, or is missing from boot command"
+    abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+fi
+
+# Storage Type
+STORAGE_TYPE=`iniget STOR_TYPE -f ${ENIQ_BASE_DIR}/installation/config/${SUNOS_INI} -v STORAGE_TYPE`
+if [ ! "${STORAGE_TYPE}" ]; then
+    _err_msg_="Could not read STORAGE_TYPE param "
+    abort_script "${_err_msg_}"
+fi
+
+
+_check_storage_ip_script_=${ENIQ_CORE_INST_DIR}/eniq_checks/bin/check_storage_ip.bsh
+
+HNAME=`${MYHOSTNAME}`
+
+}
+
+
+# ********************************************************************
+#
+#       Main body of program
+#
+# ********************************************************************
+#
+
+# Default user
+DEFAULT_USER=root
+
+# Check that the effective id of the user is root
+check_id ${DEFAULT_USER}
+
+#get absolute path
+get_absolute_path
+
+# Set up environment variables for script.
+setup_env
+
+# Logfile path
+LOGFILE=${ENIQ_PRECHECK_LOG_DIR}/check_storage_ip.log
+
+# Check Logfile
+chk_logfile
+
+#Create a temporary Directory
+TEM_DIR=/tmp/check_storage_ip.$$.$$
+
+$MKDIR -p ${TEM_DIR}
+
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not create directory ${TEM_DIR}"
+    abort_script "${_err_msg_}"
+fi
+
+# Check Storage type
+if [ "${STORAGE_TYPE}" == "fs" ]; then
+    log_msg -s "This check is not applicable for RACK servers." -l $LOGFILE
+    exit $RACK_NOT_APPLICABLE
+fi
+
+#check storage IP
+check_ip
+
+log_msg -t -s "IP check completed on ${SERVER_TYPE} server. Check log ${LOGFILE} on ${HNAME}\n"
+
+
+$RM -rf ${TEM_DIR}
+if [ -s ${TEM_DIR} ]; then
+    _err_msg_="Could not remove ${TEM_DIR}"
+    abort_script "$_err_msg_"
+fi
+
+exit ${RET_CODE}

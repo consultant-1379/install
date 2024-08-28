@@ -1,0 +1,410 @@
+#!/bin/bash
+# ********************************************************************
+# Ericsson Radio Systems AB                                     SCRIPT
+# ********************************************************************
+#
+#
+# (c) Ericsson Radio Systems AB 2012 - All rights reserved.
+#
+# The copyright to the computer program(s) herein is the property
+# of Ericsson Radio Systems AB, Sweden. The programs may be used
+# and/or copied only with the written permission from Ericsson Radio
+# Systems AB or in accordance with the terms and conditions stipulated
+# in the agreement/contract under which the program(s) have been
+# supplied.
+#
+# ********************************************************************
+# Name    : update_ipmp_ini.bsh
+# Date    : 29/11/2018
+# Revision: B.1
+# Purpose : Script to make any required IPMP changes to ini file(s)
+#
+# ********************************************************************
+#
+#       Command Section
+#
+# ********************************************************************
+AWK=/usr/bin/awk
+BASENAME=/usr/bin/basename
+CAT=/usr/bin/cat
+CLEAR=/usr/bin/clear
+CP=/usr/bin/cp
+CUT=/usr/bin/cut
+DATE=/usr/bin/date
+DIRNAME=/usr/bin/dirname
+ECHO=/usr/bin/echo
+EGREP=/usr/bin/egrep
+ENV=/usr/bin/env
+EXPR=/usr/bin/expr
+GREP=/usr/bin/grep
+ID=/usr/bin/id
+LS=/usr/bin/ls
+MKDIR=/usr/bin/mkdir
+PWD=/usr/bin/pwd
+RM=/usr/bin/rm
+SED=/usr/bin/sed
+SU=/usr/bin/su
+TEE=/usr/bin/tee
+TOUCH=/usr/bin/touch
+
+# ********************************************************************
+#
+#       Configuration Section
+#
+# ********************************************************************
+# Name of SunOS & ENIQ ini Files
+ENIQ_ENV=niq.rc
+IPMP_INI=ipmp.ini
+NIQ_INI=niq.ini
+SUNOS_INI=SunOS.ini
+
+# ********************************************************************
+#
+#       Pre-execution Operations
+#
+# ********************************************************************
+
+
+# ********************************************************************
+#
+#       Functions
+#
+# ********************************************************************
+### Function: abort_script ###
+#
+#   This will is called if the script is aborted thru an error
+#   error signal sent by the kernel such as CTRL-C or if a serious
+#   error is encountered during runtime
+#
+# Arguments:
+#       $1 - Error message from part of program (Not always used)
+# Return Values:
+#       none
+abort_script()
+{
+if [ "$1" ]; then
+    _err_msg_=$1
+else
+    _err_msg_="Script aborted.......\n"
+fi
+
+if [ "${LOGFILE}" ]; then
+    $ECHO "\n$_err_msg_\n"|$TEE -a ${LOGFILE}
+else
+    $ECHO "\n$_err_msg_\n"
+fi
+
+cd $SCRIPTHOME
+
+$RM -rf ${TEM_DIR}
+
+if [ "$2" ]; then
+    ${2}
+else
+   exit 1
+fi
+}
+
+### Function: check_id ###
+#
+#   Check that the effective id of the user is correct
+#   If not print error msg and exit.
+#
+# Arguments:
+#       $1 : User ID name
+# Return Values:
+#       none
+check_id()
+{
+_check_id_=`$ID  | $AWK -F\( '{print $2}' | $AWK -F\) '{print $1}'`
+if [ "$_check_id_" != "$1" ]; then
+    _err_msg_="You must be $1 to execute this script."
+    abort_script "$_err_msg_"
+fi
+}
+
+### Function: chk_create_ipmp_ini ###
+#
+# See if we need to create the IPMP ini file
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+chk_create_ipmp_ini()
+{
+# Check if we have IPMP entries in  ${ENIQ_CONF_DIR}/${SUNOS_INI}
+_ipmp_in_sunos_ini_=`iniget IPMP -f ${ENIQ_CONF_DIR}/${SUNOS_INI}`
+
+# Check if we have IPMP entries in  ${ENIQ_CONF_DIR}/${SUNOS_INI}
+_stor_netmask_in_sunos_ini_=`iniget STOR_NETMASK -f ${ENIQ_CONF_DIR}/${SUNOS_INI}`
+
+$RM -f ${TEM_DIR}/sunos_tmp.1 ${TEM_DIR}/sunos_tmp.2 ${TEM_DIR}/ipmp.ini
+
+# Do we have IPMP file. If not then I need to strip entries
+# from ${ENIQ_CONF_DIR}/${SUNOS_INI} and create it
+if [ ! -s ${ENIQ_CONF_DIR}/${IPMP_INI} ]; then
+    # Do we have IPMP entries in ${ENIQ_CONF_DIR}/${SUNOS_INI}
+    if [ ! "${_ipmp_in_sunos_ini_}" ]; then
+		_err_msg_="No IPMP information found in ${ENIQ_CONF_DIR}/${SUNOS_INI}"
+		abort_script "$_err_msg_"
+    fi
+
+    $ECHO "Creating new ${ENIQ_CONF_DIR}/${IPMP_INI} file" | $TEE -a ${LOGFILE}
+    $ECHO ";--------------------------------------------------------------------------" >> ${TEM_DIR}/ipmp.ini
+    $ECHO "; IPMP information" >> ${TEM_DIR}/ipmp.ini
+    $ECHO ";--------------------------------------------------------------------------" >> ${TEM_DIR}/ipmp.ini
+    $ECHO "[IPMP]" >> ${TEM_DIR}/ipmp.ini
+    for _intf_ in ${_ipmp_in_sunos_ini_}; do
+		$ECHO "${_intf_}" >> ${TEM_DIR}/ipmp.ini
+    done
+    $ECHO "" >> ${TEM_DIR}/ipmp.ini
+
+    for _intf_ in ${_ipmp_in_sunos_ini_}; do
+    	$ECHO "Adding ${_intf_} section to ${ENIQ_CONF_DIR}/${IPMP_INI} file" | $TEE -a ${LOGFILE}
+    	$ECHO "[${_intf_}]" >> ${TEM_DIR}/ipmp.ini
+		iniget ${_intf_} -f ${ENIQ_CONF_DIR}/${SUNOS_INI} >> ${TEM_DIR}/ipmp.ini
+		$ECHO "" >> ${TEM_DIR}/ipmp.ini
+    done
+
+    for _intf_ in ${_ipmp_in_sunos_ini_}; do
+		_vlan_name_=`iniget ${_intf_} -f ${ENIQ_CONF_DIR}/${SUNOS_INI} -v IPMP_Group_Name`
+		if [ "${_vlan_name_}" != "stor_grp" ]; then
+			continue	
+		fi
+		_ipmp_ip_=`iniget ${_intf_} -f ${ENIQ_CONF_DIR}/${SUNOS_INI} -v IPMP_Group_IP`
+		_ipmp_netmask_=`iniget ${_intf_} -f ${ENIQ_CONF_DIR}/${SUNOS_INI} -v IPMP_Group_Netmask`
+		_ipmp_net_=`get_network_addr "${_ipmp_netmask_}" "${_ipmp_ip_}"`
+    done
+
+    $ECHO "Adding STOR_NETMASK section to ${ENIQ_CONF_DIR}/${IPMP_INI} file" | $TEE -a ${LOGFILE}
+    $ECHO "[STOR_NETMASK]" >> ${TEM_DIR}/ipmp.ini
+    $ECHO "NETMASKS=${_ipmp_net_}:${_ipmp_netmask_}" >> ${TEM_DIR}/ipmp.ini
+    $ECHO "" >> ${TEM_DIR}/ipmp.ini
+fi
+
+$CP ${ENIQ_CONF_DIR}/${SUNOS_INI} ${TEM_DIR}/sunos_tmp.1
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not make a copy of ${ENIQ_CONF_DIR}/${SUNOS_INI}"
+    abort_script "$_err_msg_"
+fi
+		
+# Do we have IPMP entries in ${ENIQ_CONF_DIR}/${SUNOS_INI}
+if [ "${_ipmp_in_sunos_ini_}" ]; then
+    for _intf_ in ${_ipmp_in_sunos_ini_}; do
+		$RM -f ${TEM_DIR}/sunos_tmp.2
+		$ECHO "Removing ${_intf_} information from ${ENIQ_CONF_DIR}/${SUNOS_INI}" | $TEE -a ${LOGFILE}
+        $INI_DEL -g IPMP -p ${_intf_} -i ${TEM_DIR}/sunos_tmp.1 -o ${TEM_DIR}/sunos_tmp.2
+		if [ $? -ne 0 ]; then
+		    _err_msg_="Could not remove ${_intf_} section from ${ENIQ_CONF_DIR}/${SUNOS_INI}"
+		    abort_script "$_err_msg_"
+		fi
+		$CP ${TEM_DIR}/sunos_tmp.2 ${TEM_DIR}/sunos_tmp.1
+		if [ $? -ne 0 ]; then
+		    _err_msg_="Could not save removed ${_intf_} section from ${ENIQ_CONF_DIR}/${SUNOS_INI}"
+		    abort_script "$_err_msg_"
+		fi
+    done
+
+    $RM -f ${TEM_DIR}/sunos_tmp.2
+    $ECHO "Removing IPMP section from ${ENIQ_CONF_DIR}/${SUNOS_INI}" | $TEE -a ${LOGFILE}
+    $INI_DEL -p IPMP -i ${TEM_DIR}/sunos_tmp.1 -o ${TEM_DIR}/sunos_tmp.2
+    if [ $? -ne 0 ]; then
+		_err_msg_="Could not remove IPMP section from ${ENIQ_CONF_DIR}/${SUNOS_INI}"
+		abort_script "$_err_msg_"
+    fi
+    $CP ${TEM_DIR}/sunos_tmp.2 ${TEM_DIR}/sunos_tmp.1
+fi
+
+# Do we have IPMP entries in ${ENIQ_CONF_DIR}/${SUNOS_INI}
+if [ "${_stor_netmask_in_sunos_ini_}" ]; then
+    $ECHO "Removing STOR_NETMASK entry from ${ENIQ_CONF_DIR}/${SUNOS_INI} file" | $TEE -a ${LOGFILE}
+    $RM -f ${TEM_DIR}/sunos_tmp.2
+    $INI_DEL -p STOR_NETMASK -i ${TEM_DIR}/sunos_tmp.1 -o ${TEM_DIR}/sunos_tmp.2
+    if [ $? -ne 0 ]; then
+		_err_msg_="Could not remove IPMP section from \n${ENIQ_CONF_DIR}/${SUNOS_INI}"
+		abort_script "$_err_msg_"
+    fi
+    $CP ${TEM_DIR}/sunos_tmp.2 ${TEM_DIR}/sunos_tmp.1
+fi
+
+if [ -s ${TEM_DIR}/ipmp.ini ]; then
+    $CP ${TEM_DIR}/ipmp.ini ${ENIQ_CONF_DIR}/${IPMP_INI}
+    if [ $? -ne 0 ]; then
+		_err_msg_="Could not save new \n${ENIQ_CONF_DIR}/${IPMP_INI}"
+		abort_script "$_err_msg_"
+    fi
+fi
+
+if [ -s ${TEM_DIR}/sunos_tmp.1 ]; then
+    $CP ${TEM_DIR}/sunos_tmp.1 ${ENIQ_CONF_DIR}/${SUNOS_INI}
+    if [ $? -ne 0 ]; then
+		_err_msg_="Could not save new \n${ENIQ_CONF_DIR}/${SUNOS_INI}"
+		abort_script "$_err_msg_"
+    fi
+fi
+}
+
+### Function: chk_create_logfile ###
+#
+# Check/Create Logfile
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+chk_create_logfile()
+{
+$MKDIR -p `$DIRNAME ${LOGFILE}`
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not create directory `$DIRNAME ${LOGFILE}`"
+     abort_script "$_err_msg_"
+fi
+
+$TOUCH -a ${LOGFILE}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not write to file ${LOGFILE}"
+    abort_script "$_err_msg_"
+fi
+}
+
+### Function: get_absolute_path ###
+#
+# Determine absolute path to software
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+get_absolute_path()
+{
+_dir_=`$DIRNAME $0`
+SCRIPTHOME=`cd $_dir_ 2>/dev/null && pwd || $ECHO $_dir_`
+}
+
+### Function: setup_env ###
+#
+# Setup up path environment etc
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+setup_env()
+{
+if [ ! "${ENIQ_BASE_DIR}" ]; then
+    ENIQ_BASE_DIR=/eniq
+fi
+
+ENIQ_CORE_DIR=${ENIQ_BASE_DIR}/installation/core_install
+
+ENIQ_CONF_DIR=${ENIQ_BASE_DIR}/installation/config
+if [ ! -s ${ENIQ_CONF_DIR}/ericsson_use_config ]; then
+    _err_msg_="Could not locate file ${ENIQ_CONF_DIR}/config"
+    abort_script "$_err_msg_"
+fi
+
+CURR_SERVER_TYPE=`$CAT $ENIQ_CONF_DIR/installed_server_type | $EGREP -v  '^[[:blank:]]*#' | $SED -e 's/ //g'`
+if [ ! "${CURR_SERVER_TYPE}" ]; then
+        _err_msg_="Could not determine which server type this is"
+    abort_script "$_err_msg_"
+fi
+
+if [ -x ${ENIQ_CORE_DIR}/lib/iniadd.pl ]; then
+    INIADD=${ENIQ_CORE_DIR}/lib/iniadd.pl
+else
+    _err_msg_="${ENIQ_CORE_DIR}/lib/iniadd.pl is not found, or is not executable"
+    abort_script "$_err_msg_" 
+fi
+
+if [ -x ${ENIQ_CORE_DIR}/lib/inidel.pl ]; then
+    INI_DEL=${ENIQ_CORE_DIR}/lib/inidel.pl
+else
+    _err_msg_="${ENIQ_CORE_DIR}/lib/inidel.pl is not found, or is not executable"
+    abort_script "$_err_msg_" 
+fi
+}
+
+### Function: usage_msg ###
+#
+#   Print out the usage message
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+usage_msg()
+{
+$CLEAR
+$ECHO "
+Usage: `$BASENAME $0` [ -l <path_to_logfile> ]
+
+options:
+-l  : Optional parameter specifying the full path to logfile.
+"
+}
+
+# ********************************************************************
+#
+#       Main body of program
+#
+# ********************************************************************
+#
+RUN_TIME=`$DATE '+%Y-%b-%d_%H.%M.%S'`
+
+# Determine absolute path to software
+get_absolute_path
+
+# Check that the effective id of the user is root
+check_id root
+
+while getopts ":b:l:f:" arg; do
+  case $arg in
+    b) ENIQ_BASE_DIR="$OPTARG"
+       ;;
+    l) LOGFILE="$OPTARG"
+       ;;
+   \?) usage_msg
+       exit 1
+       ;;
+  esac
+done
+shift `expr $OPTIND - 1`
+
+# Setup up path environment etc
+setup_env
+
+if [ ! -s ${ENIQ_CORE_DIR}/lib/common_functions.lib ]; then
+    _err_msg_="Cannot locate ${ENIQ_CORE_DIR}/lib/common_functions.lib"
+    abort_script "$_err_msg_"
+else
+   . ${ENIQ_CORE_DIR}/lib/common_functions.lib
+fi
+
+if [ ! -x ${ENIQ_CORE_DIR}/lib/iniadd.pl ]; then
+    _err_msg_="Cannot locate ${ENIQ_CORE_DIR}/lib/iniadd.pl"
+    abort_script "$_err_msg_"
+fi
+
+if [ ! "${LOGFILE}" ]; then
+	LOGFILE=${ENIQ_BASE_DIR}/local_logs/upgrade/ipmp_file_upgrade.log
+fi
+
+# Check/Create Logfile
+chk_create_logfile
+
+# Create a temporary Directory
+TEM_DIR=/tmp/update_ini_files.$$.$$
+$RM -rf ${TEM_DIR}
+$MKDIR -p ${TEM_DIR}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not create directory ${TEM_DIR}"
+    abort_script "$_err_msg_"
+fi
+
+# See if we need to create the IPMP ini file
+chk_create_ipmp_ini
+
+$RM -rf ${TEM_DIR}
+
+exit 0

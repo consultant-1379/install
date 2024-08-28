@@ -1,0 +1,351 @@
+#!/bin/bash
+# ********************************************************************
+# Ericsson Radio Systems AB                                     SCRIPT
+# ********************************************************************
+# (c) Ericsson Radio Systems AB 2020 - All rights reserved.
+#
+# The copyright to the computer program(s) herein is the property
+# of Ericsson Radio Systems AB, Sweden. The programs may be used
+# and/or copied only with the written permission from Ericsson Radio
+# Systems AB or in accordance with the terms and conditions stipulated
+# in the agreement/contract under which the program(s) have been
+# supplied.
+#
+# ********************************************************************
+# Name    : log_transfer.bsh
+# Date    : 15/03/2022
+# Revision: \main\1
+# Purpose : Script to collect log files of given date
+# Usage   : bash log_collector.bsh
+# Exit Values: 
+#     0   : Success
+#    
+# ********************************************************************
+#
+#   Command Section
+#
+# ********************************************************************
+##
+AWK=/usr/bin/awk
+ECHO='/usr/bin/echo -e'
+CHMOD=/usr/bin/chmod
+CAT=/usr/bin/cat
+CD=/usr/bin/cd
+EGREP=/usr/bin/egrep
+SED=/usr/bin/sed
+MKDIR=/usr/bin/mkdir
+FIND=/usr/bin/find
+GREP=/usr/bin/grep
+RM=/usr/bin/rm
+TAIL=/usr/bin/tail
+# ********************************************************************
+#
+#   Functions
+#
+# ********************************************************************
+### Function: setup_env ###
+#
+# Setup path environment
+# Imports the common lib files which imports common functions 
+# 
+# Arguments:
+#   $DATE_VAL 
+# Return Values:
+#   none 
+#
+setup_env(){
+
+#Log_collector log file
+log_path=/eniq/log/log_collector
+
+#ENIQ BASE DIRECTORY
+ENIQ_BASE_DIR=/eniq
+
+# Main Directory for the Core Installation SW
+ENIQ_INST_DIR=${ENIQ_BASE_DIR}/installation
+
+#ENIQ config directory
+ENIQ_CONF_DIR=${ENIQ_INST_DIR}/config
+CURR_SERVER_TYPE=`$CAT $ENIQ_CONF_DIR/installed_server_type | $EGREP -v  '^[[:blank:]]*#' | $SED -e 's/ //g'`
+
+#Remporary Location
+VAR_TMP=/var/tmp
+
+# Main Directory for the Core Installation SW
+ENIQ_INST_DIR=${ENIQ_BASE_DIR}/installation
+
+# ENIQ Core Installation SW
+ENIQ_CORE_INST_DIR=${ENIQ_INST_DIR}/core_install
+
+#ENIQ local logs directory
+ENIQ_LOCAL_LOGS_DIR=${ENIQ_BASE_DIR}/local_logs
+
+#Configuration file location
+LOG_COLLECTOR=${ENIQ_CORE_INST_DIR}/eniq_log_collector
+
+#Log transfer directory
+LOG_DIR=${ENIQ_LOCAL_LOGS_DIR}/log_transfer
+if [ ! -d $LOG_DIR ]; then
+   $MKDIR -p $LOG_DIR
+fi
+
+#Log file name
+date=$(date '+%Y-%m-%d')
+log_file_name=log_transfer-$date.log
+
+#Temporary Log Directory
+TEMP_LOG=${ENIQ_BASE_DIR}/log/temp_log
+#$MKDIR $TEMP_LOG
+if [ ! -d $TEMP_LOG ]; then
+   $MKDIR -p $TEMP_LOG 
+fi
+
+#Temporary Log Location
+TEMP_LOG_LOCATION=${TEMP_LOG_DIR}/log_collector_temp
+
+
+#Installation lib directory
+ENIQ_LIB_DIR=${ENIQ_INST_DIR}/core_install/lib
+
+#Common function directory
+COMMON_FUNCS_LIB=${ENIQ_LIB_DIR}/common_functions.lib
+
+# Source the common functions
+if [ -s ${COMMON_FUNCS_LIB} ]; then
+    . ${COMMON_FUNCS_LIB}
+else
+    _err_msg_="File ${COMMON_FUNCS_LIB} not found"
+    abort_script "${_err_msg_}"
+fi
+
+}
+
+### Function: abort_script ###
+#
+#   This will is called if the script is aborted thru an error
+#   signal sent by the kernel such as CTRL-C or if a serious
+#   error is encountered during runtime
+#
+# Arguments:
+#       $1 - Error message from part of program (Not always used)
+# Return Values:
+#       none
+abort_script()
+{
+_err_time_=`date '+%Y-%b-%d_%H.%M.%S'`
+
+if [ "$1" ]; then
+    _err_msg_="${_err_time_} - $1"
+else
+    _err_msg_="${_err_time_} - ERROR : Script aborted.......\n"
+fi
+if [ -s ${TEMP_LOG_LOCATION}/summary.log  ]; then
+    $ECHO "\nERROR : ${_err_msg_}\n" >> ${TEMP_LOG_LOCATION}/summary.log
+else
+    $ECHO "\nERROR : ${_err_msg_}\n"
+fi
+
+clean_up
+
+exit 1
+}
+
+### Function: log_transfer ###
+#
+# Selects specific inputs to transfer logs
+#
+# Arguments:
+#      none
+# Return Values:
+#       none
+#
+log_transfer()
+{
+ #Getting User Input to transfer log files
+    while :; do
+        $ECHO "DO you wish to transfer logs to the remote server[Y/N] ?:"
+        read input
+		# Did user enter anything
+        if [ ! "${input}" ]; then
+            continue
+        fi		
+
+		if [ "${input}" == "Y" -o "${input}" == "N" ]; then
+		    break
+        else
+            continue
+        fi
+        break
+    done
+
+if [ $input == Y ]; then
+   ##Getting value for date
+   validate_date
+    
+   while :; do
+        $ECHO "Enter username of remote server:"
+        read username
+
+        # Did user enter anything
+        if [ ! "${username}" ]; then
+            continue
+        fi
+        break
+    done
+
+    while :; do
+        $ECHO "Enter Host_ip of remote server:"
+        read host_ip
+        # Did user enter anything
+        if [ ! "${host_ip}" ]; then
+            continue
+        fi
+       validate_ip ${host_ip}
+        if [ $? -ne 0 ]; then
+            continue
+        fi
+        break
+    done
+	
+    while :; do
+        $ECHO "Enter the destination server path to transfer logs]:(must enter a valid path which is present on destination server)"
+        read destination_path
+
+        # Did user enter anything
+        if [ ! "${destination_path}" ]; then
+            continue
+        fi
+
+        break
+    done
+    $ECHO "Transfering logs to remote server:$host_ip" >>${log_file_name}
+    if [ $file ];then
+     $ECHO  "put $file $destination_path" | sftp $username@$host_ip 
+    fi 
+fi
+}
+
+### Function: validate_date ###
+#
+# Selects a date to tarnsfer logs to remote hosts
+#
+# Arguments:
+#      none
+# Return Values:
+#       none
+#
+validate_date(){
+    while :; do
+        echo "Enter date in format[YYYY-MM-DD]:"
+        read date
+        Date=`echo $date | tr -d "-"`
+  # To check if date is integer
+        if [ ${#Date} -eq 8 ];then
+            year=${Date:0:4}
+            month=${Date:4:2}
+            day=${Date:6:2}
+            month30="04 06 09 11"
+            leapyear=$((year%4))
+                if [ "$month" -le 12 -a "$day" -le 31 -a "$day" -ge 1  -a "$month" -ge 1 ]; then
+                    if [ "$month" -eq 02 -a "$day" -gt 29 ] || [ "$leapyear" -ne 0 -a "$month" -eq 02 -a "$day" -gt 28 ]; then
+                        $ECHO "Date is out of range...try again"
+                        continue
+                    elif [[ "$month30" =~ "$month" ]] && [ "$day" -eq 31 ]; then
+                        $ECHO "Month $month cannot have 31 days...try again" 
+                        continue
+                    else
+                      cd $log_path
+                      file=`$LS -lrt | $GREP  "${date}" | $TAIL -1 | $AWK '{print $9}'`
+                        if [ $? -ne 0 ]; then
+                           $ECHO "INFO:Log files for selected date are not present"
+                            abort_script
+                        fi
+                       break
+                    fi
+                else
+                    $ECHO "Date is out of range...try again"
+                   continue
+                fi
+           
+        else
+            $ECHO "Date entered is not in the expected format...try again"
+             continue
+        fi
+		
+        break
+    done
+}
+### Function: clean_up ##
+#
+#   Removes temporary files when script is aborted
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+#
+clean_up(){
+
+cd ${CURR_DIR}
+
+REM_LIST=""
+    if [ -d ${TEMP_LOG} ];then
+        REM_LIST+=" ${TEMP_LOG}"
+    fi
+	
+	
+	if [ ${#REM_LIST} -ne 0 ];then
+        $RM -rf ${REM_LIST}
+   fi
+}
+
+### Function: usage_msg ###
+#
+# Usage message for script
+# 
+# Arguments:
+#   none 
+# Return Values:
+#   none 
+#
+usage_msg(){
+$ECHO "Usage:"
+$ECHO "bash /eniq/installation/core_install/eniq_log_collector/bin/log_transfer.bsh [ -l <path_to_logfile> ]"
+$ECHO "-l : Optional parameter to generate the logfile"
+$ECHO "Script should be run from the standalone and co-ordinator"
+}
+
+# ********************************************************************
+#
+#       Main body of program
+#
+# ********************************************************************
+setup_env
+#Checking if server is ENIQ Standalone or ENIQ coordinator server
+if [ "${CURR_SERVER_TYPE}" != "stats_coordinator" ] && [ "${CURR_SERVER_TYPE}" != "eniq_stats" ]; then
+    _err_msg_="Script can be run only from ENIQ Standalone or ENIQ Coordinator server."
+    abort_script "$_err_msg_"
+fi
+while getopts ":l:" arg; do
+  case $arg in
+    l) LOGFILE="$OPTARG"
+       ;;
+   \?) usage_msg
+       exit 1
+       ;;
+  esac
+done
+shift `expr $OPTIND - 1`
+
+if [ ! $LOGFILE ] ; then
+    log_file_name=${LOG_DIR}/log_transfer-$date.log
+else
+    log_file_name=$LOGFILE
+fi
+
+log_transfer
+clean_up
+
+
+
+

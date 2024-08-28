@@ -1,0 +1,1880 @@
+#!/bin/bash
+# ********************************************************************
+# Ericsson Radio Systems AB                                     SCRIPT
+# ********************************************************************
+#
+#
+# (c) Ericsson Radio Systems AB 2022 - All rights reserved.
+#
+# The copyright to the computer program(s) herein is the property
+# of Ericsson Radio Systems AB, Sweden. The programs may be used 
+# and/or copied only with the written permission from Ericsson Radio 
+# Systems AB or in accordance with the terms and conditions stipulated 
+# in the agreement/contract under which the program(s) have been 
+# supplied.
+#
+# ********************************************************************
+# Name    : update_sunos_ini.bsh
+# Date    : 0$/02/2022
+# Revision: M
+# Purpose : Script to make any required changes to ini file(s)
+#
+# Usage   : update_sunos_ini.bsh
+#
+# ********************************************************************
+#
+# 	Command Section
+#
+# ********************************************************************
+AWK=/usr/bin/awk
+BASENAME=/usr/bin/basename
+CAT=/usr/bin/cat
+CLEAR=/usr/bin/clear
+CMP=/usr/bin/cmp
+CP=/usr/bin/cp
+DATE=/usr/bin/date
+DIRNAME=/usr/bin/dirname
+ECHO='/usr/bin/echo -e'
+EGREP=/usr/bin/egrep
+EXPR=/usr/bin/expr
+GREP=/usr/bin/grep
+ID=/usr/bin/id
+MKDIR=/usr/bin/mkdir
+RM=/usr/bin/rm
+SED=/usr/bin/sed
+TAIL=/usr/bin/tail
+TEE=/usr/bin/tee
+TOUCH=/usr/bin/touch
+UNAME=/usr/bin/uname
+VGS=/usr/sbin/vgs
+
+
+
+# ********************************************************************
+#
+#       Configuration Section
+#
+# ********************************************************************
+# Name of SunOS & ENIQ ini Files
+ENIQ_INI=niq.ini
+SUNOS_INI=SunOS.ini
+
+# Volume Group for Root
+ROOT_VG="vg_root"
+# ********************************************************************
+#
+#       Pre-execution Operations
+#
+# ********************************************************************
+
+
+# ********************************************************************
+#
+# 	Functions
+#
+# ********************************************************************
+### Function: abort_script ###
+#
+#   This will is called if the script is aborted thru an error
+#   error signal sent by the kernel such as CTRL-C or if a serious
+#   error is encountered during runtime
+#
+# Arguments:
+#       $1 - Error message from part of program (Not always used)
+# Return Values:
+#       none
+abort_script()
+{
+_err_time_=`$DATE '+%Y-%b-%d_%H.%M.%S'`
+	
+if [ "$1" ]; then
+    _err_msg_="${_err_time_} - $1"
+else
+    _err_msg_="${_err_time_} - Script aborted.......\n"    
+fi
+
+if [ "${LOGFILE}" ]; then
+    $ECHO "\n$_err_msg_\n"|$TEE -a ${LOGFILE}
+else
+    $ECHO "\n$_err_msg_\n"
+fi
+
+cd $SCRIPTHOME
+
+$RM -rf ${TEM_DIR}
+
+if [ "$2" ]; then
+    ${2}
+else
+   exit 1
+fi
+}
+
+### Function: check_id ###
+#
+#   Check that the effective id of the user is correct
+#   If not print error msg and exit.
+#
+# Arguments:
+#       $1 : User ID name
+# Return Values:
+#       none
+check_id()
+{
+_check_id_=`$ID  | $AWK -F\( '{print $2}' | $AWK -F\) '{print $1}'`
+if [ "$_check_id_" != "$1" ]; then
+    _err_msg_="You must be $1 to execute this script."
+    abort_script "$_err_msg_" 
+fi
+}
+
+### Function: chk_create_logfile ###
+#
+# Check/Create Logfile
+#
+# Arguments:
+#	none
+# Return Values:
+#	none
+chk_create_logfile()
+{
+$MKDIR -p `$DIRNAME ${LOGFILE}`
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not create directory `$DIRNAME ${LOGFILE}`"
+     abort_script "$_err_msg_"
+fi	
+
+$TOUCH -a ${LOGFILE}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not write to file ${LOGFILE}"
+    abort_script "$_err_msg_"
+fi	
+}
+
+### Function: determine_server_type_pool ###
+#
+# Determine server type pool
+#
+# Arguments:
+#	none
+# Return Values:
+#	none
+determine_server_type_pool()
+{
+# Determine the Volume Group from the OS as a check
+
+_os_pool_name_=$($VGS -o vg_name --noheading | $EGREP -iw "${CURR_SERVER_TYPE}_pool" | $SED 's/[[:blank:]]//g')
+if [ ! "${_os_pool_name_}" ]; then
+    _err_msg_="Could not determine Volume Group from the OS"
+    abort_script "$_err_msg_"
+fi
+
+# Determine the pool from the SunOS.ini
+for _blk_ in `iniget SunOS_FS_POOL -f ${ENIQ_CONF_DIR}/${SUNOS_INI}`; do
+    _pool_name_=`iniget $_blk_ -f ${ENIQ_CONF_DIR}/${SUNOS_INI} -v name`
+    if [ ! "${_pool_name_}" ]; then
+        _err_msg_="Could not determine _pool_name_"
+        abort_script "${_err_msg_}"
+    fi
+done
+
+if [ "${_pool_name_}" != "${_os_pool_name_}" ]; then
+    _err_msg_="ERROR: OS and ${ENIQ_CONF_DIR}/${SUNOS_INI} have different values for Volume Group"
+    abort_script "$_err_msg_"
+fi
+
+_volume_grp_="${_pool_name_}"
+}
+
+### Function: get_absolute_path ###
+#
+# Determine absolute path to software
+#
+# Arguments:
+#	none
+# Return Values:
+#	none
+get_absolute_path() 
+{
+_dir_=`$DIRNAME $0`
+SCRIPTHOME=`cd $_dir_ 2>/dev/null && pwd || $ECHO $_dir_`
+}
+
+### Function: setup_env ###
+#
+# Setup up path environment etc
+#
+# Arguments:
+#	none
+# Return Values:
+#	none
+setup_env()
+{
+# Determine Solaris OS version
+unset SOLARIS_10
+OS_VERSION=`$UNAME -r`
+if [ "${OS_VERSION}" == "5.10" ]; then
+    SOLARIS_10="YES"
+fi
+
+if [ ! "${ENIQ_BASE_DIR}" ]; then
+    ENIQ_BASE_DIR=/eniq
+fi
+
+ENIQ_CORE_DIR=${ENIQ_BASE_DIR}/installation/core_install
+
+ENIQ_CONF_DIR=${ENIQ_BASE_DIR}/installation/config
+if [ ! -s ${ENIQ_CONF_DIR}/${SUNOS_INI} ]; then
+    _err_msg_="Could not locate file ${ENIQ_CONF_DIR}/${SUNOS_INI}"
+    abort_script "$_err_msg_"
+fi
+
+if [ -x ${ENIQ_CORE_DIR}/lib/iniadd.pl ]; then
+    INIADD=${ENIQ_CORE_DIR}/lib/iniadd.pl
+else
+    _err_msg_="${ENIQ_CORE_DIR}/lib/iniadd.pl is not found, or is not executable"
+    abort_script "$_err_msg_" 
+fi
+
+CURR_SERVER_TYPE=`$CAT $ENIQ_CONF_DIR/installed_server_type | $EGREP -v '^[[:blank:]]*#' | $SED -e 's/ //g'`
+if [ ! "${CURR_SERVER_TYPE}" ]; then
+	_err_msg_="Could not determine which server type this is"
+    abort_script "$_err_msg_"
+fi
+
+# Determine the current deployment type
+CURR_DEPLOYMENT_TYPE=`$CAT ${ENIQ_CONF_DIR}/extra_params/deployment`
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not get current deployment type form ${ENIQ_CONF_DIR}/extra_params/deployment file"
+    abort_script "$_err_msg_"
+fi
+
+INST_TYPE_FILE=${ENIQ_CONF_DIR}/ericsson_use_config
+if [ ! -s ${INST_TYPE_FILE} ]; then
+	_err_msg_="Could not Find ${INST_TYPE_FILE}"
+    abort_script "$_err_msg_"
+fi
+
+INSTALL_TYPE=`$CAT ${INST_TYPE_FILE} | $AWK -F\= '{print $2}'`
+if [ ! "${INSTALL_TYPE}" ]; then
+	_err_msg_="Could not determine which installation type this is"
+    abort_script "$_err_msg_"
+fi
+
+if [ ! -s ${SCRIPTHOME}/../lib/inidel.pl ]; then
+    _err_msg_="Cannot locate ${SCRIPTHOME}/../lib/inidel"
+    abort_script "$_err_msg_"
+else
+    INIDEL=${SCRIPTHOME}/../lib/inidel.pl
+fi
+}
+
+### Function: update_asa_info ###
+#
+# Add information about ASA
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+update_asa_info()
+{
+$CP ${ENIQ_CONF_DIR}/${SUNOS_INI} ${TEM_DIR}/SunOS.ini
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not copy ${ENIQ_CONF_DIR}/${SUNOS_INI} to ${TEM_DIR}/SunOS.ini"
+    abort_script "$_err_msg_"
+fi
+
+_curr_num_=`iniget SunOS_ZFS_FS -f ${ENIQ_CONF_DIR}/${SUNOS_INI} | $TAIL -1 | $AWK -F\_ '{print $NF}'`
+_nxt_num_=`$EXPR ${_curr_num_} + 1`
+
+$RM -f ${TEM_DIR}/SunOS.ini ${TEM_DIR}/ins_det
+
+$ECHO "[SunOS_ZFS_FS_${_nxt_num_}]
+name=${_volume_grp_}-sql_anywhere
+mountpoint=/eniq/sql_anywhere
+perms=1777" > ${TEM_DIR}/ins_det
+
+$ECHO "\nUpdating ${ENIQ_CONF_DIR}/${SUNOS_INI} with SunOS_ZFS_FS_${_nxt_num_}" | $TEE -a ${LOGFILE}
+$ECHO "$INIADD -g SunOS_ZFS_FS -p SunOS_ZFS_FS_${_nxt_num_} -i ${ENIQ_CONF_DIR}/${SUNOS_INI} -d ${TEM_DIR}/ins_det -o ${TEM_DIR}/SunOS.ini" >> ${LOGFILE}
+$INIADD -g SunOS_ZFS_FS -p SunOS_ZFS_FS_${_nxt_num_} -i ${ENIQ_CONF_DIR}/${SUNOS_INI} -d ${TEM_DIR}/ins_det -o ${TEM_DIR}/SunOS.ini
+if [ $? -ne 0 ]; then
+    _err_msg_="Error adding SunOS_ZFS_FS_${_nxt_num_} to ${ENIQ_CONF_DIR}/${SUNOS_INI}"
+    abort_script "$_err_msg_" 
+fi
+
+$ECHO "
+;--------------------------------------------------------------------------
+; Sybase ASA information
+;--------------------------------------------------------------------------
+[SYBASE_ASA]
+SYBASE_ASA_SOURCE_DIR=applications/sql_anywhere
+SYBASE_ASA_SW_BUNDLE=sybase_asa.tar.gz
+SYBASE_ASA_TARGET_DIR=/eniq/sql_anywhere\n" >> ${TEM_DIR}/SunOS.ini
+
+$CP ${TEM_DIR}/SunOS.ini ${ENIQ_CONF_DIR}/${SUNOS_INI}
+if [ $? -ne 0 ]; then
+    _err_msg_="Error copying ${TEM_DIR}/SunOS.ini to ${ENIQ_CONF_DIR}/${SUNOS_INI}"
+    abort_script "$_err_msg_" 
+fi
+}
+
+### Function: update_ddc_info ###
+#
+# Add information about DDC
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+update_ddc_info()
+{
+$CAT ${ENIQ_CONF_DIR}/${SUNOS_INI} | $GREP -vi "ddc" > ${TEM_DIR}/SunOS.ini
+if [ $? -ne 0 ]; then
+    _err_msg_="Error removing DDC from ${ENIQ_CONF_DIR}/${SUNOS_INI}"
+    abort_script "$_err_msg_"
+fi
+
+$ECHO "Updating ${ENIQ_CONF_DIR}/${SUNOS_INI} with DDC" | $TEE -a ${LOGFILE}
+$ECHO "
+;--------------------------------------------------------------------------
+; DDC information
+;--------------------------------------------------------------------------
+[DDC]
+DDC_TARGET_DIR=/var/tmp/OM_CACHE/ddc
+DDC_PKG_FILE=ERICddc.pkg.gz
+DDC_PKG_NAME=ERICddc.pkg\n" >> ${TEM_DIR}/SunOS.ini
+if [ $? -ne 0 ]; then
+    _err_msg_="Error updating ${TEM_DIR}/SunOS.ini with DDC info"
+    abort_script "$_err_msg_"
+fi
+
+$CP ${TEM_DIR}/SunOS.ini ${ENIQ_CONF_DIR}/${SUNOS_INI}
+if [ $? -ne 0 ]; then
+    _err_msg_="Error copying ${TEM_DIR}/SunOS.ini to ${ENIQ_CONF_DIR}/${SUNOS_INI}"
+    abort_script "$_err_msg_"
+fi
+}
+
+### Function: update_for_backup_fs ###
+#
+# Update the ini file for the bkup_sw filesystem
+#
+# Arguments:
+#	none
+# Return Values:
+#	none
+update_for_backup_fs()
+{
+_curr_num_=`iniget SunOS_ZFS_FS -f ${ENIQ_CONF_DIR}/${SUNOS_INI} | $TAIL -1 | $AWK -F\_ '{print $NF}'` 
+_nxt_num_=`$EXPR ${_curr_num_} + 1`
+
+$RM -f ${TEM_DIR}/SunOS.ini ${TEM_DIR}/ins_det
+
+$ECHO "[SunOS_ZFS_FS_${_nxt_num_}]
+name=${_volume_grp_}-backup
+mountpoint=/eniq/backup
+perms=0755" > ${TEM_DIR}/ins_det
+
+$ECHO "\nUpdating ${ENIQ_CONF_DIR}/${SUNOS_INI} with SunOS_ZFS_FS_${_nxt_num_}" | $TEE -a ${LOGFILE}
+$ECHO "$INIADD -g SunOS_ZFS_FS -p SunOS_ZFS_FS_${_nxt_num_} -i ${ENIQ_CONF_DIR}/${SUNOS_INI} -d ${TEM_DIR}/ins_det -o ${TEM_DIR}/SunOS.ini" >> ${LOGFILE}
+$INIADD -g SunOS_ZFS_FS -p SunOS_ZFS_FS_${_nxt_num_} -i ${ENIQ_CONF_DIR}/${SUNOS_INI} -d ${TEM_DIR}/ins_det -o ${TEM_DIR}/SunOS.ini
+if [ $? -ne 0 ]; then
+    _err_msg_="Error adding SunOS_ZFS_FS_${_nxt_num_} to ${ENIQ_CONF_DIR}/${SUNOS_INI}"
+    abort_script "$_err_msg_" 
+fi
+
+$CP ${TEM_DIR}/SunOS.ini ${ENIQ_CONF_DIR}/${SUNOS_INI}
+if [ $? -ne 0 ]; then
+    _err_msg_="Error copying ${TEM_DIR}/SunOS.ini to ${ENIQ_CONF_DIR}/${SUNOS_INI}"
+    abort_script "$_err_msg_" 
+fi
+}
+
+### Function: update_for_bkup_sw_fs ###
+#
+# Update the ini file for the bkup_sw filesystem
+#
+# Arguments:
+#	none
+# Return Values:
+#	none
+update_for_bkup_sw_fs()
+{
+_curr_num_=`iniget SunOS_ZFS_FS -f ${ENIQ_CONF_DIR}/${SUNOS_INI} | $TAIL -1 | $AWK -F\_ '{print $NF}'` 
+_nxt_num_=`$EXPR ${_curr_num_} + 1`
+
+$RM -f ${TEM_DIR}/SunOS.ini ${TEM_DIR}/ins_det
+
+$ECHO "[SunOS_ZFS_FS_${_nxt_num_}]
+name=${_volume_grp_}-bkup_sw
+mountpoint=/eniq/bkup_sw
+perms=0755" > ${TEM_DIR}/ins_det
+
+$ECHO "\nUpdating ${ENIQ_CONF_DIR}/${SUNOS_INI} with SunOS_ZFS_FS_${_nxt_num_}" | $TEE -a ${LOGFILE}
+$ECHO "$INIADD -g SunOS_ZFS_FS -p SunOS_ZFS_FS_${_nxt_num_} -i ${ENIQ_CONF_DIR}/${SUNOS_INI} -d ${TEM_DIR}/ins_det -o ${TEM_DIR}/SunOS.ini" >> ${LOGFILE}
+$INIADD -g SunOS_ZFS_FS -p SunOS_ZFS_FS_${_nxt_num_} -i ${ENIQ_CONF_DIR}/${SUNOS_INI} -d ${TEM_DIR}/ins_det -o ${TEM_DIR}/SunOS.ini
+if [ $? -ne 0 ]; then
+    _err_msg_="Error adding SunOS_ZFS_FS_${_nxt_num_} to ${ENIQ_CONF_DIR}/${SUNOS_INI}"
+    abort_script "$_err_msg_" 
+fi
+
+$CP ${TEM_DIR}/SunOS.ini ${ENIQ_CONF_DIR}/${SUNOS_INI}
+if [ $? -ne 0 ]; then
+    _err_msg_="Error copying ${TEM_DIR}/SunOS.ini to ${ENIQ_CONF_DIR}/${SUNOS_INI}"
+    abort_script "$_err_msg_" 
+fi
+}
+
+### Function: update_for_connectd_fs ###
+#
+# Update the ini file for the connectd filesystem
+#
+# Arguments:
+#	none
+# Return Values:
+#	none
+update_for_connectd_fs()
+{
+_curr_num_=`iniget SunOS_ZFS_FS -f ${ENIQ_CONF_DIR}/${SUNOS_INI} | $TAIL -1 | $AWK -F\_ '{print $NF}'` 
+_nxt_num_=`$EXPR ${_curr_num_} + 1`
+
+$RM -f ${TEM_DIR}/SunOS.ini ${TEM_DIR}/ins_det
+
+$ECHO "[SunOS_ZFS_FS_${_nxt_num_}]
+name=${_volume_grp_}-connectd
+mountpoint=/eniq/connectd
+perms=0755" > ${TEM_DIR}/ins_det
+
+$ECHO "\nUpdating ${ENIQ_CONF_DIR}/${SUNOS_INI} with SunOS_ZFS_FS_${_nxt_num_}" | $TEE -a ${LOGFILE}
+$ECHO "$INIADD -g SunOS_ZFS_FS -p SunOS_ZFS_FS_${_nxt_num_} -i ${ENIQ_CONF_DIR}/${SUNOS_INI} -d ${TEM_DIR}/ins_det -o ${TEM_DIR}/SunOS.ini" >> ${LOGFILE}
+$INIADD -g SunOS_ZFS_FS -p SunOS_ZFS_FS_${_nxt_num_} -i ${ENIQ_CONF_DIR}/${SUNOS_INI} -d ${TEM_DIR}/ins_det -o ${TEM_DIR}/SunOS.ini
+if [ $? -ne 0 ]; then
+    _err_msg_="Error adding SunOS_ZFS_FS_${_nxt_num_} to ${TEM_DIR}/${SUNOS_INI}"
+    abort_script "$_err_msg_" 
+fi
+
+$CP ${TEM_DIR}/SunOS.ini ${ENIQ_CONF_DIR}/${SUNOS_INI}
+if [ $? -ne 0 ]; then
+    _err_msg_="Error copying ${TEM_DIR}/SunOS.ini to ${ENIQ_CONF_DIR}/${SUNOS_INI}"
+    abort_script "$_err_msg_" 
+fi
+}
+
+### Function: update_for_dwh_reader ###
+#
+# Update the ini file for the dwh_reader filesystem
+#
+# Arguments:
+#	none
+# Return Values:
+#	none
+update_for_dwh_reader()
+{
+_curr_num_=`iniget SunOS_ZFS_FS -f ${ENIQ_CONF_DIR}/${SUNOS_INI} | $TAIL -1 | $AWK -F\_ '{print $NF}'` 
+_nxt_num_=`$EXPR ${_curr_num_} + 1`
+
+$RM -f ${TEM_DIR}/SunOS.ini ${TEM_DIR}/ins_det
+
+$ECHO "[SunOS_ZFS_FS_${_nxt_num_}]
+name=${_volume_grp_}-dwh_reader
+mountpoint=/eniq/database/dwh_reader
+perms=0755" > ${TEM_DIR}/ins_det
+
+$ECHO "\nUpdating ${ENIQ_CONF_DIR}/${SUNOS_INI} with SunOS_ZFS_FS_${_nxt_num_}" | $TEE -a ${LOGFILE}
+$ECHO "$INIADD -g SunOS_ZFS_FS -p SunOS_ZFS_FS_${_nxt_num_} -i ${ENIQ_CONF_DIR}/${SUNOS_INI} -d ${TEM_DIR}/ins_det -o ${TEM_DIR}/SunOS.ini" >> ${LOGFILE}
+$INIADD -g SunOS_ZFS_FS -p SunOS_ZFS_FS_${_nxt_num_} -i ${ENIQ_CONF_DIR}/${SUNOS_INI} -d ${TEM_DIR}/ins_det -o ${TEM_DIR}/SunOS.ini
+if [ $? -ne 0 ]; then
+    _err_msg_="Error adding SunOS_ZFS_FS_${_nxt_num_} to ${TEM_DIR}/${SUNOS_INI}"
+    abort_script "$_err_msg_" 
+fi
+
+$CP ${TEM_DIR}/SunOS.ini ${ENIQ_CONF_DIR}/${SUNOS_INI}
+if [ $? -ne 0 ]; then
+    _err_msg_="Error copying ${TEM_DIR}/SunOS.ini to ${ENIQ_CONF_DIR}/${SUNOS_INI}"
+    abort_script "$_err_msg_" 
+fi	
+}
+
+### Function: update_for_dwh_reader_zfs ###
+#
+# Update the ini file for the dwh_reader filesystem
+#
+# Arguments:
+#	none
+# Return Values:
+#	none
+update_for_dwh_reader_zfs()
+{
+_curr_num_=`iniget SunOS_ZFS_FS -f ${ENIQ_CONF_DIR}/${SUNOS_INI} | $TAIL -1 | $AWK -F\_ '{print $NF}'` 
+_nxt_num_=`$EXPR ${_curr_num_} + 1`
+
+$RM -f ${TEM_DIR}/SunOS.ini ${TEM_DIR}/ins_det
+
+$ECHO "[SunOS_ZFS_FS_${_nxt_num_}]
+name=${_volume_grp_}-dwh_reader
+mountpoint=/eniq/database/dwh_reader
+perms=0755" > ${TEM_DIR}/ins_det
+
+$ECHO "\nUpdating ${ENIQ_CONF_DIR}/${SUNOS_INI} with SunOS_ZFS_FS_${_nxt_num_}" | $TEE -a ${LOGFILE}
+$ECHO "$INIADD -g SunOS_ZFS_FS -p SunOS_ZFS_FS_${_nxt_num_} -i ${ENIQ_CONF_DIR}/${SUNOS_INI} -d ${TEM_DIR}/ins_det -o ${TEM_DIR}/SunOS.ini" >> ${LOGFILE}
+$INIADD -g SunOS_ZFS_FS -p SunOS_ZFS_FS_${_nxt_num_} -i ${ENIQ_CONF_DIR}/${SUNOS_INI} -d ${TEM_DIR}/ins_det -o ${TEM_DIR}/SunOS.ini
+if [ $? -ne 0 ]; then
+    _err_msg_="Error adding SunOS_ZFS_FS_${_nxt_num_} to ${TEM_DIR}/${SUNOS_INI}"
+    abort_script "$_err_msg_" 
+fi
+
+$CP ${TEM_DIR}/SunOS.ini ${ENIQ_CONF_DIR}/${SUNOS_INI}
+if [ $? -ne 0 ]; then
+    _err_msg_="Error copying ${TEM_DIR}/SunOS.ini to ${ENIQ_CONF_DIR}/${SUNOS_INI}"
+    abort_script "$_err_msg_" 
+fi	
+}
+
+### Function: update_for_install_fs ###
+#
+# Update the ini file for the installation filesystem
+#
+# Arguments:
+#	none
+# Return Values:
+#	none
+update_for_install_fs()
+{
+_curr_num_=`iniget SunOS_ZFS_FS -f ${ENIQ_CONF_DIR}/${SUNOS_INI} | $TAIL -1 | $AWK -F\_ '{print $NF}'` 
+_nxt_num_=`$EXPR ${_curr_num_} + 1`
+
+$RM -f ${TEM_DIR}/SunOS.ini ${TEM_DIR}/ins_det
+
+$ECHO "[SunOS_ZFS_FS_${_nxt_num_}]
+name=${_volume_grp_}-installation
+mountpoint=/eniq/installation
+perms=0755" > ${TEM_DIR}/ins_det
+
+$ECHO "\nUpdating ${ENIQ_CONF_DIR}/${SUNOS_INI} with SunOS_ZFS_FS_${_nxt_num_}" | $TEE -a ${LOGFILE}
+$ECHO "$INIADD -g SunOS_ZFS_FS -p SunOS_ZFS_FS_${_nxt_num_} -i ${ENIQ_CONF_DIR}/${SUNOS_INI} -d ${TEM_DIR}/ins_det -o ${TEM_DIR}/SunOS.ini" >> ${LOGFILE}
+$INIADD -g SunOS_ZFS_FS -p SunOS_ZFS_FS_${_nxt_num_} -i ${ENIQ_CONF_DIR}/${SUNOS_INI} -d ${TEM_DIR}/ins_det -o ${TEM_DIR}/SunOS.ini
+if [ $? -ne 0 ]; then
+    _err_msg_="Error adding SunOS_ZFS_FS_${_nxt_num_} to ${ENIQ_CONF_DIR}/${SUNOS_INI}"
+    abort_script "$_err_msg_" 
+fi
+
+$CP ${TEM_DIR}/SunOS.ini ${ENIQ_CONF_DIR}/${SUNOS_INI}
+if [ $? -ne 0 ]; then
+    _err_msg_="Error copying ${TEM_DIR}/SunOS.ini to ${ENIQ_CONF_DIR}/${SUNOS_INI}"
+    abort_script "$_err_msg_" 
+fi
+}
+
+### Function: update_for_local_log_fs ###
+#
+# Update the ini file for the local log filesystem
+#
+# Arguments:
+#	none
+# Return Values:
+#	none
+update_for_local_log_fs()
+{
+_curr_num_=`iniget SunOS_ZFS_FS -f ${ENIQ_CONF_DIR}/${SUNOS_INI} | $TAIL -1 | $AWK -F\_ '{print $NF}'` 
+_nxt_num_=`$EXPR ${_curr_num_} + 1`
+
+$RM -f ${TEM_DIR}/SunOS.ini ${TEM_DIR}/ins_det
+
+$ECHO "[SunOS_ZFS_FS_${_nxt_num_}]
+name=${_volume_grp_}-local_logs
+mountpoint=/eniq/local_logs
+perms=0755" > ${TEM_DIR}/ins_det
+
+$ECHO "\nUpdating ${ENIQ_CONF_DIR}/${SUNOS_INI} with SunOS_ZFS_FS_${_nxt_num_}" | $TEE -a ${LOGFILE}
+$ECHO "$INIADD -g SunOS_ZFS_FS -p SunOS_ZFS_FS_${_nxt_num_} -i ${ENIQ_CONF_DIR}/${SUNOS_INI} -d ${TEM_DIR}/ins_det -o ${TEM_DIR}/SunOS.ini" >> ${LOGFILE}
+$INIADD -g SunOS_ZFS_FS -p SunOS_ZFS_FS_${_nxt_num_} -i ${ENIQ_CONF_DIR}/${SUNOS_INI} -d ${TEM_DIR}/ins_det -o ${TEM_DIR}/SunOS.ini
+if [ $? -ne 0 ]; then
+    _err_msg_="Error adding SunOS_ZFS_FS_${_nxt_num_} to ${ENIQ_CONF_DIR}/${SUNOS_INI}"
+    abort_script "$_err_msg_" 
+fi
+
+$CP ${TEM_DIR}/SunOS.ini ${ENIQ_CONF_DIR}/${SUNOS_INI}
+if [ $? -ne 0 ]; then
+    _err_msg_="Error copying ${TEM_DIR}/SunOS.ini to ${ENIQ_CONF_DIR}/${SUNOS_INI}"
+    abort_script "$_err_msg_" 
+fi
+}
+
+### Function: update_for_log_fs ###
+#
+# Update the ini file for the log filesystem
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+update_for_log_fs()
+{
+_curr_num_=`iniget SunOS_ZFS_FS -f ${ENIQ_CONF_DIR}/${SUNOS_INI} | $TAIL -1 | $AWK -F\_ '{print $NF}'`
+_nxt_num_=`$EXPR ${_curr_num_} + 1`
+
+$RM -f ${TEM_DIR}/SunOS.ini ${TEM_DIR}/ins_det
+
+$ECHO "[SunOS_ZFS_FS_${_nxt_num_}]
+name=${_volume_grp_}-log
+mountpoint=/eniq/log
+perms=0755" > ${TEM_DIR}/ins_det
+
+$ECHO "\nUpdating ${ENIQ_CONF_DIR}/${SUNOS_INI} with SunOS_ZFS_FS_${_nxt_num_}" | $TEE -a ${LOGFILE}
+$ECHO "$INIADD -g SunOS_ZFS_FS -p SunOS_ZFS_FS_${_nxt_num_} -i ${ENIQ_CONF_DIR}/${SUNOS_INI} -d ${TEM_DIR}/ins_det -o ${TEM_DIR}/SunOS.ini" >> ${LOGFILE}
+$INIADD -g SunOS_ZFS_FS -p SunOS_ZFS_FS_${_nxt_num_} -i ${ENIQ_CONF_DIR}/${SUNOS_INI} -d ${TEM_DIR}/ins_det -o ${TEM_DIR}/SunOS.ini
+if [ $? -ne 0 ]; then
+    _err_msg_="Error adding SunOS_ZFS_FS_${_nxt_num_} to ${ENIQ_CONF_DIR}/${SUNOS_INI}"
+    abort_script "$_err_msg_" 
+fi
+
+$CP ${TEM_DIR}/SunOS.ini ${ENIQ_CONF_DIR}/${SUNOS_INI}
+if [ $? -ne 0 ]; then
+    _err_msg_="Error copying ${TEM_DIR}/SunOS.ini to ${ENIQ_CONF_DIR}/${SUNOS_INI}"
+    abort_script "$_err_msg_"
+fi
+}
+
+### Function: update_for_misc_fs ###
+#
+# Update the ini file for the misc filesystem
+#
+# Arguments:
+#	none
+# Return Values:
+#	none
+update_for_misc_fs()
+{
+_curr_num_=`iniget SunOS_ZFS_FS -f ${ENIQ_CONF_DIR}/${SUNOS_INI} | $TAIL -1 | $AWK -F\_ '{print $NF}'` 
+_nxt_num_=`$EXPR ${_curr_num_} + 1`
+
+$RM -f ${TEM_DIR}/SunOS.ini ${TEM_DIR}/ins_det
+
+$ECHO "[SunOS_ZFS_FS_${_nxt_num_}]
+name=${_volume_grp_}-misc
+mountpoint=/eniq/misc
+perms=0755" > ${TEM_DIR}/ins_det
+
+$ECHO "\nUpdating ${ENIQ_CONF_DIR}/${SUNOS_INI} with SunOS_ZFS_FS_${_nxt_num_}" | $TEE -a ${LOGFILE}
+$ECHO "$INIADD -g SunOS_ZFS_FS -p SunOS_ZFS_FS_${_nxt_num_} -i ${ENIQ_CONF_DIR}/${SUNOS_INI} -d ${TEM_DIR}/ins_det -o ${TEM_DIR}/SunOS.ini" >> ${LOGFILE}
+$INIADD -g SunOS_ZFS_FS -p SunOS_ZFS_FS_${_nxt_num_} -i ${ENIQ_CONF_DIR}/${SUNOS_INI} -d ${TEM_DIR}/ins_det -o ${TEM_DIR}/SunOS.ini
+if [ $? -ne 0 ]; then
+    _err_msg_="Error adding SunOS_ZFS_FS_${_nxt_num_} to ${TEM_DIR}/${SUNOS_INI}"
+    abort_script "$_err_msg_" 
+fi
+
+$CP ${TEM_DIR}/SunOS.ini ${ENIQ_CONF_DIR}/${SUNOS_INI}
+if [ $? -ne 0 ]; then
+    _err_msg_="Error copying ${TEM_DIR}/SunOS.ini to ${ENIQ_CONF_DIR}/${SUNOS_INI}"
+    abort_script "$_err_msg_" 
+fi
+}
+
+### Function: update_for_export_dir ###
+#
+# Update the ini file for the export directory
+#
+# Arguments:
+#	none
+# Return Values:
+#	none
+update_for_export_dir()
+{
+_curr_num_=`iniget SunOS_DIRECTORY -f ${ENIQ_CONF_DIR}/${SUNOS_INI} | $TAIL -1 | $AWK -F\_ '{print $NF}'` 
+_nxt_num_=`$EXPR ${_curr_num_} + 1`
+
+$RM -f ${TEM_DIR}/SunOS.ini ${TEM_DIR}/ins_det
+
+$ECHO "[SunOS_DIRECTORY_DIR_${_nxt_num_}]
+path=/eniq/export
+perms=0755
+user=dcuser
+group=dc5000" > ${TEM_DIR}/ins_det
+
+$ECHO "\nUpdating ${ENIQ_CONF_DIR}/${SUNOS_INI} with SunOS_DIRECTORY_DIR_${_nxt_num_}" | $TEE -a ${LOGFILE}
+$ECHO "$INIADD -g SunOS_DIRECTORY -p SunOS_DIRECTORY_DIR_${_nxt_num_} -i ${ENIQ_CONF_DIR}/${SUNOS_INI} -d ${TEM_DIR}/ins_det -o ${TEM_DIR}/SunOS.ini" >> ${LOGFILE}
+$INIADD -g SunOS_DIRECTORY -p SunOS_DIRECTORY_DIR_${_nxt_num_} -i ${ENIQ_CONF_DIR}/${SUNOS_INI} -d ${TEM_DIR}/ins_det -o ${TEM_DIR}/SunOS.ini
+if [ $? -ne 0 ]; then
+    _err_msg_="Error adding SunOS_DIRECTORY_DIR_${_nxt_num_} to ${ENIQ_CONF_DIR}/${SUNOS_INI}"
+    abort_script "$_err_msg_" 
+fi
+
+$CP ${TEM_DIR}/SunOS.ini ${ENIQ_CONF_DIR}/${SUNOS_INI}
+if [ $? -ne 0 ]; then
+    _err_msg_="Error copying ${TEM_DIR}/SunOS.ini to ${ENIQ_CONF_DIR}/${SUNOS_INI}"
+    abort_script "$_err_msg_" 
+fi
+}
+
+### Function: update_for_fmdata_dir ###
+#
+# Update the ini file for the fmdata directory
+#
+# Arguments:
+#	none
+# Return Values:
+#	none
+update_for_fmdata_dir()
+{
+_curr_num_=`iniget SunOS_DIRECTORY -f ${ENIQ_CONF_DIR}/${SUNOS_INI} | $TAIL -1 | $AWK -F\_ '{print $NF}'` 
+_nxt_num_=`$EXPR ${_curr_num_} + 1`
+
+$RM -f ${TEM_DIR}/SunOS.ini ${TEM_DIR}/ins_det
+
+$ECHO "[SunOS_DIRECTORY_DIR_${_nxt_num_}]
+path=/eniq/fmdata
+perms=0755
+user=dcuser
+group=dc5000" > ${TEM_DIR}/ins_det
+
+$ECHO "\nUpdating ${ENIQ_CONF_DIR}/${SUNOS_INI} with SunOS_DIRECTORY_DIR_${_nxt_num_}" | $TEE -a ${LOGFILE}
+$ECHO "$INIADD -g SunOS_DIRECTORY -p SunOS_DIRECTORY_DIR_${_nxt_num_} -i ${ENIQ_CONF_DIR}/${SUNOS_INI} -d ${TEM_DIR}/ins_det -o ${TEM_DIR}/SunOS.ini" >> ${LOGFILE}
+$INIADD -g SunOS_DIRECTORY -p SunOS_DIRECTORY_DIR_${_nxt_num_} -i ${ENIQ_CONF_DIR}/${SUNOS_INI} -d ${TEM_DIR}/ins_det -o ${TEM_DIR}/SunOS.ini
+if [ $? -ne 0 ]; then
+    _err_msg_="Error adding SunOS_DIRECTORY_DIR_${_nxt_num_} to ${ENIQ_CONF_DIR}/${SUNOS_INI}"
+    abort_script "$_err_msg_" 
+fi
+
+$CP ${TEM_DIR}/SunOS.ini ${ENIQ_CONF_DIR}/${SUNOS_INI}
+if [ $? -ne 0 ]; then
+    _err_msg_="Error copying ${TEM_DIR}/SunOS.ini to ${ENIQ_CONF_DIR}/${SUNOS_INI}"
+    abort_script "$_err_msg_" 
+fi
+}
+
+### Function: update_for_ldap_db_dir ###
+#
+# Update the ini file for the ldap_db directory
+#
+# Arguments:
+#	none
+# Return Values:
+#	none
+update_for_ldap_db_dir()
+{
+_curr_num_=`iniget SunOS_DIRECTORY -f ${ENIQ_CONF_DIR}/${SUNOS_INI} | $TAIL -1 | $AWK -F\_ '{print $NF}'` 
+_nxt_num_=`$EXPR ${_curr_num_} + 1`
+
+$RM -f ${TEM_DIR}/SunOS.ini ${TEM_DIR}/ins_det
+
+$ECHO "[SunOS_DIRECTORY_DIR_${_nxt_num_}]
+path=/eniq/misc/ldap_db
+perms=0755
+user=dcuser
+group=dc5000" > ${TEM_DIR}/ins_det
+
+$ECHO "\nUpdating ${ENIQ_CONF_DIR}/${SUNOS_INI} with SunOS_DIRECTORY_DIR_${_nxt_num_}" | $TEE -a ${LOGFILE}
+$ECHO "$INIADD -g SunOS_DIRECTORY -p SunOS_DIRECTORY_DIR_${_nxt_num_} -i ${ENIQ_CONF_DIR}/${SUNOS_INI} -d ${TEM_DIR}/ins_det -o ${TEM_DIR}/SunOS.ini" >> ${LOGFILE}
+$INIADD -g SunOS_DIRECTORY -p SunOS_DIRECTORY_DIR_${_nxt_num_} -i ${ENIQ_CONF_DIR}/${SUNOS_INI} -d ${TEM_DIR}/ins_det -o ${TEM_DIR}/SunOS.ini
+if [ $? -ne 0 ]; then
+    _err_msg_="Error adding SunOS_DIRECTORY_DIR_${_nxt_num_} to ${ENIQ_CONF_DIR}/${SUNOS_INI}"
+    abort_script "$_err_msg_" 
+fi
+
+$CP ${TEM_DIR}/SunOS.ini ${ENIQ_CONF_DIR}/${SUNOS_INI}
+if [ $? -ne 0 ]; then
+    _err_msg_="Error copying ${TEM_DIR}/SunOS.ini to ${ENIQ_CONF_DIR}/${SUNOS_INI}"
+    abort_script "$_err_msg_" 
+fi
+}
+
+### Function: update_for_lte_event_ctrs_symlink ###
+#
+# Update the ini file for the lte_event_ctrs_symlink directory
+#
+# Arguments:
+#	none
+# Return Values:
+#	none
+update_for_lte_event_ctrs_symlink()
+{
+_curr_num_=`iniget SunOS_DIRECTORY -f ${ENIQ_CONF_DIR}/${SUNOS_INI} | $TAIL -1 | $AWK -F\_ '{print $NF}'` 
+_nxt_num_=`$EXPR ${_curr_num_} + 1`
+
+$RM -f ${TEM_DIR}/SunOS.ini ${TEM_DIR}/ins_det
+
+$ECHO "[SunOS_DIRECTORY_DIR_${_nxt_num_}]
+path=/eniq/northbound/lte_event_ctrs_symlink
+perms=0755
+user=dcuser
+group=dc5000" > ${TEM_DIR}/ins_det
+
+$ECHO "\nUpdating ${ENIQ_CONF_DIR}/${SUNOS_INI} with SunOS_DIRECTORY_DIR_${_nxt_num_}" | $TEE -a ${LOGFILE}
+$ECHO "$INIADD -g SunOS_DIRECTORY -p SunOS_DIRECTORY_DIR_${_nxt_num_} -i ${ENIQ_CONF_DIR}/${SUNOS_INI} -d ${TEM_DIR}/ins_det -o ${TEM_DIR}/SunOS.ini" >> ${LOGFILE}
+$INIADD -g SunOS_DIRECTORY -p SunOS_DIRECTORY_DIR_${_nxt_num_} -i ${ENIQ_CONF_DIR}/${SUNOS_INI} -d ${TEM_DIR}/ins_det -o ${TEM_DIR}/SunOS.ini
+if [ $? -ne 0 ]; then
+    _err_msg_="Error adding SunOS_DIRECTORY_DIR_${_nxt_num_} to ${ENIQ_CONF_DIR}/${SUNOS_INI}"
+    abort_script "$_err_msg_" 
+fi
+
+$CP ${TEM_DIR}/SunOS.ini ${ENIQ_CONF_DIR}/${SUNOS_INI}
+if [ $? -ne 0 ]; then
+    _err_msg_="Error copying ${TEM_DIR}/SunOS.ini to ${ENIQ_CONF_DIR}/${SUNOS_INI}"
+    abort_script "$_err_msg_" 
+fi	
+}
+
+### Function: update_for_northbound ###
+#
+# Update the ini file for the northbound directory
+#
+# Arguments:
+#	none
+# Return Values:
+#	none
+update_for_northbound()
+{
+_curr_num_=`iniget SunOS_DIRECTORY -f ${ENIQ_CONF_DIR}/${SUNOS_INI} | $TAIL -1 | $AWK -F\_ '{print $NF}'` 
+_nxt_num_=`$EXPR ${_curr_num_} + 1`
+
+$RM -f ${TEM_DIR}/SunOS.ini ${TEM_DIR}/ins_det
+
+$ECHO "[SunOS_DIRECTORY_DIR_${_nxt_num_}]
+path=/eniq/northbound
+perms=0755
+user=dcuser
+group=dc5000" > ${TEM_DIR}/ins_det
+
+$ECHO "\nUpdating ${ENIQ_CONF_DIR}/${SUNOS_INI} with SunOS_DIRECTORY_DIR_${_nxt_num_}" | $TEE -a ${LOGFILE}
+$ECHO "$INIADD -g SunOS_DIRECTORY -p SunOS_DIRECTORY_DIR_${_nxt_num_} -i ${ENIQ_CONF_DIR}/${SUNOS_INI} -d ${TEM_DIR}/ins_det -o ${TEM_DIR}/SunOS.ini" >> ${LOGFILE}
+$INIADD -g SunOS_DIRECTORY -p SunOS_DIRECTORY_DIR_${_nxt_num_} -i ${ENIQ_CONF_DIR}/${SUNOS_INI} -d ${TEM_DIR}/ins_det -o ${TEM_DIR}/SunOS.ini
+if [ $? -ne 0 ]; then
+    _err_msg_="Error adding SunOS_DIRECTORY_DIR_${_nxt_num_} to ${ENIQ_CONF_DIR}/${SUNOS_INI}"
+    abort_script "$_err_msg_" 
+fi
+
+$CP ${TEM_DIR}/SunOS.ini ${ENIQ_CONF_DIR}/${SUNOS_INI}
+if [ $? -ne 0 ]; then
+    _err_msg_="Error copying ${TEM_DIR}/SunOS.ini to ${ENIQ_CONF_DIR}/${SUNOS_INI}"
+    abort_script "$_err_msg_" 
+fi
+
+_nxt_num_=`$EXPR ${_nxt_num_} + 1`
+
+$RM -f ${TEM_DIR}/SunOS.ini ${TEM_DIR}/ins_det
+
+$ECHO "[SunOS_DIRECTORY_DIR_${_nxt_num_}]
+path=/eniq/northbound/lte_event_stat_file
+perms=0755
+user=dcuser
+group=dc5000" > ${TEM_DIR}/ins_det
+
+$ECHO "\nUpdating ${ENIQ_CONF_DIR}/${SUNOS_INI} with SunOS_DIRECTORY_DIR_${_nxt_num_}" | $TEE -a ${LOGFILE}
+$ECHO "$INIADD -g SunOS_DIRECTORY -p SunOS_DIRECTORY_DIR_${_nxt_num_} -i ${ENIQ_CONF_DIR}/${SUNOS_INI} -d ${TEM_DIR}/ins_det -o ${TEM_DIR}/SunOS.ini" >> ${LOGFILE}
+$INIADD -g SunOS_DIRECTORY -p SunOS_DIRECTORY_DIR_${_nxt_num_} -i ${ENIQ_CONF_DIR}/${SUNOS_INI} -d ${TEM_DIR}/ins_det -o ${TEM_DIR}/SunOS.ini
+if [ $? -ne 0 ]; then
+    _err_msg_="Error adding SunOS_DIRECTORY_DIR_${_nxt_num_} to ${ENIQ_CONF_DIR}/${SUNOS_INI}"
+    abort_script "$_err_msg_" 
+fi
+
+$CP ${TEM_DIR}/SunOS.ini ${ENIQ_CONF_DIR}/${SUNOS_INI}
+if [ $? -ne 0 ]; then
+    _err_msg_="Error copying ${TEM_DIR}/SunOS.ini to ${ENIQ_CONF_DIR}/${SUNOS_INI}"
+    abort_script "$_err_msg_" 
+fi
+}
+
+### Function: update_for_pushdata ###
+#
+# Update the ini file for the pushdata directory
+#
+# Arguments:
+#	none
+# Return Values:
+#	none
+update_for_pushdata()
+{
+_curr_num_=`iniget SunOS_DIRECTORY -f ${ENIQ_CONF_DIR}/${SUNOS_INI} | $TAIL -1 | $AWK -F\_ '{print $NF}'` 
+_nxt_num_=`$EXPR ${_curr_num_} + 1`
+
+$RM -f ${TEM_DIR}/SunOS.ini ${TEM_DIR}/ins_det
+
+$ECHO "[SunOS_DIRECTORY_DIR_${_nxt_num_}]
+path=/eniq/data/pushData
+perms=0770
+user=dcuser
+group=dc5000" > ${TEM_DIR}/ins_det
+
+$ECHO "\nUpdating ${ENIQ_CONF_DIR}/${SUNOS_INI} with SunOS_DIRECTORY_DIR_${_nxt_num_}" | $TEE -a ${LOGFILE}
+$ECHO "$INIADD -g SunOS_DIRECTORY -p SunOS_DIRECTORY_DIR_${_nxt_num_} -i ${ENIQ_CONF_DIR}/${SUNOS_INI} -d ${TEM_DIR}/ins_det -o ${TEM_DIR}/SunOS.ini" >> ${LOGFILE}
+$INIADD -g SunOS_DIRECTORY -p SunOS_DIRECTORY_DIR_${_nxt_num_} -i ${ENIQ_CONF_DIR}/${SUNOS_INI} -d ${TEM_DIR}/ins_det -o ${TEM_DIR}/SunOS.ini
+if [ $? -ne 0 ]; then
+    _err_msg_="Error adding SunOS_DIRECTORY_DIR_${_nxt_num_} to ${ENIQ_CONF_DIR}/${SUNOS_INI}"
+    abort_script "$_err_msg_" 
+fi
+
+$CP ${TEM_DIR}/SunOS.ini ${ENIQ_CONF_DIR}/${SUNOS_INI}
+if [ $? -ne 0 ]; then
+    _err_msg_="Error copying ${TEM_DIR}/SunOS.ini to ${ENIQ_CONF_DIR}/${SUNOS_INI}"
+    abort_script "$_err_msg_" 
+fi
+
+_nxt_num_=`$EXPR ${_nxt_num_} + 1`
+_end_cnt_=15
+$ECHO "" >> ${LOGFILE}
+
+for (( _start_cnt_=0; _start_cnt_<=${_end_cnt_}; _start_cnt_++ )); do
+	$RM -f ${TEM_DIR}/SunOS.ini ${TEM_DIR}/ins_det
+	
+	_fs_num_=`printf  "%02s\n" "${_start_cnt_}"`
+	if [ ! "${_fs_num_}" ]; then
+	    _err_msg_="Could not pad the pushData filesystem numbers"
+	    abort_script "$_err_msg_" 
+	fi
+	
+	$ECHO "[SunOS_DIRECTORY_DIR_${_nxt_num_}]
+path=/eniq/data/pushData/${_fs_num_}
+perms=0770
+user=dcuser
+group=dc5000" > ${TEM_DIR}/ins_det
+
+	$ECHO "Updating ${ENIQ_CONF_DIR}/${SUNOS_INI} with SunOS_DIRECTORY_DIR_${_nxt_num_}" | $TEE -a ${LOGFILE}
+	$ECHO "$INIADD -g SunOS_DIRECTORY -p SunOS_DIRECTORY_DIR_${_nxt_num_} -i ${ENIQ_CONF_DIR}/${SUNOS_INI} -d ${TEM_DIR}/ins_det -o ${TEM_DIR}/SunOS.ini" >> ${LOGFILE}
+	$INIADD -g SunOS_DIRECTORY -p SunOS_DIRECTORY_DIR_${_nxt_num_} -i ${ENIQ_CONF_DIR}/${SUNOS_INI} -d ${TEM_DIR}/ins_det -o ${TEM_DIR}/SunOS.ini
+	if [ $? -ne 0 ]; then
+	    _err_msg_="Error adding SunOS_DIRECTORY_DIR_${_nxt_num_} to ${ENIQ_CONF_DIR}/${SUNOS_INI}"
+	    abort_script "$_err_msg_" 
+	fi
+	
+	$CP ${TEM_DIR}/SunOS.ini ${ENIQ_CONF_DIR}/${SUNOS_INI}
+	if [ $? -ne 0 ]; then
+	    _err_msg_="Error copying ${TEM_DIR}/SunOS.ini to ${ENIQ_CONF_DIR}/${SUNOS_INI}"
+	    abort_script "$_err_msg_" 
+	fi
+	
+	_nxt_num_=`$EXPR ${_nxt_num_} + 1`
+done
+}
+
+### Function: update_for_sentinel_fs ###
+#
+# Update the ini file for the sentinal filesystem
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+update_for_sentinel_fs()
+{
+_curr_num_=`iniget SunOS_ZFS_FS -f ${ENIQ_CONF_DIR}/${SUNOS_INI} | $TAIL -1 | $AWK -F\_ '{print $NF}'`
+_nxt_num_=`$EXPR ${_curr_num_} + 1`
+
+$ECHO "[SunOS_ZFS_FS_${_nxt_num_}]
+name=${_volume_grp_}-sentinel
+mountpoint=/eniq/sentinel
+perms=0755" > ${TEM_DIR}/ins_det
+
+$RM -f ${TEM_DIR}/SunOS.ini
+
+$ECHO "\nUpdating ${ENIQ_CONF_DIR}/${SUNOS_INI} with SunOS_ZFS_FS_${_nxt_num_}" | $TEE -a ${LOGFILE}
+$ECHO "$INIADD -g SunOS_ZFS_FS -p SunOS_ZFS_FS_${_nxt_num_} -i ${ENIQ_CONF_DIR}/${SUNOS_INI} -d ${TEM_DIR}/ins_det -o ${TEM_DIR}/SunOS.ini" >> ${LOGFILE}
+$INIADD -g SunOS_ZFS_FS -p SunOS_ZFS_FS_${_nxt_num_} -i ${ENIQ_CONF_DIR}/${SUNOS_INI} -d ${TEM_DIR}/ins_det -o ${TEM_DIR}/SunOS.ini
+if [ $? -ne 0 ]; then
+    _err_msg_="Error adding SunOS_ZFS_FS_${_nxt_num_} to ${TEM_DIR}/${SUNOS_INI}"
+    abort_script "$_err_msg_"
+fi
+
+$CP ${TEM_DIR}/SunOS.ini ${ENIQ_CONF_DIR}/${SUNOS_INI}
+if [ $? -ne 0 ]; then
+    _err_msg_="Error copying ${TEM_DIR}/SunOS.ini to ${ENIQ_CONF_DIR}/${SUNOS_INI}"
+    abort_script "$_err_msg_"
+fi
+}
+
+### Function: update_for_smf_fs ###
+#
+# Update the ini file for the smf filesystem
+#
+# Arguments:
+#	none
+# Return Values:
+#	none
+update_for_smf_fs()
+{
+_curr_num_=`iniget SunOS_ZFS_FS -f ${ENIQ_CONF_DIR}/${SUNOS_INI} | $TAIL -1 | $AWK -F\_ '{print $NF}'` 
+_nxt_num_=`$EXPR ${_curr_num_} + 1`
+
+$RM -f ${TEM_DIR}/SunOS.ini ${TEM_DIR}/ins_det
+
+$ECHO "[SunOS_ZFS_FS_${_nxt_num_}]
+name=${_volume_grp_}-smf
+mountpoint=/eniq/smf
+perms=0755" > ${TEM_DIR}/ins_det
+
+$ECHO "\nUpdating ${ENIQ_CONF_DIR}/${SUNOS_INI} with SunOS_ZFS_FS_${_nxt_num_}" | $TEE -a ${LOGFILE}
+$ECHO "$INIADD -g SunOS_ZFS_FS -p SunOS_ZFS_FS_${_nxt_num_} -i ${ENIQ_CONF_DIR}/${SUNOS_INI} -d ${TEM_DIR}/ins_det -o ${TEM_DIR}/SunOS.ini" >> ${LOGFILE}
+$INIADD -g SunOS_ZFS_FS -p SunOS_ZFS_FS_${_nxt_num_} -i ${ENIQ_CONF_DIR}/${SUNOS_INI} -d ${TEM_DIR}/ins_det -o ${TEM_DIR}/SunOS.ini
+if [ $? -ne 0 ]; then
+    _err_msg_="Error adding SunOS_ZFS_FS_${_nxt_num_} to ${TEM_DIR}/${SUNOS_INI}"
+    abort_script "$_err_msg_" 
+fi
+
+$CP ${TEM_DIR}/SunOS.ini ${ENIQ_CONF_DIR}/${SUNOS_INI}
+if [ $? -ne 0 ]; then
+    _err_msg_="Error copying ${TEM_DIR}/SunOS.ini to ${ENIQ_CONF_DIR}/${SUNOS_INI}"
+    abort_script "$_err_msg_" 
+fi	
+}
+
+### Function: update_for_soem_dir ###
+#
+# Update the ini file for the soem directory
+#
+# Arguments:
+#	none
+# Return Values:
+#	none
+update_for_soem_dir()
+{
+_curr_num_=`iniget SunOS_DIRECTORY -f ${ENIQ_CONF_DIR}/${SUNOS_INI} | $TAIL -1 | $AWK -F\_ '{print $NF}'` 
+_nxt_num_=`$EXPR ${_curr_num_} + 1`
+
+$RM -f ${TEM_DIR}/SunOS.ini ${TEM_DIR}/ins_det
+
+$ECHO "[SunOS_DIRECTORY_DIR_${_nxt_num_}]
+path=/eniq/data/pmdata_soem
+perms=0755
+user=dcuser
+group=dc5000" > ${TEM_DIR}/ins_det
+
+$ECHO "\nUpdating ${ENIQ_CONF_DIR}/${SUNOS_INI} with SunOS_DIRECTORY_DIR_${_nxt_num_}" | $TEE -a ${LOGFILE}
+$ECHO "$INIADD -g SunOS_DIRECTORY -p SunOS_DIRECTORY_DIR_${_nxt_num_} -i ${ENIQ_CONF_DIR}/${SUNOS_INI} -d ${TEM_DIR}/ins_det -o ${TEM_DIR}/SunOS.ini" >> ${LOGFILE}
+$INIADD -g SunOS_DIRECTORY -p SunOS_DIRECTORY_DIR_${_nxt_num_} -i ${ENIQ_CONF_DIR}/${SUNOS_INI} -d ${TEM_DIR}/ins_det -o ${TEM_DIR}/SunOS.ini
+if [ $? -ne 0 ]; then
+    _err_msg_="Error adding SunOS_DIRECTORY_DIR_${_nxt_num_} to ${ENIQ_CONF_DIR}/${SUNOS_INI}"
+    abort_script "$_err_msg_" 
+fi
+
+$CP ${TEM_DIR}/SunOS.ini ${ENIQ_CONF_DIR}/${SUNOS_INI}
+if [ $? -ne 0 ]; then
+    _err_msg_="Error copying ${TEM_DIR}/SunOS.ini to ${ENIQ_CONF_DIR}/${SUNOS_INI}"
+    abort_script "$_err_msg_" 
+fi
+}
+
+### Function: update_for_upgrade_fs ###
+#
+# Update the ini file for the upgrade filesystem
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+update_for_upgrade_fs()
+{
+_curr_num_=`iniget SunOS_ZFS_FS -f ${ENIQ_CONF_DIR}/${SUNOS_INI} | $TAIL -1 | $AWK -F\_ '{print $NF}'`
+_nxt_num_=`$EXPR ${_curr_num_} + 1`
+
+$RM -f ${TEM_DIR}/SunOS.ini ${TEM_DIR}/ins_det
+
+$ECHO "[SunOS_ZFS_FS_${_nxt_num_}]
+name=${_volume_grp_}-upgrade
+mountpoint=/eniq/upgrade
+perms=0755" > ${TEM_DIR}/ins_det
+
+$ECHO "\nUpdating ${ENIQ_CONF_DIR}/${SUNOS_INI} with SunOS_ZFS_FS_${_nxt_num_}" | $TEE -a ${LOGFILE}
+$ECHO "$INIADD -g SunOS_ZFS_FS -p SunOS_ZFS_FS_${_nxt_num_} -i ${ENIQ_CONF_DIR}/${SUNOS_INI} -d ${TEM_DIR}/ins_det -o ${TEM_DIR}/SunOS.ini" >> ${LOGFILE}
+$INIADD -g SunOS_ZFS_FS -p SunOS_ZFS_FS_${_nxt_num_} -i ${ENIQ_CONF_DIR}/${SUNOS_INI} -d ${TEM_DIR}/ins_det -o ${TEM_DIR}/SunOS.ini
+if [ $? -ne 0 ]; then
+    _err_msg_="Error adding SunOS_ZFS_FS_${_nxt_num_} to ${TEM_DIR}/${SUNOS_INI}"
+    abort_script "$_err_msg_" 
+fi
+
+$CP ${TEM_DIR}/SunOS.ini ${ENIQ_CONF_DIR}/${SUNOS_INI}
+if [ $? -ne 0 ]; then
+    _err_msg_="Error copying ${TEM_DIR}/SunOS.ini to ${ENIQ_CONF_DIR}/${SUNOS_INI}"
+    abort_script "$_err_msg_"
+fi
+}
+
+
+### Function: update_freeware_info ###
+#
+# Add information about the freeware 
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+update_freeware_info()
+{
+$CP ${ENIQ_CONF_DIR}/${SUNOS_INI} ${TEM_DIR}/SunOS.ini
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not copy ${ENIQ_CONF_DIR}/${SUNOS_INI} to ${TEM_DIR}/SunOS.ini"
+    abort_script "$_err_msg_"
+fi
+	
+$ECHO "Updating ${ENIQ_CONF_DIR}/${SUNOS_INI} with FREEWARE" | $TEE -a ${LOGFILE}
+$ECHO "
+;--------------------------------------------------------------------------
+; Freeware information
+;--------------------------------------------------------------------------
+[FREEWARE_SW]
+FREEWARE_SW_SOURCE_DIR=freeware
+FREEWARE_SW_INST_PROG=install_freeware.bsh
+FREEWARE_SW_PKGS_TO_INST=ALL\n" >> ${TEM_DIR}/SunOS.ini
+if [ $? -ne 0 ]; then
+    _err_msg_="Error updating ${TEM_DIR}/SunOS.ini with FREEWARE info"
+    abort_script "$_err_msg_"
+fi
+
+$CP ${TEM_DIR}/SunOS.ini ${ENIQ_CONF_DIR}/${SUNOS_INI}
+if [ $? -ne 0 ]; then
+    _err_msg_="Error copying ${TEM_DIR}/SunOS.ini to ${ENIQ_CONF_DIR}/${SUNOS_INI}"
+    abort_script "$_err_msg_"
+fi
+}
+
+### Function: update_san_device_info ###
+#
+# Add information about the SAN device type
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+update_san_device_info()
+{
+# Make a copy of SunOS.ini
+$CP ${ENIQ_CONF_DIR}/${SUNOS_INI} ${TEM_DIR}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not copy ${ENIQ_CONF_DIR}/${ENIQ_INI} to ${TEM_DIR}"
+    abort_script "$_err_msg_"
+fi
+		
+# Is there any need to update the SunOS.ini??	
+$CAT ${ENIQ_CONF_DIR}/${SUNOS_INI} | $EGREP "SAN_DEV" >> /dev/null 2>&1
+if [ $? -ne 0 ]; then
+    $ECHO "Updating ${ENIQ_CONF_DIR}/${SUNOS_INI} with SAN_DEV details" | $TEE -a ${LOGFILE}
+	
+	#Get type of SAN device (e.g. clariion, vnx)
+	if [ -s ${ENIQ_CONF_DIR}/san_details ]; then
+		_san_type_=`$CAT ${ENIQ_CONF_DIR}/san_details|$EGREP "^SAN_DEVICE="|$AWK -F\= '{print $2}'`
+	else
+		_san_type_="clariion"
+		$ECHO "Updating ${ENIQ_CONF_DIR}/san_details with SAN_DEV details" | $TEE -a ${LOGFILE}
+# Add in san_details
+$ECHO "STORAGE_TYPE=raw
+SAN_DEVICE=${_san_type_}
+"> ${ENIQ_CONF_DIR}/san_details
+
+	fi
+
+	if [ ! "${_san_type_}" ]; then
+		_err_msg_="Could not read SAN_DEVICE param from ${ENIQ_CONF_DIR}/san_details while updating SUNOS.ini"
+		abort_script "$_err_msg_"
+	fi
+	
+    # Add in the SAN block
+    $ECHO "
+;--------------------------------------------------------------------------
+; SAN Device information
+;--------------------------------------------------------------------------
+[SAN_DEV]
+SAN_DEVICE=${_san_type_}
+    ">> ${TEM_DIR}/${SUNOS_INI}
+    if [ $? -ne 0 ]; then
+        _err_msg_="Could not update ${TEM_DIR}/${SUNOS_INI}"
+        abort_script "$_err_msg_"
+    fi
+fi
+
+$CP ${TEM_DIR}/${SUNOS_INI} ${ENIQ_CONF_DIR}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not copy ${TEM_DIR}/${SUNOS_INI} to ${ENIQ_CONF_DIR}"
+    abort_script "$_err_msg_"
+fi
+}
+
+### Function: update_san_sw_info ###
+#
+# Add information about the SAN S/W
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+update_san_sw_info()
+{
+$CP ${ENIQ_CONF_DIR}/${SUNOS_INI} ${TEM_DIR}/SunOS.ini
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not copy ${ENIQ_CONF_DIR}/${SUNOS_INI} to ${TEM_DIR}/SunOS.ini"
+    abort_script "$_err_msg_"
+fi
+	
+$ECHO "Updating ${ENIQ_CONF_DIR}/${SUNOS_INI} with STORAGE TYPE " | $TEE -a ${LOGFILE}
+$ECHO "
+[SAN_SW]
+SAN_SW_SOURCE_DIR=EMC
+SAN_SW_INST_PROG=install_emc_sw.bsh
+SAN_SW_PKGS_TO_INST=NAVISCLI,HOSTAGENT
+    " >> ${TEM_DIR}/${SUNOS_INI}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not update ${TEM_DIR}/${SUNOS_INI}"
+    abort_script "$_err_msg_"
+fi
+
+$CP ${TEM_DIR}/SunOS.ini ${ENIQ_CONF_DIR}/${SUNOS_INI}
+if [ $? -ne 0 ]; then
+    _err_msg_="Error copying ${TEM_DIR}/SunOS.ini to ${ENIQ_CONF_DIR}/${SUNOS_INI}"
+    abort_script "$_err_msg_"
+fi
+}
+
+### Function: update_sentinel_info ###
+#
+# Add information about the Sentinel server
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+update_sentinel_info()
+{
+$CP ${ENIQ_CONF_DIR}/${SUNOS_INI} ${TEM_DIR}/SunOS.ini
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not copy ${ENIQ_CONF_DIR}/${SUNOS_INI} to ${TEM_DIR}/SunOS.ini"
+    abort_script "$_err_msg_"
+fi
+	
+$ECHO "Updating ${ENIQ_CONF_DIR}/${SUNOS_INI} with SENTINEL" | $TEE -a ${LOGFILE}
+$ECHO "
+;--------------------------------------------------------------------------
+; Sentinel information
+;--------------------------------------------------------------------------
+[SENTINEL]
+SENTINEL_SOURCE_DIR=applications/sentinel
+SENTINEL_SW_BUNDLE=eniq_sentinel.tar.gz
+SENTINEL_INST_PROG=eniq_smf_sentinel_install.bsh\n" >> ${TEM_DIR}/SunOS.ini
+if [ $? -ne 0 ]; then
+    _err_msg_="Error updating ${TEM_DIR}/SunOS.ini with SENTINEL info"
+    abort_script "$_err_msg_"
+fi
+
+$CP ${TEM_DIR}/SunOS.ini ${ENIQ_CONF_DIR}/${SUNOS_INI}
+if [ $? -ne 0 ]; then
+    _err_msg_="Error copying ${TEM_DIR}/SunOS.ini to ${ENIQ_CONF_DIR}/${SUNOS_INI}"
+    abort_script "$_err_msg_"
+fi
+}
+
+### Function: update_sentinel_smf_str ###
+#
+# Add information about the Sentinel server
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+update_sentinel_smf_str()
+{
+$CP ${ENIQ_CONF_DIR}/${SUNOS_INI} ${TEM_DIR}/SunOS.ini
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not copy ${ENIQ_CONF_DIR}/${SUNOS_INI} to ${TEM_DIR}/SunOS.ini"
+    abort_script "$_err_msg_"
+fi
+### adding the string in the /tmp/ini_insert_new_param file just after the [SENTINEL] tag
+$ECHO "Adding ${ENIQ_CONF_DIR}/${SUNOS_INI} with SENTINEL SMF string" | $TEE -a ${LOGFILE}
+$ECHO "SENTINEL_SMF_STR=svc:/licensing/sentinel" > /tmp/ini_insert_new_param
+$SED "/\[SENTINEL\]/ r /tmp/ini_insert_new_param" < ${TEM_DIR}/SunOS.ini > ${TEM_DIR}/SunOS.ini.new
+if [ $? -ne 0 ]; then
+    _err_msg_="Error updating ${TEM_DIR}/SunOS.ini with SENTINEL SMF string"
+    abort_script "$_err_msg_"
+fi
+
+$CP ${TEM_DIR}/SunOS.ini.new ${ENIQ_CONF_DIR}/${SUNOS_INI}
+if [ $? -ne 0 ]; then
+    _err_msg_="Error copying ${TEM_DIR}/SunOS.ini to ${ENIQ_CONF_DIR}/${SUNOS_INI}"
+    abort_script "$_err_msg_"
+fi
+}
+
+
+### Function: update_stor_api_info ###
+#
+# Add information about the Storage API
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+update_stor_api_info()
+{
+# Make a copy of SunOS.ini
+$CP ${ENIQ_CONF_DIR}/${SUNOS_INI} ${TEM_DIR}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not copy ${ENIQ_CONF_DIR}/${ENIQ_INI} to ${TEM_DIR}"
+    abort_script "$_err_msg_"
+fi
+
+$CAT ${ENIQ_CONF_DIR}/${SUNOS_INI} | $EGREP "STOR_API" >> /dev/null 2>&1
+if [ $? -ne 0 ]; then
+    $ECHO "Updating ${ENIQ_CONF_DIR}/${SUNOS_INI} with STORAGE API info" | $TEE -a ${LOGFILE}
+    # Add in the Storage block
+    $ECHO "
+[STOR_API]
+STOR_API_SOURCE_DIR=storage
+STOR_API_PKG=ERICstorapi.pkg
+STOR_API_CMD=/ericsson/storage/san/bin/blkcli
+    " >> ${TEM_DIR}/${SUNOS_INI}
+    if [ $? -ne 0 ]; then
+        _err_msg_="Could not update ${TEM_DIR}/${SUNOS_INI}"
+        abort_script "$_err_msg_"
+    fi
+fi
+
+$CP ${TEM_DIR}/${SUNOS_INI} ${ENIQ_CONF_DIR}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not copy ${TEM_DIR}/${SUNOS_INI} to ${ENIQ_CONF_DIR}"
+    abort_script "$_err_msg_"
+fi
+}
+
+### Function: update_stor_type_info ###
+#
+# Add information about the Storage type
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+update_stor_type_info()
+{
+$CP ${ENIQ_CONF_DIR}/${SUNOS_INI} ${TEM_DIR}/SunOS.ini
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not copy ${ENIQ_CONF_DIR}/${SUNOS_INI} to ${TEM_DIR}/SunOS.ini"
+    abort_script "$_err_msg_"
+fi
+	
+$ECHO "Updating ${ENIQ_CONF_DIR}/${SUNOS_INI} with STORAGE TYPE " | $TEE -a ${LOGFILE}
+$ECHO "
+;--------------------------------------------------------------------------
+; Storage Type info
+;--------------------------------------------------------------------------
+[STOR_TYPE]
+STORAGE_TYPE=${STORAGE_TYPE}\n" >> ${TEM_DIR}/SunOS.ini
+if [ $? -ne 0 ]; then
+    _err_msg_="Error updating ${TEM_DIR}/SunOS.ini with STORAGE TYPE info"
+    abort_script "$_err_msg_"
+fi
+
+$CP ${TEM_DIR}/SunOS.ini ${ENIQ_CONF_DIR}/${SUNOS_INI}
+if [ $? -ne 0 ]; then
+    _err_msg_="Error copying ${TEM_DIR}/SunOS.ini to ${ENIQ_CONF_DIR}/${SUNOS_INI}"
+    abort_script "$_err_msg_"
+fi
+}
+
+
+### Function: usage_msg ###
+#
+#   Print out the usage message
+#
+# Arguments:
+#	none
+# Return Values:
+#	none
+usage_msg() 
+{
+$CLEAR
+
+$ECHO "
+Usage: `$BASENAME $0` [ -b <eniq_base_dir> ] [ -l <path_to_logfile> ] [ -s <zfs|raw> ]
+
+options:
+
+-b  : Optional parameter specifying the full path to where the ENIQ
+      BASEDIR directory is (eg. /eniq). If not specified, then the
+      script will assume the the base directory is /eniq
+
+-l  : Optional parameter specifying the full path to logfile.
+                      
+-s  : Optional parameter specifying the storaqe type (zfs|raw)
+"
+}
+
+
+# ********************************************************************
+#
+# 	Main body of program
+#
+# ********************************************************************
+#
+RUN_TIME=`$DATE '+%Y-%b-%d_%H.%M.%S'`
+
+# Determine absolute path to software
+get_absolute_path
+
+# Check that the effective id of the user is root
+check_id root
+
+while getopts ":b:s:l:" arg; do
+  case $arg in
+    b) ENIQ_BASE_DIR="$OPTARG" 
+       ;;
+    s) STORAGE_TYPE="$OPTARG"
+       ;;
+    l) LOGFILE="$OPTARG" 
+       ;;
+   \?) usage_msg
+       exit 1
+       ;;
+  esac
+done
+shift `expr $OPTIND - 1`
+
+# Setup up path environment etc
+setup_env
+
+if [ ! -s ${ENIQ_CORE_DIR}/lib/common_functions.lib ]; then
+    _err_msg_="Cannot locate ${ENIQ_CORE_DIR}/lib/common_functions.lib"
+    abort_script "$_err_msg_" 
+else
+   . ${ENIQ_CORE_DIR}/lib/common_functions.lib
+fi	
+
+if [ "${LOGFILE}" ]; then
+    # Check/Create Logfile
+    chk_create_logfile
+fi
+
+# Create a temporary Directory
+TEM_DIR=/tmp/update_ini_files.$$.$$
+$RM -rf ${TEM_DIR}
+$MKDIR -p ${TEM_DIR}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not create directory ${TEM_DIR}"
+    abort_script "$_err_msg_"
+fi
+
+# Correct the format of the ini file.
+$CAT ${ENIQ_CONF_DIR}/${SUNOS_INI} | $SED -e 's|\(SunOS_DIRECTORY_DIR\)\([0-9]\)|\1_\2|'   \
+			  							-e 's|\(SunOS_USER\)\(_USER\)\([0-9]\)|\1_\3|'   \
+			  							-e 's|\(SunOS_GROUP\)\(_GROUP\)\([0-9]\)|\1_\3|' > ${TEM_DIR}/SunOS.ini
+$CMP -s ${ENIQ_CONF_DIR}/${SUNOS_INI} ${TEM_DIR}/SunOS.ini
+if [ $? -ne 0 ]; then
+    $CP ${TEM_DIR}/SunOS.ini ${ENIQ_CONF_DIR}/${SUNOS_INI}
+    if [ $? -ne 0 ]; then
+        _err_msg_="Could not copy ${TEM_DIR}/SunOS.ini to ${ENIQ_CONF_DIR}/${SUNOS_INI} after comparison"
+        abort_script "$_err_msg_"
+    fi
+fi
+
+# Determine Volume Group
+determine_server_type_pool
+
+####################### Common updates for the raw and zfs systems #######################
+# Do I need to add installation filesystem
+_update_=1
+for _fs_det_ in `iniget SunOS_ZFS_FS -f ${ENIQ_CONF_DIR}/SunOS.ini`; do
+    iniget ${_fs_det_} -f ${ENIQ_CONF_DIR}/SunOS.ini -v name | $EGREP "\-installation[[:blank:]]*$" >> /dev/null 2>&1
+    if [ $? -eq 0 ]; then
+       _update_=0
+       break
+    fi
+done
+if [ ${_update_} -eq 1 ]; then
+    update_for_install_fs
+fi
+
+# Do I need to add smf filesystem
+_update_=1
+for _fs_det_ in `iniget SunOS_ZFS_FS -f ${ENIQ_CONF_DIR}/SunOS.ini`; do
+    iniget ${_fs_det_} -f ${ENIQ_CONF_DIR}/SunOS.ini -v name | $EGREP "\-smf[[:blank:]]*$" >> /dev/null 2>&1
+    if [ $? -eq 0 ]; then
+        _update_=0
+        break
+    fi
+done
+if [ ${_update_} -eq 1 ]; then
+    update_for_smf_fs
+fi
+
+# Do I need to add local log filesystem
+_update_=1
+for _fs_det_ in `iniget SunOS_ZFS_FS -f ${ENIQ_CONF_DIR}/SunOS.ini`; do
+    iniget ${_fs_det_} -f ${ENIQ_CONF_DIR}/SunOS.ini -v name | $EGREP "\-local_logs[[:blank:]]*$" >> /dev/null 2>&1
+    if [ $? -eq 0 ]; then
+        _update_=0
+        break
+    fi
+done
+if [ ${_update_} -eq 1 ]; then
+    update_for_local_log_fs
+fi
+    
+# Do I need to add bkup_sw filesystem
+_update_=1
+for _fs_det_ in `iniget SunOS_ZFS_FS -f ${ENIQ_CONF_DIR}/SunOS.ini`; do
+    iniget ${_fs_det_} -f ${ENIQ_CONF_DIR}/SunOS.ini -v name | $EGREP "\-bkup_sw[[:blank:]]*$" >> /dev/null 2>&1
+    if [ $? -eq 0 ]; then
+        _update_=0
+        break
+    fi
+done
+if [ ${_update_} -eq 1 ]; then
+    update_for_bkup_sw_fs
+fi
+    
+# Do I need to add connectd filesystem
+_update_=1
+for _fs_det_ in `iniget SunOS_ZFS_FS -f ${ENIQ_CONF_DIR}/SunOS.ini`; do
+    iniget ${_fs_det_} -f ${ENIQ_CONF_DIR}/SunOS.ini -v name | $EGREP "\-connectd[[:blank:]]*$" >> /dev/null 2>&1
+    if [ $? -eq 0 ]; then
+        _update_=0
+        break
+    fi
+done
+if [ ${_update_} -eq 1 ]; then
+    update_for_connectd_fs
+fi
+    
+# Do I need to add misc filesystem
+_update_=1
+for _fs_det_ in `iniget SunOS_ZFS_FS -f ${ENIQ_CONF_DIR}/SunOS.ini`; do
+iniget ${_fs_det_} -f ${ENIQ_CONF_DIR}/SunOS.ini -v name | $EGREP "\-misc[[:blank:]]*$" >> /dev/null 2>&1
+if [ $? -eq 0 ]; then
+    _update_=0
+    break
+fi
+done
+if [ ${_update_} -eq 1 ]; then
+    update_for_misc_fs
+fi
+
+_stor_type_info_=`iniget STOR_TYPE -f ${ENIQ_CONF_DIR}/${SUNOS_INI} -v STORAGE_TYPE`
+if [ ! "${_stor_type_info_}" ]; then
+    update_stor_type_info
+fi
+
+if [ "${INSTALL_TYPE}" != "es" ]; then	
+ 	
+	# Do I need to add pmdata_soem directory
+	_update_=1
+	for _fs_det_ in `iniget SunOS_DIRECTORY -f ${ENIQ_CONF_DIR}/SunOS.ini`; do
+		iniget ${_fs_det_} -f ${ENIQ_CONF_DIR}/SunOS.ini -v path | $EGREP "\/pmdata_soem[[:blank:]]*$" >> /dev/null 2>&1
+		if [ $? -eq 0 ]; then
+		    _update_=0
+		    break
+		fi
+	done
+	if [ ${_update_} -eq 1 ]; then
+	    update_for_soem_dir
+	fi
+	
+	# Set the path for the IQ binaries
+    iniset SYBASE_IQ -f ${ENIQ_CONF_DIR}/${SUNOS_INI} SYBASE_IQ_SOURCE_DIR="applications/sybase_iq"
+    if [ $? -ne 0 ]; then
+        _err_msg_="Could not set SYBASE_IQ_SOURCE_DIR=\"applications/sybase_iq\" in ${ENIQ_CONF_DIR}/${SUNOS_INI}"
+        abort_script "$_err_msg_"
+    fi
+	
+	# Set the path for the ASA binaries
+    iniset SYBASE_ASA -f ${ENIQ_CONF_DIR}/${SUNOS_INI} SYBASE_ASA_SOURCE_DIR="applications/sql_anywhere"
+    if [ $? -ne 0 ]; then
+        _err_msg_="Could not set SYBASE_ASA_SOURCE_DIR=\"applications/sql_anywhere\" in ${ENIQ_CONF_DIR}/${SUNOS_INI}"
+        abort_script "$_err_msg_"
+    fi
+fi
+	
+####################### Updates for the RAW system #######################
+if [ "${STORAGE_TYPE}" == "raw" ]; then
+        
+    if [ "${INSTALL_TYPE}" != "es" ]; then
+	    
+	    # Do I need to add export directory
+	    _update_=1
+	    for _fs_det_ in `iniget SunOS_DIRECTORY -f ${ENIQ_CONF_DIR}/SunOS.ini`; do
+	        iniget ${_fs_det_} -f ${ENIQ_CONF_DIR}/SunOS.ini -v path | $EGREP "\/export[[:blank:]]*$" >> /dev/null 2>&1
+	        if [ $? -eq 0 ]; then
+	            _update_=0
+	            break
+	        fi
+	    done
+	    if [ ${_update_} -eq 1 ]; then
+	        update_for_export_dir
+	    fi
+	
+	    # Do I need to add fmdata directory
+	    _update_=1
+	    for _fs_det_ in `iniget SunOS_DIRECTORY -f ${ENIQ_CONF_DIR}/SunOS.ini`; do
+	        iniget ${_fs_det_} -f ${ENIQ_CONF_DIR}/SunOS.ini -v path | $EGREP "\/fmdata[[:blank:]]*$" >> /dev/null 2>&1
+	        if [ $? -eq 0 ]; then
+	            _update_=0
+	            break
+	        fi
+	    done
+	    if [ ${_update_} -eq 1 ]; then
+	        update_for_fmdata_dir
+	    fi
+	
+	    # Do I need to add ldap_db directory
+	    _update_=1
+	    for _fs_det_ in `iniget SunOS_DIRECTORY -f ${ENIQ_CONF_DIR}/SunOS.ini`; do
+	        iniget ${_fs_det_} -f ${ENIQ_CONF_DIR}/SunOS.ini -v path | $EGREP "\/ldap_db[[:blank:]]*$" >> /dev/null 2>&1
+	        if [ $? -eq 0 ]; then
+	            _update_=0
+	            break
+	        fi
+	    done
+	    if [ ${_update_} -eq 1 ]; then
+	        update_for_ldap_db_dir
+	    fi
+		
+	    # Do I need to add dwh_reader directory
+	    _update_=1
+	    for _fs_det_ in `iniget SunOS_ZFS_FS -f ${ENIQ_CONF_DIR}/SunOS.ini`; do
+	        iniget ${_fs_det_} -f ${ENIQ_CONF_DIR}/SunOS.ini -v name | $EGREP "\-dwh_reader[[:blank:]]*$" >> /dev/null 2>&1
+	        if [ $? -eq 0 ]; then
+	        	iniset ${_fs_det_} -f ${ENIQ_CONF_DIR}/${SUNOS_INI} mountpoint="/eniq/database/dwh_reader"
+	        	if [ $? -ne 0 ]; then
+	            	_err_msg_="Could not set mountpoint=\"/eniq/database/dwh_reader\" for ${_fs_det_} in ${ENIQ_CONF_DIR}/${SUNOS_INI}"
+		    		abort_script "$_err_msg_"
+	        	fi
+	            _update_=0
+	            break
+	        fi
+	    done
+	    if [ ${_update_} -eq 1 ]; then
+	        update_for_dwh_reader
+	    fi
+	    
+	    # Remove dwh_reader_1 directory
+	    for _fs_det_ in `iniget SunOS_DIRECTORY -f ${ENIQ_CONF_DIR}/SunOS.ini`; do
+	        iniget ${_fs_det_} -f ${ENIQ_CONF_DIR}/SunOS.ini -v path | $EGREP "\/dwh_reader_1[[:blank:]]*$" >> /dev/null 2>&1
+	        if [ $? -eq 0 ]; then
+	        	$RM -rf ${TEM_DIR}/SunOS.ini_new
+	            ${INIDEL} -g SunOS_DIRECTORY -p ${_fs_det_} -i ${ENIQ_CONF_DIR}/SunOS.ini -o ${TEM_DIR}/SunOS.ini_new
+	            if [ $? -ne 0 ]; then
+	                _err_msg_="Error removing ${_fs_det_} from ${ENIQ_CONF_DIR}/${SUNOS_INI}"
+	                abort_script "$_err_msg_" 
+	            fi
+	
+	            $CP ${TEM_DIR}/SunOS.ini_new ${ENIQ_CONF_DIR}/${SUNOS_INI}
+	            if [ $? -ne 0 ]; then
+	                _err_msg_="Error copying ${TEM_DIR}/SunOS.ini to ${ENIQ_CONF_DIR}/${SUNOS_INI}"
+	                abort_script "$_err_msg_" 
+	            fi
+	        fi
+	    done
+	
+	    # Remove dwh_reader_2 directory
+	    for _fs_det_ in `iniget SunOS_DIRECTORY -f ${ENIQ_CONF_DIR}/SunOS.ini`; do
+	        iniget ${_fs_det_} -f ${ENIQ_CONF_DIR}/SunOS.ini -v path | $EGREP "\/dwh_reader_2[[:blank:]]*$" >> /dev/null 2>&1
+	        if [ $? -eq 0 ]; then
+	        	$RM -rf ${TEM_DIR}/SunOS.ini_new
+	            ${INIDEL} -g SunOS_DIRECTORY -p ${_fs_det_} -i ${ENIQ_CONF_DIR}/SunOS.ini -o ${TEM_DIR}/SunOS.ini_new
+	            if [ $? -ne 0 ]; then
+	                _err_msg_="Error removing ${_fs_det_} from ${ENIQ_CONF_DIR}/${SUNOS_INI}"
+	                abort_script "$_err_msg_" 
+	            fi
+	
+	            $CP ${TEM_DIR}/SunOS.ini_new ${ENIQ_CONF_DIR}/${SUNOS_INI}
+	            if [ $? -ne 0 ]; then
+	                _err_msg_="Error copying ${TEM_DIR}/SunOS.ini to ${ENIQ_CONF_DIR}/${SUNOS_INI}"
+	                abort_script "$_err_msg_" 
+	            fi
+	        fi
+	    done
+    fi
+  
+    # Do I need to add northbound directory
+    _update_=1
+    for _fs_det_ in `iniget SunOS_DIRECTORY -f ${ENIQ_CONF_DIR}/SunOS.ini`; do
+        iniget ${_fs_det_} -f ${ENIQ_CONF_DIR}/SunOS.ini -v path | $EGREP "\/northbound[[:blank:]]*$" >> /dev/null 2>&1
+        if [ $? -eq 0 ]; then
+            _update_=0
+            break
+        fi
+    done
+    if [ ${_update_} -eq 1 ]; then
+        update_for_northbound
+    fi
+    
+   	# Do I need to add northbound directory
+    _update_=1
+    for _fs_det_ in `iniget SunOS_DIRECTORY -f ${ENIQ_CONF_DIR}/SunOS.ini`; do
+        iniget ${_fs_det_} -f ${ENIQ_CONF_DIR}/SunOS.ini -v path | $EGREP "\/lte_event_ctrs_symlink[[:blank:]]*$" >> /dev/null 2>&1
+        if [ $? -eq 0 ]; then
+            _update_=0
+            break
+        fi
+    done
+    if [ ${_update_} -eq 1 ]; then
+        update_for_lte_event_ctrs_symlink
+    fi
+    
+    # Do I need to add pushData directory
+    _update_=1
+    for _fs_det_ in `iniget SunOS_DIRECTORY -f ${ENIQ_CONF_DIR}/SunOS.ini`; do
+        iniget ${_fs_det_} -f ${ENIQ_CONF_DIR}/SunOS.ini -v path | $EGREP "\/pushData[[:blank:]]*$" >> /dev/null 2>&1
+        if [ $? -eq 0 ]; then
+            _update_=0
+            break
+        fi
+    done
+    if [ ${_update_} -eq 1 ]; then
+        update_for_pushdata
+    fi
+
+    _san_sw_source_dir_=`iniget SAN_SW -f ${ENIQ_CONF_DIR}/SunOS.ini -v SAN_SW_SOURCE_DIR`
+    if [ ! "${_san_sw_source_dir_}" ]; then
+        update_san_sw_info
+    fi
+
+    _san_device_type_=`iniget SAN_DEV -f ${ENIQ_CONF_DIR}/SunOS.ini -v SAN_DEVICE`
+    if [ ! "${_san_device_type_}" ]; then
+        update_san_device_info
+    fi
+
+    _stor_api_pkg_=`iniget STOR_API -f ${ENIQ_CONF_DIR}/SunOS.ini -v SAN_DEVICE`
+    if [ ! "${_stor_api_pkg_}" ]; then
+        update_stor_api_info
+    fi
+
+    # Tidy up the SunOS.ini for incorrect database paths
+    $CAT ${ENIQ_CONF_DIR}/${SUNOS_INI} | $SED -e 's|dwh_main\/dwh_main_dbspace|dwh_main_dbspace|g'   \
+	  											-e 's|dwh_main\/dwh_temp_dbspace|dwh_temp_dbspace|g' > ${TEM_DIR}/SunOS.ini
+
+    $CMP -s ${ENIQ_CONF_DIR}/${SUNOS_INI} ${TEM_DIR}/SunOS.ini
+    if [ $? -ne 0 ]; then
+        $CP ${TEM_DIR}/SunOS.ini ${ENIQ_CONF_DIR}/${SUNOS_INI}
+        if [ $? -ne 0 ]; then
+            _err_msg_="Could not copy ${TEM_DIR}/SunOS.ini to ${ENIQ_CONF_DIR}/${SUNOS_INI} after comparison"
+            abort_script "$_err_msg_"
+        fi
+    fi
+fi
+
+####################### Updates for the ZFS system #######################
+if [ "${STORAGE_TYPE}" == "fs" ]; then
+    # Do I need to add sentinel filesystem
+    _update_=1
+    for _fs_det_ in `iniget SunOS_ZFS_FS -f ${ENIQ_CONF_DIR}/SunOS.ini`; do
+        iniget ${_fs_det_} -f ${ENIQ_CONF_DIR}/SunOS.ini -v name | $EGREP "\-sentinel[[:blank:]]*$" >> /dev/null 2>&1
+        if [ $? -eq 0 ]; then
+            _update_=0
+            break
+        fi
+    done
+    if [ ${_update_} -eq 1 ]; then
+        update_for_sentinel_fs
+    fi
+	
+    # Do I need to add log filesystem
+    _update_=1
+    for _fs_det_ in `iniget SunOS_ZFS_FS -f ${ENIQ_CONF_DIR}/SunOS.ini`; do
+        iniget ${_fs_det_} -f ${ENIQ_CONF_DIR}/SunOS.ini -v name | $EGREP "\-log[[:blank:]]*$" >> /dev/null 2>&1
+        if [ $? -eq 0 ]; then
+            _update_=0
+            break
+        fi
+    done
+    if [ ${_update_} -eq 1 ]; then
+        update_for_log_fs
+    fi
+    
+    # Do I need to add backup filesystem
+    _update_=1
+    for _fs_det_ in `iniget SunOS_ZFS_FS -f ${ENIQ_CONF_DIR}/SunOS.ini`; do
+        iniget ${_fs_det_} -f ${ENIQ_CONF_DIR}/SunOS.ini -v name | $EGREP "\-backup[[:blank:]]*$" >> /dev/null 2>&1
+        if [ $? -eq 0 ]; then
+            _update_=0
+            break
+        fi
+    done
+    if [ ${_update_} -eq 1 ]; then
+        update_for_backup_fs
+    fi
+    
+
+    # Do I need to add upgrade filesystem
+    _update_=1
+    for _fs_det_ in `iniget SunOS_ZFS_FS -f ${ENIQ_CONF_DIR}/SunOS.ini`; do
+        iniget ${_fs_det_} -f ${TEM_DIR}/SunOS.ini -v name | $EGREP "\-upgrade[[:blank:]]*$" >> /dev/null 2>&1
+        if [ $? -eq 0 ]; then
+            _update_=0
+            break
+        fi
+    done
+    if [ ${_update_} -eq 1 ]; then
+        update_for_upgrade_fs
+    fi
+    
+    # Do I need to add the ASA filesystem
+    _update_=1
+    for _fs_det_ in `iniget SunOS_ZFS_FS -f ${ENIQ_CONF_DIR}/SunOS.ini`; do
+        iniget ${_fs_det_} -f ${ENIQ_CONF_DIR}/SunOS.ini -v name | $EGREP "\-sql_anywhere[[:blank:]]*$" >> /dev/null 2>&1
+        if [ $? -eq 0 ]; then
+            _update_=0
+            break
+        fi
+    done
+    if [ ${_update_} -eq 1 ]; then
+        update_asa_info
+    fi
+
+    # Do I need to add dwh_reader directory
+    _update_=1
+    for _fs_det_ in `iniget SunOS_ZFS_FS -f ${ENIQ_CONF_DIR}/SunOS.ini`; do
+        iniget ${_fs_det_} -f ${ENIQ_CONF_DIR}/SunOS.ini -v name | $EGREP "\-dwh_reader[[:blank:]]*$" >> /dev/null 2>&1
+        if [ $? -eq 0 ]; then
+        	iniset ${_fs_det_} -f ${ENIQ_CONF_DIR}/${SUNOS_INI} mountpoint="/eniq/database/dwh_reader"
+        	if [ $? -ne 0 ]; then
+            	_err_msg_="Could not set mountpoint=\"/eniq/database/dwh_reader\" for ${_fs_det_} in ${ENIQ_CONF_DIR}/${SUNOS_INI}"
+	    		abort_script "$_err_msg_"
+        	fi
+            _update_=0
+            break
+        fi
+    done
+    if [ ${_update_} -eq 1 ]; then
+        update_for_dwh_reader_zfs
+    fi
+    
+    # Update details regarding sentinel
+    _sentinel_info_=`iniget SENTINEL -f ${ENIQ_CONF_DIR}/${SUNOS_INI} -v SENTINEL_SOURCE_DIR`
+    if [ ! "${_sentinel_info_}" ]; then
+        update_sentinel_info
+    fi
+    if [ "${_sentinel_info_}" == "sentinel" ]; then
+        # Update the location of the sentinal sw on the media from sentinel to applications/sentinel
+        $ECHO "Setting SENTINEL_SOURCE_DIR value to \"applications/sentinel\" in ${ENIQ_CONF_DIR}/${SUNOS_INI}" | $TEE -a $LOGFILE
+        iniset SENTINEL -f ${ENIQ_CONF_DIR}/${SUNOS_INI} SENTINEL_SOURCE_DIR="applications/sentinel" 
+        if [ $? -ne 0 ]; then
+            _err_msg_="Could not set SENTINEL_SOURCE_DIR=\"applications/sentinel\" in ${ENIQ_CONF_DIR}/${SUNOS_INI}"
+	    	abort_script "$_err_msg_"
+        fi
+    fi
+	
+	# Add sentinel smf string
+	_chk_sentinel_smf_str_=`iniget SENTINEL -f ${ENIQ_CONF_DIR}/${SUNOS_INI} -v SENTINEL_SMF_STR`
+    if [ ! "${_chk_sentinel_smf_str_}" ]; then
+        update_sentinel_smf_str
+    fi
+
+    # Add DDC info
+    _ddc_info_=`iniget DDC -f ${ENIQ_CONF_DIR}/${SUNOS_INI} -v DDC_PKG_FILE`
+    if [ ! "${_ddc_info_}" ]; then
+        update_ddc_info
+    fi
+    
+    # Update the freeware info
+    _freeware_info_=`iniget FREEWARE_SW -f ${ENIQ_CONF_DIR}/${SUNOS_INI} -v FREEWARE_SW_SOURCE_DIR`
+    if [ ! "${_freeware_info_}" ]; then
+        update_freeware_info
+    fi
+fi
+
+if [ ! -s ${TEM_DIR}/SunOS.ini ]; then
+    $CP ${ENIQ_CONF_DIR}/${SUNOS_INI} ${TEM_DIR}/SunOS.ini
+    if [ $? -ne 0 ]; then
+		_err_msg_="Could not copy ${ENIQ_CONF_DIR}/${SUNOS_INI} to ${TEM_DIR}/SunOS.ini"
+		abort_script "$_err_msg_"
+    fi	
+fi
+
+$RM -rf ${TEM_DIR}
+
+exit 0

@@ -1,0 +1,816 @@
+#!/bin/bash
+# ********************************************************************
+# Ericsson Radio Systems AB SCRIPT
+# ********************************************************************
+#
+# (c) Ericsson Radio Systems AB 2019 - All rights reserved.
+#
+# The copyright to the computer program(s) herein is the property
+# of Ericsson Radio Systems AB, Sweden. The programs may be used
+# and/or copied only with the written permission from Ericsson Radio
+# Systems AB or in accordance with the terms and conditions stipulated
+# in the agreement/contract under which the program(s) have been
+# supplied.
+#
+# ********************************************************************
+#
+# Name    : eniq_linux_migration_restore.bsh
+# Date    : 12/11/2019
+# Revision: \main\7
+#
+# Purpose : 1. This script will support restore from Solaris 11 OS to
+#           RHEL.Script will copy the selective solaris files in temporarty 
+#           location which will be used in the Linux migration.
+#
+# ********************************************************************
+#
+#   Command Section
+#
+# ********************************************************************
+AWK=/usr/bin/awk
+BASH=/bin/bash
+CAT=/usr/bin/cat
+CHOWN=/usr/bin/chown 
+DATE=/usr/bin/date
+DIRNAME=/usr/bin/dirname
+ECHO='/usr/bin/echo -e'
+EGREP=/usr/bin/egrep
+EXPECT=/usr/bin/expect
+ID=/usr/bin/id
+KILL=/usr/bin/kill
+MKDIR=/usr/bin/mkdir
+MYHOSTNAME=/usr/bin/hostname
+PERL=/usr/bin/perl
+PS=/usr/bin/ps
+RM=/usr/bin/rm
+RSYNC=/usr/bin/rsync
+SED=/usr/bin/sed
+SU=/usr/bin/su
+SYSTEMCTL=/usr/bin/systemctl
+TEE=/usr/bin/tee
+
+
+
+### Function: abort_script ###
+#
+#   This will is called if the script is aborted thru an error
+#   signal sent by the kernel such as CTRL-C or if a serious
+#   error is encountered during runtime
+#
+# Arguments:
+#       $1 - Error message from part of program (Not always used)
+# Return Values:
+#       none
+abort_script()
+{
+_err_time_=`$DATE '+%Y-%b-%d_%H.%M.%S'`
+
+if [ "$1" ]; then
+    _err_msg_="${_err_time_} - $1"
+else
+    _err_msg_="${_err_time_} - ERROR : Script aborted.......\n"
+fi
+
+if [ "${LOGFILE}" ]; then
+    $ECHO -e "\nERROR : ${_err_msg_}\n" | $TEE -a ${LOGFILE}
+else
+    $ECHO -e "\nERROR : ${_err_msg_}\n" 
+fi
+
+exit 1
+}
+
+
+### Function: check_id ###
+#
+#   Check that the effective id of the user is correct
+#   If not print error msg and exit.
+#
+# Arguments:
+#       $1 : User ID name
+# Return Values:
+#       0 for success; 1 for failure;
+check_id()
+{
+    _check_id_=`$ID  | $AWK -F\( '{print $2}' | $AWK -F\) '{print $1}'`
+    if [ "${_check_id_}" != "$1" ]; then
+        _err_msg_="ERROR:: You must be ROOT to execute Script $0 - exiting."
+        abort_script "${_err_msg_}"     "${EXEC_SHELL_CMD}"
+    fi
+}
+
+
+### Function: check_user_input ###
+#
+# Check provides input by User
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+check_user_input()
+{
+input_msg="$1"
+while :; do
+    $ECHO "${input_msg}"
+    if [ "$2" == "BACK_SERVER_PASS" -o "$2" == "CON_BACK_SERVER_PASS" ]; then
+		_user_input_=$(/usr/bin/perl -e 'system ("stty -echo");my $_temp_password_1 =<STDIN>;print $_temp_password_1; system ("stty echo");')
+	else
+        read _user_input_
+    fi
+
+    if [ -z "${_user_input_}" ]; then
+        continue
+    fi
+        break
+done
+eval "$2='${_user_input_}'"
+}
+
+
+### Function: chk_create_logfile ###
+#
+# Check/Create Logfile
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+
+chk_create_logfiles()
+{
+
+if [ ! "${LOGFILE}" ]; then
+    LOGFILE=${ENIQ_LOC_LOG_DIR}/migration/restore_data_`$DATE '+%Y-%b-%d_%H.%M.%S'`.log
+fi
+
+$MKDIR -p `$DIRNAME ${LOGFILE}`
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not create directory `$DIRNAME ${LOGFILE}`"
+     abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+fi
+
+$TOUCH -a ${LOGFILE}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not create file ${LOGFILE}"
+    abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+fi
+
+}
+
+### Function: create_conn ###
+#
+# Create Connection from back server
+#
+# Arguments:
+#   $1=Back server data_path
+#   $2=local server data_path
+# Return Values:
+#   none
+
+create_conn()
+{
+_source_backup_path_=$1
+_dest_restore_path_=$2
+
+$EXPECT << EOF >>${LOGFILE} 2>&1
+set timeout 86400
+spawn ${RSYNC} -avz -e "ssh -o StrictHostKeyChecking=no" ${DEFAULT_USER}@${BACK_SERVER_IP}:${_source_backup_path_} ${_dest_restore_path_}
+expect {
+"*assword:" {send -- "${BACK_SERVER_PASS}\r"
+expect {
+"*file*" { send_user "Connected to backup Server."}
+"*denied*" { exit 8 }
+"*invalid*" { exit 8 }
+}
+}
+timeout {send_user "\nTIMEOUT\n"; exit 9}
+}
+expect eof 
+EOF
+
+#Please do not add any spaces before EOF
+}
+
+
+### Function: get_absolute_path ###
+#
+# Determine absolute path to software
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+get_absolute_path()
+{
+_dir_=`$DIRNAME $0`
+SCRIPTHOME=`cd $_dir_ 2>/dev/null && pwd || $ECHO $_dir_`
+}
+
+
+### Function: get_backup_server_details ###
+#
+# Get details from user of server where backup is stored
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+
+get_backup_server_details()
+{ 
+#Take backup Server IP from user
+ENTER_SERVER_IP="Enter backup Server IP:"
+BACK_SERVER_IP=''
+check_user_input "${ENTER_SERVER_IP}" BACK_SERVER_IP
+BACK_SERVER_IP=${BACK_SERVER_IP}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not save backup server IP"
+    abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+fi
+
+while :; do
+#Take backup Server password from user
+ENTER_SERVER_PASS="Enter backup server password:"
+BACK_SERVER_PASS=''
+check_user_input "${ENTER_SERVER_PASS}" BACK_SERVER_PASS
+
+
+#Confirm backup server password from user 
+CON_ENTER_SERVER_PASS="Confirm backup server password:"
+CON_BACK_SERVER_PASS=''
+check_user_input "${CON_ENTER_SERVER_PASS}" CON_BACK_SERVER_PASS
+    if [ ${CON_BACK_SERVER_PASS} == ${BACK_SERVER_PASS} ]; then 
+        BACK_SERVER_PASS=${BACK_SERVER_PASS}
+            if [ $? -ne 0 ]; then
+                _err_msg_="Could not save backup server password"
+                abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+            else
+                break
+            fi
+    else 
+        $ECHO "Enter password does not match"
+        continue
+    fi
+done
+
+#Take backup Server path from user
+ENTER_SERVER_PATH="Enter backup data storage path:"
+BACKUP_PATH=''
+check_user_input "${ENTER_SERVER_PATH}" BACKUP_PATH
+BACKUP_PATH=${BACKUP_PATH}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not save backup server data path"
+    abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+fi
+
+}
+
+### Function: get_cron_files ###
+#
+# Get Cron files from backup Server
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+
+get_cron_files()
+{
+
+log_msg -s "---------------------------------------" -l "${LOGFILE}"
+log_msg -s "Copy cron files from ${BACK_SERVER_IP}" -l "${LOGFILE}"
+
+$MKDIR -p ${VAR_TMP_MIGRATION}/crontab
+
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not create directory ${VAR_TMP_MIGRATION}/crontab"
+    abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+fi
+
+_cron_list=`iniget CRON_FILES -f ${ENIQ_CORE_ETC_DIR}/${RESTORE_FILES_LIST}`
+
+#Even if variables are not fetched script should not be aborted.
+for _cron_files_ in ${_cron_list}; 
+do
+    CRON_BACKUP_PATH=${BACKUP_PATH}/${_cron_files_}
+    create_conn ${CRON_BACKUP_PATH} ${VAR_TMP_MIGRATION}/crontab
+    local exit_status=$?
+    if [ ${exit_status} -ne 0 ]; then
+        if [ ${exit_status} -eq 8 ]; then
+            _err_msg_="Permission denied, Check Credentials."
+            abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+        fi
+        _err_msg_="Could not copy file ${_cron_files_}"
+        abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+    fi
+done
+
+#update file copied variables
+$SED -i 's/FILE_COPY=START_COPYING/FILE_COPY=CRON_FILES_DONE/g' ${SERVER_DETAILS}
+
+log_msg -s "Successfully copied cron files from ${BACK_SERVER_IP}" -l "${LOGFILE}"
+}
+
+### Function: get_database ###
+#
+# Get database files from backup server
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+get_database()
+{
+log_msg -s "---------------------------------------" -l "${LOGFILE}"
+log_msg -s "Copying database files from ${BACK_SERVER_IP} " -l "${LOGFILE}"
+
+_dfs_list=`iniget DATABASE_FILES -f ${ENIQ_CORE_ETC_DIR}/${RESTORE_FILES_LIST}`
+
+for _dfs_files_ in ${_dfs_list}; 
+do
+    $RM -rf ${_dfs_files_} >> /dev/null 2>&1
+    sleep 10 
+done
+
+#kill database processes 
+PROCESS_DBSRV=`$PS -ef | $EGREP database | $EGREP dbsrv | $AWK -F " " '{print $2}'`
+if [ ! -z  ${PROCESS_DBSRV} ]; then
+    $KILL -9 ${PROCESS_DBSRV} 
+    if [ $? -ne 0 ]; then
+        _err_msg_="Could not killed ${PROCESS_DBSRV} proccess ID for dbsrv"
+        abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+    fi
+fi
+
+PROCESS_IQSER=`$PS -ef | $EGREP database | $EGREP iqsrv | $AWK -F " " '{print $2}'`
+if [ ! -z ${PROCESS_IQSER} ]; then
+    $KILL -9 ${PROCESS_IQSER}
+    if [ $? -ne 0 ]; then
+        _err_msg_="Could not killed ${PROCESS_IQSER} proccess ID for iqsrv"
+        abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+    fi
+fi
+
+#Even if variables are not fetched script should not be aborted.
+for _dfs_files_ in ${_dfs_list}; 
+do
+    DFS_BACKUP_PATH=${BACKUP_PATH}/${_dfs_files_}
+    create_conn ${DFS_BACKUP_PATH} ${ENIQ_DATABASE_DIR}
+    local exit_status=$?
+    if [ ${exit_status} -ne 0 ]; then
+        if [ ${exit_status} -eq 8 ]; then
+            _err_msg_="Permission denied, Check Credentials."
+            abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+        fi
+        _err_msg_="Could not copy file ${_dfs_list}"
+        abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+    fi
+done
+
+
+#changing ownership of database files
+log_msg -t -s "changing ownership of database files" -l ${LOGFILE}
+$CHOWN -R ${SYSUSER}:${SYSGRP} /eniq/database/ | $TEE -a ${LOGFILE}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not change ownership to dcuser."
+    abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+fi
+
+#update file copied variables
+$SED -i 's/FILE_COPY=ETC_FILES_DONE/FILE_COPY=DATABASE_FILES_DONE/g' ${SERVER_DETAILS}
+
+#create flag to skip the IQ_restore during the migration 
+$TOUCH ${VAR_TMP_MIGRATION}/sysmain_main_temp_db_restore
+
+log_msg -s "Successfully copied database files from ${BACK_SERVER_IP}" -l "${LOGFILE}"
+}
+
+### Function: restore_config_files ###
+#
+# Get config files from backup Server
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+restore_config_files()
+{
+log_msg -s "---------------------------------------" -l "${LOGFILE}"
+log_msg -s "Copy config files from ${BACK_SERVER_IP}" -l "${LOGFILE}"
+
+$MKDIR -p  ${MIGRATION_CONFIG}
+
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not create directory ${MIGRATION_CONFIG}"
+    abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+fi
+
+con_files_=`iniget CONFIG_FILES -f ${ENIQ_CORE_ETC_DIR}/${RESTORE_FILES_LIST}`
+
+#Even if variables are not fetched script should not be aborted.
+for _con_files_ in ${con_files_}; 
+do
+    SOU_CONFIG_FILES=${BACKUP_PATH}/${_con_files_}
+    create_conn ${SOU_CONFIG_FILES} ${MIGRATION_CONFIG}
+    local exit_status=$?
+    if [ ${exit_status} -ne 0 ]; then
+        if [ ${exit_status} -eq 8 ]; then
+            _err_msg_="Permission denied, Check Credentials."
+            abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+        fi
+        _err_msg_="Could not copy file ${_con_files_}"
+        abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+    fi
+done
+
+#update file copied variables
+$SED -i 's/FILE_COPY=ENIQ_FILES_DONE/FILE_COPY=CONFIG_FILES_DONE/g' ${SERVER_DETAILS}
+
+log_msg -s "Successfully copied config files from ${BACK_SERVER_IP}" -l "${LOGFILE}"
+}
+
+
+### Function: restore_etc_files###
+#
+# Get etc files from backup Server
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+restore_etc_files()
+{
+
+log_msg -s "---------------------------------------" -l "${LOGFILE}"
+log_msg -s "Copy etc files from ${BACK_SERVER_IP}" -l "${LOGFILE}"
+
+etc_files_=`iniget FILE_SYSTEM -f ${ENIQ_CORE_ETC_DIR}/${RESTORE_FILES_LIST}`
+
+#Even if variables are not fetched script should not be aborted.
+for _etc_file_ in ${etc_files_}; 
+do
+    SOU_ETC_FILES=${BACKUP_PATH}/${_etc_file_}
+    create_conn ${SOU_ETC_FILES} ${VAR_TMP_MIGRATION}
+    local exit_status=$?
+    if [ ${exit_status} -ne 0 ]; then
+        if [ ${exit_status} -eq 8 ]; then
+            _err_msg_="Permission denied, Check Credentials."
+            abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+        fi
+        _err_msg_="Could not copy file ${_etc_file_}"
+        abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+    fi
+done
+
+#update file copied variables
+$SED -i 's/FILE_COPY=SW_CONF_FILES_DONE/FILE_COPY=ETC_FILES_DONE/g' ${SERVER_DETAILS}
+
+log_msg -s "Successfully copied etc files from ${BACK_SERVER_IP}" -l "${LOGFILE}"
+}
+
+
+### Function: restore_eniq_files ###
+#
+# Get Eniq File from backup Server
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+
+restore_eniq_files()
+{
+log_msg -s "---------------------------------------" -l "${LOGFILE}"
+log_msg -s "Copy eniq files from ${BACK_SERVER_IP}" -l "${LOGFILE}"
+
+all_files_=`iniget ENIQ_FILE_SYSTEM -f ${ENIQ_CORE_ETC_DIR}/${RESTORE_FILES_LIST}`
+
+#Even if variables are not fetched script should not be aborted.
+for _eniq_files_ in ${all_files_}; 
+do
+    SOU_RESTORE_FILES=${BACKUP_PATH}/${_eniq_files_}
+    create_conn ${SOU_RESTORE_FILES} ${VAR_TMP_MIGRATION}
+    local exit_status=$?
+    if [ ${exit_status} -ne 0 ]; then
+        if [ ${exit_status} -eq 8 ]; then
+            _err_msg_="Permission denied, Check Credentials."
+            abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+        fi
+        _err_msg_="Could not copy file ${_eniq_files_}"
+        abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+    fi
+done
+
+#update file copied variables 
+$SED -i 's/FILE_COPY=CRON_FILES_DONE/FILE_COPY=ENIQ_FILES_DONE/g' ${SERVER_DETAILS}
+
+log_msg -s "Successfully copied eniq files from ${BACK_SERVER_IP}" -l "${LOGFILE}"
+}
+
+
+
+
+### Function: get server etc files data_path ###
+#
+# Get config files from backup Server
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+restore_sw_conf_files()
+{
+log_msg -s "---------------------------------------" -l "${LOGFILE}"
+log_msg -s "Copy sw conf files from ${BACK_SERVER_IP}" -l "${LOGFILE}"
+
+sw_conf_files_=`iniget ENIQ_SW_CONF_FILE -f ${ENIQ_CORE_ETC_DIR}/${RESTORE_FILES_LIST}`
+
+#Even if variables are not fetched script should not be aborted.
+for _sw_conf_ in ${sw_conf_files_}; 
+do
+    SOU_CONF_FILES=${BACKUP_PATH}/${_sw_conf_}
+    create_conn ${SOU_CONF_FILES} ${ENIQ_SW_CONF}
+    local exit_status=$?
+    if [ ${exit_status} -ne 0 ]; then
+        if [ ${exit_status} -eq 8 ]; then
+            _err_msg_="Permission denied, Check Credentials."
+            abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+        fi
+        _err_msg_="Could not copy file ${_sw_conf_}"
+        abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+    fi
+    $CHOWN -R ${SYSUSER}:${SYSGRP} ${_sw_conf_} >> /dev/null 2>&1
+done
+
+#update file copied variables
+$SED -i 's/FILE_COPY=CONFIG_FILES_DONE/FILE_COPY=SW_CONF_FILES_DONE/g' ${SERVER_DETAILS}
+
+log_msg -s "Successfully copied sw conf files from ${BACK_SERVER_IP}" -l "${LOGFILE}"
+}
+
+### Function: setup_env ###
+#
+# Set up environment variables for script.
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+setup_env()
+{
+#SCP with options
+SCP="/usr/bin/scp -o StrictHostKeyChecking=no"
+
+# Default user
+DEFAULT_USER=root
+
+#Eniq Base Directory
+ENIQ_BASE_DIR=/eniq
+
+#Eniq Installation Directory
+ENIQ_INST_DIR=${ENIQ_BASE_DIR}/installation
+
+# Main Directory for the Core Installation SW
+ENIQ_CORE_INST_DIR=${ENIQ_INST_DIR}/core_install
+
+# Main Directory for the Core Installation etc SW
+ENIQ_CORE_ETC_DIR=${ENIQ_CORE_INST_DIR}/etc
+
+ENIQ_SW_CONF=${ENIQ_BASE_DIR}/sw/conf
+
+#ENIQ SMF Directory
+ENIQ_SMF=${ENIQ_BASE_DIR}/smf
+
+# ENIQ Admin Directory
+ENIQ_ADMIN_DIR=${ENIQ_BASE_DIR}/admin
+
+# ENIQ Config Directory
+ENIQ_CONF_DIR=${ENIQ_INST_DIR}/config
+
+ENIQ_LOC_LOG_DIR=${ENIQ_BASE_DIR}/local_logs
+
+#Eniq Database Directory
+ENIQ_DATABASE_DIR=${ENIQ_BASE_DIR}/database
+
+# Name of the ini Files
+SUNOS_INI=SunOS.ini
+
+# Hostname Information
+HNAME=`${MYHOSTNAME}`
+
+# Get current server type
+CURR_SERVER_TYPE=`$CAT ${ENIQ_CONF_DIR}/installed_server_type | $EGREP -v  '^[[:blank:]]*#' | $SED -e 's/ //g'`
+if [ ! "${CURR_SERVER_TYPE}" ]; then
+    _err_msg_="Could not determine which server type this is"
+    abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+fi
+
+# Selective file restore list
+RESTORE_FILES_LIST="eniq_linux_migration_restore_files"
+
+# VAR Directory
+VAR=/var
+VAR_TMP=${VAR}/tmp
+VAR_TMP_MIGRATION=${VAR_TMP}/migration
+MIGRATION_CONFIG=${VAR_TMP_MIGRATION}/config
+
+MIGRATION_LIB=${ENIQ_INST_DIR}/core_install/lib
+
+MIGRATION_LOCAL_LOGS=${VAR_TMP_MIGRATION}/local_logs
+
+#copy status file
+SERVER_DETAILS=${VAR_TMP_MIGRATION}/server_details
+
+# Cmd to exec a shell and drop user to it in case of an error
+EXEC_SHELL_CMD="exec /bin/bash -o emacs"
+
+# Source the common functions
+_common_functions_list_="common_functions.lib common_core_install_functions.lib common_migration_functions.lib"
+for _lib_file_ in ${_common_functions_list_}; do
+    if [ -s ${MIGRATION_LIB}/${_lib_file_} ]; then
+        . ${MIGRATION_LIB}/${_lib_file_}
+    else
+        _err_msg_="File ${MIGRATION_LIB}/${_lib_file_} not found"
+        abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+    fi
+done
+
+# Get the System User
+SYSUSER=`iniget ENIQ_INSTALL_CONFIG -f ${ENIQ_CONF_DIR}/${SUNOS_INI} -v ENIQ_SYSUSER`
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not read SYSUSER param from ${ENIQ_CONF_DIR}/${SUNOS_INI}"
+    abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+fi
+
+#Fetching group name for dcuser.
+SYSGRP=`$ID ${SYSUSER}|$AWK '{print $2}'|$AWK -F\( '{print $2}'|$AWK -F\) '{print $1}'`
+if [ ! "${SYSGRP}" ]; then
+    _err_msg_="Could not read SYSGRP param from ${ENIQ_CONF_DIR}/${SUNOS_INI}"
+    abort_script "$_err_msg_" "${EXEC_SHELL_CMD}"
+fi
+
+}
+
+
+### Function: start_eniq_services ###
+#
+# Start all ENIQ services
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+start_eniq_services()
+{
+
+# Enable all the ENIQ services
+log_msg -l ${LOGFILE} -s "Starting the ENIQ services on $HNAME. Please wait..."
+$BASH ${ENIQ_ADMIN_DIR}/bin/manage_eniq_services.bsh -a start -s ALL -N >> ${LOGFILE}
+if [ $? -ne 0 ]; then
+    _err_msg_="Failed to start ENIQ services."
+    abort_script "$_err_msg_" "${EXEC_SHELL_CMD}"
+fi
+}
+
+### Function: stop_eniq_services ###
+#
+# Stop all ENIQ services
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+stop_eniq_services()
+{
+$ECHO "\nStopping all ENIQ services"
+$BASH ${ENIQ_ADMIN_DIR}/bin/manage_eniq_services.bsh -a list -s ALL -N >> /dev/null 2>&1
+if [ $? -eq 0 ];then
+   log_msg -s "\nENIQ services need to be stopped." -l ${LOGFILE}
+   # Disable all the ENIQ services
+   log_msg -l ${LOGFILE} -s "Stopping the ENIQ services on ${HNAME}. Please wait..."
+   $BASH ${ENIQ_ADMIN_DIR}/bin/manage_eniq_services.bsh -a stop -s ALL -N >> ${LOGFILE}
+    if [ $? -ne 0 ]; then
+        _err_msg_="Failed to stop ENIQ services."
+        abort_script "$_err_msg_" "${EXEC_SHELL_CMD}"
+    fi
+else
+ # Stopping all ENIQ related processes started using the administrator scripts
+    log_msg -t -s "Stopping all ENIQ related processes started using the administrator scripts" -l ${LOGFILE} 
+   for _service_ in `$CAT ${ENIQ_ADMIN_DIR}/etc/smf_contract_config |$GREP "${SERVER_TYPE}"|$GREP -w ENIQ|$GREP -w "Y"|$AWK -F"::" '{print $3}'` 
+   do 
+     $SU - $SYSUSER -c "${ENIQ_SMF}/bin/eniq_smf_start_stop.sh -a stop -s ${_service_}" >> ${LOGFILE}
+        if [ $? -ne 0 ]; then
+            _err_msg_="Failed to stop ${_service_} using the administrator scripts"
+            abort_script "$_err_msg_" "${EXEC_SHELL_CMD}"
+        fi
+   done
+  
+fi
+
+#Stoping Crond service
+$SYSTEMCTL stop crond.service
+if [ $? -ne 0 ]; then 
+    _err_msg_="Failed to stop crond service"
+    abort_script "$_err_msg_" "${EXEC_SHELL_CMD}"
+fi
+
+}
+
+
+# ********************************************************************
+#
+#   Main body of program
+#
+# ********************************************************************
+#
+
+RUN_TIME=`$DATE '+%Y-%b-%d_%H.%M.%S'`
+
+
+#get Absolute Path
+get_absolute_path
+
+#setup environment
+setup_env
+
+#Check User
+check_id $DEFAULT_USER
+
+#chk_create_logfile
+chk_create_logfiles
+
+#stop_eniq_services
+stop_eniq_services
+
+#create migration directory 
+
+$MKDIR -p ${VAR_TMP_MIGRATION}
+
+#get server backup details
+get_backup_server_details
+
+if [ -s "${SERVER_DETAILS}" ]; then
+    FILE_COPY=`$CAT ${SERVER_DETAILS} | $EGREP -w FILE_COPY | $AWK -F  "=" '{print $2}'` >> /dev/null 2>&1
+fi
+
+if [ -z "${FILE_COPY}" ]; then
+    $ECHO FILE_COPY="START_COPYING">> ${SERVER_DETAILS}
+     #get cron files
+     get_cron_files
+     FILE_COPY=`$CAT ${SERVER_DETAILS} | $EGREP -w FILE_COPY | $AWK -F  "=" '{print $2}'`
+fi
+
+
+#Copy files from backup server
+case $FILE_COPY in
+    "START_COPYING")
+        #get cron files
+        get_cron_files
+        restore_eniq_files
+        restore_config_files
+        restore_sw_conf_files
+        restore_etc_files
+        get_database
+        ;;
+    "CRON_FILES_DONE")
+        # Restore FIles
+        restore_eniq_files
+        restore_config_files
+        restore_sw_conf_files
+        restore_etc_files
+        get_database
+        ;;
+    "ENIQ_FILES_DONE")
+        #restore config files
+        restore_config_files
+        restore_sw_conf_files
+        restore_etc_files
+        get_database
+        ;;
+    "CONFIG_FILES_DONE")
+        #restore_sw_conf_files
+        restore_sw_conf_files
+        restore_etc_files
+        get_database
+        ;;
+    "SW_CONF_FILES_DONE")
+        #restore etc files
+        restore_etc_files
+        get_database
+        ;;
+    "ETC_FILES_DONE")
+        #get Database files
+        get_database
+        ;;
+    "DATABASE_FILES_DONE")
+        log_msg -s "ALL file copied Successfully from ${BACK_SERVER_IP}." -l "${LOGFILE}"
+        ;;
+esac
+
+#remove ^M from log file
+$SED -i 's/\r//g'  ${LOGFILE}
+
+log_msg -h -l ${LOGFILE} -t -s "Successfully completed Selective Restore. Logfile: ${LOGFILE}" 
+
+exit 0

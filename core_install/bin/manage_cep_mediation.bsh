@@ -1,0 +1,712 @@
+#!/bin/bash
+# ********************************************************************
+# Ericsson Radio Systems AB                                     SCRIPT
+# ********************************************************************
+#
+#
+# (c) Ericsson Radio Systems AB 2012 - All rights reserved.
+#
+# The copyright to the computer program(s) herein is the property
+# of Ericsson Radio Systems AB, Sweden. The programs may be used 
+# and/or copied only with the written permission from Ericsson Radio 
+# Systems AB or in accordance with the terms and conditions stipulated 
+# in the agreement/contract under which the program(s) have been 
+# supplied.
+#
+# ********************************************************************
+# Name    : manage_cep_mediation.bsh
+# Date    : 16/01/2014
+# Revision:\main\9 
+# Purpose : Script to take in details of CEP Mediation servers 
+# 			then create a cep_mediation.ini file and create NFS shares 
+#			on the NAS 
+#
+# Usage   : manage_cep_mediation.bsh -a <action> -i <path_to_ini_file>
+#			-n <number_cep_servers_to_add>[ -N ] [ -l <logfile> ] 
+#
+# ********************************************************************
+#
+#   Command Section
+#
+# ********************************************************************
+AWK=/usr/bin/awk
+BASENAME=/usr/bin/basename
+BC=/usr/bin/bc
+CAT=/usr/bin/cat
+CHMOD=/usr/bin/chmod
+CLEAR=/usr/bin/clear
+CMP=/usr/bin/cmp
+CP=/usr/bin/cp
+CUT=/usr/bin/cut
+DATE=/usr/bin/date
+DF=/usr/bin/df
+DIRNAME=/usr/bin/dirname
+DOMAINNAME=/usr/bin/domainname
+DTCONFIG=/usr/dt/bin/dtconfig
+ECHO=/usr/bin/echo
+EGREP=/usr/bin/egrep
+EJECT=/usr/bin/eject
+ENV=/usr/bin/env
+EXPR=/usr/bin/expr
+FORMAT=/usr/sbin/format
+FSTYP=/usr/sbin/fstyp
+FUSER=/usr/sbin/fuser
+GETENT=/usr/bin/getent
+GETTEXT=/usr/bin/gettext
+GREP=/usr/bin/grep
+GTAR=/usr/sfw/bin/gtar
+GZCAT=/usr/bin/gzcat
+HEAD=/usr/bin/head
+HOSTID=/usr/bin/hostid
+HOSTNAME=/usr/bin/hostname
+ID=/usr/bin/id
+INIT=/usr/sbin/init
+LS=/usr/bin/ls
+MKDIR=/usr/bin/mkdir
+MORE=/usr/bin/more
+MV=/usr/bin/mv
+NAWK=/usr/bin/nawk
+PGREP=/usr/bin/pgrep
+PING=/usr/sbin/ping
+PKGADD=/usr/sbin/pkgadd
+PKGINFO=/usr/bin/pkginfo
+PRTCONF=/usr/sbin/prtconf
+PRTVTOC=/usr/sbin/prtvtoc
+PSRINFO=/usr/sbin/psrinfo
+PWD=/usr/bin/pwd
+RM=/usr/bin/rm
+RCP=/usr/bin/rcp
+ROLES=/usr/bin/roles
+RSH=/usr/bin/rsh
+SED=/usr/bin/sed
+SLEEP=/usr/bin/sleep
+SORT=/usr/bin/sort
+SU=/usr/bin/su
+SVCADM=/usr/sbin/svcadm
+SVCCFG=/usr/sbin/svccfg
+SVCS=/usr/bin/svcs
+SYNC=/usr/sbin/sync
+TAIL=/usr/bin/tail
+TEE=/usr/bin/tee
+TOUCH=/usr/bin/touch
+TPUT=/usr/bin/tput
+UADMIN=/usr/sbin/uadmin
+UNAME=/usr/bin/uname
+VOLD=/usr/sbin/vold
+WC=/usr/bin/wc
+ZFS=/usr/sbin/zfs
+ZPOOL=/usr/sbin/zpool
+
+# ********************************************************************
+#
+#       Configuration Section
+#
+# ********************************************************************
+ENIQ_ENV=niq.rc
+ENIQ_INI=niq.ini
+SUNOS_INI=SunOS.ini
+CEP_MED_INI=cep_mediation.ini
+# Directory on the root filesystem
+ENIQ_ROOT_DIR=/eniq
+
+DEFAULT_USER=root
+
+CEP_MED_SERV_STR="cep_med_"
+
+# ********************************************************************
+#
+#       Pre-execution Operations
+#
+# ********************************************************************
+
+
+# ********************************************************************
+#
+#   Functions
+#
+# ********************************************************************
+
+### Function: abort_script ###
+#
+#   This will is called if the script is aborted thru an error
+#   signal sent by the kernel such as CTRL-C or if a serious
+#   error is encountered during runtime
+#
+# Arguments:
+#       $1 - Error message from part of program (Not always used)
+# Return Values:
+#       none
+abort_script()
+{
+_err_time_=`$DATE '+%Y-%b-%d_%H.%M.%S'`
+
+if [ "$1" ]; then
+    _err_msg_="${_err_time_} - $1"
+else
+    _err_msg_="${_err_time_} - ERROR : Script aborted.......\n"
+fi
+
+if [ "${LOGFILE}" ]; then
+    $ECHO "\nERROR : $_err_msg_\n" | $TEE -a ${LOGFILE}
+else
+    $ECHO "\nERROR : $_err_msg_\n"
+fi
+
+cd $SCRIPTHOME
+$RM -rf ${TEM_DIR}
+
+}
+
+### Function: check_params ###
+#
+# Check Input Params
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+check_params()
+{
+# Must have action & ini file
+if [ ! "${ACTION}" -o ! -f "${CEP_MED_INI_FILE}" ]; then
+    usage_msg
+    exit 1
+fi
+}
+
+### Function: chk_create_logfile ###
+#
+# Check/Create Logfile
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+chk_create_logfile()
+{
+$MKDIR -p `$DIRNAME ${LOGFILE}`
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not create directory `$DIRNAME ${LOGFILE}`"
+     abort_script "$_err_msg_"
+fi  
+
+$TOUCH -a ${LOGFILE}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not write to file ${LOGFILE}"
+    abort_script "$_err_msg_"
+fi  
+
+}
+
+### Function: chk_hostname_used ###
+#
+# Compare the hostname passed to the function with what's 
+# already in the cep_mediation.ini file. If it's been used return 1.
+# If it's not being used return 0
+#
+# Arguments:
+#   $1 - hostname entered by user
+# Return Values: 
+#	0 - hostname available
+#	1 - hostname in use
+#   
+chk_hostname_used()
+{
+local _new_hostname_=$1
+log_msg -t -l ${LOGFILE} -s "Get the list of current host name from ${ENIQ_CONF_DIR}/${CEP_MED_INI}"
+_current_host_list_=`iniget CEP_MEDIATION -f ${ENIQ_CONF_DIR}/${CEP_MED_INI}`
+if [ ! "${_current_host_list_}" ]; then
+	_err_msg_="Could not get a list of current CEP Mediation servers"
+    abort_script "$_err_msg_" "${EXEC_SHELL_CMD}"
+fi
+	
+for _hname_ in ${_current_host_list_}; do
+	_current_hostname_=`iniget ${_hname_} -f ${ENIQ_CONF_DIR}/${CEP_MED_INI} -v CEP_MED_HOSTNAME`
+	if [ "${_new_hostname_}" == "${_current_hostname_}" ]; then
+		# hostname already defined in ini file
+		log_msg -t -l ${LOGFILE} -s "${_new_hostname_} already defined in cep_mediation.ini"
+		sleep 2
+		return 1
+	fi
+done
+
+# hostname available
+return 0
+}
+
+### Function: chk_services_ip_used ###
+#
+# Compare the services_ip passed to the function with what's 
+# already in the cep_mediation.ini file. If it's been used return 1.
+# If it's not being used return 0
+#
+# Arguments:
+#   $1 - hostname entered by user
+# Return Values: 
+#	0 - hostname available
+#	1 - hostname in use
+
+chk_services_ip_used()
+{
+local _new_services_ip_=$1
+log_msg -t -l ${LOGFILE} -s "Get the current service ip list from ${ENIQ_CONF_DIR}/${CEP_MED_INI}"
+_current_services_ip_list_=`iniget CEP_MEDIATION -f ${ENIQ_CONF_DIR}/${CEP_MED_INI}`
+if [ ! "${_current_services_ip_list_}" ]; then
+	_err_msg_="Could not get a list of current CEP Mediation servers"
+    abort_script "$_err_msg_" "${EXEC_SHELL_CMD}"
+fi
+	
+for _services_ip_ in ${_current_services_ip_list_}; do
+	_current_services_ip_=`iniget ${_services_ip_} -f ${ENIQ_CONF_DIR}/${CEP_MED_INI} -v SERVICES_IP`
+	if [ "${_new_services_ip_}" == "${_current_services_ip_}" ]; then
+		#IP already used in ini file
+		log_msg -t -l ${LOGFILE} -s "${_new_services_ip_} already defined in cep_mediation.ini"
+		sleep 2
+		return 1
+	fi
+done
+# Services IP address available
+return 0
+}
+
+### Function: chk_storage_ip_used ###
+#
+# Compare the storage_ip passed to the function with what's 
+# already in the cep_mediation.ini file. If it's been used return 1.
+# If it's not being used return 0
+#
+# Arguments:
+#   $1 - hostname entered by user
+# Return Values: 
+#	0 - hostname available
+#	1 - hostname in use
+chk_storage_ip_used()
+{
+local _new_storage_ip_=$1
+log_msg -t -l ${LOGFILE} -s "Get the current storage ip list from ${ENIQ_CONF_DIR}/${CEP_MED_INI}"
+_current_storage_ip_list_=`iniget CEP_MEDIATION -f ${ENIQ_CONF_DIR}/${CEP_MED_INI}`
+if [ ! "${_current_storage_ip_list_}" ]; then
+	_err_msg_="Could not get a list of current CEP Mediation servers"
+    abort_script "$_err_msg_" "${EXEC_SHELL_CMD}"
+fi
+	
+for _storage_ip_ in ${_current_storage_ip_list_}; do
+	_current_storage_ip_=`iniget ${_storage_ip_} -f ${ENIQ_CONF_DIR}/${CEP_MED_INI} -v STORAGE_IP`
+	if [ "${_new_storage_ip_}" == "${_current_storage_ip_}" ]; then
+		# IP already used in ini file
+		log_msg -t -l ${LOGFILE} -s "${_new_storage_ip_} already defined in cep_mediation.ini"
+		sleep 2
+		return 1
+	fi
+done
+# Storage IP address available
+return 0
+}
+
+### Function: create_cep_med_ini ###
+#
+# Create the cep_mediation.ini file 
+# CEP Mediation server
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+create_cep_med_ini()
+{
+# call function to calculate how many cep servers are currently configured in cep_mediation.ini
+num_cep_servers
+local _cep_num_
+local _cep_start_num_=$((${CURRENT_CEP_COUNT}+1))
+local _cep_finish_num_=$((${CURRENT_CEP_COUNT}+${CEP_MED_NUM_SRVRS}))
+#echo "num ceps is: ${CURRENT_CEP_COUNT} so we start adding from ${_cep_start_num_} up to ${_cep_finish_num_}\n"
+
+for (( _cep_num_=${_cep_start_num_}; _cep_num_<=${_cep_finish_num_};_cep_num_++ )) do
+
+	$RM -rf ${TEM_DIR}/iniblock >> /dev/null 2>&1
+	$RM -rf ${TEM_DIR}/new_cep_med_ini >> /dev/null 2>&1
+	
+	while :; do
+		$CLEAR
+		
+		unset _cep_med_hostname_
+		$ECHO "\nEnter the hostname of the CEP Mediation server (${_cep_num_} of ${_cep_finish_num_}:)"
+		read _cep_med_hostname_
+		
+		# Did user enter anything
+		if [ ! "${_cep_med_hostname_}" ]; then
+			continue
+		fi
+		
+		# check hostname entered is not currently defined in ini file.
+		#only need to cehck if there are already ceps installed. if CURRENT_CEP_COUNT=0 then ini is empty
+		if [ ${CURRENT_CEP_COUNT} -gt 0 ]; then
+			chk_hostname_used ${_cep_med_hostname_}
+			if [ $? -ne 0 ]; then
+			continue
+			fi
+		fi
+		
+		CEP_MED_HOSTNAME=${_cep_med_hostname_}
+		break
+	done
+	
+	while :; do
+		$CLEAR
+		
+		unset _cep_med_services_ip_
+		$ECHO "\nEnter the OSS Services group IP address of CEP Mediation server (${_cep_num_} of ${_cep_finish_num_}):"
+		read _cep_med_services_ip_
+		
+		# Did user enter anything
+		if [ ! "${_cep_med_services_ip_}" ]; then
+			continue
+		fi
+	
+		validate_ip ${_cep_med_services_ip_}
+		if [ $? -ne 0 ]; then
+			continue
+		fi
+		# check hostname entered is not currently defined in ini file.
+		#only need to cehck if there are already ceps installed. if CURRENT_CEP_COUNT=0 then ini is empty
+		if [ ${CURRENT_CEP_COUNT} -gt 0 ]; then
+			chk_services_ip_used ${_cep_med_services_ip_}
+			if [ $? -ne 0 ]; then
+				continue
+			fi
+		fi
+		CEP_MED_SERVICES_IP=${_cep_med_services_ip_}
+		break
+	done
+		
+	while :; do
+		$CLEAR
+		
+		unset _cep_med_stor_ip_
+		$ECHO "\nEnter the OSS Storage group IP address of CEP Mediation server number (${_cep_num_} of ${_cep_finish_num_}):"
+		read _cep_med_stor_ip_
+		
+		# Did user enter anything
+		if [ ! "${_cep_med_stor_ip_}" ]; then
+			continue
+		fi
+		
+		validate_ip ${_cep_med_stor_ip_}
+		if [ $? -ne 0 ]; then
+			continue
+		fi
+		
+		# check hostname entered is not currently defined in ini file.
+		#only need to cehck if there are already ceps installed. if CURRENT_CEP_COUNT=0 then ini is empty
+		if [ ${CURRENT_CEP_COUNT} -gt 0 ]; then
+			chk_storage_ip_used ${_cep_med_stor_ip_}
+			if [ $? -ne 0 ]; then
+				continue
+			fi
+		fi
+		CEP_MED_STORAGE_IP=${_cep_med_stor_ip_}
+		break
+	done
+
+	# Set a service name alias
+	_cep_med_service_name_="${CEP_MED_SERV_STR}${_cep_num_}"
+	
+	$ECHO "[CEP_MEDIATION_${_cep_num_}]" > ${TEM_DIR}/iniblock
+	$ECHO "CEP_MED_HOSTNAME=${CEP_MED_HOSTNAME}" >> ${TEM_DIR}/iniblock
+	$ECHO "ALIAS=${_cep_med_service_name_}" >> ${TEM_DIR}/iniblock
+	$ECHO "SERVICES_IP=${CEP_MED_SERVICES_IP}" >> ${TEM_DIR}/iniblock
+	$ECHO "STORAGE_IP=${CEP_MED_STORAGE_IP}" >> ${TEM_DIR}/iniblock
+	
+	$INIADD -g CEP_MEDIATION -p CEP_MEDIATION_${_cep_num_} -i ${CEP_MED_INI_FILE} -d ${TEM_DIR}/iniblock -o ${TEM_DIR}/new_cep_med_ini
+	if [ $? -ne 0 ]; then 
+		_err_msg_="Failed to update ${INI_FILE}\n"
+		abort_script "$_err_msg_"
+	fi
+	log_msg -t -l ${LOGFILE} -s "Copying files from ${TEM_DIR}/new_cep_med_ini to ${CEP_MED_INI_FILE}"
+	$CP ${TEM_DIR}/new_cep_med_ini ${CEP_MED_INI_FILE}
+	if [ $? -ne 0 ]; then 
+		_err_msg_="Could not copy ${TEM_DIR}/new_cep_med_ini to ${CEP_MED_INI_FILE}"
+		abort_script "$_err_msg_"
+	fi
+	
+	if [ ${SUMRY_FILE} ]; then
+		$ECHO "CEP Mediation Server ${_cep_num_}:" >> ${SUMRY_FILE}
+		$ECHO "\tHostname: ${CEP_MED_HOSTNAME}" >> ${SUMRY_FILE}
+		$ECHO "\tOSS Services group IP: ${CEP_MED_SERVICES_IP}" >> ${SUMRY_FILE}
+		$ECHO "\tOSS Storage group IP: ${CEP_MED_STORAGE_IP}\n" >> ${SUMRY_FILE}
+	fi
+done
+}
+
+### Function: delete_cepm_shares ###
+#
+# Delete the NFS shares on the NAS for 
+# CEP Mediation server
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+delete_cepm_shares()
+{
+	_err_msg_="Not implemented yet"
+    abort_script "$_err_msg_"  
+}
+
+### Function: get_absolute_path ###
+#
+# Determine absolute path to software
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+get_absolute_path() 
+{
+_dir_=`$DIRNAME $0`
+SCRIPTHOME=`cd $_dir_ 2>/dev/null && pwd || $ECHO $_dir_`
+}
+
+### Function: list_cepm_shares ###
+#
+# List the NFS shares on the NAS for 
+# CEP Mediation server
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+list_cepm_shares()
+{
+	_err_msg_="Not implemented yet"
+    abort_script "$_err_msg_"  
+}
+### Function: num_cep_servers ###
+#
+# Count the number of cep servers already configured in cep_mediation.ini
+# If ADD_CEP_MED=NO then count is set to 0
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+
+num_cep_servers()
+{
+local _srvr_cnt=0
+
+# check if the ini file exists as if script gets here there's two scenarios:
+# 1. it's an ii & at that stage file won't exist we're dealing with template file.
+# 2. it's been called by configure_cep_mediation.bsh which has already checked if ini file exists.
+# if it doesn't exist then it's an II , set count to 0 and return
+
+# Check the ini file exists
+if [ ! -f ${ENIQ_SW_CONF_DIR}/${CEP_MED_INI} ]; then
+	CURRENT_CEP_COUNT=0
+	export CURRENT_CEP_COUNT
+else
+	# See if there are currently any CEP servers configured
+         log_msg -t -l ${LOGFILE} -s "Check the current CEP configuration from ${ENIQ_CONF_DIR}/${CEP_MED_INI}"
+	_cepused_=`iniget CEP_MEDIATION_INCLUDED -f ${ENIQ_CONF_DIR}/${CEP_MED_INI} -v ADD_CEP_MED`
+	if [ ! "${_cepused_}" ]; then
+		_err_msg_="Could not get current cep configuration from ${CEP_MED_INI}"
+		abort_script "$_err_msg_" "${EXEC_SHELL_CMD}"
+	fi
+
+	# if ADD_CEP_MED is Yes then count how many cep servers are currently configured.
+	# if ADD_CEP_MED is No then set count to 0
+	if [ "${_cepused_}" == "Yes" ]; then
+                 log_msg -t -l ${LOGFILE} -s "Get the list of current server from ${ENIQ_CONF_DIR}/${CEP_MED_INI}"
+		_current_srvr_list_=`iniget CEP_MEDIATION -f ${ENIQ_CONF_DIR}/${CEP_MED_INI}`
+		if [ ! "${_current_srvr_list_}" ]; then
+			_err_msg_="Could not get a list of CEP Mediation servers"
+			abort_script "$_err_msg_" "${EXEC_SHELL_CMD}"
+		fi
+		
+		for _srvr_ in ${_current_srvr_list_}; do
+			_srvr_cnt=`expr ${_srvr_cnt} + 1`
+			_cep_med_hostname_=`iniget ${_srvr_} -f ${ENIQ_CONF_DIR}/${CEP_MED_INI} -v CEP_MED_HOSTNAME`
+		done
+		CURRENT_CEP_COUNT=${_srvr_cnt}
+		
+	else
+		CURRENT_CEP_COUNT=0
+	fi
+	
+	export CURRENT_CEP_COUNT
+fi
+}
+### Function: setup_env ###
+#
+# Setup up path environment etc
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+setup_env()
+{
+ENIQ_BASE_DIR=${ENIQ_ROOT_DIR}
+
+ENIQ_ADMIN_DIR=${ENIQ_BASE_DIR}/admin
+
+ENIQ_CONF_DIR=${ENIQ_BASE_DIR}/installation/config
+
+ENIQ_SW_CONF_DIR=${ENIQ_BASE_DIR}/sw/conf
+
+CURR_SERVER_TYPE=`$CAT $ENIQ_CONF_DIR/installed_server_type | $EGREP -v '^[ 	]*#' | $SED -e 's/ //g'`
+if [ ! "${CURR_SERVER_TYPE}" ]; then
+    _err_msg_="Could not determine which server type this is"
+    abort_script "$_err_msg_" 
+fi
+
+# File containing the type of OSS installation. Eg. events or statistics
+INST_TYPE_FILE=${ENIQ_CONF_DIR}/ericsson_use_config
+if [ ! -s "${INST_TYPE_FILE}" ]; then
+    _err_msg_="ENIQ install type not defined in ${INST_TYPE_FILE}"
+    abort_script "$_err_msg_"  
+fi
+
+# Read the installation type - should be "events" or "stats"
+INSTALL_TYPE=`$CAT ${INST_TYPE_FILE} | $NAWK -F\= '{print $2}'`
+if [ ! "${INSTALL_TYPE}" ]; then
+    _err_msg_="Could not read INSTALL_TYPE param "
+    abort_script "$_err_msg_" 
+fi
+
+# Set up Variable to hold network path to SW
+if [ ! -s ${SCRIPTHOME}/../lib/iniadd.pl ]; then
+    _err_msg_="Cannot locate ${SCRIPTHOME}/../lib/iniadd"
+    abort_script "$_err_msg_" 
+else
+	INIADD=${SCRIPTHOME}/../lib/iniadd.pl
+fi
+
+if [ ! -s ${SCRIPTHOME}/../lib/inidel.pl ]; then
+    _err_msg_="Cannot locate ${SCRIPTHOME}/../lib/inidel"
+    abort_script "$_err_msg_" 
+else
+	INIDEL=${SCRIPTHOME}/../lib/inidel.pl
+fi
+
+}
+
+### Function: usage_msg ###
+#
+#   Print out the usage message
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+usage_msg()
+{
+$ECHO "
+Usage: `$BASENAME $0` -a <action> -i <path_to_ini_file> [ -l <logfile> ]
+
+options:
+
+-a  : Action. Must be  
+              add   --> Create NFS shares for CEP Mediation server
+              
+-i  : Path to the CEP Mediation ini file
+
+-n	: Number of CEP Mediation servers to add
+      
+-l  : Optional parameter specifying the full path to logfile. If not specified, a 
+      logfile will be created in ${LOGFILE_DIR}
+"
+}
+
+# ********************************************************************
+#
+#   Main body of program
+#
+# ********************************************************************
+#
+
+# Determine absolute path to software
+get_absolute_path
+
+# Check that the effective id of the user is root
+#check_id $DEFAULT_USER
+
+while getopts ":a:f:i:n:l:" arg; do
+  case $arg in
+    a) ACTION="$OPTARG" 
+       ;;
+    f) SUMRY_FILE="$OPTARG"
+    	;;
+    i) CEP_MED_INI_FILE="$OPTARG" 
+       ;;
+    n) CEP_MED_NUM_SRVRS="$OPTARG" 
+       ;;
+    l) LOGFILE="$OPTARG" 
+       ;;
+    \?) usage_msg
+       exit 1
+       ;;
+  esac
+done
+shift `expr $OPTIND - 1`    
+
+# Source the common functions
+if [ -s ${ENIQ_ROOT_DIR}/installation/core_install/lib/common_functions.lib ]; then
+    . ${ENIQ_ROOT_DIR}/installation/core_install/lib/common_functions.lib
+else
+    _err_msg_="File ${ENIQ_ROOT_DIR}/installation/core_install/lib/common_functions.lib not found"
+    abort_script "$_err_msg_"
+fi
+
+# Setup up path environment etc
+setup_env
+
+# Check Input Params
+check_params
+
+if [ ! "${LOGFILE}" ]; then
+    LOGFILE="${ENIQ_ROOT_DIR}/local_logs/installation/cep_mediation_setup.log"
+fi	
+  
+# Check/Create Logfile
+chk_create_logfile
+
+if [ "${INSTALL_TYPE}" != "events" ]; then
+    _err_msg_="CEP Mediation config can only be run on ENIQ Events\n"
+    abort_script "$_err_msg_"
+fi
+
+# Create a temporary Directory
+TEM_DIR=/tmp/manage_cep_med_setup.$$.$$
+$RM -rf ${TEM_DIR}
+$MKDIR -p ${TEM_DIR}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not create directory ${TEM_DIR}"
+    abort_script "$_err_msg_"
+fi
+
+#Copy the inputted ini file to TEMP
+log_msg -t -l ${LOGFILE} -s "Copying files from ${CEP_MED_INI_FILE} to ${TEM_DIR}/cm_ini_file"
+$CP ${CEP_MED_INI_FILE} ${TEM_DIR}/cm_ini_file
+if [ $? -ne 0 ]; then
+    _err_msg_="Failed to copy ${CEP_MED_INI_FILE} file to ${TEM_DIR}/cm_ini_file"
+    abort_script "$_err_msg_"
+fi
+
+INI_FILE=${TEM_DIR}/cm_ini_file
+
+case "${ACTION}" in
+	add)		create_cep_med_ini
+        		;;
+    #delete)	delete_cep_med_ini
+    #    		;;
+    #list)		list_cep_med_ini
+    #    		;;
+    *)	 		usage_msg
+       		exit 1
+       		;;
+esac
+
+$RM -rf ${TEM_DIR}
+
+exit 0

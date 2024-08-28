@@ -1,0 +1,499 @@
+#!/bin/bash
+# ********************************************************************
+# Ericsson Radio Systems AB                                     SCRIPT
+# ********************************************************************
+#
+#
+# (c) Ericsson Radio Systems AB 2012 - All rights reserved.
+#
+# The copyright to the computer program(s) herein is the property
+# of Ericsson Radio Systems AB, Sweden. The programs may be used
+# and/or copied only with the written permission from Ericsson Radio
+# Systems AB or in accordance with the terms and conditions stipulated
+# in the agreement/contract under which the program(s) have been
+# supplied.
+#
+# ********************************************************************
+# Name    : openldap_server_install.bsh
+# Date    : 21/02/2012
+# Revision: D.1
+# Purpose : Main wrapper script handling the installation LDAP. It will
+#           call all necessary scripts to complete the installation
+#
+# Usage   : openldap_server_install.bsh
+#
+# ********************************************************************
+#
+#   Command Section
+#
+# ********************************************************************
+AWK=/usr/bin/awk
+BASENAME=/usr/bin/basename
+BASH=/usr/bin/bash
+BC=/usr/bin/bc
+BOOTADM=/usr/sbin/bootadm
+CAT=/usr/bin/cat
+CHMOD=/usr/bin/chmod
+CHOWN=/usr/bin/chown
+CLEAR=/usr/bin/clear
+CMP=/usr/bin/cmp
+CP=/usr/bin/cp
+CPIO=/usr/bin/cpio
+DATE=/usr/bin/date
+DIRNAME=/usr/bin/dirname
+DLADM=/usr/sbin/dladm
+DOMAINNAME=/usr/bin/domainname
+DTCONFIG=/usr/dt/bin/dtconfig
+DUMPADM=/usr/sbin/dumpadm
+ECHO=/usr/bin/echo
+EGREP=/usr/bin/egrep
+EJECT=/usr/bin/eject
+ENV=/usr/bin/env
+EXPR=/usr/bin/expr
+FIND=/usr/bin/find
+FLARCREATE=/usr/sbin/flarcreate
+FORMAT=/usr/sbin/format
+FUSER=/usr/sbin/fuser
+GEGREP=/usr/sfw/bin/gegrep
+GETENT=/usr/bin/getent
+GETTEXT=/usr/bin/gettext
+GREP=/usr/bin/grep
+GROUPADD=/usr/sbin/groupadd
+GTAR=/usr/sfw/bin/gtar
+GZCAT=/usr/bin/gzcat
+GZIP=/usr/bin/gzip
+HEAD=/usr/bin/head
+MYHOSTNAME=/usr/bin/hostname
+ID=/usr/bin/id
+IFCONFIG=/usr/sbin/ifconfig
+INIT=/usr/sbin/init
+LN=/usr/bin/ln
+LS=/usr/bin/ls
+MKDIR=/usr/bin/mkdir
+MORE=/usr/bin/more
+MOUNT=/usr/sbin/mount
+MV=/usr/bin/mv
+NAWK=/usr/bin/nawk
+NSLOOKUP=/usr/sbin/nslookup
+PGREP=/usr/bin/pgrep
+PING=/usr/sbin/ping
+PKGADD=/usr/sbin/pkgadd
+PKGINFO=/usr/bin/pkginfo
+PKGRM=/usr/sbin/pkgrm
+PRTCONF=/usr/sbin/prtconf
+PSRINFO=/usr/sbin/psrinfo
+PWD=/usr/bin/pwd
+REBOOT=/usr/sbin/reboot
+RM=/usr/bin/rm
+RCP=/usr/bin/rcp
+RSH=/usr/bin/rsh
+SED=/usr/bin/sed
+SEVEN_Z=/usr/bin/7z
+SLEEP=/usr/bin/sleep
+SORT=/usr/bin/sort
+STMSBOOT=/usr/sbin/stmsboot
+SU=/usr/bin/su
+SVCADM=/usr/sbin/svcadm
+SVCCFG=/usr/sbin/svccfg
+SVCS=/usr/bin/svcs
+SWAP=/usr/sbin/swap
+SYNC=/usr/sbin/sync
+TAIL=/usr/bin/tail
+TAR=/usr/sbin/tar
+TEE=/usr/bin/tee
+TOUCH=/usr/bin/touch
+TPUT=/usr/bin/tput
+TR=/usr/bin/tr
+UADMIN=/usr/sbin/uadmin
+UMOUNT=/usr/sbin/umount
+UNAME=/usr/bin/uname
+USERADD=/usr/sbin/useradd
+VOLD=/usr/sbin/vold
+WC=/usr/bin/wc
+YES=/usr/bin/yes
+ZFS=/usr/sbin/zfs
+ZPOOL=/usr/sbin/zpool
+
+# ********************************************************************
+#
+#       Configuration Section
+#
+# ********************************************************************
+
+# Default user
+DEFAULT_USER=root
+
+# Name of SunOS & ENIQ ini Files
+BLK_STOR_INI=block_storage.ini
+ENIQ_ENV=niq.rc
+ENIQ_INI=niq.ini
+SYM_INI=sym_links.ini
+IPMP_INI=ipmp.ini
+LUN_MAP_INI=lun_map.ini
+RBAC_INI=RBAC.ini
+SUNOS_INI=SunOS.ini
+SENTINEL_INI=sentinel.ini
+STORAGE_INI=storage.ini
+TP_INI=input_parameters.ini
+ECS_INI=ecs.ini
+
+UNTAR_SW_NAME="open_ldap_server_install_config_bundle"
+INSTALL_SCRIPT="openLDAP-2-4-16_install.sh"
+SMF_INSTALL_SCRIPT="installOpenLDAP_SMF.bsh"
+
+# ********************************************************************
+#
+#       Pre-execution Operations
+#
+# ********************************************************************
+
+# ********************************************************************
+#
+#   Functions
+#
+# ********************************************************************
+### Function: abort_script ###
+#
+#   This will is called if the script is aborted thru an error
+#   signal sent by the kernel such as CTRL-C or if a serious
+#   error is encountered during runtime
+#
+# Arguments:
+#       $1 - Error message from part of program (Not always used)
+# Return Values:
+#       none
+abort_script()
+{
+_err_time_=`$DATE '+%Y-%b-%d_%H.%M.%S'`
+
+if [ "$1" ]; then
+    _err_msg_="${_err_time_} - $1"
+else
+    _err_msg_="${_err_time_} - ERROR : Script aborted.......\n"
+fi
+
+if [ "${LOGFILE}" ]; then
+    $ECHO "\nERROR : $_err_msg_\n" | $TEE -a ${LOGFILE}
+else
+    $ECHO "\nERROR : $_err_msg_\n"
+fi
+
+cd $SCRIPTHOME
+$RM -rf ${TEM_DIR}
+
+if [ "$2" ]; then
+	if [ ! "${UPGRADE}" ]; then
+    	${2}    	
+    fi
+    exit 1
+else
+   exit 1
+fi
+}
+
+### Function: chk_create_logfile ###
+#
+# Check/Create Logfile
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+chk_create_logfile()
+{
+$MKDIR -p `$DIRNAME ${LOGFILE}`
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not create directory `$DIRNAME ${LOGFILE}`"
+     abort_script "$_err_msg_"
+fi
+
+$TOUCH -a ${LOGFILE}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not write to file ${LOGFILE}"
+    abort_script "$_err_msg_"
+fi
+}
+
+### Function: check_id ###
+#
+#   Check that the effective id of the user is correct
+#   If not print error msg and exit.
+#
+# Arguments:
+#       $1 : User ID name
+# Return Values:
+#       none
+check_id()
+{
+_check_id_=`$ID | $AWK -F\( '{print $2}' | $AWK -F\) '{print $1}'`
+if [ "$_check_id_" != "$1" ]; then
+    _err_msg_="You must be $1 to execute this script."
+    abort_script "$_err_msg_"
+fi
+}
+
+### Function: create_admin_script ###
+#
+# Create the SMF service for openLDAP
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+create_admin_script()
+{
+_openldap_admin_script_="${TEM_DIR}/${UNTAR_SW_NAME}/openldapserver"	
+# Check the admin script exists
+if [ ! -s ${_openldap_admin_script_} ]; then
+	_err_msg_="${_openldap_admin_script_} does not exist, or is empty"
+    abort_script "$_err_msg_"
+fi	
+
+$ECHO "Creating openLDAP service admin script in ${ENIQ_ADMIN_BIN_DIR}" | $TEE -a ${LOGFILE}
+$CP ${_openldap_admin_script_} ${ENIQ_ADMIN_BIN_DIR}
+if [ $? -ne 0 ]; then
+	_err_msg_="Could not copy ${_openldap_admin_script_} to ${ENIQ_ADMIN_BIN_DIR}"
+    abort_script "$_err_msg_"
+fi
+}
+
+### Function: create_SMF_service ###
+#
+# Create the SMF service for openLDAP
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+create_SMF_service()
+{
+_smf_install_script_="${TEM_DIR}/${UNTAR_SW_NAME}/smf/${SMF_INSTALL_SCRIPT}"
+# Check the SMF script exists
+if [ ! -s ${_smf_install_script_} ]; then
+	_err_msg_="${_smf_install_script_} does not exist, or is empty"
+    abort_script "$_err_msg_"
+fi
+
+# Run the script
+$ECHO "Starting to install openLDAP SMF service" | $TEE -a ${LOGFILE}
+$ECHO "using command" >> ${LOGFILE}
+$ECHO "$BASH ${_smf_install_script_} -l ${LOGFILE}" >> ${LOGFILE}
+$BASH ${_smf_install_script_} -l ${LOGFILE}
+if [ $? -ne 0 ]; then
+	_err_msg_="Problem encountered creating openLDAP SMF service using ${_smf_install_script_}"
+    abort_script "$_err_msg_"
+fi
+}
+
+### Function: get_absolute_path ###
+#
+# Determine absolute path to software
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+get_absolute_path()
+{
+_dir_=`$DIRNAME $0`
+SCRIPTHOME=`cd $_dir_ 2>/dev/null && pwd || $ECHO $_dir_`
+}
+
+### Function: install_openLDAP ###
+#
+# Install openLDAP
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+install_openLDAP()
+{
+_openldap_install_script_="${TEM_DIR}/${UNTAR_SW_NAME}/${INSTALL_SCRIPT}"
+# Check the SMF script exists
+if [ ! -s ${_openldap_install_script_} ]; then
+	_err_msg_="${_openldap_install_script_} does not exist, or is empty"
+    abort_script "$_err_msg_"
+fi
+
+# Run the script
+$ECHO "Starting to install openLDAP SW" | $TEE -a ${LOGFILE}
+$ECHO "using command" >> ${LOGFILE}
+$ECHO "$BASH ${_openldap_install_script_} -l ${LOGFILE}" >> ${LOGFILE}
+$BASH ${_openldap_install_script_} -l ${LOGFILE}
+if [ $? -ne 0 ]; then
+	_err_msg_="Problem encountered running ${_openldap_install_script_}"
+    abort_script "$_err_msg_"
+fi
+}
+
+### Function: setup_env ###
+#
+# Set up environment variables for script.
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+setup_env()
+{
+if [ ! "${ENIQ_BASE_DIR}" ]; then
+    # Directory on the root filesystem
+    ENIQ_BASE_DIR=/eniq
+fi
+
+# ENIQ Admin Directory
+ENIQ_ADMIN_DIR=${ENIQ_BASE_DIR}/admin
+
+# ENIQ Log Directory
+ENIQ_LOG_DIR=${ENIQ_BASE_DIR}/local_logs
+
+# ENIQ Admin Bin Directory
+ENIQ_ADMIN_BIN_DIR=${ENIQ_ADMIN_DIR}/bin
+
+# ENIQ SW conf
+CLI_CONF_DIR=${ENIQ_BASE_DIR}/sw/conf
+
+# Main Directory for the Core Installation SW
+ENIQ_INST_DIR=${ENIQ_BASE_DIR}/installation
+
+# Main Directory for the Core Installation SW
+ENIQ_CORE_INST_DIR=${ENIQ_INST_DIR}/core_install
+
+# ENIQ Config Directory
+ENIQ_CONF_DIR=${ENIQ_INST_DIR}/config
+
+# Templates Directory
+ENIQ_TEMPL_DIR="`$DIRNAME ${SCRIPTHOME}`/templates/${INSTALL_TYPE}"
+
+# Common SW directory
+ENIQ_COMMON_SW_DIR="`$DIRNAME ${SCRIPTHOME}`/templates/common"
+
+HNAME=`${MYHOSTNAME}`
+HOST_IP=`$GETENT hosts ${HNAME} | $NAWK '{print $1}' | $HEAD -1`
+
+# Has debug flag been used?
+if [ -s ${ENIQ_CONF_DIR}/extra_params/debug ]; then
+    set -xv
+    BASH="/usr/bin/bash -xv"
+fi
+}
+
+### Function: untar_sw_bundle ###
+#
+# Untar the LDAP bundle
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+untar_sw_bundle()
+{
+if [ ! -s ${LDAP_SW_LOC}/${LDAP_BUNDLE} ]; then
+    _err_msg_="Failed to find LDAP SW bundle - ${LDAP_SW_LOC}/${LDAP_BUNDLE}"
+    abort_script "$_err_msg_" "${EXEC_SHELL_CMD}"
+fi	
+
+cd ${TEM_DIR}
+$GZCAT ${LDAP_SW_LOC}/${LDAP_BUNDLE} | $TAR xf -
+if [ $? -ne 0 ]; then
+	_err_msg_="Problem encountered extracting ${LDAP_SW_LOC}/${LDAP_BUNDLE}"
+    abort_script "$_err_msg_"
+fi
+cd ${SCRIPTHOME}
+}
+
+### Function: usage_msg ###
+#
+#   Print out the usage message
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+usage_msg()
+{
+$CLEAR
+
+$ECHO "
+Usage: `$BASENAME $0` -n <LDAP_tarfile_name> -s <LDAP_tarfile_location> [-l <path_to_logfile>]
+
+options:
+
+-n  : Parameter specifying the name of the openLDAP SW tarfile
+      
+-s  : Parameter specifying the full path to the openLDAP SW tarfile
+
+-l  : Optional parameter specifying the full path to logfile. If not specified, a 
+      logfile will be created in /eniq/local_logs/installation
+"
+}
+
+# ********************************************************************
+#
+#   Main body of program
+#
+# ********************************************************************
+#
+RUN_TIME=`$DATE '+%Y-%b-%d_%H.%M.%S'`
+
+# Determine absolute path to software
+get_absolute_path
+
+# Check that the effective id of the user is root
+check_id $DEFAULT_USER
+
+while getopts ":l:n:s:" arg; do
+  case $arg in
+    l) LOGFILE="$OPTARG"
+       ;;
+    n) LDAP_BUNDLE="$OPTARG"
+       ;;
+    s) LDAP_SW_LOC="$OPTARG"
+       ;;
+  esac
+done
+shift `expr $OPTIND - 1`
+
+if [ ! "${LDAP_BUNDLE}" -o ! "${LDAP_SW_LOC}" ]; then
+    usage_msg
+    exit 1
+fi
+
+# Set up environment variables for script.
+setup_env
+
+# Log file
+if [ ! "${LOGFILE}" ]; then
+    LOGFILE="${ENIQ_LOG_DIR}/installation/`${MYHOSTNAME}`_openldap_install.log"
+fi
+
+# Check/Create Logfile
+chk_create_logfile
+
+$ECHO "Beginning to install openLDAP" | $TEE -a ${LOGFILE}
+
+# Create a temporary Directory
+TEM_DIR=/tmp/openldap_installation.$$.$$
+$RM -rf ${TEM_DIR}
+$MKDIR -p ${TEM_DIR}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not create directory $TEM_DIR"
+    abort_script "$_err_msg_"
+fi
+
+# Untar out the LDAP tar file
+untar_sw_bundle
+
+# Install openLDAP
+install_openLDAP
+
+# Create the admin script used by SMF
+create_admin_script
+
+# Create the SMF service
+create_SMF_service
+
+$RM -rf ${TEM_DIR}
+
+exit 0

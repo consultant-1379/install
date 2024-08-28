@@ -1,0 +1,690 @@
+#!/bin/bash
+# ********************************************************************
+# Ericsson Radio Systems AB                                     SCRIPT
+# ********************************************************************
+#
+#
+# (c) Ericsson Radio Systems AB 2019 - All rights reserved.
+#
+# The copyright to the computer program(s) herein is the property
+# of Ericsson Radio Systems AB, Sweden. The programs may be used
+# and/or copied only with the written permission from Ericsson Radio
+# Systems AB or in accordance with the terms and conditions stipulated
+# in the agreement/contract under which the program(s) have been
+# supplied.
+#
+#
+# ********************************************************************
+# Name    : hostsync_monitor.bsh
+# Date    : 06/10/2023
+# Revision: main\12
+# Purpose : Monitor a master copy of the hosts file and update the local hosts file with any changes.
+#
+# ********************************************************************
+#
+# **********************    Command Section     **********************
+#
+# ********************************************************************
+AWK=/usr/bin/awk
+CAT=/usr/bin/cat
+CMP=/usr/bin/cmp
+CP=/usr/bin/cp
+DATE=/usr/bin/date
+DIGEST=/usr/bin/digest
+DIRNAME=/usr/bin/dirname
+ECHO="/usr/bin/echo -e"
+EGREP=/usr/bin/egrep
+GREP=/usr/bin/grep
+ID=/usr/bin/id
+MD5SUM=/usr/bin/md5sum
+MKDIR=/usr/bin/mkdir
+MYHOSTNAME=/usr/bin/hostname
+PERL=/usr/bin/perl
+RM=/usr/bin/rm
+SED=/usr/bin/sed
+SLEEP=/usr/bin/sleep
+SSHKEYGEN=/usr/bin/ssh-keygen
+SU=/usr/bin/su
+SYNC=/usr/sbin/sync
+TEE=/usr/bin/tee
+TOUCH=/usr/bin/touch
+
+# ********************************************************************
+#
+# **********************  Configuration Section  *********************
+#
+# ********************************************************************
+# Local hosts file that will be updated.
+readonly HOSTS_DESTINATION_FILE="/etc/hosts"
+
+# Start and End tags to look for in the hosts file
+readonly HOSTSYNC_START_MARKER="#<---- HOSTSYNC START MARKER ---->"
+readonly HOSTSYNC_END_MARKER="#<---- HOSTSYNC END MARKER ---->"
+readonly HOSTSYNC_WARNING="# WARNING DO NOT REMOVE OR EDIT BETWEEN THE HOSTSYNC MARKERS"
+
+# Sets how often to check for updates to the host file.
+readonly SLEEP_TIME_BETWEEN_CHECK=20
+
+# Used to break out of Sleep. An interrupt function will set this to true
+WAKE=false
+
+# Used to check for changes to the master hosts file on the NAS
+LOCAL_HOSTS_DIGEST=""
+MASTER_HOSTS_DIGEST=""
+
+# ini file variables
+readonly INI_CONFIG_FILE="ini_config_file.cfg"
+readonly SUNOS_INI="SunOS.ini"
+
+# ********************************************************************
+#
+# 	Functions
+#
+# ********************************************************************
+### Function: abort_script ###
+#
+#   This will is called if the script is aborted thru an error
+#   error signal sent by the kernel such as CTRL-C or if a serious
+#   error is encountered during runtime
+#
+# Arguments:
+#       $1 - Error message from part of program (Not always used)
+# Return Values:
+#       none
+abort_script()
+{
+_err_time_=`$DATE '+%Y-%b-%d_%H.%M.%S'`
+
+if [ "$1" ]; then
+    _err_msg_="${_err_time_} - $1"
+else
+    _err_msg_="${_err_time_} - ERROR : Script aborted.......\n"
+fi
+
+if [ "${LOGFILE}" ]; then
+    $ECHO "\nERROR : $_err_msg_\n" | $TEE -a ${LOGFILE}
+else
+    $ECHO "\nERROR : $_err_msg_\n"
+fi
+
+cd $SCRIPTHOME
+$RM -rf ${TEM_DIR}
+}
+
+### Function: check_id ###
+#
+#   Check that the effective id of the user is correct
+#   If not print error msg and exit.
+#
+# Arguments:
+#       $1 : User ID name
+# Return Values:
+#       none
+check_id()
+{
+_check_id_=`$ID  | $AWK -F\( '{print $2}' | $AWK -F\) '{print $1}'`
+if [ "$_check_id_" != "$1" ]; then
+    _err_msg_="You must be $1 to execute this script."
+    abort_script "$_err_msg_"
+fi
+}
+
+### Function: check_master_hosts_file ###
+#
+# Check if master hosts file is newer than local hosts file.
+#
+# Uses Global Variable: HOSTS_MASTER_FILE; HOSTS_DESTINATION_FILE; LOCAL_HOSTS_DIGEST;
+# Sets Global Variable: MASTER_HOSTS_DIGEST;
+# Arguments: none
+# Return Values:
+#       0 if local hosts file is up to date;
+# 		1 if master hosts file has changed;
+check_master_hosts_file()
+{
+if [ -n "${HOSTS_MASTER_FILE}" -a -s "${HOSTS_MASTER_FILE}" ]; then
+    MASTER_HOSTS_DIGEST=`$MD5SUM ${HOSTS_MASTER_FILE} | $AWK '{print $1}'` >> ${LOGFILE}
+    if [ ${PIPESTATUS[0]} -eq 0 ]; then
+        if [ "${MASTER_HOSTS_DIGEST}" != "${LOCAL_HOSTS_DIGEST}" ]; then
+            # Local copy of hosts file may not be up to date
+            return 1
+        fi
+    fi
+fi
+
+return 0
+}
+
+### Function: chk_create_logfile ###
+#
+# Check/Create Logfile
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+chk_create_logfile()
+{
+$MKDIR -p `$DIRNAME ${LOGFILE}`
+if [ $? -ne 0 ]; then
+	_err_msg_="Could not create directory `$DIRNAME ${LOGFILE}`"
+	abort_script "$_err_msg_"
+fi  
+
+$TOUCH -a ${LOGFILE}
+if [ $? -ne 0 ]; then
+	_err_msg_="Could not write to file ${LOGFILE}"
+	abort_script "$_err_msg_"
+fi  
+}
+
+### Function: get_absolute_path ###
+#
+# Determine absolute path to software
+#
+# Arguments:
+#	none
+# Return Values:
+#	none
+get_absolute_path() 
+{
+_dir_=`$DIRNAME $0`
+SCRIPTHOME=`cd $_dir_ 2>/dev/null && pwd || $ECHO $_dir_`
+}
+
+## Function: read_storage_type ###
+#
+# Arguments:
+#   none
+# Return Values:
+#   set varibale STORAGE_TYPE
+#
+read_storage_type()
+{
+# Read the storage type
+if [ -s ${ENIQ_CONF_DIR}/${SUNOS_INI} ]; then
+	STORAGE_TYPE=`iniget STOR_TYPE -f ${ENIQ_CONF_DIR}/${SUNOS_INI} -v STORAGE_TYPE`
+else
+	if [ -s ${ENIQ_CONF_DIR}/san_details ]; then
+		STORAGE_TYPE=`$CAT ${ENIQ_CONF_DIR}/san_details | $EGREP "^STORAGE_TYPE=" | $AWK -F\= '{print $2}'`
+	fi
+fi
+
+if [ ! "${STORAGE_TYPE}" ]; then
+	abort_script "Could not read STORAGE_TYPE param"
+fi
+}
+
+### Function: setup_env ###
+#
+# Setup up path environment etc
+#
+# Arguments:
+#	none
+# Return Values:
+#	none
+setup_env()
+{
+# Key variables
+ROOT_HOME=/root
+AUTH_KEY_FILE="${ROOT_HOME}/.ssh/authorized_keys"
+
+if [ ! "${ENIQ_BASE_DIR}" ]; then
+    ENIQ_BASE_DIR=/eniq
+fi
+
+ENIQ_INSTALL_DIR=${ENIQ_BASE_DIR}/installation
+
+# Core install dir
+ENIQ_CORE_DIR=${ENIQ_INSTALL_DIR}/core_install
+ENIQ_CORE_BIN_DIR=${ENIQ_CORE_DIR}/bin
+
+ENIQ_CONF_DIR=${ENIQ_INSTALL_DIR}/config
+if [ ! -s ${ENIQ_CONF_DIR}/${SUNOS_INI} ]; then
+    _err_msg_="Could not locate file ${ENIQ_CONF_DIR}/${SUNOS_INI}"
+    abort_script "$_err_msg_"
+fi
+
+CLI_CONF_DIR=${ENIQ_BASE_DIR}/sw/conf
+
+# Admin dir
+ENIQ_ADMIN_BIN_DIR=${ENIQ_BASE_DIR}/admin/bin
+ENIQ_ADMIN_ETC_DIR=${ENIQ_BASE_DIR}/admin/etc
+
+# SMF dir
+ENIQ_SMF_ETC_DIR="${ENIQ_BASE_DIR}/smf/etc"
+
+# File variables
+COMMON_FUNCTIONS="${ENIQ_CORE_DIR}/lib/common_functions.lib"
+HOSTS_MASTER_FILE="${CLI_CONF_DIR}/service_names"
+LOCAL_HOSTS_MASTER_FILE="${ENIQ_CONF_DIR}/service_names"
+LOCAL_BKP_HOSTS_MASTER_FILE="${ENIQ_CONF_DIR}/backup/service_names"
+PARSED_MASTER_HOSTS_FILE="${TEM_DIR}/hostsync_parsed.tmp"
+HOSTS_TEMP_FILE="${TEM_DIR}/hostsync_local.tmp"
+LOGFILE="${ENIQ_BASE_DIR}/local_logs/hostsync/hostsync.log"
+
+PUBLIC_KEY_FILE="${ENIQ_ADMIN_ETC_DIR}/id_rsa.pub"
+TEMP_AUTH_FING_FILE="${TEM_DIR}/auth_key_finger_file"
+TEMP_KEY_FING_FILE="${TEM_DIR}/auth_key_finger_indv"
+
+# Debug file settings
+DEBUG_FILE="${CLI_CONF_DIR}/.debug_hostsync"
+
+# Hostname of local host
+HNAME=`${MYHOSTNAME}`
+}
+
+### Function: sleep_function ###
+#
+# Sleep; but checks for interrupt every second
+# Any Interupt functions should set WAKE=true to terminate sleep.
+#
+# Uses Global Variables: WAKE
+# Arguments: Number of seconds to sleep for.
+#
+sleep_function()
+{
+WAKE=false
+if [[ -n "${1}" ]]; then
+	for (( i=0; i < ${1}; i++ )); do
+		$SLEEP 1
+		if [[ "${WAKE}" = "true" ]]; then
+			return
+		fi
+	done
+else
+    log_msg -s "\nIncorrect parameters passed to sleep_function()" -q -l ${LOGFILE}
+    $SLEEP 1
+fi
+}
+
+### Function: sync_ini_data ###
+#
+# Sync bits of ini files as 
+# specified in the config file
+#
+sync_ini_data()
+{
+if [ ! -s ${CLI_CONF_DIR}/ini_data_sync.cfg ]; then
+	if [ -e "${DEBUG_FILE}" ]; then	
+		log_msg -s "\n${CLI_CONF_DIR}/ini_data_sync.cfg not found" -q -l ${LOGFILE}
+	fi
+else
+	if [ -e "${DEBUG_FILE}" ]; then	
+		log_msg -t -s "Updating ini parameters as specified in ${CLI_CONF_DIR}/ini_data_sync.cfg" -q -l ${LOGFILE}
+	fi
+	
+	while read _line_; do
+		local _ini_file_=`$ECHO ${_line_} | $AWK -F"::" '{print $1}'`
+		local _ini_block_=`$ECHO ${_line_} | $AWK -F"::" '{print $2}'`
+		local _ini_param_=`$ECHO ${_line_} | $AWK -F"::" '{print $3}'`
+		
+		if [ -e "${DEBUG_FILE}" ]; then	
+			log_msg -s "Setting ${_ini_param_} value in ${_ini_file_}" -q -l ${LOGFILE}
+		fi
+		iniset ${_ini_block_} -f ${_ini_file_} "${_ini_param_}"
+		if [ $? -ne 0 ]; then
+			log_msg -s "Could not set ${_ini_param_} value in ${_ini_file_}" -q -l ${LOGFILE}
+		fi
+	done < ${CLI_CONF_DIR}/ini_data_sync.cfg
+fi
+}
+
+### Function: trap_restart_ ###
+#
+#  Restart NASd is called by trapping interrupt HUP USR1
+#  Read config file, reset counters and wake from sleeps.
+#
+trap_restart_()
+{
+log_msg -t -s "Trapped a RESTART signal for hostsync" -l ${LOGFILE}
+# Exits from sleep function immediately if interrupted during a sleep
+WAKE=true
+# will force an update of local hosts file.
+LOCAL_HOSTS_DIGEST=""
+return
+}
+
+### Function: trap_shutdown_and_exit ###
+#
+# Shutdown and Exit is called by trapping the USR2 or any of the Terminate interrupts
+#
+trap_shutdown_and_exit()
+{
+local exit_status
+if [[ -n "${1}" ]]; then
+    exit_status=${1}
+else
+    exit_status=1
+fi
+
+log_msg -t -s "Trapped a TERMINATE signal for hostsync" -l ${LOGFILE}
+exit ${exit_status}
+}
+
+### Function: update_local_hosts_file ###
+#
+# Local copy of hosts file must be updated from master copy on NAS.
+# Saves a backup of original hosts file and latest version of hosts file.
+#
+# Uses Global Variable: HOSTS_MASTER_FILE; HOSTS_DESTINATION_FILE; PARSED_MASTER_HOSTS_FILE;
+#                       HOSTS_TEMP_FILE; HOSTSYNC_START_MARKER; HOSTSYNC_END_MARKER;
+# Arguments: none
+# Return Values:
+#       0 for success;
+# 		1 for failure;
+update_local_hosts_file()
+{
+# Remove old temp files.
+if [ -f ${HOSTS_TEMP_FILE} ]; then
+	$RM ${HOSTS_TEMP_FILE} >> /dev/null 2>&1
+fi
+
+# Backup original hosts file. This should only happen once.
+if [ ! -s ${HOSTS_DESTINATION_FILE}.hostsync_orig ]; then
+    $CP ${HOSTS_DESTINATION_FILE} ${HOSTS_DESTINATION_FILE}.hostsync_orig
+fi
+
+# Backup current version of local hosts file.
+$CP ${HOSTS_DESTINATION_FILE} ${HOSTS_DESTINATION_FILE}.hostsync_bak
+
+# Copy local hosts file to temp file and remove entries between hostsync markers in the temp file.
+$CAT ${HOSTS_DESTINATION_FILE} \
+        | $PERL -ne "print unless m{^$HOSTSYNC_START_MARKER}..m{^$HOSTSYNC_END_MARKER}" \
+   	    > ${HOSTS_TEMP_FILE}
+
+# Append new START hostsync marker and warning to temp copy of hosts file.
+$ECHO ${HOSTSYNC_START_MARKER} >> ${HOSTS_TEMP_FILE}
+$ECHO ${HOSTSYNC_WARNING} >> ${HOSTS_TEMP_FILE}
+
+# Append parsed master file into temp copy of hosts file.
+$CAT ${PARSED_MASTER_HOSTS_FILE} >> ${HOSTS_TEMP_FILE}
+
+# Append new END hostsync marker to temp copy of hosts file.
+$ECHO ${HOSTSYNC_END_MARKER} >> ${HOSTS_TEMP_FILE}
+
+# Copy temp hostsfile to original
+$CP ${HOSTS_TEMP_FILE} ${HOSTS_DESTINATION_FILE}
+
+# Backup of local service_names file
+RUN_TIME=`$DATE '+%Y-%b-%d_%H.%M.%S'`
+$CP ${LOCAL_HOSTS_MASTER_FILE} ${LOCAL_BKP_HOSTS_MASTER_FILE}.${RUN_TIME}
+if [ $? -ne 0 ]; then
+        log_msg -s "Could not copy ${LOCAL_HOSTS_MASTER_FILE} to ${LOCAL_BKP_HOSTS_MASTER_FILE}.${RUN_TIME}" -q -l ${LOGFILE}
+fi
+
+# Copy NAS copy of service_names to local
+$CP ${HOSTS_MASTER_FILE} ${LOCAL_HOSTS_MASTER_FILE}
+if [ $? -ne 0 ]; then
+        log_msg -s "Could not copy ${HOSTS_MASTER_FILE} to ${LOCAL_HOSTS_MASTER_FILE}" -q -l ${LOGFILE}
+fi
+
+}
+
+### Function: update_ini_files ###
+#
+# Migrate central ini file to local dir
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+update_ini_files()
+{
+if [ -e "${DEBUG_FILE}" ]; then 	
+	log_msg -t -s "Beginning sync of files as described in ${ENIQ_SMF_ETC_DIR}/${INI_CONFIG_FILE}" -q -l ${LOGFILE}	
+fi
+
+# Check if the config file exists, and log an INFO if its not there	
+if [ -s ${ENIQ_SMF_ETC_DIR}/${INI_CONFIG_FILE} ]; then
+	# Remove comments from the config file
+	$CAT ${ENIQ_SMF_ETC_DIR}/${INI_CONFIG_FILE} | $EGREP -v '^[[:blank:]]*#' > ${TEM_DIR}/${INI_CONFIG_FILE}
+	if [ $? -ne 0 ]; then
+		log_msg -s "Could not parse comments from ${ENIQ_CONF_DIR}/${INI_CONFIG_FILE}" -q -l ${LOGFILE}
+		return 1
+	fi
+	
+	# Loop through the new commentless config file, and read each field to
+	# determine the correct paths to copy the files about
+	while read _line_; do
+		_local_file_dir_=`$ECHO ${_line_} | $AWK -F"::" '{print $1}'`
+		_shared_file_dir_=`$ECHO ${_line_} | $AWK -F"::" '{print $2}'`
+		_file_name_=`$ECHO ${_line_} | $AWK -F"::" '{print $3}'`
+		if [ ! "${_local_file_dir_}" -o ! "${_shared_file_dir_}" -o ! "${_file_name_}" ]; then
+			log_msg -s "Could not read required data from ${ENIQ_SMF_ETC_DIR}/${INI_CONFIG_FILE}" -q -l ${LOGFILE}
+			continue
+		fi
+		
+		_update_ini_=0
+		
+		# Set a flag to only update ini files when required
+		if [ "${_file_name_}" == "storage.ini" ]; then
+			if [ "${STORAGE_TYPE}" != "raw" ]; then
+				_update_ini_=1
+			fi
+		fi
+		
+		if [ ${_update_ini_} -eq 0 ]; then
+			# Only copy the files if the shared file exists, and the local file is not already the same
+			if [ -s ${_shared_file_dir_}/${_file_name_} ]; then
+				$CMP ${_shared_file_dir_}/${_file_name_} ${_local_file_dir_}/${_file_name_}
+				if [ $? -ne 0 ]; then
+					$CP ${_shared_file_dir_}/${_file_name_} ${_local_file_dir_}/${_file_name_}
+					if [ $? -ne 0 ]; then
+						log_msg -s "Could not copy ${_shared_file_dir_}/${_file_name_} to ${_local_file_dir_}/${_file_name_}" -q -l ${LOGFILE}
+					else
+						if [ -e "${DEBUG_FILE}" ]; then
+							log_msg -s "Successfully copied ${_shared_file_dir_}/${_file_name_} to ${_local_file_dir_}/${_file_name_}" -q -l ${LOGFILE}
+						fi
+					fi
+				fi
+			else
+				if [ -e "${DEBUG_FILE}" ]; then
+					log_msg -s "Could not find ${_shared_file_dir_}/${_file_name_} - will not copy to ${_local_file_dir_}" -q -l ${LOGFILE}
+				fi
+			fi
+		fi
+	done < ${TEM_DIR}/${INI_CONFIG_FILE}
+else
+	if [ -e "${DEBUG_FILE}" ]; then
+		log_msg -s "${ENIQ_SMF_ETC_DIR}/${INI_CONFIG_FILE} does not exist, or is empty" -q -l ${LOGFILE}
+	fi
+fi
+}
+
+### Function: update_keys ###
+#
+# Add root keys to authorized_keys
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+update_keys()
+{
+if [ -e "${DEBUG_FILE}" ]; then	
+	log_msg -t -s "Updating ssh keys" -q -l ${LOGFILE}
+fi
+
+if [ ! -s ${PUBLIC_KEY_FILE} ]; then
+	if [ -e "${DEBUG_FILE}" ]; then
+		log_msg -s "Could not find ${PUBLIC_KEY_FILE} file" -q -l ${LOGFILE}
+	fi
+	return 1
+fi
+
+local _root_key_fingerprint_=`${SSHKEYGEN} -E md5 -l -f ${PUBLIC_KEY_FILE} 2>/dev/null| $AWK '{print $2}' | $SED 's/MD5://'`
+if [ ! "${_root_key_fingerprint_}" ]; then
+	if [ -e "${DEBUG_FILE}" ]; then	
+		log_msg -s "Could not find fingerprint from ${PUBLIC_KEY_FILE} file" -q -l ${LOGFILE}
+	fi
+	return 1
+fi
+
+if [ ! -s ${AUTH_KEY_FILE} ]; then
+	log_msg -s "Copying ${PUBLIC_KEY_FILE} value to ${AUTH_KEY_FILE}" -q -l ${LOGFILE}
+	$CP ${PUBLIC_KEY_FILE} ${AUTH_KEY_FILE}
+	if [ $? -ne 0 ]; then
+		log_msg -s "Could not copy ${PUBLIC_KEY_FILE} to ${AUTH_KEY_FILE}" -q -l ${LOGFILE}
+	fi
+else
+	$RM -f ${TEMP_AUTH_FING_FILE}
+	while read _line_; do 
+		$RM -f ${TEMP_KEY_FING_FILE}
+		$ECHO "${_line_}" > ${TEMP_KEY_FING_FILE}
+		_auth_fing_val_=`${SSHKEYGEN} -E md5 -l -f ${TEMP_KEY_FING_FILE} | $AWK '{print $2}' | $SED 's/MD5://'`
+		$ECHO "${_auth_fing_val_}" >> ${TEMP_AUTH_FING_FILE}
+	done < ${AUTH_KEY_FILE}
+	
+	$CAT ${TEMP_AUTH_FING_FILE} | $GREP "${_root_key_fingerprint_}" >> /dev/null 2>&1
+	if [ $? -ne 0 ]; then
+		log_msg -s "Adding ${PUBLIC_KEY_FILE} value to ${AUTH_KEY_FILE}" -q -l ${LOGFILE}
+		$CAT ${PUBLIC_KEY_FILE} >> ${AUTH_KEY_FILE}
+		if [ $? -ne 0 ]; then
+			log_msg -s "Could not update ${AUTH_KEY_FILE} with ${PUBLIC_KEY_FILE} values" -q -l ${LOGFILE}
+		fi
+	else
+		if [ -e "${DEBUG_FILE}" ]; then
+			log_msg -s "No update required to ${AUTH_KEY_FILE}" -q -l ${LOGFILE}
+		fi
+	fi	
+fi	
+}
+
+### Function: validate_master_hosts_file ###
+#
+# Local copy of hosts file must be updated from master copy on NAS.
+#
+# Uses Global Variable: HOSTS_MASTER_FILE; PARSED_MASTER_HOSTS_FILE;
+# Arguments: none
+# Return Values:
+#       0 for success;
+# 		1 for failure;
+validate_master_hosts_file()
+{
+# Remove old temp files.
+if [ -f ${PARSED_MASTER_HOSTS_FILE} ]; then
+	$RM ${PARSED_MASTER_HOSTS_FILE} >> /dev/null 2>&1
+fi
+
+log_msg -s "Gathering information from ${HOSTS_MASTER_FILE}" -q -l ${LOGFILE}
+if [ "${_ip_type_}" == "IPv4" ]; then	
+	$CAT ${HOSTS_MASTER_FILE} | $EGREP -v '^[[:blank:]]*#' | $EGREP -v '^[[:blank:]]*$' \
+        | $SED -e 's/^[ ]*//' -e 's/^[	]*//' -e 's/::/  /g' \
+        > ${PARSED_MASTER_HOSTS_FILE}
+fi
+
+if [ "${_ip_type_}" == "IPv6" ]; then
+	$CAT ${HOSTS_MASTER_FILE} | $EGREP -i "nas" | $EGREP -v '^[[:blank:]]*#' | $EGREP -v '^[[:blank:]]*$' \
+        | $SED -e 's/^[ ]*//' -e 's/^[	]*//' -e 's/::/  /g' \
+        > ${PARSED_MASTER_HOSTS_FILE}
+
+	for _line_ in `$CAT ${HOSTS_MASTER_FILE} | $EGREP -iv "nas" | $EGREP -v '^[[:blank:]]*#' | $EGREP -v '^[[:blank:]]*$'` ; do	
+		unset _count_
+		local _count_=`$ECHO "${_line_}" | grep -o "::" | wc -l`
+		if [ "${_count_}" == 3 ]; then
+			$ECHO "${_line_}" | $SED -e 's/^[ ]*//' -e 's/^[	]*//' -e 's/::/  /2g' >> ${PARSED_MASTER_HOSTS_FILE}
+		else
+			$ECHO "${_line_}" | $SED -e 's/^[ ]*//' -e 's/^[	]*//' -e 's/::/  /g' >> ${PARSED_MASTER_HOSTS_FILE}
+		fi		
+	done
+fi
+
+# Returns 1 in case of PARSED_MASTER_HOSTS_FILE is empty
+if [ -s ${PARSED_MASTER_HOSTS_FILE} ]; then
+    return 0
+else
+    return 1
+fi	
+}
+
+# **********************************************************************
+#
+# ********************** Main body of program  *************************
+#
+# **********************************************************************
+#
+get_absolute_path
+
+# Check that the effective id of the user is root
+check_id root
+
+# Create temp directory
+TEM_DIR=/tmp/hostsync.$$.$$
+$RM -rf ${TEM_DIR}
+$MKDIR -p ${TEM_DIR}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not create directory ${TEM_DIR}"
+    abort_script "$_err_msg_"
+fi
+
+# Setup up path environment etc
+setup_env
+
+# Source the common functions
+if [ -s ${COMMON_FUNCTIONS} ]; then
+    . ${COMMON_FUNCTIONS}
+else
+    _err_msg_="File ${COMMON_FUNCTIONS} not found"
+    abort_script "$_err_msg_"
+fi
+
+#Fetching IP Type from IPMP_INI file.
+check_ip_type
+
+if [ ! "${_ip_type_}" ]; then
+    _err_msg_="Could not read parameter _IP_TYPE_ from file ${ENIQ_CONF_DIR}/${IPMP_INI}"
+    abort_script "$_err_msg_"
+fi
+
+# Check/Create Logfile
+chk_create_logfile
+
+log_msg -h -t -s "Starting hostsync service for ${HNAME}" -q -l ${LOGFILE}
+
+trap "trap_restart_" USR1      # Reset  Monitor
+trap "trap_restart_" INT HUP   # Restart  Monitor
+trap "trap_shutdown_and_exit 0" USR2   # Stops NAS monitor script
+trap "trap_shutdown_and_exit 1" QUIT TERM ABRT TSTP # Stops NAS monitor script
+
+# Read the storage type
+read_storage_type
+
+# Continuous loop to monitor the master copy of the hosts file stored on the NAS
+# and updates the local copy every time it changes.
+# Loop repeats every ${SLEEP_TIME_BETWEEN_CHECK} seconds
+while true; do
+    check_master_hosts_file
+    if [ $? -ne 0 ]; then
+        # Then file has changed and local hosts file should be updated.
+        log_msg -s "Local hosts file may not be in sync with master copy" -q -l ${LOGFILE}
+        validate_master_hosts_file
+        if [ $? -ne 0 ]; then
+            log_msg -s "Invalid data in master hosts file - ${HOSTS_MASTER_FILE}" -q -l ${LOGFILE}
+        else
+            log_msg -s "Validated data in master hosts file - ${HOSTS_MASTER_FILE}" -q -l ${LOGFILE}
+            update_local_hosts_file
+            if [ $? -eq 0 ]; then
+                log_msg -s "Updated local hosts file" -q -l ${LOGFILE}
+                
+                # If local host file is updated successfully, then update digest.
+                LOCAL_HOSTS_DIGEST="${MASTER_HOSTS_DIGEST}"
+            else
+                log_msg -s "Problem updating local hosts file" -q -l ${LOGFILE}
+            fi
+        fi
+    fi
+    
+    # Sync the ini files
+    update_ini_files
+    
+    # Update the authorized_keys
+    update_keys
+    
+    # Sync ini file data
+    sync_ini_data
+
+	sleep_function ${SLEEP_TIME_BETWEEN_CHECK}  # Loop repeats every ${SLEEP_TIME_BETWEEN_CHECK} seconds
+done     # End of while true loop. This monitor deamon should never end
+
+# Should never get here.
+abort_script "Exiting"

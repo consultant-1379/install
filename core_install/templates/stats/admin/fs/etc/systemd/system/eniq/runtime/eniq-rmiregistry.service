@@ -1,0 +1,19 @@
+[Unit]
+Description=The Eniq Rmi Registry Service
+Before=eniq-licmgr.service eniq-engine.service eniq-scheduler.service
+
+[Service]
+Type=forking
+User=dcuser
+Group=dc5000
+ExecStart=/eniq/smf/bin/eniq_smf_start_stop.sh -a start -s rmiregistry
+ExecStop=/eniq/smf/bin/eniq_smf_start_stop.sh -a stop -s rmiregistry
+Restart=always
+RestartSec=15
+StartLimitInterval=400
+StartLimitBurst=3
+TimeoutStartSec=0
+TimeoutStopSec=150
+
+[Install]
+WantedBy=multi-user.target

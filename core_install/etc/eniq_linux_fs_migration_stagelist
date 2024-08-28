@@ -1,0 +1,14 @@
+restore_migrate_data
+merge_config_files
+restore_iq_file
+migrate_sap_asa
+migrate_sap_iq
+install_ENIQ_platform
+install_parser
+merge_lic_file
+merge_crontab_files 
+post_configuration
+update_password
+create_snapshots
+db_expansion
+cleanup_migration

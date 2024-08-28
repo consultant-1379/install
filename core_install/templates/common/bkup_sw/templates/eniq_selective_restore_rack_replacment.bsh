@@ -1,0 +1,717 @@
+#!/usr/bin/bash
+# ********************************************************************
+# Ericsson Radio Systems AB                                     SCRIPT
+# ********************************************************************
+#
+# (c) Ericsson Radio Systems AB 2019 - All rights reserved.
+#
+# The copyright to the computer program(s) herein is the property
+# of Ericsson Radio Systems AB, Sweden. The programs may be used
+# and/or copied only with the written permission from Ericsson Radio
+# Systems AB or in accordance with the terms and conditions stipulated
+# in the agreement/contract under which the program(s) have been
+# supplied.
+#
+# ********************************************************************
+# Name    : eniq_selective_restore_rack_replacement.bsh
+# Date    : 31/01/2020
+# Revision: /main/1
+# Purpose : Selective Restore of ENIQ files in case of Rack Replacement
+##
+#
+# ********************************************************************
+#
+#   Command Section
+#
+# ********************************************************************
+AWK=/usr/bin/awk
+BASENAME=/usr/bin/basename
+CUT=/usr/bin/cut
+DATE=/usr/bin/date
+DIRNAME=/usr/bin/dirname
+ECHO='/usr/bin/echo -e'
+EXPR=/usr/bin/expr
+GREP=/usr/bin/grep
+HEAD=/usr/bin/head
+ID=/usr/bin/id
+MKDIR=/usr/bin/mkdir
+PRINTF=/usr/bin/printf
+RM=/usr/bin/rm
+SED=/usr/bin/sed
+SLEEP=/usr/bin/sleep
+TEE=/usr/bin/tee
+TOUCH=/usr/bin/touch
+
+####################
+#OMBS COMMANDS #####
+NBU_ADMIN=/usr/openv/netbackup/bin/admincmd
+NBU_BIN=/usr/openv/netbackup/bin
+####################
+
+# ********************************************************************
+#
+#   Functions
+#
+# ********************************************************************
+
+
+### Function: abort_script ###
+#
+#   This will is called if the script is aborted through an error
+#   signal sent by the kernel such as CTRL-C or if a serious
+#   error is encountered during runtime
+#
+# Arguments:
+#       $1 - Error message from part of program (Not always used)
+# Return Values:
+#       none
+abort_script()
+{
+_err_time_=`$DATE '+%Y-%b-%d_%H.%M.%S'`
+
+if [ "$1" ]; then
+    _err_msg_="${_err_time_} - $1"
+else
+    _err_msg_="${_err_time_} - Script aborted.......\n"
+fi
+
+if [ "${LOGFILE}" ]; then
+    $ECHO -e "\n${_err_msg_}\n" | $TEE -a ${LOGFILE}
+else
+    $ECHO -e "\n${_err_msg_}\n"
+fi
+
+exit 1
+
+}
+
+### Function: ask_for_input ###
+#
+#   Common function to ask for user input
+#   and stores user input in USER_VALUE
+#
+# Arguments:
+#       $1 : User message
+# Return Values:
+#       none
+ask_for_input()
+{
+_msg_=$1
+unset USER_VALUE
+
+while [ 1 ]; do
+    $ECHO  "\n${_msg_}" 
+    read USER_VALUE
+
+    if [ ! "${USER_VALUE}" == "Y" ] && [ ! "${USER_VALUE}" == "N" ];then
+        $ECHO  "\nPlease enter a valid input" 
+        continue
+    else
+        break
+    fi
+done
+eval "$2='${USER_VALUE}'"
+}
+
+### Function: check_id ###
+#
+#   Check the effective id of the user is correct
+#   If not print error message and exit.
+#
+# Arguments:
+#       $1 : User ID name
+# Return Values:
+#       none
+check_id()
+{
+_check_id_=`$ID | $AWK -F\( '{print $2}' | $AWK -F\) '{print $1}'`
+if [ "${_check_id_}" != "$1" ]; then
+    _err_msg_="You must be $1 to execute this script."
+    abort_script "${_err_msg_}"
+fi
+}
+
+### Function: chk_create_logfile ###
+#
+# Check/Create Logfile
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+chk_create_logfiles()
+{
+
+if [ ! "${LOGFILE}" ]; then
+    LOGFILE=${ERICSSON_ETC}/${_client_hostname_}/selective_restore_rack_replacement`$DATE '+%Y-%b-%d_%H.%M.%S'`.log
+fi
+
+$MKDIR -p ${ERICSSON_ETC}/${_client_hostname_}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not create directory `$DIRNAME ${LOGFILE}`"
+    abort_script "${_err_msg_}"
+fi
+
+$TOUCH -a ${LOGFILE}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not create file ${LOGFILE}"
+    abort_script "${_err_msg_}"
+fi
+
+}
+
+### Function: copy_files ###
+#
+# Restore ENIQ_PLATFORM files.
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+copy_files()
+{
+for file in ${_eniq_backup_}; do
+    $ECHO "change /.ENIQ_BACKUP${file} to ${file}" > ${change_file}
+    $ECHO "${file} restore progress log" > ${restore_proglog}
+    RESTORE_BMR_ROOT="${NBU_BIN}/bprestore -s "${_starttime_}" -e "${_endtime_}" -S `hostname` -C ${_client_hostname_} -D ${_client_hostname_} -L ${restore_proglog} -H -R ${change_file} /.ENIQ_BACKUP${file}"
+    ${RESTORE_BMR_ROOT} >>${LOGFILE} 2>&1
+    if [ $? -ne 0 ]; then
+        _err_msg_="\nRestore failed. Exiting....\n Check Below log and Netbackup GUI for more details.\n ${restore_proglog}"
+        abort_script "${_err_msg_}"
+    fi
+    $ECHO "\nRestoring ${file}. This would take some time..."
+    $SLEEP 10
+
+    count_1=1
+    jobid=$($GREP 'Restore Job Id=' ${restore_proglog} 2>> ${LOGFILE} | $AWK -F'=' '{print $2}')
+    if [ ! "${jobid}" ]; then
+        err_msg_="Could not get the value for jobid"
+        abort_script "${_err_msg_}"
+    fi
+    $SLEEP 5
+
+    while [ ! "${jobtype}" -a "${count_1}" -le 6 ]; do
+        jobtype=$(${NBU_ADMIN}/bpdbjobs -report | $GREP -w ${jobid} | $AWK '{print $2}')
+        if [ "${jobtype}" ]; then
+            break;
+        else
+            $SLEEP 10
+            count_1=$($EXPR ${count_1} + 1)
+            continue
+        fi
+    done
+    if [ ! "${jobtype}" ]; then
+        err_msg_="Could not get the value for jobtype"
+        abort_script "${_err_msg_}"
+    fi
+    validate_restore ${jobid} ${jobtype} /.ENIQ_BACKUP${file} ${file} ${restore_proglog} 60
+done
+}
+
+### Function: get_absolute_path ###
+#
+# Determine absolute path to software
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+get_absolute_path()
+{
+_dir_=`$DIRNAME $0`
+SCRIPTHOME=`cd ${_dir_} 2>/dev/null && pwd || $ECHO ${_dir_}`
+SCRIPTNAME=`$BASENAME $0`
+}
+
+### Function: get_details ###
+#
+# Get detail for backup VLAN configuration
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+get_details()
+{
+# Ask for client backup hostname
+while true
+do
+    $ECHO "\nPlease enter Client backup hostname of server: "
+    read _client_hostname_
+    if [ ! "${_client_hostname_}" ];then
+        $ECHO  "\nPlease enter a valid input" 
+        continue
+    else
+        break
+    fi
+done
+# chk_create_logfile
+chk_create_logfiles
+
+ # Ask for backup start Date and time
+while true
+do
+    $ECHO "\nPlease enter backup start Date and time in format: MM/DD/YYYY HH:MM:SS"
+    read _start_date_ _start_time_
+    if [[ ${_start_date_} =~ ^[0-9]{2}/[0-9]{2}/[0-9]{4} && ${_start_time_} =~ ^([01]?[0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9]$ ]] ; then
+        _starttime_=`$ECHO "${_start_date_} ${_start_time_} "`
+        break
+    else
+        $ECHO "\nPlease enter a valid input, Date and time  ${_start_date_} ${_start_time_} is in an invalid format (MM/DD/YYYY HH:MM:SS )"
+        continue
+    fi
+done
+
+# Ask backup end date and time
+while true; do
+    $ECHO "\nPlease enter backup End Date and time in format: MM/DD/YYYY HH:MM:SS"
+    read _end_date_ _end_time_
+    if [[ ${_end_date_} =~ ^[0-9]{2}/[0-9]{2}/[0-9]{4} && ${_end_time_} =~ ^([01]?[0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9]$ ]] ; then
+        _endtime_=`$ECHO "${_end_date_} ${_end_time_}"`
+        break
+    else
+        $ECHO "\nPlease enter a valid input, Date and time  ${_end_date_} ${_end_time_} is in an invalid format (MM/DD/YYYY HH:MM:SS )"
+        continue
+    fi
+done
+
+# Ask for SIM Configuration input
+ask_for_input "\nWas SIM configured before replacement? [Y/N]" _sim_conf_
+
+# Ask for ENM Integration input
+ask_for_input "\nWas ENM Integrated before replacement? [Y/N]" _enm_conf_
+
+# Ask for SOEM Integration input
+ask_for_input "\nWas SOEM Integrated before replacement? [Y/N]" _soem_conf_
+
+# Ask for DTDB Configuration input
+ask_for_input "\nWas DTDB Integrated before replacement? [Y/N]" _dtdb_conf_
+}
+
+### Function: iniget ###
+#
+# Read specified parts from a given ini file
+#
+# Arguments:
+#       -f  : specified ini file
+#       -p  : gives whole matching <line>
+#       -v  : gives only value of matching <line>
+#       raw : will print even commented (;) lines
+# Return Values:
+#       0 : Success
+#       1 : Error
+#       Text output
+iniget()
+{
+if [ -n "$1" ]; then
+    INIBLOCK="$1"
+    shift 1
+else
+    $ECHO "Usage: iniget <block> -f <configfile> [-<p|v> <line>] [raw]"
+    return 1
+fi
+
+unset INIWLINE INILINE INICONFIGFILE INIPRINTTYPE
+while [ -n "$1" ]; do
+    case $1 in
+        -p)    INIWLINE=parameter
+               INILINE=$2
+               shift 2
+               ;;
+        -v)    INIWLINE=value
+               INILINE=$2
+               shift 2
+               ;;
+        -f)    INICONFIGFILE=$2
+               shift 2
+               ;;
+        raw)   INIPRINTTYPE=raw
+               shift 1
+               ;;
+        *)     return 1
+               ;;
+    esac
+done
+
+if [ -z "${INICONFIGFILE}" ]; then
+    $ECHO "Usage: iniget <block> -f <configfile> [-<p|v> <line>] [raw]"
+    return 1
+fi
+
+$AWK -F= -v printtype=${INIPRINTTYPE} -v line="${INILINE}" -v way=${INIWLINE} '
+  { sub(/[       ]*$/,"");      #remove trailing whitespace and tabs
+    if ($1=="['${INIBLOCK}']") {
+        while ((getline) > 0) {
+            if ($0 ~ /^ *\[/) exit
+            if (($0 ~ /^ *;/) && (printtype!="raw")) continue
+            if ($1==line) {
+                if (way=="parameter") {print $0; exit}
+                if (way=="value")     {sub(/^[^=]*=/,""); print $0; exit}
+            }
+            else if (! line) print $0
+        }
+    }
+  }' ${INICONFIGFILE}
+}
+
+### Function: log_msg ###
+#
+# I will create the function log if one does not already exist
+# This allows user to have his/her own log function and still
+# work with the common functions
+#
+# Arguments:
+#       -l) : File to be logged to
+#               -h) : Print the message as a header
+#       -q) : don't echo the text, just tee it
+#       -s) : Text/message to be logged
+#               -t) : Prints the current time as part of the message
+# Return Values:
+#       0 : Success
+#       1 : Error
+log_msg()
+{
+local logfile quiet outstr header msg_time
+
+while [ -n "$1" ]; do
+    case $1 in
+        -l)     logfile=$2
+                shift 2
+                ;;
+        -h)     header=-h
+                shift 1
+                ;;
+        -q)     quiet=-q
+                shift 1
+                ;;
+        -s)     outstr=$2
+                shift 2
+                ;;
+        -t)     msg_time=-t
+                shift 1
+                ;;
+        *)      return 1
+                ;;
+    esac
+done
+
+if [ ! "${outstr}" ]; then
+    return 1
+fi
+
+local run_time=`$DATE '+%Y-%m-%d_%H.%M.%S'`
+if [ "${msg_time}" ]; then
+    outstr="${run_time} - ${outstr}"
+fi
+
+# Simply print the message
+if [ "${logfile}" ]; then
+    if [ ! "${quiet}" ]; then
+        $ECHO "${outstr}" |$TEE -a ${logfile}
+    else
+        $ECHO "${outstr}" >> ${logfile}
+    fi
+else
+    if [ ! "${quiet}" ]; then
+        $ECHO "${outstr}"
+    fi
+fi
+}
+
+### Function: restore_files ###
+#
+# Restore selected files for Rack Replacement.
+#
+# Arguments:
+#   $1 : type of restore file
+#   $2 : Flag
+# Return Values:
+#   none
+restore_files()
+{
+eval restore_file_type='$'$1
+eval types=$2
+
+for tag in ${restore_file_type}
+do
+
+    files_list=`iniget ${tag} -f ${INI_FILE}`
+    for entry in ${files_list}
+    do
+        hostname=`hostname`
+        unset eniq_backup root_backup
+        if [ ${types} == "YES" ]; then
+            eniq_backup=`${NBU_BIN}/bplist -C ${_client_hostname_} -S ${hostname} -s ${_starttime_} -e ${_endtime_} -R 1 /.ENIQ_BACKUP${entry} | $HEAD -n 1  2> /dev/null` 
+        else
+            root_backup=`${NBU_BIN}/bplist -C ${_client_hostname_} -S ${hostname} -s ${_starttime_} -e ${_endtime_} -R 1 ${entry} | $HEAD -n 1  2> /dev/null`
+        fi
+        
+
+        if [ -n "${eniq_backup}" ]  || [ -n "${root_backup}" ]; then
+        
+            change_file="/tmp/change_file"
+            restore_proglog="/usr/openv/netbackup/logs/file_restore_progress_${_client_hostname_}.log"
+            base_name=`$ECHO ${entry} | $AWK -F/ '{print $NF}'`
+            case $1 in
+                RESTORE_TO_ORIG_LOC) $ECHO "change /.ENIQ_BACKUP${entry} to ${entry}" > ${change_file}
+                                     $ECHO "${entry} restore progress log" > ${restore_proglog}
+                                     ;;
+                RESTORE_ENIQ_SIM_STATIC) $ECHO "change /.ENIQ_BACKUP${entry} to ${entry}" > ${change_file}
+                                     $ECHO "${entry} restore progress log" > ${restore_proglog}
+                                     ;;
+                RESTORE_ENIQ_SIM_ROOT) $ECHO "change /.ENIQ_BACKUP${entry} to ${entry}" > ${change_file}
+                                     $ECHO "${entry} restore progress log" > ${restore_proglog}
+                                     ;;
+                RESTORE_ENIQ_ENM) $ECHO "change /.ENIQ_BACKUP${entry} to ${entry}" > ${change_file}
+                                     $ECHO "${entry} restore progress log" > ${restore_proglog}
+                                     ;;
+                RESTORE_ENIQ_SOEM) $ECHO "change /.ENIQ_BACKUP${entry} to ${entry}" > ${change_file}
+                                     $ECHO "${entry} restore progress log" > ${restore_proglog}
+                                     ;;
+                RESTORE_ENIQ_DTDB) $ECHO "change /.ENIQ_BACKUP${entry} to ${entry}" > ${change_file}
+                                     $ECHO "${entry} restore progress log" > ${restore_proglog}
+                                     ;;
+                RESTORE_TO_ETC_LOC) $ECHO "change ${entry} to ${entry}" > ${change_file}
+                                     $ECHO "${entry} restore progress log" > ${restore_proglog}
+                                     ;;
+                RESTORE_TO_CRON_LOC) $ECHO "change ${entry} to ${entry}" > ${change_file}
+                                     $ECHO "${entry} restore progress log" > ${restore_proglog}
+                                     ;;
+                RESTORE_TO_TEMP_LOC_ENIQ_LOGS) $ECHO "change /.ENIQ_BACKUP${entry} to ${TEMP_RESTORE_LOCATION}${base_name}" > ${change_file}
+                                     $ECHO "${entry} restore progress log" > ${restore_proglog}
+                                     ;;
+                RESTORE_ENIQ_PLATFORM) _eniq_backup_=`${NBU_BIN}/bplist -C ${_client_hostname_} -S ${hostname} -s ${_starttime_} -e ${_endtime_} -R 1 /.ENIQ_BACKUP${entry} | $SED -e 's/\/\.ENIQ_BACKUP//g'`
+                                     copy_files
+                                     ;;
+                                   *) exit
+                                     ;;
+            esac
+
+            if [ "$1" == "RESTORE_TO_ETC_LOC" -o "$1" == "RESTORE_TO_CRON_LOC" -o "$1" == "RESTORE_ENIQ_SIM_ROOT" ];then
+                RESTORE_BMR_ROOT="${NBU_BIN}/bprestore -s "${_starttime_}" -e "${_endtime_}" -S `hostname` -C ${_client_hostname_} -D ${_client_hostname_} -L ${restore_proglog} -H -R ${change_file} ${entry}"
+            elif [ "$1" == "RESTORE_ENIQ_PLATFORM" ]; then
+                continue
+            else
+                RESTORE_BMR_ROOT="${NBU_BIN}/bprestore -s "${_starttime_}" -e "${_endtime_}" -S `hostname` -C ${_client_hostname_} -D ${_client_hostname_} -L ${restore_proglog} -H -R ${change_file} /.ENIQ_BACKUP${entry}"
+            fi
+
+
+            ${RESTORE_BMR_ROOT} >>${LOGFILE} 2>&1
+            if [ $? -ne 0 ]; then
+                _err_msg_="\nRestore failed. Exiting....\n Check Below log and Netbackup GUI for more details.\n ${restore_proglog}"
+                abort_script "${_err_msg_}"
+            fi
+
+            $ECHO "\nRestoring ${entry}. This would take some time..."
+            $SLEEP 10
+
+            count_1=1
+            jobid=$($GREP 'Restore Job Id=' ${restore_proglog} 2>> ${LOGFILE} | $AWK -F'=' '{print $2}')
+            if [ ! "${jobid}" ]; then
+                err_msg_="Could not get the value for jobid"
+                abort_script "${_err_msg_}"
+            fi
+            $SLEEP 5
+
+            while [ ! "${jobtype}" -a "${count_1}" -le 6 ]; do
+                jobtype=$(${NBU_ADMIN}/bpdbjobs -report | $GREP -w ${jobid} | $AWK '{print $2}')
+                if [ "${jobtype}" ]; then
+                    break;
+                else
+                    $SLEEP 10
+                    count_1=$($EXPR ${count_1} + 1)
+                    continue
+                fi
+            done
+            if [ ! "${jobtype}" ]; then
+                err_msg_="Could not get the value for jobtype"
+                abort_script "${_err_msg_}"
+            fi
+            
+            case $1 in
+                RESTORE_TO_ORIG_LOC) validate_restore ${jobid} $jobtype /.ENIQ_BACKUP${entry} ${entry} ${restore_proglog} 60
+                                     ;;
+                RESTORE_ENIQ_SIM_STATIC) validate_restore ${jobid} $jobtype /.ENIQ_BACKUP${entry} ${entry} ${restore_proglog} 60
+                                     ;;
+                RESTORE_ENIQ_SIM_ROOT) validate_restore ${jobid} $jobtype /.ENIQ_BACKUP${entry} ${entry} ${restore_proglog} 60
+                                     ;;
+                RESTORE_ENIQ_ENM) validate_restore ${jobid} $jobtype /.ENIQ_BACKUP${entry} ${entry} ${restore_proglog} 60
+                                     ;;
+                RESTORE_ENIQ_SOEM) validate_restore ${jobid} $jobtype /.ENIQ_BACKUP${entry} ${entry} ${restore_proglog} 60
+                                     ;;
+                RESTORE_ENIQ_DTDB) validate_restore ${jobid} $jobtype /.ENIQ_BACKUP${entry} ${entry} ${restore_proglog} 60
+                                     ;;
+                RESTORE_TO_ETC_LOC)  validate_restore ${jobid} $jobtype ${entry} ${entry} ${restore_proglog} 60
+                                     ;;
+                RESTORE_TO_CRON_LOC) validate_restore ${jobid} $jobtype ${entry} ${entry} ${restore_proglog} 60
+                                     ;;
+                RESTORE_TO_TEMP_LOC_ENIQ_LOGS) validate_restore ${jobid} $jobtype /.ENIQ_BACKUP${entry} ${TEMP_RESTORE_LOCATION}${base_name} ${restore_proglog} 60
+                                     ;;
+                                   *) exit
+                                     ;;
+            esac
+        else
+            $ECHO "${entry} not found in the backup."
+        fi
+    done
+done
+}
+
+### Function: setup_env ###
+#
+# Set up environment variables for script.
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+setup_env()
+{
+# Default user
+DEFAULT_USER=root
+
+TEMP_RESTORE_LOCATION=/eniq/log/replaced_log/
+
+RESTORE_TO_ORIG_LOC="ENIQ_FILE_SYSTEM ENIQ_SW_CONF_FILE DATABASE_FILES CONFIG_FILES"
+RESTORE_TO_ETC_LOC="FILE_SYSTEM"
+RESTORE_TO_CRON_LOC="CRON_FILES"
+RESTORE_TO_TEMP_LOC_ENIQ_LOGS="ENIQ_LOGS"
+RESTORE_ENIQ_PLATFORM="ENIQ_PLATFORM_SIM"
+RESTORE_ENIQ_SIM_STATIC="ENIQ_SIM_STATIC"
+RESTORE_ENIQ_SIM_ROOT="ENIQ_SIM_ROOT"
+RESTORE_ENIQ_ENM="ENIQ_ENM"
+RESTORE_ENIQ_SOEM="ENIQ_SOEM"
+RESTORE_ENIQ_DTDB="ENIQ_DTDB"
+
+
+INI_FILE=/ericsson/ombsl/eniq_stats_blade/bin/ini_file_rack_replacement
+
+ERICSSON_ETC=/ericsson/ombsl/eniq_stats_blade/etc
+
+}
+
+### function: validate_restore ###
+#
+# Validate the restore with Job id
+#
+# Arguments:
+#       job_id, job_type, restore_file, dest_path, log, sleep_time
+# Return Values:
+#       none
+validate_restore()
+{
+local cnt=0
+local cnt1=0
+job_id=$1
+job_type=$2
+restore_file=$3
+dest_path=$4
+log=$5
+sleep_time=$6
+
+for((i=0;;i++)); do
+    jobid_status=$(${NBU_ADMIN}/bpdbjobs -report | $AWK '{ if($1 == '${job_id}') print $3;}')
+    for ((j=0;;j++)); do
+        if [ "${jobid_status}" == "Queued" ]; then
+            if [ ${cnt1} == 0 ]; then
+                log_msg -s "Restore is in queued state."
+            fi
+            cnt1=$($EXPR ${cnt1} + 1)
+            $SLEEP 30
+        else
+            break
+        fi
+    done
+    if [ "${jobid_status}" !=  "Active" ]; then
+        jobid_ecode=$(${NBU_ADMIN}/bpdbjobs -report | $AWK '{ if($1 == '${job_id}') print $4;}')
+        if [ "${jobid_status}" == "Done" -a ${jobid_ecode} == 0 ]; then
+            $ECHO "##### Restore of ${restore_file} to ${dest_path} logs #####" >>${LOGFILE}
+            log_msg -s "\nRestore of ${restore_file} to ${dest_path} is successful." -l ${LOGFILE} -w
+            break
+        else
+            $ECHO "##### Restore of ${restore_file} to ${dest_path} logs #####" >>${LOGFILE}
+            log_msg -s "\nRestore of ${restore_file} to ${dest_path} failed.\nExiting..." -l ${LOGFILE} -w
+            local fail_reason="$($GREP -w Status ${log} | $CUT -f2 -d'=')"
+            _err_msg_="Restore failed with ${fail_reason}"
+            abort_script "${_err_msg_}"
+        fi
+    elif [ "${job_type}" == "Restore" ]; then
+        for ((j=0;;j++)); do
+            if [ "${jobid_status}" == "Queued" ]; then
+                if [ ${cnt1} == 0 ]; then
+                    log_msg -s "Restore is in queued state."
+                fi
+                cnt1=$($EXPR ${cnt1} + 1)
+                $SLEEP 30
+            else
+                break
+            fi
+        done
+        if [ ${cnt} == 0 ]; then
+            log_msg -s "Restore is in progress"
+        else
+            $PRINTF ". "
+        fi
+        cnt=$($EXPR ${cnt} + 1)
+        $SLEEP ${sleep_time} >> /dev/null 2>&1
+    else
+        _err_msg_="Mismatch in Job ID ${job_id} and Job Type ${job_type}"
+        abort_script "${_err_msg_}"
+    fi
+done
+
+}
+
+# ********************************************************************
+#
+#   Main body of program
+#
+# ********************************************************************
+#
+
+#Get the absolute path of the script
+get_absolute_path
+
+# Set up environment variables for script.
+setup_env
+
+# Check that the effective id of the user is root
+check_id ${DEFAULT_USER}
+
+# Get backup details
+get_details
+
+log_msg -s "\n-----------------------$($DATE '+%Y-%b-%d_%H.%M.%S') : Starting restore -------------------\n" -l ${LOGFILE}
+
+FINAL_TAG="RESTORE_TO_ORIG_LOC RESTORE_TO_ETC_LOC RESTORE_TO_CRON_LOC RESTORE_TO_TEMP_LOC_ENIQ_LOGS "
+if [ ${_sim_conf_} == "Y" ]; then
+    FINAL_TAG=${FINAL_TAG}+"RESTORE_ENIQ_PLATFORM RESTORE_ENIQ_SIM_STATIC RESTORE_ENIQ_SIM_ROOT "
+fi
+
+if [ ${_enm_conf_} == "Y" ]; then
+    FINAL_TAG=${FINAL_TAG}+"RESTORE_ENIQ_ENM "
+fi
+
+if [ ${_soem_conf_}  == "Y"  ]; then
+    FINAL_TAG=${FINAL_TAG}+"RESTORE_ENIQ_SOEM "
+fi
+
+if [ ${_dtdb_conf_} == "Y"  ]; then
+    FINAL_TAG=${FINAL_TAG}+"RESTORE_ENIQ_DTDB "
+fi
+
+FINAL_TAG=$( $ECHO ${FINAL_TAG} | $SED "s/+//g" )
+
+for _tag_name_ in ${FINAL_TAG}
+do
+    if [ ${_tag_name_} == "RESTORE_TO_ETC_LOC" -o ${_tag_name_} == "RESTORE_TO_CRON_LOC" -o ${_tag_name_} == "RESTORE_ENIQ_SIM_ROOT" ]; then
+        FLAG="NO"
+    else
+        FLAG="YES"
+    fi
+    restore_files ${_tag_name_} ${FLAG}
+done 
+
+log_msg -s "\n-----------------------$($DATE '+%Y-%b-%d_%H.%M.%S') : Successfully completed ENIQ selective restore for Rack Replacement. Check Logfile: ${LOGFILE} -----------------------\n"  -l ${LOGFILE}
+
+exit 0

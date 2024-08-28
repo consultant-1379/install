@@ -1,0 +1,1369 @@
+#!/bin/bash
+
+# ********************************************************************
+# Ericsson Radio Systems AB SCRIPT
+# ********************************************************************
+#
+# (c) Ericsson Radio Systems AB 2023 - All rights reserved.
+#
+# The copyright to the computer program(s) herein is the property
+# of Ericsson Radio Systems AB, Sweden. The programs may be used
+# and/or copied only with the written permission from Ericsson Radio
+# Systems AB or in accordance with the terms and conditions stipulated
+# in the agreement/contract under which the program(s) have been
+# supplied.
+#
+# ********************************************************************
+# Name    : set_ipmp_enm.bsh
+# Date    : 25/10/2023
+# Revision: 13
+# Purpose : Script to configure BOND for ENM Storage.
+#
+# Usage   : set_ipmp_enm.bsh
+#
+# ********************************************************************
+#
+#   Command Section
+#
+# ********************************************************************
+
+AWK=/usr/bin/awk
+BASH=/usr/bin/bash
+CAT=/usr/bin/cat
+CP=/usr/bin/cp
+DATE=/usr/bin/date
+DMIDECODE=/usr/sbin/dmidecode
+ECHO=/usr/bin/echo
+EGREP=/usr/bin/egrep
+GREP=/usr/bin/grep
+HOSTNAME=/usr/bin/hostname
+LS=/usr/bin/ls
+MKDIR=/usr/bin/mkdir
+NMCLI=/usr/bin/nmcli
+SED=/usr/bin/sed
+TAIL=/usr/bin/tail
+TEE=/usr/bin/tee
+ID=/usr/bin/id
+PRINTF=/usr/bin/printf
+RM=/usr/bin/rm
+SYSTEMCTL=/usr/bin/systemctl
+
+#Define INI files.
+IPMP_INI=ipmp.ini
+
+# Define used directories path.
+TEM_DIR=/tmp/enm_ipmp
+ENIQ_LIB_DIR=/eniq/installation/core_install/lib/
+ENIQ_CONF_DIR=/eniq/installation/config
+ENIQ_TEMPL_DIR=/eniq/installation/core_install/templates/stats
+INIADD=/eniq/installation/core_install/lib/iniadd.pl
+INIDEL=/eniq/installation/core_install/lib/inidel.pl
+
+INTF_DIR="/etc/sysconfig/network-scripts/"
+
+# ********************************************************************
+#                                                                    *
+#                           Functions                                *
+#                                                                    *
+# ********************************************************************
+######################### Function: abort_script ######################
+#                                                                     #
+#   This will is called if the script is aborted thru an error        #
+#   signal sent by the kernel such as CTRL-C or if a serious          #
+#   error is encountered during runtime                               #
+#                                                                     #
+# Arguments:                                                          #
+#       $1 - Error message from part of program (Not always used)     #
+# Return Values:                                                      #
+#       none                                                          #
+# #####################################################################
+
+abort_script()
+{
+
+if [ -d ${TEM_DIR} ]; then
+    $RM -rf ${TEM_DIR}
+fi
+_err_time_=`$DATE '+%Y-%b-%d_%H.%M.%S'`
+
+if [ "$1" ]; then
+    _err_msg_="${_err_time_} - $1"
+else
+    _err_msg_="${_err_time_} - ERROR : Script aborted.......\n"
+fi
+if [ "${LOGFILE}" ]; then
+    $ECHO "\nERROR : ${_err_msg_}\n" | $TEE -a ${LOGFILE}
+else
+    $ECHO "\nERROR : ${_err_msg_}\n"
+fi
+exit 1
+}
+
+
+########################### Function: check_id #########################
+#                                                                      #
+#   Checks that the effective id of the user is correct                #
+#   If not print error msg and exit.                                   #
+#                                                                      #
+# Arguments:                                                           #
+#       $1 : User ID name                                              #
+# Return Values:                                                       #
+#       none                                                           #
+########################################################################
+
+check_id()
+{
+_check_id_=`$ID  | $AWK -F\( '{print $2}' | $AWK -F\) '{print $1}'`
+if [ "$_check_id_" != "$1" ]; then
+    _err_msg_="You must be $1 to execute this script."
+    abort_script "$_err_msg_"
+fi
+}
+
+######################## Function: usage ###########################
+#                                                                  #
+#Description: Copies ini file to temp directory                        #
+#                                                                  #
+####################################################################
+
+copy_ini_temp()
+{
+if [ -s ${ENIQ_CONF_DIR}/${IPMP_INI} ]; then
+    log_msg -q -t -l ${LOGFILE} -s "Copying ${ENIQ_CONF_DIR}/${IPMP_INI} to ${TEM_DIR}/${IPMP_INI}"
+    $CP ${ENIQ_CONF_DIR}/${IPMP_INI} ${TEM_DIR}/${IPMP_INI}
+    if [ $? -ne 0 ]; then
+        _err_msg_="Could not copy ${ENIQ_CONF_DIR}/${IPMP_INI} to ${TEM_DIR}/${IPMP_INI}"
+        abort_script "${_err_msg_}"
+    fi
+else
+    _err_msg_="${ENIQ_CONF_DIR}/${IPMP_INI} does not exist, or is empty"
+    abort_script "${_err_msg_}"
+fi
+}
+
+
+### Function: get_ipmp_information ####
+#                                     #
+#                                     #
+#                                     #
+# Arguments:                          #
+#  NA                                 #
+# Return Values:                      #
+#   0 : Success                       #
+#   1 : Fail                          #
+#######################################
+
+get_ipmp_information()
+{
+log_msg -q -t -l ${LOGFILE} -s "Getting IPMP Information"
+$RM -rf ${TEM_DIR}/interface_list
+
+if [ "${SAN_DEVICE}" != "unityXT" ]; then
+log_msg -q -t -l ${LOGFILE} -s "Build a list of interfaces....."
+
+if [ -s ${ENIQ_CONF_DIR}/${IPMP_INI} ]; then
+    _ipmp_config_list_=`iniget IPMP -f ${TEM_DIR}/${IPMP_INI}`
+    if [ ! "${_ipmp_config_list_}" ]; then
+        _err_msg_="Could not build a list of VLAN blocks from ${TEM_DIR}/${IPMP_INI}"
+        abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+    fi
+    for _ipmp_det_ in ${_ipmp_config_list_}; do
+	    if [ "${_ipmp_det_}" != "IPMP_INTF_4" ]; then
+            _ipmp_vlan_enabled_=`iniget ${_ipmp_det_} -f ${TEM_DIR}/${IPMP_INI} -v BONDING_ENABLE`
+            if [ "${_ipmp_vlan_enabled_}" == "Y" ]; then
+                iniget ${_ipmp_det_} -f ${ENIQ_CONF_DIR}/${IPMP_INI} -v IPMP_Group_Intf >> ${TEM_DIR}/usd_interface_list
+                if [ $? -ne 0 ]; then
+                    _err_msg_="Could not read BONDING_ENABLE Y/N for ${_ipmp_det_} from ${TEM_DIR}/${IPMP_INI}"
+                    abort_script "${_err_msg_}"
+                fi
+            fi
+		fi
+    done
+fi
+
+_used_interface_list=`$CAT ${TEM_DIR}/usd_interface_list | $SED -e 's/ /\|/g'`
+
+$NMCLI device | $AWK '{print $1}' | $EGREP -v '*bond*|DEVICE|lo' > ${TEM_DIR}/interface_list_temp
+
+$CAT ${TEM_DIR}/interface_list_temp | $EGREP -v "${_used_interface_list}" > ${TEM_DIR}/interface_list
+
+if [ ! -s ${TEM_DIR}/interface_list ]; then
+    _err_msg_="No interfaces available for ENM Configuration"
+    abort_script "${_err_msg_}"
+fi
+fi
+
+log_msg -q -t -l ${LOGFILE} -s "Getting information from ${TEM_DIR}/${IPMP_INI}"
+
+while :; do
+
+    $RM -rf $TEM_DIR/ipmp_information
+
+    $PRINTF '\33[H\33[2J'
+    $ECHO "\nIPMP Information" >> $TEM_DIR/ipmp_information
+    $ECHO "----------------" >> $TEM_DIR/ipmp_information
+
+    _ipmp_config_list_=`iniget IPMP -f ${TEM_DIR}/${IPMP_INI} | $TAIL -1`
+    if [ ! "${_ipmp_config_list_}" ]; then
+        _err_msg_="Could not read interface list in ${TEM_DIR}/${IPMP_INI}"
+        abort_script "${_err_msg_}"
+    fi
+    _ipmp_group_name_=`iniget ${_ipmp_config_list_} -f ${TEM_DIR}/${IPMP_INI} -v IPMP_VLAN_Group_Name`
+    if [ ! "${_ipmp_group_name_}" ]; then
+        _err_msg_="Could not read IPMP_VLAN_Group_Name in ${TEM_DIR}/${IPMP_INI}"
+        abort_script "${_err_msg_}"
+    fi
+    _ipmp_enabled_=`iniget ${_ipmp_config_list_} -f ${TEM_DIR}/${IPMP_INI} -v BONDING_ENABLE`
+    if [ ! "${_ipmp_enabled_}" ]; then
+        _err_msg_="Could not read BONDING_ENABLE Y/N in ${TEM_DIR}/${IPMP_INI}"
+        abort_script "${_err_msg_}"
+    fi
+
+    log_msg -q -t -l ${LOGFILE} -s "Updating INI information for ${_ipmp_group_name_}"
+
+if [ "${SAN_DEVICE}" != "unityXT" ]; then
+    common_get_intf_names "${_ipmp_group_name_}" ${TEM_DIR} ${TEM_DIR}/interface_list "${_ipmp_enabled_}"
+
+    iniset ${_ipmp_config_list_} -f ${TEM_DIR}/${IPMP_INI} IPMP_Group_Intf="${IPMP_INTERFACE_VALUES}"
+    if [ $? -ne 0 ]; then
+        _err_msg_="Could not update ${TEM_DIR}/${IPMP_INI} with IPMP_Group_Intf=${IPMP_INTERFACE_VALUES} for ${_ipmp_det_}"
+        abort_script "${_err_msg_}"
+    fi
+else
+    iniset ${_ipmp_config_list_} -f ${TEM_DIR}/${IPMP_INI} IPMP_Group_Intf=bond0
+    if [ $? -ne 0 ]; then
+        _err_msg_="Could not update ${TEM_DIR}/${IPMP_INI} with IPMP_Group_Intf=bond0 for ${_ipmp_det_}"
+        abort_script "${_err_msg_}"
+    fi
+fi
+
+    common_get_vlan_ipmp_ip "${_ipmp_group_name_}"
+    _group_ip_=${IPMP_IPS}
+    iniset ${_ipmp_config_list_} -f ${TEM_DIR}/${IPMP_INI} IPMP_Group_IP=${IPMP_IPS}
+    if [ $? -ne 0 ]; then
+        _err_msg_="Could not update ${TEM_DIR}/${IPMP_INI} with IPMP_Group_IP=${IPMP_IPS} for ${_ipmp_det_}"
+        abort_script "${_err_msg_}"
+    fi
+    
+    log_msg -q -t -l ${LOGFILE} -s "Updating group netmask......"
+    common_get_vlan_ipmp_netmask "${_ipmp_group_name_}"
+    _ipv4_netmask_=${IPMP_NETMASKS}
+    iniset ${_ipmp_config_list_} -f ${TEM_DIR}/${IPMP_INI} IPMP_Group_Netmask=${IPMP_NETMASKS}
+    if [ $? -ne 0 ]; then
+        _err_msg_="Could not update ${TEM_DIR}/${IPMP_INI} with IPMP_Group_Netmask=${IPMP_NETMASKS} for ${_ipmp_config_list_}"
+        abort_script "${_err_msg_}"
+    fi
+
+    log_msg -q -t -l ${LOGFILE} -s "Updating group gateway......"
+    common_get_vlan_gateway "${_ipmp_group_name_}"
+    _ipv4_gateway_=${IPMP_GATEWAY}
+    iniset ${_ipmp_config_list_} -f ${TEM_DIR}/${IPMP_INI} IPMP_Group_Gateway=${IPMP_GATEWAY}
+    if [ $? -ne 0 ]; then
+        _err_msg_="Could not update ${TEM_DIR}/${IPMP_INI} with IPMP_Group_Gateway=${IPMP_GATEWAY} for ${_ipmp_config_list_}"
+        abort_script "${_err_msg_}"
+    fi
+    
+if [ "${SAN_DEVICE}" == "unityXT" ]; then
+    log_msg -q -t -l ${LOGFILE} -s "Updating group vlan......"
+        common_get_vlan_id "${_ipmp_group_name_}"
+        _vlan_id_=${ID_VLAN}
+        iniset ${_ipmp_config_list_} -f ${TEM_DIR}/${IPMP_INI} IPMP_VLAN_Group_ID=${ID_VLAN}
+        if [ $? -ne 0 ]; then
+            _err_msg_="Could not update ${TEM_DIR}/${IPMP_INI} with IPMP_VLAN_Group_ID=${ID_VLAN} for ${_ipmp_config_list_}"
+            abort_script "${_err_msg_}"
+        fi
+else
+    log_msg -q -t -l ${LOGFILE} -s "Updating group gateway......"
+    common_get_vlan_arp "${_ipmp_group_name_}"
+    _ipv4_arp_=${IPMP_ARP}
+    iniset ${_ipmp_config_list_} -f ${TEM_DIR}/${IPMP_INI} ARP_IP_TARGET=${IPMP_ARP}
+    if [ $? -ne 0 ]; then
+        _err_msg_="Could not update ${TEM_DIR}/${IPMP_INI} with ARP_IP_TARGET=${IPMP_ARP} for ${_ipmp_config_list_}"
+        abort_script "${_err_msg_}"
+    fi
+fi
+    # Get the network address by 'ANDing' Netmask & IP address
+    if [ "${_ipmp_group_name_}" == "ENM Storage Group" ]; then
+        _net_=`get_network_addr "${IPMP_NETMASKS}" "${IPMP_IPS}"`
+        _default_netmask_="${_net_}:${IPMP_NETMASKS}"
+        _out_msg_="Enter the Storage VLAN network-number:netmask details"
+        common_get_netmask_info "${_out_msg_}" "${_default_netmask_}"
+        if [ $? -ne 0 ]; then
+            _err_msg_="Failed to get Storage VLAN network-number:netmask details"
+            abort_script "${_err_msg_}"
+        fi
+        if [ ! "${NETMASK_INFO}" ]; then
+            _err_msg_="Could not determine server network-number:netmask details"
+            abort_script "${_err_msg_}"
+        fi
+
+        log_msg -q -t -l ${LOGFILE} -s "Updating ENM_STOR_NETMASK netmask......"
+        iniset ENM_STOR_NETMASK -f ${TEM_DIR}/${IPMP_INI} NETMASKS=${NETMASK_INFO}
+        if [ $? -ne 0 ]; then
+            _err_msg_="Could not update ${TEM_DIR}/${IPMP_INI} with NETMASKS=${NETMASK_INFO}"
+            abort_script "${_err_msg_}"
+        fi
+    fi
+
+    log_msg -q -t -l ${LOGFILE} -s "Updating ${TEM_DIR}/ipmp_information file...."
+    $ECHO "\nGroup name:\t${_ipmp_group_name_}" >> $TEM_DIR/ipmp_information
+    if [ "${SAN_DEVICE}" == "unityXT" ]; then
+    	$ECHO "\nInterface name:\tbond0" >> $TEM_DIR/ipmp_information
+    else
+	$ECHO "\nInterface name:\t${IPMP_INTERFACE_VALUES}" >> $TEM_DIR/ipmp_information
+    fi
+    $ECHO "${_ipmp_group_name_} IP:\t${_group_ip_}" >> $TEM_DIR/ipmp_information
+    $ECHO "${_ipmp_group_name_} netmask:\t${_ipv4_netmask_}" >> $TEM_DIR/ipmp_information
+    $ECHO "${_ipmp_group_name_} gateway:\t${_ipv4_gateway_}" >> $TEM_DIR/ipmp_information
+    if [ "${SAN_DEVICE}" == "unityXT" ]; then
+     	$ECHO "${_ipmp_group_name_} VLAN ID:\t${_vlan_id_}" >> $TEM_DIR/ipmp_information
+   	$ECHO "${_ipmp_group_name_} network netmask:\t${NETMASK_INFO}" >> $TEM_DIR/ipmp_information
+    else
+        $ECHO "${_ipmp_group_name_} arp ip target:\t${_ipv4_arp_}" >> $TEM_DIR/ipmp_information
+        $ECHO "${_ipmp_group_name_} network netmask:\t${NETMASK_INFO}" >> $TEM_DIR/ipmp_information
+    fi
+
+    while :; do
+        $PRINTF '\33[H\33[2J'
+
+        $CAT $TEM_DIR/ipmp_information
+        $ECHO "\nIs the information above correct (Yes|No)"
+        read _ans_
+
+        if [ ! "${_ans_}" ]; then
+            continue
+        fi
+
+        if [ "${_ans_}" == "Yes" -o "${_ans_}" == "No" ]; then
+            break
+        else
+            continue
+        fi
+    done
+
+    if [ "${_ans_}" == "Yes" ]; then
+        break
+    else
+        log_msg -q -t -l ${LOGFILE} -s "Unset the IPMP_INTERFACE_VALUES....."
+        unset IPMP_INTERFACE_VALUES
+        continue
+    fi
+done
+}
+
+############## Function: import_common_functions ########################################
+#                                                                                       #
+# Description:  Imports the common lib files which imports common functions             #
+#                                                                                       #
+#                                                                                       #
+#########################################################################################
+
+import_common_functions()
+{
+COMMON_FUNCS_LIB=${ENIQ_LIB_DIR}/common_functions.lib
+COMMON_CORE_INSTALL_FUNCTIONS_LIB=${ENIQ_LIB_DIR}/common_core_install_functions.lib
+COMMON_INIRATOR_FUNCTIONS_LIB=${ENIQ_LIB_DIR}/common_inirator_functions.lib
+
+_lib_files_="${COMMON_FUNCS_LIB} ${COMMON_CORE_INSTALL_FUNCTIONS_LIB} ${COMMON_INIRATOR_FUNCTIONS_LIB}"
+
+for _lib_file_ in ${_lib_files_}
+do
+    if [ ! -f "${_lib_file_}" ]; then
+        _err_msg_="${_lib_file_} missing, this is required for this script, exiting!!!!"
+        abort_script "${_err_msg_}"
+    fi
+    . ${_lib_file_}
+    if [ $? -ne 0 ]; then
+        _err_msg_="Importing functions of ${_lib_file_} failed, exiting!!!!"
+        abort_script "${_err_msg_}"
+    fi
+done
+}
+
+############## Function: exist_bond #########################################
+#                                                                           #
+# Description:  Removes the existing bond files                             #
+#                                                                           #
+#                                                                           #
+#############################################################################
+
+exist_bond()
+{
+    _enm_bond_=`iniget ENM_BASED_BONDING -f ${ENIQ_CONF_DIR}/${IPMP_INI} -v ENM_CONFIGURED`
+    if [ "${_enm_bond_}" ]; then
+	if [ -s /etc/sysconfig/network-scripts/ifcfg-${_enm_bond_} ]; then
+        log_msg -t -l ${LOGFILE} -s "Cleaning up existing bond file..."
+        $NMCLI con del ${_enm_bond_} 
+        if [ $? -ne 0 ]; then
+            $ECHO "Could not delete bond file ${_enm_bond_}" | $TEE -a ${_logfile_}
+            return 1
+        fi
+	fi
+    fi
+    if [ "${SAN_DEVICE}" != "unityXT" ]; then
+    _enm_intf_list=`iniget IPMP_INTF_4 -f ${ENIQ_CONF_DIR}/${IPMP_INI} -v IPMP_Group_Intf`
+    if [ "${_enm_intf_list}" ]; then
+        for _enm_inft_ in ${_enm_intf_list}; do
+		    $MV ${ENIQ_INTF_DIR}/ifcfg-${_enm_inft_} ${INTF_DIR}
+            $NMCLI con delete bond-slave-${_enm_inft_}
+        done
+	else
+	    $ECHO "Could not find the interfaces for ${_enm_bond_}" | $TEE -a ${_logfile_}
+        return 1
+    fi
+    fi
+	$SYSTEMCTL restart ${NETWORK_SERVICE}
+    if [ $? -ne 0 ]; then
+        log_msg -l ${_logfile_} -s "Network service not restarted successfully"
+        return 1
+    fi
+}
+
+########## Function: setup_ipmp ############
+#                                          #
+# Updates to allow root to ftp             #
+#                                          #
+# Arguments:                               #
+#   $1 : logfile                           #
+#   $2 : IPMP ini file                     #
+# Return Values:                           #
+#   0 : Success                            #
+#   1 : Fail                               #
+############################################
+
+setup_ipmp()
+{
+local _logfile_=$1
+local _ipmp_config_list_ini_file_=$2
+
+_ipmp_config_list_=`iniget IPMP -f ${_ipmp_config_list_ini_file_} | $TAIL -1`
+
+# Get the values required
+_intf_list_=`iniget ${_ipmp_config_list_} -f ${_ipmp_config_list_ini_file_} -v IPMP_Group_Intf`
+if [ ! "${_intf_list_}" ]; then
+    log_msg -t -l ${LOGFILE} -s "No interfaces found for ${_ipmp_config_list_} block in ${_ipmp_config_list_ini_file_}"
+    return 1
+fi
+
+_client_ip_=`iniget ${_ipmp_config_list_} -f ${_ipmp_config_list_ini_file_} -v IPMP_Group_IP`
+_netmask_=`iniget ${_ipmp_config_list_} -f ${_ipmp_config_list_ini_file_} -v IPMP_Group_Netmask`
+_vlan_group_=`iniget ${_ipmp_config_list_} -f ${_ipmp_config_list_ini_file_} -v IPMP_Group_Name`
+_gateway_=`iniget ${_ipmp_config_list_} -f ${_ipmp_config_list_ini_file_} -v IPMP_Group_Gateway`
+if [ ! "${_client_ip_}" -o ! "${_netmask_}" -o ! "${_vlan_group_}" -o ! "${_gateway_}" ]; then
+    log_msg -t -l ${LOGFILE} -s "Could not read IPMP values for ${_ipmp_config_list_} in ${_ipmp_config_list_ini_file_}"
+    return 1
+fi
+
+if [ "${_ip_type_}" == "IPv6" -a "${_vlan_group_}" == "oss_grp" ]; then
+    _netmask_subnet_=`$CAT ${ENIQ_CONF_DIR}/${HNAME}/${HNAME}_ks_cfg.txt | $GREP CLIENT_IP_ADDR_V6 | $AWK -F"=" '{ print $2 }' | $AWK -F"/" '{print $2}'`
+    HNAME=`${HOSTNAME}`
+    if [ ! "${_netmask_subnet_}" ]; then
+      log_msg -l ${_logfile_} -s "Failed to get subnet"
+      return 1
+    fi
+else
+   _netmask_subnet_=`get_network_from_netmask ${_netmask_}`
+   if [ ! "${_netmask_subnet_}" ]; then
+      $ECHO "Failed to get subnet"
+      return 1
+   fi
+fi
+
+if [ "${SAN_DEVICE}" == "unityXT" ]; then
+#get the primary interface from ipmp.ini for each vlan
+_primary_intf_=`iniget ${_ipmp_config_list_} -f ${_ipmp_config_list_ini_file_} -v IPMP_Group_Intf | $AWK '{print $1}'`
+if [ ! "${_primary_intf_}" ]; then
+    log_msg -l ${_logfile_} -s "Could not read primary interface"
+    return 1
+fi
+#To get the VLAN id from ipmp.ini file for each vlan
+_vlan_id_=`iniget ${_ipmp_config_list_} -f ${_ipmp_config_list_ini_file_} -v IPMP_VLAN_Group_ID`
+if [ ! "${_vlan_id_}" ]; then
+    log_msg -l ${_logfile_} -s "Failed to get Gateway"
+    return 1
+fi
+_bond_tag_=${_primary_intf_}.${_vlan_id_}
+if [ ! "${_bond_tag_}" ]; then
+    log_msg -l ${_logfile_} -s "Failed to set VLAN tag file name"
+    return 1
+fi
+#configure VLAN tag file
+    $NMCLI con add type vlan \
+    con-name ${_bond_tag_} \
+    dev ${_primary_intf_} \
+    id ${_vlan_id_} \
+    ip4 ${_client_ip_}/${_netmask_subnet_} \
+    ipv4.never-default true \
+        gw4 ${_gateway_} | $TEE -a ${_logfile_}
+if [ $? -ne 0 ]; then
+    log_msg -l ${_logfile_} -s "Could not Create VLAN tag file for ${_vlan_group_}"
+    return 1
+else
+    log_msg -l ${_logfile_} -s "Successfully created VLAN tag file ifcfg-${_bond_tag_} for ${_vlan_group_} \n"
+fi
+#bring the connection up
+$NMCLI connection up ${_bond_tag_} | $TEE -a ${_logfile_}
+if [ $? -ne 0 ]; then
+    log_msg -l ${_logfile_} -s "Unable to make up ${_bond_tag_}"
+    return 1
+else
+    log_msg -l ${_logfile_} -s "Successfully activated VLAN tag ifcfg-${_bond_tag_} for ${_vlan_group_} \n\n"
+fi
+else
+_client_arp_target_=`iniget ${_ipmp_config_list_} -f ${_ipmp_config_list_ini_file_} -v ARP_IP_TARGET`
+if [ ! "${_client_arp_target_}" ]; then
+    log_msg -l ${_logfile_} -s "Failed to get arp-ip-target"
+    return 1
+fi
+
+_mode_group_=`iniget BOND_PARAMETER -f ${_ipmp_config_list_ini_file_} -v MODE`
+if [ ! "${_mode_group_}" ]; then
+    $ECHO "Failed to get mode"
+    return 1
+fi
+
+_arp_interval_group_=`iniget BOND_PARAMETER -f ${_ipmp_config_list_ini_file_} -v ARP_INTERVAL`
+if [ ! "${_arp_interval_group_}" ]; then
+    $ECHO "Failed to get arp interval"
+    return 1
+fi
+
+_primary_intf_=`iniget ${_ipmp_config_list_} -f ${_ipmp_config_list_ini_file_} -v IPMP_Group_Intf | $AWK '{print $1}'`
+
+#To get the bond name for each vlan
+_bond_tag_=`get_next_bond`
+if [ ! "${_bond_tag_}" ]; then
+    log_msg -l ${_logfile_} -s "Failed to next bond count"
+    return 1
+fi
+
+#get the selected interfaces from ipmp.ini
+_ethernet_list_=`iniget ${_ipmp_config_list_} -f ${_ipmp_config_list_ini_file_} -v IPMP_Group_Intf`
+if [ ! "${_ethernet_list_}" ]; then
+    log_msg -l ${_logfile_} -s "Could not selected interfaces"
+    return 1
+fi
+
+#Move the interface configuration files
+for _ethernet_det_ in ${_ethernet_list_}; do
+    $MV ${INTF_DIR}/ifcfg-${_ethernet_det_} ${ENIQ_INTF_DIR}
+    if [ $? -ne 0 ]; then
+        log_msg -l ${_logfile_} -s "Copied the original interface file"
+        return 1
+    fi
+done
+
+#configure bond file for each vlan
+$NMCLI con add type bond \
+    con-name ${_bond_tag_} \
+    ifname ${_bond_tag_} \
+    mode ${_mode_group_} \
+    ip4 ${_client_ip_}/${_netmask_subnet_} \
+    ipv4.never-default true \
+    ipv4.dns "${_dns_ip_}" \
+    arp-interval ${_arp_interval_group_} \
+    arp-ip-target ${_client_arp_target_} \
+    primary ${_primary_intf_} | $TEE -a ${_logfile_}
+status=(${PIPESTATUS[@]})
+pipe_status0=${status[0]}
+pipe_status1=${status[1]}
+if [ "${pipe_status0}" -ne 0 ]; then
+    log_msg -l ${_logfile_} -s "Could not Create bond file for ${_vlan_group_}"
+    return 1
+else
+    log_msg -l ${_logfile_} -s "Successfully created bond file ifcfg-${_bond_tag_} for ${_vlan_group_} \n"
+fi
+
+#configure bond-slave file
+for _ethernet_det_ in ${_ethernet_list_}; do
+    $NMCLI con add type bond-slave ifname ${_ethernet_det_} master ${_bond_tag_} | $TEE -a ${_logfile_}
+	status=(${PIPESTATUS[@]})
+    pipe_status0=${status[0]}
+    pipe_status1=${status[1]}
+    if [ "${pipe_status0}" -ne 0 ]; then
+        log_msg -l ${_logfile_} -s "Could not create bond-salve file for ${_ethernet_det_}"
+        return 1
+    else
+        log_msg -l ${_logfile_} -s "Successfully created bond-slave file ifcfg-bond-slave-${_ethernet_det_} for ${_ethernet_det_} \n"
+    fi
+    $NMCLI connection up bond-slave-${_ethernet_det_} | $TEE -a ${_logfile_}
+	status=(${PIPESTATUS[@]})
+    pipe_status0=${status[0]}
+    pipe_status1=${status[1]}
+    if [ "${pipe_status0}" -ne 0 ]; then
+        log_msg -l ${_logfile_} -s "Unable to make up bond-slave for ${_ethernet_det_}"
+        return 1
+    else
+        log_msg -l ${_logfile_} -s "Successfully activated ifcfg-bond-slave-${_ethernet_det_} for ${_ethernet_det_} \n"
+    fi
+done
+
+#bring the connection up
+$NMCLI connection up ${_bond_tag_} | $TEE -a ${_logfile_}
+status=(${PIPESTATUS[@]})
+pipe_status0=${status[0]}
+pipe_status1=${status[1]}
+if [ "${pipe_status0}" -ne 0 ]; then
+    log_msg -l ${_logfile_} -s "Unable to make up ${_bond_tag_}"
+    return 1
+else
+    log_msg -l ${_logfile_} -s "Successfully activated bond ifcfg-${_bond_tag_} for ${_vlan_group_} \n\n"
+fi
+fi
+
+iniset ENM_BASED_BONDING -f ${TEM_DIR}/${IPMP_INI} ENM_CONFIGURED=${_bond_tag_}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not update ${TEM_DIR}/${IPMP_INI} with ENM_CONFIGURED=${_bond_tag_} for ENM_BASED_BONDING"
+    abort_script "${_err_msg_}"
+fi
+}
+
+################ Function: update_ini_template ######################
+#                                                                   #
+#   This will update IPMP.ini file.                                 #
+#                                                                   #
+# Arguments:                                                        #
+#       $1 - Error message from part of program (Not always used)   #
+# Return Values:                                                    #
+#       none                                                        #
+#####################################################################
+
+update_ini_template()
+{
+log_msg -q -l ${LOGFILE} -s "Updating IPMP.ini file...."
+#Copy ini file to temp directory
+copy_ini_temp
+
+log_msg -q -l ${LOGFILE} -s "Creating ${TEM_DIR}/intf_template file"
+
+${ECHO} "[IPMP_INTF_4]" >> ${TEM_DIR}/intf_template
+${ECHO} "IPMP_Group_Name=enm_stor_grp"  >> ${TEM_DIR}/intf_template
+${ECHO} "BONDING_ENABLE=Y" >> ${TEM_DIR}/intf_template
+${ECHO} "IPMP_Group_Intf=" >> ${TEM_DIR}/intf_template
+${ECHO} "IPMP_VLAN_Group_Name=ENM Storage Group"  >> ${TEM_DIR}/intf_template
+if [ "${SAN_DEVICE}" == "unityXT" ]; then
+${ECHO} "IPMP_VLAN_Group_ID=" >> ${TEM_DIR}/intf_template
+fi
+${ECHO} "IPMP_Group_Phys1=" >> ${TEM_DIR}/intf_template
+${ECHO} "IPMP_Group_Phys2=" >> ${TEM_DIR}/intf_template
+${ECHO} "IPMP_Group_IP=" >> ${TEM_DIR}/intf_template
+${ECHO} "IPMP_Group_Netmask=" >> ${TEM_DIR}/intf_template
+${ECHO} "IPMP_Group_Gateway=" >> ${TEM_DIR}/intf_template
+${ECHO} "IPv6_Enable=N" >> ${TEM_DIR}/intf_template
+${ECHO} "IPMP_Group_IPv6_Phys1=" >> ${TEM_DIR}/intf_template
+${ECHO} "IPMP_Group_IPv6_Phys2=" >> ${TEM_DIR}/intf_template
+${ECHO} "IPMP_Group_IPv6_VIP=" >> ${TEM_DIR}/intf_template
+${ECHO} "IPMP_Group_IPv6_Netmask=" >> ${TEM_DIR}/intf_template
+${ECHO} "ARP_IP_TARGET=" >> ${TEM_DIR}/intf_template
+
+log_msg -q -l ${LOGFILE} -s "Adding ${TEM_DIR}/intf_template file to ${TEM_DIR}/intf_template_updated"
+${INIADD} -g IPMP -p IPMP_INTF_4 -i ${TEM_DIR}/${IPMP_INI} -d ${TEM_DIR}/intf_template -o ${TEM_DIR}/intf_template_updated
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not add ${TEM_DIR}/intf_template to ${TEM_DIR}/intf_template_updated"
+    abort_script "${_err_msg_}"
+fi
+
+$RM -rf ${TEM_DIR}/intf_template
+
+${ECHO} "[ENM_BASED_BONDING]" >> ${TEM_DIR}/intf_template
+${ECHO} "ENM_CONFIGURED=" >> ${TEM_DIR}/intf_template
+
+${INIADD} -p ENM_BASED_BONDING -i ${TEM_DIR}/intf_template_updated -d ${TEM_DIR}/intf_template -o ${TEM_DIR}/intf_template_tmp
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not add ${TEM_DIR}/intf_template to ${TEM_DIR}/intf_template_enm"
+    abort_script "${_err_msg_}"
+fi
+$RM -rf ${TEM_DIR}/intf_template
+
+${ECHO} "[ENM_STOR_NETMASK]" >> ${TEM_DIR}/intf_template
+${ECHO} "NETMASKS=" >> ${TEM_DIR}/intf_template
+
+${INIADD} -p ENM_STOR_NETMASK -i ${TEM_DIR}/intf_template_tmp -d ${TEM_DIR}/intf_template -o ${TEM_DIR}/intf_template_enm
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not add ${TEM_DIR}/intf_template to ${TEM_DIR}/intf_template_enm}"
+    abort_script "${_err_msg_}"
+fi
+$RM -rf ${TEM_DIR}/${IPMP_INI}
+$CP ${TEM_DIR}/intf_template_enm ${TEM_DIR}/${IPMP_INI}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not copy ${TEM_DIR}/intf_template_enm to ${TEM_DIR}/${IPMP_INI}"
+    abort_script "${_err_msg_}"
+fi
+$RM -rf ${TEM_DIR}/intf_template_enm ${TEM_DIR}/intf_template ${TEM_DIR}/intf_template_updated ${TEM_DIR}/intf_template_tmp
+}
+
+######################## Function: usage ###########################
+#                                                                  #
+# Description: prints the usage if incorrect values are entered    #
+#                                                                  #
+####################################################################
+
+usage()
+{
+        $ECHO "Usage: bash set_ipmp_enm.bsh -l <Log File Location>"
+        $ECHO ""
+        $ECHO "-l: Value for log file location"
+        $ECHO "To start the script execute script with log location: bash set_ipmp_enm.bsh -l /tmp/setup_ipmp.log"
+
+}
+
+
+
+################ Function: display_ipmp_enm_configuration #############
+#                                                                     #
+# Description: Display IPMP_INTF_4 Contents                           #
+#                                                                     #
+#######################################################################
+
+display_ipmp_enm_configuration() 
+{
+log_msg -q -t -l ${LOGFILE} -s "Displaying existing IPMP Information"
+$PRINTF '\33[H\33[2J'
+${ECHO}  "Displaying Existing IPMP Information:" >> $TEM_DIR/ipmp_information
+${ECHO}  "-------------------------------------\n\n" >> $TEM_DIR/ipmp_information
+${ECHO} "ENM Storage Group Interface:\t`iniget IPMP_INTF_4 -f ${ENIQ_CONF_DIR}/${IPMP_INI} -v IPMP_Group_Intf`" >> $TEM_DIR/ipmp_information
+${ECHO} "ENM Storage Group IP:\t`iniget IPMP_INTF_4 -f ${ENIQ_CONF_DIR}/${IPMP_INI} -v IPMP_Group_IP`" >> $TEM_DIR/ipmp_information
+${ECHO} "ENM Storage Group netmask:\t`iniget IPMP_INTF_4 -f ${ENIQ_CONF_DIR}/${IPMP_INI} -v IPMP_Group_Netmask`" >> $TEM_DIR/ipmp_information
+${ECHO} "ENM Storage Group Gateway:\t`iniget IPMP_INTF_4 -f ${ENIQ_CONF_DIR}/${IPMP_INI} -v IPMP_Group_Gateway`" >> $TEM_DIR/ipmp_information
+if [ "${SAN_DEVICE}" != "unityXT" ]; then
+${ECHO} "ENM Storage Group same subnet IPs:\t`iniget IPMP_INTF_4 -f ${ENIQ_CONF_DIR}/${IPMP_INI} -v ARP_IP_TARGET`" >> $TEM_DIR/ipmp_information
+else
+${ECHO} "ENM Storage Group VLAN id:\t`iniget IPMP_INTF_4 -f ${ENIQ_CONF_DIR}/${IPMP_INI} -v IPMP_VLAN_Group_ID`" >> $TEM_DIR/ipmp_information
+fi
+$CAT $TEM_DIR/ipmp_information
+}
+
+
+
+################## Function: terminate_script ###################################
+#                                                                               #
+# Description: Function to restore previous IPMP configuration.                 #
+#                                                                               #
+#################################################################################
+
+terminate_script()
+{
+log_msg -q -t -l ${LOGFILE} -s "Restoring the existing IPMP configuration as the script terminated abnormally"
+${RM} -rf ${TEM_DIR}
+}
+
+
+
+################## Function: format_ipmp_file ###################################
+#                                                                               #
+# Description: This function will remove leading new line character.            #
+#                                                                               #
+#################################################################################
+
+format_ipmp_file()
+{
+${SED} '$!N; /^\(.*\)\n\1$/!P; D' ${ENIQ_CONF_DIR}/${IPMP_INI} > ${ENIQ_CONF_DIR}/${IPMP_INI}_tmp
+${CP} ${ENIQ_CONF_DIR}/${IPMP_INI}_tmp ${ENIQ_CONF_DIR}/${IPMP_INI}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not move ${ENIQ_CONF_DIR}/${IPMP_INI}_tmp to ${ENIQ_CONF_DIR}/${IPMP_INI}"
+    abort_script "${_err_msg_}"
+fi
+${RM} -rf ${ENIQ_CONF_DIR}/${IPMP_INI}_tmp
+}
+
+### Function: create_enm_vlan_tag ###
+#
+# Create ENM VLAN tag on bond0 for G10Plus Simplex rack deployment
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+create_enm_vlan_tag()
+{
+
+while :; do
+
+    $RM -rf "${TEM_DIR}"/"${IPMP_INI}"
+
+    while :; do
+       $ECHO "\nDo you want to configure ENM VLAN (Y|N)?"
+        read _ans_
+       
+        if [ ! "${_ans_}" ]; then
+            continue
+        fi
+
+        if [ "${_ans_}" == "Y" -o "${_ans_}" == "N" ]; then
+              
+              if [ -s "${ENIQ_CONF_DIR}"/"${IPMP_INI}" ]; then
+                 #copy the ipmp.ini file
+                 $CP "${ENIQ_CONF_DIR}"/"${IPMP_INI}" "${TEM_DIR}"/"${IPMP_INI}"
+                 _cp_conf_ipmp_=$?
+                 if [ "${_cp_conf_ipmp_}" -ne 0 ]; then
+                      _err_msg_="Could not copy ${ENIQ_CONF_DIR}/${IPMP_INI} to ${TEM_DIR}/${IPMP_INI}" 
+                      abort_script "${_err_msg_}"
+                 fi
+              else
+                 _err_msg_="${ENIQ_CONF_DIR}/${IPMP_INI} does not exist, or is empty"
+                  abort_script "${_err_msg_}"
+              fi
+
+              $RM -rf "${TEM_DIR}"/intf_template "${TEM_DIR}"/intf_template_new_block
+
+              ${ECHO} "[IPMP_INTF_3]" >> "${TEM_DIR}"/intf_template
+              ${ECHO} "IPMP_Group_Name=enm_stor_grp"  >> "${TEM_DIR}"/intf_template
+              ${ECHO} "BONDING_ENABLE=" >> "${TEM_DIR}"/intf_template
+              ${ECHO} "IPMP_Group_Intf=" >> "${TEM_DIR}"/intf_template
+              ${ECHO} "IPMP_VLAN_Group_Name=ENM Storage Group"  >> "${TEM_DIR}"/intf_template
+              ${ECHO} "IPMP_VLAN_Group_ID=" >> "${TEM_DIR}"/intf_template
+              ${ECHO} "IPMP_Group_Phys1=" >> "${TEM_DIR}"/intf_template
+              ${ECHO} "IPMP_Group_Phys2=" >> "${TEM_DIR}"/intf_template
+              ${ECHO} "IPMP_Group_IP=" >> "${TEM_DIR}"/intf_template
+              ${ECHO} "IPMP_Group_Netmask=" >> "${TEM_DIR}"/intf_template
+              ${ECHO} "IPMP_Group_Gateway=" >> "${TEM_DIR}"/intf_template
+              ${ECHO} "IPv6_Enable=N" >> "${TEM_DIR}"/intf_template
+              ${ECHO} "IPMP_Group_IPv6_Phys1=" >> "${TEM_DIR}"/intf_template
+              ${ECHO} "IPMP_Group_IPv6_Phys2=" >> "${TEM_DIR}"/intf_template
+              ${ECHO} "IPMP_Group_IPv6_VIP=" >> "${TEM_DIR}"/intf_template
+              ${ECHO} "IPMP_Group_IPv6_Netmask=" >> "${TEM_DIR}"/intf_template
+              ${ECHO} "ARP_IP_TARGET=" >> "${TEM_DIR}"/intf_template
+
+              log_msg -q -l "${LOGFILE}" -s "Adding ${TEM_DIR}/intf_template file to ${TEM_DIR}/intf_template_updated"
+              ${INIADD} -g IPMP -p IPMP_INTF_3 -i "${TEM_DIR}"/"${IPMP_INI}" -d "${TEM_DIR}"/intf_template -o "${TEM_DIR}"/intf_template_updated
+              _add_block_=$?
+              if [ "${_add_block_}" -ne 0 ]; then
+                    _err_msg_="Could not add ${TEM_DIR}/intf_template to ${TEM_DIR}/intf_template_updated"
+                    abort_script "${_err_msg_}"
+              fi
+
+              ${ECHO} "[ENM_STOR_NETMASK]" >> "${TEM_DIR}"/intf_template_new_block
+              ${ECHO} "NETMASKS=" >> "${TEM_DIR}"/intf_template_new_block
+
+              ${INIADD} -p ENM_STOR_NETMASK -i "${TEM_DIR}"/intf_template_updated -d "${TEM_DIR}"/intf_template_new_block -o "${TEM_DIR}"/intf_template_enm
+              _add_netmask_=$?
+              if [ "${_add_netmask_}" -ne 0 ]; then
+                   _err_msg_="Could not add ${TEM_DIR}/intf_template to ${TEM_DIR}/intf_template_enm}"
+                   abort_script "${_err_msg_}"
+              fi
+              $RM -rf "${TEM_DIR}"/"${IPMP_INI}"
+              $CP "${TEM_DIR}"/intf_template_enm "${TEM_DIR}"/"${IPMP_INI}"
+              _cp_tem_ipmp_=$?
+              if [ "${_cp_tem_ipmp_}" -ne 0 ]; then
+                   _err_msg_="Could not copy ${TEM_DIR}/intf_template_enm to ${TEM_DIR}/${IPMP_INI}"
+                   abort_script "${_err_msg_}"
+              fi
+              $RM -rf "${TEM_DIR}"/intf_template_enm "${TEM_DIR}"/intf_template "${TEM_DIR}"/intf_template_updated
+
+              iniset IPMP_INTF_3 -f "${TEM_DIR}"/"${IPMP_INI}" IPMP_Group_Intf=bond0
+              _set_bond0_=$?
+              if [ "${_set_bond0_}" -ne 0 ]; then
+                   _err_msg_="Could not update ${TEM_DIR}/${IPMP_INI} with IPMP_Group_Intf=bond0 for IPMP_INTF_3"
+                   abort_script "${_err_msg_}"
+              fi
+              
+              iniset IPMP_INTF_3 -f "${TEM_DIR}"/"${IPMP_INI}" BONDING_ENABLE="${_ans_}"
+              _set_enable_=$?
+              if [ "${_set_enable_}" -ne 0 ]; then
+                   _err_msg_="Could not update ${TEM_DIR}/${IPMP_INI} with BONDING_ENABLE=Y for IPMP_INTF_3"
+                   abort_script "${_err_msg_}"
+              fi
+              break
+        else
+              continue
+        fi
+
+    done    
+
+     _ipmp_group_name_=$(iniget IPMP_INTF_3 -f "${TEM_DIR}"/"${IPMP_INI}" -v IPMP_VLAN_Group_Name)
+     if [ ! "${_ipmp_group_name_}" ]; then
+           _err_msg_="Could not read IPMP_VLAN_Group_Name in ${TEM_DIR}/${IPMP_INI}"
+           abort_script "${_err_msg_}"
+     fi
+     _ipmp_enabled_=$(iniget IPMP_INTF_3 -f "${TEM_DIR}"/"${IPMP_INI}" -v BONDING_ENABLE)
+     if [ ! "${_ipmp_enabled_}" ]; then
+           _err_msg_="Could not read BONDING_ENABLE Y/N in ${TEM_DIR}/${IPMP_INI}"
+           abort_script "${_err_msg_}"
+     fi 
+
+     if [ "${_ipmp_enabled_}" == "Y" ]; then
+           log_msg -q -t -l "${LOGFILE}" -s "Updating group VLAN IP......"
+           common_get_vlan_ipmp_ip "${_ipmp_group_name_}"
+           _group_ip_=${IPMP_IPS}
+           iniset IPMP_INTF_3 -f "${TEM_DIR}"/"${IPMP_INI}" IPMP_Group_IP="${IPMP_IPS}"
+           _set_ip_=$?
+           if [ "${_set_ip_}" -ne 0 ]; then
+                _err_msg_="Could not update ${TEM_DIR}/${IPMP_INI} with IPMP_Group_IP=${IPMP_IPS} for IPMP_INTF_3"
+                abort_script "${_err_msg_}"
+           fi
+    
+           log_msg -q -t -l "${LOGFILE}" -s "Updating group netmask......"
+           common_get_vlan_ipmp_netmask "${_ipmp_group_name_}"
+            _ipv4_netmask_=${IPMP_NETMASKS}
+           iniset IPMP_INTF_3 -f "${TEM_DIR}"/"${IPMP_INI}" IPMP_Group_Netmask="${IPMP_NETMASKS}"
+           _set_netmask_=$?
+           if [ "${_set_netmask_}" -ne 0 ]; then
+                _err_msg_="Could not update ${TEM_DIR}/${IPMP_INI} with IPMP_Group_Netmask=${IPMP_NETMASKS} for IPMP_INTF_3"
+                abort_script "${_err_msg_}"
+           fi
+
+           log_msg -q -t -l "${LOGFILE}" -s "Updating group gateway......"
+           common_get_vlan_gateway "${_ipmp_group_name_}"
+           _ipv4_gateway_=${IPMP_GATEWAY}
+           iniset IPMP_INTF_3 -f "${TEM_DIR}"/"${IPMP_INI}" IPMP_Group_Gateway="${IPMP_GATEWAY}"
+           _set_gateway_=$?
+           if [ "${_set_gateway_}" -ne 0 ]; then
+                _err_msg_="Could not update ${TEM_DIR}/${IPMP_INI} with IPMP_Group_Gateway=${IPMP_GATEWAY} for IPMP_INTF_3"
+                abort_script "${_err_msg_}"
+           fi
+
+           log_msg -q -t -l "${LOGFILE}" -s "Updating group VLAN id......"
+           common_get_vlan_id "${_ipmp_group_name_}"
+           _vlan_id_=${ID_VLAN}
+           iniset IPMP_INTF_3 -f "${TEM_DIR}"/"${IPMP_INI}" IPMP_VLAN_Group_ID="${ID_VLAN}"
+           _set_id_=$?
+           if [ "${_set_id_}" -ne 0 ]; then
+                _err_msg_="Could not update ${TEM_DIR}/${IPMP_INI} with IPMP_VLAN_Group_ID=${ID_VLAN} for IPMP_INTF_3"
+                abort_script "${_err_msg_}"
+           fi  
+
+           if [ "${_ipmp_group_name_}" == "ENM Storage Group" ]; then
+                _net_=$(get_network_addr "${IPMP_NETMASKS}" "${IPMP_IPS}")
+                _default_netmask_="${_net_}:${IPMP_NETMASKS}"
+                _out_msg_="Enter the Storage VLAN network-number:netmask details"
+                common_get_netmask_info "${_out_msg_}" "${_default_netmask_}"
+                _get_netmask_=$?
+                if [ "${_get_netmask_}" -ne 0 ]; then
+                     _err_msg_="Failed to get Storage VLAN network-number:netmask details"
+                     abort_script "${_err_msg_}"
+                fi
+                if [ ! "${NETMASK_INFO}" ]; then
+                      _err_msg_="Could not determine server network-number:netmask details"
+                      abort_script "${_err_msg_}"
+                fi
+
+                log_msg -q -t -l "${LOGFILE}" -s "Updating ENM_STOR_NETMASK netmask......"
+                iniset ENM_STOR_NETMASK -f "${TEM_DIR}"/"${IPMP_INI}" NETMASKS="${NETMASK_INFO}"
+                _set_netmask_=$?
+                if [ "${_set_netmask_}" -ne 0 ]; then
+                     _err_msg_="Could not update ${TEM_DIR}/${IPMP_INI} with NETMASKS=${NETMASK_INFO}"
+                     abort_script "${_err_msg_}"
+                fi
+           fi   
+
+           $RM -rf "${TEM_DIR}"/ipmp_information
+
+           log_msg -q -t -l "${LOGFILE}" -s "Updating ${TEM_DIR}/ipmp_information file...."
+           $ECHO "\nGroup name:\t${_ipmp_group_name_}" >> "${TEM_DIR}"/ipmp_information
+           $ECHO "\nInterface name:\tbond0" >> "${TEM_DIR}"/ipmp_information
+           $ECHO "${_ipmp_group_name_} IP:\t${_group_ip_}" >> "${TEM_DIR}"/ipmp_information
+           $ECHO "${_ipmp_group_name_} netmask:\t${_ipv4_netmask_}" >> "${TEM_DIR}"/ipmp_information
+           $ECHO "${_ipmp_group_name_} gateway:\t${_ipv4_gateway_}" >> "${TEM_DIR}"/ipmp_information
+           $ECHO "${_ipmp_group_name_} VLAN ID:\t${_vlan_id_}" >> "${TEM_DIR}"/ipmp_information
+           $ECHO "${_ipmp_group_name_} network netmask:\t${NETMASK_INFO}" >> "${TEM_DIR}"/ipmp_information
+           
+           # Final confirmation for user input
+           while :; do
+             $PRINTF '\33[H\33[2J'
+
+             $CAT "${TEM_DIR}"/ipmp_information
+             $ECHO "\nIs the information above correct (Yes|No)"
+             read _ans_
+
+             if [ ! "${_ans_}" ]; then
+                 continue
+             fi
+
+             if [ "${_ans_}" == "Yes" -o "${_ans_}" == "No" ]; then
+                 break
+             else
+                 continue
+             fi
+           done
+           if [ "${_ans_}" == "Yes" ]; then
+
+                 _vlan_tag_exist_=$($LS /etc/sysconfig/network-scripts/ifcfg-bond0."${_vlan_id_}" 2> /dev/null)
+                 if [ "${_vlan_tag_exist_}" ]; then
+                       $RM -rf "${_vlan_tag_exist_}"
+                       $SYSTEMCTL restart network
+                       _restart_nw_=$?
+                       if [ "${_restart_nw_}" -ne 0 ]; then
+                            _err_msg_="Network service not restarted successfully"
+                            abort_script "${_err_msg_}"
+                       fi
+                 fi
+            
+                 core_install_vlan_tag_file_create IPMP_INTF_3 "${TEM_DIR}"/"${IPMP_INI}" "${LOGFILE}"
+                 _vlan_tag_=$?
+                 if [ "${_vlan_tag_}" -ne 0 ]; then
+                      _err_msg_="Failed to setup ENM VLAN tag"
+                      abort_script "${_err_msg_}" 
+                 fi
+
+                 $CP "${TEM_DIR}"/"${IPMP_INI}" "${ENIQ_CONF_DIR}"/"${IPMP_INI}"
+                 _cp_temp_ipmp_=$?
+                 if [ "${_cp_temp_ipmp_}" -ne 0 ]; then
+                      _err_msg_="Could not copy ${TEM_DIR}/${IPMP_INI} to ${ENIQ_CONF_DIR}/${IPMP_INI}"
+                      abort_script "${_err_msg_}" 
+                 fi
+
+                 log_msg  -t -l "${LOGFILE}" -s "Successfully setup ENM VLAN tag"
+                 break
+           else
+                 continue
+        fi 
+
+     else
+         log_msg  -t -l "${LOGFILE}" -s  "ENM VLAN not configured on Simplex rack"
+         break
+     fi
+
+done
+
+}
+
+### Function: ip_plumb_enm_intf ###
+#
+# Plumb ENM VLAN IP with interface for G9/G10 Simplex rack deployment
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+ip_plumb_enm_intf()
+{
+
+local IPMP_INI_template=ipmp.ini_fs
+local _group_name_="ENM_Group"
+
+$RM -rf "${TEM_DIR}"/interface_list
+$RM -rf "${TEM_DIR}"/disp_file
+
+$NMCLI device | $EGREP -v 'System|DEVICE|lo' | $AWK '{print $1}' > "${TEM_DIR}"/interface_list
+if [ ! -s "${TEM_DIR}"/interface_list ]; then
+    _err_msg_="Could not build a list of interfaces"
+    abort_script "${_err_msg_}"
+fi
+
+while read _line_; do
+    _mac_addr_=$($IFCONFIG "${_line_}" 2> /dev/null | $EGREP -w "ether" | $AWK '{print $2}')
+    $ECHO "${_line_} ${_mac_addr_}" >> "${TEM_DIR}"/disp_file
+done < "${TEM_DIR}"/interface_list
+
+while :; do
+
+    $RM -rf "${TEM_DIR}"/ipmp_information "${TEM_DIR}"/"${IPMP_INI}"
+
+    $PRINTF '\33[H\33[2J'
+    $ECHO "\nInterface Information" >> "${TEM_DIR}"/ipmp_information
+    $ECHO "----------------" >> "$TEM_DIR}"/ipmp_information
+
+    while :; do
+        $ECHO "\nDo you want to configure ENM VLAN (Y|N)?"
+        read _ans_
+
+        if [ ! "${_ans_}" ]; then
+            continue
+        fi
+
+        if [ "${_ans_}" == "Y" -o "${_ans_}" == "N" ]; then
+           
+            if [ -s "${ENIQ_CONF_DIR}"/"${IPMP_INI}" ]; then
+                 #copy the ipmp.ini file
+                 $CP "${ENIQ_CONF_DIR}"/"${IPMP_INI}" "${TEM_DIR}"/"${IPMP_INI}"
+                 _cp_stat_=$?
+                 if [ "${_cp_stat_}" -ne 0 ]; then
+                      _err_msg_="Could not copy ${ENIQ_CONF_DIR}/${IPMP_INI} to ${TEM_DIR}/${IPMP_INI}" 
+                      abort_script "${_err_msg_}"
+                 fi
+            else
+              #copy the ipmp.ini file from templates
+              if [ -s "${ENIQ_TEMPL_DIR}"/"${IPMP_INI_template}" ]; then
+                  $CP "${ENIQ_TEMPL_DIR}"/"${IPMP_INI_template}" "${TEM_DIR}"/"${IPMP_INI}"
+                  _cp_templ_=$?
+                  if [ "${_cp_templ_}" -ne 0 ]; then
+                      _err_msg_="Could not copy ${ENIQ_TEMPL_DIR}/${IPMP_INI_template} to ${TEM_DIR}/${IPMP_INI}"
+                      abort_script "${_err_msg_}"
+                  fi
+              else
+                  _err_msg_="${ENIQ_TEMPL_DIR}/${IPMP_INI_template} does not exist, or is empty"
+                  abort_script "${_err_msg_}"
+              fi
+            fi
+
+            $RM -rf "${TEM_DIR}"/intf_template
+            
+            ${ECHO} "[ENM_Group]" >> "${TEM_DIR}"/intf_template
+            ${ECHO} "ENABLE=" >> "${TEM_DIR}"/intf_template
+            ${ECHO} "ENM_Group_Intf=" >> "${TEM_DIR}"/intf_template
+            ${ECHO} "ENM_Group_IP=" >> "${TEM_DIR}"/intf_template
+            ${ECHO} "ENM_Group_Netmask=" >> "${TEM_DIR}"/intf_template
+            ${ECHO} "ENM_Group_Gateway=" >> "${TEM_DIR}"/intf_template
+
+            log_msg -q -t -l "${LOGFILE}" -s "Adding ENM VLAN Group block in ipmp.ni file"
+
+            ${INIADD}  -i "${TEM_DIR}"/"${IPMP_INI}" -d "${TEM_DIR}"/intf_template -o "${TEM_DIR}"/intf_template_updated
+            _add_blk_=$?
+            if [ "${_add_blk_}" -ne 0 ]; then
+                 _err_msg_="Could not add ${TEM_DIR}/intf_template to ${TEM_DIR}/${IPMP_INI}"
+                 abort_script "${_err_msg_}"
+            fi
+
+            $CP "${TEM_DIR}"/intf_template_updated "${TEM_DIR}"/"${IPMP_INI}"
+            _cp_intf_=$?
+            if [ "${_cp_intf_}" -ne 0 ]; then
+                 _err_msg_="Could not copy ${TEM_DIR}/intf_template_updated to ${TEM_DIR}/${IPMP_INI}"
+                 abort_script "${_err_msg_}"
+            fi
+
+            $RM -rf "${TEM_DIR}"/intf_template "${TEM_DIR}"/intf_template_updated
+ 
+            iniset ${_group_name_} -f "${TEM_DIR}"/"${IPMP_INI}" ENABLE="${_ans_}"
+            _set_enb_=$?
+            if [ "${_set_enb_}" -ne 0 ]; then
+                 _err_msg_="Could not update ${TEM_DIR}/${IPMP_INI} with ENABLE=${_ans_}"
+                 abort_script "${_err_msg_}"
+            fi
+            break
+        else
+            continue
+        fi
+    done
+
+    _ENM_enabled_=$(iniget "${_group_name_}" -f "${TEM_DIR}"/"${IPMP_INI}" -v ENABLE)
+    if [ ! "${_ENM_enabled_}" ]; then
+        _err_msg_="Could not read ${_group_name_} ENABLE Y in ${TEM_DIR}/${IPMP_INI}"
+        abort_script "${_err_msg_}"
+    fi
+    if [ "${_ENM_enabled_}" == "Y" ]; then
+        # User selects the interface name
+        $ECHO "\nAvailable Interfaces for ${_group_name_}"
+        $ECHO "-------------------------------------------"
+        $CAT "${TEM_DIR}"/disp_file
+        while :; do
+            $ECHO "\nSelect interface from the list for ENM VLAN"
+            read _enm_intf_
+            if [ -z "${_enm_intf_}" ]; then
+                continue
+            fi
+
+            _selected_intf_=$($GREP -w "${_enm_intf_}" "${TEM_DIR}"/interface_list 2>/dev/null)
+            if [ ! "${_selected_intf_}" ]; then
+                $ECHO "${_enm_intf_} not in the list"
+                continue
+            fi
+            iniset "${_group_name_}" -f "${TEM_DIR}"/"${IPMP_INI}" ENM_Group_Intf="${_enm_intf_}"
+            _set_grp_intf_=$?
+            if [ "${_set_grp_intf_}" -ne 0 ]; then
+                _err_msg_="Could not update ${TEM_DIR}/${IPMP_INI} with ENM_Group_Intf=${_enm_intf_} for ${_group_name_}"
+                abort_script "${_err_msg_}"
+            fi
+            break
+        done
+
+       common_get_vlan_ipmp_ip "${_group_name_}"
+            _group_ip_=${IPMP_IPS}
+            iniset "${_group_name_}" -f "${TEM_DIR}"/"${IPMP_INI}" ENM_Group_IP="${IPMP_IPS}"
+            _set_grp_ip_=$?
+            if [ "${_set_grp_ip_}" -ne 0 ]; then
+                _err_msg_="Could not update ${TEM_DIR}/${IPMP_INI} with ENM_Group_IP=${IPMP_IPS} for ${_group_name_}"
+                abort_script "${_err_msg_}"
+            fi
+
+        common_get_vlan_ipmp_netmask "${_group_name_}"
+            _ipv4_netmask_=${IPMP_NETMASKS}
+            iniset "${_group_name_}" -f "${TEM_DIR}"/"${IPMP_INI}" ENM_Group_Netmask="${IPMP_NETMASKS}"
+            _set_grp_net_=$?
+            if [ "${_set_grp_net_}" -ne 0 ]; then
+                _err_msg_="Could not update ${TEM_DIR}/${IPMP_INI} with ENM_Group_Netmask=${IPMP_NETMASKS} for ${_group_name_}"
+                abort_script "${_err_msg_}"
+            fi
+
+        common_get_vlan_gateway "${_group_name_}"
+            _gateway_=${IPMP_GATEWAY}
+            iniset "${_group_name_}" -f "${TEM_DIR}"/"${IPMP_INI}" ENM_Group_Gateway="${IPMP_GATEWAY}"
+            _set_grp_way_=$?
+            if [ "${_set_grp_way_}" -ne 0 ]; then
+                _err_msg_="Could not update ${TEM_DIR}/${IPMP_INI} with ENM_Group_Gateway=${IPMP_GATEWAY} for ${_group_name_}"
+                abort_script "${_err_msg_}"
+            fi
+        $ECHO "\nGroup name:\t${_group_name_}" >> "${TEM_DIR}"/ipmp_information
+        $ECHO "\n${_group_name_} Interface:\t${_enm_intf_}" >> "${TEM_DIR}"/ipmp_information
+        $ECHO "${_group_name_} IP:\t${_group_ip_}" >> "${TEM_DIR}"/ipmp_information
+        $ECHO "${_group_name_} netmask:\t${_ipv4_netmask_}" >> "${TEM_DIR}"/ipmp_information
+        $ECHO "${_group_name_} Gateway IP:\t${_gateway_}" >> "${TEM_DIR}"/ipmp_information
+
+        # Final confirmation for user input
+        while :; do
+            $PRINTF '\33[H\33[2J'
+
+            $CAT "${TEM_DIR}"/ipmp_information
+            $ECHO "\nIs the information above correct (Yes|No)"
+            read _ans_
+
+            if [ ! "${_ans_}" ]; then
+                continue
+            fi
+
+            if [ "${_ans_}" == "Yes" -o "${_ans_}" == "No" ]; then
+                break
+            else
+                continue
+            fi
+        done
+        if [ "${_ans_}" == "Yes" ]; then
+            
+            core_install_ip_assign_intf_enm "${_group_name_}" "${TEM_DIR}"/"${IPMP_INI}" "${LOGFILE}"
+            _ip_assign_=$?
+            if [ "${_ip_assign_}" -ne 0 ]; then
+                _err_msg_="Failed to setup ENM interfaces"
+                abort_script "${_err_msg_}" 
+            fi
+
+            $CP "${TEM_DIR}"/"${IPMP_INI}" "${ENIQ_CONF_DIR}"/"${IPMP_INI}"
+            _cp_ipmp_rack_=$?
+            if [ "${_cp_ipmp_rack_}" -ne 0 ]; then
+                _err_msg_="Could not copy ${TEM_DIR}/${IPMP_INI} to ${ENIQ_CONF_DIR}/${IPMP_INI}"
+                abort_script "${_err_msg_}" 
+            fi
+
+            log_msg -q -t -l "${LOGFILE}" -s "Successfully setup ENM interface information"
+            break
+        else
+            unset _enm_intf_
+            continue
+        fi
+    else
+       log_msg -q -t -l "${LOGFILE}" -s  "ENM vlan not configured on Simplex rack"
+        break
+    fi
+done
+
+}
+
+######################## Function: usage ###########################
+#                                                                  #
+#                        Main body of program                      #
+#                                                                  #
+####################################################################
+
+check_id root
+$RM -rf ${TEM_DIR}
+$MKDIR -p ${TEM_DIR}
+_choice_=N
+
+if [ $# -lt 2 ]
+then
+    usage
+    exit 1
+fi
+
+
+case $1 in
+        -l)
+            LOGFILE=$2
+            ;;
+        *)
+            $ECHO "Invalid option selected"
+            usage
+            exit 1
+            ;;
+esac
+
+import_common_functions
+
+#Fetching IP Type from IPMP_INI file.
+check_ip_type
+
+if [ ! "${_ip_type_}" ]; then
+    _err_msg_="Could not read parameter _IP_TYPE_ from file ${ENIQ_CONF_DIR}/${IPMP_INI}"
+    abort_script "$_err_msg_"
+fi
+
+# Storage type
+STORAGE_TYPE=`iniget STOR_TYPE -f /eniq/installation/config/SunOS.ini -v STORAGE_TYPE`
+if [ ! "${STORAGE_TYPE}" ]; then
+    _err_msg_="Could not obtain storage type from /eniq/installation/config/SunOS.ini"
+    abort_script "${_err_msg_}"
+fi
+if [ "${STORAGE_TYPE}" == "raw" ]; then
+    SAN_DEVICE=`$CAT ${ENIQ_CONF_DIR}/san_details | $EGREP "^SAN_DEVICE=" | $AWK -F\= '{print $2}'`
+    if [ ! "${SAN_DEVICE}" ]; then
+        _err_msg_="Could not read SAN_DEVICE value from ${ENIQ_CONF_DIR}/san_details"
+    fi
+else
+
+    #Storage type is fs. Script is being executed on Simplex rack server.
+    #Server Generation
+    SERVER_GEN=$($DMIDECODE -s system-product-name | $AWK -F " " '{print $3 $4}')
+    if [ ! "${SERVER_GEN}" ]; then
+           _err_msg_="Could not determine server hardware generation"
+           abort_script "${_err_msg_}"
+    fi
+    if [ "${SERVER_GEN}" != "Gen10Plus" ]; then
+         ip_plumb_enm_intf
+    else
+         create_enm_vlan_tag
+    fi
+
+fi
+
+if [ "${STORAGE_TYPE}" == "raw" ]; then
+
+log_msg -q -t -l ${LOGFILE} -s "Started main execution of script"
+
+# Is IPMP.ini template already Updated??
+_intf_name_=`iniget IPMP -f ${ENIQ_CONF_DIR}/${IPMP_INI} | $TAIL -1`
+if [ "${_intf_name_}" == "IPMP_INTF_4" ]; then
+    while :; do
+        $PRINTF '\33[H\33[2J'
+        display_ipmp_enm_configuration
+        $ECHO "\nDo you want to change IPMP settings(Y|N)?"
+        $ECHO "\n!!!WARNING!!!: On selection of Y, this will remove existing settings and reconfigure IPMP settings"
+        read _choice_
+        if [ ! "${_choice_}" ]; then
+            continue
+        fi
+
+        if [ "${_choice_}" == "Y" -o "${_choice_}" == "y" -o "${_choice_}" == "N"  -o  "${_choice_}" == "n" ]; then
+            break
+        else
+            continue
+        fi
+    done
+    if [ $_choice_ == "N" -o $_choice_ == "n" ]; then
+        exit 0;
+    fi
+fi
+
+
+if [ $_choice_ == "Y" -o $_choice_ == "y" ]; then
+    #Ooh its a tricky case. Script is terminated abnormally, need to restore the previous configuration. Good Luck :)
+    trap '{ $PRINTF '\33[H\33[2J'; $ECHO "Restoring the configuration"; terminate_script; $ECHO "Successfully restored the previous configuration..... Time to quit ."; exit 1; } 1>&2' 1 2 15
+    exist_bond
+    copy_ini_temp
+    get_ipmp_information
+    _choice_=N
+    #Restore the "INT" signal handler to the default action"
+    trap - INT
+else
+    update_ini_template
+    get_ipmp_information
+fi
+
+log_msg -t -l ${LOGFILE} -s "Commencing IPMP Configuration ..."
+
+setup_ipmp ${LOGFILE} ${TEM_DIR}/${IPMP_INI}
+if [ $? -ne 0 ]; then
+    _err_msg_="Failed to setup IPMP interfaces"
+    abort_script "${_err_msg_}"
+fi
+
+$CP ${TEM_DIR}/${IPMP_INI} ${ENIQ_CONF_DIR}/${IPMP_INI}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not copy ${TEM_DIR}/${IPMP_INI} to ${ENIQ_CONF_DIR}/${IPMP_INI}"
+    abort_script "${_err_msg_}"
+fi
+
+log_msg -t -l ${LOGFILE} -s "IPMP Configuration completed exiting..."
+#Format ipmp.ini file before existing the script
+format_ipmp_file
+fi
+
+$RM -rf ${TEM_DIR}
+exit 0

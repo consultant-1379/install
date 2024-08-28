@@ -1,0 +1,819 @@
+#!/bin/bash
+# ********************************************************************
+# Ericsson Radio Systems AB                                     SCRIPT
+# ********************************************************************
+#
+# (c) Ericsson Radio Systems AB 2019 - All rights reserved.
+#
+# The copyright to the computer program(s) herein is the property
+# of Ericsson Radio Systems AB, Sweden. The programs may be used
+# and/or copied only with the written permission from Ericsson Radio
+# Systems AB or in accordance with the terms and conditions stipulated
+# in the agreement/contract under which the program(s) have been
+# supplied.
+#
+# ********************************************************************
+# Name    : reconfigure_oss.bsh
+# Date    : 10/10/2023
+# Revision: \main\04
+# Purpose : reconfigure the oss setup on engine server
+#
+#
+# Usage   : reconfigure_oss.bsh   
+#
+# ********************************************************************
+#
+#   Command Section
+#
+# ********************************************************************
+AWK=/usr/bin/awk
+BASH=/usr/bin/bash
+CAT=/usr/bin/cat
+CP=/usr/bin/cp
+DATE=/usr/bin/date
+DF=/usr/bin/df
+DIRNAME=/usr/bin/dirname
+ECHO='/usr/bin/echo -e'
+EGREP=/usr/bin/egrep
+GETENT=/usr/bin/getent
+GREP=/usr/bin/grep
+HEAD=/usr/bin/head
+ID=/usr/bin/id
+MKDIR=/usr/bin/mkdir
+MOUNT=/usr/bin/mount
+MV=/usr/bin/mv
+MYHOSTNAME=/usr/bin/hostname
+PERL=/usr/bin/perl
+PWD=/usr/bin/pwd
+RM=/usr/bin/rm
+SCP=/usr/bin/scp
+SED=/usr/bin/sed
+SLEEP=/usr/bin/sleep
+SYSTEMCTL=/usr/bin/systemctl
+TAIL=/usr/bin/tail
+TEE=/usr/bin/tee
+TOUCH=/usr/bin/touch
+TR=/usr/bin/tr
+WC=/usr/bin/wc
+
+# ********************************************************************
+#
+#       Configuration Section
+#
+# ********************************************************************
+
+# Default user
+DEFAULT_USER=root
+
+### Function: abort_script ###
+#
+#   This will is called 
+#   if a serious error is encountered during runtime
+#   
+#
+# Arguments:
+#       $1 - Error message from part of program (Not always used)
+# Return Values:
+#       none
+abort_script()
+{
+_err_time_=`$DATE '+%Y-%b-%d_%H.%M.%S'`
+
+if [ "$1" ]; then
+    _err_msg_=$1
+else
+    _err_msg_="${_err_time_} - ERROR : Script aborted.......\n"
+fi
+
+if [ "${LOGFILE}" ]; then
+    $ECHO "\n${_err_time_} - ERROR : $_err_msg_\n" | $TEE -a ${LOGFILE}
+else
+    $ECHO "\n${_err_time_} - ERROR : $_err_msg_\n"
+fi
+
+$RM -rf ${TEM_DIR}
+
+exit 1
+}
+
+### Function: check_disable_oss ###
+#
+#   Check if the ENM Filesystem are unmounted
+#
+# Arguments:
+#       None
+# Return Values:
+#       None
+check_disable_oss()
+{
+if [ -f ${TEM_DIR}/fls_exists.txt ]; then
+    while :; do 
+        $DF -hk |$GREP -w ${_oss_alias_} | grep -v nas >/dev/null
+        if [ $? -eq 0 ];then
+            log_msg -s "Waiting for ENM FS to unmount" -l ${LOGFILE}
+            $SLEEP 5
+        else
+            log_msg -s "ENM FS unmounted successfully" -l ${LOGFILE}
+            break
+        fi
+    done
+else
+    while :; do 
+        $DF -hk |$GREP -w ${_oss_alias_} >/dev/null
+        if [ $? -eq 0 ];then
+            log_msg -s "Waiting for ENM FS to unmount" -l ${LOGFILE}
+            $SLEEP 5
+        else
+            log_msg -s "ENM FS unmounted successfully" -l ${LOGFILE}
+            break
+        fi
+    done
+fi
+}
+
+### Function: check_id ###
+#
+#   Check that the effective id of the user is correct
+#   If not print error msg and exit.
+#
+# Arguments:
+#       $1 : User ID name
+# Return Values:
+#       0 for success; 1 for failure;
+check_id()
+{
+_check_id_=`$ID  | $AWK -F\( '{print $2}' | $AWK -F\) '{print $1}'`
+if [ "${_check_id_}" != "$1" ]; then
+    _err_msg_="ERROR:: You must be ROOT to execute Script $0 - exiting."
+    abort_script "$_err_msg_"
+fi
+}
+
+### Function: cleanup_CO ###
+#
+# Merging the extra filesystem and directory in Sunos.ini and storage.ini file
+#
+# Arguments: none
+#
+# Return Values: none
+cleanup_CO()
+{
+
+if [ -d "${MOUNT_INFO_DIR}" ];then
+    log_msg -s "mount_info temp dir exits, removing ${MOUNT_INFO_DIR} contents."  -l ${LOGFILE} 
+    $RM -rf ${MOUNT_INFO_DIR}/*
+    $RM -rf ${MOUNT_INFO_DIR}/.oss_ref_name_file
+    if [ $? -ne 0 ]; then
+        _err_msg_="Could not remove ${MOUNT_INFO_DIR} contents from CO"
+        abort_script "$_err_msg_"
+    fi
+fi
+
+if [ -d "${ENIQ_BASE_DIR}/data/importdata" ];then
+    log_msg -s "importdata temp dir exits, removing ${ENIQ_BASE_DIR}/data/importdata/ contents."  -l ${LOGFILE} 
+    $RM -rf ${ENIQ_BASE_DIR}/data/importdata/*
+    if [ $? -ne 0 ]; then
+        _err_msg_="Could not remove ${ENIQ_BASE_DIR}/data/importdata/ contents from CO server"
+        abort_script "$_err_msg_"
+    fi
+    
+fi
+
+}
+
+
+### Function: create_nas_shares_OSS ###
+#
+# Share NAS filesystems for the OSS to storage VLAN of other blades
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+create_nas_shares_OSS()
+{
+
+_nas_sw_target_dir_=`iniget NAS_STORAGE_API -f ${ENIQ_CONF_DIR}/${SUNOS_INI} -v NAS_API_TARGET_DIR`
+if [ ! "${_nas_sw_target_dir_}" ]; then
+    _err_msg_="Failed to get NAS API target dir information from ${ENIQ_CONF_DIR}/${SUNOS_INI}"
+    abort_script "${_err_msg_}"
+fi
+
+_nascli_=${_nas_sw_target_dir_}/bin/nascli
+if [ ! -s ${_nascli_} ]; then
+    _err_msg_="${_nascli_} not found"
+    abort_script "${_err_msg_}"
+fi
+
+if [ "${_deployment_}" == "ft" ]; then
+    # we only configure 1 vlan i.e. the oss services vlan
+    _intf_list_=`iniget IPMP -f ${ENIQ_CONF_DIR}/${IPMP_INI} | $HEAD -1`
+    if [ ! "${_intf_list_}" ]; then
+        _err_msg_="Could not build a list of IPMP blocks from ${ENIQ_CONF_DIR}/${IPMP_INI}"
+        abort_script "${_err_msg_}"
+    fi
+else
+    # we configured both services and storage vlans
+    _intf_list_=`iniget IPMP -f ${ENIQ_CONF_DIR}/${IPMP_INI}`
+    if [ ! "${_intf_list_}" ]; then
+        _err_msg_="Could not build a list of IPMP blocks from ${ENIQ_CONF_DIR}/${IPMP_INI}"
+        abort_script "${_err_msg_}"
+    fi
+fi
+
+for _intf_ in ${_intf_list_}; do
+    _vlan_name_=`iniget ${_intf_} -f ${ENIQ_CONF_DIR}/${IPMP_INI} -v IPMP_Group_Name`
+    if [ ! "${_vlan_name_}" ]; then
+        _err_msg_="Could not read IPMP_Group_Name for ${_intf_} in ${ENIQ_CONF_DIR}/${IPMP_INI}"
+        abort_script "${_err_msg_}"
+    fi
+
+    if [ "${_deployment_}" != "ft" ]; then
+        if [ "${_vlan_name_}" != "stor_grp" ]; then
+            continue
+        fi
+    fi
+
+    _intf_ip_=`iniget ${_intf_} -f ${ENIQ_CONF_DIR}/${IPMP_INI} -v IPMP_Group_IP`
+    if [ ! "${_intf_ip_}" ]; then
+        _err_msg_="Could not read IPMP_Group_IP value for ${_intf_} in ${ENIQ_CONF_DIR}/${IPMP_INI}"
+        abort_script "${_err_msg_}"
+    fi
+
+    # Reading value of IPMP_Group_Netmask from /eniq/installation/config/ipmp.ini
+    _net_mask_ip_=`iniget ${_intf_} -f ${ENIQ_CONF_DIR}/${IPMP_INI} -v IPMP_Group_Netmask`
+    if [ ! "${_net_mask_ip_}" ]; then
+        _err_msg_="Could not read IPMP_Group_Netmask value for ${_intf_} in ${ENIQ_CONF_DIR}/${IPMP_INI}"
+        abort_script "$_err_msg_"
+    fi
+
+    # Generating subnet value using NetMask IP
+    _subnet_=`get_network_from_netmask ${_net_mask_ip_}`
+    if [ ! "${_subnet_}" ]; then
+          _err_msg_="Could not generate subnet value using NetMask IP"
+          abort_script "$_err_msg_"
+    fi
+
+   if [ "${_vlan_name_}" != "stor_grp" ]; then
+        # Reading Network IP from /etc/netmasks
+        _network_ip_=`$CAT /etc/netmasks | $GREP -w ${_net_mask_ip_} | $EGREP -v "#" | $AWK -F " " '{print $1}'`
+        if [ ! "${_network_ip_}" ]; then
+            _err_msg_="Could not read network IP from /etc/netmasks"
+            abort_script "$_err_msg_"
+        fi
+   else
+        # Reading Network IP from ipmp ini
+        _network_ip_=`iniget STOR_NETMASK -f ${ENIQ_CONF_DIR}/${IPMP_INI} -v NETMASKS | $CUT -d":" -f1`
+        if [ ! "${_network_ip_}" ]; then
+            _err_msg_="Could not read Network IP from ${ENIQ_CONF_DIR}/${IPMP_INI}"
+            abort_script "$_err_msg_"
+        fi
+   fi
+
+    # Sharing NFS over the subnet
+    log_msg -l ${LOGFILE} -s "Adding ${_network_ip_}/${_subnet_} as a client of NAS"
+    ${_nascli_} add_client - ${_network_ip_}/${_subnet_} - -
+    if [ $? -ne 0 ]; then
+        _err_msg_="Problem encountered adding ${_network_ip_}/${_subnet_} as a client of NAS"
+        abort_script "${_err_msg_}"
+    fi
+
+done
+
+log_msg -h -l ${LOGFILE} -t -s "Successfully completed Sharing NAS filesystems for the OSS to other blades. Logfile: ${LOGFILE}"
+
+}
+
+### Function: get_absolute_path ###
+#
+# Get absolute path of the script
+#
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+get_absolute_path()
+{
+_dir_=`$DIRNAME $0`
+SCRIPTHOME=`cd $_dir_ 2>/dev/null && pwd || $ECHO $_dir_`
+}
+
+
+### Function: get_deployment_order ###
+#
+# Get the order of the deployment
+# for performing required functionality based on action type
+#
+# Arguments: none
+#
+# Return Values: none
+get_deployment_order()
+{
+$RM -rf ${TEM_DIR}/server_order_list ${TEM_DIR}/configuration_order
+
+# Get an ordered list of servers based on the server_list file
+$PERL ${GET_IP_ORDER} -f ${TEM_DIR}/configuration_order
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not get an ordered list of servers"
+    abort_script "${_err_msg_}"
+fi
+}
+
+### Function: merge_config_files ###
+#
+# To merge config files
+#
+# Arguments: none
+#
+# Return Values: none
+
+merge_config_files()
+{
+
+if [ -x ${ENIQ_CORE_INST_DIR}/lib/iniadd.pl ]; then
+    INIADD=${ENIQ_CORE_INST_DIR}/lib/iniadd.pl
+else
+    _err_msg_="${ENIQ_CORE_INST_DIR}/lib/iniadd.pl is not found, or is not executable"
+    abort_script "$_err_msg_" "${EXEC_SHELL_CMD}"
+fi
+
+if [ -s "${FLS_CONFIG_FILE}" ];then
+    $CAT ${FLS_CONFIG_FILE} > ${TEM_DIR}/merge_input_file
+fi
+
+
+if [ -s "${TEM_DIR}/merge_input_file" ];then
+    while read _line_; do
+    _item_="${_line_}"
+    log_msg -l ${LOGFILE} -s "Merging existing block for ${_line_}"
+    merge_ini ${_line_} ${ENIQ_CONF_DIR}/${SUNOS_INI} /tmp/SunOS.ini_CO
+    if [ -s /tmp/SunOS.ini_${SAN_DEVICE}_CO ]; then
+        merge_ini ${_line_} ${SUNOS_INI_TEMPLATE} /tmp/SunOS.ini_${SAN_DEVICE}_CO
+    fi
+    done < ${TEM_DIR}/merge_input_file
+fi
+
+}
+
+### Function: merge_ini ###
+#
+# Merging the extra filesystem and directory in Sunos.ini and Sunos.ini_template file
+#
+# Arguments: none
+#
+# Return Values: none
+merge_ini()
+{
+new_fs_name=$1
+new_template_ini=$2
+old_template_ini=$3
+
+if  [ "${STORAGE_TYPE}" == "raw" ];then
+    old_tag=`$CAT ${old_template_ini} | $EGREP -B1 $new_fs_name |$HEAD -1 |$TR -d "[" |$TR -d "]"`
+    _last_used_=`$CAT ${new_template_ini} |$GREP SunOS_DIRECTORY_DIR_ |$GREP -v "\[*\]" | $TAIL -1 |$SED 's/[^0-9]*//g'`
+    ((_last_used_++))
+    gtag="SunOS_DIRECTORY"
+    ptag="SunOS_DIRECTORY_DIR_${_last_used_}"
+    merge_ini_block
+fi
+
+}
+
+
+### Function: merge_ini_block ###
+#
+# Merging the extra filesystem and directory in Sunos.ini and Sunos.ini_template file.
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+merge_ini_block()
+{
+$ECHO "[${ptag}]" > ${TEM_DIR}/new_ini_block
+iniget $old_tag -f ${old_template_ini} >> ${TEM_DIR}/new_ini_block
+if [ $? -ne 0 ]; then
+    _err_msg_="Failed to get $old_tag from ${old_template_ini}"
+    abort_script "$_err_msg_" "${EXEC_SHELL_CMD}"
+fi
+
+log_msg -l ${LOGFILE} -q -s "Executing command: \n$INIADD -g $gtag -p $ptag -i ${new_template_ini} -d ${TEM_DIR}/new_ini_block -o ${TEM_DIR}/output_file"
+$INIADD -g $gtag -p $ptag -i ${new_template_ini} -d ${TEM_DIR}/new_ini_block -o ${TEM_DIR}/output_file
+if [ $? -ne 0 ]; then
+    _err_msg_="Error in migrating block ${_item_} from ${old_template_ini}"
+    abort_script "$_err_msg_" "${EXEC_SHELL_CMD}"
+fi
+
+$CP ${TEM_DIR}/output_file ${new_template_ini}
+if [ $? -ne 0 ]; then
+    _err_msg_="Failed to migrate ${old_template_ini}"
+    abort_script "$_err_msg_" "${EXEC_SHELL_CMD}"
+fi
+$RM -rf ${TEM_DIR}/output_file
+log_msg -l ${LOGFILE} -s "Successfully migrated block ${_item_} to ${new_template_ini}."
+
+}
+
+### Function: reconfigure_config_files ###
+#
+# Add the entry of symlink directory in connectd configuration file
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+reconfigure_config_files()
+{
+_server_name_=$1
+_config_file_=$2
+
+#Copying config files to other servers
+if [ -s ${_config_file_} ] ; then 
+    log_msg -s "${_config_file_} file exits. Copying ${_config_file_} to the ${_server_name_} server"  -l ${LOGFILE} 
+    if [ "${_ip_type_}" == "IPv6" ]; then
+		$SCP -6 -rp ${_config_file_} ${DEFAULT_USER}@[${_server_name_}]:${_config_file_}
+	else
+		$SCP -rp ${_config_file_} ${DEFAULT_USER}@${_server_name_}:${_config_file_}
+	fi
+    if [ $? -ne 0 ]; then
+        _err_msg_="Could not copy the ${_config_file_} to ${_server_name_} server"
+        abort_script "$_err_msg_"
+    fi
+fi
+}
+
+
+### Function: reconfigure_connectd ###
+#
+# Merging the extra filesystem and directory in Sunos.ini and storage.ini file
+#
+# Arguments: none
+#
+# Return Values: none
+reconfigure_connectd()
+{
+
+if [ -d "${MOUNT_INFO_DIR}" ];then
+    log_msg -s "${MOUNT_INFO_DIR} exits, copying ${MOUNT_INFO_DIR} contents to the engine server"  -l ${LOGFILE} 
+    if [ "${_ip_type_}" == "IPv6" ]; then
+		$SCP -6 -pr ${MOUNT_INFO_DIR}/* ${DEFAULT_USER}@[${ENGINE_IP}]:${MOUNT_INFO_DIR}/
+	else
+		$SCP -pr ${MOUNT_INFO_DIR}/* ${DEFAULT_USER}@${ENGINE_IP}:${MOUNT_INFO_DIR}/
+	fi
+    if [ $? -ne 0 ]; then
+        _err_msg_="Could not copy ${MOUNT_INFO_DIR} contents to the engine server"
+        abort_script "$_err_msg_"
+    else
+        $MKDIR -p ${TEM_DIR}/connectd/mount_info
+        $CP -pr ${MOUNT_INFO_DIR}/* ${TEM_DIR}/connectd/mount_info/
+        if [ $? -ne 0 ]; then
+        _err_msg_="Could not copy ${MOUNT_INFO_DIR}/* to ${TEM_DIR}/connectd/mount_info/"
+        abort_script "$_err_msg_"
+        fi
+    fi
+fi
+
+if [ -d "${ENIQ_BASE_DIR}/data/importdata" ];then
+    log_msg -s "${ENIQ_BASE_DIR}/data/importdata/ exits, copying ${ENIQ_BASE_DIR}/data/importdata/ contents to the engine server"  -l ${LOGFILE} 
+    if [ "${_ip_type_}" == "IPv6" ]; then
+		$SCP -6 -pr ${ENIQ_BASE_DIR}/data/importdata/* ${DEFAULT_USER}@[${ENGINE_IP}]:${ENIQ_BASE_DIR}/data/importdata/
+	else
+		$SCP -pr ${ENIQ_BASE_DIR}/data/importdata/* ${DEFAULT_USER}@${ENGINE_IP}:${ENIQ_BASE_DIR}/data/importdata/
+	fi
+    if [ $? -ne 0 ]; then
+        _err_msg_="Could not copy ${ENIQ_BASE_DIR}/data/importdata/ contents to the engine server"
+        abort_script "$_err_msg_"
+    else
+        $MKDIR -p ${TEM_DIR}/data/importdata
+        $CP -pr ${ENIQ_BASE_DIR}/data/importdata/* ${TEM_DIR}/data/importdata
+        if [ $? -ne 0 ]; then
+        _err_msg_="Could not copy ${ENIQ_BASE_DIR}/data/importdata/* to ${TEM_DIR}/data/importdata"
+        abort_script "$_err_msg_"
+        fi
+    fi
+    
+fi
+
+}
+
+### Function: update_SunOS ###
+#
+# Update the sunOS.ini file on other servers
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+update_SunOS()
+{
+_server_name_=$1
+_config_file_=$2
+_tmp_config_file_=$3
+
+#Copying SunOS.ini to other servers
+if [ -s ${_config_file_} ] ; then 
+    log_msg -s "${_config_file_} file exits. Copying ${_config_file_} to the ${_server_name_} server"  -l ${LOGFILE} 
+    if [ "${_ip_type_}" == "IPv6" ]; then
+		$SCP -6 -rp ${_config_file_} ${DEFAULT_USER}@[${_server_name_}]:/tmp/${_tmp_config_file_}_CO
+	else
+		$SCP -rp ${_config_file_} ${DEFAULT_USER}@${_server_name_}:/tmp/${_tmp_config_file_}_CO
+	fi
+    if [ $? -ne 0 ]; then
+        _err_msg_="Could not copy the ${_config_file_} to ${_server_name_} server"
+        abort_script "$_err_msg_"
+    fi
+fi
+
+}
+
+### Function: setup_env ###
+#
+# Setup environment variables
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+setup_env()
+{
+SUNOS_INI=SunOS.ini
+
+#Eniq base directory
+ENIQ_BASE_DIR=/eniq
+
+
+ENIQ_LOGFILE_DIR=${ENIQ_BASE_DIR}/local_logs
+
+# Main Directory for the Core Installation SW
+ENIQ_INST_DIR=${ENIQ_BASE_DIR}/installation
+
+# Main Directory for the Core Installation SW
+ENIQ_CORE_INST_DIR=${ENIQ_INST_DIR}/core_install
+
+# ENIQ Config Directory
+ENIQ_CONF_DIR=${ENIQ_INST_DIR}/config
+
+# FLS Config file
+FLS_CONFIG_FILE=${ENIQ_CONF_DIR}/fls_conf
+
+# IPMP Config file
+IPMP_INI=ipmp.ini
+
+# NASd Config file
+NASD_CONFIG_FILE=${ENIQ_BASE_DIR}/smf/nasd/nasd_config
+
+# ENIQ SW conf directory
+CLI_CONF_DIR=${ENIQ_BASE_DIR}/sw/conf
+
+HNAME=`${MYHOSTNAME}`
+
+#ENIQ Core install arguments
+ENIQ_CORE_INST_ARG="-n -M -l ${LOGFILE}"
+
+#ENIQ Core install script
+ENIQ_CORE_INST_SCRIPT=${ENIQ_CORE_INST_DIR}/bin/eniq_core_install.bsh
+
+# Source the common functions
+if [ -s $ENIQ_CORE_INST_DIR/lib/common_functions.lib ]; then
+    . $ENIQ_CORE_INST_DIR/lib/common_functions.lib
+else
+    _err_msg_="File $ENIQ_CORE_INST_DIR/lib/common_functions.lib not found"
+    abort_script "$_err_msg_"
+fi
+
+#Fetching IP Type from ipmp.ini file.
+check_ip_type
+
+if [ ! "${_ip_type_}" ]; then
+    _err_msg_="Could not read parameter _IP_TYPE_ from file ${ENIQ_CONF_DIR}/${IPMP_INI}"
+    abort_script "$_err_msg_"
+fi
+
+# ConnectD Software Directory
+CONNECTD_BASE_DIR="/eniq/connectd"
+
+# Location of ConnectD Mount Info Directory
+MOUNT_INFO_DIR="${CONNECTD_BASE_DIR}/mount_info"
+
+#OSS reference file
+OSS_REF_FILE=${MOUNT_INFO_DIR}/.oss_ref_name_file
+
+#/eniq/sw/conf OSS reference file
+CLI_OSS_REF_FILE=${CLI_CONF_DIR}/.oss_ref_name_file
+
+#Engine IP address
+ENGINE_IP=`$CAT /etc/hosts |$EGREP -w engine |$AWK '{print $1}'`
+
+#Engine Host name
+ENGINE_HOSTNAME=`$CAT /etc/hosts |$EGREP -w engine |$AWK '{print $2}'`
+
+# Set up Variable to hold path for iniadd
+if [ ! -s ${ENIQ_CORE_INST_DIR}/lib/iniadd.pl ]; then
+    _err_msg_="Cannot locate ${ENIQ_CORE_INST_DIR}/lib/iniadd.pl "
+    abort_script "$_err_msg_"
+else
+    INIADD=${ENIQ_CORE_INST_DIR}/lib/iniadd.pl
+fi
+
+# Set up Variable to hold path for inidel
+if [ ! -s ${ENIQ_CORE_INST_DIR}/lib/inidel.pl ]; then
+    _err_msg_="Cannot locate ${ENIQ_CORE_INST_DIR}/lib/inidel.pl "
+    abort_script "$_err_msg_"
+else
+    INIDEL=${ENIQ_CORE_INST_DIR}/lib/inidel.pl
+fi
+
+# File containing the type of installation
+INST_TYPE_FILE=${ENIQ_CONF_DIR}/ericsson_use_config
+if [ ! -s ${INST_TYPE_FILE} ]; then
+    _err_msg_="Could not locate file ${INST_TYPE_FILE}"
+    abort_script "$_err_msg_"
+fi
+
+# Read the installation type
+INSTALL_TYPE=`$CAT ${INST_TYPE_FILE} | $AWK -F\= '{print $2}'`
+
+NASCLI=/ericsson/storage/bin/nascli
+
+HOST_IP=`$MYHOSTNAME -i | $AWK '{print $1}' | $HEAD -1`
+
+NEW_TEMPL_DIR="${ENIQ_INST_DIR}/core_install/templates/${INSTALL_TYPE}"
+
+CURR_SERVER_TYPE=`$CAT ${ENIQ_CONF_DIR}/installed_server_type`
+
+if [ -s ${ENIQ_CONF_DIR}/${SUNOS_INI} ]; then
+    STORAGE_TYPE=`iniget STOR_TYPE -f ${ENIQ_CONF_DIR}/${SUNOS_INI} -v STORAGE_TYPE`
+    SAN_DEVICE=`iniget SAN_DEV -f ${ENIQ_CONF_DIR}/${SUNOS_INI} -v SAN_DEVICE`
+else
+    if [ -s ${ENIQ_CONF_DIR}/san_details ]; then
+        STORAGE_TYPE=`$CAT ${ENIQ_CONF_DIR}/san_details | $EGREP "^STORAGE_TYPE=" | $AWK -F\= '{print $2}'`
+        SAN_DEVICE=`$CAT ${ENIQ_CONF_DIR}/san_details | $EGREP "^SAN_DEVICE=" | $AWK -F\= '{print $2}'`
+    fi
+fi
+
+# Check if server is Coordinator or Standalone
+CO_SERVER=""
+if [ "${CURR_SERVER_TYPE}" == "stats_coordinator" ]; then
+    CO_SERVER="YES"
+fi
+
+SUNOS_INI_TEMPLATE="${NEW_TEMPL_DIR}/SunOS.ini_${SAN_DEVICE}"
+if [ ! -f "${SUNOS_INI_TEMPLATE}" ]; then
+    _err_msg_="Failed to get the SunOs.ini template"
+    abort_script "$_err_msg_"
+fi
+
+# Determine storage.ini template file based on deployment type
+if [ -s ${ENIQ_CONF_DIR}/extra_params/deployment ]; then
+    _deployment_=`$CAT ${ENIQ_CONF_DIR}/extra_params/deployment | $TR '[:upper:]' '[:lower:]'`
+
+    case ${_deployment_} in
+        small)  STORAGE_INI_TEMPLATE="storage_ini.sml"
+                ;;
+        medium) STORAGE_INI_TEMPLATE="storage_ini.med"
+                ;;
+        large)  STORAGE_INI_TEMPLATE="storage_ini.lrg"
+                ;;
+        extralarge) STORAGE_INI_TEMPLATE="storage_ini.extralrg"
+                   ;;
+        ft)     STORAGE_INI_TEMPLATE="storage_ini.ft"
+                ;;
+        vm)     STORAGE_INI_TEMPLATE="storage_ini.vm"
+                ;;
+    esac
+fi
+
+GET_IP_ORDER=${ENIQ_CORE_INST_DIR}/lib/get_ip_order.pl
+}
+
+# **********************************************************************
+#
+# ********************** Main body of program  *************************
+#
+# **********************************************************************
+#
+
+# Check that the effective id of the user is root
+check_id root
+
+TIMESTAMP=`$DATE '+%d-%m-%y_%H.%M.%S'`
+
+# Create a temporary Directory
+TEM_DIR=/tmp/reconfigure_oss.$$.$$
+$RM -rf ${TEM_DIR}
+$MKDIR -p ${TEM_DIR}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not create directory $TEM_DIR"
+    abort_script "$_err_msg_"
+fi
+
+# Determine absolute path to software
+get_absolute_path
+
+setup_env
+
+LOGFILE=${ENIQ_LOGFILE_DIR}/reconfigure_oss_${TIMESTAMP}.log
+if [ ! "${LOGFILE}" ]; then
+    $TOUCH $LOGFILE
+fi
+
+$LS $MOUNT_INFO_DIR > ${TEM_DIR}/oss_names.txt
+
+get_deployment_order
+
+if [ "${CO_SERVER}" == "YES" ]; then
+    for _oss_alias_ in `$CAT ${TEM_DIR}/oss_names.txt` ;do
+        $CAT $ENIQ_CONF_DIR/fls_conf | $GREP ${_oss_alias_} >/dev/null
+        if [ $? -eq 0 ];then
+            $TOUCH ${TEM_DIR}/fls_exists.txt
+        fi
+        if [ ! -f $MOUNT_INFO_DIR/$_oss_alias_/disable_OSS ]; then
+            $TOUCH $MOUNT_INFO_DIR/$_oss_alias_/disable_OSS
+            check_disable_oss
+        fi
+    done
+    for _line_ in `$CAT ${TEM_DIR}/configuration_order`; do
+         unset _ip_address_ _serv_hostname_ _count_
+                _count_=`$ECHO "${_line_}" | grep -o "::" | wc -l`
+
+                if [ "${_ip_type_}" == "IPv6" ] && [ "${_count_}" == 3 ]; then
+                        _ip_address_=`$ECHO ${_line_} | grep -oE '([a-fA-F0-9]{1,4}::?){1,7}[a-fA-F0-9]{1,4}' | head -n 1 | awk -F "::" '{ print $1 "::" $2}'`
+                       _serv_hostname_=`$ECHO ${_line_} | $AWK -F"::" '{print $3}'`			
+                else
+                       _ip_address_=`$ECHO ${_line_} | $AWK -F"::" '{print $1}'`
+                       _serv_hostname_=`$ECHO ${_line_} | $AWK -F"::" '{print $2}'`			
+                fi
+         if [ ! "${_ip_address_}" -o ! "${_serv_hostname_}" ]; then
+               _err_msg_="Could not read required info from ${_order_file_}"
+               abort_script "${_err_msg_}"
+         fi
+
+         log_msg -h -l ${LOGFILE} -t -s "Starting OSS reconfiguration procedure on ${_serv_hostname_}"
+
+         if [ "${_ip_address_}" == "${HOST_IP}" ]; then
+               run_remote_cmd "${ENGINE_HOSTNAME}"  "$MKDIR -p ${ENIQ_BASE_DIR}/data/importdata/" "${LOGFILE}" | $TEE -a ${LOGFILE}
+			   status=(${PIPESTATUS[@]})
+               pipe_status0=${status[0]}
+               pipe_status1=${status[1]}
+               if [ "${pipe_status0}" -ne 0 ]; then
+                   _err_msg_="Failed to create ${ENIQ_BASE_DIR}/data/importdata/ on engine server"
+                   abort_script "${_err_msg_}"
+               fi
+               reconfigure_connectd
+               log_msg -h -l ${LOGFILE} -t -s "Successfully migrated connectd from ${HNAME}. Logfile: ${LOGFILE}" 
+         else
+            if [ "${_ip_address_}" == "${ENGINE_IP}" ]; then
+                reconfigure_config_files "${_serv_hostname_}" "${OSS_REF_FILE}"
+            fi
+            if [ -f ${TEM_DIR}/fls_exists.txt ]; then
+                reconfigure_config_files "${_serv_hostname_}" "${FLS_CONFIG_FILE}"
+                reconfigure_config_files "${_serv_hostname_}" "${ENIQ_CONF_DIR}/storage.ini"
+                reconfigure_config_files "${_serv_hostname_}" "${NEW_TEMPL_DIR}/${STORAGE_INI_TEMPLATE}"
+                reconfigure_config_files "${_serv_hostname_}" "${NASD_CONFIG_FILE}"
+                update_SunOS "${_serv_hostname_}" "${ENIQ_CONF_DIR}/${SUNOS_INI}" SunOS.ini
+                update_SunOS "${_serv_hostname_}" "${SUNOS_INI_TEMPLATE}" SunOS.ini_${SAN_DEVICE}
+            fi
+            run_remote_cmd "${_serv_hostname_}" "$BASH ${SCRIPTHOME}/reconfigure_oss.bsh" "$LOGFILE"
+            if [ $? -ne 0 ]; then
+                _err_msg_="Failed to execute reconfigure_oss.bsh on ${_serv_hostname_}"
+                abort_script "${_err_msg_}"
+            fi
+         fi
+     done
+else
+    if [ -f /tmp/SunOS.ini_CO ]; then
+        merge_config_files
+    fi
+    if [ "${HOST_IP}" == "${ENGINE_IP}" ]; then
+        $CAT ${OSS_REF_FILE} | $AWK '{print $1}' > ${TMP}/oss_alias
+        while read _oss_alias_ ; do
+        $RM -f ${MOUNT_INFO_DIR}/${_oss_alias_}/disable_OSS
+        if [ $? -ne 0 ]; then
+        _err_msg_="Failed to remove disable_OSS on ${_serv_hostname_}"
+        abort_script "${_err_msg_}"
+        fi
+        done < ${TMP}/oss_alias
+    fi
+    log_msg -h -l ${LOGFILE} -t -s "Successfully completed OSS configuration on ${HNAME}. Logfile: ${LOGFILE}"  
+fi
+
+if [ "${CO_SERVER}" == "YES" ]; then
+    if [ -f ${TEM_DIR}/fls_exists.txt ]; then
+        create_nas_shares_OSS
+        if [ $? -ne 0 ]; then
+            _err_msg_="Failed to create nas shares on ${_serv_hostname_}"
+            abort_script "${_err_msg_}"
+        fi
+    fi    
+    cleanup_CO
+    if [ $? -eq 0 ]; then
+          $RM -rf ${TEM_DIR}
+          log_msg -h -l ${LOGFILE} -t -s "Script Successfully executed. Logfile: ${LOGFILE}"
+    else
+        _err_msg_="Failed to execute cleanup on ${CO_SERVER}"
+        abort_script "${_err_msg_}"
+    fi
+fi
+
+exit 0

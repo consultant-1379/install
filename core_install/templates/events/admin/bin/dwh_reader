@@ -1,0 +1,489 @@
+#!/bin/bash
+# ********************************************************************
+# Ericsson Radio Systems AB                                     SCRIPT
+# ********************************************************************
+#
+#
+# (c) Ericsson Radio Systems AB 2012 - All rights reserved.
+#
+# The copyright to the computer program(s) herein is the property
+# of Ericsson Radio Systems AB, Sweden. The programs may be used
+# and/or copied only with the written permission from Ericsson Radio
+# Systems AB or in accordance with the terms and conditions stipulated
+# in the agreement/contract under which the program(s) have been
+# supplied.
+#
+# ********************************************************************
+# Name    : dwh_reader
+# Date    : 25/06/2016
+# Revision: main\9
+# Purpose : DWH reader database control script for SMF to use
+#
+# ********************************************************************
+
+# ********************************************************************
+#
+#   Command Section
+#
+# ********************************************************************
+AWK=/usr/bin/awk
+CAT=/usr/bin/cat
+DIRNAME=/usr/bin/dirname
+ECHO=/usr/bin/echo
+EGREP=/usr/bin/egrep
+EXPR=/usr/bin/expr
+GREP=/usr/bin/grep
+GETENT=/usr/bin/getent
+GREP=/usr/bin/grep
+KILL=kill
+KSTAT=/usr/bin/kstat
+MKDIR=/usr/bin/mkdir
+NAWK=/usr/bin/nawk
+RM=/usr/bin/rm
+PS=/usr/bin/ps
+PSTACK=/usr/bin/pstack
+SED=/usr/bin/sed
+SLEEP=/usr/bin/sleep
+SORT=/usr/bin/sort
+SSH=/usr/bin/ssh
+SU=/usr/bin/su
+TAIL=/usr/bin/tail
+TEE=/usr/bin/tee
+TOUCH=/usr/bin/touch
+UMOUNT=/usr/sbin/umount
+UPS=/usr/ucb/ps
+WAIT=wait
+WC=/usr/bin/wc
+
+ENIQ_INI=niq.ini
+
+# ********************************************************************
+#
+#       Configuration Section
+#
+# ********************************************************************
+unalias stop 2> /dev/null
+
+if [ -z "$CONF_DIR" ] ; then
+        $ECHO "ERROR: CONF_DIR is not set"
+	exit 1
+fi
+
+# ********************************************************************
+#
+#   Functions
+#
+# ********************************************************************
+
+### Function: abort_script ###
+#
+#   This will is called if the script is aborted thru an error
+#   error signal sent by the kernel such as CTRL-C or if a serious
+#   error is encountered during runtime
+#
+# Arguments:
+#       $1 - Error message from part of program (Not always used)
+# Return Values:
+#       none
+abort_script()
+{
+if [ "$1" ]; then
+    _err_msg_=$1
+else
+    _err_msg_="Script aborted.......\n"    
+fi
+
+# Check if log_msg() is defined, else define log()
+type log_msg > /dev/null 2>&1
+if [ $? -gt 0 ]; then
+    if [ "${LOGFILE}" ]; then
+	if [ ! "${SNAP_QUIET}" ]; then
+            $ECHO "\n${_err_msg_}\n" |$TEE -a ${LOGFILE}
+	else
+            $ECHO "\n${_err_msg_}\n" >> ${LOGFILE}
+        fi
+    else
+        $ECHO "\n${_err_msg_}\n" 
+    fi
+else
+    if [ "${LOGFILE}" ]; then
+	log_msg -s "\n${_err_msg_}\n" -l ${LOGFILE} ${SNAP_QUIET}
+    else
+	log_msg -s "\n${_err_msg_}\n" ${SNAP_QUIET}
+    fi
+fi
+
+cd $SCRIPTHOME
+
+$RM -rf  ${TEM_DIR}
+
+if [ "$2" ]; then
+    exit ${2}
+else
+   exit 1
+fi
+}
+
+### Function: setup_variables ###
+#
+#   Stop the reader
+#
+# Arguments:
+#       none
+# Return Values:
+# 
+setup_variables()
+{
+if [ ! -s ${CONF_DIR}/niq.rc ]; then
+    _err_msg_="Could not find ${CONF_DIR}/niq.rc"
+    abort_script "$_err_msg_"
+else
+    $ECHO "Sourcing ${CONF_DIR}/niq.rc"
+    . ${CONF_DIR}/niq.rc
+fi
+
+if [ ! -s ${IQ_DIR}/IQ.sh ]; then
+    _err_msg_="Could not find ${IQ_DIR}/IQ.sh"
+    abort_script "$_err_msg_"
+else
+    $ECHO "Sourcing ${IQ_DIR}/IQ.sh" 
+    . ${IQ_DIR}/IQ.sh
+fi
+
+if [ ! -f ${CONF_DIR}/${ENIQ_INI} ] ; then
+    _err_msg_="Panic: Configuration file ${CONF_DIR}/${ENIQ_INI} not found"
+    abort_script "$_err_msg_"
+fi
+
+if [ ! "${ENIQ_BASE_DIR}" ]; then
+    # Directory on the root filesystem
+    ENIQ_BASE_DIR=/eniq
+fi
+
+# ENIQ Log Directory
+ENIQ_LOG_DIR=${ENIQ_BASE_DIR}/local_logs
+
+IQLOGDIR16=${ENIQ_LOG_DIR}/iq
+export IQLOGDIR16
+
+_dir_=`$DIRNAME $0`
+SCRIPTHOME=`cd ${_dir_} 2>/dev/null && pwd || $ECHO ${_dir_}`
+
+if [ -s $SCRIPTHOME/../lib/common_functions.lib ]; then
+    . $SCRIPTHOME/../lib/common_functions.lib
+else
+    _err_msg_="Could not find $SCRIPTHOME/../lib/common_functions.lib"
+    abort_script "$_err_msg_"
+fi
+
+# Main Directory for the Core Installation SW
+ENIQ_INST_DIR=${ENIQ_BASE_DIR}/installation
+# ENIQ Config Directory
+ENIQ_CONF_DIR=${ENIQ_INST_DIR}/config
+# Get server type
+CURR_SERVER_TYPE=`$CAT $ENIQ_CONF_DIR/installed_server_type`
+if [ ! "$CURR_SERVER_TYPE" ]; then
+    _err_msg_="Could not read $ENIQ_CONF_DIR/installed_server_type"
+    abort_script "$_err_msg_" 
+fi
+
+IQ_USER=`iniget DB -v IQUserName -f ${CONF_DIR}/${ENIQ_INI}`
+if [ ${LOGNAME} != ${IQ_USER} ] ; then
+    _err_msg_="This script has to be installed by ${IQ_USER}"
+    abort_script "$_err_msg_"
+fi
+
+# Coord params
+DWH_COORD_PORT=`iniget DWH -v PortNumber -f ${CONF_DIR}/${ENIQ_INI}`
+DWH_COORD_ENG=`iniget DWH -v ServerName -f ${CONF_DIR}/${ENIQ_INI}`
+if [ ! "${DWH_COORD_PORT}" -o ! "${DWH_COORD_ENG}" ] ; then
+    _err_msg_="Could not get coordinator info"
+    abort_script "$_err_msg_"
+fi
+
+# Reader params
+SERVER_NAME=`/usr/bin/hostname`
+IP_ADDRESS=`$GETENT hosts ${SERVER_NAME} | $NAWK '{print $1}' | $SORT -u`
+READER_NUM=`$CAT ${CONF_DIR}/service_names | $GREP "${IP_ADDRESS}" | $GREP "dwh_" | $NAWK -F"::" '{print $3}' | $NAWK -F\_ '{print $NF}'`
+if [ ! "${READER_NUM}" ] ; then
+    _err_msg_="Could not get reader number"
+    abort_script "$_err_msg_"
+fi
+
+
+_reader_="DWH_READER_${READER_NUM}"
+#eval READER_DIR=$($ECHO \${DWH_DIR_R${READER_NUM}})
+READER_DIR=${DWH_READER_DIR}
+
+DWH_ENG=`$CAT ${CONF_DIR}/service_names | $GREP "${IP_ADDRESS}" | $GREP "dwh_" | $NAWK -F"::" '{print $3}'`
+DWH_PORT=`iniget DWH_READER_SETTINGS -v PortNumber -f ${CONF_DIR}/${ENIQ_INI}`
+if [ ! "${DWH_ENG}" -o ! "${DWH_PORT}" ] ; then
+    _err_msg_="Could not get DBA info"
+    abort_script "$_err_msg_"
+fi
+
+DBA_PASSWORD=`inigetpassword DB -v DBAPassword -f ${CONF_DIR}/${ENIQ_INI}`
+if [ ! ${DBA_PASSWORD} ]; then
+    if [ -f ${ENIQ_BASE_DIR}/sw/installer/dbusers ]; then
+        DBA_PASSWORD=`${ENIQ_BASE_DIR}/sw/installer/dbusers dba dwh`
+        if [ ! "${DBA_PASSWORD}" ] ; then
+             _err_msg_="Could not get DBA Password"
+            abort_script "$_err_msg_"
+        fi
+    else
+        _err_msg_="Could not get DBA Password"
+        abort_script "$_err_msg_"
+    fi
+fi
+
+MAINCACHE=`iniget ${_reader_} -v MainCache -f ${CONF_DIR}/${ENIQ_INI}`
+TEMPCACHE=`iniget ${_reader_} -v TempCache -f ${CONF_DIR}/${ENIQ_INI}`
+if [ ! "${MAINCACHE}" -o ! "${TEMPCACHE}" ] ; then
+    _err_msg_="Could not get cache settings"
+    abort_script "$_err_msg_"
+fi
+
+LARGEMEMORY=`iniget ${_reader_} -v LargeMemory -f ${CONF_DIR}/${ENIQ_INI}`
+if [ ! ${LARGEMEMORY} ]; then
+    _err_msg_="Could not read LargeMemory param from ${CONF_DIR}/${ENIQ_INI}"
+    abort_script "$_err_msg_"
+fi
+
+CATALOGCACHE=`iniget DWH -v CatalogCache -f ${CONF_DIR}/${ENIQ_INI}`
+if [ ${CATALOGCACHE} ]; then
+    CC="-c ${CATALOGCACHE}m"
+else
+    _err_msg_="Could not read CatalogCache param from ${CONF_DIR}/${ENIQ_INI}"
+    abort_script "$_err_msg_"
+fi
+
+NUMBEROFCORES=`${KSTAT} cpu_info|${GREP} -w core_id|${SORT} -u|wc -l`
+if [ ! ${NUMBEROFCORES} ]; then
+     _err_msg_="Could not get the number of cores"
+     abort_script "$_err_msg_"
+fi
+
+STOP_COUNT=`iniget DWH_READER_SETTINGS -v StopCount -f ${CONF_DIR}/${ENIQ_INI}`
+STOP_DELAY=`iniget DWH_READER_SETTINGS -v StopDelay -f ${CONF_DIR}/${ENIQ_INI}`
+if [ ! "${STOP_COUNT}" -o ! "${STOP_DELAY}" ] ; then
+    _err_msg_="Could not get stop settings"
+    abort_script "$_err_msg_"
+fi
+}
+
+### Function: include_reader ###
+#
+#   Include the reader in the coordinator.
+#
+# Arguments:
+#       $1 : reader name e.g. dwh_reader_2
+# Return Values:
+#       none
+include_reader()
+{
+	if [ $# -ne 1 ] ; then
+		abort_script "Invalid number of arguements passed to include_reader()" 3
+	fi
+	local _reader_name_=$1
+	local _include_template_=${ENIQ_ADMIN_DIR}/sql/template_include_reader.sql
+	if [ ! -f ${_include_template_} ] ; then
+		abort_script "$_include_template_ not found"
+	fi
+	local _sqlfile_=${ENIQ_ADMIN_DIR}/sql/include_${_reader_name_}.sql
+	$SED -e "/@@reader_name@@/s//${_reader_name_}/g" ${_include_template_} > ${_sqlfile_}
+	local _conn_="uid=DBA;pwd=${DBA_PASSWORD};links=tcpip{host=${DWH_COORD_ENG};port=${DWH_COORD_PORT}};eng=${DWH_COORD_ENG};con=${DWH_COORD_ENG}"
+        log_msg -l ${LOGFILE} -q -s "Ensuring ${_reader_name_} is included in ${DWH_COORD_ENG}"
+	${IQDIR}/bin64/dbisql -onerror exit -c "${_conn_}" ${_sqlfile_} >> ${LOGFILE} 2>&1
+	_ec_=$?
+	if [ $_ec_ -ne 0 ] ; then
+		local _err_msg_="Failed to include ${_reader_name_} in ${DWH_COORD_ENG} error [$_ec_]"
+		if [ $_ec_ -eq 9 ] ; then
+			_err_msg_="$_err_msg_\nPlease ensure dwhdb is running."
+		fi
+		abort_script "$_err_msg_" ${_res_}
+	fi
+        log_msg -l ${LOGFILE} -q -s "${_reader_name_} should now be included in coordinator." 
+}
+
+### Function: start ###
+#
+#   Start the reader
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+start() 
+{
+if [ ! -d ${LOG_DIR}/iq ] ; then
+	$MKDIR -p ${LOG_DIR}/iq
+fi
+
+LOGFILE=${LOG_DIR}/iq/start_${DWH_ENG}.`date '+%y%m%d_%H%M%S'`.log
+
+#Do the include before the synch
+include_reader ${DWH_ENG}
+
+# Need to backup the catalog before starting the Reader
+log_msg -l ${LOGFILE} -q -s "Changing Directory to ${READER_DIR}"
+cd $READER_DIR
+
+# clearing suspended transactions  for reader before startup
+log_msg -l ${LOGFILE} -q -s "Clearing suspended transactions  for ${DWH_ENG} on startup ..." 
+${IQDIR}/bin64/dbisql -nogui -onerror exit -c "con=${DWH_COORD_ENG};eng=${DWH_COORD_ENG};links=tcpip{host=${DWH_COORD_ENG};port=${DWH_COORD_PORT}};uid=dba;pwd=${DBA_PASSWORD}" "sp_iqmpxrollbacksuspendedtransactions('${DWH_ENG}')"
+if [ $? -ne 0 ]; then
+    _err_msg_="Failed to clear suspended transactions from ${DWH_ENG} on ${DWH_COORD_ENG}"
+    abort_script "$_err_msg_"
+else
+    log_msg -l ${LOGFILE} -q -s "Successfully cleared suspended transactions from ${DWH_ENG} on ${DWH_COORD_ENG} "
+fi
+
+log_msg -l ${LOGFILE} -q -s "Backing up catalog db..."
+${IQDIR}/bin64/dbbackup -y -d -c "uid=DBA;pwd=${DBA_PASSWORD};links=tcpip{host=${DWH_COORD_ENG};port=${DWH_COORD_PORT}};eng=${DWH_COORD_ENG};con=${DWH_COORD_ENG}" . >> ${LOGFILE}
+if [ $? -ne 0 ]; then
+    _err_msg_="Failed to backup ${DWH_COORD_ENG}"
+    abort_script "$_err_msg_"
+else
+    log_msg -l ${LOGFILE} -q -s "Successfully backed up ${DWH_COORD_ENG}"
+fi
+
+# Delete old log if it exists
+$RM -rf ${DWH_COORD_ENG}.log ${DWH_COORD_ENG}.tran
+
+# Creat new log file
+${IQDIR}/bin64/dblog -r -t ${DWH_COORD_ENG}.tran ${DWH_COORD_ENG}.db >> ${LOGFILE}
+
+log_msg -l ${LOGFILE} -q -s "Starting $DWH_ENG..."
+if [ -f $READER_DIR/$DWH_COORD_ENG.iqmsg ] ; then
+    $MV $READER_DIR/$DWH_COORD_ENG.iqmsg "${LOG_DIR}/iq/$DWH_COORD_ENG.`date '+%y%m%d_%H%M%S'`.iqmsg"
+fi
+
+TMP=${DWH_TEMP_DIR}
+export TMP
+
+${IQDIR}/bin64/start_iq -STARTDIR ${READER_DIR} @${READER_DIR}/dwhdb.cfg ${CC} -n ${DWH_ENG} -iqmc ${MAINCACHE} -iqtc ${TEMPCACHE} -iqlm ${LARGEMEMORY} -x tcpip{port=${DWH_PORT}} -iqnumbercpus ${NUMBEROFCORES} ${READER_DIR}/dwhdb.db >> ${LOGFILE} 2>&1
+
+${IQDIR}/bin64/dbping -q -c "con=$DWH_ENG;eng=$DWH_ENG;links=tcpip{host=$DWH_ENG;port=${DWH_PORT};dobroadcast=none;verify=no};uid=dba;pwd=${DBA_PASSWORD}" >> ${LOGFILE} 2>&1
+if [ $? -eq 0 ] ; then
+    log_msg -l ${LOGFILE} -q -s "Database $DWH_ENG succesfully started" 
+    exit 0
+else
+    _err_msg_="ERROR: $DWH_ENG start failed"
+    abort_script "$_err_msg_"
+fi
+}
+
+### Function: stop ###
+#
+#   Stop the reader
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+stop() 
+{
+if [ ! -d ${ENIQ_LOG_DIR}/iq ]; then
+    $MKDIR -p ${ENIQ_LOG_DIR}/iq
+fi
+
+LOGFILE=${LOG_DIR}/iq/stop_${DWH_ENG}.`date '+%y%m%d_%H%M%S'`.log
+PSTACK_LOGFILE=${LOG_DIR}/iq/pstack_${DWH_ENG}.`date '+%y%m%d_%H%M%S'`.log
+
+$ECHO "Stoping ${DWH_ENG}..." > ${LOGFILE}
+PID=`$UPS -auxww | $GREP "iqsrv" | $GREP "${DWH_ENG}" | $AWK '{print $2}'`
+
+if [ -z "${PID}" ] ; then
+    log_msg -l ${LOGFILE} -q -s "Can't find dwh_reader process. Database not running."
+    exit 0
+else
+    log_msg -l ${LOGFILE} -q -s "Database is running with PID ${PID}" 
+fi
+
+${IQDIR}/bin64/dbstop -y -q -c "con=$DWH_ENG;eng=${DWH_ENG};links=tcpip{host=${DWH_ENG};port=${DWH_PORT};dobroadcast=none;verify=no};uid=dba;pwd=${DBA_PASSWORD}" 
+if [ $? -ne 0 ] ; then
+    _err_msg_="Could not stop reader (code: 22)"
+    abort_script "$_err_msg_"
+else
+    log_msg -t -l ${LOGFILE} -q -s "dbstop forked" 
+fi
+
+cnt=0
+while [ ${cnt} -lt ${STOP_COUNT} ]; do
+    sleep ${STOP_DELAY}
+	
+    xPS=`$UPS -auxww | $GREP "iqsrv" | $GREP "${DWH_ENG}"`
+	
+    if [ -z "${xPS}" ] ; then
+        log_msg -l ${LOGFILE} -q -s "Database is down"
+	exit 0
+    else
+	xPID=`$ECHO ${xPS} | $AWK '{print $2}'`
+	xNAM=`$ECHO ${xPS} | $AWK '{print $8}'`
+        
+        log_msg -l ${LOGFILE} -q -s "DB process ${xNAM} is still running with ${xPID}"   		
+	let cnt=cnt+1
+		
+	sleep ${STOP_DELAY}
+    fi
+done
+xPID=`$UPS -auxww | $GREP "iqsrv" | $GREP "${DWH_ENG}" | $AWK '{print $2}'`
+if [ -z ${xPID} ] ; then
+     log_msg -l ${LOGFILE} -q -s "Database is down"
+     exit 0
+else
+     cnt=0
+     SLEEP_COUNT=15
+     SLEEP_DELAY=2
+     xPID=`$UPS -auxww | $GREP "iqsrv" | $GREP "${DWH_ENG}" | $AWK '{print $2}'`
+     # Starting a while loop of 30 second in order to take PSTACK at 0th second and 30th second.
+     while [ ${cnt} -lt ${SLEEP_COUNT} ] ; do
+          $SLEEP ${SLEEP_DELAY}
+          xPID=`$UPS -auxww | $GREP "iqsrv" | $GREP "${DWH_ENG}" | $AWK '{print $2}'`
+          if [ -z ${xPID} ] ; then
+              log_msg -l ${LOGFILE} -q -s "Database is down"
+              exit 0
+          else
+              # Taking PSTACK when while loop runs first time (0th second) and last time (30th second)
+              if [ ${cnt} == 0 -o ${cnt} == 14 ]; then
+                   log_msg -l ${LOGFILE} -q -s "DB process ${xNAM} is still running with ${xPID}. Taking PSTACK of pid $xPID"
+                   $ECHO "Taking PSTACK of pid ${xPID}"  >> ${PSTACK_LOGFILE}
+                   $PSTACK ${xPID} >> ${PSTACK_LOGFILE} 2>&1
+              fi
+          fi
+          let cnt=cnt+1
+     done
+fi
+
+xPID=`$UPS -auxww | $GREP "iqsrv" | $GREP "${DWH_ENG}" | $AWK '{print $2}'`
+log_msg -l ${LOGFILE} -q -s "Database $DWH_ENG refused to stop trying to kill it."
+if [ ! -z ${xPID} ] ; then
+    $KILL -9 ${xPID}
+    log_msg -t -l ${LOGFILE} -q -s "Database killed." 
+else
+    log_msg -l ${LOGFILE} -q -s "Database was dead before killing" 
+fi
+
+exit 0
+}
+
+# ********************************************************************
+#
+#   Main body of program
+#
+# ********************************************************************
+#
+# Set up variables
+setup_variables
+
+case "$1" in
+    start) start
+	   ;;
+    stop)  stop
+	   ;;
+    *)	   $ECHO "This script shall only be used by SMF!"
+	   exit 10
+	   ;;
+esac
+
+

@@ -1,0 +1,7 @@
+dwhdb
+	master tcp ether dwhdb <CHANGE><DWH_PORT_NUM>
+
+repdb
+	master tcp ether repdb <CHANGE><REP_PORT_NUM>
+
+

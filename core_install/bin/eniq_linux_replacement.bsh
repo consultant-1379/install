@@ -1,0 +1,5291 @@
+#!/bin/bash
+# ********************************************************************
+# Ericsson Radio Systems AB                                     SCRIPT
+# ********************************************************************
+#
+# (c) Ericsson Radio Systems AB 2023 - All rights reserved.
+#
+# The copyright to the computer program(s) herein is the property
+# of Ericsson Radio Systems AB, Sweden. The programs may be used
+# and/or copied only with the written permission from Ericsson Radio
+# Systems AB or in accordance with the terms and conditions stipulated
+# in the agreement/contract under which the program(s) have been
+# supplied.
+#
+# ********************************************************************
+#
+# Name    : eniq_linux_replacement.bsh
+# Date    : 20/10/2023
+# Revision: \main\44
+# Author  : xpribho
+# Purpose : This script will support replacement on Linux
+# Usage   : eniq_linux_replacement.bsh -a <action> [-R] [-l <logfile>]
+#
+# ********************************************************************
+#
+#   Command Section
+#
+# ********************************************************************
+AWK=/usr/bin/awk
+BASENAME=/usr/bin/basename
+BASH=/usr/bin/bash
+BC=/usr/bin/bc
+CAT=/usr/bin/cat
+CUT=/usr/bin/cut
+CP=/usr/bin/cp
+CPIO=/usr/bin/cpio
+DATE=/usr/bin/date
+DF=/usr/bin/df
+DU=/usr/bin/du
+DIFF=/usr/bin/diff
+DIRNAME=/usr/bin/dirname
+DRACUT=/usr/sbin/dracut
+ECHO=/usr/bin/echo
+EGREP=/usr/bin/egrep
+ENV=/usr/bin/env
+EXPECT=/usr/bin/expect
+EXPR=/usr/bin/expr
+FIND=/usr/bin/find
+GETENT=/usr/bin/getent
+GREP=/usr/bin/grep
+HEAD=/usr/bin/head
+HOST=/usr/sbin/host
+KILL=/usr/bin/kill
+LN=/usr/bin/ln
+LS=/usr/bin/ls
+LSOF=/usr/sbin/lsof
+LVCREATE=/usr/sbin/lvcreate
+LVREMOVE=/usr/sbin/lvremove
+LVRENAME=/usr/sbin/lvrename
+LVS=/usr/sbin/lvs
+MYHOSTNAME=/usr/bin/hostname
+MKFS_EXT4=/usr/sbin/mkfs.ext4
+ID=/usr/bin/id
+MKDIR=/usr/bin/mkdir
+MOUNT=/usr/bin/mount
+NETSTAT=/usr/bin/netstat
+NMCLI=/usr/bin/nmcli
+OPENSSL=/usr/bin/openssl
+PASTE=/usr/bin/paste
+PERL=/usr/bin/perl
+PRINTF=/usr/bin/printf
+RAW=/usr/bin/raw
+RM=/usr/bin/rm
+SED=/usr/bin/sed
+SORT=/usr/bin/sort
+SLEEP=/usr/bin/sleep
+SU=/usr/bin/su
+SUDO=/usr/bin/sudo
+SYSTEMCTL=/usr/bin/systemctl
+SWAPOFF=/usr/sbin/swapoff
+SWAPON=/usr/sbin/swapon
+TAIL=/usr/bin/tail
+TEE=/usr/bin/tee
+TOUCH=/usr/bin/touch
+TR=/usr/bin/tr
+UDEVADM=/usr/sbin/udevadm
+UMOUNT=/usr/bin/umount
+VGCHANGE=/usr/sbin/vgchange
+VGEXPORT=/usr/sbin/vgexport
+VGIMPORT=/usr/sbin/vgimport
+VGS=/usr/sbin/vgs
+WC=/usr/bin/wc
+
+
+# ********************************************************************
+#
+#       Configuration Section
+#
+# ********************************************************************
+
+
+if [ ! "${BACKUP}" ]; then
+    # Cmd to exec a shell and drop user to it in case of an error
+    EXEC_SHELL_CMD="exec /bin/bash -o emacs"
+fi
+
+# Name of the ini Files
+IPMP_INI=ipmp.ini
+STORAGE_INI=storage.ini
+SYM_LINKS_INI=sym_links.ini
+COORD_SYM_INI=coordinator_sym_links.ini
+SUNOS_INI=SunOS.ini
+BLK_STOR_INI=block_storage.ini
+
+# Service
+HOSTSYNC_SMF_ID="hostsync.service"
+DDC_SMF_ID="ddc.service"
+SENTINEL_SMF_ID="licensing-sentinel.service"
+
+
+# NAS Services
+NAS_MILESTONE_SMF_ID="NAS-online.service"
+NASd_SMF_ID="NASd.service"
+
+# ROOT VG Information
+ROOT_POOL="vg_root"
+
+# Set REPLACEMENT default value
+REPLACEMENT="NO"
+
+# Setting no confirmation from user
+NO_CONFIRM="YES"
+
+#UDEV File
+UDEV_FILE=/etc/udev/rules.d/99-iq-raw-devs.rules
+
+# Location of interface directory
+INTF_DIR="/etc/sysconfig/network-scripts"
+
+# ********************************************************************
+#
+#   Functions
+#
+# ********************************************************************
+### Function: abort_script ###
+#
+#   This will be called if the script is aborted by an error
+#   which is encountered during runtime
+#
+# Arguments:
+#       $1 - Error message from part of program (Not always used)
+# Return Values:
+#       none
+abort_script()
+{
+_err_time_=`$DATE '+%Y-%b-%d_%H.%M.%S'`
+
+if [ "$1" ]; then
+    _err_msg_="${_err_time_} - $1"
+else
+    _err_msg_="${_err_time_} - ERROR : Script aborted.......\n"
+fi
+
+if [ "${LOGFILE}" ]; then
+    $ECHO "ERROR : ${_err_msg_}\n" | $TEE -a ${LOGFILE}
+else
+    $ECHO "ERROR : ${_err_msg_}\n"
+fi
+
+if [[ ${BACKUP} ]] && [[ ${USER_STAGE} == "get_replacement_data" ]];then
+    if [ -f "${REPLACEMENT_CONF}"_bkp ];then
+        $MV "${REPLACEMENT_CONF}"_bkp "${REPLACEMENT_CONF}"
+    fi
+fi
+
+$RM -rf ${TEM_DIR}
+
+if [ "$2" ]; then
+    if [ ! "${CONTINUE}" ]; then 
+        ${2}
+    fi
+    exit 1
+else
+   exit 1
+fi
+}
+
+### Function: remove_bkp_lv ###
+#
+#   Remove Backup LV
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+remove_bkp_lv()
+{
+cd /
+$LVS | $GREP -w ${MOUNT_BKP_LV} >>/dev/null 2>&1
+if [ $? -eq 0 ];then
+     log_msg -s "/dev/mapper/${VOLUME_GROUP_FOR_BACKUP}-${MOUNT_BKP_LV} exists. Destroying." -l ${LOGFILE}
+     $LVREMOVE -f /dev/mapper/${VOLUME_GROUP_FOR_BACKUP}-${MOUNT_BKP_LV} >> /dev/null 2>&1
+     if [ $? -ne 0 ];then
+        _err_msg_="Could not destroy ${BACKUP_DIR}."
+        abort_script "${_err_msg_}"
+     fi
+fi
+
+}
+
+### Function: remount_old_lv ###
+#
+#   Remount old LV in case if failure
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+remount_old_lv()
+{
+
+log_msg -s "Renaming ${VOLUME_GROUP_FOR_BACKUP} ${MOUNT_BKP_LV} ${BACKUP_DIR}" -l ${LOGFILE}
+$LVRENAME ${VOLUME_GROUP_FOR_BACKUP} ${MOUNT_BKP_LV} ${BACKUP_DIR} >> /dev/null 2>&1
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not rename replacement root backup ${BACKUP_DIR}_BKP as ${BACKUP_DIR}  "
+    abort_script "${_err_msg_}" 
+fi
+
+log_msg -s "Mounting /dev/mapper/${VOLUME_GROUP_FOR_BACKUP}-${BACKUP_DIR} to ${MOUNT_POINT_BKUP}" -l ${LOGFILE}
+$MOUNT /dev/mapper/${VOLUME_GROUP_FOR_BACKUP}-${BACKUP_DIR} ${MOUNT_POINT_BKUP} >> /dev/null 2>&1
+if [ $? -ne 0 ]; then
+    _err_msg_="Unable to Mount /dev/mapper/${VOLUME_GROUP_FOR_BACKUP}-${BACKUP_DIR} on ${MOUNT_POINT_BKUP}"
+    abort_script "${_err_msg_}"
+fi
+}
+
+
+### Function: backup_iqheader ###
+#
+# Backup iq_header_info file
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+backup_iqheader()
+{
+insert_header_footer head "Entering Linux ${ACTION_TYPE} stage - ${NEXT_STAGE}" ${LOGFILE}
+
+# Skip if Rack server
+if [ "${STORAGE_TYPE}" != "raw" ]; then
+    insert_header_footer foot "Rack Replacement - Skipping - ${NEXT_STAGE}" ${LOGFILE}
+    set_next_stage `$EXPR ${ARRAY_ELEM}+1`
+    return 0
+fi
+
+# Skip if engine
+if [ "${CO_SERVER}" != "YES" -a "${RD_SERVER}" != "YES" ]; then
+    insert_header_footer foot "Skipping the stage for ${CURR_SERVER_TYPE} - ${NEXT_STAGE} " ${LOGFILE}
+    set_next_stage `$EXPR ${ARRAY_ELEM}+1`
+    return 0
+fi
+
+# Skip if prereplacement on CO is not selected in case of multiblade replacement
+if [ "${CO_SERVER}" ]; then
+    if [[ ! "${BACKUP}" ]] && [[ ! -f ${REPLACEMENT_CO} ]]; then
+        insert_header_footer foot "Skipping replacement stage on ${CURR_SERVER_TYPE} - ${NEXT_STAGE}" ${LOGFILE}
+        set_next_stage `$EXPR ${ARRAY_ELEM}+1`
+        return 0
+    fi
+fi
+
+# Check NASd is online
+check_and_manage_smf ${NASd_SMF_ID} enable
+
+IQ_HEADER_INFO=${ENIQ_CONF_DIR}/iq_header_info
+
+# Save iq header data
+save_iq_header_info
+
+if [ ! -s ${IQ_HEADER_INFO} ]; then
+    _err_msg_="Unable to save ${IQ_HEADER_INFO} file."
+    abort_script "${_err_msg_}"
+fi
+
+log_msg -s "\nSuccessfully taken iq_header_info backup in ${IQ_HEADER_INFO} file." -l ${LOGFILE}
+
+insert_header_footer foot "Successfully completed - ${NEXT_STAGE}" ${LOGFILE}
+
+set_next_stage `$EXPR ${ARRAY_ELEM}+1`
+}
+
+
+### Function: backup_root_data ###
+#
+#   Backup root data
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+backup_root_data()
+{
+insert_header_footer head "Entering Linux ${ACTION_TYPE} stage - ${NEXT_STAGE}" ${LOGFILE}
+
+# Skip if prereplacement on CO is not selected in case of multiblade replacement
+if [ "${CO_SERVER}" ]; then
+    if [[ ! "${BACKUP}" ]] && [[ ! -f ${REPLACEMENT_CO} ]]; then
+        insert_header_footer foot "Skipping replacement stage on ${CURR_SERVER_TYPE} - ${NEXT_STAGE}" ${LOGFILE}
+        set_next_stage `$EXPR ${ARRAY_ELEM}+1`
+        return 0
+    fi
+fi
+
+# Check NASd is online if raw
+if [ "${STORAGE_TYPE}" == "raw" ]; then
+   check_and_manage_smf ${NASd_SMF_ID} enable
+fi
+
+# Decrypt sourcefile.gpg if exist
+if [ "${STORAGE_TYPE}" == "raw" ]; then
+   decrypt_sourcefile
+fi
+
+
+if [ ! "${BACKUP}" ]; then
+    # Stop the ENIQ services, if exist, before taking backup of root
+    $BASH ${ENIQ_ADMIN_DIR}/bin/manage_eniq_services.bsh -a list -s ALL -N >> /dev/null 2>&1
+    if [ $? -eq 0 ];then
+        stop_eniq_services
+    fi
+
+    log_msg -s "\nStopping the ENIQ services." -l ${LOGFILE}
+    stop_smf_services
+
+    # Disabling OSS mounts
+    disable_oss_mounts
+fi
+
+#Zipping /var/log/audit/ directory to include in backup
+$ECHO "Zipping /var/log/audit/ to include in backup"
+if [ -f /var/log/compressed_audit_* ]; then 
+   $RM -rf /var/log/compressed_audit_*
+   zip /var/log/compressed_audit_${RUN_TIME} -r /var/log/audit/
+else
+   zip /var/log/compressed_audit_${RUN_TIME} -r /var/log/audit/
+fi
+
+# Check Volume group space availability
+_vgs_free_=`$VGS ${VOLUME_GROUP_FOR_BACKUP} -o vg_free --noheading |$AWK -F" " '{print $1}' | $SED 's/<//g'`
+_vgs_space_=`$ECHO ${_vgs_free_} | $SED 's/.$//'`
+if [ "${_vgs_free_: -1}" == "T" ];then
+    _vgs_space_=`$ECHO "${_vgs_space_} * 1024" |$BC`
+fi
+
+_vgs_space_=`$ECHO "${_vgs_space_%.*}" | $BC`
+
+_root_used_=`$DF -h / | $AWK '{print $3}' | $EGREP -ivw 'Used'`
+_root_size_=`$ECHO "${_root_used_}" | $SED 's/.$//'`
+_root_char_=`$ECHO "${_root_used_: -1}"`
+
+if [ "${_root_char_}" == "t" -o "${_root_char_}" == "T" ];then
+    _root_size_=`$ECHO "${_root_size_} * 1024" | $BC`
+elif [ "${_root_char_}" == "m" -o "${_root_char_}" == "M" ];then
+    _root_size_=`$ECHO "scale=5; ${_root_size_} / 1024" | $BC`
+elif [ "${_root_char_}" == "k" -o "${_root_char_}" == "K" ];then
+    _root_size_=`$ECHO "scale=5; ${_root_size_} / 1024 / 1024" | $BC`
+elif [ "${_root_char_}" == "g" -o "${_root_char_}" == "G" ];then
+    _root_size_=`$ECHO "${_root_size_}"`
+else
+    _err_msg_="Unrecognised character returned from command"
+    abort_script "${_err_msg_}"
+fi
+
+_var_dir_used_=`$DF -h /var | $AWK '{print $3}' | $EGREP -iv 'Used'`
+_var_dir_size_=`$ECHO "${_var_dir_used_}" | $SED 's/.$//'`
+_var_char_=`$ECHO "${_var_dir_used_: -1}"`
+
+if [ "${_var_char_}" == "t" -o "${_var_char_}" == "T" ];then
+    _var_dir_size_=`$ECHO "${_var_dir_size_} * 1024" | $BC`
+elif [ "${_var_char_}" == "m" -o "${_var_char_}" == "M" ];then
+    _var_dir_size_=`$ECHO "scale=5; ${_var_dir_size_} / 1024" | $BC`
+elif [ "${_var_char_}" == "g" -o "${_var_char_}" == "G" ];then
+    _var_dir_size_=`$ECHO "${_var_dir_size_}"`
+elif [ "${_var_char_}" == "k" -o "${_var_char_}" == "K" ];then
+    _var_dir_size_=`$ECHO "scale=5; ${_var_dir_size_} / 1024 / 1024" | $BC`
+else
+    _err_msg_="Unrecognised character returned from command"
+    abort_script "${_err_msg_}"
+fi
+
+_var_log_journal_used_=`$DU -sh /var/log/journal/ | $AWK '{print $1}'`
+_var_log_journal_size_=`$ECHO "${_var_log_journal_used_}" | $SED 's/.$//'`
+_var_log_journal_char_=`$ECHO "${_var_log_journal_used_: -1}"`
+
+if [ "${_var_log_journal_char_}" == "t" -o "${_var_log_journal_char_}" == "T" ];then
+    _var_log_journal_size_=`$ECHO "${_var_log_journal_size_} * 1024" | $BC`
+elif [ "${_var_log_journal_char_}" == "m" -o "${_var_log_journal_char_}" == "M" ];then
+    _var_log_journal_size_=`$ECHO "scale=5; ${_var_log_journal_size_} / 1024" | $BC`
+elif [ "${_var_log_journal_char_}" == "g" -o "${_var_log_journal_char_}" == "G" ];then
+    _var_log_journal_size_=`$ECHO "${_var_log_journal_size_}"`
+elif [ "${_var_log_journal_char_}" == "k" -o "${_var_log_journal_char_}" == "K" ];then
+    _var_log_journal_size_=`$ECHO "scale=5; ${_var_log_journal_size_} / 1024 / 1024" | $BC`
+else
+    _err_msg_="Unrecognised character returned from command"
+    abort_script "${_err_msg_}"
+fi
+
+_var_log_audit_used_=`$DU -sh /var/log/audit/ | $AWK '{print $1}'`
+_var_log_audit_size_=`$ECHO "${_var_log_audit_used_}" | $SED 's/.$//'`
+_var_log_audit_char_=`$ECHO "${_var_log_audit_used_: -1}"`
+
+if [ "${_var_log_audit_char_}" == "t" -o "${_var_log_audit_char_}" == "T" ];then
+   _var_log_audit_size_=`$ECHO "${_var_log_audit_size_} * 1024" | $BC`
+elif [ "${_var_log_audit_char_}" == "m" -o "${_var_log_audit_char_}" == "M" ];then
+   _var_log_audit_size_=`$ECHO "scale=5; ${_var_log_audit_size_} / 1024" | $BC`
+elif [ "${_var_log_audit_char_}" == "g" -o "${_var_log_audit_char_}" == "G" ];then
+   _var_log_audit_size_=`$ECHO "${_var_log_audit_size_}"`
+elif [ "${_var_log_audit_char_}" == "k" -o "${_var_log_audit_char_}" == "K" ];then
+   _var_log_audit_size_=`$ECHO "scale=5; ${_var_log_audit_size_} / 1024 / 1024" | $BC`
+else
+    _err_msg_="Unrecognised character returned from command"
+    abort_script "${_err_msg_}"
+fi
+
+_total_var_size_=`$ECHO "${_var_dir_size_} - ${_var_log_journal_size_} - ${_var_log_audit_size_}" | $BC`
+
+if (( $(echo "${_total_var_size_} > 0" | $BC -l) )); then
+   _total_size_=`$ECHO "${_root_size_} + ${_total_var_size_}" | $BC`
+else
+   _total_size_=`$ECHO "${_root_size_} + 0" | $BC`
+fi
+_space_required_=`$ECHO "${_total_size_} + 5" | $BC`
+_space_required_=`$ECHO "${_space_required_%.*}" | $BC`
+
+if [ ${_vgs_space_} -lt ${_space_required_} ];then
+    _err_msg_="Not enough space in Volume Group to dump root data. ${ACTION_TYPE} can not continue."
+    abort_script "${_err_msg_}"
+fi
+
+if [ "${BACKUP}" ];then
+    _backup_dir_="${BACKUP_DIR}"_new
+else
+    _backup_dir_="${BACKUP_DIR}"
+fi
+
+# Go to / directory before backup LVM creation
+cd /
+if [ "${BACKUP}" ];then
+    $LVS | $GREP -w ${BACKUP_DIR}_new >>/dev/null 2>&1
+    if [ $? -eq 0 ];then
+        $DF -hk ${MOUNT_POINT_BKUP} | $GREP -w replacement >> /dev/null 2>&1
+        if [ $? -eq 0 ];then
+            log_msg -s "Unmounting ${MOUNT_POINT_BKUP}" -l ${LOGFILE}
+            $UMOUNT -l ${MOUNT_POINT_BKUP} >> /dev/null 2>&1
+            if [ $? -ne 0 ];then
+                _err_msg_="Could not unmount ${MOUNT_POINT_BKUP}."
+                abort_script "${_err_msg_}"
+            fi
+        fi
+    fi
+    $LVS | $GREP -w ${BACKUP_DIR} >>/dev/null 2>&1
+    if [ $? -eq 0 ];then
+        $DF -hk ${MOUNT_POINT_BKUP} | $GREP -w replacement >> /dev/null 2>&1
+        if [ $? -eq 0 ];then
+            log_msg -s "Unmounting ${MOUNT_POINT_BKUP}" -l ${LOGFILE}
+            $UMOUNT -l ${MOUNT_POINT_BKUP} >> /dev/null 2>&1
+            if [ $? -ne 0 ];then
+                _err_msg_="Could not unmount ${MOUNT_POINT_BKUP}."
+                abort_script "${_err_msg_}"
+            fi
+        fi
+        log_msg -s "${VOLUME_GROUP_FOR_BACKUP}-${BACKUP_DIR} exists.Taking a backup of it" -l ${LOGFILE}
+        $LVS | $GREP -w ${MOUNT_BKP_LV} >>/dev/null 2>&1
+        if [ $? -ne 0 ]; then
+            $LVRENAME ${VOLUME_GROUP_FOR_BACKUP} ${BACKUP_DIR} ${MOUNT_BKP_LV} >> /dev/null 2>&1
+            if [ $? -ne 0 ];then
+                _err_msg_="Could not destroy ${BACKUP_DIR}."
+                abort_script "${_err_msg_}"
+            fi
+        fi
+    fi
+fi
+
+log_msg -s "\n\nPreparing to take backup of required root data to ${_backup_dir_}" -l ${LOGFILE}
+if [ ! "${BACKUP}" ];then
+    $LVS | $GREP -w ${_backup_dir_} >>/dev/null 2>&1
+    if [ $? -eq 0 ];then
+    $DF -hk ${MOUNT_POINT_BKUP} | $GREP -w replacement >> /dev/null 2>&1
+        if [ $? -eq 0 ];then
+            log_msg -s "Unmounting ${MOUNT_POINT_BKUP}" -l ${LOGFILE}
+            $UMOUNT -l ${MOUNT_POINT_BKUP} >> /dev/null 2>&1
+            if [ $? -ne 0 ];then
+                _err_msg_="Could not unmount ${MOUNT_POINT_BKUP}."
+                abort_script "${_err_msg_}"
+            fi
+        fi
+            log_msg -s "${_backup_dir_} exists. Taking a backup of it." -l ${LOGFILE}
+            $LVS | $GREP -w ${MOUNT_BKP_LV} >>/dev/null 2>&1
+            if [ $? -ne 0 ]; then
+                $LVRENAME ${VOLUME_GROUP_FOR_BACKUP} ${BACKUP_DIR} ${MOUNT_BKP_LV} >> /dev/null 2>&1
+                if [ $? -ne 0 ];then
+                    _err_msg_="Could not destroy ${_backup_dir_}."
+                    abort_script "${_err_msg_}"
+                fi
+            fi
+    fi
+fi
+
+# Create backup dir and dump root data
+log_msg -s "Creating directory ${_backup_dir_} to dump the root filesystem" -l ${LOGFILE}
+$LVS | $GREP -w ${_backup_dir_} >>/dev/null 2>&1
+if [ $? -ne 0 ]; then
+    $LVCREATE -y -L ${_space_required_}G -n ${_backup_dir_} ${VOLUME_GROUP_FOR_BACKUP} >> /dev/null 2>&1
+    if [ $? -ne 0 ];then
+        _err_msg_="Could not create ${_backup_dir_}"
+        abort_script "${_err_msg_}"
+    fi
+fi
+
+$MKFS_EXT4 /dev/mapper/${VOLUME_GROUP_FOR_BACKUP}-${_backup_dir_} >> /dev/null 2>&1
+if [ $? -ne 0 ]; then
+    log_msg -q -s "\n\nRemoving LVM filesystem ${_filesystem_name_}" -l ${LOGFILE}
+    $LVREMOVE -f /dev/mapper/${VOLUME_GROUP_FOR_BACKUP}-${_backup_dir_} >> /dev/null 2>&1
+    if [ $? -ne 0 ]; then
+        _err_msg_="Unable to remove LV ${VOLUME_GROUP_FOR_BACKUP}|${_backup_dir_}"
+        abort_script "${_err_msg_}"
+    fi
+    # call remount old lv added
+    remount_old_lv
+    _err_msg_="Could not create EXT4 filesytem on ${_backup_dir_}"
+    abort_script "${_err_msg_}"
+fi
+
+#Creation of root backup directory
+$MKDIR -p ${MOUNT_POINT_BKUP}
+if [ $? -ne 0 ];then
+    _err_msg_="Could not create ${MOUNT_POINT_BKUP}"
+    abort_script "${_err_msg_}"
+fi
+
+log_msg -s "Mounting /dev/mapper/${VOLUME_GROUP_FOR_BACKUP}-${_backup_dir_} to ${MOUNT_POINT_BKUP}" -l ${LOGFILE}
+$MOUNT /dev/mapper/${VOLUME_GROUP_FOR_BACKUP}-${_backup_dir_} ${MOUNT_POINT_BKUP} >> /dev/null 2>&1
+if [ $? -ne 0 ]; then
+    _err_msg_="Unable to Mount /dev/mapper/${VOLUME_GROUP_FOR_BACKUP}-${_backup_dir_} on ${MOUNT_POINT_BKUP}"
+    abort_script "${_err_msg_}"
+fi
+
+log_msg -s "\n\nDumping the root filesystem to ${_backup_dir_}" -l ${LOGFILE}
+# Exclude list for root filesystem
+_exclude_list_='^/var/spool/clientmqueue|^/var/adm|^/usr|^core|vol|^/tmp'
+$FIND / -xdev -depth -print | $EGREP -v ${_exclude_list_} | $CPIO -pdum ${MOUNT_POINT_BKUP} >> /dev/null 2>&1
+if [ $? -ne 0 ];then
+    log_msg -s "\n\nDumping the root filesystem to ${MOUNT_POINT_BKUP} failed, destroying ${VOLUME_GROUP_FOR_BACKUP}/${_backup_dir_}" -l ${LOGFILE}
+    $DF -hk ${MOUNT_POINT_BKUP} | $GREP -w replacement >> /dev/null 2>&1
+    if [ $? -eq 0 ];then
+        log_msg -s "Unmounting ${MOUNT_POINT_BKUP}" -l ${LOGFILE}
+        $UMOUNT -l ${MOUNT_POINT_BKUP} >> /dev/null 2>&1
+        if [ $? -ne 0 ];then
+            _err_msg_="Could not UNMOUNT ${MOUNT_POINT_BKUP}."
+            abort_script "${_err_msg_}"
+        fi
+    fi
+    $LVREMOVE -f /dev/mapper/${VOLUME_GROUP_FOR_BACKUP}-${_backup_dir_} >> /dev/null 2>&1
+    if [ $? -ne 0 ]; then
+        _err_msg_="Unable to remove LV ${VOLUME_GROUP_FOR_BACKUP}|${_backup_dir_}"
+        abort_script "${_err_msg_}"
+    fi
+    remount_old_lv
+    _err_msg_="Could not backup the root filesystem to the VGS pool"
+    abort_script "${_err_msg_}"
+fi    
+
+# Include list for root filesystem
+_include_list_='^/etc/|^/ericsson/|^/dev'                     
+$FIND / -xdev -depth -print | $EGREP -i ${_include_list_} | $CPIO -pdum ${MOUNT_POINT_BKUP} >> /dev/null 2>&1
+if [ $? -ne 0 ];then
+    log_msg -s "\n\nDumping the root filesystem to ${MOUNT_POINT_BKUP} failed, destroying ${VOLUME_GROUP_FOR_BACKUP}/${_backup_dir_}" -l ${LOGFILE}
+    $DF -hk ${MOUNT_POINT_BKUP} | $GREP -w replacement >> /dev/null 2>&1
+    if [ $? -eq 0 ];then
+        log_msg -s "Unmounting ${MOUNT_POINT_BKUP}." -l ${LOGFILE}
+        $UMOUNT -l ${MOUNT_POINT_BKUP} >> /dev/null 2>&1
+        if [ $? -ne 0 ];then
+            _err_msg_="Could not UNMOUNT ${MOUNT_POINT_BKUP}."
+            abort_script "${_err_msg_}"
+        fi
+    fi
+    $LVREMOVE -f /dev/mapper/${VOLUME_GROUP_FOR_BACKUP}-${_backup_dir_} >> /dev/null 2>&1
+    if [ $? -ne 0 ]; then
+        _err_msg_="Unable to remove LV ${VOLUME_GROUP_FOR_BACKUP}|${_backup_dir_}"
+        abort_script "${_err_msg_}"
+    fi
+    remount_old_lv
+    _err_msg_="Could not backup the root filesystem to the VGS pool"
+    abort_script "${_err_msg_}"
+fi
+
+# Deleting sourcefile created during decrypting sourcefile.gpg
+if [ -f /ericsson/storage/etc/sourcefile.gpg ]; then
+    if [ -f /ericsson/storage/etc/sourcefile ]; then
+        $RM -rf  /ericsson/storage/etc/sourcefile
+        if [ $? -ne 0 ]; then
+            _err_msg_="Failed to delete sourcefile file"
+            abort_script "$_err_msg_"
+        fi
+    fi
+fi
+
+# Include list for /var filesystem
+_include_var_list_='^/var/tmp/upgrade/|^/var/spool/cron/|^/var/log/'
+$FIND /var -xdev -depth -print | $EGREP -i ${_include_var_list_} | $EGREP -v '^/var/log/journal|^/var/log/audit' | $CPIO -pdum ${MOUNT_POINT_BKUP} >> /dev/null 2>&1
+if [ $? -ne 0 ];then
+    log_msg -s "\n\nDumping the root filesystem to ${MOUNT_POINT_BKUP} failed, destroying ${VOLUME_GROUP_FOR_BACKUP}/${_backup_dir_}" -l ${LOGFILE}
+    $DF -hk ${MOUNT_POINT_BKUP}  | $TAIL -1 >> /dev/null 2>&1
+    if [ $? -eq 0 ];then
+        log_msg -s "Unmounting ${MOUNT_POINT_BKUP}." -l ${LOGFILE}
+        $UMOUNT -l ${MOUNT_POINT_BKUP} >> /dev/null 2>&1
+        if [ $? -ne 0 ];then
+            _err_msg_="Could not UNMOUNT ${MOUNT_POINT_BKUP}."
+            abort_script "${_err_msg_}"
+        fi
+    fi
+    $LVREMOVE -f /dev/mapper/${VOLUME_GROUP_FOR_BACKUP}-${_backup_dir_} >> /dev/null 2>&1
+    if [ $? -ne 0 ]; then
+        _err_msg_="Unable to remove LV ${VOLUME_GROUP_FOR_BACKUP}|${_backup_dir_}"
+        abort_script "${_err_msg_}"
+    fi
+    remount_old_lv
+    _err_msg_="Could not backup the root filesystem to the VGS pool"
+    abort_script "${_err_msg_}"
+fi
+  
+if [ "${BACKUP}" ];then
+    log_msg -s "Backup Successful. Checking if ${BACKUP_DIR} exists before Renaming ${_backup_dir_} to ${BACKUP_DIR}." -l ${LOGFILE}
+    $LVS | $GREP -w ${BACKUP_DIR} | $GREP -v ${_backup_dir_} >/dev/null 2>&1
+    if [ $? -eq 0 ]; then
+        $LVREMOVE -f /dev/mapper/${VOLUME_GROUP_FOR_BACKUP}-${BACKUP_DIR} >> /dev/null 2>&1
+        if [ $? -ne 0 ]; then
+            _err_msg_="Could not destroy ${BACKUP_DIR}"
+            abort_script "${_err_msg_}"
+        fi
+    fi
+    $DF -hk ${MOUNT_POINT_BKUP} | $GREP -w replacement >> /dev/null 2>&1
+    if [ $? -eq 0 ];then
+        log_msg -s "Unmounting ${MOUNT_POINT_BKUP}." -l ${LOGFILE}
+        $UMOUNT -l ${MOUNT_POINT_BKUP} >> /dev/null 2>&1
+        if [ $? -ne 0 ];then
+            _err_msg_="Could not UNMOUNT ${MOUNT_POINT_BKUP}."
+            abort_script "${_err_msg_}"
+        fi
+    fi
+    log_msg -s "Renaming ${_backup_dir_} to ${BACKUP_DIR}" -l ${LOGFILE}
+    $LVRENAME ${VOLUME_GROUP_FOR_BACKUP} ${_backup_dir_} ${BACKUP_DIR} >> /dev/null 2>&1
+    if [ $? -ne 0 ]; then
+        _err_msg_="Could not rename ${_backup_dir_} as ${BACKUP_DIR}"
+        abort_script "${_err_msg_}"
+    fi
+    _backup_dir_=${BACKUP_DIR}
+    log_msg -s "Re-mounting /dev/mapper/${_backup_dir_} to ${MOUNT_POINT_BKUP}" -l ${LOGFILE}
+    $MOUNT /dev/mapper/${VOLUME_GROUP_FOR_BACKUP}-${_backup_dir_} ${MOUNT_POINT_BKUP} >> /dev/null 2>&1
+    if [ $? -ne 0 ]; then
+        _err_msg_="Unable to Mount /dev/mapper/${VOLUME_GROUP_FOR_BACKUP}-${_backup_dir_} on ${MOUNT_POINT_BKUP}"
+        abort_script "${_err_msg_}"
+    fi
+fi
+log_msg -s "\nRequired root files have been dumped to ${_backup_dir_}\n" -l ${LOGFILE}
+
+#calling remove_bkp_lv function here after successful root backup
+remove_bkp_lv
+
+# Take backup of ini files going to be modified during replacement
+_config_list_="lun_map.ini
+SunOS.ini
+sym_links.ini
+eniq_sw_locate
+om_sw_locate
+storage.ini
+disks_partitioned"
+
+# Create config files backup directory
+if [ ! -d ${CONFIG_BACKUP_DIR} ];then
+    $MKDIR -p ${CONFIG_BACKUP_DIR}
+    if [ $? -ne 0 ];then
+        _err_msg_="Unable to create config files backup directory ${CONFIG_BACKUP_DIR}."
+        abort_script "${_err_msg_}"
+    fi
+fi
+log_msg -q -s "Created backup directory for config files." -l ${LOGFILE}
+
+# Copy the config files
+for _file_ in ${_config_list_} ; do
+    if [ -f "${ENIQ_CONF_DIR}/${_file_}" ]; then
+        if [ ! -f "${CONFIG_BACKUP_DIR}/${_file_}" ]; then
+            $CP -p ${ENIQ_CONF_DIR}/${_file_} ${CONFIG_BACKUP_DIR}/
+            if [ $? -ne 0 ];then
+                _err_msg_="Unable to take backup of ${ENIQ_CONF_DIR}/${_file_}."
+                abort_script "${_err_msg_}"
+            fi
+        fi
+    fi
+done
+
+log_msg -q -s "Taken backup of config files in ${CONFIG_BACKUP_DIR} directory.\n" -l ${LOGFILE}
+
+insert_header_footer foot "Successfully completed - ${NEXT_STAGE}" ${LOGFILE}
+
+set_next_stage `$EXPR ${ARRAY_ELEM}+1`
+
+}
+
+
+### Function: check_absolute_path ###
+#
+# Determine absolute path to software
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+check_absolute_path()
+{
+_dir_=`$DIRNAME $0`
+SCRIPTHOME=`cd ${_dir_} 2>/dev/null && pwd || $ECHO ${_dir_}`
+
+if [ "${ACTION_TYPE}" == "prereplacement" ];then
+    if [[ ! "${BACKUP}" ]] && [[ ! "${SCRIPTHOME}" =~ ^/var/tmp.* ]];then
+        _err_msg_="Script should be placed and run from a directory under /var/tmp."
+        abort_script "${_err_msg_}"
+    fi
+fi
+
+# Check pwd
+_curr_dir_=`pwd`
+if [[ "${_curr_dir_}" =~ ^/eniq.* ]];then
+    _err_msg_="Your current directory ${_curr_dir_} is a ENIQ location. Please change directory to /"
+    abort_script "${_err_msg_}"
+fi
+}
+
+
+### Function: check_and_manage_smf ###
+#
+#   Check SMF service status and manage
+#
+# Arguments:
+#   $1 : SMF name
+#   $2 : Action
+# Return Values:
+#   none
+check_and_manage_smf()
+{
+# Check argument count
+if [ $# -ne 2 ];then
+    _err_msg_="Incorrect number of argument passed to check_and_manage_smf."
+    abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+fi
+
+_smf_str_=$1
+_svc_action_=$2
+
+# Check status of Service
+_smf_status_=`$SYSTEMCTL show ${_smf_str_} -p ActiveState | $AWK -F= '{print $2}'`
+
+_smf_next_state_=""
+case $_svc_action_ in
+  enable) _smf_next_state_="active"
+     ;;
+  disable) _smf_next_state_="inactive"
+     ;;
+  *) $ECHO "Invalid action"
+     exit 1
+     ;;
+esac
+
+if [ "${_smf_status_}" != "${_smf_next_state_}" ];then
+    if [ "${_smf_status_}" == "maintenance" ];then
+        $SYSTEMCTL reset-failed ${_smf_str_} >> /dev/null 2>&1
+    fi
+    if [ "${_svc_action_}" == "enable" ];then
+        $SYSTEMCTL start ${_smf_str_} >> /dev/null 2>&1
+        if [ $? -ne 0 ];then
+            _err_msg_="Could not start ${_smf_str_}"
+            abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+        fi
+        $SYSTEMCTL enable ${_smf_str_} >> /dev/null 2>&1
+        if [ $? -ne 0 ];then
+            _err_msg_="Could not $_svc_action_ `$BASENAME $_smf_str_ :enable` service."
+            abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+        fi
+    else
+        $SYSTEMCTL disable ${_smf_str_} >> /dev/null 2>&1
+        if [ $? -ne 0 ];then
+            _err_msg_="Could not $_svc_action_ `$BASENAME $_smf_str_ :disable` service."
+            abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+        fi
+        $SYSTEMCTL stop ${_smf_str_} >> /dev/null 2>&1
+        if [ $? -ne 0 ];then
+            _err_msg_="Could not stop ${_smf_str_}"
+            abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+        fi
+    fi
+fi
+
+# Wait for NAS milestone service if enabling NASd service 
+if [ "${_smf_str_}" == "${NASd_SMF_ID}" -a "${_svc_action_}" == "enable" ];then
+    _count_=0
+    while [ 1 ];
+    do
+        _milestone_state_=`$SYSTEMCTL show ${NAS_MILESTONE_SMF_ID} -p ActiveState | $AWK -F= '{print $2}'`
+        if [ "${_milestone_state_}" == "active" ];then
+            log_msg -q -s "${NAS_MILESTONE_SMF_ID} service is active." -l ${LOGFILE}
+            break
+        fi
+        if [ $_count_ -eq 0 ]; then
+            $ECHO "\nEnabling NAS milestone service. It can take upto 2 to 5 minutes. Please wait...\n"
+        fi
+        $SLEEP 30
+        let _count_=_count_+1
+        if [ $_count_ -eq 5 ];then
+            _err_msg_="NAS milestone ${NAS_MILESTONE_SMF_ID} SMF not active. Check ${ENIQ_LOG_DIR}/NASd/NASd.log"
+            abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+        fi
+    done
+fi
+}
+
+
+### Function: check_id ###
+#
+#   Check that the effective id of the user is correct
+#   If not print error msg and exit.
+#
+# Arguments:
+#       $1 : User ID name
+# Return Values:
+#       none
+check_id()
+{
+
+_get_id_=`$ENV |$GREP -w SUDO_USER | $EGREP "^[[:blank:]]*SUDO_USER="|$AWK -F\= '{print $2}'|$SED -e 's|"||g'`
+
+_check_id_=`$ID | $AWK -F\( '{print $2}' | $AWK -F\) '{print $1}'`
+
+_check_group_=`$ID $_get_id_ | $AWK -F\( '{print $3}' | $AWK -F\) '{print $1}'`
+
+
+    if [ "${_get_id_}" == "" ]; then
+
+        if [ "${_check_id_}" == "root" ]; then
+           # Set 1 for true
+           _user_root=1
+
+        else
+           _err_msg_="You must be root or admin to execute this script."
+           abort_script "${_err_msg_}"
+        fi
+          else
+            if [ "${_check_group_}" == "ENIQ_ADMIN_ROLE" ]; then
+               # Set 0 for false
+               _user_root=0
+
+            else
+               _err_msg_="You must be root or admin to execute this script." 
+               abort_script "${_err_msg_}"
+            fi
+    fi
+}
+
+### Function: check_for_mpath ###
+#
+#   Checks mpath value of all the luns are visible or not
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+check_for_mpath()
+{
+_stor_api_cmd_=${ERICSSON_STOR_DIR}/san/bin/blkcli
+# Getting the disks which are already partitioned
+if [ "${STORAGE_TYPE}" == "raw" ]; then
+    for (( _count_=0;${_count_}<2;_count_++ ));do
+        $RM -f ${TEM_DIR}/listluns.txt
+        ${_stor_api_cmd_} --action listluns > ${TEM_DIR}/listluns.txt
+        if [ $? -ne 0 ]; then
+            # exit from script if return code non-zero
+            _err_msg_="Couldn't get list of partitioned disks."
+            abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+        else
+            # check if listluns.txt has content in case return code is zero
+            if [ ! -s ${TEM_DIR}/listluns.txt ]; then
+                continue
+            fi
+        fi
+        break
+    done
+fi
+
+# Check if there are disks for which mpath value is not assigned
+$CAT ${TEM_DIR}/listluns.txt | $GREP -v mpath >> /dev/null 2>&1
+if [ $? -eq 0 ]; then
+    if [ ! -f ${VAR_TMP_DIR}/reboot_required ]; then
+        ## Adding multipath module to initramfs before reboot
+        log_msg -s "Adding multipath module to initramfs" -l ${LOGFILE}
+
+        $DRACUT --force --add multipath --include /etc/multipath >> /dev/null 2>&1
+        if [ $? -ne 0 ]; then
+            _err_msg_="Failed to add multipath module to initramfs using DRACUT"
+            abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+        fi
+        
+        $TOUCH ${VAR_TMP_DIR}/reboot_required
+        log_msg -s  "Rebooting the server to assign mpath value for the disk" -l ${LOGFILE}
+        $REBOOT
+    else
+         $RM -rf ${VAR_TMP_DIR}/reboot_required
+        _err_msg_="For some disks mpath value is not assigned"
+        abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+    fi
+fi
+
+}
+
+### Function: check_mandatory_files ###
+#
+#   Checks mandatory files in backup Directory in LV
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+check_mandatory_files()
+{
+_mandatory_files_="etc/hosts etc/fstab"
+for _file_ in ${_mandatory_files_}
+do
+    log_msg -s "Checking the mandatory file ${_file_} in the backup directory ${BACKUP_DIR}" -l ${LOGFILE}
+    if [ ! -f ${MOUNT_POINT_BKUP}/${_file_} ]; then
+        _err_msg_="Couldn't backup the mandatory file ${_file_} to the VOLUME GROUP. Take manual backup for ${_file_} to directory ${BACKUP_DIR} and re-run the stage"
+        abort_script "${_err_msg_}"
+    fi
+done
+}
+
+### Function: check_params ###
+#
+# Check Input Params
+#
+# Arguments:
+#    none
+# Return Values:
+#    none
+check_params()
+{
+# Check that we got the required action type
+if [ ! "${ACTION_TYPE}" ]; then
+    $ECHO "\nERROR: Required parameters not passed."
+    usage_msg
+    exit 1
+fi
+
+if [ "${ACTION_TYPE}" != "prereplacement" -a "${ACTION_TYPE}" != "replacement" -a \
+     "${ACTION_TYPE}" != "prerecovery" -a "${ACTION_TYPE}" != "rep-recovery" -a \
+     "${ACTION_TYPE}" != "cleanup" -a "${ACTION_TYPE}" != "post-replacement" ]; then
+    $ECHO "\nERROR: Not a valid action type"
+    usage_msg
+    exit 1
+fi
+
+case $ACTION_TYPE in
+  prereplacement) STOP_STAGE="cleanup_prereplacement"
+                  ACTIVITY="Backup procedure for Linux Blade Replacement"
+                  _base_sw_param_="REP_BASE_SW_LOC"
+                  _om_sw_param_="REP_OM_SW_LOC"
+     ;;
+  prerecovery) ACTIVITY="Preparation phase for Linux Replacement Recovery" 
+     ;;
+  replacement) STOP_STAGE="cleanup_replacement"
+               ACTIVITY="Procedure for Linux Blade Replacement"
+               _base_sw_param_="REP_BASE_SW_LOC"
+               _om_sw_param_="REP_OM_SW_LOC"
+     ;;
+  rep-recovery) STOP_STAGE="recovery_cleanup"
+            ACTIVITY="Procedure to recover Linux Replacement Recovery"
+            _base_sw_param_="REC_BASE_SW_LOC"
+            _om_sw_param_="REC_OM_SW_LOC"
+     ;;
+  cleanup) ACTIVITY="Procedure to clean temporary files/directories"
+     ;;
+  post-replacement) ACTIVITY="Procedure to check all loads work properly"
+     ;;
+ \?) $ECHO "Invalid action type"
+     usage_msg
+     exit 1
+     ;;
+esac
+
+}
+
+
+### Function: copy_config_files ###
+#
+#   Copy configuration files
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+copy_config_files()
+{
+log_msg -s "Copying configuration files." -l ${LOGFILE}
+
+_source_dir_=${MOUNT_POINT_BKUP}
+
+# Copy etc files
+_file_list_="etc/hosts etc/fstab"
+
+_san_device_=`iniget SAN_DEV -f ${ENIQ_CONF_DIR}/${SUNOS_INI} -v SAN_DEVICE`
+if [ ! "${_san_device_}" ]; then
+    _err_msg_="Could not read SAN_DEVICE value from ${SUNOS_INI}."
+    abort_script "${_err_msg_}"
+fi
+
+SAN_DEVICE_TYPE=${_san_device_}
+
+# Additional files if "raw"
+if [ "${SAN_DEVICE_TYPE}" != "unity" -o "${SAN_DEVICE_TYPE}" != "unityXT" ]; then
+    _file_list_="${_file_list_} agentID.txt etc/Unisphere/agent.config"
+fi
+
+for _file_ in ${_file_list_}
+do
+    log_msg -s "Copying ${_source_dir_}/${_file_} to /${_file_}" -l ${LOGFILE}
+    if [ -f ${_source_dir_}/${_file_} ];then
+        if [ "${_file_}" == "etc/fstab" -a "${ACTION_TYPE}" == "replacement" ];then
+            $CAT ${_source_dir_}/${_file_} | $GREP "${VOLUME_GROUP_FOR_BACKUP}" >> ${TEM_DIR}/fstabfile
+            $CAT ${TEM_DIR}/fstabfile >> /${_file_}
+        else
+            $CP ${_source_dir_}/${_file_} /${_file_} >> /dev/null 2>&1
+            if [ $? -ne 0 ];then
+                _err_msg_="Could not copy ${_source_dir_}/${_file_} to /${_file_}"
+                abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+            fi
+        fi
+    fi
+done
+}
+
+
+### Function: copy_rep_conf_to_nas ###
+#
+# Copy replacement software to /eniq/backup/replacement_sw
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+copy_rep_conf_to_nas()
+{
+
+# Create new replacement config backup directory
+if [ -d ${REP_SW_BACKUP_DIR} ];then
+    
+    if [ -f ${REP_SW_BACKUP_DIR}/${REPLACEMENT_CONF_FILE} ]; then
+        log_msg -q -s "Replacement Conf file ${REPLACEMENT_CONF} already present removing..." -l ${LOGFILE}
+        $RM -rf ${REP_SW_BACKUP_DIR}/${REPLACEMENT_CONF_FILE}
+    fi
+    
+fi
+
+$MKDIR -p ${REP_SW_BACKUP_DIR}
+
+# Copy replacement config files if CO
+# lib file
+check_and_copy ${REPLACEMENT_LIB}/common_migration_functions.lib ${REP_SW_BACKUP_DIR}/
+
+# config file
+check_and_copy ${REPLACEMENT_CONF} ${REP_SW_BACKUP_DIR}/
+
+log_msg -q -s "Successfully copied required config files to ${REP_SW_BACKUP_DIR}" -l ${LOGFILE}
+}
+
+### Function: decrypt_sourcefile ###
+#
+#   Decrypt sourcefile.gpg if exist
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+decrypt_sourcefile()
+{
+    if [ -f /ericsson/storage/etc/sourcefile.gpg ]; then
+        gpg /ericsson/storage/etc/sourcefile.gpg 
+        if [ $? -ne 0 ]; then
+            _err_msg_="Failed to decrypt sourcefile.gpg file"
+            abort_script "$_err_msg_"
+        fi
+        if [ -f "${source_file}" ]; then
+            $CP -p "${source_file}" "${source_file}"_rep
+            actvity="replacement"
+            sto_adm_pass=$($CAT "${source_file}" | $GREP -w SAPASSWD | $AWK -F\' '{print $2}')
+            nas_mas_pass=$($CAT "${source_file}" | $GREP -w MPASSWD | $AWK -F\' '{print $2}')
+            nas_sup_pass=$($CAT "${source_file}" | $GREP -w SPASSWD | $AWK -F\' '{print $2}')
+            if [ ! "${sto_adm_pass}" ] || [ ! "${nas_mas_pass}" ] || [ ! "${nas_sup_pass}" ]; then
+                _err_msg_="Unable to retrieve storadm or master or support users password.\n"
+                abort_script "${_err_msg_}"
+            fi
+            $ECHO "Activity=$actvity" >> "${source_file}"
+            sto_adm_pass_enc=$($ECHO "$sto_adm_pass" | openssl enc -aes-256-ctr -md sha512 -a -salt -pass pass:$actvity)
+            if [ ! "${sto_adm_pass_enc}" ]; then
+                _err_msg_="Could not encrypt value of storadm user"
+                abort_script "${_err_msg_}"
+            fi
+            nas_mas_pass_enc=$($ECHO "$nas_mas_pass" | openssl enc -aes-256-ctr -md sha512 -a -salt -pass pass:$actvity)
+            if [ ! "${nas_mas_pass_enc}" ]; then
+                _err_msg_="Could not encrypt value of master user"
+                abort_script "${_err_msg_}"
+            fi
+            nas_sup_pass_enc=$($ECHO "$nas_sup_pass" | openssl enc -aes-256-ctr -md sha512 -a -salt -pass pass:$actvity)
+            if [ ! "${sto_adm_pass_enc}" ]; then
+                _err_msg_="Could not encrypt value of support user"
+                abort_script "${_err_msg_}"
+            fi
+            $SED -i "s|$sto_adm_pass|$sto_adm_pass_enc|g" "${source_file}"
+            _storadm_exe_status_=$?
+            $SED -i "s|$nas_mas_pass|$nas_mas_pass_enc|g" "${source_file}"
+            _master_exe_status_=$?
+            $SED -i "s|$nas_sup_pass|$nas_sup_pass_enc|g" "${source_file}"
+            _support_exe_status_=$?
+            if [ $_storadm_exe_status_ -ne 0 ] || [ $_master_exe_status_ -ne 0 ] || [ $_support_exe_status_ -ne 0 ]; then
+                _err_msg_="Failed to update value storadm or master or support user"
+                $MV "${source_file}"_rep "${source_file}"
+                abort_script "${_err_msg_}"
+            fi
+            rm -rf "${source_file}"_rep
+        else
+            _err_msg_="File ${source_file} not found"
+            abort_script "$_err_msg_"
+        fi
+    fi
+}
+
+### Function: disable_oss_mounts ###
+#
+#   Creates disable_OSS for each oss mounts
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+disable_oss_mounts()
+{
+log_msg -s "Disabling OSS mounts." -l ${LOGFILE}
+_oss_mount_dir_="${ENIQ_BASE_DIR}/connectd/mount_info"
+_oss_list_=`$LS -1 ${_oss_mount_dir_} 2> /dev/null`
+
+if [ "${_oss_list_}" ];then
+    for _dir_ in ${_oss_list_}
+    do
+        log_msg -s "Creting disable_OSS file under ${_oss_mount_dir_}/${_dir_}" -l ${LOGFILE}
+        $TOUCH ${_oss_mount_dir_}/${_dir_}/disable_OSS
+    done
+else
+    log_msg -s "\nNo OSS mount present to disable on ${HNAME}" -l ${LOGFILE}
+fi
+}
+
+
+### Function: disconnect_vg ###
+#
+#   Export VG and disconnects the SAN
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+disconnect_vg()
+{
+insert_header_footer head "Entering Linux ${ACTION_TYPE} stage - ${NEXT_STAGE}" ${LOGFILE}
+
+# Skip if prereplacement on CO is not selected in case of multiblade replacement
+if [ "${CO_SERVER}" ]; then
+    if [ ! -f ${REPLACEMENT_CO} ]; then
+        insert_header_footer foot "Skipping replacement stage on ${CURR_SERVER_TYPE} - ${NEXT_STAGE}" ${LOGFILE}
+        set_next_stage `$EXPR ${ARRAY_ELEM}+1`
+        return 0
+    fi
+fi
+
+# Do not execute if not replacement backup
+if [ "${ACTION_TYPE}" != "prereplacement" ];then
+    log_msg -s "\nExport the VG and disconnect the storage manually." -l ${LOGFILE}
+    return 0
+fi
+
+# Checking mandatory files in backup directory
+check_mandatory_files
+
+# Get storage data before exporting volume group
+get_storage_info
+
+# Export Volume Group(s)
+export_vgs
+
+#disconnect host from SAN
+host_disconnect
+
+insert_header_footer foot "Successfully completed - ${NEXT_STAGE}" ${LOGFILE}
+
+set_next_stage `$EXPR ${ARRAY_ELEM}+1`
+}
+
+
+### Function: display_replacement_info ###
+#
+#   Display the replacement SW details
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+display_replacement_info()
+{
+# Create display file
+DISP_FILE=${TEM_DIR}/display_info
+$RM -rf ${DISP_FILE}
+
+# Write to display file
+$ECHO "\n********************** IMPORTANT **********************" > ${DISP_FILE}
+$ECHO "\n******** PLEASE SAVE THE FOLLOWING INFORMATION ********" >> ${DISP_FILE}
+$ECHO "\n\nNOTE: Below details needs to be provided by user after Linux OS installation." >> ${DISP_FILE}
+
+if [ "${STORAGE_TYPE}" == "raw" ]; then
+    # Get migration SW backup info
+    _rep_nas_ip_=`read_value REP_BACKUP_NAS_IP ${REPLACEMENT_CONF}` || abort_script "${_rep_nas_ip_}" "${EXEC_SHELL_CMD}"
+    _rep_nas_dir_=`read_value REP_BACKUP_NAS_DIR ${REPLACEMENT_CONF}` || abort_script "${_rep_nas_dir_}" "${EXEC_SHELL_CMD}"
+    _rep_scp_user_=`read_value REP_SW_SCP_USER ${REPLACEMENT_CONF}` || abort_script "${_rep_scp_user_}" "${EXEC_SHELL_CMD}"
+    _deployment_=`$CAT ${ENIQ_CONF_DIR}${DEPLOYMENT}`
+ 
+    $ECHO "\nIP address of Replacement Config backup server  \t\t: ${_rep_nas_ip_}" >> ${DISP_FILE}
+    $ECHO "\nDirectory of Replacement Config on backup server\t\t: ${_rep_nas_dir_}" >> ${DISP_FILE}
+    $ECHO "\n\nNOTE: Password for SFS user \"support\" will be asked to provide along with the above details." >> ${DISP_FILE}
+
+    #cleaning temporary files
+    $RM -rf ${SERVER_IP_LIST}
+else
+    $RM -rf ${TEM_DIR}/pool_map >> /dev/null 2>&1
+
+    # Get Volume Group Information
+    _count_=1
+    for _entry_ in `$CAT ${REPLACEMENT_CONF} | $GREP "^VOLUME_GROUP_TO_IMPORT_"`; do
+        _pool_info_=`read_value VOLUME_GROUP_TO_IMPORT_${_count_} ${REPLACEMENT_CONF}` || abort_script "${_pool_info_}" "${EXEC_SHELL_CMD}"
+        _vg_name_=`$ECHO ${_pool_info_} | $CUT -f1 -d'@'`
+        _vg_id_=`$ECHO ${_pool_info_} | $CUT -f2 -d'@'`
+   
+        # Update pool data to the display file
+        $ECHO "Volume Group Name: ${_vg_name_}  Volume Group ID: ${_vg_id_}" >> ${TEM_DIR}/pool_map
+        _count_=`$EXPR $_count_ + 1`
+    done
+
+    $ECHO "\nVolume Group ID mapping" >> ${DISP_FILE}
+    $ECHO "-----------------\n" >> ${DISP_FILE}
+    $CAT ${TEM_DIR}/pool_map >> ${DISP_FILE}
+fi
+
+# Display the information
+$ECHO "\n\n"
+$CAT ${DISP_FILE}
+$ECHO "\n\n Press enter key to continue."
+read
+}
+
+
+### Function: enable_oss_mounts ###
+#
+#   Deletes disable_OSS for each oss mounts
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+enable_oss_mounts()
+{
+log_msg -s "\nChecking for OSS mount info directories." -l ${LOGFILE}
+_oss_mount_dir_="${ENIQ_BASE_DIR}/connectd/mount_info"
+if [ ! -d ${_oss_mount_dir_} ];then
+    _err_msg_="Couldn't find ${_oss_mount_dir_} directory."
+    abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+fi
+_oss_list_=`$LS -1 ${_oss_mount_dir_} 2> /dev/null`
+
+if [ "${_oss_list_}" ];then
+    for _dir_ in ${_oss_list_}
+    do
+        log_msg -q -s "\nRemoving disable_OSS file from ${_oss_mount_dir_}/${_dir_}" -l ${LOGFILE}
+        $RM -f ${_oss_mount_dir_}/${_dir_}/disable_OSS
+    done
+else
+    log_msg -s "\nNo OSS mount present to enable on ${HNAME}" -l ${LOGFILE}
+fi
+}
+
+### Function: export_vgs ###
+#
+#   Exports volume groups during prereplacement and prerecovery activity
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+export_vgs()
+{
+log_msg -s "Exporting volume group during ${ACTION_TYPE}" -l ${LOGFILE}
+cd /
+
+# Check vgs are healthy before export
+$VGS --noheading >> /dev/null 2>&1
+if [ $? -ne 0 ];then
+    _err_msg_="VGs are not in proper state. Please check."
+    abort_script "${_err_msg_}"
+fi
+log_msg -s "VGs are online." -l ${LOGFILE}
+
+if [ ! -d ${REPLACEMENT_LOGDIR} ];then
+    $MKDIR -p ${REPLACEMENT_LOGDIR}
+fi
+
+# Create logfile for the current activity (Prereplacement/Prerecovery)
+if [ "${ACTION_TYPE}" == "prereplacement" -o "${ACTION_TYPE}" == "prerecovery" ];then
+    CURR_ACTION_LOGFILE=${REPLACEMENT_LOGDIR}/eniq_linux_${ACTION_TYPE}.log
+    $RM -rf ${CURR_ACTION_LOGFILE}
+    $CAT ${LOGFILE} > ${CURR_ACTION_LOGFILE}
+    LOGFILE=${CURR_ACTION_LOGFILE}
+fi
+
+if [ ! "${NO_CONFIRM}" ];then
+    $ECHO "\n\nWARNING: You are about to export the volume group(s) from system"
+    user_confirm
+    $ECHO "\nYou have selected $_response_"
+    if [ "${_response_}" != "YES" ];then
+        log_msg -s "Exiting from script as user selected NOT to proceed." -l ${LOGFILE}
+        $ECHO "Please export volume group(s) manually."
+        return 0
+    fi
+fi
+
+_vg_name_=`$VGS -o vg_name --noheading | $GREP -iw "${CURR_SERVER_TYPE}_pool" | $AWK '{print $1}'`
+log_msg -s "\nExporting following Volume Group:" -l ${LOGFILE}
+log_msg -s "${_vg_name_}" -l ${LOGFILE}
+
+# Remove pool ID info file if exists
+_pool_map_disp_=${VAR_DIR}/tmp/vg_mapping
+$TOUCH ${_pool_map_disp_} >> /dev/null 2>&1
+
+_pool_=$_vg_name_
+
+# Get VG Information for fs storage
+if [ "${STORAGE_TYPE}" == "fs" ]; then
+    # Update pool data to the display file
+    $CAT ${_pool_map_disp_} | $GREP "VG Name: ${_pool_} " >> /dev/null
+    if [ $? -ne 0 ]; then
+        $ECHO "VG Name: ${_pool_}" >> ${_pool_map_disp_}
+    fi
+fi
+
+$GREP -w ${_pool_} /etc/fstab | $GREP -w swap | $AWK '{print $1}' >> /dev/null 2>&1
+if [ $? -eq 0 ];then
+    SWAP_PARITION=`$GREP -w ${_pool_} /etc/fstab | $GREP -w swap | $AWK '{print $1}'`
+    log_msg -s "Deactivating $SWAP_PARITION of ${_pool_}." -l ${LOGFILE}
+    #Check attributes of swapvol
+    _swap_state_check_=`lvs ${SWAP_PARITION} -o attr --noheading | awk '{print $1}'`
+    if [ ${_swap_state_check_} == "-wi-ao----" ];then
+        $SWAPOFF ${SWAP_PARITION} >> /dev/null 2>&1
+        if [ $? -ne 0 ];then
+            _err_msg_="Unable to SWAPOFF."
+            abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+        fi
+    fi
+fi
+    
+stop_eniq_services
+
+check_and_manage_smf ${SENTINEL_SMF_ID} disable
+check_and_manage_smf ${DDC_SMF_ID} disable
+check_and_manage_smf ${HOSTSYNC_SMF_ID} disable  
+check_and_manage_smf ${NAS_MILESTONE_SMF_ID} disable    
+check_and_manage_smf ${NASd_SMF_ID} disable
+
+# Unmount all the directories mounted from _pool_
+for _unmount_ in `cat /etc/fstab | grep "${_pool_}" | grep -vw swap | awk '{print $2}'`; do 
+    
+    df -hk $_unmount_ | $TAIL -1 >> /dev/null 2>&1
+    if [ $? -eq 0 ];then
+        $KILL -9 `$LSOF ${_unmount_} | $AWK '{print $2}'| $SORT -un| $SED -n '2,$p'` >> /dev/null 2>&1
+        $UMOUNT -l "$_unmount_" >> /dev/null 2>&1
+        if [ $? -ne 0 ];then
+            _err_msg_="Unable to UNMOUNT $_unmount_."
+            remount_fs
+            abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+        fi
+    fi
+done
+
+# Unmount root backup directory
+$KILL -9 `$LSOF ${MOUNT_POINT_BKUP} | $AWK '{print $2}'| $SORT -un| $SED -n '2,$p'` >> /dev/null 2>&1
+df -hk ${MOUNT_POINT_BKUP} | $TAIL -1 >> /dev/null 2>&1
+if [ $? -eq 0 ];then
+    $UMOUNT ${MOUNT_POINT_BKUP} >> /dev/null 2>&1
+    if [ $? -ne 0 ];then
+            _err_msg_="Unable to UNMOUNT ${MOUNT_POINT_BKUP}."
+            remount_fs
+            abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+    fi
+fi
+
+$VGCHANGE -an ${_pool_} >> /dev/null 2>&1
+if [ $? -ne 0 ];then
+    _err_msg_="VGCHANGE of ${_pool_} is not done properly."
+    remount_fs
+    abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+fi
+    
+$VGEXPORT ${_pool_} >> /dev/null 2>&1
+_vg_export_check_=`vgs ${_pool_} -o attr --noheading | awk '{print $1}'`
+if [ ${_vg_export_check_} != "wzx-n-" ];then
+    _err_msg_="Pool ${_pool_} not exported. Export manually."
+    abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+fi
+log_msg -s "\nExported VG:${_pool_}" -l ${LOGFILE}
+
+log_msg -s "\nVolume Group have been exported successfully." -l ${LOGFILE}
+
+}
+
+
+### Function: get_array_element ###
+#
+# Get the current array element number
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+get_array_element()
+{
+_num_elements_=${#ENIQ_CORE_STAGES[*]}
+_array_length_=`${EXPR} ${_num_elements_} - 1`
+
+for (( _elem_=0; _elem_<=${_array_length_}; _elem_++ )); do
+    $ECHO ${ENIQ_CORE_STAGES[${_elem_}]} | $GREP -w ${NEXT_STAGE} >> /dev/null 2>&1
+    if [ $? -eq 0 ]; then
+        ARRAY_ELEM=${_elem_}
+        break
+    fi
+done
+}
+
+
+### Function: get_replacement_data ###
+#
+# Get the required replacement data from user
+# and create replacement.conf during prereplacement
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+get_replacement_data()
+{
+insert_header_footer head "Entering Linux ${ACTION_TYPE} stage - ${NEXT_STAGE}" ${LOGFILE}
+
+_temp_replace_conf_=${TEM_DIR}/replacement.conf.$$.$$
+$RM -rf $_temp_replace_conf_
+$TOUCH ${_temp_replace_conf_}
+
+while [ 1 ];do
+    if [ ! -s ${REPLACEMENT_CONF} ];then
+        # Save hostname
+        set_conf_value "SERVER_HOSTNAME" ${HNAME} ${_temp_replace_conf_}
+
+        # Set replacement type
+        set_conf_value "REPLACEMENT_ACTION" "replacement" ${_temp_replace_conf_}
+        set_conf_value "REPLACEMENT" "${REPLACEMENT}" ${_temp_replace_conf_}
+        
+        # Get values from user
+        save_sw_loc_path 
+  
+        # Save current base_sw and om_sw location
+        # in case we have to recover the server
+        save_recovery_info 
+
+        # Save Storage related information
+        if [ "${STORAGE_TYPE}" == "raw" ];then
+            # Save Storage details in case of raw
+            save_san_data $_temp_replace_conf_
+
+            # Save Replacement SW scp information
+            save_rep_scp_info $_temp_replace_conf_
+            
+        else
+            set_conf_value "SAN_DEVICE_TYPE" "fs" ${_temp_replace_conf_}
+        fi
+
+               _num_=1
+        for _pool_name_ in `$VGS -o vg_name --noheading | $GREP -vw "vg_root" | $AWK '{print $1}'`; do
+            # Update pool data in conf file
+            set_conf_value "VOLUME_GROUP_TO_IMPORT_${_num_}" "${_pool_name_}" ${_temp_replace_conf_}
+            _num_=`$EXPR $_num_ + 1`
+        done
+        
+        if [ ! -s ${_temp_replace_conf_} ];then
+            _err_msg_="Configuration file ${_temp_replace_conf_} is empty."
+            abort_script "${_err_msg_}"
+        fi
+
+        # Save the replacement.conf
+        $CP ${_temp_replace_conf_} ${REPLACEMENT_CONF}
+        if [ $? -ne 0 ];then
+            _err_msg_="Unable to update ${REPLACEMENT_CONF}"
+            abort_script "${_err_msg_}"
+        fi
+        $RM -rf ${_temp_replace_conf_}
+        break
+    else
+        # Determine whether conf file needs to be removed
+        _conf_replace_val_=`read_value REPLACEMENT ${REPLACEMENT_CONF}` || abort_script "${_conf_replace_val_}"
+        $GREP STORAGE_PASS_ ${REPLACEMENT_CONF} >> /dev/null 2>&1
+        if [[ $? -ne 0 ]] || [[ "${_conf_replace_val_}" != "${REPLACEMENT}" ]]; then 
+            # If REPLACEMENT value doesn't match, re-create file
+            $RM -rf ${REPLACEMENT_CONF}
+            continue
+        fi
+
+        log_msg -s "\nReplacement config file already created.\n" -l ${LOGFILE}
+        if [ "${CO_SERVER}" ]; then
+            _disp_exclued_="HOSTNAME|STORAGE_GROUP_|REP_BACKUP_|REP_SW_|VOLUME_|STORAGE_PASS_"
+            $ECHO "\nReplacement Config Details" 
+            $ECHO "========================\n"
+            $CAT ${REPLACEMENT_CONF} | $EGREP -v ${_disp_exclued_}
+            $ECHO "\nPlease confirm the details.\n"
+            user_confirm
+            if [ "${_response_}" != "YES" ]; then
+                $RM -rf ${REPLACEMENT_CONF}
+                continue
+            fi
+        else
+                log_msg -s "\nRemoving Replacement config file.\n" -l ${LOGFILE}
+                $RM -rf ${REPLACEMENT_CONF}
+                continue
+        fi
+        break
+    fi
+done
+
+log_msg -q -s "\n## USER PROVIDED REPLACEMENT VALUES ##\n" -l "${LOGFILE}"
+$CAT ${REPLACEMENT_CONF} >> "${LOGFILE}"
+
+if [ ! "${BACKUP}" ]; then
+    # Display required details for replacement
+    if [ "${CO_SERVER}" ]; then
+        display_replacement_info
+    fi
+fi
+
+# Copy Replacement SW to NAS location
+if [ "${STORAGE_TYPE}" == "raw" ]; then
+    copy_rep_conf_to_nas
+    if [ $? -ne 0 ]; then
+        _err_msg_="Error occurred during backing up replacement config files to ${REP_SW_BACKUP_DIR}."
+        abort_script "${_err_msg_}"
+    fi
+log_msg -s "\nSuccessfully backed up Replacement SW scripts to ${REP_SW_BACKUP_DIR}." -l ${LOGFILE}
+fi
+
+insert_header_footer foot "Successfully completed - ${NEXT_STAGE}" ${LOGFILE}
+
+set_next_stage `$EXPR ${ARRAY_ELEM}+1`
+}
+
+
+### Function: get_next_stage ###
+#
+# Get the stage to be run
+#
+# Arguments:
+#   $1 : Stage to be set to. Either numeric value or 'done'
+# Return Values:
+#   none
+get_next_stage()
+{
+ARRAY_ELEM=0
+
+if [ -s $STAGEFILE ]; then
+    NEXT_STAGE=`$CAT $STAGEFILE | $GREP -v '^[[:blank:]]*#' | $SED -e 's| ||g'`
+    if [ ! "$NEXT_STAGE" ]; then
+        _err_msg_="Failed to read stage from ${STAGEFILE}, exiting."
+        abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+    fi
+
+    if [ "$NEXT_STAGE" == "${STOP_STAGE}" ]; then
+        return 0
+    else
+        $ECHO ${ENIQ_CORE_STAGES[*]} | $GREP -w ${NEXT_STAGE} >> /dev/null 2>&1
+        if [ $? -ne 0 ]; then
+            _err_msg_="Specified stage ${NEXT_STAGE} is not a valid stage"
+            abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+        fi
+    fi
+
+    # Get the element number so we can move along the array
+    get_array_element
+else
+    $MKDIR -p `$DIRNAME $STAGEFILE`
+    if [ $? -ne 0 ]; then
+        _err_msg_="Failed to create directory `$DIRNAME ${STAGEFILE}`, exiting."
+        abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+    fi
+
+    NEXT_STAGE=${ENIQ_CORE_STAGES[${ARRAY_ELEM}]}
+fi
+}
+
+
+### Function: get_replacement_server_list ###
+#
+#   Create the list of servers to be replaced 
+#   to run prereplacement from CO
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+get_replacement_server_list()
+{
+_selected_servers_=${VAR_DIR}/tmp/serverlist.prereplacement
+_server_list_file_=${TEM_DIR}/available_servers
+_menu_opt_=1
+
+# Check if the replacement list was populated in previous run
+if [ ! -s ${_selected_servers_} ]; then
+    log_msg -s "\nStarting Prereplacement Wizard for Replacement.\n" -l ${LOGFILE}
+    # Display available server list if replacement
+    # Write to display file
+    clear
+    $ECHO "Available Servers:\n==================\n"
+    while read serverinfo; do
+        _srv_=`$ECHO ${serverinfo} | $AWK -F:: '{print $2}'`
+        $ECHO "[${_menu_opt_}] ${_srv_}" >> ${_server_list_file_}
+        _menu_opt_=$((_menu_opt_ + 1))
+    done < ${ORDER_FILE}
+    $CAT ${_server_list_file_}
+    $ECHO "\n==================\n" 
+    $ECHO "Select the server(s) to be replaced from the list above" 
+    $ECHO "For multiple servers enter numbers in comma (,) separated format [e.g. 1,3]"
+
+    # Take input from user
+    while [ 1 ]; do
+        _invalid_num_=0
+        $RM -rf ${_selected_servers_} >>/dev/null
+        ask_for_input "server number(s): \c"
+        $ECHO ${USER_VALUE} | $EGREP "[0-9][\ ,]|[0-9]" >> /dev/null 2>&1
+        if [ $? -ne 0 ]; then
+            $ECHO "Enter numbers in comma (,) separated format only"
+            continue
+        fi
+
+        _num_list_=`$ECHO ${USER_VALUE} | sed -e 's/ //g' -e s'/,/ /g'`
+        for _num_ in ${_num_list_}; do
+            if [ $_num_ -ge $_menu_opt_ 2>/dev/null  -o $_num_ -lt 1 2>/dev/null ]; then
+                _invalid_num_=1
+                break
+            fi
+            $CAT ${_server_list_file_} | $GREP "\[$_num_\]" | $AWK '{print $2}' >> ${_selected_servers_}
+        done
+
+        # Check if any invalid input is there
+        if [ $_invalid_num_ -eq 1 ]; then
+            $RM -rf ${_selected_servers_} >>/dev/null
+            $ECHO "Enter numbers only"
+            continue
+        else
+            # User selected proper servers numbers
+            break
+        fi
+    done
+    log_msg -s "User has selected the following server(s) for replacement: " -l ${LOGFILE}
+    $CAT ${_selected_servers_}
+fi
+
+# Modify server order list file
+$RM -rf ${ORDER_FILE}.tmp >> /dev/null 2>&1
+while read _server_; do
+    # Update server order file
+    $CAT ${ORDER_FILE} | $GREP ${_server_} >> ${ORDER_FILE}.tmp
+done < ${_selected_servers_}
+if [  -s ${ORDER_FILE}.tmp ]; then
+    $MV  ${ORDER_FILE}.tmp  ${ORDER_FILE}
+fi
+}
+
+
+### Function: get_server_list ###
+#
+#   Create the server list to run prereplacement from CO
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+get_server_list()
+{
+if [ ! "${CO_SERVER}" ]; then
+    log_msg -s "\nSkipping this step on non-Coordinator server. \n" -l ${LOGFILE}
+    return 0
+fi
+
+# Create server order file 
+IP_ORDER_SCRIPT=${REPLACEMENT_LIB}/get_ip_order.pl
+ORDER_FILE=${TEM_DIR}/server_order_list
+$RM -rf ${ORDER_FILE} >> /dev/null
+
+# Get server order
+if [ -f ${IP_ORDER_SCRIPT} ]; then
+    # Check NASd service is active if storage type is raw
+    if [ "${STORAGE_TYPE}" == "raw" ]; then
+        check_and_manage_smf ${NASd_SMF_ID} enable
+    fi
+    $PERL ${IP_ORDER_SCRIPT} -f ${ORDER_FILE}
+else
+    _err_msg_="${IP_ORDER_SCRIPT} file not found."
+    abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+fi
+
+if [ ! -s ${ORDER_FILE} ]; then
+    _err_msg_="Could not get server details from ${ORDER_FILE}."
+    abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+fi
+
+
+# Check how many entries are in server list file
+if [ `$CAT ${ORDER_FILE} | $WC -l` -eq 1 ]; then
+    log_msg -s "\nINFO: Prereplacement triggered on Standalone server." -l ${LOGFILE}
+    if [ "${STORAGE_TYPE}" == "fs" ]; then
+        # Reset REPLACEMENT value to NO for rack
+        REPLACEMENT="NO"
+    fi
+
+    # Set CO for premigration as standalone server will be treated as CO
+    $RM -rf ${REPLACEMENT_CO} >> /dev/null
+    $TOUCH ${REPLACEMENT_CO}
+    if [ ! -f ${REPLACEMENT_CO} ]; then
+        _err_msg_="Couldn't create the flag ${REPLACEMENT_CO} to enable ${ACTION_TYPE} on server."
+        abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+    fi
+
+    # No need to manipulate server order list for Standalone
+    # Go back to stage list
+    return 0
+fi
+
+# Modify server order file for replacement
+if [ "${REPLACEMENT}" == "YES" ]; then
+    get_replacement_server_list
+fi
+}
+
+
+### Function: get_storage_info ###
+#
+#  Copy Storage information to temporary file before vg(s) are exported
+#
+# Arguments:
+#   none 
+# Return Values:
+#   none
+get_storage_info()
+{
+if [ "${STORAGE_TYPE}" == "raw" ]; then
+    if [ ! -s ${ENIQ_CONF_DIR}/${SUNOS_INI} ]; then
+        _err_msg_="Could not locate file ${ENIQ_CONF_DIR}/${SUNOS_INI}."
+        abort_script "${_err_msg_}"
+    fi
+
+    if [ ! -s ${ENIQ_CONF_DIR}/${BLK_STOR_INI} ]; then
+        _err_msg_="Could not locate file ${ENIQ_CONF_DIR}/${BLK_STOR_INI}."
+        abort_script "${_err_msg_}"
+    fi
+
+    _file_list_="${ENIQ_CONF_DIR}/${SUNOS_INI}
+    ${ENIQ_CONF_DIR}/${BLK_STOR_INI}
+    ${REPLACEMENT_CONF}"
+ 
+    for _file_ in ${_file_list_}; do
+        if [ ! -s ${_file_} ]; then
+            _err_msg_="Could not locate file ${_file_}."
+            abort_script "${_err_msg_}"
+        fi
+    done
+
+    log_msg -s "\nCopying necessary storage and volume group information into temporary file..." -l ${LOGFILE}
+    _temp_storage_info_="${TEM_DIR}/temp_storage_info"
+    $RM -rf ${_temp_storage_info_}
+    log_msg -q -s "INFO: Storage information will be stored in ${_temp_storage_info_}" -l ${LOGFILE}
+    $TOUCH ${_temp_storage_info_}
+    if [ $? -ne 0 ]; then
+    _err_msg_="Could not create ${_temp_storage_info_}"
+    abort_script "${_err_msg_}"
+    fi
+
+    # Get VG Information
+    count=1
+    for _entry_ in `$CAT ${REPLACEMENT_CONF} | $GREP "^VOLUME_GROUP_TO_IMPORT_"`; do
+        _pool_info_=`read_value VOLUME_GROUP_TO_IMPORT_$count ${REPLACEMENT_CONF}` || abort_script "${_pool_info_}" "${EXEC_SHELL_CMD}"
+        _vg_name_=`$ECHO ${_pool_info_} | $CUT -f1 -d'@'`
+
+        # Update pool data to the display file
+        $ECHO "VOLUME_GROUP_NAME_$count=${_vg_name_}" >> ${_temp_storage_info_}
+        count=`$EXPR $count + 1`
+    done
+    
+    # Copy SAN device type (vnx/unity) to temporary file
+    _san_device_=`iniget SAN_DEV -f ${ENIQ_CONF_DIR}/${SUNOS_INI} -v SAN_DEVICE`
+    if [ ! "${_san_device_}" ]; then
+        _err_msg_="Could not read SAN_DEVICE value from ${SUNOS_INI}."
+        abort_script "${_err_msg_}"
+    fi
+	
+    SAN_DEVICE_TYPE=${_san_device_}
+    
+    $ECHO "SAN_DEVICE_TYPE=${_san_device_}" >> ${_temp_storage_info_} 
+    log_msg -s "\nCopying SAN device type in ${_temp_storage_info_}" -l ${LOGFILE}
+    
+    _stor_count_=`iniget BLK_STORAGE_DEV_DETAILS -f ${ENIQ_CONF_DIR}/${BLK_STOR_INI} | $WC -l`
+    if [ ${_stor_count_} -eq 0 ]; then
+        _err_msg_="Unable to get connected SAN count from ${BLK_STOR_INI}."
+        abort_script "${_err_msg_}"
+    fi
+    
+    # Determine number of storages
+    log_msg -s "\nDetermining number of SAN connected" -l ${LOGFILE}
+    if [ "${SAN_DEVICE}" == "vnx" ]; then
+        count=1
+        while [ $count -le $_stor_count_ ]; do
+            _spa_ip_=`iniget BLK_STORAGE_DEV_DETAILS_$count -f ${ENIQ_CONF_DIR}/${BLK_STOR_INI} -v BLK_STORAGE_IP_SPA`
+            if [ ! "${_spa_ip_}" ]; then
+                _err_msg_="Could not read BLK_STORAGE_IP_SPA value from ${BLK_STOR_INI}."
+                abort_script "${_err_msg_}"
+            fi
+            
+            _stor_grp_=`iniget BLK_STORAGE_DEV_DETAILS_$count -f ${ENIQ_CONF_DIR}/${BLK_STOR_INI} -v BLK_STORAGE_GROUP_NAME`
+            if [ ! "${_stor_grp_}" ]; then
+                _err_msg_="Could not read BLK_STORAGE_GROUP_NAME value from ${BLK_STOR_INI}."
+                abort_script "${_err_msg_}"
+            fi
+        
+            $ECHO "STORAGE_SPA_$count=${_spa_ip_}" >> ${_temp_storage_info_}
+            log_msg -q -s "\nCopying STORAGE_SPA_$count in ${_temp_storage_info_}" -l ${LOGFILE}
+            $ECHO "STORAGE_GROUP_$count=${_stor_grp_}" >> ${_temp_storage_info_}
+            log_msg -q -s "Copying STORAGE_GROUP_$count in ${_temp_storage_info_}" -l ${LOGFILE}
+            count=$((count+1))
+        done
+    elif [ "${SAN_DEVICE}" == "unity" -o "${SAN_DEVICE}" == "unityXT" ]; then
+            count=1
+        while [ $count -le $_stor_count_ ]; do
+            _spa_ip_=`iniget BLK_STORAGE_DEV_DETAILS_$count -f ${ENIQ_CONF_DIR}/${BLK_STOR_INI} -v BLK_STORAGE_IP_SPA`
+            if [ ! "${_spa_ip_}" ]; then
+                _err_msg_="Could not read BLK_STORAGE_IP_SPA value from ${BLK_STOR_INI}."
+                abort_script "${_err_msg_}"
+            fi
+            
+            _stor_disks_=`iniget BLK_STORAGE_DEV_DETAILS_$count -f ${ENIQ_CONF_DIR}/${BLK_STOR_INI} -v BLK_STORAGE_DISKS`
+            if [ ! "${_stor_disks_}" ]; then
+                _err_msg_="Could not read BLK_STORAGE_DISKS value from ${BLK_STOR_INI}."
+                abort_script "${_err_msg_}"
+            fi
+        
+            $ECHO "STORAGE_SPA_$count=${_spa_ip_}" >> ${_temp_storage_info_}
+            log_msg -q -s "\nCopying STORAGE_SPA_$count in ${_temp_storage_info_}" -l ${LOGFILE}
+            $ECHO "STORAGE_DISKS_$count=${_stor_disks_}" >> ${_temp_storage_info_}
+            log_msg -q -s "Copying STORAGE_DISKS_$count in ${_temp_storage_info_}" -l ${LOGFILE}
+            count=$((count+1))
+        done
+    else 
+        _err_msg_="Unable to retrieve Storage details file for ${SAN_DEVICE}."
+        abort_script "${_err_msg_}"
+    fi
+fi
+}
+
+### Function: get_update_server_netmask ###
+#
+# Get the server netmask info and update if necessary
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+get_update_server_netmask()
+{
+
+# Get domain name
+_domain_name_=`$CAT ${ENIQ_CONF_DIR}/${HNAME}/${HNAME}_ks_cfg.txt | $GREP -w CLIENT_DNSDOMAIN | $AWK -F"=" '{print $2}'`
+if [ ! "${_domain_name_}" ]; then
+   _err_msg_="Could not get the domain name from ${HNAME}_ks_cfg.txt file"
+   abort_script "${_err_msg_}"
+fi
+
+# Get active default interface
+if [ ${_ip_type_} == "IPv4" ]; then
+     _active_interface_=`$NETSTAT -nr | $GREP "UG" | $AWK '{print $NF}'`
+else
+     _active_interface_=`$NETSTAT -nr -6 | $GREP "UG" | $AWK '{print $NF}'`
+fi
+if [ ! "${_active_interface_}" ]; then
+    _err_msg_="Could not get the active_interface file"
+    abort_script "${_err_msg_}"
+fi
+
+for _act_intf_ in ${_active_interface_}; do
+    #Get the default interface file
+    _intf_file_=`$LS ${INTF_DIR}/*${_act_intf_}* 2> /dev/null`
+
+        if [ "${_intf_file_}" ]; then
+            $GREP -i "${_domain_name_}" ${_intf_file_} > /dev/null
+            if [ $? -ne 0 ]; then
+                $ECHO "DOMAIN=\""${_domain_name_}"\"" >> ${_intf_file_}
+            fi
+        else
+            _err_msg_="Could not get the default interface file from ${INTF_DIR} directory"
+            abort_script "${_err_msg_}"
+        fi
+done
+
+#Start NetworkManager Service
+$ECHO "Starting NetworkManager Service"
+
+$SYSTEMCTL enable NetworkManager >> /dev/null 2>&1
+if [ $? -ne 0 ]; then
+    _err_msg_="Failed to enable NetworkManager Service"
+    abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+fi
+
+$SYSTEMCTL restart NetworkManager
+if [ $? -ne 0 ]; then
+    _err_msg_="Failed to start NetworkManager Service"
+    abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+fi
+
+#Removing /etc/inet directory
+if [ -s /etc/inet ]; then
+     $RM -rf /etc/inet
+     if [ $? -ne 0 ]; then
+          _err_msg_="Could not remove /etc/inet directory"
+          abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+     fi
+fi
+
+#Creating /etc/inet directory
+$MKDIR -p /etc/inet
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not create directory /etc/inet"
+    abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+fi
+
+#Creating symbolic link to /etc/inet/netmasks
+if [ -L /etc/netmasks ]; then
+     $RM -rf /etc/netmasks
+     if [ $? -ne 0 ]; then
+          _err_msg_="Could not remove /etc/netmasks Symbolic link"
+          abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+     fi
+fi
+
+#Restoring netmasks file
+if [ -s /etc/netmasks ]; then
+    $MV /etc/netmasks /etc/inet/netmasks >> /dev/null 2>&1
+    if [ $? -ne 0 ]; then
+        _err_msg_="Could not rename file"
+        abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+    fi
+else
+    if [ -s ${MOUNT_POINT_BKUP}/etc/inet/netmasks ]; then
+        $CP -p ${MOUNT_POINT_BKUP}/etc/inet/netmasks /etc/inet/ >> /dev/null 2>&1
+        if [ $? -ne 0 ]; then
+            _err_msg_="Could not copy netmasks file to /etc/inet/"
+            abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+        fi
+    else
+        _err_msg_="Required file is not present for restore"
+        abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+    fi
+fi
+
+#Creating symbolic link to /etc/inet/netmasks
+$LN -s /etc/inet/netmasks /etc/netmasks
+if [ $? -ne 0 ]; then
+    _err_msg_="Failed to create symbolic link to /etc/inet/netmasks"
+    abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+fi
+
+}
+
+
+### Function: health_checks ### 
+# 
+# To run health checks on the server
+# 
+# Arguments: 
+#        none 
+# Return Values: 
+#         none 
+health_checks() 
+{ 
+insert_header_footer head "Entering Linux ${ACTION_TYPE} stage - ${NEXT_STAGE}" ${LOGFILE} 
+
+if [ ! "${CO_SERVER}" ]; then
+    insert_header_footer foot "Skipping stage on ${CURR_SERVER_TYPE} server - ${NEXT_STAGE}" ${LOGFILE}
+    set_next_stage `$EXPR ${ARRAY_ELEM}+1`
+    return 0
+fi
+
+# Start eniq services
+start_eniq_services
+
+# Path to scripts registry for health checks
+PRECHECK_REG_DEFAULT=${ENIQ_CORE_INST_DIR}/eniq_checks/config/script_registry_${INSTALL_TYPE}.cfg
+if [ ! -f ${PRECHECK_REG_DEFAULT} ]; then
+    _err_msg_="Could not find ${PRECHECK_REG_DEFAULT} file."
+    abort_script "${_err_msg_}"
+fi
+
+_temp_reg_default_=${TEM_DIR}/script_registry_stats.cfg
+
+# This list contains few of the checks defined in precheck script_registry file
+# Modify this list to add/remove the health checks
+_precheck_list_="NAS_ONLINE|CORE_DUMP_CHECK|ENIQ_SERVICES|FILESYSTEM|SSH_CHECK|SNAPSHOT_CACHE|VG_STATUS|MESSAGES_LOGS|SNAPSHOT_CACHE_FS"
+
+# Backup the default registry file
+if [ ! -f ${PRECHECK_REG_DEFAULT}.prerep ]; then
+    $CP -p ${PRECHECK_REG_DEFAULT} ${PRECHECK_REG_DEFAULT}.prerep
+    if [ ! -f ${PRECHECK_REG_DEFAULT}.prerep ]; then
+        _err_msg_="Could not take backup of ${PRECHECK_REG_DEFAULT} file."
+        abort_script "${_err_msg_}"
+    fi
+fi
+
+# Update the registry with selective checks
+$CAT ${PRECHECK_REG_DEFAULT} | $GREP -v "[[:blank:]]#" | $EGREP "${_precheck_list_}" > ${_temp_reg_default_}
+$CAT ${_temp_reg_default_} | $EGREP "${_precheck_list_}" >> /dev/null 2>&1
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not modify ${_temp_reg_default_} file."
+    abort_script "${_err_msg_}"
+fi
+$MV ${_temp_reg_default_} ${PRECHECK_REG_DEFAULT} >>/dev/null 2>&1
+if [ $? -ne 0 ]; then
+    _err_msg_="Unable to save ${PRECHECK_REG_DEFAULT} file."
+    abort_script "${_err_msg_}"
+fi
+
+log_msg -s "\nStarting to run $BASH ${HEALTHCHECK_SCRIPT}." -l ${LOGFILE}
+
+log_msg -s "\nFollowing checks will be performed on all servers in the deployment: " -l ${LOGFILE}
+log_msg -s "`$ECHO ${_precheck_list_} | $TR '|' ', '`" -l ${LOGFILE}
+$ECHO "\nNote: It may take around 3-5 mins to complete the required checks. Please wait..."
+
+# Trigger healthcheck script
+$BASH ${HEALTHCHECK_SCRIPT} >>/dev/null
+_precheck_status_=$?
+
+# Copy back the original script_registry
+$MV ${PRECHECK_REG_DEFAULT}.prerep ${PRECHECK_REG_DEFAULT} >>/dev/null 2>&1
+if [ $? -ne 0 ]; then
+    _err_msg_="Unable to restore back original ${PRECHECK_REG_DEFAULT} file."
+    abort_script "${_err_msg_}"
+fi
+
+# Check the eniq_checks script exit status
+if [ $_precheck_status_ -ne 0 ]; then
+    _err_msg_="Unable to run health-checks. Please refer logfile. \n"
+    abort_script "${_err_msg_}"
+fi
+
+# Check for failures in health check summary file
+_last_summary_file_=`$LS -rt ${HEALTH_SUMMARY_DIR} | $TAIL -1`
+_failure_count_=`$CAT ${HEALTH_SUMMARY_DIR}/${_last_summary_file_} | $GREP -vw "TOTAL CHECKS" | $GREP -w "FAILURE" | $WC -l`
+if [ $_failure_count_ -gt 0 ]; then
+    log_msg -s "\nFailed Health Checks: " -l ${LOGFILE}  
+    $CAT ${HEALTH_SUMMARY_DIR}/${_last_summary_file_} | $GREP -wv "TOTAL CHECKS" | $GREP -w "FAILURE" | $AWK -F\| '{print $1, "Check Log:" $4}'
+    log_msg -s "Please refer to the summary file ${HEALTH_SUMMARY_DIR}/${_last_summary_file_}" -l ${LOGFILE}
+    _err_msg_="Healthcheck failed. Resolve the issue(s) and re-run the script again."
+    abort_script "${_err_msg_}"
+fi
+
+log_msg -s "\nHealthcheck successful." -l ${LOGFILE}
+
+insert_header_footer foot "Successfully completed health checks - ${NEXT_STAGE}" ${LOGFILE} 
+set_next_stage `$EXPR ${ARRAY_ELEM}+1` 
+}
+
+
+### Function: host_disconnect ###
+#
+#   Disconnects the SAN
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+host_disconnect()
+{
+if [ "${STORAGE_TYPE}" == "raw" ]; then
+    # Check temp_storage_data file exists with necessary information
+    log_msg -s "\nGetting required storage information." -l ${LOGFILE}
+    if [ ! -s ${_temp_storage_info_} ]; then
+        _err_msg_="Unable to get required storage information. ${_temp_storage_info_} file doesn't exists."
+        abort_script "${_err_msg_}"
+    fi
+    
+    # Check storage device type (vnx/unity) 
+    _san_device_type_=`$CAT ${_temp_storage_info_} | $GREP -w "SAN_DEVICE_TYPE" | $CUT -d'=' -f2` 
+    if [ ! ${_san_device_type_} ]; then
+        _err_msg_="Unable to get SAN_DEVICE_TYPE information from ${_temp_storage_info_}"
+        abort_script "${_err_msg_}"
+    fi    
+
+    # Check storage count
+    _str_cnt_=`$CAT ${_temp_storage_info_} | $EGREP "^STORAGE_SPA_[1-9]=" | $WC -l`
+     if [ ! ${_str_cnt_} ]; then
+        _err_msg_="Unable to get the count of connected SAN from ${_temp_storage_info_}"
+        abort_script "${_err_msg_}"
+    fi
+
+    if [ "${_san_device_type_}" == "vnx" ]; then    
+        _navisec_options_=""
+    
+        # Loop through the information and disconnect host from storage
+        count=1
+    while [ $count -le $_str_cnt_ ]; do
+        # Get specific values from storage data file
+        _str_spa_=`$CAT ${_temp_storage_info_} | $GREP "^STORAGE_SPA_$count=" | $CUT -d'=' -f2`
+        if [ ! ${_str_spa_} ]; then
+            _err_msg_="Unable to get the STORAGE_SPA_$count from ${_temp_storage_info_}"
+            abort_script "${_err_msg_}"
+        fi
+
+        _str_grp_=`$CAT ${_temp_storage_info_} | $GREP "^STORAGE_GROUP_$count=" | $CUT -d'=' -f2`
+        if [ ! ${_str_grp_} ]; then
+            _err_msg_="Unable to get the STORAGE_GROUP_$count from ${_temp_storage_info_}"
+            abort_script "${_err_msg_}"
+        fi
+
+        # Set options to pass to naviseccli command
+        _navisec_options_="-h ${_str_spa_} -secfilepath ${ERICSSON_SAN_PLUGINS_DIR}/${_san_device_type_}/cred/ storagegroup -disconnecthost -host ${HNAME} -gname ${_str_grp_}"
+        log_msg -q -s "Disconnecting Storage..." -l ${LOGFILE}
+        log_msg -q -s "Executing the command:\n"  -l ${LOGFILE}
+        # Run command to disconnect hosts
+$EXPECT <<END
+set timeout 5
+spawn ${NAVISPHERE}/naviseccli ${_navisec_options_}
+expect "Disconnect host ${HNAME} from storage group ${_str_grp_}  (y/n)? "
+send "y\r"
+expect eof
+END
+#Please do not add any spaces before EOF 
+        
+        if [ $? -ne 0 ];then
+            _err_msg_="Could not Disconnect Storage for $HNAME. Please disconnect the SAN manually."
+            log_msg -s "Disconnecting Storage failed... Importing volume group again" -l ${LOGFILE} 
+            $SLEEP 60
+            # Import VG
+            import_vgs
+            _err_msg_="Rectify the issue and re-run the script again."
+            abort_script "${_err_msg_}"
+        fi
+        count=`$EXPR $count + 1`
+    done
+    
+    elif [ "${_san_device_type_}" == "unity" -o "${_san_device_type_}" == "unityXT" ]; then
+    
+        # Loop through the information and disconnect host from storage
+        count=1
+    while [ $count -le $_str_cnt_ ]; do
+        # Get specific values from storage data file
+        _str_spa_=`$CAT ${_temp_storage_info_} | $GREP "^STORAGE_SPA_$count=" | $CUT -d'=' -f2`
+        if [ ! ${_str_spa_} ]; then
+            _err_msg_="Unable to get the STORAGE_SPA_$count from ${_temp_storage_info_}"
+            abort_script "${_err_msg_}"
+        fi
+
+        _stor_disks_=`$CAT ${_temp_storage_info_} | $GREP "^STORAGE_DISKS_$count=" | $CUT -d'=' -f2`
+        if [ ! ${_stor_disks_} ]; then
+            _err_msg_="Unable to get the STORAGE_GROUP_$count from ${_temp_storage_info_}"
+            abort_script "${_err_msg_}"
+        fi
+        
+        #Identify the Host ID & Accessible LUNs in order to disconnect the Host from Unity
+        host_id=`$UEMCLI -d ${_str_spa_} /remote/host show -filter "ID,Name,Accessible LUNs" | $GREP -C 1 "${HNAME}" | $GREP "Host" | $CUT -d '=' -f2`        
+        if [ -z "${host_id}" ];then
+            _err_msg_="Unable to get the HOST ID prior to disconnecting SAN."
+            abort_script "${_err_msg_}"
+        fi
+        
+        log_msg -q -s "Disconnecting Storage..." -l ${LOGFILE}
+        log_msg -q -s "Executing the command:\n"  -l ${LOGFILE}
+        
+        for i in ${host_id[@]}
+        do  
+            IFS=","
+            # Run command to disconnect hosts
+            for _disk_ in ${_stor_disks_}
+            do    
+                _luns_=`$UEMCLI -d ${_str_spa_} /remote/host show -filter "ID,Name,Accessible LUNs" | $GREP -A 2 "$i" | $GREP "Accessible" | $CUT -d '=' -f2`         
+                if [ ! "${_luns_}" ];then
+                    log_msg -s "Removing Duplicate Host Entry "$i"..." -l ${LOGFILE}
+                    
+                else
+                    $UEMCLI -d ${_str_spa_} /remote/host -id $i set -removeLuns "${_disk_}"         
+                    if [ $? -ne 0 ];then
+                        _err_msg_="Could not Disconnect Storage for $HNAME. Please disconnect the SAN manually."
+                        log_msg -s "Disconnecting Storage failed... Importing volume group again" -l ${LOGFILE} 
+                        unset IFS
+                        $SLEEP 60
+                        # Import VG
+                        import_vgs
+                        _err_msg_="Rectify the issue and re-run the script again."
+                        abort_script "${_err_msg_}"
+                    fi
+                fi
+            done
+            $SLEEP 60
+            $UEMCLI -d ${_str_spa_} /remote/host -id $i delete
+            if [ $? -ne 0 ];then
+                _err_msg_="Failed to remove Host Entry $i"
+                abort_script "${_err_msg_}"
+            fi
+            unset IFS
+        done
+        
+        count=`$EXPR $count + 1`
+    done    
+    
+    else
+        _err_msg_="Invalid ${SAN_DEVICE} type."
+        abort_script "${_err_msg_}"
+    fi
+    
+    log_msg -s "\nSuccessfully disconnected SAN for $HNAME." -l ${LOGFILE}
+fi
+}
+
+
+### Function: insert_header_footer ###
+#
+#   Insert a stage header/footer message
+#
+# Arguments:
+#   $1 : head/foot
+#   $2 : Message
+#   $3 : Logfile
+# Return Values:
+#   none
+insert_header_footer()
+{
+if [ $# -ne 3 ]; then
+    _err_msg_="3 Parameters must be passed to header/footer function"
+    abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+fi
+
+if [ "$1" != "head" -a "$1" != "foot" ]; then
+    _err_msg_="Only Param of head/foot is allowed...exiting!"
+    abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+fi
+_type_=$1
+
+_msg_=$2
+
+_logfile_=$3
+$MKDIR -p `$DIRNAME ${_logfile_}`
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not create directory `$DIRNAME ${_logfile_}`"
+    abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+fi
+
+$TOUCH -a ${_logfile_}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not write to file ${_logfile_}"
+    abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+fi
+
+_time_=`$DATE '+%Y-%b-%d_%H.%M.%S'`
+if [ "$_type_" == "head" ]; then
+    $ECHO "\n=====================================================" | $TEE -a ${_logfile_}
+    $ECHO "-----------------------------------------------------" | $TEE -a ${_logfile_}
+    $ECHO "$_time_ : $_msg_" | $TEE -a ${_logfile_}
+    $ECHO "-----------------------------------------------------" | $TEE -a ${_logfile_}
+fi
+
+if [ "$_type_" == "foot" ]; then
+    $ECHO "\n-----------------------------------------------------" | $TEE -a ${_logfile_}
+    $ECHO "$_time_ : $_msg_" | $TEE -a ${_logfile_}
+    $ECHO "-----------------------------------------------------" | $TEE -a ${_logfile_}
+    $ECHO "=====================================================\n" | $TEE -a ${_logfile_}
+fi
+}
+
+
+### Function: rep_stage_1 ###
+#
+#   Run required ENIQ core install stages 
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+rep_stage_1()
+{
+insert_header_footer head "Entering Linux ${ACTION_TYPE} stage - ${NEXT_STAGE}" ${LOGFILE}
+
+# Set stage list to run
+_stage_list_="allow_root_access"
+
+_extra_params_=""
+for _stage_ in ${_stage_list_}; do
+    # Run the stage
+    $BASH ${REPLACEMENT_BIN}/eniq_core_install.bsh -n -M -s ${_stage_} ${_extra_params_} -l ${LOGFILE}
+    if [ $? -ne 0 ];then
+        _err_msg_="Unable to execute install stage ${_stage_}"
+        abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+    fi
+done
+
+insert_header_footer foot "Successfully completed - ${NEXT_STAGE}" ${LOGFILE}
+
+set_next_stage `$EXPR ${ARRAY_ELEM}+1`
+}
+
+
+### Function: import_vgs ###
+#
+#  Importing volume groups if disconnecting storage failed 
+#
+# Arguments:
+# none
+# Return Values:
+#   none
+import_vgs()
+{
+if [ "${STORAGE_TYPE}" == "raw" ]; then
+   
+    # Flag to check VG import needed or not
+    _import_needed_=0
+
+    # Get VG name from temporary file
+    _vg_name_=`$CAT ${_temp_storage_info_} | $GREP "^VOLUME_GROUP_NAME_1=" | $CUT -d'=' -f2`
+    if [ ! ${_vg_name_} ]; then
+        _err_msg_="Unable to get the VOLUME_GROUP_NAME_1 from ${_temp_storage_info_}"
+        abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+    fi
+    
+    #Check if VG with exported attributes
+    _vg_export_check_=`vgs ${_vg_name_} -o attr --noheading | awk '{print $1}'`
+    if [ ! ${_vg_export_check_} ];then
+        _err_msg_="Unable to get the attributes of ${_vg_name_}."
+        abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+    else
+        if [ ${_vg_export_check_} == "wzx-n-" ];then
+            _import_needed_=1
+        else
+            _import_needed_=0
+        fi
+    fi
+
+    # Import Volume Group
+    if [ ${_import_needed_} -eq 1 ];then
+        $VGIMPORT -f ${_vg_name_} >> /dev/null 2>&1
+        if [ $? -ne 0 ];then
+            _err_msg_="Could not import Volume Group ${_vg_name_}."
+            abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+        fi
+        log_msg -q -s "Volume Group ${_vg_name_} imported successfully." -l ${LOGFILE}
+        
+        $VGCHANGE -ay ${_vg_name_} >> /dev/null 2>&1
+        if [ $? -ne 0 ];then
+            _err_msg_="VGCHANGE of ${_vg_name_} is not done properly."
+            abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+        fi
+        
+        #Restore all LV mountpoints and start all ENIQ Services.
+        remount_fs
+    else
+        log_msg -q -s "Volume Group ${_vg_name_} already imported." -l ${LOGFILE}
+    fi
+    
+fi
+
+}
+
+
+### Function: rep_stage_2 ###
+#
+#   Run required ENIQ core install stages
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+rep_stage_2()
+{
+insert_header_footer head "Entering Linux ${ACTION_TYPE} stage - ${NEXT_STAGE}" ${LOGFILE}
+
+# Skip if Rack
+if [ "${STORAGE_TYPE}" != "raw" ]; then
+    insert_header_footer foot "Rack Replacement - Skipping - ${NEXT_STAGE}" ${LOGFILE}
+    set_next_stage `$EXPR ${ARRAY_ELEM}+1`
+    return 0
+fi
+
+log_msg -s "\nChecking if interfaces need to be updated." -l ${LOGFILE}
+# Update the interfaces name in ipmp.ini if required
+if [ ! -f ${ENIQ_CONF_DIR}/${IPMP_INI} ];then
+    _err_msg_="Could not find ${ENIQ_CONF_DIR}/${IPMP_INI}"
+    abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+fi
+
+# In replacement the interface names are going to be changed
+if [ "${ACTION_TYPE}" == "replacement" ];then
+    # Backing up the ipmp.ini in case of rollback required
+    if [ ! -f ${ENIQ_CONF_DIR}/${IPMP_INI}.recovery ];then
+        $CP -p ${ENIQ_CONF_DIR}/${IPMP_INI} ${ENIQ_CONF_DIR}/${IPMP_INI}.recovery
+        if [ $? -ne 0 ];then
+            _err_msg_="Could not take backup of ${ENIQ_CONF_DIR}/${IPMP_INI}"
+            abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+        fi
+    fi
+    if [  -f ${REPLACEMENT_CONF} ];then
+        $RM -rf ${REPLACEMENT_CONF}
+        if [ $? -ne 0 ];then
+            _err_msg_="Could not take delete ${REPLACEMENT_CONF}"
+            abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+        fi
+    fi
+    
+    # Copy the replacement.conf file from /var/tmp/replacement_sw to /eniq/installation/config/
+    if [  -f ${REPLACEMENT_TMP_CONF} ];then
+        $CP ${REPLACEMENT_TMP_CONF} ${ENIQ_CONF_DIR}
+        if [ $? -ne 0 ];then
+            _err_msg_="Could not copy ${REPLACEMENT_TMP_CONF} to ${ENIQ_CONF_DIR}"
+            abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+        fi
+    fi
+    
+    update_ipmp_ini
+elif [ "${ACTION_TYPE}" == "rep-recovery" ];then
+    # ipmp.ini.recovery should contain the old ipmp.ini data
+    if [ ! -f ${ENIQ_CONF_DIR}/${IPMP_INI}.recovery ];then
+        if [ -f ${ENIQ_CONF_DIR}/${IPMP_INI} ];then
+            log_msg -s "\nReferring current ${ENIQ_CONF_DIR}/${IPMP_INI} file for IPMP setup."
+        else
+            _err_msg_="Could not find ${ENIQ_CONF_DIR}/${IPMP_INI} on server"
+            abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+        fi
+    else
+        # Copying older IPMP file
+        $CP -p ${ENIQ_CONF_DIR}/${IPMP_INI}.recovery ${ENIQ_CONF_DIR}/${IPMP_INI}    
+    fi
+fi
+
+#Restore the /etc/netmask file from Root Backup
+get_update_server_netmask
+
+#check for Mpath
+check_for_mpath
+
+
+if [ "${SAN_DEVICE}" == "unityXT" ]; then
+    _stage_list_="setup_ipmp
+    update_netmasks_file
+    create_lun_map"
+else
+    _stage_list_="setup_ipmp
+    update_netmasks_file
+    create_lun_map
+    install_nas_sw
+    create_nas_users"
+fi
+
+_extra_params_=""
+for _stage_ in ${_stage_list_}; do
+    if [ "${_stage_}" == "install_nas_sw" ];then
+        _extra_params_="-u -o ${OM_SW_DIR}"
+    fi
+    # Run the stage
+    $BASH ${REPLACEMENT_BIN}/eniq_core_install.bsh -n -M -s ${_stage_} ${_extra_params_} -l ${LOGFILE}
+    if [ $? -ne 0 ];then
+        _err_msg_="Unable to execute install stage ${_stage_}"
+        abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+    fi
+done
+
+if [ "${STORAGE_TYPE}" == "raw" -a "${SAN_DEVICE}" != "unityXT" ]; then
+    if [ -f "${MOUNT_POINT_BKUP}"/"${source_file}" ] && [ -f "${MOUNT_POINT_BKUP}"/"${source_file}".gpg ]; then
+        Nas_Mas_Password=$($CAT "${MOUNT_POINT_BKUP}"/"${source_file}" | $GREP -w MPASSWD | $AWK -F\' '{print $2}')
+        Nas_Sup_Password=$($CAT "${MOUNT_POINT_BKUP}"/"${source_file}" | $GREP -w SPASSWD | $AWK -F\' '{print $2}')
+        word=$($CAT "${MOUNT_POINT_BKUP}"/"${source_file}" | $GREP -w "Activity" | $AWK -F "=" '{print $2}')
+        if [ ! "${Nas_Mas_Password}" ] && [ ! "${Nas_Sup_Password}" ] && [ ! "${word}" ]; then
+            _err_msg_="Password in File ${MOUNT_POINT_BKUP}/${source_file} not found"
+            abort_script "$_err_msg_"
+        fi
+        
+        NAS_MAS_PASSWORD=$($ECHO "$Nas_Mas_Password" | openssl enc -aes-256-ctr -md sha512 -a -d -salt -pass pass:"$word")
+        if [ ! "${NAS_MAS_PASSWORD}" ]; then
+            _err_msg_="Could not decrypt Master user password from File ${MOUNT_POINT_BKUP}/${source_file}"
+            abort_script "${_err_msg_}"
+        fi
+        NAS_SUP_PASSWORD=$($ECHO "$Nas_Sup_Password" | openssl enc -aes-256-ctr -md sha512 -a -d -salt -pass pass:"$word")
+        if [ ! "${Nas_Sup_Password}" ]; then
+            _err_msg_="Could not decrypt Support user password from File ${MOUNT_POINT_BKUP}/${source_file}"
+            abort_script "${_err_msg_}"
+        fi
+    else
+        if [ -f "${MOUNT_POINT_BKUP}"/"${source_file}" ]; then
+            NAS_MAS_PASSWORD=$($CAT "${MOUNT_POINT_BKUP}"/"${source_file}" | $GREP -w MPASSWD | $AWK -F\' '{print $2}')
+            NAS_SUP_PASSWORD=$($CAT "${MOUNT_POINT_BKUP}"/"${source_file}" | $GREP -w SPASSWD | $AWK -F\' '{print $2}')
+            if [ ! "${NAS_MAS_PASSWORD}" ] && [ ! "${NAS_SUP_PASSWORD}" ]; then
+                _err_msg_="Password in File ${MOUNT_POINT_BKUP}/${source_file} not found"
+                abort_script "$_err_msg_"
+            fi
+        fi
+    fi
+fi
+
+if [ "${STORAGE_TYPE}" == "raw" -a "${SAN_DEVICE}" != "unityXT" ]; then
+    # Updating the source_file with NAS passwords
+    $EGREP  "${NAS_MAS_PASSWORD}|${NAS_SUP_PASSWORD}" ${source_file} >> /dev/null 2>&1
+    if [ $? -ne 0 ]; then
+        $ECHO "Updating ${source_file} with NAS passwords" >> ${LOGFILE}
+        $CP ${source_file} ${source_file}_backup
+        if [ $? -ne 0 ]; then
+            _err_msg_="Could not backup file ${source_file}"
+            abort_script "$_err_msg_"
+        fi
+
+        $ECHO "Updating ${source_file} with MASTER user password" >> ${LOGFILE}
+        $ECHO "export MPASSWD='${NAS_MAS_PASSWORD}'" >> ${source_file}
+        if [ $? -ne 0 ]; then
+            _err_msg_="Could not write master password to the file ${source_file}"
+            #Reverting back to original source file
+            $MV ${source_file}_backup ${source_file}
+            abort_script "$_err_msg_"
+        fi
+        $ECHO "Updating ${source_file} with SUPPORT user password" >> ${LOGFILE}
+        $ECHO "export SPASSWD='${NAS_SUP_PASSWORD}'" >> ${source_file}
+        if [ $? -ne 0 ]; then
+            _err_msg_="Could not write support password to the file ${source_file}"
+            #Reverting back to original source file
+            $MV ${source_file}_backup ${source_file}
+            abort_script "$_err_msg_"
+        fi
+    fi
+
+fi
+
+# Delete sourcefile_backup if exist
+if [ -f ${source_file}_backup ]; then
+    $RM -rf ${source_file}_backup 
+    if [ $? -ne 0 ]; then
+        _err_msg_="Failed to delete ${source_file}_backup"
+        abort_script "$_err_msg_"
+    fi
+fi
+
+
+# Delete  sourcefile.gpg if exist 
+if [ -f /ericsson/storage/etc/sourcefile.gpg ]; then
+    $RM -rf /ericsson/storage/etc/sourcefile.gpg
+    if [ $? -ne 0 ]; then
+        _err_msg_="Failed to delete sourcefile.gpg from /ericsson/storage/etc/ "
+        abort_script "$_err_msg_"
+    fi
+fi
+
+if [ "${SAN_DEVICE}" != "unityXT" ];then
+
+    log_msg -s "\nSetting up SSH connection for NAS." -l ${LOGFILE}
+    # Setup SSH for NAS
+    if [ ! -f ${ENIQ_CONF_DIR}/ssh_input_file ];then
+        _err_msg_="Unable to find ${ENIQ_CONF_DIR}/ssh_input_file."
+        abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+    fi
+    $ECHO "\nExecuting command: $BASH ${ERICSSON_BIN_DIR}/setup_ssh_FileStore.sh ${ENIQ_CONF_DIR}/ssh_input_file" >> ${LOGFILE}
+    $BASH ${ERICSSON_BIN_DIR}/setup_ssh_FileStore.sh ${ENIQ_CONF_DIR}/ssh_input_file 
+    if [ $? -ne 0 ];then
+        _err_msg_="Could not setup SSH connectivity. Please check logfile ${ERICSSON_STOR_DIR}/log/setup_ssh_FileStore.log for further details."
+        abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+    fi
+    log_msg -s "\nSuccessfully set up SSH connection for NAS." -l ${LOGFILE}
+fi
+insert_header_footer foot "Successfully completed - ${NEXT_STAGE}" ${LOGFILE}
+
+set_next_stage `$EXPR ${ARRAY_ELEM}+1`
+}
+
+
+### Function: rep_stage_3 ###
+#
+#   Run required ENIQ core install stages
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+rep_stage_3()
+{
+insert_header_footer head "Entering Linux ${ACTION_TYPE} stage - ${NEXT_STAGE}" ${LOGFILE}
+
+log_msg -s "\nDetermining stages to be executed for ${NEXT_STAGE}" -l ${LOGFILE}
+_stage_list_="update_system_file update_defaultrouter_file"
+
+# Checking if NASd SMF is installed
+if [ "${STORAGE_TYPE}" == "raw" ]; then
+    $SYSTEMCTL -a | $GREP -w ${NASd_SMF_ID} | $GREP .service  >> /dev/null 2>&1
+    if [ $? -ne 0 ];then
+        _stage_list_="$_stage_list_ install_nasd"
+    fi
+fi
+
+$MOUNT -a >> /dev/null 2>&1
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not mount filesystem"
+    
+fi
+
+
+_pool_=`$VGS -o vg_name --noheading | $GREP -iw "${CURR_SERVER_TYPE}_pool" | $AWK '{print $1}'` 
+SWAP_PARITION=`$GREP -w ${_pool_} /etc/fstab | $GREP -w swap | $AWK '{print $1}'`
+#Checking if the swapvol is activated
+_swap_state_check_=`lvs ${SWAP_PARITION} -o attr --noheading | awk '{print $1}'`
+if [ ${_swap_state_check_} != "-wi-ao----" ];then
+    $SWAPON ${SWAP_PARITION} >> /dev/null 2>&1
+    if [ $? -ne 0 ];then
+        _err_msg_="Failed to enable ${SWAP_PARITION}."
+        abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}" 
+    fi
+
+fi
+
+
+_extra_params_=""
+for _stage_ in ${_stage_list_}; do
+    # Run the stage
+    $BASH ${REPLACEMENT_BIN}/eniq_core_install.bsh -n -M -d $BASE_SW_DIR -s ${_stage_} ${_extra_params_} -l ${LOGFILE}
+    if [ $? -ne 0 ];then
+        _err_msg_="Unable to execute install stage ${_stage_}"
+        abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+    fi
+done
+
+# Continue to next stage if Rack
+if [ "${STORAGE_TYPE}" != "raw" ]; then
+    insert_header_footer foot "Successfully completed - ${NEXT_STAGE}" ${LOGFILE}
+    set_next_stage `$EXPR ${ARRAY_ELEM}+1`
+    return 0
+fi
+
+# Enable NASd service
+check_and_manage_smf ${NASd_SMF_ID} enable
+log_msg -s "\nNASd services are online." -l ${LOGFILE}
+
+insert_header_footer foot "Successfully completed - ${NEXT_STAGE}" ${LOGFILE}
+
+set_next_stage `$EXPR ${ARRAY_ELEM}+1`
+}
+
+
+### Function: rep_stage_4 ###
+#
+#   Run required ENIQ core install stages
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+rep_stage_4()
+{
+insert_header_footer head "Entering Linux ${ACTION_TYPE} stage - ${NEXT_STAGE}" ${LOGFILE}
+
+_stage_list_="create_groups
+create_users
+change_mount_owners
+install_host_syncd
+generate_keys
+create_rbac_roles"
+
+
+log_msg -s "\nChecking if dcuser is created." -l ${LOGFILE}
+$CAT /etc/passwd | $GREP "^dcuser" >> /dev/null 2>&1
+if [ $? -ne 0 ]; then
+    # Remove dcuser ssh keys
+    if [ "${CO_SERVER}" ];then
+        if [ -d ${DCUSER}/.ssh/ ];then
+            log_msg -s "\nTaking backup of dcuser .ssh keys." -l ${LOGFILE}
+            $CP -rf ${DCUSER}/.ssh/ ${DCUSER}/.ssh_repbkup >> /dev/null 2>&1
+            log_msg -s "\nRemoving dcuser .ssh keys." -l ${LOGFILE}
+            $RM -rf ${DCUSER}/.ssh/ >> /dev/null 2>&1
+        fi
+    fi
+fi
+
+# Remove CO root ssh keys if they exist
+if [ "${CO_SERVER}" ]; then
+    $CP -rf ${SSH_DIR} ${SSH_DIR}_repbkup >> /dev/null 2>&1
+    log_msg -s "\nRemoving root .ssh keys." -l ${LOGFILE}
+    $RM -rf ${SSH_DIR} >> /dev/null 2>&1
+fi
+
+# Check if hostsync exists
+$SYSTEMCTL status ${HOSTSYNC_SMF_ID} >> /dev/null 2>&1
+if [ $? -eq 0 ];then
+    log_msg -s "\n${HOSTSYNC_SMF_ID} exists. Disabling it." -l ${LOGFILE}
+    check_and_manage_smf ${HOSTSYNC_SMF_ID} disable
+fi
+
+_extra_params_=""
+for _stage_ in ${_stage_list_}; do
+    if [ "S{_stage_}" == "generate_keys" ];then
+        _extra_params_="-u"
+    fi
+    # Run the stage
+    $BASH ${REPLACEMENT_BIN}/eniq_core_install.bsh -n -M -s ${_stage_} ${_extra_params_} -l ${LOGFILE}
+    if [ $? -ne 0 ];then
+        _err_msg_="Unable to execute install stage ${_stage_}"
+        # Restore back the user ssh directories, if failed
+        $MV ${SSH_DIR}_repbkup ${SSH_DIR} >/dev/null 2>&1
+        $MV /eniq/home/dcuser/.ssh_repbkup /eniq/home/dcuser/.ssh >/dev/null 2>&1
+        abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+    fi
+done
+
+# Remove backup of .ssh directories
+$RM -rf ${SSH_DIR}_repbkup /eniq/home/dcuser/.ssh_repbkup >> /dev/null 2>&1
+
+# Start hostsync service
+log_msg -s "\nEnabling ${HOSTSYNC_SMF_ID} SMF." -l ${LOGFILE}
+check_and_manage_smf ${HOSTSYNC_SMF_ID} enable
+
+insert_header_footer foot "Successfully completed - ${NEXT_STAGE}" ${LOGFILE}
+
+set_next_stage `$EXPR ${ARRAY_ELEM}+1`
+}
+
+
+### Function: rep_stage_5 ###
+#
+#   Run required ENIQ core install stages
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+rep_stage_5()
+{
+insert_header_footer head "Entering Linux ${ACTION_TYPE} stage - ${NEXT_STAGE}" ${LOGFILE}
+
+# Install sentinel SMF
+$SYSTEMCTL status ${SENTINEL_SMF_ID} >> /dev/null
+if [ $? -ne 0 ]; then
+    log_msg -s "\nInstalling sentinel SMF." -l ${LOGFILE}
+    $BASH ${ENIQ_SENTINEL_DIR}/admin/eniq_sentinel_install.bsh -a systemd -l ${LOGFILE}
+    if [ $? -ne 0 ];then
+        _err_msg_="Unable to install sentinel SMF"
+        abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+    fi
+    log_msg -s "\nSuccessfully installed sentinel." -l ${LOGFILE}
+fi
+
+# Start sentinel in CO_TYPE server only
+if [ "${CO_SERVER}" ]; then
+    log_msg -s "\nStarting ${SENTINEL_SMF_ID} service." -l ${LOGFILE}
+    check_and_manage_smf ${SENTINEL_SMF_ID} enable
+fi
+
+# Install SMF scripts
+log_msg -s "\nStarting to import SMF xmls." -l ${LOGFILE}
+$BASH ${REPLACEMENT_BIN}/eniq_core_install.bsh -n -M -s setup_SMF_scripts -u -l ${LOGFILE}
+if [ $? -ne 0 ];then
+    _err_msg_="Unable to install ENIQ SMF xmls on server."
+    abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+fi
+log_msg -s "\nSuccessfully installed SMF xmls." -l ${LOGFILE}
+
+# Validate the SMF
+log_msg -s "\nStarting to validate SMFs.\n" -l ${LOGFILE}
+$BASH ${REPLACEMENT_BIN}/eniq_core_install.bsh -n -M -s validate_SMF_contracts -u -l ${LOGFILE}
+if [ $? -ne 0 ];then
+    _err_msg_="Unable to import SMF services during ${ACTION_TYPE}."
+    abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}" 
+fi
+log_msg -s "\nSuccessfully validated SMF xmls." -l ${LOGFILE}
+
+insert_header_footer foot "Successfully completed - ${NEXT_STAGE}" ${LOGFILE}
+
+set_next_stage `$EXPR ${ARRAY_ELEM}+1`
+}
+
+
+### Function: post_configuration ###
+#
+#   Post configuration after running II stages
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+post_configuration()
+{
+insert_header_footer head "Entering Linux ${ACTION_TYPE} stage - ${NEXT_STAGE}" ${LOGFILE}
+
+# Enable OSS mounts
+log_msg -s "\nEnabling OSS mounts" -l ${LOGFILE}
+enable_oss_mounts
+
+
+# Restore user passwords
+log_msg -s "\n\nRestoring user password values" -l ${LOGFILE}
+retain_user_password
+
+# Enable DDC SMF
+log_msg -s "\n\nStarting DDC service." -l ${LOGFILE}
+check_and_manage_smf ${DDC_SMF_ID} enable
+
+# Stop ENIQ services
+stop_eniq_services
+
+
+if [ "${ACTION_TYPE}" == "replacement" ];then
+    # Clean-up Flag files
+    log_msg -s "Cleaning up flag ${REPL_PROGRESS} used for replacement." -l ${LOGFILE}
+    $RM -rf ${REPL_PROGRESS} >> /dev/null 2>&1
+
+    $TOUCH ${REPL_SUCCESS}
+    if [ ! -f "${REPL_SUCCESS}" ];then
+        _err_msg_="Could not create ${REPL_SUCCESS} during ${ACTION_TYPE}."
+        abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"    
+    else
+        $DF -hk ${MOUNT_POINT_BKUP} | $GREP -w replacement >> /dev/null 2>&1
+        if [ $? -eq 0 ];then
+            log_msg -s "${MOUNT_POINT_BKUP} exists." -l ${LOGFILE}
+            log_msg -s "Unmounting ${MOUNT_POINT_BKUP} before renaming ${BACKUP_DIR}." -l ${LOGFILE}
+            $UMOUNT -l ${MOUNT_POINT_BKUP} >> /dev/null 2>&1
+            if [ $? -ne 0 ];then
+                _err_msg_="Could not UNMOUNT ${MOUNT_POINT_BKUP}."
+                abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+            fi
+        fi
+        
+        # Rename the replacement root backup to a different name
+        log_msg -s "Renaming ${BACKUP_DIR} to ${BACKUP_DIR}_replaced" -l ${LOGFILE}
+        cd /
+        $LVRENAME ${VOLUME_GROUP_FOR_BACKUP} ${BACKUP_DIR} ${BACKUP_DIR}_replaced >> /dev/null 2>&1
+        if [ $? -ne 0 ];then
+            _err_msg_="Could not rename replacement root backup ${BACKUP_DIR} as ${BACKUP_DIR}_replaced"
+            abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+        fi    
+        
+        log_msg -s "Re-mounting /dev/mapper/${BACKUP_DIR} to ${MOUNT_POINT_BKUP}" -l ${LOGFILE}
+        $MOUNT /dev/mapper/${VOLUME_GROUP_FOR_BACKUP}-${BACKUP_DIR}_replaced ${MOUNT_POINT_BKUP} >> /dev/null 2>&1
+        if [ $? -ne 0 ]; then
+            $LVRENAME ${VOLUME_GROUP_FOR_BACKUP} ${BACKUP_DIR}_replaced ${BACKUP_DIR} >> /dev/null 2>&1
+            if [ $? -ne 0 ]; then
+                _err_msg_="Could not rename replacement root backup ${BACKUP_DIR}_replaced as ${BACKUP_DIR}  "
+                abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+            fi       
+        fi
+        
+        # Set up the cron job for cleanup
+        setup_cron_for_cleanup
+
+        # Moving /ericsson/config directory to clean leftovers
+        if [ -d "${ERICSSON_DIR}/config" ]; then
+           $MV ${ERICSSON_DIR}/config ${CONFIG_BACKUP_DIR}/ericsson_config
+           if [ -d "${ERICSSON_DIR}/config" ]; then
+               _err_msg_="Could not move ${ERICSSON_DIR}/config directory."
+               abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+           fi
+        fi
+    fi
+fi
+
+log_msg -s "\n\nPost configuration completed." -l ${LOGFILE}
+
+insert_header_footer foot "Successfully completed - ${NEXT_STAGE}" ${LOGFILE}
+
+set_next_stage `$EXPR ${ARRAY_ELEM}+1`
+}
+
+### Function: post_replacement ###
+#
+#   Post replacement steps
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+post_replacement()
+{
+
+#Check the scheduler is running ok
+_seduler_running_=`$SU - ${SYS_USER} -c "scheduler status| $GREP -w 'running' " | $GREP -w "OK" | $AWK '{print $4}'`
+if [ "${_seduler_running_}" == "OK" ]; then
+    log_msg -s "scheduler is running OK" -l ${LOGFILE}
+else 
+    log_msg -s "scheduler is not running" -l ${LOGFILE}
+fi
+
+#Put scheduler on hold
+if [ "${_seduler_running_}" == "OK" ]; then
+    log_msg -s "Putting scheduler on hold" -l ${LOGFILE}
+    $SU - ${SYS_USER} -c "scheduler hold"
+    _seduler_hold_=`$SU - ${SYS_USER} -c "scheduler status | $GREP -w 'Status'" | $AWK -F":" '{print $2}' | $AWK '{print $2}'`
+    if [ "${_seduler_hold_}" != "hold" ]; then
+        _err_msg_="could to set scheduler on hold"
+        abort_script "${_err_msg_}"
+    fi
+    log_msg -s "scheduler successfully put on hold" -l ${LOGFILE}
+fi
+
+#Check Engine is running OK
+_engine_running_=`$SU - ${SYS_USER} -c "engine status | $GREP -w 'running' " | $GREP -w "OK" | $AWK '{print $4}'`
+if [ "${_engine_running_}" == "OK" ]; then
+    log_msg -s "Engine is running OK" -l ${LOGFILE}
+else
+    log_msg -s "Connection to Engine refused" -l ${LOGFILE}
+fi
+
+#Put Engine on NoLoads
+if [ "${_engine_running_}" == "OK" ]; then
+    log_msg -s "Putting engine on NoLoads" -l ${LOGFILE}
+    $SU - ${SYS_USER} -c "engine -e changeProfile 'NoLoads'"
+    _engine_status_=`$SU - ${SYS_USER} -c "engine -e getCurrentProfile"`
+    if [ "${_engine_status_}" != "NoLoads" ]; then
+        _err_msg_="could not set engine to NoLoads"
+        abort_script "${_err_msg_}"
+    fi
+    log_msg -s "Engine successfully put on NoLoad" -l ${LOGFILE}
+fi
+$SLEEP 10
+#Check if the execution slots are clear of Loader or Aggregators
+$SU - ${SYS_USER} -c "engine -e showSetsInExecutionSlots | $EGREP 'Loader|Aggregator'" >> ${TEM_DIR}/slots
+if [ -s ${TEM_DIR}/slots ];then
+    _err_msg_="execution slots are not clear of Loader or Aggregators"
+    abort_script "${_err_msg_}"
+fi
+
+#Regenerate engine slots
+$SU - ${SYS_USER} -c "bash /eniq/admin/bin/regenerateslots"
+if [ $? -ne 0 ];then
+    _err_msg_="could not execute /eniq/admin/bin/regenerateslots"
+    abort_script "${_err_msg_}"
+fi
+log_msg -s "successfully completed regeneration of slot" -l ${LOGFILE}
+
+
+_seduler_running_=`$SU - ${SYS_USER} -c "scheduler status| $GREP -w 'running' " | $GREP -w "OK" | $AWK '{print $4}'`
+_seduler_hold_=`$SU - ${SYS_USER} -c "scheduler status | $GREP -w 'Status'" | $AWK -F":" '{print $2}' | $AWK '{print $2}'`
+if [ "${_seduler_running_}" == "OK" -a "{_seduler_hold_}" == "hold" ]; then
+    $SU - ${SYS_USER} -c "scheduler activate"
+    if [ $? -ne 0 ];then
+        _err_msg_="could not activate scheduler"
+        abort_script "${_err_msg_}"
+    fi
+else
+    #Start scheduler
+    if [ "${CURR_SERVER_TYPE}" == "stats_coordinator" -o "${CURR_SERVER_TYPE}" == "eniq_stats" ]; then
+        $SU - ${SYS_USER} -c "scheduler start"
+        if [ $? -ne 0 ];then
+            _err_msg_="could not start scheduler"
+            abort_script "${_err_msg_}"
+        fi
+        $SU - ${SYS_USER} -c "scheduler activate"
+        if [ $? -ne 0 ];then
+            _err_msg_="could not activate scheduler"
+            abort_script "${_err_msg_}"
+        fi
+    fi
+fi
+
+
+#Checking all status of engine and scheduler
+_seduler_status_=`$SU - ${SYS_USER} -c "scheduler status | $GREP -w 'Status'" | $AWK -F":" '{print $2}'`
+if [ "${_seduler_status_}" == "active" ]; then
+    log_msg -s "scheduler is activated successfully" -l ${LOGFILE}
+fi
+
+_engine_running_=`$SU - ${SYS_USER} -c "engine status | $GREP -w 'running OK' " | $GREP -w "OK" | $AWK '{print $4}'`
+if [ "${_engine_running_}" == "OK" ]; then
+    log_msg -s "Engine is working fine" -l ${LOGFILE}
+    $SU - ${SYS_USER} -c "engine -e changeProfile 'Normal'"
+     if [ $? -ne 0 ];then
+        _err_msg_="could not set engine profile to normal"
+        abort_script "${_err_msg_}"
+    fi
+    _engine_status_=`$SU - ${SYS_USER} -c "engine -e getCurrentProfile"`
+    if [ "${_engine_status_}" != "Normal" ]; then
+        _err_msg_="could not set engine to Normal"
+        abort_script "${_err_msg_}"
+    fi
+    log_msg -s "Engine successfully put on Normal" -l ${LOGFILE}
+fi
+
+}
+
+
+### Function: run_prerecovery ###
+#
+#   Pre Recovery steps
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+run_prerecovery()
+{
+log_msg -t -h -s "Starting ${ACTION_TYPE} activity on $HNAME" -l ${LOGFILE} 
+
+rep_progress_indicator=${VAR_DIR}/tmp/linux_replacement_in_progress
+rep_success_indicator=${VAR_DIR}/tmp/linux_replacement_success
+
+# Check the status of OS migration activity
+if [ -f "${rep_progress_indicator}" -o -f "${rep_success_indicator}" ];then
+    
+    # Stop ENIQ services if they exist
+    $SYSTEMCTL -a | $GREP -w eniq | $GREP ".service" | $GREP -w active >> /dev/null 2>&1
+    if [ $? -eq 0 ];then
+        log_msg -s "\nENIQ services need to be stopped before recovery." -l ${LOGFILE}
+        stop_eniq_services
+    fi
+
+    # Update storage.ini  
+    if [ "${STORAGE_TYPE}" == "raw" ]; then
+        log_msg -s "\nChecking if storage.ini update required." -l ${LOGFILE}
+        update_stor_ini
+    fi
+
+    # Take backup of the current nasd_config if present
+    if [ -f "${ENIQ_BASE_DIR}/smf/nasd/nasd_config" ]; then
+        _nasd_backup_dir_=${CONFIG_BACKUP_DIR}/nasd_backup
+        if [ ! -d "${_nasd_backup_dir_}" ]; then
+            $MKDIR -p ${_nasd_backup_dir_}
+            if [ $? -ne 0 ];then
+                _err_msg_="Unable to create directory to backup nasd config file."
+                abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+            fi
+        fi
+        $CP -p ${ENIQ_BASE_DIR}/smf/nasd/nasd_config ${_nasd_backup_dir_}
+        if [ $? -ne 0 ];then
+            _err_msg_="Unable to take backup of nasd config file"
+            abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+        fi
+    fi
+
+    # Recreate nasd config file before starting recovery
+    _stage_="populate_nasd_config"
+    $BASH ${REPLACEMENT_BIN}/eniq_core_install.bsh -n -M -s ${_stage_} -l ${LOGFILE}
+    if [ $? -ne 0 ];then
+        _err_msg_="Unable to re-create nasd config file"
+        abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+    fi
+
+    # Disable SMF Services
+    log_msg -s "\nStopping SMF services." -l ${LOGFILE}
+    stop_smf_services
+fi
+
+# Check if  ${BACKUP_DIR}_replaced is present and rename it.
+$LVS | $GREP "${BACKUP_DIR}"_replaced >> /dev/null 2>&1
+if [ $? -eq 0 ]; then            
+# Use proper root backup for recovery.
+    $LVS | $GREP "${BACKUP_DIR}" | $GREP -v replaced | $GREP -v new >> /dev/null 2>&1
+    if [ $? -eq 0 ];then
+        $DF -hk ${MOUNT_POINT_BKUP} | $GREP -w replacement >> /dev/null 2>&1
+        if [ $? -eq 0 ];then
+            cd /
+            $UMOUNT -l ${MOUNT_POINT_BKUP} >> /dev/null 2>&1
+            if [ $? -ne 0 ];then
+                _err_msg_="Could not unmount ${MOUNT_POINT_BKUP}."
+                abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+            fi
+        fi
+        log_msg -s "\n${BACKUP_DIR} exists. Destroying." -l ${LOGFILE}
+        $LVREMOVE -f /dev/mapper/${VOLUME_GROUP_FOR_BACKUP}-${BACKUP_DIR} >> /dev/null 2>&1
+        if [ $? -ne 0 ];then
+            _err_msg_="Could not destroy /dev/mapper/${VOLUME_GROUP_FOR_BACKUP}-${BACKUP_DIR}."
+            abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+        fi
+        
+    fi    
+    $DF -hk ${MOUNT_POINT_BKUP} | $GREP -w replacement >> /dev/null 2>&1
+    if [ $? -eq 0 ];then
+        $UMOUNT -l ${MOUNT_POINT_BKUP} >> /dev/null 2>&1
+        if [ $? -ne 0 ];then
+            _err_msg_="Could not unmount ${MOUNT_POINT_BKUP}."
+            abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+        fi
+    fi
+    cd /
+    log_msg -s "Renaming "${BACKUP_DIR}"_replaced to ${BACKUP_DIR}" -l ${LOGFILE}
+    $LVRENAME ${VOLUME_GROUP_FOR_BACKUP} ${BACKUP_DIR}_replaced ${BACKUP_DIR} >> /dev/null 2>&1
+    if [ $? -ne 0 ]; then
+        _err_msg_="Could not rename ${BACKUP_DIR}_replaced as ${BACKUP_DIR}"
+        abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+    fi
+    log_msg -s "Mounting /dev/mapper/${VOLUME_GROUP_FOR_BACKUP}-${BACKUP_DIR} to ${MOUNT_POINT_BKUP}" -l ${LOGFILE}
+    $MOUNT /dev/mapper/${VOLUME_GROUP_FOR_BACKUP}-${BACKUP_DIR} ${MOUNT_POINT_BKUP} >> /dev/null 2>&1
+    if [ $? -ne 0 ]; then
+        _err_msg_="Unable to Mount /dev/mapper/${VOLUME_GROUP_FOR_BACKUP}-${BACKUP_DIR} on ${MOUNT_POINT_BKUP}"
+        abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+    fi
+    log_msg -s "Successfully renamed LVM directory ${BACKUP_DIR}_replaced to ${BACKUP_DIR}\n" -l ${LOGFILE}
+else
+    log_msg -s "No need to rename LVM root backup for Recovery.\n" -l ${LOGFILE}
+fi
+
+# Check LVM are present or not
+_lv_list_=`$LVS | $EGREP -v "${ROOT_POOL}" | $EGREP -v swap`
+if [ "${_lv_list_}" ];then
+    # Get storage data before exporting VG
+    get_storage_info
+
+    # Export Volume Group
+    export_vgs
+
+    # Disconnect the storage 
+    host_disconnect
+else
+    log_msg -s "No VG found on the ${HNAME}. " -l ${LOGFILE}
+    log_msg -s "Disconnect storage manually before shutting down the server and perform Linux OS Installation to recover." -l ${LOGFILE}
+    exit 1
+fi
+}
+
+
+### Function: recreate_eniq_structure ###
+#
+#   Recreate ENIQ
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+recreate_eniq_structure()
+{
+insert_header_footer head "Entering Linux ${ACTION_TYPE} stage - ${NEXT_STAGE}" ${LOGFILE}
+
+log_msg -s "\nChecking VG status." -l ${LOGFILE}
+# Check VG are present and healthy
+_vg_name_=`$VGS -o vg_name --noheading | $GREP -iw "${CURR_SERVER_TYPE}_pool" | $AWK '{print $1}'`
+
+#Check if VG with exported attributes
+_vg_export_check_=`vgs ${_vg_name_} -o attr --noheading | awk '{print $1}'`
+if [ ! "${_vg_export_check_}" ];then
+    _err_msg_="VG ${_vg_name_} not in proper state. Please check."
+    abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+fi
+
+log_msg -s "Volume Group is online." -l ${LOGFILE}
+
+# Copy directory structures from prereplacement backup
+_source_dir_="${MOUNT_POINT_BKUP}"
+
+
+_dir_list_="${ENIQ_BASE_DIR} ${CRONTABS_DIR} ${VAR_DIR}/tmp/upgrade "
+
+
+if [ "${STORAGE_TYPE}" == "raw" ]; then
+    _dir_list_="${_dir_list_} ${ERICSSON_DIR}"
+fi
+
+for _dir_ in ${_dir_list_}
+do
+    if [ -d "${_source_dir_}${_dir_}" ]; then
+        log_msg -s "Copying ${_source_dir_}${_dir_}/ to ${_dir_} directory\n" -l ${LOGFILE}
+        if [ ! -d ${_source_dir_}${_dir_} ];then
+            _err_msg_="Could not find ${_source_dir_}${_dir_} directory."
+            abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+        fi
+
+        if [ ! -d ${_dir_} ];then
+            $MKDIR -p ${_dir_} >> /dev/null 2>&1
+        fi
+
+        cd ${_source_dir_}${_dir_}
+        $FIND ./ -depth -print | $CPIO -pdum ${_dir_} >> /dev/null 2>&1
+        if [ $? -ne 0 ]; then
+            _err_msg_="Could not copy contents of ${_source_dir_}${_dir_} to ${_dir_} directory"
+            abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+        fi
+    fi
+done
+
+# Copy configuration files
+copy_config_files
+
+
+insert_header_footer foot "Successfully completed - ${NEXT_STAGE}" ${LOGFILE}
+
+set_next_stage `$EXPR ${ARRAY_ELEM}+1`
+}
+
+
+### Function: repair_sym_links ###
+#
+# Verifies and corrects the DB sym_links
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+repair_sym_links()
+{
+insert_header_footer head "Entering Linux ${ACTION_TYPE} stage - ${NEXT_STAGE}" ${LOGFILE}
+
+# Skip if Rack
+if [ "${STORAGE_TYPE}" != "raw" ]; then
+    insert_header_footer foot "Rack Server - Skipping - ${NEXT_STAGE}" ${LOGFILE}
+    set_next_stage `$EXPR ${ARRAY_ELEM}+1`
+    return 0
+fi
+
+# Skip stage if not CO or Reader server
+if [ "${CO_SERVER}" != "YES" -a "${RD_SERVER}" != "YES" ]; then  
+    insert_header_footer foot "Skipping ${ACTIVITY} stage for ${CURR_SERVER_TYPE} - ${NEXT_STAGE} " ${LOGFILE} 
+    set_next_stage `$EXPR ${ARRAY_ELEM}+1`
+    return 0
+fi
+    
+$RM -rf ${TEM_DIR}/db_spaces.txt
+if [ -s ${TEM_DIR}/db_spaces.txt ]; then
+     _err_msg_="Failed to remove ${TEM_DIR}/db_spaces.txt"
+     abort_script "$_err_msg_" "${EXEC_SHELL_CMD}"
+fi
+
+INST_TYPE_FILE=${ENIQ_CONF_DIR}/ericsson_use_config
+if [ ! -s "${INST_TYPE_FILE}" ]; then
+      _err_msg_="ENIQ install type not defined in ${INST_TYPE_FILE}"
+      abort_script "$_err_msg_" "${EXEC_SHELL_CMD}"
+fi
+
+INST_TYPE=`$CAT ${INST_TYPE_FILE} | $AWK -F\= '{print $2}'`
+if [ ! "${INSTALL_TYPE}" ]; then
+      _err_msg_="Failed to get install type"
+      abort_script "$_err_msg_" "${EXEC_SHELL_CMD}"
+fi
+
+_ini_file_list_="lun_map.ini sym_links.ini niq.ini SunOS.ini"
+
+for _ini_file_ in `$ECHO ${_ini_file_list_}`
+do
+   log_msg -t -s "Backing up ${_ini_file_} file to ${TEM_DIR}" -l ${LOGFILE} 
+   if [ -s ${ENIQ_CONF_DIR}/${_ini_file_} ]; then
+        $CP -p ${ENIQ_CONF_DIR}/${_ini_file_} ${TEM_DIR}
+        if [ $? -ne 0 ]; then
+           _err_msg_="Failed to backup ${ENIQ_CONF_DIR}/${_ini_file_} to ${TEM_DIR}"
+           abort_script "$_err_msg_" "${EXEC_SHELL_CMD}"
+        fi
+   else
+        _err_msg_="${ENIQ_CONF_DIR}/${_ini_file_} file not found"
+        abort_script "$_err_msg_" "${EXEC_SHELL_CMD}"
+   fi
+done
+
+_par_tag_list_="DWH_SYSTEM_MAIN DWH_DBSPACES_MAIN DWH_DBSPACES_TEMP"
+
+for _lun_map_det_ in `iniget LUN_MAP_DETAILS -f  ${TEM_DIR}/lun_map.ini`
+do
+    _disk_id_=`iniget ${_lun_map_det_} -f  ${TEM_DIR}/lun_map.ini -v DISK_ID`
+    _lun_id_=`iniget ${_lun_map_det_} -f  ${TEM_DIR}/lun_map.ini -v LUN_ID`
+    
+     for _par_tag_ in `$ECHO ${_par_tag_list_}`
+     do
+         for _dwh_dbspace_ in `iniget ${_par_tag_} -f ${TEM_DIR}/sym_links.ini`
+         do
+             _db_lun_id_=`iniget ${_dwh_dbspace_} -f ${TEM_DIR}/sym_links.ini -v Lun_ID`
+             if [ "${_db_lun_id_}" == "${_lun_id_}" ]; then
+                  $ECHO "${_dwh_dbspace_}=${_disk_id_}" >> ${TEM_DIR}/db_spaces.txt
+             fi
+        done
+     done
+done
+
+MAINDB_DISKS=`$CAT ${TEM_DIR}/db_spaces.txt |$GREP "DWH_DBSPACES_MAIN"|$SORT -u -t_ -k4 -g|$CUT -d"=" -f2|$PASTE -sd" "`
+if [ ! "${MAINDB_DISKS}" ]; then
+      _err_msg_="Failed to get Main DB Disks"
+      abort_script "$_err_msg_" "${EXEC_SHELL_CMD}"
+else
+     log_msg -t -s "Setting MAINDB_DISKS=${MAINDB_DISKS} in ${TEM_DIR}/sym_links.ini" -l ${LOGFILE} 
+     iniset DB_DISK_ALLOC -f ${TEM_DIR}/sym_links.ini MAINDB_DISKS="${MAINDB_DISKS}"
+     if [ $? -ne 0 ]; then
+          _err_msg_="Failed to set Main DB Disks in ${TEM_DIR}/sym_links.ini"
+          abort_script "$_err_msg_" "${EXEC_SHELL_CMD}"
+     fi
+fi
+
+TEMPDB_DISKS=`$CAT ${TEM_DIR}/db_spaces.txt |$GREP "DWH_DBSPACES_TEMP"|$SORT -u -t_ -k4 -g|$CUT -d"=" -f2|$PASTE -sd" "`
+if [ ! "${TEMPDB_DISKS}" ]; then
+      _err_msg_="Failed to get Temp DB Disks"
+      abort_script "$_err_msg_" "${EXEC_SHELL_CMD}"
+else
+     log_msg -t -s "Setting TEMPDB_DISKS=${TEMPDB_DISKS} in ${TEM_DIR}/sym_links.ini" -l ${LOGFILE} 
+     iniset DB_DISK_ALLOC -f ${TEM_DIR}/sym_links.ini TEMPDB_DISKS="${TEMPDB_DISKS}"
+     if [ $? -ne 0 ]; then
+          _err_msg_="Failed to set Temp DB Disks in ${TEM_DIR}/sym_links.ini"
+          abort_script "$_err_msg_" "${EXEC_SHELL_CMD}"
+     fi
+fi
+
+IQ_SYS_MAIN_DB_DISKS=`$CAT ${TEM_DIR}/db_spaces.txt |$GREP "DWH_SYSTEM_MAIN"|$SORT -u -t_ -k4 -g|$CUT -d"=" -f2|$PASTE -sd" "`
+if [ ! "${IQ_SYS_MAIN_DB_DISKS}" ]; then
+      _err_msg_="Failed to get Sys_Main DB Disks"
+      abort_script "$_err_msg_" "${EXEC_SHELL_CMD}"
+else
+     log_msg -t -s "Setting IQ_SYS_MAIN_DISKS=${IQ_SYS_MAIN_DB_DISKS} in ${TEM_DIR}/sym_links.ini" -l ${LOGFILE} 
+     iniset DB_DISK_ALLOC -f ${TEM_DIR}/sym_links.ini IQ_SYS_MAIN_DISKS="${IQ_SYS_MAIN_DB_DISKS}"
+     if [ $? -ne 0 ]; then
+          _err_msg_="Failed to set Sys_Main DB Disks in ${TEM_DIR}/sym_links.ini"
+          abort_script "$_err_msg_" "${EXEC_SHELL_CMD}"
+     fi
+fi
+
+$ECHO "/usr/bin/bash $SCRIPTHOME/get_cell_count.bsh -b ${ENIQ_BASE_DIR} -d ${TEM_DIR} -t ${STORAGE_TYPE} -e ${INST_TYPE} -l $LOGFILE" >> ${LOGFILE}
+$BASH $SCRIPTHOME/get_cell_count.bsh -b ${ENIQ_BASE_DIR} -d ${TEM_DIR} -t ${STORAGE_TYPE} -e ${INST_TYPE} -l $LOGFILE
+if [ $? -ne 0 ]; then
+     _err_msg_="Failed to execute $SCRIPTHOME/get_cell_count.bsh"
+     abort_script "$_err_msg_" "${EXEC_SHELL_CMD}"
+fi
+
+if [ -s ${TEM_DIR}/sym_links.ini ]; then
+     log_msg -t -s "Restoring ${TEM_DIR}/sym_links.ini file to ${ENIQ_CONF_DIR}" -l ${LOGFILE} 
+     $CP -p ${TEM_DIR}/sym_links.ini ${ENIQ_CONF_DIR}
+     if [ $? -ne 0 ]; then
+           _err_msg_="Failed to restore ${TEM_DIR}/sym_links.ini to ${ENIQ_CONF_DIR}"
+           abort_script "$_err_msg_" "${EXEC_SHELL_CMD}"
+     fi
+else
+     _err_msg_="${TEM_DIR}/sym_links.ini file not found"
+     abort_script "$_err_msg_" "${EXEC_SHELL_CMD}"
+fi
+
+# Check for udev rules file if exist or not
+if [ ! -f ${UDEV_FILE} ]; then
+    err_msg_="UDEV rules files does not exist"
+    abort_script "$_err_msg_" "${EXEC_SHELL_CMD}"
+fi
+
+# Activate the raw device created in udev rules
+$UDEVADM  control --reload-rules
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not reload udev rules for raw device"
+    abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+fi
+
+$UDEVADM  trigger --type=devices --action=change
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not trigger udev rules for raw device"
+    abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+fi
+
+$SLEEP 5
+
+# Check if the raw devices are created or not
+_count_=0
+
+while :; do
+    $RAW -qa | $GREP -w raw >> /dev/null 2>&1
+    if [ $? -eq 0 ]; then
+        break
+    else
+        $SLEEP 1
+        _count_=`$EXPR ${_count_} + 1`
+        if [ ${_count_} -eq 10 ]; then
+            err_msg_="Could not create raw device"
+            abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+        fi
+        continue
+    fi
+done
+
+# Update sym_links.ini
+$BASH ${REPLACEMENT_BIN}/update_sym_links_ini.bsh -N -M
+if [ $? -ne 0 ]; then
+    _err_msg_="Unable to update sym_links.ini file."
+    abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+fi
+
+# Re-create DB sym_links
+$BASH ${REPLACEMENT_BIN}/eniq_core_install.bsh -M -s create_db_sym_links -n -R -l ${LOGFILE}
+if [ $? -ne 0 ]; then
+    _err_msg_="Unable to repair the DB symbolic links"
+    abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+fi
+
+# Verify sym links are correctly configured
+_sym_links_check_="${REPLACEMENT_BIN}/check_sym_links.pl"
+log_msg -s "\nVerifying DB sym_links..." -l ${LOGFILE}
+$PERL ${_sym_links_check_} ${ENIQ_CONF_DIR}/${SYM_LINKS_INI} >> /dev/null
+_return_code_=$?
+if [ $_return_code_ -eq 0 ]; then
+    log_msg -s "DB sym_links are correctly assigned." -l ${LOGFILE}
+elif [ $_return_code_ -eq 22 -o $_return_code_ -eq 32 ]; then
+    _err_msg_="DB sym_links are still incorrect. Please fix the sym_links manually."
+    abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+else
+    _err_msg_="Failed to execute ${_sym_links_} script to verify the sym_links."
+    abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+fi
+
+insert_header_footer foot "Successfully completed - ${NEXT_STAGE}" ${LOGFILE}
+
+set_next_stage `$EXPR ${ARRAY_ELEM}+1`
+}
+
+### Function: retain_user_password ######
+#
+# Retain password for all users after replacement
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+retain_user_password()
+{
+_orig_pass_file_="${MOUNT_POINT_BKUP}/etc/shadow"
+_rep_pass_file_="/etc/shadow"
+
+# Creating temporary copy of shadow file
+_temp_pass_file_="${TEM_DIR}/shadow"
+$RM -rf ${_temp_pass_file_} >> /dev/null
+$CP -p ${_rep_pass_file_} ${_temp_pass_file_} >> /dev/null
+if [ $? -ne 0 ];then
+    _err_msg_="Unable to create temporary copy of ${_rep_pass_file_}."
+    abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+fi
+
+# Give write permission to temp file
+$CHMOD +w ${_temp_pass_file_} >> /dev/null
+if [ $? -ne 0 ];then
+    _err_msg_="Unable to give write permission to ${_temp_pass_file_}."
+    abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+fi
+
+_curr_user_list_=`$CAT ${_rep_pass_file_} | $AWK -F":" '{print $1}'`
+_old_user_list_=`$CAT ${_orig_pass_file_} | $AWK -F":" '{print $1}'`
+
+for _user_ in ${_old_user_list_}; do
+    # Check if the user was present on older OS/system
+    $CAT ${_temp_pass_file_} | $GREP -w "${_user_}" | $GREP "^${_user_}" >> /dev/null 2>&1
+    if [ $? -eq 0 ]; then
+        # Check if the user passwords
+        _user_pass_curr_=`$CAT ${_temp_pass_file_} | $GREP -w "${_user_}" | $GREP "^${_user_}" | $AWK -F":" '{print $2}'`
+        _user_pass_old_=`$CAT ${_orig_pass_file_} | $GREP -w "${_user_}" | $GREP "^${_user_}" | $AWK -F":" '{print $2}'`
+
+        # Compare password values
+        if [ ! "${_user_pass_curr_}" -a ! "${_user_pass_old_}" ]; then
+            log_msg -q -s "No need to set password for $_user_" -l ${LOGFILE}
+            continue
+        fi
+
+        log_msg -s "Updating password for $_user_" -l ${LOGFILE}
+        $CAT ${_temp_pass_file_} | $SED "s|${_user_}\:${_user_pass_curr_}\:|${_user_}\:${_user_pass_old_}\:|" > ${_temp_pass_file_}.tmp
+        $MV ${_temp_pass_file_}.tmp ${_temp_pass_file_}
+    else
+        log_msg -s "Adding $_user_ on new OS/system" -l ${LOGFILE}
+        $CAT ${_orig_pass_file_} | $GREP "^${_user_}" >> ${_temp_pass_file_}
+    fi
+done
+
+# Copy the temp file to original file
+$CP -p ${_temp_pass_file_} ${_rep_pass_file_}
+if [ $? -ne 0 ]; then
+    _err_msg_="Unable to save password file ${_rep_pass_file_}."
+    abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+fi
+
+# Update permission of original password file
+$CHMOD 400 ${_rep_pass_file_} >> /dev/null
+if [ $? -ne 0 ]; then
+    _err_msg_="Unable to update permission of ${_rep_pass_file_}."
+    abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+fi
+
+# Restore ownership of original password file
+$CHOWN root:sys ${_rep_pass_file_} >> /dev/null
+if [ $? -ne 0 ]; then
+    _err_msg_="Unable to restore ownership of ${_rep_pass_file_}."
+    abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+fi
+}
+
+
+### Function: remote_prereplacement ###
+#
+# Runs required prereplacement stages from CO
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+remote_prereplacement()
+{
+insert_header_footer head "Entering Linux ${ACTION_TYPE} stage - ${NEXT_STAGE}" ${LOGFILE}
+
+# Skip if Rack
+if [ "${STORAGE_TYPE}" != "raw" ]; then
+    insert_header_footer foot "Rack Replacement - Skipping - ${NEXT_STAGE}" ${LOGFILE}
+    set_next_stage `$EXPR ${ARRAY_ELEM}+1`
+    return 0
+fi
+
+# Skip stage if not CO server
+if [ "${CO_SERVER}" != "YES" ]; then  
+    insert_header_footer foot "Skipping ${ACTION_TYPE} stage for ${CURR_SERVER_TYPE} - ${NEXT_STAGE} " ${LOGFILE} 
+    set_next_stage `$EXPR ${ARRAY_ELEM}+1`
+    return 0
+fi
+
+# Get server order
+if [ `$CAT ${ORDER_FILE} | $WC -l` -eq 1 ]; then
+    # Check if the activity type is not replacement
+    if [ "${REPLACEMENT}" != "YES" ]; then
+        log_msg -s "Pre-replacement triggered in Single Blade environment. " -l ${LOGFILE}
+        insert_header_footer foot "Skipping ${ACTION_TYPE} stage - ${NEXT_STAGE}" ${LOGFILE}
+        set_next_stage `$EXPR ${ARRAY_ELEM}+1`
+        return 0
+    fi
+    log_msg -s "Blade replacement: Pre-replacement triggered for only one server." -l ${LOGFILE}
+fi
+
+# Command to run on remote
+ _optional_=""
+ if [ "${REPLACEMENT}" == "YES" ]; then
+     _optional_="-R"
+ fi
+
+if [ "${_user_root}" == 1 ]; then
+
+	# Execute Root command
+	_prereplacement_cmd_="$BASH ${REPLACEMENT_BIN}/eniq_linux_replacement.bsh -a ${ACTION_TYPE}"
+    _ssh_cmd_="$SSH -o StrictHostKeyChecking=no -o BatchMode=yes -q -l root"
+	
+else
+
+	# Execute non root admin user command
+	_prereplacement_cmd_="$SUDO $BASH ${REPLACEMENT_BIN}/eniq_linux_replacement.bsh -a ${ACTION_TYPE}"
+    _ssh_cmd_="$SSH -o StrictHostKeyChecking=no -o BatchMode=yes -q -l $_get_id_"	
+fi
+
+for _entry_ in `$CAT ${ORDER_FILE}`; do
+     local _count_
+     _count_=`$ECHO ${_entry_} |$GREP -o "::" | $WC -l`
+     if [ "${_ip_type_}" == "IPv6" ] && [ "${_count_}" == 3 ]; then
+        _server_ip_=`$ECHO ${_entry_} |$GREP -oE '([a-fA-F0-9]{1,4}::?){1,7}[a-fA-F0-9]{1,4}' | $HEAD -n 1 | $AWK -F "::" '{ print $1 "::" $2}'`
+        _server_name_=`$ECHO "${_entry_}" | $AWK -F"::" '{print $3}'`
+     else
+        _server_ip_=`$ECHO "${_entry_}" | $AWK -F"::" '{print $1}'`
+        _server_name_=`$ECHO "${_entry_}" | $AWK -F"::" '{print $2}'`
+     fi
+
+    # No need to run script remotely on local. 
+    # Next stage will be triggered following stage list.
+    if [ "${_server_ip_}" == "${HOST_IP}" ]; then
+        # Set CO for prereplacement if CO is listed in order file
+        # This flag is required in case CO is not selected for Replacement
+        $RM -rf ${REPLACEMENT_CO} >> /dev/null
+        $TOUCH ${REPLACEMENT_CO}
+        if [ ! -f ${REPLACEMENT_CO} ]; then
+            _err_msg_="Couldn't create the flag ${REPLACEMENT_CO} to exclude CO from ${ACTION_TYPE}"
+            abort_script "${_err_msg_}"
+        fi
+        continue
+    fi
+if [ "${_user_root}" == 1 ]; then
+        
+    # Execute Root command
+    # Check if prereplacement success flag is present
+    run_remote_cmd "${_server_name_}" "ls ${REPL_SUCCESS} >>/dev/null 2>&1" "$LOGFILE"
+    if [ $? -eq 0 ]; then
+        log_msg -s "Prereplacement steps are already completed on ${_server_name_}" -l $LOGFILE
+        continue
+    fi
+
+    # Check the presence of replacement script
+    run_remote_cmd "${_server_name_}" "ls ${REPLACEMENT_BIN}/eniq_linux_replacement.bsh >>/dev/null 2>&1" "$LOGFILE"
+    if [ $? -ne 0 ]; then
+        _err_msg_="Prereplacement script ${REPLACEMENT_BIN}/eniq_linux_replacement.bsh not found on ${_server_name_}"
+        abort_script "${_err_msg_}"
+    fi
+
+    # If prereplacement not completed, run/resume activity   
+    log_msg -h -s "Starting Prereplacement on ${_server_name_}" -l ${LOGFILE}
+    run_remote_cmd "${_server_name_}" "${_prereplacement_cmd_}" "$LOGFILE" | $TEE -a ${LOGFILE}
+	status=(${PIPESTATUS[@]})
+    pipe_status0=${status[0]}
+    pipe_status1=${status[1]}
+    if [ "${pipe_status0}" -ne 0 ]; then
+        _err_msg_="Prereplacement failed on ${_server_name_}. Check logfile ${LOGFILE}"
+        abort_script "${_err_msg_}"
+    else
+        run_remote_cmd "${_server_name_}" "ls ${REPL_SUCCESS} >>/dev/null 2>&1" "$LOGFILE"
+        if [ $? -ne 0 ]; then
+            _err_msg_="Prereplacement not completed on ${_server_name_}. Check logfile ${LOGFILE}"
+            abort_script "${_err_msg_}"
+        fi
+        log_msg -h -s "Completed Prereplacement on ${_server_name_}" -l ${LOGFILE}
+    fi
+else
+		
+	# Execute non root admin user command
+    # Check if prereplacement success flag is present
+    run_remote_cmd "${_server_name_}" "ls ${REPL_SUCCESS} >>/dev/null 2>&1" "$LOGFILE" "$_get_id_"
+    if [ $? -eq 0 ]; then
+        log_msg -s "Prereplacement steps are already completed on ${_server_name_}" -l $LOGFILE
+        continue
+    fi
+
+    # Check the presence of replacement script
+    run_remote_cmd "${_server_name_}" "ls ${REPLACEMENT_BIN}/eniq_linux_replacement.bsh >>/dev/null 2>&1" "$LOGFILE" "$_get_id_"
+     if [ $? -ne 0 ]; then
+         _err_msg_="Prereplacement script ${REPLACEMENT_BIN}/eniq_linux_replacement.bsh not found on ${_server_name_}"
+         abort_script "${_err_msg_}"
+     fi
+
+     # If prereplacement not completed, run/resume activity
+     log_msg -h -s "Starting Prereplacement on ${_server_name_}" -l ${LOGFILE}
+     run_remote_cmd "${_server_name_}" "${_prereplacement_cmd_}" "$LOGFILE" "$_get_id_" | $TEE -a ${LOGFILE}
+         status=(${PIPESTATUS[@]})
+     pipe_status0=${status[0]}
+     pipe_status1=${status[1]}
+     if [ "${pipe_status0}" -ne 0 ]; then
+         _err_msg_="Prereplacement failed on ${_server_name_}. Check logfile ${LOGFILE}"
+         abort_script "${_err_msg_}"
+     else
+         run_remote_cmd "${_server_name_}" "ls ${REPL_SUCCESS} >>/dev/null 2>&1" "$LOGFILE" "$_get_id_"
+         if [ $? -ne 0 ]; then
+             _err_msg_="Prereplacement not completed on ${_server_name_}. Check logfile ${LOGFILE}"
+             abort_script "${_err_msg_}"
+         fi
+         log_msg -h -s "Completed Prereplacement on ${_server_name_}" -l ${LOGFILE}
+     fi
+fi
+done 
+
+insert_header_footer foot "Successfully completed - ${NEXT_STAGE}" ${LOGFILE}
+
+set_next_stage `$EXPR ${ARRAY_ELEM}+1`
+}
+
+### Function: remount_fs ###
+#
+# Restore the services state and mounts
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+remount_fs ()
+{
+_pool_=`$VGS -o vg_name --noheading | $GREP -iw "${CURR_SERVER_TYPE}_pool" | $AWK '{print $1}'`
+SWAP_PARITION=`$GREP -w ${_pool_} /etc/fstab | $GREP -w swap | $AWK '{print $1}'`
+log_msg -s "Re-activating $SWAP_PARITION of ${_pool_}." -l ${LOGFILE}
+#Check attributes of swapvol
+_swap_state_check_=`lvs ${SWAP_PARITION} -o attr --noheading | awk '{print $1}'`
+if [ ${_swap_state_check_} != "-wi-ao----" ];then
+    $SWAPON ${SWAP_PARITION} >> /dev/null 2>&1
+fi
+    
+start_eniq_services
+    
+check_and_manage_smf ${SENTINEL_SMF_ID} enable
+check_and_manage_smf ${DDC_SMF_ID} enable
+check_and_manage_smf ${HOSTSYNC_SMF_ID} enable    
+check_and_manage_smf ${NAS_MILESTONE_SMF_ID} enable    
+check_and_manage_smf ${NASd_SMF_ID} enable
+
+# Re-mount all the directories mounted from _pool_
+for _mount_ in `cat /etc/fstab | grep "${_pool_}" | grep -wv swap | awk '{print $1, $2}'`; do 
+            $MOUNT "$_mount_"  >> /dev/null 2>&1
+            if [ $? -ne 0 ];then
+               _err_msg_="Unable to MOUNT $_mount_."
+                abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+            fi
+done
+
+df -hk ${MOUNT_POINT_BKUP} | $TAIL -1 >> /dev/null 2>&1
+if [ $? -ne 0 ];then
+    $MOUNT /dev/mapper/${VOLUME_GROUP_FOR_BACKUP}-${BACKUP_DIR} ${MOUNT_POINT_BKUP} >> /dev/null 2>&1
+    if [ $? -ne 0 ]; then
+        _err_msg_="Unable to Mount /dev/mapper/${VOLUME_GROUP_FOR_BACKUP}-${BACKUP_DIR} on ${MOUNT_POINT_BKUP}"
+        abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+    fi
+fi
+
+}
+
+
+### Function: setup_cron_for_cleanup ###
+#
+# Sets the cron for cleanup of root backup from LV
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+setup_cron_for_cleanup()
+{
+# Verify if the cronjob for cleanup is already present in crontab
+crontab -l | $GREP -w "eniq_linux_replacement.bsh -a cleanup" >> /dev/null 2>&1
+if [ $? -ne 0 ]; then
+    crontab -l > /tmp/crontab.tmp
+    $ECHO "0 0 1 * * $FIND ${REPL_SUCCESS} -mtime +30 -exec $BASH ${REPLACEMENT_BIN}/eniq_linux_replacement.bsh -a cleanup \;" >> /tmp/crontab.tmp
+    crontab /tmp/crontab.tmp
+fi
+
+# Verify if the cronjob is added
+crontab -l | $GREP "eniq_linux_replacement.bsh -a cleanup" >> /dev/null 2>&1
+if [ $? -ne 0 ]; then
+   _err_msg_="Failed to add the cronjob in crontab"
+    abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+fi
+}
+
+
+### Function: save_rep_scp_info ##
+#
+# Save replacement info to replacement.conf
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+save_rep_scp_info()
+{
+if [ ! "$1" ];then
+  _err_msg_="File name is required"
+  abort_script "${_err_msg_}"
+fi
+_temp_conf_file_=$1
+
+# Get NAS IP
+_nas_name_=`$DF -hk ${ENIQ_BACKUP_DIR} | $GREP -vw 'Filesystem' | $AWK -F\: '{print $1}'`
+_nas_dir_=`$DF -hk ${ENIQ_BACKUP_DIR} | $GREP -vw 'Filesystem' | $AWK '{print $1}' | $CUT -f2 -d:`
+if [ ! "${_nas_name_}" -o ! "${_nas_dir_}" ];then
+    _err_msg_="NAS information for ${ENIQ_BACKUP_DIR} not found."
+    abort_script "${_err_msg_}"
+fi
+_nas_ip_=`$CAT /etc/hosts | $GREP -w $_nas_name_ | $AWK '{print $1}'`
+_nas_user_=`$CAT ${ENIQ_CONF_DIR}/ssh_input_file | $GREP -w R_USER_S= | $CUT -f2 -d\"`
+
+# Insert value in replacement.conf
+set_conf_value REP_BACKUP_NAS_IP $_nas_ip_ $_temp_conf_file_
+set_conf_value REP_BACKUP_NAS_DIR ${_nas_dir_}/${REP_SW_DIR_NAME} $_temp_conf_file_
+set_conf_value REP_SW_SCP_USER "${_nas_user_}" $_temp_conf_file_
+}
+
+
+### Function: save_recovery_info ###
+#
+# Save replacement info to replacement.conf
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+save_recovery_info()
+{
+log_msg -s "Getting current ENIQ Base SW and OM SW paths..." -l "${LOGFILE}"
+
+if [ ! "${CO_SERVER}" ];then
+    # Check if CO replacement conf is created. Get values from there
+    if [ -s ${REP_CO_CONF} ]; then
+        _curr_base_sw_=`read_value REC_BASE_SW_LOC ${REP_CO_CONF}` || abort_script "${_curr_base_sw_}" 
+        _curr_om_sw_=`read_value REC_OM_SW_LOC ${REP_CO_CONF}` || abort_script "${_curr_om_sw_}"
+    fi
+else
+    if [ "${REPLACEMENT}" == "YES" ]; then
+        # Should be same as SW location for replacement
+        _curr_base_sw_=`read_value REP_BASE_SW_LOC ${_temp_replace_conf_}` || abort_script "${_curr_base_sw_}" "${EXEC_SHELL_CMD}"
+        _curr_om_sw_=`read_value REP_OM_SW_LOC ${_temp_replace_conf_}` || abort_script "${_curr_om_sw_}" 
+    fi
+fi
+
+# Store the values
+if [ ! "${_curr_base_sw_}" -o ! "${_curr_om_sw_}" ]; then
+    # Ask SW location path info for replacement conf file
+    common_save_sw_rep_loc_path "$_temp_replace_conf_" "rep-recovery" "curr"
+    if [ $? -ne 0 ]; then
+        _err_msg_="Unable to fetch required details from ${ENIQ_CONF_DIR}/${BLK_STOR_INI}"
+        abort_script "${_err_msg_}"
+    fi
+    log_msg -s "Current ENIQ Base SW and OM SW locations are provided.\n" -l "${LOGFILE}"
+else
+    # Save SW location path info in replacement conf file 
+    set_conf_value "REC_BASE_SW_LOC" ${_curr_base_sw_} ${_temp_replace_conf_}
+    set_conf_value "REC_OM_SW_LOC" ${_curr_om_sw_} ${_temp_replace_conf_}
+fi
+  
+log_msg -s "Current ENIQ Base SW and OM SW locations successfully saved.\n" -l "${LOGFILE}"
+}
+
+
+### Function: save_san_data ###
+#
+# Save storage info to replacement.conf
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+save_san_data()
+{
+if [ ! "$1" ];then
+  _err_msg_="File name is required"
+  abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+fi
+_temp_conf_file_=$1
+
+log_msg -s "Getting the Storage details..." -l "${LOGFILE}"
+
+# Save Storage information
+set_conf_value "SAN_DEVICE_TYPE" ${SAN_DEVICE} ${_temp_conf_file_}
+
+if [ "${SAN_DEVICE}" == "unity" -o "${SAN_DEVICE}" == "unityXT" ]; then
+_storage_conf_file_=${ERICSSON_STOR_DIR}/san/plugins/${SAN_DEVICE}/etc/unity.conf
+elif [ "${SAN_DEVICE}" == "vnx" ]; then
+_storage_conf_file_=${ERICSSON_STOR_DIR}/san/plugins/${SAN_DEVICE}/etc/clariion.conf
+else 
+    _err_msg_="Unable to retrieve Storage Config file for ${SAN_DEVICE}."
+    abort_script "${_err_msg_}"
+fi
+
+# Get host agent IP
+_host_agent_ip_=`iniget BLK_STORAGE_INTERF -f ${ENIQ_CONF_DIR}/${BLK_STOR_INI} -v BLK_STORAGE_INTERF_IP`
+if [ ! "${_host_agent_ip_}" ];then
+    _err_msg_="Unable to retrieve HOST AGENT IP from ${ENIQ_CONF_DIR}/${BLK_STOR_INI} file."
+    abort_script "${_err_msg_}"
+fi
+set_conf_value "HOST_AGENT_IP" ${_host_agent_ip_} ${_temp_conf_file_}
+
+_storage_list_=`iniget BLK_STORAGE_DEV_DETAILS -f ${ENIQ_CONF_DIR}/${BLK_STOR_INI}`
+
+if [ "${SAN_DEVICE}" == "vnx" ]; then
+_count_=1
+for _storage_ in $_storage_list_; do
+    _stor_name_=`iniget ${_storage_} -f ${ENIQ_CONF_DIR}/${BLK_STOR_INI} -v BLK_STORAGE_NAME`
+    _stor_spa_=`iniget ${_storage_} -f ${ENIQ_CONF_DIR}/${BLK_STOR_INI} -v BLK_STORAGE_IP_SPA`
+    _stor_spb_=`iniget ${_storage_} -f ${ENIQ_CONF_DIR}/${BLK_STOR_INI} -v BLK_STORAGE_IP_SPB`
+    _stor_group_=`iniget ${_storage_} -f ${ENIQ_CONF_DIR}/${BLK_STOR_INI} -v BLK_STORAGE_GROUP_NAME`
+    _stor_admin_=`iniget ${_storage_} -f ${ENIQ_CONF_DIR}/${BLK_STOR_INI} -v BLK_STORAGE_USERNAME`
+
+    if [ ! "${_stor_name_}" -o ! "${_stor_spa_}" -o ! "${_stor_spb_}" -o \
+         ! "${_stor_group_}" -o ! "${_stor_admin_}" ];then
+        _err_msg_="Unable to fetch required details from ${ENIQ_CONF_DIR}/${BLK_STOR_INI}"
+        abort_script "${_err_msg_}"
+    fi
+    
+    # Run in non-CO blade to get the Storage password 
+    if [[ ! ${BACKUP} ]] && [[ ! "${CO_SERVER}" ]]; then
+            # Check if the password exists in CO migration conf
+            _stor_pass_=`$CAT ${REP_CO_CONF} | $GREP "^STORAGE_PASS_${_count_}=" |$CUT --complement -d "=" -f 1` || abort_script "${_stor_pass_}"
+    fi
+
+    if [[ ! "${BACKUP}" ]] && [[ ! ${_stor_pass_} ]]; then
+        # Get Password from user
+        _disp_file_=${TEM_DIR}/disp_file
+        $ECHO "\nDisplaying details of Storage ${_stor_name_}" > ${_disp_file_}
+        $ECHO "----------------------------------------------" >> ${_disp_file_}
+        $ECHO "Storage Name\t\t: ${_stor_name_}" >> ${_disp_file_}
+        $ECHO "Storage SP A IP Address\t: ${_stor_spa_}" >> ${_disp_file_}
+        $ECHO "Storage SP B IP Address\t: ${_stor_spb_}" >> ${_disp_file_}
+        $ECHO "Storage Admin userid\t: ${_stor_admin_}" >> ${_disp_file_}
+        while [ 1 ]; do
+            while true
+        do
+            $ECHO "Please enter Storage Admin password for ${_stor_name_}:"
+            _stor_pass_=$(/usr/bin/perl -e 'system ("stty -echo");my $_temp_san_password_ =<STDIN>; print $_temp_san_password_; system ("stty echo");')
+            $ECHO "\nRe-Enter Storage Admin password for ${_stor_name_}:"
+            _stor_pass1_=$(/usr/bin/perl -e 'system ("stty -echo");my $_temp_san_password_1 =<STDIN>; print $_temp_san_password_1; system ("stty echo");')
+            if [ "${_stor_pass_}" == "${_stor_pass1_}" ]; then
+                break
+            else
+                $ECHO "password mismatch. Try again..."
+                $SLEEP 2
+                continue
+            fi
+        done
+        _stor_pass_=`$ECHO ${_stor_pass_} | $OPENSSL enc -base64`
+        if [ -z $_stor_pass_ ]; then
+            _err_msg_="Unable to encrypted password"
+            abort_script "${_err_msg_}"
+        fi
+        
+            clear
+           # Take user confirmation
+            $CAT ${_disp_file_}
+            $ECHO "\nPlease confirm the Storage details for ${_stor_name_}"
+            user_confirm
+            if [ "${_response_}" != "YES" ];then
+                continue
+            else
+                break
+            fi
+        done
+    fi
+
+    # Set values
+    set_conf_value "STORAGE_NAME_${_count_}" ${_stor_name_} ${_temp_conf_file_}
+    set_conf_value "STORAGE_SPA_${_count_}" ${_stor_spa_} ${_temp_conf_file_}
+    set_conf_value "STORAGE_SPB_${_count_}" ${_stor_spb_} ${_temp_conf_file_}
+    set_conf_value "STORAGE_ADMIN_${_count_}" ${_stor_admin_} ${_temp_conf_file_}
+    set_conf_value "STORAGE_GROUP_${_count_}" ${_stor_group_} ${_temp_conf_file_}
+    
+    if [ ! ${BACKUP} ];then
+        set_conf_value "STORAGE_PASS_${_count_}" ${_stor_pass_} ${_temp_conf_file_}
+    fi
+    
+    $RM -rf ${_disp_file_}
+    _count_=`expr $_count_ + 1`
+    # Unset _stor_pass_
+    unset _stor_pass_
+done
+
+elif [ "${SAN_DEVICE}" == "unity" -o "${SAN_DEVICE}" == "unityXT" ]; then
+_count_=1
+for _storage_ in $_storage_list_; do
+    _stor_name_=`iniget ${_storage_} -f ${ENIQ_CONF_DIR}/${BLK_STOR_INI} -v BLK_STORAGE_NAME`
+    _stor_spa_=`iniget ${_storage_} -f ${ENIQ_CONF_DIR}/${BLK_STOR_INI} -v BLK_STORAGE_IP_SPA`
+    if [[ ! ${BACKUP} ]] && [[  "${CURR_SERVER_TYPE}" == "stats_coordinator" ]]; then
+            _array_index_=0
+            declare -a _disk_
+            for _host_ in `$CAT ${_selected_servers_}`;do
+                if [ "${_user_root}" == 1 ]; then
+    # Execute Root command
+	_stor_disks_=`run_remote_cmd "${_host_}" ". ${SCRIPTHOME}/../lib/common_functions.lib; iniget ${_storage_} -f ${ENIQ_CONF_DIR}/${BLK_STOR_INI} -v BLK_STORAGE_DISKS" ${LOGFILE} root disable_tty`
+else
+
+	# Execute non root admin user command
+	_stor_disks_=`run_remote_cmd "${_host_}" ". ${SCRIPTHOME}/../lib/common_functions.lib; iniget ${_storage_} -f ${ENIQ_CONF_DIR}/${BLK_STOR_INI} -v BLK_STORAGE_DISKS" ${LOGFILE} $_get_id_ disable_tty`
+fi
+                _disk_[_array_index_]="${_host_}::${_stor_disks_}"
+                _array_index_=`expr $_array_index_ + 1`
+            done
+    fi
+    _stor_disks_=`iniget ${_storage_} -f ${ENIQ_CONF_DIR}/${BLK_STOR_INI} -v BLK_STORAGE_DISKS`
+    if [ ! "${_stor_disks_}" ]; then
+        _err_msg_="Could not read BLK_STORAGE_DISKS value from ${BLK_STOR_INI}."
+        abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+    fi
+    
+    _stor_group_id_=`iniget ${_storage_} -f ${ENIQ_CONF_DIR}/${BLK_STOR_INI} -v BLK_CONSISTENCY_GROUP_ID`
+    _stor_admin_=`iniget ${_storage_} -f ${ENIQ_CONF_DIR}/${BLK_STOR_INI} -v BLK_STORAGE_USERNAME`
+
+    if [ ! "${_stor_name_}" -o ! "${_stor_spa_}" -o \
+         ! "${_stor_group_id_}" -o ! "${_stor_admin_}" ];then
+        _err_msg_="Unable to fetch required details from ${ENIQ_CONF_DIR}/${BLK_STOR_INI}"
+        abort_script "${_err_msg_}"
+    fi
+    
+    # Run in non-CO blade to get the Storage password 
+    if [[ ! ${BACKUP} ]] && [[ ! "${CO_SERVER}" ]]; then
+            # Check if the password exists in CO migration conf
+           _stor_pass_=`$CAT ${REP_CO_CONF} | $GREP "^STORAGE_PASS_${_count_}=" |$CUT --complement -d "=" -f 1` || abort_script "${_stor_pass_}"
+    fi
+
+    if [[ ! "${BACKUP}" ]] && [[ ! ${_stor_pass_} ]]; then
+        # Get Password from user
+        _disp_file_=${TEM_DIR}/disp_file
+        $ECHO "\nDisplaying details of Storage ${_stor_name_}" > ${_disp_file_}
+        $ECHO "----------------------------------------------" >> ${_disp_file_}
+        $ECHO "Storage Name\t\t: ${_stor_name_}" >> ${_disp_file_}
+        $ECHO "Storage SP A IP Address\t: ${_stor_spa_}" >> ${_disp_file_}
+        if [ "${CURR_SERVER_TYPE}" == "stats_coordinator" ];then
+            _array_index_=0
+            for _host_ in `$CAT ${_selected_servers_}`; do
+                $ECHO "Storage Disks\t: ${_disk_[_array_index_]} " >> ${_disp_file_}
+                _array_index_=`expr $_array_index_ + 1`
+            done
+        else
+            $ECHO "Storage Disks\t: ${_stor_disks_}" >> ${_disp_file_}
+        fi
+        $ECHO "Storage Admin userid\t: ${_stor_admin_}" >> ${_disp_file_}
+        while [ 1 ]; do
+            while true
+        do
+            $ECHO "Please enter Storage Admin password for ${_stor_name_}:"
+            _stor_pass_=$(/usr/bin/perl -e 'system ("stty -echo");my $_temp_san_password_ =<STDIN>; print $_temp_san_password_; system ("stty echo");')
+            $ECHO "\nRe-Enter Storage Admin password for ${_stor_name_}:"
+            _stor_pass1_=$(/usr/bin/perl -e 'system ("stty -echo");my $_temp_san_password_1 =<STDIN>; print $_temp_san_password_1; system ("stty echo");')
+            if [ "${_stor_pass_}" == "${_stor_pass1_}" ]; then
+                break
+            else
+                $ECHO "password mismatch. Try again..."
+                $SLEEP 2
+                continue
+            fi
+        done
+
+        _stor_pass_=`$ECHO ${_stor_pass_} | $OPENSSL enc -base64`
+        if [ -z $_stor_pass_ ]; then
+            _err_msg_="Unable to encrypted password"
+            abort_script "${_err_msg_}"
+        fi
+            clear
+            # Take user confirmation
+            $CAT ${_disp_file_}
+            $ECHO "\nPlease confirm the Storage details for ${_stor_name_}"
+            user_confirm
+            if [ "${_response_}" != "YES" ];then
+                continue
+            else
+                break
+            fi
+        done
+    fi
+
+    # Set values
+    set_conf_value "STORAGE_NAME_${_count_}" ${_stor_name_} ${_temp_conf_file_}
+    set_conf_value "STORAGE_SPA_${_count_}" ${_stor_spa_} ${_temp_conf_file_}
+    set_conf_value "STORAGE_DISKS_${_count_}" ${_stor_disks_} ${_temp_conf_file_}
+    set_conf_value "STORAGE_ADMIN_${_count_}" ${_stor_admin_} ${_temp_conf_file_}
+    set_conf_value "STORAGE_GROUP_${_count_}" ${_stor_group_id_} ${_temp_conf_file_}
+    
+    if [ ! ${BACKUP} ];then
+        set_conf_value "STORAGE_PASS_${_count_}" ${_stor_pass_} ${_temp_conf_file_}
+    fi
+    
+    $RM -rf ${_disp_file_}
+    _count_=`expr $_count_ + 1`
+    # Unset _stor_pass_
+    unset _stor_pass_
+done
+
+else 
+    _err_msg_="Unable to retrieve Storage details file for ${SAN_DEVICE}."
+    abort_script "${_err_msg_}"
+
+fi
+
+log_msg -s "Storage details are saved successfully.\n" -l "${LOGFILE}"
+}
+
+
+### Function: save_sw_loc_path ###
+#
+# Save replacement info to replacement.conf
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+save_sw_loc_path()
+{
+log_msg -s "\nGetting the ENIQ Base SW and OM SW paths for replacement...\n" -l "${LOGFILE}"
+
+if [ ! "${CO_SERVER}" ];then
+    # Check if CO replacement conf is created
+    if [ -s ${REP_CO_CONF} ]; then
+         _base_sw_path_=`read_value REP_BASE_SW_LOC ${REP_CO_CONF}` || abort_script "${_base_sw_path_}" 
+        _om_sw_path_=`read_value REP_OM_SW_LOC ${REP_CO_CONF}` || abort_script "${_om_sw_path_}" 
+    fi
+fi
+
+if [ ! "${_base_sw_path_}" -o ! "${_om_sw_path_}" ]; then
+    # In case of replacement prereplacement ENIQ will be on same SW
+    if [ "${REPLACEMENT}" == "YES" ]; then
+        common_save_sw_rep_loc_path "$_temp_replace_conf_" "replacement" "curr"
+        if [ $? -ne 0 ]; then
+            _err_msg_="Unable to save required SW details."
+            abort_script "${_err_msg_}"
+        fi
+    fi
+    log_msg -s "ENIQ Base SW and OM SW locations are provided.\n" -l "${LOGFILE}"
+else
+    # Save SW location path info in migration conf file 
+    set_conf_value "REP_BASE_SW_LOC" ${_base_sw_path_} ${_temp_replace_conf_}
+    set_conf_value "REP_OM_SW_LOC" ${_om_sw_path_} ${_temp_replace_conf_}
+fi
+
+log_msg -s "ENIQ Base SW and OM SW locations successfully saved.\n" -l "${LOGFILE}"
+}
+
+
+### Function: setup_env ###
+#
+# Set up environment variables for script.
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+setup_env()
+{
+# Define root user's home
+ROOT_HOME=/root/
+
+# Setting the env HOME to /root for console run
+export HOME=/root
+VAR_DIR=/var
+
+# Configuration files
+FSTAB_FILE_LIST=fstab
+FSTAB=fstab
+ETC_DIR=/etc
+
+# ENIQ SSH Directory
+SSH_DIR=${ROOT_HOME}.ssh
+
+#ENIQ DCUSER Directory
+DCUSER=/eniq/home/dcuser
+
+#Unpack directory
+UNPACK_PATH=/var/tmp/upgrade
+
+# ENIQ Directories
+if [ ! "${ENIQ_BASE_DIR}" ]; then
+    # Directory on the root filesystem
+    ENIQ_BASE_DIR=/eniq
+fi
+
+ENIQ_INST_DIR=${ENIQ_BASE_DIR}/installation
+ENIQ_CORE_INST_DIR=${ENIQ_INST_DIR}/core_install
+ENIQ_LOG_DIR=${ENIQ_BASE_DIR}/local_logs
+ENIQ_CONF_DIR=${ENIQ_INST_DIR}/config
+DEPLOYMENT=/extra_params/deployment
+
+# ENIQ Admin Directory
+ENIQ_ADMIN_DIR=${ENIQ_BASE_DIR}/admin
+ENIQ_SENTINEL_DIR=${ENIQ_BASE_DIR}/sentinel
+ENIQ_BACKUP_DIR=${ENIQ_BASE_DIR}/backup
+
+# ENIQ Log Directory 
+LOG_DIR=${ENIQ_BASE_DIR}/log 
+SW_LOG_DIR=${LOG_DIR}/sw_log 
+
+# ENIQ SW conf directory
+ENIQ_SW_CONF_DIR=${ENIQ_BASE_DIR}/sw/conf
+
+# ENIQ Bkup SW dir 
+ENIQ_BKUP_SW_DIR=${ENIQ_BASE_DIR}/bkup_sw 
+ENIQ_BKUP_SW_BIN_DIR=${ENIQ_BKUP_SW_DIR}/bin 
+
+# Replacement Directories
+REPLACEMENT_CORE=`$DIRNAME ${SCRIPTHOME}`
+if [ "${ACTION_TYPE}" != "prereplacement" -a "${ACTION_TYPE}" != "prerecovery" ]; then
+    REPLACEMENT_CORE=${ENIQ_CORE_INST_DIR}
+fi
+
+REPLACEMENT_HOME=`$DIRNAME ${REPLACEMENT_CORE}`
+REPLACEMENT_BIN=${REPLACEMENT_CORE}/bin
+REPLACEMENT_LIB=${REPLACEMENT_CORE}/lib
+REPLACEMENT_ETC=${REPLACEMENT_CORE}/etc
+REPLACEMENT_LOGDIR=${REPLACEMENT_HOME}/log
+
+# ERICSSON Directory
+ERICSSON_DIR=/ericsson 
+ERICSSON_STOR_DIR=${ERICSSON_DIR}/storage
+ERICSSON_BIN_DIR=${ERICSSON_STOR_DIR}/bin
+ERICSSON_SAN_PLUGINS_DIR=${ERICSSON_STOR_DIR}/san/plugins
+
+# Source file containing the NAS password
+source_file=/ericsson/storage/etc/sourcefile
+
+# Navisphere bin directory
+NAVISPHERE=/opt/Navisphere/bin
+
+# Uemcli bin directory
+UEMCLI=/usr/bin/uemcli
+
+# ENIQ Crontab Directory
+CRONTABS_DIR=${VAR_DIR}/spool/cron/
+
+# ENIQ SMF location
+ENIQ_SMF_MANIFEST_LOC="${VAR_DIR}/svc/manifest/eniq/runtime"
+
+# Hostname Information
+HNAME=`${MYHOSTNAME}`
+HOST_IP=`${MYHOSTNAME} -i | $AWK '{print $1}'`
+
+# Source the common functions
+_common_functions_list_="common_functions.lib common_core_install_functions.lib common_migration_functions.lib"
+for lib_file in ${_common_functions_list_}; do
+    if [ -s ${REPLACEMENT_LIB}/${lib_file} ]; then
+        . ${REPLACEMENT_LIB}/${lib_file}
+    else
+        _err_msg_="File ${REPLACEMENT_LIB}/${lib_file} not found"
+        abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+    fi
+done
+
+# File to hold stage information
+STAGEFILE=${REPLACEMENT_ETC}/eniq_linux_rep_stage
+
+# Replacement status files
+REPL_PROGRESS=${VAR_DIR}/tmp/linux_${ACTION_TYPE}_in_progress
+REPL_SUCCESS=${VAR_DIR}/tmp/linux_${ACTION_TYPE}_success
+
+#Server host/ip temp list
+SERVER_IP_LIST="/tmp/server_ip_list"
+
+# Check config dir is present
+if [ ! -d "${ENIQ_CONF_DIR}" ]; then
+    _err_msg_="${ENIQ_CONF_DIR} is required for $ACTIVITY"
+    abort_script "${_err_msg_}"  "${EXEC_SHELL_CMD}"
+fi
+
+# Determine SAN Device type if raw
+if [ "${STORAGE_TYPE}" == "raw" ];then
+    SAN_DEVICE=`$CAT ${ENIQ_CONF_DIR}/san_details | $GREP "^SAN_DEVICE=" | $AWK -F\= '{print $2}'`
+    if [ ! "${SAN_DEVICE}" ]; then
+        _err_msg_="Could not read SAN_DEVICE type from ${ENIQ_CONF_DIR}/san_details."
+        abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+    fi
+fi
+
+# File containing the type of installation. Eg. events or statistics
+INST_TYPE_FILE=${ENIQ_CONF_DIR}/ericsson_use_config
+if [ ! -s "${INST_TYPE_FILE}" ]; then
+    _err_msg_="ENIQ install type not defined in ${INST_TYPE_FILE}"
+    abort_script "${_err_msg_}"  "${EXEC_SHELL_CMD}"
+fi
+# Read the installation type - should be "events" or "stats"
+INSTALL_TYPE=`$CAT ${INST_TYPE_FILE} | $AWK -F\= '{print $2}'`
+
+# Get current server type
+CURR_SERVER_TYPE=`$CAT ${ENIQ_CONF_DIR}/installed_server_type | $GREP -v  '^[[:blank:]]*#' | $SED -e 's/ //g'`
+if [ ! "${CURR_SERVER_TYPE}" ]; then
+    _err_msg_="Could not determine which server type this is"
+    abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+fi
+
+# Get CO server hostname
+SERVICE_NAME_FILE=${ENIQ_CONF_DIR}/service_names
+if [ ! -f "${SERVICE_NAME_FILE}" ]; then
+    _err_msg_="${SERVICE_NAME_FILE} not found on server."
+    abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+fi
+
+
+ _count_=`$CAT ${SERVICE_NAME_FILE}|$GREP "dwhdb$" |$GREP -o "::" | $WC -l`
+if [ "${_ip_type_}" == "IPv6" ] && [ "${_count_}" == 3 ]; then
+     CO_HOSTNAME=`$CAT ${SERVICE_NAME_FILE} | $GREP "dwhdb$" | $AWK -F"::" '{print $3}'`
+else
+     CO_HOSTNAME=`$CAT ${SERVICE_NAME_FILE} | $GREP "dwhdb$" | $AWK -F"::" '{print $2}'`
+fi
+
+# Replacement config file
+REPLACEMENT_CONF_FILE=replacement_${HNAME}.conf
+REPLACEMENT_CONF=${ENIQ_CONF_DIR}/${REPLACEMENT_CONF_FILE}
+
+# Check if server is coordinator type
+CO_SERVER=""
+if [ "${CURR_SERVER_TYPE}" == "stats_coordinator" -o "${CURR_SERVER_TYPE}" == "eniq_stats" ]; then 
+    CO_SERVER="YES"
+fi
+
+# Check if server is Reader type
+RD_SERVER=""
+if [ "${CURR_SERVER_TYPE}" == "stats_iqr" ]; then
+    RD_SERVER="YES"
+fi
+
+# Volume group backup directory
+VOLUME_GROUP_FOR_BACKUP=${CURR_SERVER_TYPE}_pool
+
+#BACKUP_DIR_NAME
+BACKUP_DIR=replacement_root_backup
+MOUNT_POINT_BKUP=/eniq/replacement
+MOUNT_BKP_LV=replacement_root_backup_BKP
+
+# Config files backup directory
+CONFIG_BACKUP_DIR=${ENIQ_CONF_DIR}/conf_bkup_replacement
+
+# Replacement SW backup directory
+REP_SW_DIR_NAME=replacement_sw
+REP_SW_BACKUP_DIR=${ENIQ_BACKUP_DIR}/${REP_SW_DIR_NAME}
+REP_CO_CONF=${REP_SW_BACKUP_DIR}/replacement_${CO_HOSTNAME}.conf
+
+REP_SW_TMP_DIR=/var/tmp/replacement_sw
+REPLACEMENT_TMP_CONF=${REP_SW_TMP_DIR}/replacement_${HNAME}.conf
+
+# Healthcheck files
+HEALTHCHECK_SCRIPT=${ENIQ_CORE_INST_DIR}/eniq_checks/bin/eniq_checks.bsh
+HEALTH_SUMMARY_DIR=${ENIQ_BASE_DIR}/log/precheck/summary
+
+# Configuration flags
+REPLACEMENT_CO=${VAR_DIR}/tmp/replacement_co
+
+# Get the System User/Group.
+SYS_USER=`iniget ENIQ_INSTALL_CONFIG -f ${ENIQ_CONF_DIR}/${SUNOS_INI} -v ENIQ_SYSUSER`
+
+
+#Fetch ip_type from ipmp.ini
+check_ip_type
+if [ ! "${_ip_type_}" ]; then
+            _err_msg_="Could not read parameter _ip_type_ from file ${ENIQ_CONF_DIR}/${IPMP_INI}"
+            abort_script "$_err_msg_"
+fi
+
+}
+
+
+### Function: set_next_stage ###
+#
+# Set up the stage to be run
+#
+# Arguments:
+#   $1 : Stage to be set to. Either numeric value or last stage of stagefile
+# Return Values:
+#   none
+set_next_stage()
+{
+# Do I have to reset stage
+if [ "${USER_STAGE}" -a "${NO_RESET_STAGE}" ]; then
+    return 0
+fi
+
+_stage_time_=`$DATE '+%Y-%b-%d_%H.%M.%S'`
+$ECHO "# Setting new stage at $_stage_time_" > ${STAGEFILE} | $TEE -a ${LOGFILE}
+$ECHO "${ENIQ_CORE_STAGES[$1]} " >> ${STAGEFILE} | $TEE -a ${LOGFILE}
+}
+
+
+### Function: show_server_info ###
+#
+#   Display current server info
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+show_server_info()
+{
+_system_config_=`/usr/sbin/dmidecode | grep -iw "Product Name" | $AWK -F ":" '{print $2}'`
+_system_release_=`cat /etc/os-release | grep -w PRETTY_NAME | cut -d '=' -f2 | awk -F \" '{print $2}'`
+
+log_msg -s "******* Current System Information *********" -l ${LOGFILE}
+log_msg -s "Hardware Detail:${_system_config_}" -l ${LOGFILE}
+log_msg -s "OS Version:${_system_release_}" -l ${LOGFILE}
+
+$ECHO "========================================================"
+}
+
+
+### Function: start_eniq_services ###
+#
+# Start all ENIQ services
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+start_eniq_services()
+{
+# Ensure NASd is online
+if [ "${STORAGE_TYPE}" == "raw" ]; then
+    check_and_manage_smf ${NASd_SMF_ID} enable
+fi
+
+# Ensure licensing service is online
+if [ "${CO_SERVER}" ];then
+    check_and_manage_smf ${SENTINEL_SMF_ID} enable
+fi
+
+# Enable all the ENIQ services
+log_msg -l ${LOGFILE} -s "Starting the ENIQ services on $HNAME. Please wait..."
+$BASH ${ENIQ_ADMIN_DIR}/bin/manage_eniq_services.bsh -a start -s ALL -N >> ${LOGFILE}
+if [ $? -ne 0 ]; then
+    _err_msg_="Failed to start ENIQ services."
+    abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+fi
+}
+
+
+### Function: stop_eniq_services ###
+#
+# Stop all ENIQ services
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+stop_eniq_services()
+{
+# Ensure NASd is online
+if [ "${STORAGE_TYPE}" == "raw" ]; then
+    check_and_manage_smf ${NASd_SMF_ID} enable
+fi
+
+# Disable all the ENIQ services
+log_msg -l ${LOGFILE} -s "Stopping the ENIQ services on $HNAME. Please wait..."
+$BASH ${ENIQ_ADMIN_DIR}/bin/manage_eniq_services.bsh -a stop -s ALL -N >> ${LOGFILE}
+if [ $? -ne 0 ]; then
+    _err_msg_="Failed to stop ENIQ services."
+    abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+fi
+}
+
+### Function: stop_smf_services ###
+#
+# Stop all SMF services
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+stop_smf_services()
+{
+
+if [ "${CO_SERVER}" ]; then
+# Get the SMF list to disable
+    smf_list="${SENTINEL_SMF_ID} ${DDC_SMF_ID} ${HOSTSYNC_SMF_ID}"
+else
+    smf_list="${DDC_SMF_ID} ${HOSTSYNC_SMF_ID}"
+
+fi
+# Disable NAS, hostsync, ddc services
+smf_list="${smf_list} ${NASd_SMF_ID}"
+
+for _smf_ in ${smf_list}; do
+    log_msg -l ${LOGFILE} -s "Disabling service ${_smf_}"
+    check_and_manage_smf ${_smf_} disable
+    if [ $? -ne 0 ]; then
+        _err_msg_="Failed to stop SMF service ${_smf_}."
+        abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+    fi
+done
+}
+
+### Function: update_ipmp_ini ###
+#
+#   Update ipmp.ini for replacement
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+update_ipmp_ini()
+{
+
+if [ -f /eniq/installation/config/replacement_${HNAME}.conf ]; then
+
+_pm_intf_name_=`$CAT /eniq/installation/config/replacement_${HNAME}.conf | $GREP "^PM_VLAN_INTF_NAME=" | $AWK -F\= '{print $2}'`
+if [ ! -z "${_pm_intf_name_}" ]; then
+      log_msg -s "\nUpdating Interface name" -l ${LOGFILE}
+      iniset IPMP_INTF_1 -f ${ENIQ_CONF_DIR}/${IPMP_INI}  IPMP_Group_Intf="${_pm_intf_name_}"
+      if [ $? -ne 0 ];then
+           _err_msg_="Failed to update the interface name in ${ENIQ_CONF_DIR}/${IPMP_INI} "
+           abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+      fi
+
+      log_msg -s "Successfully updated ${ENIQ_CONF_DIR}/${IPMP_INI} with available interfaces for PM Service VLAN." -l ${LOGFILE}
+else
+      _err_msg_="Not able to fetch PM VLAN interface details."
+      abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+fi
+
+
+ _storage_vlan_=`$CAT /eniq/installation/config/replacement_${HNAME}.conf | $GREP "^STORAGE_VLAN_CONFIRMATION=" | $AWK -F\= '{print $2}'` || abort_script "${_storage_vlan_}" "${EXEC_SHELL_CMD}"
+if [ "${_storage_vlan_}" == "YES" ];then
+# Update intf names
+    if [ "${SAN_DEVICE}" != "unityXT" ]; then
+        _storage_intf_name_=`$CAT /eniq/installation/config/replacement_${HNAME}.conf | $GREP "^STORAGE_VLAN_INTF_NAME=" | $AWK -F\= '{print $2}'`
+        _storage_intf_arp_ip_=`$CAT /eniq/installation/config/replacement_${HNAME}.conf | $GREP "^STOR_VLAN_ARP_IP=" | $AWK -F\= '{print $2}'`
+        if [ -z "${_storage_intf_name_}"  -o -z "${_storage_intf_arp_ip_}" ]; then
+            _err_msg_="Not able to fetch STORAGE VLAN interface details like ${_storage_intf_name_} or .${_storage_intf_arp_ip_}"
+            abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+        fi
+    else
+        _stor_vlan_id_=`$CAT /eniq/installation/config/replacement_${HNAME}.conf | $GREP "^STOR_VLAN_Group_ID=" | $AWK -F\= '{print $2}'`
+        if [ -z "${_stor_vlan_id_}" ]; then
+            _err_msg_="Not able to fetch STORAGE VLAN Id"
+            abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+        fi
+    fi
+
+    _storage_intf_ip_=`$CAT /eniq/installation/config/replacement_${HNAME}.conf | $GREP "^STORAGE_VLAN_IP=" | $AWK -F\= '{print $2}'`
+    _storage_intf_vlan_netmask_=`$CAT /eniq/installation/config/replacement_${HNAME}.conf | $GREP "^STORAGE_VLAN_Netmask=" | $AWK -F\= '{print $2}'`
+    _storage_intf_gw_=`$CAT /eniq/installation/config/replacement_${HNAME}.conf | $GREP "^STOR_VLAN_GATEWAY=" | $AWK -F\= '{print $2}'`
+    
+    _storage_NETMASK_=`$CAT /eniq/installation/config/replacement_${HNAME}.conf | $GREP "^STOR_NETMASK=" | $AWK -F\= '{print $2}'`    
+    if [ ! -z "${_storage_intf_ip_}" -o ! -z "${_storage_intf_vlan_netmask_}" -o ! -z "${_storage_intf_gw_}" -o ! -z "${_storage_NETMASK_}" ]; then
+        log_msg -s "\nUpdating Interface details" -l ${LOGFILE}
+        iniset IPMP_INTF_2 -f ${ENIQ_CONF_DIR}/${IPMP_INI}  BONDING_ENABLE="Y"
+        if [ $? -ne 0 ];then
+        _err_msg_="Failed to update the storage bond enable tag in ${ENIQ_CONF_DIR}/${IPMP_INI} "
+        abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+        fi  
+        if [ "${SAN_DEVICE}" == "unityXT" ]; then
+            iniset IPMP_INTF_2 -f ${ENIQ_CONF_DIR}/${IPMP_INI}  IPMP_Group_Intf=bond0
+            if [ $? -ne 0 ];then
+                _err_msg_="Failed to update the interface name in ${ENIQ_CONF_DIR}/${IPMP_INI} "
+                abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+            fi
+       else 
+           iniset IPMP_INTF_2 -f ${ENIQ_CONF_DIR}/${IPMP_INI}  IPMP_Group_Intf="${_storage_intf_name_}"
+            if [ $? -ne 0 ];then
+                _err_msg_="Failed to update the interface name in ${ENIQ_CONF_DIR}/${IPMP_INI} "
+                abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+            fi
+       fi
+        iniset IPMP_INTF_2 -f ${ENIQ_CONF_DIR}/${IPMP_INI}  IPMP_Group_IP="${_storage_intf_ip_}"
+        if [ $? -ne 0 ];then
+        _err_msg_="Failed to update the interface ip in ${ENIQ_CONF_DIR}/${IPMP_INI} "
+        abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+        fi
+        iniset IPMP_INTF_2 -f ${ENIQ_CONF_DIR}/${IPMP_INI}  IPMP_Group_Netmask="${_storage_intf_vlan_netmask_}"
+        if [ $? -ne 0 ];then
+        _err_msg_="Failed to update the vlan netmask in ${ENIQ_CONF_DIR}/${IPMP_INI} "
+        abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+        fi
+        iniset IPMP_INTF_2 -f ${ENIQ_CONF_DIR}/${IPMP_INI}  IPMP_Group_Gateway="${_storage_intf_gw_}"
+        if [ $? -ne 0 ];then
+        _err_msg_="Failed to update the storage gateway ip in ${ENIQ_CONF_DIR}/${IPMP_INI} "
+        abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+        fi
+        iniset IPMP_INTF_2 -f ${ENIQ_CONF_DIR}/${IPMP_INI}  ARP_IP_TARGET="${_storage_intf_arp_ip_}"
+        if [ $? -ne 0 ];then
+        _err_msg_="Failed to update the arp ip in ${ENIQ_CONF_DIR}/${IPMP_INI} "
+        abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+        fi
+        iniset IPMP_INTF_2 -f ${ENIQ_CONF_DIR}/${IPMP_INI}  IPMP_VLAN_Group_ID="${_stor_vlan_id_}"
+        if [ $? -ne 0 ];then
+            _err_msg_="Failed to update the Storage Vlan Id in ${ENIQ_CONF_DIR}/${IPMP_INI} "
+            abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+        fi
+        iniset STOR_NETMASK -f ${ENIQ_CONF_DIR}/${IPMP_INI}  NETMASKS="${_storage_NETMASK_}"
+        if [ $? -ne 0 ];then
+        _err_msg_="Failed to update the storage netmask in ${ENIQ_CONF_DIR}/${IPMP_INI} "
+        abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+        fi
+        log_msg -s "Successfully updated ${ENIQ_CONF_DIR}/${IPMP_INI} with available interfaces for Storage VLAN." -l ${LOGFILE}
+    else
+        _err_msg_="Not able to fetch STORAGE VLAN interface details."
+        abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+    fi
+else
+    iniset IPMP_INTF_2 -f ${ENIQ_CONF_DIR}/${IPMP_INI}  BONDING_ENABLE="N"
+    if [ $? -ne 0 ];then
+        _err_msg_="Failed to update the storage bond enable tag in ${ENIQ_CONF_DIR}/${IPMP_INI} "
+        abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+    fi
+fi
+_backup_vlan_=`$CAT /eniq/installation/config/replacement_${HNAME}.conf  | $GREP "^BACKUP_VLAN_CONFIRMATION=" | $AWK -F\= '{print $2}'` || abort_script "${_storage_vlan_}" "${EXEC_SHELL_CMD}"
+
+if [ "${_backup_vlan_}" == "YES" ];then
+
+
+    if [ "${SAN_DEVICE}" != "unityXT" ]; then
+        _backup_intf_name_=`$CAT /eniq/installation/config/replacement_${HNAME}.conf | $GREP "^BACKUP_VLAN_INTF_NAME=" | $AWK -F\= '{print $2}'` 
+        _backup_intf_arp_ip_=`$CAT /eniq/installation/config/replacement_${HNAME}.conf | $GREP "^BACKUP_VLAN_ARP_IP=" | $AWK -F\= '{print $2}'`
+         if [  -z "${_backup_intf_name_}" -o -z "${_backup_intf_arp_ip_}" ]; then
+            _err_msg_="Not able to fetch BACKUP VLAN interface name ${_backup_intf_name_} or ${_backup_intf_arp_ip_}"
+            abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+         fi
+    else
+        _bkup_vlan_id_=`$CAT /eniq/installation/config/replacement_${HNAME}.conf | $GREP "^BACKUP_VLAN_Group_ID=" | $AWK -F\= '{print $2}'`
+        if [  -z "${_bkup_vlan_id_}" ]; then
+            _err_msg_="Not able to fetch BACKUP VLAN Id "
+            abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+         fi
+    fi
+    
+    _backup_intf_ip_=`$CAT /eniq/installation/config/replacement_${HNAME}.conf | $GREP "^BACKUP_VLAN_IP=" | $AWK -F\= '{print $2}'`
+    _backup_intf_vlan_netmask_=`$CAT /eniq/installation/config/replacement_${HNAME}.conf | $GREP "^BACKUP_VLAN_Netmask=" | $AWK -F\= '{print $2}'`
+    _backup_intf_gw_=`$CAT /eniq/installation/config/replacement_${HNAME}.conf | $GREP "^BACKUP_VLAN_GATEWAY=" | $AWK -F\= '{print $2}'`
+    
+    _backup_NETMASK_=`$CAT /eniq/installation/config/replacement_${HNAME}.conf | $GREP "^BACKUP_NETMASK=" | $AWK -F\= '{print $2}'`    
+    if [  ! -z "${_backup_intf_ip_}" -o ! -z "${_backup_intf_vlan_netmask_}" -o ! -z "${_backup_intf_gw_}" -o ! -z "${_backup_NETMASK_}" ]; then
+        log_msg -s "\nUpdating backup Interface details" -l ${LOGFILE}
+        iniset IPMP_INTF_3 -f ${ENIQ_CONF_DIR}/${IPMP_INI}  BONDING_ENABLE="Y"
+        if [ $? -ne 0 ];then
+        _err_msg_="Failed to update the backup bond enable tag in ${ENIQ_CONF_DIR}/${IPMP_INI} "
+        abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+        fi  
+        if [ "${SAN_DEVICE}" == "unityXT" ]; then
+            iniset IPMP_INTF_3 -f ${ENIQ_CONF_DIR}/${IPMP_INI}  IPMP_Group_Intf=bond0
+            if [ $? -ne 0 ];then
+                _err_msg_="Failed to update the interface name in ${ENIQ_CONF_DIR}/${IPMP_INI} "
+                abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+            fi
+        else
+            iniset IPMP_INTF_3 -f ${ENIQ_CONF_DIR}/${IPMP_INI}  IPMP_Group_Intf="${_backup_intf_name_}"
+            if [ $? -ne 0 ];then
+                _err_msg_="Failed to update the interface name in ${ENIQ_CONF_DIR}/${IPMP_INI} "
+                abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+            fi
+        fi
+        iniset IPMP_INTF_3 -f ${ENIQ_CONF_DIR}/${IPMP_INI}  IPMP_Group_IP="${_backup_intf_ip_}"
+        if [ $? -ne 0 ];then
+        _err_msg_="Failed to update the interface ip in ${ENIQ_CONF_DIR}/${IPMP_INI} "
+        abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+        fi
+        iniset IPMP_INTF_3 -f ${ENIQ_CONF_DIR}/${IPMP_INI}  IPMP_Group_Netmask="${_backup_intf_vlan_netmask_}"
+        if [ $? -ne 0 ];then
+        _err_msg_="Failed to update the vlan netmask in ${ENIQ_CONF_DIR}/${IPMP_INI} "
+        abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+        fi
+        iniset IPMP_INTF_3 -f ${ENIQ_CONF_DIR}/${IPMP_INI}  IPMP_Group_Gateway="${_backup_intf_gw_}"
+        if [ $? -ne 0 ];then
+        _err_msg_="Failed to update the backup gateway ip in ${ENIQ_CONF_DIR}/${IPMP_INI} "
+        abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+        fi
+        iniset IPMP_INTF_3 -f ${ENIQ_CONF_DIR}/${IPMP_INI}  ARP_IP_TARGET="${_backup_intf_arp_ip_}"
+        if [ $? -ne 0 ];then
+        _err_msg_="Failed to update the arp ip in ${ENIQ_CONF_DIR}/${IPMP_INI} "
+        abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+        fi
+        iniset IPMP_INTF_3 -f ${ENIQ_CONF_DIR}/${IPMP_INI}  IPMP_VLAN_Group_ID="${_bkup_vlan_id_}"
+        if [ $? -ne 0 ];then
+            _err_msg_="Failed to update the backup Vlan Id in ${ENIQ_CONF_DIR}/${IPMP_INI} "
+            abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+        fi
+        iniset BKUP_NETMASK -f ${ENIQ_CONF_DIR}/${IPMP_INI}  NETMASKS="${_backup_NETMASK_}"
+        if [ $? -ne 0 ];then
+            _err_msg_="Failed to update the backup netmask in ${ENIQ_CONF_DIR}/${IPMP_INI} "
+            abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+        fi
+
+        log_msg -s "Successfully updated ${ENIQ_CONF_DIR}/${IPMP_INI} with available interfaces for Backup VLAN." -l ${LOGFILE}
+    else
+        _err_msg_="Not able to fetch BACKUP VLAN interface name "
+        abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+    fi
+else
+    iniset IPMP_INTF_3 -f ${ENIQ_CONF_DIR}/${IPMP_INI}  BONDING_ENABLE="N"
+    if [ $? -ne 0 ];then
+        _err_msg_="Failed to update the backup bond enable tag in ${ENIQ_CONF_DIR}/${IPMP_INI} "
+        abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+    fi
+fi
+    
+fi
+}
+
+### Function: update_stor_ini ###
+#   
+#   Updates the storage.ini in NAS and local
+#   config directory during prerecovery
+#
+# Arguments:
+#   None
+# Return Values:
+#   None
+update_stor_ini()
+{
+if [ ! -f "${ENIQ_CONF_DIR}/${STORAGE_INI}" ];then
+    _err_msg_="${ENIQ_CONF_DIR}/${STORAGE_INI} file not found during ${ACTION_TYPE}."
+    abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+fi
+
+if [ ! -f "${CONFIG_BACKUP_DIR}/${STORAGE_INI}" ];then
+    _err_msg_="${CONFIG_BACKUP_DIR}/${STORAGE_INI} file not found during ${ACTION_TYPE}."
+    abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+fi
+
+# Look for any difference in fs entries
+$DIFF ${ENIQ_CONF_DIR}/${STORAGE_INI} ${CONFIG_BACKUP_DIR}/${STORAGE_INI} >>/dev/null 2>&1
+if [ $? -ne 0 ];then
+    # Disable hostsync to stop syncing of storage.ini
+    $SYSTEMCTL show ${HOSTSYNC_SMF_ID} -p ActiveState | $AWK -F= '{print $2}' | $GREP -w active >> /dev/null 2>&1
+    if [ $? -eq 0 ];then
+        log_msg -s "\n${HOSTSYNC_SMF_ID} exists. Disabling it." -l ${LOGFILE}
+        check_and_manage_smf ${HOSTSYNC_SMF_ID} disable
+    fi
+
+    # Taking backup of current config storage.ini file
+    log_msg -s "\nTaking backup of latest ${ENIQ_CONF_DIR}/${STORAGE_INI} file." -l ${LOGFILE}
+    $CP -p ${ENIQ_CONF_DIR}/${STORAGE_INI} ${ENIQ_CONF_DIR}/backup/${STORAGE_INI}_`$DATE '+%Y-%b-%d_%H.%M.%S'`
+    if [ $? -ne 0 ];then
+        _err_msg_="Unable to take backup of ${ENIQ_CONF_DIR}/${STORAGE_INI}"
+        abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+    fi
+    # Copy older release storage.ini file in sw conf if difference found
+    if [ -f ${ENIQ_SW_CONF_DIR}/${STORAGE_INI} ]; then
+        $DIFF ${ENIQ_SW_CONF_DIR}/${STORAGE_INI} ${CONFIG_BACKUP_DIR}/${STORAGE_INI} >>/dev/null 2>&1
+        if [ $? -ne 0 ]; then
+            log_msg -s "\nCopying older release ${STORAGE_INI} to ${ENIQ_SW_CONF_DIR}" -l ${LOGFILE}
+            $CP ${CONFIG_BACKUP_DIR}/${STORAGE_INI} ${ENIQ_SW_CONF_DIR}/${STORAGE_INI}
+            if [ $? -ne 0 ];then
+                _err_msg_="Unable to copy ${CONFIG_BACKUP_DIR}/${STORAGE_INI} file to ${ENIQ_SW_CONF_DIR} directory."
+                abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+            fi
+        fi
+    fi
+
+    # Copy older release storage.ini file
+    log_msg -s "\nCopying backed up ${CONFIG_BACKUP_DIR}/${STORAGE_INI} to ${ENIQ_CONF_DIR}" -l ${LOGFILE}
+    $CP ${CONFIG_BACKUP_DIR}/${STORAGE_INI} ${ENIQ_CONF_DIR}/${STORAGE_INI}
+    if [ $? -ne 0 ];then
+        _err_msg_="Unable to copy old ${STORAGE_INI} file to ${ENIQ_CONF_DIR} directory."
+        abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+    fi
+else
+    log_msg -s "\nNO update required in ${STORAGE_INI} under ${ENIQ_CONF_DIR}." -l ${LOGFILE}
+fi
+}
+
+
+### Function: user_confirm ###
+#
+#   Take user confirmation
+#
+# Arguments:
+#   $1 : User display message
+# Return Values:
+#   User response : YES/NO
+user_confirm()
+{
+_usr_msg_="\n\nDo you want to proceed? (Yy/Nn)"
+unset _response_
+
+while [ 1 ]
+do
+    $ECHO ${_usr_msg_}
+    read ans
+
+    case $ans in
+      Y|y|YES|Yes|yes) _response_="YES"
+                       break
+                       ;;
+      N|n|NO|No|no) _response_="NO"
+                    break
+                    ;;
+      *) $ECHO "Invalid input. Enter again."
+         ;;
+    esac
+done
+
+}
+
+
+### Function: usage_msg ###
+#
+#   Print out the usage message
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+usage_msg()
+{
+clear
+$ECHO "
+Usage: 
+
+`$BASENAME $0` -a <migration action> 
+
+Optional: [-R] [ -l <path_to_logfile> ] 
+
+-a  : Mandatory parameter specifying the replacement action type. Should be either of the following:
+      prereplacement : To backup the necessary files.
+      replacement    : To replace the system.
+      prerecovery  : To prepare the system for recovery.
+      rep-recovery     : To recover the system during/after replacement
+      post-replacement :To check all the configuration
+      cleanup      : To clear leftovers of replacement/recovery [Commit step]
+
+-R  : Parameter specifying the type of migration on blade servers. If specified, 
+      the migration will be treated as blade replacement.
+
+-l  : Optional parameter specifying the full path to logfile. If not specified, a
+      logfile will be created in /eniq/local_logs/replacement
+
+"
+}
+
+
+### Function: clear ### 
+#
+# To clear the screen
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+clear()
+{
+
+# Clearing the screen without removing scrollback buffer
+$PRINTF '\33[H\33[2J'
+
+}
+
+### Function: clear_data ###
+#
+#   Clear replacement/recovery backup 
+#   Files/Directories and Flags from server
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+clear_data()
+{
+log_msg -s "\nChecking for unnecessary files/directories to be cleaned up.\n" -l ${LOGFILE}
+
+_flag_list_=`$LS -1 ${VAR_DIR}/tmp/linux_*_success 2>/dev/null`
+if [ "${ACTION_TYPE}" != "cleanup" ]; then
+    _flag_list_="${_flag_list_} `$LS -1 ${VAR_DIR}/tmp/linux_*_progress 2>/dev/null`"
+fi
+
+# Remove flag files
+if [ "${_flag_list_}" ]; then
+    log_msg -s "\nRemoving flags used for replacement." -l ${LOGFILE}
+    for _flag_ in ${_flag_list_}; do
+        $RM -rf ${_flag_} >> /dev/null 2>&1
+        if [ ! -f "${_flag_}" ]; then
+             log_msg -s "Successfully removed ${_flag_} file." -l ${LOGFILE}
+        fi
+    done
+fi
+
+# Directories to be removed
+_remove_list_="${CONFIG_BACKUP_DIR} ${REP_SW_TMP_DIR}"
+for _dirname_ in ${_remove_list_}; do
+    if [ -d ${_dirname_} ]; then
+        if [ "${ACTION_TYPE}" == "cleanup" ]; then
+            log_msg -s "\nRemoving directory ${_dirname_} used for replacement." -l ${LOGFILE}
+            $RM -rf ${_dirname_} >> /dev/null 2>&1
+            if [ ! -d "${_dirname_}" ]; then
+                log_msg -s "Successfully removed ${_dirname_} directory." -l ${LOGFILE}
+            fi
+        fi
+    fi
+done
+
+# Cleaning up configuration file
+if [ -f ${REPLACEMENT_CONF} ]; then
+    log_msg -s "\nRemoving replacement config file used for replacement." -l ${LOGFILE}
+    $RM -rf ${REPLACEMENT_CONF} >> /dev/null 2>&1
+    if [ ! -f "${REPLACEMENT_CONF}" ]; then
+        log_msg -s "Successfully removed ${REPLACEMENT_CONF} file." -l ${LOGFILE}
+    fi
+fi
+if [ -f ${REPLACEMENT_CONF}_bkp ]; then
+    log_msg -s "\nRemoving replacement backup config file used for replacement." -l ${LOGFILE}
+    $RM -rf ${REPLACEMENT_CONF}_bkp >> /dev/null 2>&1
+    if [ ! -f "${REPLACEMENT_CONF}_bkp" ]; then
+        log_msg -s "Successfully removed ${REPLACEMENT_CONF}_bkp file." -l ${LOGFILE}
+    fi
+fi
+if [ -f /var/tmp/continue_replacement/replacement_input.conf ]; then
+    log_msg -s "\nRemoving replacement_input.conf file used for replacement." -l ${LOGFILE}
+    $RM -rf /var/tmp/continue_replacement/replacement_input.conf >> /dev/null 2>&1
+    if [ ! -f /var/tmp/continue_replacement/replacement_input.conf ]; then
+        log_msg -s "Successfully removed replacement_input.conf file." -l ${LOGFILE}
+    fi
+fi
+
+# Remove ipmp.ini backup file
+if [ -f "${ENIQ_CONF_DIR}/${IPMP_INI}.recovery" ];then
+    log_msg -s "\nRemoving ${ENIQ_CONF_DIR}/${IPMP_INI}.recovery used for replacement." -l ${LOGFILE}
+    $RM -rf ${ENIQ_CONF_DIR}/${IPMP_INI}.recovery >> /dev/null 2>&1
+    if [ ! -f "${ENIQ_CONF_DIR}/${IPMP_INI}.recovery" ]; then
+        log_msg -s "Successfully removed ${ENIQ_CONF_DIR}/${IPMP_INI}.recovery file." -l ${LOGFILE}
+    else
+        log_msg -s "Remove ${ENIQ_CONF_DIR}/${IPMP_INI}.recovery file manually." -l ${LOGFILE}
+    fi
+fi
+
+# Destroy LV backup dir 
+_rep_bkup_dir_="${BACKUP_DIR}"_replaced
+$LVS | $GREP -w ${_rep_bkup_dir_} >> /dev/null 2>&1
+if [ $? -eq 0 ];then
+    $DF -hk ${MOUNT_POINT_BKUP} | $GREP -w replacement >> /dev/null 2>&1
+    if [ $? -eq 0 ];then
+        cd /
+        $UMOUNT -l ${MOUNT_POINT_BKUP} >> /dev/null 2>&1
+        if [ $? -ne 0 ];then
+            _err_msg_="Could not unmount ${MOUNT_POINT_BKUP}."
+            abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+        fi
+    fi
+    log_msg -s "${_rep_bkup_dir_} exists. Destroying." -l ${LOGFILE}
+    $LVREMOVE -f /dev/mapper/${VOLUME_GROUP_FOR_BACKUP}-${_rep_bkup_dir_}
+    if [ $? -ne 0 ];then
+        _err_msg_="Could not destroy ${_rep_bkup_dir_}."
+        abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+    fi
+    log_msg -s "Successfully removed LV directory ${_rep_bkup_dir_}\n" -l ${LOGFILE}
+fi
+
+#Remove the unpacked sw
+if [ -d "${UNPACK_PATH}" ];then
+    log_msg -s "\nRemoving "${UNPACK_PATH}" directory." -l ${LOGFILE}
+    $RM -rf "${UNPACK_PATH}" >> /dev/null 2>&1
+    if [ -d "${UNPACK_PATH}" ];then 
+        _err_msg_="Failed to remove ${UNPACK_PATH} directory." -l ${LOGFILE}
+        abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+    else
+        log_msg -s "Successfully removed "${UNPACK_PATH}" "-l ${LOGFILE}
+    fi
+fi
+}
+
+### Function: cleanup_replacement ###
+#
+#   Cleanup Replacement flags
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+cleanup_replacement()
+{
+insert_header_footer head "Entering Linux ${ACTION_TYPE} stage - ${NEXT_STAGE}" ${LOGFILE}
+
+if [ "${SAN_DEVICE}" == "unityXT" ]; then
+    if [ -f /var/tmp/intf_info.txt ]; then
+		_intf_info_var_=`$CAT /var/tmp/intf_info.txt`
+		$NMCLI connection delete $_intf_info_var_
+		$SYSTEMCTL restart network
+    else 
+		_err_msg_="interface info file does not exist"
+		abort_script "$_err_msg_"
+    fi
+fi
+$RM -rf /var/tmp/intf_info.txt
+
+log_msg -s "Cleaning up temporary directory used for replacement." -l ${LOGFILE}
+$RM -rf ${TEM_DIR} >> /dev/null 2>&1
+
+insert_header_footer foot "Successfully completed - ${NEXT_STAGE}" ${LOGFILE}
+}
+
+
+### Function: cleanup_prereplacement ###
+#
+#   Cleanup prereplacement data
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+cleanup_prereplacement()
+{
+insert_header_footer head "Entering Linux ${ACTION_TYPE} stage - ${NEXT_STAGE}" ${LOGFILE}
+
+#Taking backup and removing the ENIQ filesytem entry from /etc/fstab
+if [ ! "${BACKUP}" ]; then
+    if [ ! -f /etc/fstab  ]; then
+        _err_msg_="Could not find /etc/fstab file"
+        abort_script "${_err_msg_}"
+    else
+        $MV /etc/fstab /etc/fstab_backup
+        $CAT /etc/fstab_backup | $GREP -v "${VOLUME_GROUP_FOR_BACKUP}" >> ${TEM_DIR}/fstab
+        $CP ${TEM_DIR}/fstab /etc/fstab
+    fi
+fi
+
+log_msg -s "Cleaning up temporary directories used for prereplacement." -l ${LOGFILE}
+$RM -rf ${TEM_DIR} >> /dev/null 2>&1
+
+# If CO is not pre-replaced, remove stage file
+if [ ! -f ${REPLACEMENT_CO} ]; then
+    log_msg -s "Cleaning up temporary files used for replacement." -l ${LOGFILE}
+    $RM -rf ${STAGEFILE} >> /dev/null 2>&1
+    $RM -rf ${_selected_servers_} >> /dev/null 2>&1
+fi
+
+log_msg -s "Cleaning up flag ${REPLACEMENT_CO} used for prereplacement." -l ${LOGFILE}
+$RM -rf ${REPLACEMENT_CO} >> /dev/null 2>&1
+
+log_msg -s "Cleaning up flag ${REPL_PROGRESS} used for prereplacement." -l ${LOGFILE}
+$RM -rf ${REPL_PROGRESS} >> /dev/null 2>&1
+
+if [ ! ${BACKUP} ]; then
+    $TOUCH ${REPL_SUCCESS}
+fi
+
+insert_header_footer foot "Successfully completed - ${NEXT_STAGE}" ${LOGFILE}
+}
+
+
+### Function: recovery_cleanup ###
+#
+#   Cleanup recovery temporary files/dirs
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+recovery_cleanup()
+{
+insert_header_footer head "Entering Linux ${ACTION_TYPE} stage - ${NEXT_STAGE}" ${LOGFILE}
+
+log_msg -s "Cleaning up temporary directory used for recovery." -l ${LOGFILE}
+$RM -rf ${TEM_DIR}
+
+log_msg -s "Cleaning up flag ${REPL_PROGRESS} used for recovery." -l ${LOGFILE}
+$RM -rf ${REPL_PROGRESS}
+
+$TOUCH ${REPL_SUCCESS}
+
+log_msg -s "Cleaning up ${ENIQ_CONF_DIR}/${IPMP_INI}.recovery used for recovery." -l ${LOGFILE}
+$RM -rf ${ENIQ_CONF_DIR}/${IPMP_INI}.recovery
+
+insert_header_footer foot "Successfully completed - ${NEXT_STAGE}" ${LOGFILE}
+}
+
+
+# ********************************************************************
+#
+#   Main body of program
+#
+# ********************************************************************
+
+RUN_TIME=`$DATE '+%Y-%b-%d_%H:%M:%S'`
+
+
+
+# Check that the effective id of the user is root
+check_id
+
+
+while getopts ":a:b:d:Il:NBnCo:s:" arg; do
+  case $arg in
+    a) ACTION_TYPE="$OPTARG"
+       ;;
+    b) ENIQ_BASE_DIR="$OPTARG"
+       ;;
+    d) BASE_SW_DIR="$OPTARG"
+       ;;
+    I) INITIATE="YES"
+       ;;
+    l) LOGFILE="$OPTARG"
+       ;;
+    N) NO_CONFIRM="YES"
+       ;;
+    n) NO_RESET_STAGE="YES"
+       ;;
+    o) OM_SW_DIR="$OPTARG"
+       ;;
+    C) CONTINUE="YES"
+       ;;
+    s) USER_STAGE="$OPTARG"
+       ;;
+    B) BACKUP="YES"
+       ;;
+   \?) _err_msg_="`$BASENAME $0` -s <stage>"
+       abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+       ;;
+  esac
+done
+shift `expr $OPTIND - 1`
+
+if [ "${ACTION_TYPE}" == "prereplacement" ]; then
+    REPLACEMENT="YES"
+fi
+
+# Check Input Params
+check_params
+
+# Check hardware
+if [ -f /eniq/installation/config/san_details ];then
+    STORAGE_TYPE=`$CAT /eniq/installation/config/san_details | $GREP -w STORAGE_TYPE | $CUT -d '=' -f2`
+    if [ "${STORAGE_TYPE}" != "raw" -a "${STORAGE_TYPE}" != "fs" ];then
+        _err_msg_="\nHardware type is not supported for Linux Blade Replacement."
+        abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+    fi
+else
+    _err_msg_="Could not find the file to get hardware type."
+    abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+fi
+
+# Determine absolute path to software
+check_absolute_path
+
+
+# Set up environment variables for script.
+setup_env
+
+# Get BASE SW and OM SW directory
+if [ "${ACTION_TYPE}" != "prereplacement" -a "${ACTION_TYPE}" != "cleanup" -a "${ACTION_TYPE}" != "prerecovery" -a "${ACTION_TYPE}" != "post-replacement" ];then
+    if [ ! ${BASE_SW_DIR} -o ! ${OM_SW_DIR} ];then
+        BASE_SW_DIR=`read_value ${_base_sw_param_} ${REPLACEMENT_CONF}` || abort_script "${BASE_SW_DIR}" "${EXEC_SHELL_CMD}"
+        OM_SW_DIR=`read_value ${_om_sw_param_} ${REPLACEMENT_CONF}` || abort_script "${OM_SW_DIR}" "${EXEC_SHELL_CMD}"
+    fi
+fi
+
+# Log file
+if [ ! "${LOGFILE}" ]; then
+    $MKDIR -p ${ENIQ_LOG_DIR}/replacement
+    LOGFILE="${ENIQ_LOG_DIR}/replacement/eniq_linux_${ACTION_TYPE}_`$DATE '+%Y-%b-%d'`.log"
+fi
+
+# Create a temporary Directory
+TEM_DIR=/tmp/linux_replacement.$$.$$
+$RM -rf ${TEM_DIR}
+$MKDIR -p ${TEM_DIR}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not create directory $TEM_DIR"
+    abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+fi
+
+if [ "${ACTION_TYPE}" == "replacement" ];then
+
+$DF -hk ${MOUNT_POINT_BKUP} | $GREP -w replacement >> /dev/null 2>&1
+if [ $? -ne 0 ];then
+    log_msg -s "Mounting /dev/mapper/${VOLUME_GROUP_FOR_BACKUP}-${BACKUP_DIR} to ${MOUNT_POINT_BKUP}" -l ${LOGFILE}
+    $MOUNT /dev/mapper/${VOLUME_GROUP_FOR_BACKUP}-${BACKUP_DIR} ${MOUNT_POINT_BKUP} >> /dev/null 2>&1
+    if [ $? -ne 0 ]; then
+        _err_msg_="Unable to Mount /dev/mapper/${VOLUME_GROUP_FOR_BACKUP}-${BACKUP_DIR} on ${MOUNT_POINT_BKUP}"
+        abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+    fi
+fi
+
+fi
+
+if [[ ${BACKUP} ]] && [[ ${USER_STAGE} == "get_replacement_data" ]];then
+    if [ -f "${REPLACEMENT_CONF}" ];then
+        $MV "${REPLACEMENT_CONF}" "${REPLACEMENT_CONF}"_bkp
+    fi
+fi
+
+# Call function if cleanup is called
+if [ "${ACTION_TYPE}" == "cleanup" ]; then
+    # Check if any activity is ongoing
+    _flag_list_=`$LS -1 ${VAR_DIR}/tmp/linux_*_progress 2>/dev/null`
+    if [ "${_flag_list_}" ]; then
+        _err_msg_="Replacement Activity is in progress. Can not run \"cleanup\" now."
+        log_msg -s "Progress files detected: " -l ${LOGFILE}
+        for _flag_ in ${_flag_list_}; do
+            log_msg -s "`$BASENAME ${_flag_}`" -l ${LOGFILE}
+        done
+        abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+    fi
+
+    log_msg -h -l ${LOGFILE} -s "Starting ${ACTION_TYPE} activity."
+
+    clear_data
+
+    log_msg -h -l ${LOGFILE} -t -s "Successfully completed ${ACTIVITY}."
+    $RM -rf ${TEM_DIR}
+	
+	#Logging Eniq Activity
+    REP_DATE=`$DATE '+%Y-%m-%d %H:%M:%S'`
+    $ECHO "ENIQ ACTIVITY INFO=HW_Replacement;${REP_DATE};Replacement done on ${CURR_SERVER_TYPE}" | $TEE -a ${ENIQ_LOG_DIR}/eniq_activity_history.log >> ${LOGFILE}
+    _rep_status_=$?
+    if [ "${_rep_status_}" -ne 0 ]; then
+        _err_msg_="Failed to update Eniq Activity log file\n"
+        abort_script "$_err_msg_"
+    else
+       $ECHO "Successfully logged Eniq Activity"
+    fi
+
+    exit 0
+fi
+
+#Run Post replacement stage
+# Call function if post_replacement is called
+if [ "${ACTION_TYPE}" == "post-replacement" ]; then
+    post_replacement
+    log_msg -h -l ${LOGFILE} -t -s "Successfully completed ${ACTIVITY} on $HNAME"
+    exit 0
+fi
+
+
+# Call function if prerecovery is called
+if [ "${ACTION_TYPE}" == "prerecovery" ]; then
+    run_prerecovery
+    log_msg -h -l ${LOGFILE} -t -s "Successfully completed ${ACTIVITY} on $HNAME"
+    exit 0
+fi
+
+# Check if replacement action has been re-initialised
+if [ "${INITIATE}" ]; then
+    log_msg -h -l ${LOGFILE} -s "Starting over ${ACTION_TYPE} activity."
+    $RM -rf ${REPL_PROGRESS} ${REPL_SUCCESS}
+    start_eniq_services
+fi
+
+# Show system info in ACTIVITY and ask confirmation for the first time
+if [ ! -f "${REPL_PROGRESS}" -a ! -f "${REPL_SUCCESS}" ];then
+    log_msg -h -l ${LOGFILE} -s "Starting ${ACTION_TYPE} activity."
+    $RM -rf ${STAGEFILE}
+
+    # Creating progress flag file
+    $TOUCH ${REPL_PROGRESS}
+    show_server_info
+    if [ ! "${NO_CONFIRM}" ];then
+        $ECHO "\nINFO: You are about to start ${ACTIVITY}."
+        user_confirm
+        if [ "${_response_}" != "YES" ];then
+            $RM -rf ${TEM_DIR} >> /dev/null 2>&1
+            $RM -rf ${REPL_PROGRESS} >> /dev/null 2>&1
+            log_msg -s "\nExiting from script as user selected NOT to proceed." -l ${LOGFILE}
+            exit 0
+        fi
+    fi
+fi
+
+
+
+# Determine the server list on CO
+if [ "${ACTION_TYPE}" == "prereplacement" ]; then
+    if [[ ! ${BACKUP} ]] && [[ "${CO_SERVER}" ]]; then
+        # Determine the server list to run prereplacement
+        get_server_list
+    fi
+fi
+
+log_msg -h -l ${LOGFILE} -t -s "Entering $ACTIVITY."
+
+# Create a stage array
+core_install_build_stage_array ${LOGFILE} ${TEM_DIR} eniq_linux ${ACTION_TYPE} ${REPLACEMENT_CORE}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not build a stage array for ${ACTION_TYPE}"
+    abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+fi
+
+# If stage specified, make sure it is in the stage list for this server type
+if [ "$USER_STAGE" ]; then
+    core_install_check_user_stage ${LOGFILE} ${TEM_DIR} ${USER_STAGE}
+    if [ $? -ne 0 ]; then
+       _err_msg_="The specified stage ${USER_STAGE} is not in the stage list for ${ACTION_TYPE}"
+       abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+    fi
+fi
+
+if [ "$USER_STAGE" ]; then
+    NEXT_STAGE="${USER_STAGE}"
+    # Get the element number so we can move along the array
+    get_array_element
+else
+    get_next_stage
+fi
+
+
+# If we read last stage from the stagefile
+if [ "$NEXT_STAGE" == "${STOP_STAGE}" ]; then
+    # We exit unless the user specified that the stage be run again
+    if [ ! "$USER_STAGE" ]; then
+        _completion_date_=""
+        _completion_date_=`$LS -l ${VAR_DIR}/tmp/linux_${ACTION_TYPE}_success | \
+                           $AWK '{print " on " $6, $7, "at " $8}' 2> /dev/null`
+        log_msg -s "\nAll Stages of ${ACTION_TYPE} are already completed${_completion_date_}." -l ${LOGFILE}
+        exit 0
+    fi
+fi
+
+# Check if stop stage is defined
+if [ -s ${ENIQ_CONF_DIR}/extra_params/stop_stage ]; then
+    _stop_stage_=`$CAT ${ENIQ_CONF_DIR}/extra_params/stop_stage`
+    $ECHO ${ENIQ_CORE_STAGES[*]} | $GREP -w ${_stop_stage_} >> /dev/null 2>&1
+    if [ $? -eq 0 ]; then
+        log_msg -s "Linux Blade Replacement Procedure will stop at stage ${_stop_stage_}" -l ${LOGFILE}
+    else
+        log_msg -s "User defined stop stage - ${_stop_stage_} not valid.....Ignoring" -l ${LOGFILE}
+        unset _stop_stage_
+        $RM -f ${ENIQ_CONF_DIR}/extra_params/stop_stage
+    fi
+fi
+
+
+# Loop through the stages from stage list 
+while :; do
+    _nxt_stage_="${NEXT_STAGE}"
+    $_nxt_stage_
+    if [ $? -ne 0 ]; then
+        _err_msg_="Error in Stage ${NEXT_STAGE}"
+        abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+    fi
+
+    # Exit if the user specified to run a specific stage only
+    if [ "$USER_STAGE" ]; then
+        break
+    fi
+
+    # If we read ${STOP_STAGE} from the stagefile
+    if [ "$NEXT_STAGE" == "${STOP_STAGE}" ]; then
+        break
+    fi
+
+    get_next_stage
+done
+
+log_msg -h -l ${LOGFILE} -t -s "Successfully completed $ACTIVITY. Logfile: ${LOGFILE}" 
+
+$RM -rf ${TEM_DIR}
+
+exit 0
+

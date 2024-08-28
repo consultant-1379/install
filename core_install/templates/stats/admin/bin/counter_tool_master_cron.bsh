@@ -1,0 +1,75 @@
+#!/bin/bash
+# ********************************************************************
+# Ericsson Radio Systems AB                                     SCRIPT
+# ********************************************************************
+#
+#
+# (c) Ericsson Radio Systems AB 2021 - All rights reserved.
+#
+# The copyright to the computer program(s) herein is the property
+# of Ericsson Radio Systems AB, Sweden. The programs may be used
+# and/or copied only with the written permission from Ericsson Radio
+# Systems AB or in accordance with the terms and conditions stipulated
+# in the agreement/contract under which the program(s) have been
+# supplied.
+#
+# ********************************************************************
+# Name    : counter_tool_master_cron.bsh
+# Date    : 05/02/2021
+# Revision: main\01
+# Purpose : Master cron to perform counter tool operations
+# Usage   : counter_tool_master_cron.bsh
+#
+# ********************************************************************
+#
+#     Command Section
+#
+# ********************************************************************
+BASH=/usr/bin/bash
+DATE=/usr/bin/date
+
+### Function: usage_msg ###
+#
+#   Print out the usage message
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+usage_msg()
+{
+clear
+$ECHO "
+Usage: /usr/bin/bash `$BASENAME $0`"
+}
+
+# ********************************************************************
+#
+#   Main body of program
+#
+# ********************************************************************
+_hour_=`$DATE '+%H:%M'`
+
+ENIQ_ADMIN_BIN=/eniq/admin/bin
+COUNTER_TOOL_PARENT_DIR=/eniq/log/sw_log/iq/CounterTool
+
+# Trigger parsing level 1 and parsing level 2 every hour
+$BASH ${ENIQ_ADMIN_BIN}/counter_statistics_tool.bsh -a parse_levels &
+
+# Trigger aggregation at 1:30 a.m. 
+if [ "${_hour_}" == "01:00" ]; then
+    sleep 30m
+    $BASH ${ENIQ_ADMIN_BIN}/counter_statistics_tool.bsh -a aggregation &
+fi 
+
+# Trigger cleanup at 2 a.m.
+if [ "${_hour_}" == "02:00" ]; then
+    $BASH ${ENIQ_ADMIN_BIN}/counter_statistics_tool.bsh -a cleanup &
+fi 
+
+# Trigger re-aggregation at 2:00 p.m.
+if [ "${_hour_}" == "14:00" ]; then
+    if [ -f ${COUNTER_TOOL_PARENT_DIR}/.failed_aggregation_flag.txt ]; then
+        $BASH ${ENIQ_ADMIN_BIN}/counter_statistics_tool.bsh -a aggregation &
+    fi
+fi 

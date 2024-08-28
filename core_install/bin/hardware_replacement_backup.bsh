@@ -1,0 +1,348 @@
+#!/bin/bash
+# ********************************************************************
+# Ericsson Radio Systems AB                                   SCRIPT
+# ********************************************************************
+#(c) Ericsson Radio Systems AB 2022 - All rights reserved.
+#
+# The copyright to the computer program(s) herein is the property
+# of Ericsson Radio Systems AB, Sweden. The programs may be used
+# and/or copied only with the written permission from Ericsson Radio
+# Systems AB or in accordance with the terms and conditions stipulated
+# in the agreement/contract under which the program(s) have been
+# supplied.
+#
+######################################################################
+# Name    : hardware_replacement_backup.bsh
+# Date    : 05/10/2023
+# Revision: /Statistics_23.4/4
+# Purpose : This script will take the backup of ENIQ required in 
+#           faulty hardware replacement.
+# Usage   : hardware_replacement_backup.bsh 
+#
+# ********************************************************************
+#
+#   Command Section
+#
+# ********************************************************************
+AWK=/usr/bin/awk
+BASH=/usr/bin/bash
+CAT=/usr/bin/cat
+CD=/usr/bin/cd
+DATE=/usr/bin/date
+ECHO='/usr/bin/echo -e'
+EGREP=/usr/bin/egrep
+ENV=/usr/bin/env
+GREP=/usr/bin/grep
+ID=/usr/bin/id
+MKDIR=/usr/bin/mkdir
+RM=/usr/bin/rm
+SED=/usr/bin/sed
+SUDO=/usr/bin/sudo
+TEE=/usr/bin/tee
+TOUCH=/usr/bin/touch
+YES=/usr/bin/yes
+
+# ********************************************************************
+#
+#       Configuration Section
+#
+# ********************************************************************
+
+# Default user
+# DEFAULT_USER=root
+
+# Installation directory 
+ENIQ_CORE_INST_DIR="/eniq/installation/core_install/"
+
+# ENIQ Core Installation Bin
+ENIQ_INST_BIN_DIR="${ENIQ_CORE_INST_DIR}/bin"
+
+# ENIQ Core Installation etc
+ENIQ_INST_ETC_DIR="${ENIQ_CORE_INST_DIR}/etc"
+
+# Lib directory
+LIB_DIR=/lib
+
+# Var Tmp directory
+VAR_TEM=/var/tmp/
+
+#Linux Backup Script
+LINUX_BKUP_SCRIPT="eniq_linux_replacement.bsh"
+
+# Config Dir
+ENIQ_CONF_DIR="/eniq/installation/config"
+
+# ENIQ base directory
+ENIQ_BASE_DIR="/eniq"
+
+# Logs directory
+ENIQ_LOG_DIR="${ENIQ_BASE_DIR}/local_logs"
+
+# File containing the type of OSS installation. Eg. events or statistics
+INST_TYPE_FILE=${ENIQ_CONF_DIR}/ericsson_use_config
+if [ ! -s "${INST_TYPE_FILE}" ]; then
+    _err_msg_="ENIQ install type not defined in ${INST_TYPE_FILE}"
+    abort_script "${_err_msg_}"  
+fi
+
+# Read the installation type - should be "events" or "stats"
+INSTALL_TYPE=`$CAT ${INST_TYPE_FILE} | $AWK -F\= '{print $2}'`
+if [ ! "${INSTALL_TYPE}" ]; then
+    _err_msg_="Unable to retrieve current install type"
+    abort_script "${_err_msg_}"  
+fi
+
+#Current Server type
+CURR_SERVER_TYPE=`$CAT ${ENIQ_CONF_DIR}/installed_server_type | $EGREP -v  '^[[:blank:]]*#' | $SED -e 's/ //g'`
+if [ ! "${CURR_SERVER_TYPE}" ]; then
+    _err_msg_="Unable to retrieve current server type"
+    abort_script "${_err_msg_}"  
+fi
+
+#Install Type file
+INST_TYPE_FILE=${ENIQ_CONF_DIR}/ericsson_use_config
+
+
+if [ -s ${ENIQ_CONF_DIR}/san_details ];then
+    #Storage Type
+    STORAGE_TYPE=`$CAT ${ENIQ_CONF_DIR}/san_details | $GREP -w STORAGE_TYPE | $AWK -F= '{print $2}'`
+	if [ ! "${STORAGE_TYPE}" ]; then
+		_err_msg_="Unable to retrieve current storage type"
+		abort_script "${_err_msg_}"  
+    fi
+
+    #SAN Device
+    SAN_DEVICE=`$CAT ${ENIQ_CONF_DIR}/san_details | $GREP -w SAN_DEVICE | $AWK -F= '{print $2}'`
+	if [ ! "${SAN_DEVICE}" ]; then
+		_err_msg_="Unable to retrieve SAN device information"
+		abort_script "${_err_msg_}"  
+    fi
+else 
+    $ECHO "$ENIQ_CONF_DIR/san_details file not found...exiting.."
+    exit 1
+fi
+
+# Source the common functions
+if [ -s ${ENIQ_CORE_INST_DIR}/${LIB_DIR}/common_functions.lib ]; then
+    . ${ENIQ_CORE_INST_DIR}/${LIB_DIR}/common_functions.lib
+else
+    _err_msg_="File ${ENIQ_CORE_INST_DIR}/${LIB_DIR}/common_functions.lib not found"
+    abort_script "${_err_msg_}" 
+fi
+
+
+# ********************************************************************
+#
+#   Functions
+#
+# ********************************************************************
+### Function: abort_script ###
+#
+#   This will called if the script is aborted through an error
+#   
+#   If the error is encountered during runtime
+#
+# Arguments:
+#       $1 - Error message from part of program (Not always used)
+# Return Values:
+#       none
+abort_script()
+{
+_err_time_=`$DATE '+%Y-%b-%d_%H.%M.%S'`
+
+log_msg -s "Hardware replacement backup is failed, touching failure flag" -l ${LOGFILE}
+$TOUCH ${VAR_TEM}/hardware_replacement_backup_failure_flag
+
+if [ "$1" ]; then
+    _err_msg_="${_err_time_} - $1"
+else
+    _err_msg_="${_err_time_} - ERROR : Script aborted.......\n"
+fi
+
+if [ "${LOGFILE}" ]; then
+    $ECHO "\nERROR : ${_err_msg_}\n" | $TEE -a ${LOGFILE}
+else
+    $ECHO "\nERROR : ${_err_msg_}\n"
+fi
+
+# To clean up the pre-replacement inst stage file in case of script abort
+
+cleanup_inst_stage
+
+
+
+if [ "$2" ]; then
+    ${2}
+    exit 1
+else
+    exit 1
+fi
+
+}
+
+### Function: backup_nas_directories ###
+#
+#   Backup NAS directories by creating it in the root 
+#   backup location for eniq_linux_replacement procedure.
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+backup_nas_directories()
+{
+LINUX_BACKUP_DIR="/eniq/replacement"
+$CD ${LINUX_BACKUP_DIR}
+if [ -s /eniq/smf/nasd/nasd_config ];then
+    for _dir_ in `$CAT /eniq/smf/nasd/nasd_config | $AWK -F'::' '{print $5}'` 
+    do 
+        _dir_=${_dir_:1}
+        $MKDIR -p $_dir_
+        log_msg -s "Created directory ${_dir_}" -l ${LOGFILE} >> /dev/null 2>&1 
+    done
+else
+    log_msg -s "/eniq/smf/nasd/nasd_config file is not present or is empty - Cannot backup NAS directories" -l ${LOGFILE} >> /dev/null 2>&1 
+fi 
+}
+
+
+### Function: check_id ###
+#
+#   Check that the effective id of the user is correct
+#   If not print error msg and exit.
+#
+# Arguments:
+#       $1 : User ID name
+# Return Values:
+#       none
+check_id()
+{
+_get_id_=`$ENV |$GREP -w SUDO_USER | $EGREP "^[[:blank:]]*SUDO_USER="|$AWK -F\= '{print $2}'|$SED -e 's|"||g'`
+_check_id_=`$ID | $AWK -F\( '{print $2}' | $AWK -F\) '{print $1}'`
+_check_group_=`$ID $_get_id_ | $AWK -F\( '{print $3}' | $AWK -F\) '{print $1}'`
+    if [ "${_get_id_}" == "" ]; then
+        if [ "${_check_id_}" == "root" ]; then
+           # Set 1 for true
+           _user_root=1
+        else
+           _err_msg_="You must be root or admin to execute this script."
+           abort_script "${_err_msg_}"
+        fi
+          else
+            if [ "${_check_group_}" == "ENIQ_ADMIN_ROLE" ]; then
+               # Set 0 for false
+               _user_root=0
+            else
+               _err_msg_="You must be root or admin to execute this script." 
+               abort_script "${_err_msg_}"
+            fi
+    fi
+}
+
+
+### Function: cleanup_inst_stage ###
+#
+# Cleanup of inst stage file during the pre-replacement
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+cleanup_inst_stage()
+{
+log_msg -s "Cleaning up the prereplacement progress file" -l ${LOGFILE}
+
+# To remove {ENIQ_INST_ETC_DIR}/eniq_prereplacement_inst_stage file 
+$RM -rf ${VAR_TEM}/linux_prereplacement_in_progress 
+
+# To check the existence of in progress flag file
+if [ -f ${VAR_TEM}/linux_prereplacement_in_progress ]; then
+	log_msg -s "\nWARNING: ${VAR_TEM}/linux_prereplacement_in_progress file is not removed.This file must be deleted manually" -l ${LOGFILE} 
+else
+	log_msg -s "Cleaned ${VAR_TEM}/linux_prereplacement_in_progress file" -l ${LOGFILE}
+fi
+	
+}
+
+### Function: execute_linux_bkup_stages ###
+#  
+#  The backup stages such as get_replacement_data,backup_iqheader,backup_root_data
+#  will get executed 
+#   
+#
+# Arguments:
+#       $1 : Stages to be executed.
+# Return Values:
+#       none
+execute_linux_bkup_stages()
+{
+_stage_list_=$1
+for _stage_ in ${_stage_list_}; do
+    # Run the stage
+    $CD /
+    $YES | $BASH ${ENIQ_INST_BIN_DIR}/${LINUX_BKUP_SCRIPT} -a prereplacement -s ${_stage_} -B -l ${LOGFILE} >> /dev/null 2>&1 
+    if [ $? -ne 0 ];then
+        _err_msg_="Unable to execute install stage ${_stage_}"
+        abort_script "${_err_msg_}"
+    fi
+done
+}
+
+# ********************************************************************
+#
+#   Main body of program
+#
+# ********************************************************************
+
+# Check that the effective id of the user is root
+check_id 
+
+# Do not take backup in case of Rack, vApp and VM type of servers
+if [[ ${STORAGE_TYPE} == "fs" ]] || [[ ${SAN_DEVICE} == "local" ]]; then
+    exit 0
+fi
+
+INSTALL_TYPE=`$CAT ${INST_TYPE_FILE} | $AWK -F\= '{print $2}'`
+if [ ${INSTALL_TYPE} == "stats" ];then
+    BACKUP_TYPE="LINUX_REPLACEMENT"
+fi
+
+# Log file
+if [ ! "${LOGFILE}" ]; then
+    $MKDIR -p ${ENIQ_LOG_DIR}/replacement
+    LOGFILE="${ENIQ_LOG_DIR}/replacement/replacement_backup.log"
+fi
+
+log_msg -s "===================================================================" -l ${LOGFILE} 
+log_msg -s "-------Starting backup at `$DATE '+%Y-%b-%d_%H.%M.%S'`-------" -l ${LOGFILE}
+
+# Execute backup stages
+    if [ -f ${VAR_TEM}/linux_*_in_progress ];then
+        log_msg -s "-------Progress flag file present, not executing backup-------" -l ${LOGFILE}
+        exit 0
+    fi 
+    
+    if [ -f ${VAR_TEM}/linux_replacement_success ];then
+        log_msg -s "-------Not executing backup as replacement procedure not completed [linux_replacement_success flag file present]---------" -l ${LOGFILE}
+        log_msg -s "-------Complete Full Replacement Procedure--------------" -l ${LOGFILE}
+        exit 0
+    fi
+    
+    STAGE_LIST="get_replacement_data backup_iqheader backup_root_data cleanup_prereplacement"
+    
+    #Execute Linux backup stages from Linux Replacement script
+    execute_linux_bkup_stages "${STAGE_LIST}"
+    
+    #Backup NAS directories
+    backup_nas_directories
+	
+    log_msg -s "-------Backup completed at `$DATE '+%Y-%b-%d_%H.%M.%S'`-------" -l ${LOGFILE}
+
+    if [ -f ${VAR_TEM}/hardware_replacement_backup_failure_flag ];then
+        log_msg -s "Hardware replacement backup is successfull, removing failure flag" -l ${LOGFILE}
+        $RM -rf ${VAR_TEM}/hardware_replacement_backup_failure_flag
+    fi
+
+    log_msg -s "===================================================================" -l ${LOGFILE}
+exit 0
+

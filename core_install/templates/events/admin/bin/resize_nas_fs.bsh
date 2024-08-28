@@ -1,0 +1,1485 @@
+#!/bin/bash
+# ********************************************************************
+# Ericsson Radio Systems AB                                     SCRIPT
+# ********************************************************************
+#
+# (c) Ericsson Radio Systems AB 2012 - All rights reserved.
+#
+# The copyright to the computer program(s) herein is the property
+# of Ericsson Radio Systems AB, Sweden. The programs may be used
+# and/or copied only with the written permission from Ericsson Radio
+# Systems AB or in accordance with the terms and conditions stipulated
+# in the agreement/contract under which the program(s) have been
+# supplied.
+#
+# ********************************************************************
+# Name    : resize_nas_fs.bsh
+# Date    : 22/08/2019
+# Revision: \main\04
+# Purpose : Resize Nas Files Systems using Storage.ini in templates directory
+#
+# Usage   : resize_nas_fs.bsh
+#
+# ********************************************************************
+#
+#   Command Section
+#
+# ********************************************************************
+AWK=/usr/bin/awk
+BASENAME=/usr/bin/basename
+BASH=/usr/bin/bash
+BC=/usr/bin/bc
+CAT=/usr/bin/cat
+CLEAR=/usr/bin/clear
+CP=/usr/bin/cp
+DATE=/usr/bin/date
+DIRNAME=/usr/bin/dirname
+ECHO=/usr/bin/echo
+EGREP=/usr/bin/egrep
+EXPR=/usr/bin/expr
+GREP=/usr/bin/grep
+ID=/usr/bin/id
+PRINTF=/usr/bin/printf
+PWD=/usr/bin/pwd
+RM=/usr/bin/rm
+SED=/usr/bin/sed
+SORT=/usr/bin/sort
+SYSTEMCTL=/usr/bin/systemctl
+TEE=/usr/bin/tee
+TOUCH=/usr/bin/touch
+TR=/usr/bin/tr
+WC=/usr/bin/wc
+YES=/usr/bin/yes
+
+# ********************************************************************
+#
+#       Configuration Section
+#
+# ********************************************************************
+
+# Default user
+DEFAULT_USER=root
+
+# Name of SunOS & ENIQ ini Files
+SUNOS_INI=SunOS.ini
+STORAGE_INI=storage.ini
+TOTAL_SIZE_REQ=0
+
+# ********************************************************************
+#
+#   Functions
+#
+# ********************************************************************
+### Function: abort_script ###
+#
+#   This will is called if the script is aborted thru an error
+#   signal sent by the kernel such as CTRL-C or if a serious
+#   error is encountered during runtime
+#
+# Arguments:
+#       $1 - Error message from part of program (Not always used)
+# Return Values:
+#       none
+abort_script()
+{
+	_err_time_=`$DATE '+%Y-%b-%d_%H.%M.%S'`
+
+  if [[ -z $QUIET ]]; then
+    if [ "$1" ]; then
+      _err_msg_="${_err_time_} - $1"
+    else
+      _err_msg_="${_err_time_} - ERROR : Script aborted.......\n"
+    fi
+
+    if [ "${LOGFILE}" ]; then
+      $ECHO "\nERROR : $_err_msg_\n" | $TEE -a ${LOGFILE}
+    else
+      $ECHO "\nERROR : $_err_msg_\n"
+    fi
+  fi
+  
+	if [ -s ${TEM_DIR} ]; then    	
+		$RM -rf ${TEM_DIR}
+	fi
+
+  if [ -n "$2" ]; then
+    exit "$2"
+  fi
+  
+  exit 1
+}
+
+## Function: backup_storage_ini ###
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+
+backup_storage_ini()
+{
+	$ECHO "Creating a backup of " | $TEE -a ${LOGFILE}
+	$ECHO "${ENIQ_CONF_DIR}/${STORAGE_INI} to ${ENIQ_CONF_DIR}/backup/${STORAGE_INI}.${RUN_TIME}" | $TEE -a ${LOGFILE}
+	if [ -s ${ENIQ_CONF_DIR}/${STORAGE_INI} ]; then
+		$CP ${ENIQ_CONF_DIR}/${STORAGE_INI} ${ENIQ_CONF_DIR}/backup/${STORAGE_INI}.${RUN_TIME}
+		if [ $? -ne 0 ]; then
+			_err_msg_="Could not copy ${ENIQ_CONF_DIR}/${STORAGE_INI} to ${ENIQ_CONF_DIR}/backup/${STORAGE_INI}.${RUN_TIME}"
+			abort_script "$_err_msg_"
+		fi
+	else
+		_err_msg_="${ENIQ_CONF_DIR}/${STORAGE_INI} empty"
+		abort_script "$_err_msg_"
+	fi
+}
+### Function: check_files_and_scripts ###
+#
+#   Checks required files/scripts are present
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+check_files_and_scripts()
+{
+$ECHO "\nChecking for required files and scripts" | $TEE -a ${LOGFILE}
+
+if [ ! -s ${CLI_CONF_DIR}/${STORAGE_INI} ]; then
+    _err_msg_="Unable to access ${CLI_CONF_DIR}/${SUNOS_INI}. Exiting Script."
+    abort_script "$_err_msg_";
+fi
+
+if [ ! -s ${ENIQ_CONF_DIR}/${STORAGE_INI} ]; then
+    _err_msg_="Unable to access ${STORAGE_INI}. Exiting Script."
+    abort_script "$_err_msg_";
+fi
+
+if [ ! -d ${ENIQ_CONF_DIR}/backup ]; then
+	$MKDIR -p ${ENIQ_CONF_DIR}/backup
+fi
+
+}
+
+### Function: check_filesystems_nas ###
+#
+#checks that the filesystem exists on nas
+#
+# Arguments:
+#   filesystem name  and filesystem size in kilo
+# Return Values:
+#   none
+check_filesystems_nas()
+{
+	local _fs_name_="$1"
+	local _fs_name_size_="$2"
+	local _fs_ini_entry_="$3"
+	if  [ "${_fs_name_}" == "" ]; then
+		_err_msg_="Must provide a file system name"
+		abort_script "$_err_msg_"
+	fi
+	if  [ "${_fs_name_size_}" == "" ]; then
+		_err_msg_="Must provide a file system size"
+		abort_script "$_err_msg_"
+	fi
+	if  [ "${_fs_ini_entry_}" == "" ]; then
+		_err_msg_="Must provide a ini entry"
+		abort_script "$_err_msg_"
+	fi
+
+	
+	
+	if [ ! -s "${NAS_FS_LIST}" ]; then
+		_err_msg_="Could not list the filesystems from NAS"
+		abort_script "$_err_msg_"  
+	fi
+	local _nas_fs_name_="${POOL_NAME}/${_fs_name_}"
+	local _nas_fs_details_=$($CAT ${NAS_FS_LIST} | $EGREP "^${_nas_fs_name_}[[:blank:]]" | $AWK '{print $1" "$3}')
+	if [ ! "${_nas_fs_details_}" ]; then
+		_err_msg_="filesystem ${_nas_fs_name_} not created, this script is only for to expand existing filesytems"
+		abort_script "$_err_msg_"
+	fi
+
+
+
+	local _nas_fs_size_=$($ECHO "${_nas_fs_details_}" | $AWK '{print $2}')
+	get_kilo_size "${_fs_name_size_}"	
+	local _fs_name_size_k_=${SIZE_KILO}
+	get_kilo_size "${_nas_fs_size_}"	
+	local _nas_fs_size_k_=${SIZE_KILO}
+	
+	if [ ${_fs_name_size_k_} -ne ${_nas_fs_size_k_} ] ; then 
+		$ECHO "Warning Mismatch between ${ENIQ_CONF_DIR}/${STORAGE_INI} and NAS Size" | $TEE -a ${LOGFILE}
+		_nas_fs_size_=$($ECHO "${_nas_fs_size_}" | sed -e 's/\.00\([a-zA-Z]*\)$/\1/g' | $TR "[:upper:]" "[:lower:]")
+		$ECHO "Updating ${_fs_ini_entry_} FS_SIZE to ${_nas_fs_size_} from ${_fs_name_size_}" | $TEE -a ${LOGFILE}
+		iniset ${_fs_ini_entry_} -f ${ENIQ_CONF_DIR}/${STORAGE_INI} FS_SIZE="${_nas_fs_size_}"
+		if [ $? -ne 0 ]; then
+		_err_msg_="Could not set FS_SIZE to ${_nas_fs_size_} for ${_fs_ini_entry_} in ${ENIQ_CONF_DIR}/${STORAGE_INI}"
+		abort_script "$_err_msg_"
+		fi		
+		EXISTING_FS_SIZE=${_nas_fs_size_}
+	else
+		EXISTING_FS_SIZE=${_fs_name_size_}
+	fi
+	if  [ "${EXISTING_FS_SIZE}" == "" ]; then
+		_err_msg_="error setting EXISTING_FS_SIZE for ${_fs_name_}"
+		abort_script "$_err_msg_"
+	fi
+
+}
+
+### Function: check_id ###
+#
+#   Check that the effective id of the user is correct
+#   If not print error msg and exit.
+#
+# Arguments:
+#       $1 : User ID name
+# Return Values:
+#       none
+check_id()
+{
+	local _check_id_=`$ID | $AWK -F\( '{print $2}' | $AWK -F\) '{print $1}'`
+
+	if [ "$_check_id_" != "$1" ]; then
+		_err_msg_="You must be $1 to execute this script." 
+		abort_script "$_err_msg_" 
+	fi
+}
+### Function: check_params ###
+#
+# Check Input Params
+#
+# Arguments:
+#	none
+# Return Values:
+#	none
+check_params()
+{
+
+if [ ! "${MANUAL_RESIZE}" ]; then
+    usage_msg
+    exit 1
+fi
+
+case "${MANUAL_RESIZE}" in
+    auto)	MANUAL_RESIZE="NO"
+      if [[ $FORCE == "YES" && ( -z $SINGLE_FS_SIZE || -z $SINGLE_FS ) ]]; then
+        usage_msg
+        abort_script "No size or file system specified to force resize."
+      else
+        if [[ -n $SINGLE_FS_SIZE && -z $SINGLE_FS ]]; then
+          usage_msg
+          abort_script "No file system specified to resize."
+        fi
+      fi
+        	;;
+    manual)	MANUAL_RESIZE="YES"
+      if [[ $FORCE == "YES" || -n $SINGLE_FS_SIZE || -n $SINGLE_FS ]]; then
+        usage_msg
+        abort_script "No other parameters allowed with -a manual ."
+      fi
+        	;;
+        *)	usage_msg
+			abort_script 
+       		;;
+esac
+}
+### Function: check_space_needed ###
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+check_space_needed()
+{
+	if [  ${TOTAL_SIZE_REQ} -gt ${MAX_SIZE} ]; then
+		_err_msg_="Not enough space, current space needed  is ${TOTAL_SIZE_REQ} and available space is ${MAX_SIZE}"
+		abort_script "$_err_msg_" 
+
+	fi
+}
+### Function: chk_create_logfile ###
+#
+# Check/Create Logfile
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+chk_create_logfile()
+{
+	$MKDIR -p `$DIRNAME ${LOGFILE}`
+	if [ $? -ne 0 ]; then
+		_err_msg_="Could not create directory `$DIRNAME ${LOGFILE}`"
+		abort_script "$_err_msg_"
+	fi
+
+	$TOUCH -a ${LOGFILE}
+	if [ $? -ne 0 ]; then
+		_err_msg_="Could not write to file ${LOGFILE}"
+		abort_script "$_err_msg_"
+	fi
+}
+### Function: cleanup ###
+#
+# cleanup
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+cleanup()
+{
+hostsync_smf "enable"
+hostsync_smf "start"
+
+if [ -s ${TEM_DIR} ]; then    	
+	$RM -rf ${TEM_DIR}
+fi
+
+exit 0
+}
+
+### Function: merge_config_files ###
+#
+# To merge config files
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+#
+merge_config_files()
+{
+if [ -x ${ENIQ_CORE_INST_DIR}/lib/iniadd.pl ]; then
+    INIADD=${ENIQ_CORE_INST_DIR}/lib/iniadd.pl
+else
+    _err_msg_="${ENIQ_CORE_INST_DIR}/lib/iniadd.pl is not found, or is not executable"
+    abort_script "$_err_msg_"
+fi
+
+if [ -s ${ENIQ_CONF_DIR}/deployment.bkp ]; then
+    unset STORAGE_INI_BKP
+    # Has the user specified the previous deployment=
+    local _deployment_bkp_=`$CAT ${ENIQ_CONF_DIR}/deployment.bkp | $TR '[:upper:]' '[:lower:]'`
+    if [ ! "${_deployment_bkp_}" ]; then
+        _err_msg_="Could not determine deployment id type of ${ENIQ_CONF_DIR}/deployment.bkp"
+        abort_script "$_err_msg_"
+    fi
+
+	case "${_deployment_bkp_}" in
+		ft)		STORAGE_INI_BKP=${ENIQ_TEMPL_DIR}/storage_ini.ft
+				;;	
+		small)	STORAGE_INI_BKP=${ENIQ_TEMPL_DIR}/storage_ini.sml
+				;;			
+		medium)	STORAGE_INI_BKP=${ENIQ_TEMPL_DIR}/storage_ini.med
+				;;			
+		large)	STORAGE_INI_BKP=${ENIQ_TEMPL_DIR}/storage_ini.lrg
+				;;
+		extralarge) STORAGE_INI_BKP=${ENIQ_TEMPL_DIR}/storage_ini.extralrg
+                ;;
+		*)	abort_script "deployment type not supported ${_deployment_bkp_} in ${ENIQ_CONF_DIR}/deployment.bkp file"			
+			;;
+	esac
+
+	if [ ! -s ${STORAGE_INI_RESIZE} ]; then
+		  _err_msg_="${STORAGE_INI_RESIZE} not found, or is empty" 	
+		  abort_script "$_err_msg_" 
+	fi
+fi
+
+$CP -rp ${STORAGE_INI_BKP} ${TEM_DIR}/old_template_file
+    if [ $? -ne 0 ]; then
+        _err_msg_="Failed to migrate ${old_template_ini}"
+        abort_script "$_err_msg_" "${EXEC_SHELL_CMD}"
+    fi
+
+$CP -rp ${STORAGE_INI_RESIZE} ${TEM_DIR}/new_template_file
+    if [ $? -ne 0 ]; then
+        _err_msg_="Failed to migrate ${old_template_ini}"
+        abort_script "$_err_msg_" "${EXEC_SHELL_CMD}"
+    fi
+
+if [ -s "${FLS_CONFIG_FILE}" ];then
+    $CAT ${FLS_CONFIG_FILE} > ${TEM_DIR}/merge_input_file
+fi
+
+_config_=`$ECHO ${STORAGE_INI} | $CUT -d"." -f1`
+if [ ! "${_config_}" ]; then
+    _err_msg_="_config_ parameter empty"
+    abort_script "$_err_msg_"
+fi
+
+if [ -s "${TEM_DIR}/merge_input_file" ];then
+    while read _line_; do
+        _item_="${_line_}"
+        log_msg -l ${LOGFILE} -s "Merging existing block for ${_line_} in ${TEM_DIR}/new_template_file"
+        merge_ini ${_line_} ${TEM_DIR}/new_template_file ${TEM_DIR}/old_template_file ${_config_}
+    done < ${TEM_DIR}/merge_input_file
+fi
+
+$CP -rp ${TEM_DIR}/new_template_file ${STORAGE_INI_RESIZE}
+if [ $? -ne 0 ]; then
+    _err_msg_="Failed to migrate ${old_template_ini}"
+    abort_script "$_err_msg_" "${EXEC_SHELL_CMD}"
+fi
+}
+
+### Function: merge_ini ###
+#
+# Merging the extra filesystem and directory in Sunos.ini and storage.ini file
+#
+# Arguments: none
+#
+# Return Values: none
+merge_ini()
+{
+new_fs_name=$1
+new_template_ini=$2
+old_template_ini=$3
+ini_type=$4
+
+if [ "${ini_type}" == "storage" ];then
+
+        gtag=Storage_NAS_FS_LIST
+        ptag=Storage_NAS_`$ECHO $new_fs_name |$TR "[:lower:]" "[:upper:]" `
+
+        $ECHO "[${ptag}]" > ${TEM_DIR}/new_ini_block
+        iniget $ptag -f ${old_template_ini} >> ${TEM_DIR}/new_ini_block
+        if [ $? -ne 0 ]; then
+                _err_msg_="Failed to get $ptag from ${old_template_ini}"
+                abort_script "$_err_msg_" "${EXEC_SHELL_CMD}"
+        fi
+
+        log_msg -l ${LOGFILE} -q -s "Executing command: \n$INIADD -g $gtag -p $ptag -i ${new_template_ini} -d ${TEM_DIR}/new_ini_block -o ${TEM_DIR}/output_file"
+        $INIADD -g $gtag -p $ptag -i ${new_template_ini} -d ${TEM_DIR}/new_ini_block -o ${TEM_DIR}/output_file
+        if [ $? -ne 0 ]; then
+           _err_msg_="Error in migrating block ${_item_} from ${old_template_ini}"
+           abort_script "$_err_msg_" "${EXEC_SHELL_CMD}"
+        fi
+
+        $CP ${TEM_DIR}/output_file ${new_template_ini}
+        if [ $? -ne 0 ]; then
+           _err_msg_="Failed to migrate ${old_template_ini}"
+           abort_script "$_err_msg_" "${EXEC_SHELL_CMD}"
+        fi
+
+        $RM -rf ${TEM_DIR}/output_file
+        log_msg -l ${LOGFILE} -s "Successfully migrated block ${_item_} to ${new_template_ini}."
+
+fi
+}
+
+### Function: compare_filesystems ###
+#
+# Compares the file system sizes within the storage_ini file in the 
+# templates directory with the storage_ini file in the config directory
+# Different size file systems are extracted.
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+compare_filesystems()
+{
+	FS_COUNT=0
+	$RM -rf ${TEM_DIR}/all_fs
+	$RM -rf ${TEM_DIR}/auto_resize
+	AUTO_UPDATE="NO"
+
+	select_storage_ini
+	if [ -s "${FLS_CONFIG_FILE}" ];then
+		merge_config_files
+	fi
+	
+	get_ini_fs_name_size "${STORAGE_INI_RESIZE}" "${TEM_DIR}/template_fs"
+	get_ini_fs_name_size "${STORAGE_INI_RESIZE}" "${TEM_DIR}/template_fs"
+	get_ini_fs_name_size "${ENIQ_CONF_DIR}/${STORAGE_INI}" "${TEM_DIR}/all_fs_temp"
+	if [ $($WC -l ${TEM_DIR}/all_fs_temp| $AWK '{print $1}') -ne $($WC -l ${TEM_DIR}/template_fs | $AWK '{print $1}') ]; then	
+		_err_msg_="Number of filesystem don't match ${STORAGE_INI_RESIZE}" 
+		abort_script "$_err_msg_" 			
+	fi
+	while read line; do		
+		local _system_name_=`$ECHO ${line} | $AWK '{print $1}'`
+		local _existing_fs_size_=`$ECHO ${line} | $AWK '{print $2}'`
+		local _ini_entry_=`$ECHO ${line} | $AWK '{print $3}'`
+		if [ ! "${_system_name_}" -o ! "${_existing_fs_size_}" -o ! "${_ini_entry_}" ]; then	
+			_err_msg_="Unable to get parameters for create re-size commands " 
+			abort_script "$_err_msg_" 			
+		fi
+		check_filesystems_nas "${_system_name_}" "${_existing_fs_size_}" "${_ini_entry_}"
+		_existing_fs_size_="${EXISTING_FS_SIZE}"
+
+		_new_fs_size_=$($CAT ${TEM_DIR}/template_fs | $EGREP -w "^${_system_name_}" | $AWK '{ print $2}')
+		if [ ! "${_new_fs_size_}" ]; then	
+			_err_msg_="Unable to get filesystem size for ${_system_name_} in ${STORAGE_INI_RESIZE}" 
+			abort_script "$_err_msg_" 			
+		fi
+		let FS_COUNT+=1
+		$ECHO "${FS_COUNT}) ${_system_name_} ${_existing_fs_size_} ${_new_fs_size_}" >> ${TEM_DIR}/all_fs
+		if [ "$MANUAL_RESIZE" != "YES" ]; then	
+				update_total_size_req "${_new_fs_size_}" "${_existing_fs_size_}"
+				if [ ${CHECK_SIZE} -eq 0 ]; then
+					AUTO_UPDATE="YES"
+					$ECHO "${_system_name_} ${_existing_fs_size_} ${_new_fs_size_}" >> ${TEM_DIR}/auto_resize	
+					$ECHO "FileSystem Name: ${_system_name_}\tExisting Size: ${_existing_fs_size_}\tNew size: ${_new_fs_size_} ">> ${LOGFILE}
+				fi	
+		fi
+	done<${TEM_DIR}/all_fs_temp	
+}
+## Function: cp_storage_ini_sw ###
+#
+# Arguments:
+#   none
+# Return Values:
+#  none
+
+cp_storage_ini_sw()
+{
+	$ECHO "Copying ${STORAGE_INI} to ${CLI_CONF_DIR}" | $TEE -a ${LOGFILE}
+	if [ -s ${ENIQ_CONF_DIR}/${STORAGE_INI} ]; then
+		$CP ${ENIQ_CONF_DIR}/${STORAGE_INI} ${CLI_CONF_DIR}/${STORAGE_INI}
+		if [ $? -ne 0 ]; then
+			_err_msg_="Could not copy ${ENIQ_CONF_DIR}/${STORAGE_INI} to ${CLI_CONF_DIR}/${STORAGE_INI}"
+			abort_script "$_err_msg_"
+		fi
+	else
+		_err_msg_="${ENIQ_CONF_DIR}/${STORAGE_INI} empty"
+		abort_script "$_err_msg_"
+	fi
+}
+### Function: create_resize_commands ###
+#
+# Creates the commands to resize the file systems
+# when (-a arg) is not passed
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+create_resize_commands()
+{
+	local _resize_file_="${1}"
+	if [ ! -s "${_resize_file_}" ]; then
+	    _err_msg_="${_resize_file_} file not found"
+	    abort_script "$_err_msg_"	
+	fi
+	$RM -rf ${TEM_DIR}/resize_commands
+
+	check_space_needed
+		
+	while read line; do		
+		_system_name_=`$ECHO ${line} | $AWK '{print $1}'`
+		_actual_size_=`$ECHO ${line} | $AWK '{print $2}'`
+		_recomended_size_=`$ECHO ${line} | $AWK '{print $3}'`
+		if [ ! "${_system_name_}" -o ! "${_recomended_size_}" -o ! "${_actual_size_}" ]; then	
+			_err_msg_="Unable to get parameters for create re-size commands " 
+			abort_script "$_err_msg_" 			
+		fi
+		
+		$ECHO $NASCLI resize_fs - ${_system_name_} ${_recomended_size_}  >> ${TEM_DIR}/resize_commands
+			
+	done<${_resize_file_}	
+	if [ $? -ne 0 ]; then
+		_err_msg_="Unable to create re-size commands" 
+		abort_script "$_err_msg_" 
+	fi
+}
+### Function: display_updated ###
+#
+# Displays the filesystem updates
+# 
+#
+# Arguments:
+#   file
+# Return Values:
+#   none
+display_updated()
+{
+	local _resize_file_=$1
+	if [ ! -s "${_resize_file_}" ]; then
+	    _err_msg_="${_resize_file_} file not found"
+	    abort_script "$_err_msg_"	
+	fi
+
+	$ECHO "\nList of all Nas FS to be update."
+	$ECHO "----------------------------------------"
+
+
+
+	$ECHO "\nFS_Name        FS_Current_Size	     FS_New_Size"
+	$ECHO "------------------------------------------"
+
+	while read line; do
+		_sep_length_=20
+		_system_name_=`$ECHO ${line} | $AWK '{print $1}'`
+		_actual_size_=`$ECHO ${line} | $AWK '{print $2}'`
+		_recomended_size_=`$ECHO ${line} | $AWK '{print $3}'`
+		if [ ! "${_system_name_}" -o ! "${_recomended_size_}" -o ! "${_actual_size_}" ]; then	
+			_err_msg_="Unable to get parameters for create re-size commands " 
+			abort_script "$_err_msg_" 			
+		fi
+		_sec_length_=$(( _sep_length_ - ${#_system_name_}))	
+		$PRINTF  "%s" "$_system_name_ " 
+		$PRINTF  "%${_sec_length_}s %s" "$_actual_size_" 
+		$PRINTF  "%${_sep_length_}s %s\n" $_recomended_size_			
+	done<${_resize_file_}
+}
+
+### Function: get_absolute_path ###
+#
+# Determine absolute path to software
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+get_absolute_path()
+{
+	_dir_=`$DIRNAME $0`
+	SCRIPTHOME=`cd $_dir_ 2>/dev/null && pwd || $ECHO $_dir_`
+}
+### Function: get_ini_fs_name_size ###
+#
+# checks that filesystem new filesystem size is greater than orginal size
+# if it is then update TOTAL_SIZE_REQ with delta
+# Arguments:
+#   new file system size and orginal filesystem name
+# Return Values:
+#   none
+get_ini_fs_name_size()
+{
+	local _ini_fs_="${1}"
+	local _outfile_="${2}"
+	if  [ ! -s "${_ini_fs_}" ]; then
+		_err_msg_="Must provide a ini file"
+		abort_script "$_err_msg_"
+	fi
+	if  [ "${_outfile_}" == "" ]; then
+		_err_msg_="Must provide a output filename"
+		abort_script "$_err_msg_"
+	fi
+
+	local _count_=0
+	$RM -rf ${_outfile_}
+	$RM -rf ${TEM_DIR}/fs_temp_list
+
+	local _storage_fs_list_=`iniget Storage_NAS_FS_LIST -f ${_ini_fs_}`
+	if [ ! "${_storage_fs_list_}" ]; then
+		_err_msg_="Could not read NAS information from ${_ini_fs_}"
+		abort_script "$_err_msg_" 
+	fi
+
+	for _i_ in ${_storage_fs_list_}; do
+		local _fs_name_=`iniget $_i_ -f ${_ini_fs_} -v FS_NAME`
+		if [ ! "${_fs_name_}" ]; then
+			_err_msg_="Could not read $_i_ FS_NAME from ${_ini_fs_}" 
+			abort_script "$_err_msg_" 
+		fi
+		local _fs_size_=`iniget $_i_ -f ${_ini_fs_} -v FS_SIZE`
+		if [ ! "${_fs_size_}" ]; then
+			_err_msg_="Could not read $_i_ FS_SIZE from ${_ini_fs_}" 
+			abort_script "$_err_msg_" 
+		fi
+		$ECHO "${_fs_name_} ${_fs_size_} ${_i_}" >> ${TEM_DIR}/fs_temp_list
+	done
+
+	$SORT ${TEM_DIR}/fs_temp_list > ${_outfile_}
+}
+### Function: get_kilo_size ###
+#
+# Gets the size in kilobytes  
+#Uses GLOBAL variable SIZE_KILO
+#
+# Arguments:
+#   string with digits and unit
+# Return Values:
+#   none
+get_kilo_size()
+{
+	unset SIZE_KILO 
+	local _convert_no_=$1
+	if  [ "${_convert_no_}" == "" ]; then
+		_err_msg_="Must provide String"
+		abort_script "$_err_msg_"
+	fi
+
+
+	get_unit_size "${_convert_no_}"
+	local _units_=${UNIT}
+	local _size_=${SIZE}
+
+	case "${_units_}" in
+		T|t)	_size_=$($ECHO "${_size_} * 1073741824" | $BC | $AWK -F\. '{print $1}')
+			;;	
+		g|G)	_size_=$($ECHO "${_size_} * 1048576" | $BC | $AWK -F\. '{print $1}')
+			;;			
+		m|M)	_size_=$($ECHO "${_size_} * 1024" | $BC | $AWK -F\. '{print $1}')
+			;;			
+		k|K)	let _size_=${_size_}
+			;;		
+		*)	abort_script "Unit not supported '${_units_}'."			
+			;;
+	esac	
+	if [ -z "${_size_}" ]; then
+		_err_msg_="Unable to convert ${_convert_no_} to kilo"
+		abort_script "$_err_msg_" 
+	fi
+	SIZE_KILO=${_size_}
+}
+
+### Function: get_max_size_available ###
+#
+# Gets total size available on the nas  
+#
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+get_max_size_available()
+{
+	MAX_SIZE_NAS=$($NASCLI filestore_cmd storage pool free | $EGREP -w "^${POOL_NAME}" | $AWK '{print $2}')
+	if [ ! "$MAX_SIZE_NAS" ]; then
+		_err_msg_="Unable to get maximun size form NAS" 
+		abort_script "$_err_msg_" 
+	fi
+	get_kilo_size "${MAX_SIZE_NAS}"
+	MAX_SIZE=${SIZE_KILO}
+	$ECHO "Maximum size Available := '${MAX_SIZE_NAS}'" | $TEE -a  ${LOGFILE}
+}
+
+### Function: get_nas_fs_list###
+#
+# Gets pool name  
+#
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+get_nas_fs_list()
+{
+	$RM -rf ${NAS_FS_LIST}
+	$NASCLI list_fs raw ${POOL_NAME} | trans out | $EGREP "^${POOL_NAME}" | $SORT > ${NAS_FS_LIST}
+	if [ ! -s "${NAS_FS_LIST}" ]; then
+		_err_msg_="Could not list the filesystems from NAS"
+		abort_script "$_err_msg_"  
+	fi
+}
+### Function: get_pool_name###
+#
+# Gets pool name  
+#
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+get_pool_name()
+{
+	unset POOL_NAME
+	POOL_NAME=`iniget Storage_NAS_GENERAL -f ${ENIQ_CONF_DIR}/${STORAGE_INI} -v SYS_ID`
+	if [ ! "${POOL_NAME}" ]; then	
+		_err_msg_="Storage pool not found in file ${ENIQ_CONF_DIR}/${STORAGE_INI}"
+		abort_script "$_err_msg_" 			
+	fi
+	$ECHO "Storage Pool used := ${POOL_NAME}"| $TEE -a ${LOGFILE}
+}
+
+### Function: get_unit_size ###
+#
+# Gets the size in kilobytes  
+#Uses GLOBAL variables UNIT SIZE 
+#
+# Arguments:
+#   string with digits and unit
+# Return Values:
+#   none
+get_unit_size()
+{
+	unset UNIT
+	unset SIZE 
+	local _convert_no_="${1}"
+	if  [ "${_convert_no_}" == "" ]; then
+		_err_msg_="Must provide String"
+		abort_script "$_err_msg_"
+	fi
+
+	local _units_=$($ECHO "${_convert_no_}" | $SED 's/[0-9\.]*//g')
+	if [ -z "${_units_}" ]; then
+		_err_msg_="Unable to get unit from ${_convert_no_}"
+		abort_script "$_err_msg_" 
+	fi
+	UNIT=${_units_}
+	local _size_=${_convert_no_%[A-Z,a-z]}	
+	$AWK 'BEGIN{if ('$_size_'>0) ;else exit 1}'
+	SIZE=${_size_}
+}
+
+### Function: hostsync_smf ###
+#
+# Determine absolute path to software
+#
+# Arguments:
+#   disable/enable
+# Return Values:
+#   none
+hostsync_smf()
+{
+	local _action_="${1}"
+	if  [[ `$ECHO "${_action_}" | $EGREP -v "disable|stop|enable|start"` ]]; then
+	    _err_msg_="Must provide disable or enable string"
+	    abort_script "$_err_msg_"
+	fi
+	
+	$ECHO "\n$_action_ ${HOSTSYNC_SMF_STR}"
+	$SYSTEMCTL $_action_  ${HOSTSYNC_SMF_STR}
+	if [ $? -ne 0 ]; then
+	    _err_msg_="Could not stop ${HOSTSYNC_SMF_STR}"
+	    abort_script "$_err_msg_"
+	fi
+}
+
+### Function: list_fs_manual ###
+#
+# Gets total size of nas to be increased to
+# 
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+list_fs_manual()
+{		
+
+	if [ ! -s "${TEM_DIR}/all_fs" ]; then
+		_err_msg_="${TEM_DIR}/all_fs file not found" 
+		abort_script "$_err_msg_" 	
+	fi	
+
+	$ECHO "\nList of all Nas FS, with current FS size."
+	$ECHO "----------------------------------------"
+
+	$ECHO "\nFS Name		   	FS Size"
+	$ECHO "-------------------------------"
+	_pad_length_=30
+	while read line; do
+		local _number_=`$ECHO ${line} | $AWK '{print $1}'`				
+		local _system_name_=`$ECHO ${line} | $AWK '{print $2}'`
+		local _original_size_=`$ECHO ${line} | $AWK '{print $3}'`
+		if [ ! "${_number_}" -o ! "${_system_name_}" -o ! "${_original_size_}" ]; then	
+			_err_msg_="Unable to get parameters to display filesystem list "
+			abort_script "$_err_msg_" 			
+		fi
+		_padding_=$((_pad_length_ - ${#_number_} - ${#_system_name_}))	
+		$PRINTF  "%s" "$_number_ " 
+		$PRINTF  "%s" "$_system_name_" 
+		$PRINTF  "%${_padding_}s %s\n" $_original_size_
+		#_original_size_=${_original_size_:1}			
+	done<${TEM_DIR}/all_fs
+		
+			
+}
+
+## Function: read_storage_type ###
+#
+# Arguments:
+#   none
+# Return Values:
+#   set varibale STORAGE_TYPE
+read_storage_type()
+{
+	# Read the storage type
+	if [ -s ${ENIQ_CONF_DIR}/${SUNOS_INI} ]; then
+		STORAGE_TYPE=`iniget STOR_TYPE -f ${ENIQ_CONF_DIR}/${SUNOS_INI} -v STORAGE_TYPE`
+	else
+		if [ -s ${ENIQ_CONF_DIR}/san_details ]; then
+			STORAGE_TYPE=`$CAT ${ENIQ_CONF_DIR}/san_details | $EGREP "^STORAGE_TYPE=" | $AWK -F\= '{print $2}'`
+		fi
+	fi
+
+	if [ ! "${STORAGE_TYPE}" ]; then
+		_err_msg_="Could not read STORAGE_TYPE param "
+		abort_script "$_err_msg_"
+	fi
+}
+### Function: check_uniq ###
+#
+# check number is not in list 
+#
+#
+# Arguments:
+#   list of numbers and number
+# Return Values:
+#   0 number not in list
+#	1 number in list
+check_uniq()
+{
+	local _list_="${1}"
+	local _number_="${2}"
+	if  [ "${_list_}" == "" ]; then
+		return 0
+	fi
+	if  [ "${_number_}" == "" ]; then
+		_err_msg_="Must provide String"
+		abort_script "$_err_msg_"
+	fi
+	local _unique_=$($ECHO ${_list_} | $EGREP -w "${_number_}")
+	if [ ! "${_unique_}" ]; then
+			return 0
+	else
+			return 1
+	fi
+}
+
+### Function: resize_fs_manual ###
+#
+# Asks user for a new value that the FS is to be resized to 
+#
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+resize_fs_manual()
+{
+	until [ ! -z "$_choice_" ]; do
+		$ECHO "\nPlease enter a FS to resize using the following format [n,n,n-n,n...n], eg. 1,3,7-11)"
+		read _choice_
+		unset _num_
+		_choice_=$($ECHO ${_choice_} | $SED -e 's/[[:blank:]]//g' -e 's/,/ /g')
+		for _i_ in $_choice_ ; do
+			if [[ $($ECHO $_i_ | $EGREP -e '^[0-9]+-[0-9]+$') ]] ; then
+				_start_=`$ECHO ${_i_} | $AWK -F\- '{print $1}'`
+				_end_=`$ECHO ${_i_} | $AWK -F\- '{print $2}'`
+					if [ "${_start_}" -gt "${_end_}" ]; then			
+						unset _choice_
+						continue
+					fi
+				for (( _sel_=${_start_}; _sel_<=${_end_}; _sel_++ )); do
+					if [ "${_sel_}" -gt "${FS_COUNT}" ]; then			
+						unset _choice_
+						continue
+					fi
+					check_uniq "$_num_" "$_sel_"
+					if [ $? -eq 0 ]; then
+						_num_="$_num_ $_sel_"
+					else
+						unset _choice_
+						continue
+					fi
+				done
+			elif [[ $($ECHO $_i_ | $EGREP -e '^[0-9]+$') ]] ; then
+				if [ "${_i_}" -gt "${FS_COUNT}" ]; then			
+					unset _choice_
+					continue
+				fi
+				check_uniq "$_num_" "$_i_"
+				if [ $? -eq 0 ]; then
+					_num_="$_num_ $_i_"
+				else
+					unset _choice_
+					continue
+				fi
+			else
+				unset _choice_
+			fi
+		done
+		if [ ! "${_choice_}" ]; then
+			$ECHO "\nIncorrect entry, please retry."
+		fi		
+	done	
+	_choice_="${_num_}"
+	for _i_ in $_choice_ ; do
+		local _fs_=`$SED -n "${_i_}p" ${TEM_DIR}/all_fs`
+		if [ ! "${_fs_}" ]; then	
+			_err_msg_="Unable to get choice from al_fs file" 
+			abort_script "$_err_msg_" 			
+		fi
+		local _name_fs_=`$ECHO ${_fs_} | $AWK '{print $2}'`
+		local _existing_fs_size_=`$ECHO ${_fs_} | $AWK '{print $3}'`
+		local _default_size_=`$ECHO ${_fs_} | $AWK '{print $4}'`	
+		if [ ! "${_name_fs_}" -o ! "${_default_size_}"  ]; then	
+			_err_msg_="Unable to get parameters for create re-size commands " 
+			abort_script "$_err_msg_" 			
+		fi
+		until [ ! -z "$_amount_" ]; do	
+			$ECHO "\nEnter new filessytem size for ${_name_fs_}, the current size is ${_existing_fs_size_}\n (Recommended size for deployment is ${_default_size_} ('g = gb' 'use m for mb' and 'use k for kb')) "
+			read _amount_
+			if [[ $($ECHO "${_amount_}" | $EGREP "^[0-9\.]+[gGmMkKtT]$") ]] ; then
+				_lschar_=`$ECHO ${_amount_} | $SED 's/[0-9\.]*//g'`
+				if [ ! "${_lschar_}" ]; then	
+					unset _amount_ 				
+				else
+					update_total_size_req "${_amount_}" "${_existing_fs_size_}"
+					if [ ${CHECK_SIZE} -ne 0 ]; then
+						unset _amount_
+					else
+						continue
+					fi
+				fi
+			else
+				unset _amount_
+			fi
+		done	
+		check_space_needed
+		$ECHO "${_name_fs_} ${_existing_fs_size_} ${_amount_} " >> ${TEM_DIR}/manual_resize			
+		unset _amount_
+	done
+}
+
+### Function: resize_single_fs ###
+#
+# Creates the resize comamdn to resize a NAS file system provided as parameter.
+# The new size of the file system is read from a command line parameter of the script.
+#
+# Arguments:
+#   $1 - NAS file system name
+# Return Values:
+#   none
+resize_single_fs()
+{
+  
+  $RM -rf ${TEM_DIR}/auto_resize
+  local _single_fs_="$1"
+
+  line=$($EGREP "^$_single_fs_[[:blank:]]" ${TEM_DIR}/all_fs_temp)
+  
+  local _system_name_=`$ECHO ${line} | $AWK '{print $1}'`
+  local _existing_fs_size_=`$ECHO ${line} | $AWK '{print $2}'`
+  local _ini_entry_=`$ECHO ${line} | $AWK '{print $3}'`
+  
+  if [ ! "${_system_name_}" -o ! "${_existing_fs_size_}" -o ! "${_ini_entry_}" ]; then	
+    _err_msg_="Unable to get parameters for create re-size commands " 
+    abort_script "$_err_msg_" 			
+  fi
+
+  check_filesystems_nas "${_system_name_}" "${_existing_fs_size_}" "${_ini_entry_}"
+  _existing_fs_size_="${EXISTING_FS_SIZE}"
+  
+  if [ -n "$SINGLE_FS_SIZE" ]; then
+    _new_fs_size_="$SINGLE_FS_SIZE"
+    get_kilo_size "$SINGLE_FS_SIZE"
+    _new_fs_size_k_="$SIZE_KILO"
+    get_kilo_size "$_existing_fs_size_"
+    _existing_fs_size_k_="$SIZE_KILO"
+    
+    if [[ $_new_fs_size_k_ -lt $_existing_fs_size_k_ ]]; then
+      if [[ $FORCE == "YES" ]]; then
+        AUTO_UPDATE="YES"
+        $ECHO "${_system_name_} ${_existing_fs_size_} ${_new_fs_size_}" >> ${TEM_DIR}/auto_resize
+        $ECHO "FileSystem Name: ${_system_name_}\tExisting Size: ${_existing_fs_size_}\tNew size: ${_new_fs_size_} ">> ${LOGFILE}
+      else
+        _err_msg_="No force parameter specified for reducing filesystem."
+        abort_script "$_err_msg_" 3
+      fi
+    else
+      update_total_size_req "${_new_fs_size_}" "${_existing_fs_size_}"
+      if [ ${CHECK_SIZE} -eq 0 ]; then
+        AUTO_UPDATE="YES"
+        $ECHO "${_system_name_} ${_existing_fs_size_} ${_new_fs_size_}" >> ${TEM_DIR}/auto_resize	
+        $ECHO "FileSystem Name: ${_system_name_}\tExisting Size: ${_existing_fs_size_}\tNew size: ${_new_fs_size_} ">> ${LOGFILE}
+      fi
+    fi
+  else
+    # size parameter is not set
+    _new_fs_size_=$($CAT ${TEM_DIR}/template_fs | $EGREP -w "^${_system_name_}" | $AWK '{ print $2}')
+    if [ ! "${_new_fs_size_}" ]; then	
+      _err_msg_="Unable to get filesystem size for ${_system_name_} in ${STORAGE_INI_RESIZE}" 
+      abort_script "$_err_msg_" 			
+    fi  
+  
+    update_total_size_req "${_new_fs_size_}" "${_existing_fs_size_}"
+    if [ ${CHECK_SIZE} -eq 0 ]; then
+      AUTO_UPDATE="YES"
+			$ECHO "${_system_name_} ${_existing_fs_size_} ${_new_fs_size_}" >> ${TEM_DIR}/auto_resize	
+			$ECHO "FileSystem Name: ${_system_name_}\tExisting Size: ${_existing_fs_size_}\tNew size: ${_new_fs_size_} ">> ${LOGFILE}
+		fi	      
+  fi
+}
+
+
+### Function: run_resize_commands ###
+#
+# Runs the resizing commands in file ${TEM_DIR}/resize_commands
+# 
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+run_resize_commands()
+{
+	$ECHO "${RUN_TIME} - Starting to Resize the NAS" | $TEE -a ${LOGFILE}
+	
+	if [ ! -s "${TEM_DIR}/resize_commands" ]; then
+		_err_msg_="${TEM_DIR}/resize_commands file not found" 
+		abort_script "$_err_msg_" 	
+	fi
+
+	while read line; do
+		${line} 
+		if [ $? -ne 0 ]; then
+			_err_msg_="Could not execute re-size command ${line}"
+			abort_script "$_err_msg_" 
+		fi	
+		
+	done<${TEM_DIR}/resize_commands
+	$ECHO "Command(s) ran:" >> ${LOGFILE}
+	$CAT ${TEM_DIR}/resize_commands >> ${LOGFILE}
+}
+
+
+### Function: select_storage_ini ###
+#
+# Selects the correct storage_ini file depending on
+# deployment type
+# GLO
+# Arguments:
+#   none
+# Return Values:
+#   none
+select_storage_ini()
+{
+	unset STORAGE_INI_RESIZE
+	# Has the user specified deployment=
+	if [ -s ${ENIQ_CONF_DIR}/extra_params/deployment ]; then
+		local _deployment_=`$CAT ${ENIQ_CONF_DIR}/extra_params/deployment | $TR '[:upper:]' '[:lower:]'`
+		if [ ! "${_deployment_}" ]; then
+			_err_msg_="Could not determine deployment id type"
+			abort_script "$_err_msg_"
+		fi
+	else
+		_err_msg_="Parameter \"deployment\" incorrectly specified, or is missing from boot command" 
+		abort_script "$_err_msg_" 
+	fi
+
+	case "${_deployment_}" in
+		ft)		STORAGE_INI_RESIZE=${ENIQ_TEMPL_DIR}/storage_ini.ft
+				;;	
+		small)	STORAGE_INI_RESIZE=${ENIQ_TEMPL_DIR}/storage_ini.sml
+				;;			
+		medium)	STORAGE_INI_RESIZE=${ENIQ_TEMPL_DIR}/storage_ini.med
+				;;			
+		large)	STORAGE_INI_RESIZE=${ENIQ_TEMPL_DIR}/storage_ini.lrg
+				;;
+		extralarge) STORAGE_INI_RESIZE=${ENIQ_TEMPL_DIR}/storage_ini.extralrg
+                ;;
+		*)	abort_script "deployment type not supported ${_deployment_}"			
+			;;
+	esac
+
+	if [ ! -s ${STORAGE_INI_RESIZE} ]; then
+		  _err_msg_="${STORAGE_INI_RESIZE} not found, or is empty" 	
+		  abort_script "$_err_msg_" 
+	fi
+
+	$ECHO "INI File to be used is ${STORAGE_INI_RESIZE}\n" | $TEE -a ${LOGFILE}
+}
+### Function: setup_env ###
+#
+# Set up environment variables for script.
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+setup_env()
+{
+	if [ ! "${ENIQ_BASE_DIR}" ]; then
+		# Directory on the root filesystem
+		ENIQ_BASE_DIR=/eniq
+	fi
+	# ENIQ SW conf
+	CLI_CONF_DIR=${ENIQ_BASE_DIR}/sw/conf
+
+	# Main Directory for the Core Installation SW
+	ENIQ_INST_DIR=${ENIQ_BASE_DIR}/installation
+
+	# Main Directory for the Core Installation SW
+	ENIQ_CORE_INST_DIR=${ENIQ_INST_DIR}/core_install
+
+	# ENIQ Config Directory
+	ENIQ_CONF_DIR=${ENIQ_INST_DIR}/config
+
+    # FLS config file
+    FLS_CONFIG_FILE=${ENIQ_CONF_DIR}/fls_conf
+
+	# File containing the type of OSS installation. Eg.statistics
+	INST_TYPE_FILE=${ENIQ_CONF_DIR}/ericsson_use_config
+	if [ ! -s "${INST_TYPE_FILE}" ]; then
+		_err_msg_="ENIQ install type not defined in ${INST_TYPE_FILE}"
+		abort_script "$_err_msg_"  
+	fi
+	# Read the installation type - should be "stats"
+	INSTALL_TYPE=`$CAT ${INST_TYPE_FILE} | $AWK -F\= '{print $2}'`
+	if [ ! "${INSTALL_TYPE}" ]; then
+		_err_msg_="Could not determine INSTALL_TYPE "
+		abort_script "$_err_msg_"
+	fi
+
+	# Templates Directory
+	ENIQ_TEMPL_DIR="${ENIQ_CORE_INST_DIR}/templates/${INSTALL_TYPE}"
+
+
+	# Source the common functions
+	if [ -s ${ENIQ_CORE_INST_DIR}/lib/common_functions.lib ]; then
+		. ${ENIQ_CORE_INST_DIR}/lib/common_functions.lib
+	else
+		_err_msg_="File ${ENIQ_CORE_INST_DIR}/lib/common_functions.lib not found"
+		abort_script "$_err_msg_" 
+	fi
+
+	if [ -s ${ENIQ_CORE_INST_DIR}/lib/common_core_install_functions.lib ]; then
+		. ${ENIQ_CORE_INST_DIR}/lib/common_core_install_functions.lib
+	else
+		_err_msg_="File ${ENIQ_CORE_INST_DIR}/lib/common_core_install_functions.lib not found"
+		abort_script "$_err_msg_" 
+	fi
+
+	if [ -s ${ENIQ_CORE_INST_DIR}/lib/common_inirator_functions.lib ]; then
+		. ${ENIQ_CORE_INST_DIR}/lib/common_inirator_functions.lib
+	else
+		_err_msg_="File ${ENIQ_CORE_INST_DIR}/lib/common_inirator_functions.lib not found"
+		abort_script "$_err_msg_" 
+	fi
+
+	# Has debug flag been used?
+	if [ -s ${ENIQ_CONF_DIR}/extra_params/debug ]; then
+		set -xv
+		BASH="/usr/bin/bash -xv"
+	fi
+	
+	if [ ! -s ${ENIQ_CONF_DIR}/${SUNOS_INI} ]; then
+		_err_msg_="Unable to access ${ENIQ_CONF_DIR}/${SUNOS_INI}. Exiting Script."
+		abort_script "$_err_msg_";
+	fi
+	HOSTSYNC_SMF_STR=`iniget HOST_SYNC_DAEMON -f ${ENIQ_CONF_DIR}/${SUNOS_INI} -v HOST_SYNC_SERVICE_STR`
+	if [ ! "${HOSTSYNC_SMF_STR}" ]; then
+	_err_msg_="Could not read host_syncd SMF string from ${ENIQ_CONF_DIR}/${SUNOS_INI}"
+	abort_script "$_err_msg_"
+	fi
+	NAS_FS_LIST="${TEM_DIR}/nas_fs_list"
+	
+	NASCLI=/ericsson/storage/bin/nascli
+	if [ ! -s ${NASCLI} ]; then
+		_err_msg_="Unable to access ${NASCLI}. Exiting Script."
+		abort_script "$_err_msg_";
+	fi
+
+}
+
+### Function: trans ###
+# Transforms (first column) in stdin as:
+# All slash '/' to dash '-'. Or reverse.
+# $1 = 'in|out' 'in' does /to-, 'out' does -to/ 
+# $2 = '0-9' Col to trans. 1=default, 0=All cols. (optional)
+trans()
+{
+   local type=$1 col=${2:-1}
+   if [ "$type" = "in" ]; then
+      awk '{gsub(/\//,"-",$'$col');print}'
+   else
+      awk '{gsub(/-/,"/",$'$col');print}'
+   fi
+}
+
+### Function: update_total_size_req ###
+#
+# checks that new filesystem size is greater than orginal size
+# if it is then update TOTAL_SIZE_REQ with delta
+# Arguments:
+#   new file system size and orginal filesystem name
+# Return Values:
+#   none
+update_total_size_req()
+{
+	local _new_size_="$1"
+	local _org_size_="$2"
+	if  [ "${_new_size_}" == "" ]; then
+		_err_msg_="Must provide a greater size"
+		abort_script "$_err_msg_"
+	fi
+	if  [ "${_org_size_}" == "" ]; then
+		_err_msg_="Must provide a smaller size"
+		abort_script "$_err_msg_"
+	fi
+	unset CHECK_SIZE
+
+
+
+	get_kilo_size "${_new_size_}"	
+	_new_size_=${SIZE_KILO}
+
+
+	get_kilo_size "${_org_size_}"	
+	_org_size_=${SIZE_KILO}
+
+
+	if [ ${_new_size_} -gt ${_org_size_} ]; then
+		let TOTAL_SIZE_REQ=${TOTAL_SIZE_REQ}+${_new_size_}-${_org_size_}
+		CHECK_SIZE=0
+	else
+		CHECK_SIZE=33
+	fi
+
+}
+
+### Function: user_confirm ###
+#
+# Get confirmation from user to proceed with resize action
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+user_confirm()
+{
+	local _msg_="${1}"
+	if [ "${_msg_}" ]; then
+	    $ECHO "${_msg_}"
+	fi
+	while :; do
+		unset USER_CONF
+		$ECHO "Enter [Yes | No] (case sensitive) : \c"
+
+		read USER_CONF
+		
+		if [ "$USER_CONF" == "Yes" -o "$USER_CONF" == "No"  ]; then       
+			break        
+		fi
+	done
+}
+### Function: usage_msg ###
+#
+#   Print out the usage message
+#
+# Arguments:
+#	none
+# Return Values:
+#	none
+usage_msg() 
+{
+$CLEAR
+$ECHO "
+Usage: `$BASENAME $0` -a <auto|manual> [ -l <path_to_logfile> ]
+                      
+options:
+-a	: Action. Must be either 
+        auto   --> Automatically selects filesystem sizes for deployment
+        manual --> Manual select new filesystem sizes
+			  
+-l  : Optional parameter specifying the full path to logfile.
+
+"
+}
+
+# ********************************************************************
+#
+#   Main body of program
+#
+# ********************************************************************
+
+RUN_TIME=`$DATE '+%Y-%b-%d_%H.%M.%S'`
+
+# Determine absolute path to software
+get_absolute_path
+
+# Check that the effective id of the user is root
+check_id $DEFAULT_USER
+
+while getopts "a:f:l:NFqs:" arg; do
+  case $arg in
+    l) LOGFILE="$OPTARG"
+     	;;
+    a) MANUAL_RESIZE="$OPTARG"
+      ;;
+		N) NO_CONFIRM="YES"
+      ;;
+    f) SINGLE_FS="$OPTARG"
+      ;;
+    F) FORCE="YES"
+      ;;
+    q) QUIET="YES"
+      ;;
+    s) SINGLE_FS_SIZE="$OPTARG"
+      ;;
+    \?) _err_msg_="`$BASENAME $0`"
+	   usage_msg
+       exit 1
+       ;;
+  esac
+done
+shift `$EXPR $OPTIND - 1`
+
+check_params
+
+# Set up environment variables for script.
+setup_env
+
+if [ ! "${LOGFILE}" ]; then
+    LOGFILE=${ENIQ_BASE_DIR}/log/resize_nas/resize_nas_${RUN_TIME}.log
+fi	
+  
+# Check/Create Logfile
+chk_create_logfile
+read_storage_type
+if [ "${STORAGE_TYPE}" != "raw" ]; then
+	_err_msg_="script only for raw storage type"
+	abort_script "$_err_msg_"
+fi
+# Create a temporary Directory
+TEM_DIR=/tmp/resize_nas_fs.$$
+$RM -rf ${TEM_DIR}
+$MKDIR -p ${TEM_DIR}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not create directory $TEM_DIR"
+    abort_script "$_err_msg_" 
+fi
+
+backup_storage_ini
+hostsync_smf "stop"
+hostsync_smf "disable"
+get_pool_name
+get_nas_fs_list
+compare_filesystems
+get_max_size_available
+
+	
+if [ "$MANUAL_RESIZE" == "YES" ]; then
+	list_fs_manual
+	resize_fs_manual
+	display_updated "${TEM_DIR}/manual_resize"
+	user_confirm "\nAre you sure you wish to continue?"
+	if [ "$USER_CONF" != "Yes" ]; then
+		$ECHO "User exited"
+		cleanup
+	fi
+	RESIZE_FILE_LIST="${TEM_DIR}/manual_resize"
+else
+  if [ -n "$SINGLE_FS" ]; then
+      resize_single_fs "$SINGLE_FS"
+  fi
+	if [ "${AUTO_UPDATE}" != "YES" ]; then
+		$ECHO "Filesystem sizes match deployment" | $TEE -a $LOGFILE
+		cleanup
+	fi
+	if [ ! "${NO_CONFIRM}" ]; then
+		display_updated "${TEM_DIR}/auto_resize"
+		user_confirm "\nAre you sure you wish to continue to expand filesystem above?"
+		if [ "$USER_CONF" != "Yes" ]; then
+				$ECHO "User exited"
+				cleanup
+		fi
+	fi
+	RESIZE_FILE_LIST="${TEM_DIR}/auto_resize"
+
+fi	
+
+create_resize_commands "${RESIZE_FILE_LIST}"
+run_resize_commands
+
+
+$ECHO "\nNAS file system resized successfully at ${RUN_TIME}" | $TEE -a ${LOGFILE}
+cp_storage_ini_sw
+cleanup

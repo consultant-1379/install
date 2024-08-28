@@ -1,0 +1,230 @@
+#!/bin/bash
+# ********************************************************************
+# Ericsson Radio Systems AB                                     SCRIPT
+# ********************************************************************
+#
+# (c) Ericsson Radio Systems AB 2017 - All rights reserved.
+#
+# The copyright to the computer program(s) herein is the property
+# of Ericsson Radio Systems AB, Sweden. The programs may be used
+# and/or copied only with the written permission from Ericsson Radio
+# Systems AB or in accordance with the terms and conditions stipulated
+# in the agreement/contract under which the program(s) have been
+# supplied.
+#
+# ********************************************************************
+# Name    : flexible_data_bkup.bsh
+# Date    : 04/04/2017
+# Revision: B
+# Purpose : It is a wrapper script which will use the backup fs creation 
+#           script and data loading script for hadling the 2-week data 
+#           backup.
+#
+# Usage   : flexible_data_bkup.bsh -a enable
+#           flexible_data_bkup.bsh -a disable
+#           flexible_data_bkup.bsh -a reconfigure
+
+# ********************************************************************
+#
+#   Command Section
+#
+# ********************************************************************
+
+AWK=/usr/bin/awk
+CHMOD=/usr/bin/chmod
+BASENAME=/usr/bin/basename
+BASH=/usr/bin/bash
+BC=/usr/bin/bc
+CAT=/usr/bin/cat
+CP=/usr/bin/cp
+DATE=/usr/bin/date
+DIRNAME=/usr/bin/dirname
+ECHO=/usr/bin/echo
+EGREP=/usr/bin/egrep
+EXPR=/usr/bin/expr
+FIND=/usr/bin/find
+GEGREP=/usr/sfw/bin/gegrep
+GREP=/usr/bin/grep
+HEAD=/usr/bin/head
+ID=/usr/bin/id
+MKDIR=/usr/bin/mkdir
+MOUNT=/usr/sbin/mount
+MV=/usr/bin/mv
+NAWK=/usr/bin/nawk
+PERL=/usr/bin/perl
+PWD=/usr/bin/pwd
+RM=/usr/bin/rm
+SCP=/usr/bin/scp
+SED=/usr/bin/sed
+SLEEP=/usr/bin/sleep
+SORT=/usr/bin/sort
+SSH=/usr/bin/ssh
+SU=/usr/bin/su
+SVCADM=/usr/sbin/svcadm
+SVCS=/usr/bin/svcs
+TAIL=/usr/bin/tail
+TEE=/usr/bin/tee
+TOUCH=/usr/bin/touch
+TR=/usr/bin/tr
+UMOUNT=/usr/sbin/umount
+WC=/usr/bin/wc
+DF=/usr/sbin/df
+
+### Function: abort_script ###
+#
+#   This will is called if the script is aborted if an error
+#   is encountered during runtime
+#
+# Arguments:
+#       $1 - Error message from part of program (Not always used)
+# Return Values:
+#       none
+abort_script()
+{
+    _err_time_=`$DATE '+%Y-%b-%d_%H.%M.%S'`
+
+    if [ "$1" ]; then
+        _err_msg_=$1
+    else
+        _err_msg_="${_err_time_} - ERROR : Script aborted.......\n"
+    fi
+
+    $ECHO "\n${_err_time_} - ERROR : $_err_msg_\n"
+
+    $RM -rf ${TEM_DIR}
+
+    exit 1
+}
+
+### Function: check_id ###
+#
+#   Check that the effective id of the user is correct
+#   If not print error msg and exit.
+#
+# Arguments:
+#       $1 : User ID name
+# Return Values:
+#       0 for success; 1 for failure;
+check_id()
+{
+    _check_id_=`$ID  | $AWK -F\( '{print $2}' | $AWK -F\) '{print $1}'`
+    if [ "${_check_id_}" != "$1" ]; then
+         _err_msg_="ERROR:: You must be ROOT to execute Script $0 - exiting"
+         abort_script "$_err_msg_" 
+    fi
+}
+
+### Function: setup_env ###
+#
+# Setup the environment variables
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+setup_env()
+{
+    #Eniq base directory
+    ENIQ_BASE_DIR=/eniq
+
+    # ENIQ Backup Directory
+    ENIQ_BKUP_DIR=${ENIQ_BASE_DIR}/bkup_sw
+
+    # ENIQ Admin Directory
+    ENIQ_ADMIN_DIR=${ENIQ_BASE_DIR}/admin
+
+    # ENIQ LOGDIR
+    ENIQ_LOG_DIR=${ENIQ_BASE_DIR}/local_logs
+
+    FS_CREATION_SCRIPT="${ENIQ_BKUP_DIR}/bin/flex_data_bkup_fs_creation.bsh"
+    RECONF_FLEX_FS_SCRIPT="${ENIQ_BKUP_DIR}/bin/reconfigure_flex_fs.bsh"
+    FS_CONF_FILE="${ENIQ_BKUP_DIR}/etc/flex_data_bkup.conf"
+    RECONF_PF_SCRIPT="${ENIQ_ADMIN_DIR}/bin/manage_eniq_backup.bsh"
+    DATA_LOADING_SCRIPT=""
+}
+
+### Function: usage_msg ###
+#
+#   Print out the usage message
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+usage_msg()
+{
+    $ECHO "
+    Usage : `$BASENAME $0` -a {enable|disable|reconfigure} [-l]
+
+    options:
+
+    -a  : Action. Must be either
+             enable       --> Create a new file-system on NAS
+             disable      --> Destroy the file-sysyem from NAS
+             reconfigure  --> Resize the file-system size
+
+    -l  : To generate logfile other than default path
+    "
+}
+
+# **********************************************************************
+#
+# ********************** Main body of program  *************************
+#
+# **********************************************************************
+
+# Check that the effective id of the user is root
+check_id root
+
+TIMESTAMP=`$DATE '+%d-%m-%y_%H.%M.%S'`
+
+# Get  values on runtime
+while getopts "a:l:" arg;
+do
+    case $arg in
+        a)     ACTION="$OPTARG"
+               ;;
+        l)     LOGFILE="$OPTARG"
+               $TOUCH $LOGFILE
+               ;;
+       \?)     $ECHO "Invalid option(s) passed"
+               usage_msg
+               exit 1
+               ;;
+    esac
+done
+
+if [ "${ACTION}" != "enable" -a "${ACTION}" != "disable" -a "${ACTION}" != "reconfigure" ]; then
+    usage_msg
+    exit 1
+fi
+
+setup_env
+
+if [ ! "${LOGFILE}" ]; then
+    LOGFILE=${ENIQ_LOG_DIR}/flex_data_bkup_${ACTION}_$TIMESTAMP.log
+    $TOUCH $LOGFILE
+fi
+
+if [ "${ACTION}" == "enable" ];then
+    $BASH ${FS_CREATION_SCRIPT} -a create -l ${LOGFILE}
+elif [ "${ACTION}" == "disable" ];then
+    while true; do
+    $ECHO "The filesystem flex_data_bkup will be deleted and the backed up data in the filesystem will be lost. Do you wish to continue?"
+    $ECHO "(Yy/Nn)"
+    read _usr_cnfrm_
+    if [ ${_usr_cnfrm_} ]; then
+        if [ ${_usr_cnfrm_} == "Y" -o ${_usr_cnfrm_} == "y" -o ${_usr_cnfrm_} == "N" -o ${_usr_cnfrm_} == "n" ]; then
+                break;
+        else
+                $ECHO "Incorrect value entered" | $TEE -a ${CONSOLELOGS}
+        fi
+    fi
+    done
+    if [ ${_usr_cnfrm_} == "N" -o ${_usr_cnfrm_} == "n" ]; then
+	exit 1
+    fi
+    $BASH ${FS_CREATION_SCRIPT} -a destroy -l ${LOGFILE}
+elif [ "${ACTION}" == "reconfigure" ];then
+    $BASH ${RECONF_PF_SCRIPT} -c
+fi

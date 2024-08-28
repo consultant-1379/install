@@ -1,0 +1,803 @@
+#!/bin/bash
+# ********************************************************************
+# Ericsson Radio Systems AB                                     SCRIPT
+# ********************************************************************
+#
+#
+# (c) Ericsson Radio Systems AB 2019 - All rights reserved.
+#
+# The copyright to the computer program(s) herein is the property
+# of Ericsson Radio Systems AB, Sweden. The programs may be used 
+# and/or copied only with the written permission from Ericsson Radio 
+# Systems AB or in accordance with the terms and conditions stipulated 
+# in the agreement/contract under which the program(s) have been 
+# supplied.
+#
+# ********************************************************************
+# Name    : post_upgrade.bsh
+# Date    : 25/07/2019
+# Revision: main\43
+# Purpose : Handle post-upgrade steps to remove flag_delta_<yyyymmdd> 
+# 			file
+# Usage   : post_upgrade.bsh [ -b <eniq_base_dir> ] [-l <logfile>] 
+#
+# ********************************************************************
+#
+# 	Command Section
+#
+# ********************************************************************
+AWK=/usr/bin/awk
+BASENAME=/usr/bin/basename
+BC=/usr/bin/bc
+CAT=/usr/bin/cat
+CHMOD=/usr/bin/chmod
+CHOWN=/usr/bin/chown
+CLEAR=/usr/bin/clear
+CMP=/usr/bin/cmp
+CP=/usr/bin/cp
+CPIO=/usr/bin/cpio
+DATE=/usr/bin/date
+DIRNAME=/usr/bin/dirname
+DOMAINNAME=/usr/bin/domainname
+DTCONFIG=/usr/dt/bin/dtconfig
+DUMPADM=/usr/sbin/dumpadm
+ECHO=/usr/bin/echo
+EGREP=/usr/bin/egrep
+EJECT=/usr/bin/eject
+ENV=/usr/bin/env
+EXPR=/usr/bin/expr
+FIND=/usr/bin/find
+FLARCREATE=/usr/sbin/flarcreate
+FORMAT=/usr/sbin/format
+FUSER=/usr/sbin/fuser
+EGREP=/usr/sfw/bin/EGREP
+GETENT=/usr/bin/getent
+GETTEXT=/usr/bin/gettext
+GREP=/usr/bin/grep
+GROUPADD=/usr/sbin/groupadd
+GTAR=/usr/sfw/bin/gtar
+GZCAT=/usr/bin/gzcat
+HEAD=/usr/bin/head
+MYHOSTNAME=/usr/bin/hostname
+ID=/usr/bin/id
+INIT=/usr/sbin/init
+LS=/usr/bin/ls
+MKDIR=/usr/bin/mkdir
+MORE=/usr/bin/more
+MV=/usr/bin/mv
+PGREP=/usr/bin/pgrep
+PING=/usr/sbin/ping
+PKGRM=/usr/sbin/pkgrm
+PWD=/usr/bin/pwd
+RM=/usr/bin/rm
+SED=/usr/bin/sed
+SU=/usr/bin/su
+TEE=/usr/bin/tee
+TOUCH=/usr/bin/touch
+USERDEL=/usr/sbin/userdel
+
+# ********************************************************************
+#
+#       Configuration Section
+#
+# ********************************************************************
+
+# ********************************************************************
+#
+#       Pre-execution Operations
+#
+# ********************************************************************
+# Default user
+DEFAULT_USER=root
+
+# Name of SunOS & ENIQ ini Files
+SUNOS_INI=SunOS.ini
+STORAGE_INI=storage.ini
+
+ZFS_SAFE_LIST="local_logs smf installation"
+
+# ********************************************************************
+#
+# 	Functions
+#
+# ********************************************************************
+### Function: abort_script ###
+#
+#   This will is called if the script is aborted thru an error
+#   signal sent by the kernel such as CTRL-C or if a serious
+#   error is encountered during runtime
+#
+# Arguments:
+#       $1 - Error message from part of program (Not always used)
+# Return Values:
+#       none
+abort_script()
+{
+_err_time_=`$DATE '+%Y-%b-%d_%H.%M.%S'`
+
+if [ "$1" ]; then
+    _err_msg_="${_err_time_} - $1"
+else
+    _err_msg_="${_err_time_} - ERROR : Script aborted.......\n"
+fi
+
+if [ "${LOGFILE}" ]; then
+    $ECHO "\nERROR : ${_err_msg_}\n" | $TEE -a ${LOGFILE}
+else
+    $ECHO "\nERROR : ${_err_msg_}\n"
+fi
+
+cd $SCRIPTHOME
+$RM -rf ${TEM_DIR}
+
+exit 1
+}
+
+### Function: build_untouchable_list ###
+#
+# Create a list of filesystems that
+# are not to be removed
+#
+# Arguments:
+#       none
+# Return Values:
+#	0 : Success
+#	1 : Failure
+build_untouchable_list()
+{
+$ECHO "\nCreating a list of ZFS filesystems to protect" | $TEE -a ${LOGFILE}
+	
+# This list is the same as the install_extra_fs()
+# function in eniq_core_install.bsh	
+local _safe_fs_list_="${ZFS_SAFE_LIST}"
+REMOVE_ZFS_LIST=""
+
+# Need a few extra filesystems if we're on ZFS storage
+if [ "${STORAGE_TYPE}" == "zfs" ]; then
+	_safe_fs_list_="${_safe_fs_list_} log backup sentinel"
+fi
+
+# And Stats needs even more due to the upgrade paths
+if [ "${INSTALL_TYPE}" == "stats" ]; then
+	_safe_fs_list_="${_safe_fs_list_} bkup_sw connectd"
+fi
+
+REMOVE_ZFS_LIST=`$ECHO ${_safe_fs_list_} | $SED -e 's| |\||g'`
+if [ ! "${REMOVE_ZFS_LIST}" ]; then
+	return 1
+fi
+}
+
+### Function: check_delete_fs ###
+#
+# Checks the existing filesystems, and deletes
+# whats no longer required
+#
+# Arguments:
+#	$1 : SunOS.ini file to update
+#	$2 : List of fileysstems to keep
+# Return Values:
+#	0	: Success
+#	>0	: Failure
+check_delete_fs()
+{
+local _sunos_ini_file_=$1
+local _remove_list_=$2
+	
+# Create a temp version of the SunOS.ini
+$CP ${_sunos_ini_file_} ${TEM_DIR}/${SUNOS_INI}
+if [ $? -ne 0 ]; then
+    $ECHO "Could not copy ${_sunos_ini_file_} to ${TEM_DIR}/${SUNOS_INI}" | $TEE -a ${LOGFILE}
+    return 1
+fi
+	
+# Get a list of ZFS parent tags
+$ECHO "Creating a list of installed ZFS filesystems from ${_sunos_ini_file_}" | $TEE -a ${LOGFILE}
+local _zfs_parent_tags_=`iniget SunOS_ZFS_FS -f ${_sunos_ini_file_}`
+if [ ! "${_zfs_parent_tags_}" ]; then
+    $ECHO "Could not get a list of ZFS filesystem information from ${_sunos_ini_file_}" | $TEE -a ${LOGFILE}
+    return 1
+fi
+	
+# Check the filesystems in the existing SunOS.ini file,
+# and remove any that aren't in the templated file
+local _no_delete_=0	
+for _tag_ in ${_zfs_parent_tags_}; do
+    # Determine the dir path
+    local _zfs_fs_=`iniget ${_tag_} -f ${_sunos_ini_file_} -v mountpoint | $AWK -F\/ '{print $NF}'`
+    if [ ! "${_zfs_fs_}" ]; then
+	    _err_msg_="Could not get ZFS filesystem mountpoint for ${_tag_} in ${_sunos_ini_file_}"
+	    abort_script "${_err_msg_}"
+	fi
+	
+	$ECHO ${_zfs_fs_} | $EGREP "${_remove_list_}" >> /dev/null 2>&1
+	if [ $? -ne 0 ]; then
+        delete_zfs_fs ${_tag_} ${TEM_DIR}/${SUNOS_INI}
+        if [ $? -ne 0 ]; then
+		    _err_msg_="Problem encountered deleting ${_tag_} block of ZFS filesystem information"
+		    abort_script "${_err_msg_}"
+		fi
+        _no_delete_=1
+    fi
+done
+
+if [ ${_no_delete_} -eq 0 ]; then
+	$ECHO "\nNo ZFS filesystem found to be removed" | $TEE -a ${LOGFILE}
+else
+	$ECHO "Updating ${_sunos_ini_file_}" | $TEE -a ${LOGFILE}
+	# Update the SunOS.ini with the changes
+	$CP ${TEM_DIR}/${SUNOS_INI} ${ENIQ_CONF_DIR}/${SUNOS_INI}
+	if [ $? -ne 0 ]; then
+	    $ECHO "Could not copy ${TEM_DIR}/${SUNOS_INI} to ${_sunos_ini_file_}" | $TEE -a ${LOGFILE}
+	    return 1
+	fi
+	
+	$ECHO "\nSuccessfully removed unwanted ZFS filesystems" | $TEE -a ${LOGFILE}
+fi
+}
+
+### Function: check_files_and_scripts ###
+#
+#   Checks required files/scripts are present
+#
+# Arguments:
+#       $1 : User ID name
+# Return Values:
+#       none
+check_files_and_scripts()
+{
+$ECHO "\nChecking for required files and scripts" | $TEE -a ${LOGFILE}
+	
+if [ ! -s ${ENIQ_CONF_DIR}/${SUNOS_INI} ]; then
+    _err_msg_="Cannot locate ${ENIQ_CONF_DIR}/${SUNOS_INI}"
+    abort_script "${_err_msg_}"
+fi
+
+if [ "${INSTALL_TYPE}" == "events" ]; then
+	if [ ! -s ${ENIQ_ADMIN_DIR}/bin/remove_openldap.bsh ]; then
+	    _err_msg_="Cannot locate ${ENIQ_ADMIN_DIR}/bin/remove_openldap.bsh"
+	    abort_script "${_err_msg_}"
+	fi
+fi
+}
+
+### Function: check_id ###
+#
+#   Check that the effective id of the user is correct
+#   If not print error msg and exit.
+#
+# Arguments:
+#       $1 : User ID name
+# Return Values:
+#       none
+check_id()
+{
+_check_id_=`$ID  | $AWK -F\( '{print $2}' | $AWK -F\) '{print $1}'`
+if [ "$_check_id_" != "$1" ]; then
+    _err_msg_="You must be $1 to execute this script."
+    abort_script "${_err_msg_}"
+fi
+}
+
+### Function: chk_create_logfile ###
+#
+# Check/Create Logfile
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+chk_create_logfile()
+{
+$MKDIR -p `$DIRNAME ${LOGFILE}`
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not create directory `$DIRNAME ${LOGFILE}`"
+     abort_script "${_err_msg_}"
+fi
+
+$TOUCH -a ${LOGFILE}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not write to file ${LOGFILE}"
+    abort_script "${_err_msg_}"
+fi
+}
+
+### Function: create_template_list ###
+#
+# Create a list of filesystems from 
+# the templated SunOS.ini file
+#
+# Arguments:
+#	1 : Template SunOS ini file
+# Return Values:
+#	0 : Success
+#  >0 : Failure
+create_template_list()
+{
+local _sunos_ini_=$1
+
+# Build a list of ZFS filesystems from the template directory
+$ECHO "Creating a list of ZFS tags from ${_sunos_ini_} for filesystem comparison" | $TEE -a ${LOGFILE}
+_tag_list_template_=`iniget SunOS_ZFS_FS -f ${_sunos_ini_}`
+for _template_tag_ in ${_tag_list_template_}; do
+    # Determine the mountpoint
+    _zfs_fs_template_=`iniget ${_template_tag_} -f ${_sunos_ini_} -v mountpoint | $AWK -F\/ '{print $NF}'`
+    if [ ! "${_zfs_fs_template_}" ]; then
+	    $ECHO "Could not get ZFS filesystem mountpoint for ${_template_tag_} in ${_sunos_ini_}" | $TEE -a ${LOGFILE}
+	    return 1
+	fi
+	
+	# Add these filesystems to the protected list
+	REMOVE_ZFS_LIST="${REMOVE_ZFS_LIST}|${_zfs_fs_template_}"
+done
+}
+
+### Function: delete_zfs_fs ###
+#
+# Delete the specified ZFS filesystem
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+delete_zfs_fs()
+{
+local _del_block_=$1
+local _sunos_ini_file_=$2
+
+# Remove the storage block and its relevant ZFS filesystem
+_name_=`iniget ${_del_block_} -f ${_sunos_ini_file_} -v name`
+if [ ! "${_name_}" ]; then
+    $ECHO "Could not get ZFS filesystem name for ${_del_block_} in ${_sunos_ini_file_}" | $TEE -a ${LOGFILE}
+    return 1
+fi
+
+$ECHO "\nRemoving ZFS filesystem ${_name_}" | $TEE -a ${LOGFILE}
+$ZFS list ${_name_} >> /dev/null 2>&1
+if [ $? -ne 0 ]; then
+        $ECHO "Could not found ZFS filesystem ${_name_} to remove" | $TEE -a ${LOGFILE}
+else
+        $ZFS destroy -rf ${_name_} >> /dev/null 2>&1
+        if [ $? -ne 0 ]; then
+                $ECHO "Could not delete ZFS filesystem ${_name_}" | $TEE -a ${LOGFILE}
+                return 1
+        fi
+fi
+
+$ECHO "Removing ${_del_block_} block from ${_sunos_ini_file_}" | $TEE -a ${LOGFILE}
+$INIDEL -g SunOS_ZFS_FS -p ${_del_block_} -i ${_sunos_ini_file_} -o ${TEM_DIR}/${SUNOS_INI}_upd >> /dev/null 2>&1
+if [ $? -ne 0 ]; then
+    $ECHO "Error removing ${_del_block_} from ${_sunos_ini_file_}" | $TEE -a ${LOGFILE}
+    return 1
+fi
+
+$CP ${TEM_DIR}/${SUNOS_INI}_upd ${_sunos_ini_file_}
+if [ $? -ne 0 ]; then
+    $ECHO "Could not copy ${TEM_DIR}/${SUNOS_INI}_upd to ${_sunos_ini_file_}" | $TEE -a ${LOGFILE}
+    return 1
+fi
+
+$RM -rf ${TEM_DIR}/${SUNOS_INI}_upd
+if [ -f ${TEM_DIR}/${SUNOS_INI}_upd ]; then
+    $ECHO "Could not delete ${TEM_DIR}/${SUNOS_INI}_upd " | $TEE -a ${LOGFILE}
+    return 1
+fi
+}
+
+
+### Function: get_absolute_path ###
+#
+# Determine absolute path to software
+#
+# Arguments:
+#	none
+# Return Values:
+#	none
+get_absolute_path() 
+{
+_dir_=`$DIRNAME $0`
+SCRIPTHOME=`cd $_dir_ 2>/dev/null && pwd || $ECHO $_dir_`
+}
+
+### Function: setup_env ###
+#
+# Set up environment variables for script. 
+#
+# Arguments:
+#	none
+# Return Values:
+#	none
+setup_env()
+{
+if [ ! "${ENIQ_BASE_DIR}" ]; then
+    # Directory on the root filesystem
+    ENIQ_BASE_DIR=/eniq
+fi
+
+# Main Directory for the Installation SW
+ENIQ_INST_DIR=${ENIQ_BASE_DIR}/installation
+
+# This should not be needed in the future
+ENIQ_CONF_DIR=${ENIQ_INST_DIR}/config
+
+# Main Directory for the Core Installation SW
+ENIQ_CORE_INST_DIR=${ENIQ_INST_DIR}/core_install
+
+# ENIQ SW Directory
+ENIQ_SW_DIR=${ENIQ_BASE_DIR}/sw
+
+# ENIQ SW Conf Directory
+CLI_CONF_DIR=${ENIQ_SW_DIR}/conf
+
+# ENIQ Admin Directory
+ENIQ_ADMIN_DIR=${ENIQ_BASE_DIR}/admin
+
+# ENIQ Admin Bin Directory
+ENIQ_ADMIN_BIN_DIR=${ENIQ_ADMIN_DIR}/bin
+
+# ENIQ mediator Directory
+ENIQ_MEDIATOR_DIR=${ENIQ_BASE_DIR}/mediator
+
+# ENIQ Log Directory
+ENIQ_LOG_DIR=${ENIQ_BASE_DIR}/local_logs
+
+#ENIQ INSTALLER Directory
+ENIQ_INSTALLER_DIR=${ENIQ_SW_DIR}/installer
+
+# Get server type
+CURR_SERVER_TYPE=`$CAT ${ENIQ_CONF_DIR}/installed_server_type`
+if [ ! "${CURR_SERVER_TYPE}" ]; then
+    _err_msg_="Could not read ${ENIQ_CONF_DIR}/installed_server_type"
+    abort_script "${_err_msg_}" 
+fi
+
+# File containing the type of OSS installation. Eg. oss or single
+INST_TYPE_FILE=${ENIQ_CONF_DIR}/ericsson_use_config
+if [ ! -s "${INST_TYPE_FILE}" ]; then
+    _err_msg_="ENIQ install type not defined in ${INST_TYPE_FILE}"
+    abort_script "${_err_msg_}"
+fi
+# Read the installation type
+INSTALL_TYPE=`$CAT ${INST_TYPE_FILE} | $AWK -F\= '{print $2}'`
+
+# Source the common functions
+if [ -s ${ENIQ_ADMIN_DIR}/lib/common_functions.lib ]; then
+    . ${ENIQ_ADMIN_DIR}/lib/common_functions.lib
+else
+    _err_msg_="File ${ENIQ_ADMIN_DIR}/lib/common_functions.lib not found"
+    abort_script "${_err_msg_}"
+fi
+
+if [ ! -s $ENIQ_ADMIN_DIR/lib/inidel.pl ]; then
+    _err_msg_="Cannot locate $ENIQ_ADMIN_DIR/lib/inidel"
+    abort_script "${_err_msg_}"
+else
+    INIDEL=$ENIQ_ADMIN_DIR/lib/inidel.pl
+fi
+
+# Read the SAN device type
+if [ -s ${ENIQ_CONF_DIR}/${SUNOS_INI} ] ; then
+	STORAGE_TYPE=`iniget STOR_TYPE -f ${ENIQ_CONF_DIR}/${SUNOS_INI} -v STORAGE_TYPE`
+	if [ "${STORAGE_TYPE}" = "raw" ];then
+		if [ -s ${ENIQ_CONF_DIR}/${SUNOS_INI} ]; then
+			SAN_DEVICE=`iniget SAN_DEV -f ${ENIQ_CONF_DIR}/${SUNOS_INI} -v SAN_DEVICE`
+		else
+			if [ -s ${ENIQ_CONF_DIR}/san_details ]; then
+            SAN_DEVICE=`$CAT ${ENIQ_CONF_DIR}/san_details | $EGREP "^SAN_DEVICE=" | $AWK -F\= '{print $2}'`
+			fi
+		fi
+	else
+        if [ "${_deployment_} == "small" -o "${_deployment_} == "ft" ]; then
+            SAN_DEVICE="${STORAGE_TYPE}_compact"
+	    else
+	        SAN_DEVICE="${STORAGE_TYPE}"
+	    fi
+	fi
+	#setting the san device value for Vapp
+	if [ "${SAN_DEVICE}" == "local" ]; then
+                SAN_DEVICE=vnx
+	fi
+
+fi
+if [ ! "${SAN_DEVICE}" ]; then
+    _err_msg_="Could not read SAN_DEVICE param"
+    abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+fi 
+
+TEMPLATED_SUNOS_INI="${ENIQ_CORE_INST_DIR}/templates/${INSTALL_TYPE}/${SUNOS_INI}_${SAN_DEVICE}"
+if [ ! "${TEMPLATED_SUNOS_INI}" ]; then
+    _err_msg_="Could not read STORAGE_TYPE from ${ENIQ_CONF_DIR}/${SUNOS_INI}"
+    abort_script "${_err_msg_}"
+fi
+
+HNAME=`${MYHOSTNAME}`
+HOST_IP=`$GETENT hosts ${HNAME} | $AWK '{print $1}' | $HEAD -1`
+}
+
+### Function: chk_remove_oldSIM ###
+#
+# Remove the old instance of SIM after
+# new version has been installed
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+chk_remove_oldSIM()
+{
+if [ -e "/nav/opt/esm/bin/sim.sh" ]; then
+	$ECHO "\Removing old SIM..."
+	$PKGRM -n ERICsim 
+	if [ $? -ne 0 ]; then
+		_err_msg_="Issue encountered while trying to delete old SIM package ERICsim"
+		abort_script "${_err_msg_}"
+	fi
+	$SVCCFG delete sim
+	if [ $? -ne 0 ]; then
+		_err_msg_="Issue encountered while trying to delete old SIM service"
+		abort_script "${_err_msg_}"
+	fi
+	$RM -rf /var/svc/manifest/sim
+	if [ $? -ne 0 ]; then
+		_err_msg_="Issue encountered while trying to delete old SIM manifest files"
+		abort_script "${_err_msg_}"
+	fi
+	$RM -rf /nav
+	if [ $? -ne 0 ]; then
+		_err_msg_="Issue encountered while trying to delete old SIM nav directories"
+		abort_script "${_err_msg_}"
+	fi
+	$ECHO "\Old SIM deleted successfully"
+fi
+}
+
+### Function: chk_delete_delta_flag ###
+#
+# Remove the instance of flag_delta_<currentdate>
+# post-upgrade process
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+chk_delete_delta_flag()
+{
+delta_timestamp=`$DATE '+%Y%m%d'`
+if [ -e "/eniq/sw/installer/flag_delta_${delta_timestamp}" ]; then
+	$ECHO "Found flag_delta_${delta_timestamp} file and deleting..." | $TEE -a ${LOGFILE}
+	$RM -rf /eniq/sw/installer/flag_delta_${delta_timestamp}
+	if [ $? -ne 0 ]; then
+		_err_msg_="Issue encountered while trying to delete flag_delta_${delta_timestamp} file"
+		abort_script "${_err_msg_}"
+	fi
+else
+	$ECHO "flag_delta_${delta_timestamp} does not exist" | $TEE -a ${LOGFILE}
+fi
+}
+
+
+
+### Function: usage_msg ###
+#
+#   Print out the usage message
+#
+# Arguments:
+#	none
+# Return Values:
+#	none
+usage_msg() 
+{
+$CLEAR
+$ECHO "
+Usage: `$BASENAME $0` [ -b <eniq_base_dir> ] [-l <logfile>] 
+                      
+options:
+
+-b  : Optional parameter specifying the full path to where the ENIQ
+      BASEDIR directory is (eg. /eniq). If not specified, then the
+      script will assume the the base directory is /eniq
+
+-l  : Used to specify a logfile. Default will be used if none specified.         
+"
+}
+
+# ********************************************************************
+#
+# 	Main body of program
+#
+# ********************************************************************
+#
+RUN_TIME=`$DATE '+%Y-%b-%d_%H.%M.%S'`
+
+# Determine absolute path to software
+get_absolute_path
+
+# Check that the effective id of the user is root
+check_id $DEFAULT_USER
+
+while getopts ":b:l:" arg; do
+  case $arg in
+    b) ENIQ_BASE_DIR="$OPTARG"
+       ;;
+    l) LOGFILE="$OPTARG" 
+       ;;       
+   \?) usage_msg
+       exit 1
+       ;;
+  esac
+done
+shift `expr $OPTIND - 1`
+
+# Set up environment variables for script. 
+setup_env
+
+if [ ! "${LOGFILE}" ]; then
+    LOGFILE=${ENIQ_LOG_DIR}/upgrade/post_upgrade.log
+fi	
+  
+# Check/Create Logfile
+chk_create_logfile
+
+$ECHO "\n----------------------------------------------------------------------" >> ${LOGFILE}
+$ECHO "${RUN_TIME} - Starting post upgrade configuration on ${HNAME}" >> ${LOGFILE}
+$ECHO "----------------------------------------------------------------------" >> ${LOGFILE}
+
+# Check all required files/scripts exist on the server
+check_files_and_scripts
+
+# Create a temporary Directory
+TEM_DIR=/tmp/post_upgrade.$$
+$RM -rf ${TEM_DIR}
+$MKDIR -p -m 777 ${TEM_DIR}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not create directory ${TEM_DIR}"
+    abort_script "${_err_msg_}"
+fi
+
+# Build a list of ZFS filesystems that
+# are not to be removed regardless of
+# whether they are in the template or not
+build_untouchable_list
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not build a list of ZFS filesystems to keep"
+    abort_script "${_err_msg_}"
+fi
+
+# Create a list of filesystems from the templated SunOS.ini file
+# and add this list to the "untouchables"
+create_template_list ${TEMPLATED_SUNOS_INI}
+
+# Delete any ZFS filesystems we don't want
+check_delete_fs ${ENIQ_CONF_DIR}/${SUNOS_INI} "${REMOVE_ZFS_LIST}"
+if [ $? -ne 0 ]; then
+    _err_msg_="Issue encountered trying to check and delete unwanted filesystems"
+    abort_script "${_err_msg_}"
+fi
+
+if [ "${INSTALL_TYPE}" == "events" ]; then
+	$ECHO "\nChecking if openldap SW needs to be removed" | $TEE -a ${LOGFILE}
+	$ECHO "using command:" >> ${LOGFILE}
+	$ECHO "/usr/bin/bash ${ENIQ_ADMIN_DIR}/bin/remove_openldap.bsh -l ${LOGFILE}\n" >> ${LOGFILE}
+	/usr/bin/bash ${ENIQ_ADMIN_DIR}/bin/remove_openldap.bsh -l ${LOGFILE}
+	if [ $? -ne 0 ]; then
+	    _err_msg_="Error when running ${ENIQ_ADMIN_DIR}/bin/remove_openldap.bsh"
+	    abort_script "${_err_msg_}"
+	fi
+fi
+
+if [ "${CURR_SERVER_TYPE}" == "eniq_stats" -o "${CURR_SERVER_TYPE}" == "stats_coordinator" ]; then
+	$ECHO "\nChecking if mediator needs to be removed" | $TEE -a ${LOGFILE}
+	$ECHO "command: /usr/bin/bash ${ENIQ_ADMIN_DIR}/bin/remove_mediator.bsh -l ${LOGFILE}\n" >> ${LOGFILE}
+	/usr/bin/bash ${ENIQ_ADMIN_DIR}/bin/remove_mediator.bsh -l ${LOGFILE}
+	if [ $? -ne 0 ]; then
+	    _err_msg_="Error when running ${ENIQ_ADMIN_DIR}/bin/remove_mediator.bsh"
+	    abort_script "${_err_msg_}"
+	fi
+fi
+
+
+# Flag for DBCC script.
+
+if [ "${CURR_SERVER_TYPE}" == "stats_coordinator" -o "${CURR_SERVER_TYPE}" == "eniq_coordinator" -o  "${CURR_SERVER_TYPE}" == "eniq_events" -o "${CURR_SERVER_TYPE}" == "eniq_stats" ]; then
+
+${TOUCH} ${ENIQ_ADMIN_DIR}/etc/upgrade_II_dbcc_flag_indicator
+
+fi
+
+
+# Delete delta flag file if present post-upgrade
+chk_delete_delta_flag
+
+#restoring alarm password and enabling alarm reports
+manage_stats_alarm post
+if [ $? -ne 0 ]; then
+	_err_msg_="Error: Cannot restore alarm password and enable alarm reports"
+	abort_script "${_err_msg_}"
+	$ECHO "Error: Cannot restore alarm password and enable alarm reports"
+fi
+
+# Delete migration backup files if present post-upgrade
+if [ "${INSTALL_TYPE}" == "stats" ]; then
+    # Check if migration activity is performed on the server
+    if [ -f /var/tmp/solaris_migration_success ]; then
+        $ECHO "\nChecking if any Migration backup needs to be removed" | $TEE -a ${LOGFILE}
+        $ECHO "command: /usr/bin/bash ${ENIQ_CORE_INST_DIR}/bin/eniq_solaris_migration.bsh -a cleanup -l ${LOGFILE}\n" >> ${LOGFILE}
+        /usr/bin/bash ${ENIQ_CORE_INST_DIR}/bin/eniq_solaris_migration.bsh -a cleanup >> ${LOGFILE}
+        if [ $? -ne 0 ]; then
+             _err_msg_="Failed to execute cleanup of OS migration"
+              abort_script "${_err_msg_}"
+        fi
+    fi
+fi
+
+
+if [ "${STORAGE_TYPE}" == "raw" ]; then
+# Changing the permision of /var/adm/log/agent.pid to 644 on blade server
+     AGENT_PID_FILE=/var/adm/log/agent.pid
+     if [ -f ${AGENT_PID_FILE} ]; then
+          log_msg -l ${LOGFILE} -q -s "Changing ${AGENT_PID_FILE} permissions to 644"
+          $CHMOD 644 ${AGENT_PID_FILE}
+          if [ $? -ne 0 ]; then
+               _err_msg_="Could not change permissions of ${AGENT_PID_FILE} to 644"
+               abort_script "${_err_msg_}"
+          fi
+     fi
+else
+# Removing the unused file systems in RACK server
+# Creating a list of SunOS directories paths from old SunOS.ini file
+    if [ -s ${ENIQ_CONF_DIR}/backup/${SUNOS_INI}_backup ]; then
+        old_dir_list=`iniget SunOS_DIRECTORY -f ${ENIQ_CONF_DIR}/backup/${SUNOS_INI}_backup`
+        for old_dir in ${old_dir_list}; do
+            old_dir_path=`iniget ${old_dir} -f ${ENIQ_CONF_DIR}/backup/${SUNOS_INI}_backup -v path | ${CUT} -f 2 -d "="`
+            $ECHO $old_dir_path >> ${TEM_DIR}/old_dir_list_file    
+        done
+        
+        # Creating a list of SunOS directories paths from updated SunOS.ini file
+        new_dir_list=`iniget SunOS_DIRECTORY -f ${ENIQ_CONF_DIR}/${SUNOS_INI}`
+        for new_dir in ${new_dir_list}; do
+            new_dir_path=`iniget ${new_dir} -f ${ENIQ_CONF_DIR}/${SUNOS_INI} -v path | ${CUT} -f 2 -d "="`
+            $ECHO $new_dir_path >> ${TEM_DIR}/new_dir_list_file    
+        done
+
+        # Creating a list of SunOS directories to be removed.
+        log_msg -l ${LOGFILE} -q -s "Creating a list of file systems to be removed."
+        for DIR in `$CAT ${TEM_DIR}/old_dir_list_file`; do
+           $CAT ${TEM_DIR}/new_dir_list_file | $EGREP $DIR >> /dev/null 2>&1
+           if [ $? -ne 0 ]; then
+               $ECHO $DIR >> ${TEM_DIR}/unused_dir_list
+           fi
+        done
+
+        # Deleting the unused directories.
+        if [ -s ${TEM_DIR}/unused_dir_list ]; then
+            log_msg -l ${LOGFILE} -q -s "Removing the unused directories"
+            for unused_fs in `$CAT ${TEM_DIR}/unused_dir_list`;do
+               $RM -rf $unused_fs
+               if [ -d $unused_fs ]; then
+                    _error_msg_="Could not remove $unused_fs directory"
+                    abort_script "${_error_msg_}"
+               fi
+               log_msg -l ${LOGFILE} -q -s "Successfully removed the unused directory $unused_fs"
+            done
+        fi
+    fi
+fi
+
+#Remove upguser from ENIQ
+_user_tag_="upguser"
+for _users_ in ${_user_tag_}; do
+$GETENT passwd ${_users_} >> /dev/null 2>&1
+    if [ $? -eq 0 ]; then
+        $USERDEL -r ${_users_} >> /dev/null 2>&1
+            if [ $? -ne 0 ]; then
+                _err_msg_="Could not delete ${_users_}"
+                abort_script "$_err_msg_"
+            else
+                log_msg -l ${LOGFILE} -q -s "${_users_} removed successfully from ENIQ"
+            fi
+    fi
+
+done
+
+$RM -rf ${TEM_DIR}
+exit 0

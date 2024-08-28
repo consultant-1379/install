@@ -1,0 +1,20 @@
+[Unit]
+Description=ENIQ DataWarehouse Database Service
+After=eniq-repdb.service
+
+[Service]
+Type=forking
+User=dcuser
+Group=dc5000
+ExecStart=/eniq/smf/bin/eniq_smf_start_stop.sh -a start -s dwhdb
+ExecStop=/eniq/smf/bin/eniq_smf_start_stop.sh -a stop -s dwhdb
+Restart=always
+RestartSec=15
+StartLimitInterval=100
+StartLimitBurst=3
+TimeoutStartSec=0
+TimeoutStopSec=300
+
+[Install]
+WantedBy=multi-user.target
+

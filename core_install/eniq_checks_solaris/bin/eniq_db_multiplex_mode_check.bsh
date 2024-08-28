@@ -1,0 +1,430 @@
+#!/usr/bin/bash
+# ********************************************************************
+# Ericsson Radio Systems AB                                     SCRIPT
+# ********************************************************************
+#
+# (c) Ericsson Radio Systems AB 2016 - All rights reserved.
+#
+# The copyright to the computer program(s) herein is the property
+# of Ericsson Radio Systems AB, Sweden. The programs may be used
+# and/or copied only with the written permission from Ericsson Radio
+# Systems AB or in accordance with the terms and conditions stipulated
+# in the agreement/contract under which the program(s) have been
+# supplied.
+#
+# ********************************************************************
+# Name    : eniq_db_multiplex_mode_check.bsh 
+# Date    : 07/10/2020
+# Revision: \main\20.4.9.EU1\1
+# Purpose : Script will check the database multiplex mode.
+#
+# Usage   : eniq_db_multiplex_mode_check.bsh 
+#
+# Exit Values:
+#  0   : SUCCESS
+#  3   : NO RUN  : Healthcheck Aborted
+#  75  : FAILED  : Databse is not in multiplex mode.
+#  74  : FAILED  : Failed to set DB env variables.
+#  77  : FAILED  : Failed to execute DB query.
+#  51  : NO RUN  : Multiplex mode check is not applicable for Single blade.
+#  16  : NO RUN  : Not applicable for RACK server
+#
+#
+# ********************************************************************
+#
+#   Command Section
+#
+# ********************************************************************
+
+AWK="/usr/bin/awk"
+CAT="/usr/bin/cat"
+CP="/usr/bin/cp"
+SU="/usr/bin/su"
+CUT="/usr/bin/cut"
+DATE="/usr/bin/date"
+ECHO="/usr/bin/echo"
+ID="/usr/bin/id"
+TEE="/usr/bin/tee"
+GREP="/usr/bin/grep"
+DUMPADM="/usr/sbin/dumpadm"
+XARGS="/usr/bin/xargs"
+WC="/usr/bin/wc"
+CD="cd"
+LS="/usr/bin/ls"
+RM="/usr/bin/rm"
+HEAD="/usr/bin/head"
+TAIL="/usr/bin/tail"
+SED="/usr/bin/sed"
+PERL="/usr/bin/perl"
+NAWK="/usr/bin/nawk"
+
+#### RETURN CODE ENUM's ####
+SUCCESS=0
+FAILED=1
+WARNING=2
+NORUN=3
+ROOT_USER_FAILED=71
+DB_ENV_SET_FAILED=74
+MULTIPLEX_MODE_FAILED=75
+DB_QUERY_EXEC_FAILED=77
+MUX_MODE_SB_NO_RUN=51
+RACK_NOT_APPLICABLE=16
+
+### Function: setup_env ###
+#
+# Set up environment variables for script.
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+setup_env()
+{
+   if [ ! "${ENIQ_BASE_DIR}" ]; then
+       ENIQ_BASE_DIR=/eniq
+   fi
+
+   # Main Directory for the Core Installation SW
+   ENIQ_INST_DIR=${ENIQ_BASE_DIR}/installation
+
+   # Installation config directory
+   ENIQ_CONF_DIR=${ENIQ_INST_DIR}/config
+
+   # Precheck logs directory
+   ENIQ_PRECHECK_LOG_DIR=${ENIQ_BASE_DIR}/local_logs
+
+   # Installation lib directory
+   ENIQ_LIB_DIR=${ENIQ_INST_DIR}/core_install/lib/
+
+   # Common function directory
+   COMMON_FUNCS_LIB=${ENIQ_LIB_DIR}/common_functions.lib
+
+   # Installed server type path
+   INSTALLED_SERVER_TYPE=${ENIQ_CONF_DIR}/installed_server_type
+
+   # Ericsson config file path
+   ERICSSON_USE_CONFIG=${ENIQ_CONF_DIR}/ericsson_use_config
+
+   # Events_checks config file
+   EVENTS_CHECK_CONFIG=${ENIQ_INST_DIR}/core_install/eniq_checks/config/events_config.cfg
+
+   # Stats_checks config file
+   STATS_CHECK_CONFIG=${ENIQ_INST_DIR}/core_install/eniq_checks/config/stats_config.cfg
+
+   # Logfile path
+   LOG_FILE=${ENIQ_PRECHECK_LOG_DIR}/precheck_multiplex_mode_check.log
+
+   # Return code declaration
+   RET_CODE=0
+   
+   STORAGE_TYPE=`$CAT ${ENIQ_CONF_DIR}/san_details | $GREP "^STORAGE_TYPE=" | $NAWK -F\= '{print $2}'`
+
+   # Imports the common library functions
+   if [ ! -f "${COMMON_FUNCS_LIB}" ]; then
+      _err_msg_="${COMMON_FUNCS_LIB} missing, this is required for this script, exiting!!!!"
+      abort_script "${_err_msg_}"
+   fi
+
+   . ${COMMON_FUNCS_LIB}
+
+   if [ $? -ne 0 ]; then
+      _err_msg_="Importing functions of ${COMMON_FUNCS_LIB} failed, exiting!!!!"
+      abort_script "${_err_msg_}"
+   fi
+}
+
+### Function: abort_script
+#
+#   This will be called if the script is aborted through an error
+#   encountered during runtime
+#
+# Arguments:
+#       $1 - Error message from part of program
+# Return Values:
+#       none
+#
+
+abort_script()
+{
+   _err_time_=`$DATE '+%Y-%b-%d_%H.%M.%S'`
+
+   if [ "$1" ]; then
+      _err_msg_="${_err_time_} - $1"
+   else
+      _err_msg_="${_err_time_} - ERROR : Script aborted.......\n"
+   fi
+
+   if [ "${LOG_FILE}" ]; then
+      $ECHO "\nERROR : ${_err_msg_}\n" | $TEE -a ${LOG_FILE}
+   else
+      $ECHO "\nERROR : ${_err_msg_}\n"
+   fi
+   exit 3
+}
+
+
+#### Function: create_log_file ######
+#
+#   Check that the effective id of the user is correct
+#   If not print error msg and exit.
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+#
+
+create_log_file()
+{
+   $ECHO "" > ${LOG_FILE}  
+}
+
+### Function: check_user ###
+#
+#   Check that the effective id of the user is correct
+#   If not print error msg and exit.
+#
+# Arguments:
+#       $1 : User ID name
+# Return Values:
+#       none
+#
+check_user()
+{
+   local _check_id_=`$ID  | $AWK -F\( '{print $2}' | $AWK -F\) '{print $1}'`
+
+   if [ "$_check_id_" != "$1" ]; then
+      _err_msg_="You must be $1 to execute this script."
+      abort_script "$_err_msg_"
+   fi
+}
+
+### Function: setup_db_env_var ###
+#
+# Set up database environment variables for script.
+#
+# Arguments:
+#   none
+# Return Values:
+#   0 : SUCCESS
+#  74 : FAILED : Databse enviornment variable set failure
+###
+
+setup_db_env_var()
+{
+   # Configuration files.
+   ENIQ_INI=niq.ini
+   SUNOS_INI=SunOS.ini
+   DWHDB_CFG=dwhdb.cfg
+
+   # ENIQ directories
+   ENIQ_BASE_DIR=/eniq
+   ENIQ_SW_DIR=${ENIQ_BASE_DIR}/sw
+   CLI_CONF_DIR=${ENIQ_BASE_DIR}/sw/conf
+   DWHDB_CFG_DIR=$ENIQ_BASE_DIR/database/dwh_main
+   ENIQ_CONF_DIR=$ENIQ_BASE_DIR/installation/config
+   ENIQ_ADMIN_DIR=$ENIQ_BASE_DIR/admin
+   ENIQ_ADMIN_ETC_DIR=$ENIQ_ADMIN_DIR/etc
+   ENIQ_CORE_INST_DIR=$ENIQ_BASE_DIR/installation/core_install
+   ENIQ_IQMSG_PATH=$ENIQ_BASE_DIR/local_logs/iq
+   ENIQ_LOG_DIR=$ENIQ_BASE_DIR/log
+   ENIQ_ARCHIEVE_IQMSG_PATH=$ENIQ_LOG_DIR/sw_log/iq
+   ENIQ_ADMIN_BIN_DIR=$ENIQ_ADMIN_DIR/bin
+   ENIQ_CORE_BIN_DIR=$ENIQ_CORE_INST_DIR/bin
+
+   # Sybase directory
+   DBISQL="$($LS $ENIQ_BASE_DIR/sybase_iq/IQ-*/bin64/dbisql)"
+   SYBENV=$ENIQ_BASE_DIR/sybase_iq/IQ-*
+   SYBSOURCE=$SYBENV/IQ-*.sh
+   DBCCENV=$ENIQ_ADMIN_ETC_DIR/dbcheck.env
+   SYSUSER="dcuser"
+
+   _ret_code_=${SUCCESS}
+   _err_string_="INFO : DB env variables set successfully."
+   _db_conn_string_=""
+
+   log_msg -t -s "INFO : Setting up the database env variables." -l  ${LOG_FILE}
+
+   # Get DB server name
+   DWH_ENG=`iniget DWH -v ServerName -f ${CLI_CONF_DIR}/niq.ini`
+   if [ "$DWH_ENG" == "dwhdb" ]
+   then
+      server_type='DWH'
+   else
+      _err_string_="ERROR : Could not read server name from ${CLI_CONF_DIR}/${ENIQ_INI} ,VALUE: [ $DWH_ENG ]"
+      abort_script "$_err_string_"
+   fi
+
+   # Get DB port
+   DWH_PORT=`iniget ${server_type} -v PortNumber -f ${CLI_CONF_DIR}/niq.ini`
+   if [ ! "${DWH_PORT}" -o ! "${DWH_ENG}" ]
+   then
+      _err_string_="ERROR : Could not read port number from ${CLI_CONF_DIR}/${ENIQ_INI},VALUE: [ ${DWH_PORT} ]"
+      abort_script "$_err_string_"
+   fi
+
+   # Get the DB Password
+   $GREP "DBAPassword_Encrypted" ${CLI_CONF_DIR}/${ENIQ_INI} > /dev/null
+
+   if [ $? -ne 0 ]
+   then
+      DBA_PASSWORD=`iniget DB -f ${CLI_CONF_DIR}/${ENIQ_INI} -v DBAPassword`
+   else
+      DBA_PASSWORD=`inigetpassword DB -f ${CLI_CONF_DIR}/${ENIQ_INI} -v DBAPassword`
+      if [ ! ${DBA_PASSWORD} ]
+      then
+         if [ -f ${ENIQ_BASE_DIR}/sw/installer/dbusers ]
+         then
+            DBA_PASSWORD=`${ENIQ_BASE_DIR}/sw/installer/dbusers dba dwh`
+            if [ ! "${DBA_PASSWORD}" ]
+            then
+               _err_string_="ERROR : Could not get dwhdb DBA Password, VALUE: [ ${DBA_PASSWORD} ]"
+               abort_script "$_err_string_"
+            fi
+         else
+            _err_string_="ERROR : Could not get dwhdb DBA Password, VALUE: [ ${DBA_PASSWORD} ]"
+            abort_script "$_err_string_"
+         fi
+      fi
+   fi
+
+   # Initialize the connection string for dwhdb
+   _db_conn_string_="-nogui -onerror exit -c \"eng=${DWH_ENG};links=tcpip{host=localhost;port=${DWH_PORT}};uid=dba;pwd=${DBA_PASSWORD}\""
+
+   log_msg -t -s " ${_err_string_}" -l  ${LOG_FILE}
+}
+
+
+
+#### Function : check_db_multiplex_mode #####
+#
+# Arguments:
+#           None
+# Return values:
+#  0   : SUCCESS
+#  3   : NO RUN  : Healthcheck Aborted
+#  75  : FAILED  : Databse is not in multiplex mode.
+#  74  : FAILED  : Failed to set DB env variables.
+#  77  : FAILED  : Failed to execute DB query.
+#
+##
+
+check_db_multiplex_mode()
+{
+
+   # SQL query and output temproray files
+   _query_file_="/tmp/queryFile.sql"
+   _output_file_="/tmp/opFile"
+
+   _err_string_=""
+   _is_multiblade_=0
+   _multiplex_mode_count_=0
+   _ret_code_=${SUCCESS}
+
+   log_msg -t -s "INFO : Checking Database Multiplex-mode." -l  ${LOG_FILE}
+   log_msg -t -s "INFO : Check the server if it is a multiblade or not." -l  ${LOG_FILE}
+
+   _is_multiblade_=`$CAT ${INSTALLED_SERVER_TYPE} | $GREP -i "coordinator" | $WC -l`
+
+   # Check if it is a multiblade server or not
+   if [ ${_is_multiblade_} -eq 1 ]
+   then
+      log_msg -s "INFO : Server Type(Multiblade) - Proceeding with Database Multiplex-mode check" -l  ${LOG_FILE}
+      setup_db_env_var; _ret_code_=$?
+      if [ ${_ret_code_} -eq ${SUCCESS} ]
+      then
+         # Get the count of all the servers which needs to be in multiplex mode
+         $ECHO "select count(*) from sp_iqmpxinfo()" > ${_query_file_}
+         log_msg -q -t -s "INFO : Executing below query : \n" -l ${LOG_FILE}
+         log_msg -q -t -s "$SU - $SYSUSER -c $DBISQL ${_db_conn_string_} '`$CAT ${_query_file_}`'" -l ${LOG_FILE}
+
+         $SU - $SYSUSER >> /dev/null  -c "$DBISQL ${_db_conn_string_} '${_query_file_}' > ${_output_file_} 2>&1"; _ret_code_=$?
+         log_msg -q -t -s "\nINFO : Query result :\n" -l ${LOG_FILE}
+         $CAT ${_output_file_} >> ${LOG_FILE}
+
+         if [ ${_ret_code_} -ne ${SUCCESS} ]
+         then
+            _err_string_="ERROR : Failed to execute the DB query."
+            _ret_code_=${DB_QUERY_EXEC_FAILED}
+         else
+            _multiplex_mode_count_=`$CAT ${_output_file_} | $HEAD -n 3 | $TAIL -1 | $SED -e 's/ //g'`
+            if [ ${_multiplex_mode_count_} -ne 0 ]
+            then
+               # Get the count of all the servers which is in multiplex mode
+               $ECHO "select count(*) from sp_iqmpxinfo() where status='included'" > ${_query_file_}
+               log_msg -q -t -s "INFO : Executing below query : \n" -l ${LOG_FILE}
+               log_msg -q -t -s "$SU - $SYSUSER -c $DBISQL ${_db_conn_string_} '`$CAT ${_query_file_}`'" -l ${LOG_FILE}
+
+               $SU - $SYSUSER >> /dev/null  -c "$DBISQL ${_db_conn_string_} '${_query_file_}' > ${_output_file_} 2>&1"; _ret_code_=$?
+               log_msg -q -t -s "\nINFO : Query result :\n" -l ${LOG_FILE}
+               $CAT ${_output_file_} >> ${LOG_FILE}
+
+               if [ ${_ret_code_} -ne ${SUCCESS} ]
+               then
+                  _err_string_="ERROR : Failed to execute the DB query."
+                  _ret_code_=${DB_QUERY_EXEC_FAILED}
+               else
+                  multiplexModeIncCount=`$CAT ${_output_file_} | $HEAD -n 3 | $TAIL -1 | $SED -e 's/ //g'`
+                  # Check if all the servers in multiplex mode 
+                  if [ ${_multiplex_mode_count_} -ne ${multiplexModeIncCount} ]
+                  then
+                     _err_string_="FAILED : Databse is not in multiplex mode."
+                     _ret_code_=${MULTIPLEX_MODE_FAILED}
+                  else
+                     _err_string_="SUCCESS : Database is in multiplex mode."
+                     FAILED_ret_code_=${SUCCES}
+                  fi
+               fi
+            else
+               _err_string_="FAILED : Database is not in multiplex mode."
+               _ret_code_=${MULTIPLEX_MODE_FAILED}
+            fi
+         fi
+      else
+         _err_string_="\nFAILED : Failed to check the database multiplex mode."
+      fi
+   else
+      # We are here because it is a single blade server and we need not to check database multiplex mode for this scenario
+      _err_string_="NO-RUN : It is a single-blade, no need to check database multiplex mode."
+      _ret_code_=${MUX_MODE_SB_NO_RUN}
+   fi
+
+   $RM -rf ${_query_file_} ${_output_file_}
+
+   log_msg -t -s " ${_err_string_}\n" -l  ${LOG_FILE}
+   log_msg -t -s "INFO : Log location : ${LOG_FILE}"
+   return ${_ret_code_}
+}
+
+# ********************************************************************
+#
+#       Main body of program
+#
+# ********************************************************************
+
+# Check the current user as root
+check_user "root"; _ret_code_=$?
+if [ "$_ret_code_" -ne ${SUCCESS} ]
+then
+   log_msg -t -s "FAILED : You need to be a root user to execute this script" -l ${LOG_FILE}
+   _ret_code_=${ROOT_USER_FAILED}
+   exit ${_ret_code_}
+fi
+
+# Set up environment variables for script.
+setup_env
+
+if [ "${STORAGE_TYPE}" == "fs" ];then
+    log_msg -t -s "FAILED : This check is not applicable for RACK servers." -l ${LOG_FILE}
+    _ret_code_=${RACK_NOT_APPLICABLE}
+    exit ${_ret_code_}
+fi
+
+# Create log file
+create_log_file
+
+# Check database multiplex mode
+log_msg -t -s "INFO : Checking database multiplex-mode: BEGIN" -l ${LOG_FILE}
+check_db_multiplex_mode; rCode=$?
+log_msg -t -s "INFO : Checking database multiplex-mode : END, RC:$rCode" -l ${LOG_FILE}
+exit ${rCode}

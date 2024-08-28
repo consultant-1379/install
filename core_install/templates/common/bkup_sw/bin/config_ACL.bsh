@@ -1,0 +1,388 @@
+#!/usr/bin/bash
+###############################################
+#***********************************************************************
+# Ericsson Radio Systems AB                                     SCRIPT
+# ********************************************************************
+#
+#
+# (c) Ericsson Radio Systems AB 2018 - All rights reserved.
+#
+# The copyright to the computer program(s) herein is the property
+# of Ericsson Radio Systems AB, Sweden. The programs may be used
+# and/or copied only with the written permission from Ericsson Radio
+# Systems AB or in accordance with the terms and conditions stipulated
+# in the agreement/contract under which the program(s) have been
+# supplied.
+#
+# ********************************************************************
+# Name: config_ACL.bsh
+# Date: 10/09/2020
+# Purpose: script restores/creates ACLs for dcdata user for mountpoints from SunOS.ini
+#
+# ********************************************************************
+#
+#   Command Section
+#
+# ********************************************************************
+AWK=/usr/bin/awk
+BASENAME=/usr/bin/basename
+BASH=/usr/bin/bash
+BC=/usr/bin/bc
+BOOTADM=/usr/sbin/bootadm
+CAT=/usr/bin/cat
+CHMOD=/usr/bin/chmod
+CHOWN=/usr/bin/chown
+CLEAR=/usr/bin/clear
+CMP=/usr/bin/cmp
+CP=/usr/bin/cp
+CPIO=/usr/bin/cpio
+DATE=/usr/bin/date
+DIRNAME=/usr/bin/dirname
+DOMAINNAME=/usr/bin/domainname
+DTCONFIG=/usr/dt/bin/dtconfig
+DUMPADM=/usr/sbin/dumpadm
+ECHO='/usr/bin/echo -e'
+EGREP=/usr/bin/egrep
+EJECT=/usr/bin/eject
+ENV=/usr/bin/env
+EXPR=/usr/bin/expr
+FIND=/usr/bin/find
+FLARCREATE=/usr/sbin/flarcreate
+FORMAT=/usr/sbin/format
+FUSER=/usr/sbin/fuser
+GETENT=/usr/bin/getent
+GETFACL=/usr/bin/getfacl
+GETTEXT=/usr/bin/gettext
+GREP=/usr/bin/grep
+GROUPADD=/usr/sbin/groupadd
+GTAR=/usr/sfw/bin/gtar
+GZCAT=/usr/bin/gzcat
+GZIP=/usr/bin/gzip
+HEAD=/usr/bin/head
+MYHOSTNAME=/usr/bin/hostname
+ID=/usr/bin/id
+IFCONFIG=/usr/sbin/ifconfig
+INIT=/usr/sbin/init
+LS=/usr/bin/ls
+MKDIR=/usr/bin/mkdir
+MORE=/usr/bin/more
+MOUNT=/usr/sbin/mount
+MV=/usr/bin/mv
+NSLOOKUP=/usr/sbin/nslookup
+PGREP=/usr/bin/pgrep
+PING=/usr/sbin/ping
+PKGADD=/usr/sbin/pkgadd
+PKGINFO=/usr/bin/pkginfo
+PKGRM=/usr/sbin/pkgrm
+PRTCONF=/usr/sbin/prtconf
+PSRINFO=/usr/sbin/psrinfo
+PWD=/usr/bin/pwd
+REBOOT=/usr/sbin/reboot
+RM=/usr/bin/rm
+RCP=/usr/bin/rcp
+RSH=/usr/bin/rsh
+SED=/usr/bin/sed
+SETFACL=/usr/bin/setfacl
+SEVEN_Z=/usr/bin/7z
+SLEEP=/usr/bin/sleep
+SORT=/usr/bin/sort
+STMSBOOT=/usr/sbin/stmsboot
+SU=/usr/bin/su
+SVCADM=/usr/sbin/svcadm
+SVCCFG=/usr/sbin/svccfg
+SVCS=/usr/bin/svcs
+SWAP=/usr/sbin/swap
+SYNC=/usr/sbin/sync
+TAIL=/usr/bin/tail
+TAR=/usr/sbin/tar
+TEE=/usr/bin/tee
+TOUCH=/usr/bin/touch
+TPUT=/usr/bin/tput
+TR=/usr/bin/tr
+UADMIN=/usr/sbin/uadmin
+UMOUNT=/usr/sbin/umount
+UNAME=/usr/bin/uname
+USERADD=/usr/sbin/useradd
+USERMOD=/usr/sbin/usermod
+VOLD=/usr/sbin/vold
+WC=/usr/bin/wc
+
+
+# Various ENIQ specific variables
+SUNOS_INI=SunOS.ini
+STORAGE_INI=storage.ini
+NASD_CONFIG=nasd_config
+ENIQ_BASE_DIR=/eniq
+# ENIQ Admin Directory
+ENIQ_ADMIN_DIR=${ENIQ_BASE_DIR}/admin
+# Main Directory for the Core Installation SW
+ENIQ_INST_DIR=${ENIQ_BASE_DIR}/installation
+# ENIQ Config Directory
+ENIQ_CONF_DIR=${ENIQ_INST_DIR}/config
+# Main Directory for the Core Installation SW
+ENIQ_CORE_INST_DIR=${ENIQ_INST_DIR}/core_install
+# SMF NASD Directory for nasd_config
+ENIQ_SMF_NASD_DIR=${ENIQ_BASE_DIR}/smf/nasd
+
+
+# ********************************************************************
+#
+#   Functions
+#
+# ********************************************************************
+### Function: abort_script ###
+#
+#   This will is called if the script is aborted thru an error
+#   signal sent by the kernel such as CTRL-C or if a serious
+#   error is encountered during runtime
+#
+# Arguments:
+#       $1 - Error message from part of program (Not always used)
+# Return Values:
+#       none
+exit_script()
+{
+_err_time_=`$DATE '+%Y-%b-%d_%H.%M.%S'`
+
+if [ "$1" ]; then
+    _err_msg_="${_err_time_} - $1"
+else
+    _err_msg_="${_err_time_} - ERROR : Script aborted.......\n"
+fi
+
+    $ECHO "\nERROR : $_err_msg_\n"
+    cd $SCRIPTHOME
+    $RM -rf ${TEM_DIR}
+    exit 1
+}
+
+### Function: check_id ###
+#
+#   Check that the effective id of the user is correct
+#   If not print error msg and exit.
+#
+# Arguments:
+#       $1 : User ID name
+# Return Values:
+#       none
+check_user()
+{
+_check_id_=`$ID  | $AWK -F\( '{print $2}' | $AWK -F\) '{print $1}'`
+if [ "$_check_id_" != "$1" ]; then
+    _err_msg_="You must be $1 to execute this script."
+    exit_script "$_err_msg_" 
+fi
+}
+
+### Function: get_absolute_path ###
+#
+# Determine absolute path to software
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+get_absolute_path()
+{
+_dir_=`$DIRNAME $0`
+SCRIPTHOME=`cd $_dir_ 2>/dev/null && pwd || $ECHO $_dir_`
+}
+
+### Function: set_acl ###
+#
+# Changes ACLs for a list of directories
+#
+# Arguments:
+#	none
+# Return Values:
+#	none
+set_acl()
+{
+# change ACLs for user dcdata
+# fs mountpoints first
+_acl_fs_zfs_=`iniget SunOS_ZFS_FS -f ${ENIQ_CONF_DIR}/${SUNOS_INI}`
+for _dir_ in ${_acl_fs_zfs_} ; do
+        _mount_path_=`iniget ${_dir_} -f ${ENIQ_CONF_DIR}/${SUNOS_INI} -v mountpoint`
+        $SETFACL -m u:dcdata:--- ${_mount_path_}
+        if [ $? -ne 0 ]; then
+        _err_msg_="Could not restrict dcdata to ${_mount_path_}."
+        exit_script "$_err_msg_" 
+    fi
+done
+
+# for other /eniq dirs use setfacl
+_acl_fs_sunos_=`iniget SunOS_DIRECTORY -f ${ENIQ_CONF_DIR}/${SUNOS_INI}`
+for _dir_ in ${_acl_fs_sunos_}; do
+         _mount_path_=`iniget ${_dir_} -f ${ENIQ_CONF_DIR}/${SUNOS_INI} -v path`
+         _owner_=`iniget ${_dir_} -f ${ENIQ_CONF_DIR}/${SUNOS_INI} -v user`
+        if [ "${_mount_path_}" != "/eniq/data" -a "${_owner_}" != "dcdata" -a "${_mount_path_}" != "/eniq/home" ]; then
+                $GETFACL ${_mount_path_} >> /dev/null 2>&1
+                if [ $? -eq 0 ]; then
+                        $SETFACL -m u:dcdata:--- ${_mount_path_}
+                        if [ $? -ne 0 ]; then
+                            STORAGE_TYPE=`iniget STOR_TYPE -f ${ENIQ_CONF_DIR}/${SUNOS_INI} -v STORAGE_TYPE`
+                            if [ "${STORAGE_TYPE}" == "raw" ]; then
+                                declare -i _retry_=1
+                                declare -i _nas_ping_=1
+                                _nas_alias_=`$CAT ${ENIQ_SMF_NASD_DIR}/${NASD_CONFIG} | $EGREP -w ${_mount_path_} | $AWK -F:: '{print $1}'`
+                                for (( i=1; i<=3; i++ )); do
+                                    $SLEEP 20
+                                    ping -c 5 ${_nas_alias_}
+                                    if [ $? -eq 0 ]; then
+                                       $SETFACL -m u:dcdata:--- ${_mount_path_}
+                                       if [ $? -eq 0 ]; then
+                                           break
+                                       fi
+                                       _retry_=${_retry_}+1
+                                    else
+                                       $ECHO "\n`$DATE +%d.%m.%y_%H:%M:%S` - Could not ping the nas on the ${i} attempt"
+                                       _nas_ping_=${_nas_ping_}+1
+                                    fi
+                                done
+                                if [ ${_nas_ping_} -gt 3 ]; then
+                                    _err_msg_="Could not ping the NAS even after 3 trys"
+                                    exit_script "$_err_msg_" 
+                                fi
+                                if [ ${_retry_} -gt 3 ]; then
+                                    _err_msg_="Setfacl failed for ${_mount_path_} after 3 retrys"
+                                    exit_script "$_err_msg_" 
+                                fi
+                            else
+                                _err_msg_="Setfacl failed for Rack server"
+                                exit_script "$_err_msg_"
+                            fi
+                        fi
+                fi
+        fi
+
+done
+}
+
+### Function: unset_acl ###
+#
+# Restores back ACLs for a list of directories / dcdata user
+#
+# Arguments:
+#	none
+# Return Values:
+#	none
+unset_acl()
+{
+# change ACLs for user dcdata
+# fs mountpoints first
+_acl_fs_zfs_=`iniget SunOS_ZFS_FS -f ${ENIQ_CONF_DIR}/${SUNOS_INI}`
+for _dir_ in ${_acl_fs_zfs_} ; do
+        _mount_path_=`iniget ${_dir_} -f ${ENIQ_CONF_DIR}/${SUNOS_INI} -v mountpoint`
+        $SETFACL -x u:dcdata ${_mount_path_}
+        if [ $? -ne 0 ]; then
+        _err_msg_="Could not unset ACLs for ${_mount_path_}."
+        exit_script "$_err_msg_" 
+    fi
+done
+
+# for other /eniq dirs use setfacl
+_acl_fs_sunos_=`iniget SunOS_DIRECTORY -f ${ENIQ_CONF_DIR}/${SUNOS_INI}`
+for _dir_ in ${_acl_fs_sunos_}; do
+         _mount_path_=`iniget ${_dir_} -f ${ENIQ_CONF_DIR}/${SUNOS_INI} -v path`
+         _owner_=`iniget ${_dir_} -f ${ENIQ_CONF_DIR}/${SUNOS_INI} -v user`
+        if [ "${_mount_path_}" != "/eniq/data" -a "${_owner_}" != "dcdata" -a "${_mount_path_}" != "/eniq/home" ]; then
+                $GETFACL ${_mount_path_} >> /dev/null 2>&1
+                if [ $? -eq 0 ]; then
+                        $SETFACL -x u:dcdata ${_mount_path_}
+                        if [ $? -ne 0 ]; then
+                            STORAGE_TYPE=`iniget STOR_TYPE -f ${ENIQ_CONF_DIR}/${SUNOS_INI} -v STORAGE_TYPE`
+                            if [ "${STORAGE_TYPE}" == "raw" ]; then
+                                declare -i _retry_=1
+                                declare -i _nas_ping_=1
+                                _nas_alias_=`$CAT ${ENIQ_SMF_NASD_DIR}/${NASD_CONFIG} | $EGREP -w ${_mount_path_} | $AWK -F:: '{print $1}'`
+                                for (( i=1; i<=3; i++ )); do
+                                    $SLEEP 20
+                                    ping -c 5 ${_nas_alias_}
+                                    if [ $? -eq 0 ]; then
+                                        $SETFACL -x u:dcdata ${_mount_path_}
+                                        if [ $? -eq 0 ]; then
+                                            break
+                                        fi
+                                        _retry_=${_retry_}+1
+                                    else
+                                        $ECHO "\n`$DATE +%d.%m.%y_%H:%M:%S` - Could not ping the nas on the ${i} attempt"
+                                        _nas_ping_=${_nas_ping_}+1
+                                    fi
+                                done
+                                if [ ${_nas_ping_} -gt 3 ]; then
+                                    _err_msg_="Could not ping the NAS even after 3 trys"
+                                    exit_script "$_err_msg_" 
+                                fi	
+                                if [ ${_retry_} -gt 3 ]; then
+                                    _err_msg_="Setfacl/unset failed for ${_mount_path_} after 3 retrys"
+                                    exit_script "$_err_msg_" 
+                                fi
+                            else
+                                _err_msg_="Setfacl/unset failed for Rack Server"
+                                exit_script "$_err_msg_"
+                            fi
+                        fi
+                fi
+        fi
+
+done
+}
+
+# ********************************************************************
+#
+#   Main body of program
+#
+# ********************************************************************
+#
+# Source the common functions
+if [ -s $ENIQ_CORE_INST_DIR/lib/common_functions.lib ]; then
+    . $ENIQ_CORE_INST_DIR/lib/common_functions.lib
+else
+    _err_msg_="File $ENIQ_CORE_INST_DIR/lib/common_functions.lib not found"
+    abort_script "$_err_msg_" 
+fi
+
+# Determine absolute path to software
+get_absolute_path
+
+# Check that the effective id of the user is root
+check_user root
+
+while getopts ":usN" arg; do
+  case $arg in
+    s) SET_PARAM="YES"
+       ;;
+    u) SET_PARAM="NO"
+       ;;
+    N) NO_ECHO="YES"
+       ;;
+   \?) _err_msg_="`$BASENAME $0`"
+       abort_script "$_err_msg_" "${EXEC_SHELL_CMD}"
+       ;;
+  esac
+done
+shift `expr $OPTIND - 1`
+
+if [ "${SET_PARAM}" == "YES" ]; then
+	[[ "${NO_ECHO}" == "YES" ]] || $ECHO "Setting ACLs..."
+	set_acl 
+	if [ $? -ne 0 ]; then
+	[[ "${NO_ECHO}" == "YES" ]] || $ECHO "Something went wrong while setting ACLs."
+	exit 1
+	else
+	[[ "${NO_ECHO}" == "YES" ]] || $ECHO "-> Done."
+	fi
+else
+	if [ "${SET_PARAM}" == "NO" ]; then
+	[[ "${NO_ECHO}" == "YES" ]] || $ECHO "Unsetting ACLs..."
+	unset_acl 
+	if [ $? -ne 0 ]; then
+	[[ "${NO_ECHO}" == "YES" ]] || $ECHO "Something went wrong while unsetting ACLs."
+	exit 1
+	else
+	[[ "${NO_ECHO}" == "YES" ]] || $ECHO "-> Done."
+	fi
+	fi
+fi
+
+exit 0

@@ -1,0 +1,4 @@
+stop_eniq_services
+stop_nas_services
+stop_smf_services
+cleanup

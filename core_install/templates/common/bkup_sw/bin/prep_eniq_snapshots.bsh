@@ -1,0 +1,889 @@
+#!/bin/bash
+# ********************************************************************
+# Ericsson Radio Systems AB                                     SCRIPT
+# ********************************************************************
+#
+#
+# (c) Ericsson Radio Systems AB 2019 - All rights reserved.
+#
+# The copyright to the computer program(s) herein is the property
+# of Ericsson Radio Systems AB, Sweden. The programs may be used
+# and/or copied only with the written permission from Ericsson Radio
+# Systems AB or in accordance with the terms and conditions stipulated
+# in the agreement/contract under which the program(s) have been
+# supplied.
+#
+# ********************************************************************
+# Name    : prep_eniq_snapshots.bsh
+# Date    : 06/10/2023
+# Revision: \main\23
+# Purpose : A wrapper script to create snapshots from coordinator across all the 
+#     blades in the deployment.In case single blade deployment will run 
+#    on single blade only.	
+#
+# Usage   : prep_eniq_snapshots.bsh 
+#
+# ********************************************************************
+#
+#   Command Section
+#
+# ********************************************************************
+AWK=/usr/bin/awk
+BASENAME=/usr/bin/basename
+BC=/usr/bin/bc
+CAT=/usr/bin/cat
+CHMOD=/usr/bin/chmod
+CLEAR=/usr/bin/clear
+CMP=/usr/bin/cmp
+CP=/usr/bin/cp
+CUT=/usr/bin/cut
+DATE=/usr/bin/date
+DF=/usr/bin/df
+DIRNAME=/usr/bin/dirname
+ECHO='/usr/bin/echo -e'
+ENV=/usr/bin/env
+EGREP=/usr/bin/egrep
+EXPR=/usr/bin/expr
+GETENT=/usr/bin/getent
+GREP=/usr/bin/grep
+HEAD=/usr/bin/head
+HOSTNAME=/usr/bin/hostname
+ID=/usr/bin/id
+MKDIR=/usr/bin/mkdir
+MV=/usr/bin/mv
+PWD=/usr/bin/pwd
+RM=/usr/bin/rm
+SED=/usr/bin/sed
+SUDO=/usr/bin/sudo
+SORT=/usr/bin/sort
+TEE=/usr/bin/tee
+TOUCH=/usr/bin/touch
+UNIQ=/usr/bin/uniq
+WC=/usr/bin/wc
+
+# Number of log files to keep
+NUM_LOGS=10
+# Size in kbytes that the log file is allowed to grow to
+SIZE_LOGS=2048000
+# Flag to determine whether to compress log or not (Must be y/n)
+COMPRESS_LOG=n
+
+
+
+# ********************************************************************
+#
+#       Pre-execution Operations
+#
+# ********************************************************************
+
+
+# ********************************************************************
+#
+#   functions
+#
+# ********************************************************************
+
+### Function: abort_script ###
+#
+#   This will is called if the script is aborted thru an error
+#   error signal sent by the kernel such as CTRL-C or if a serious
+#   error is encountered during runtime
+#
+# Arguments:
+#       $1 - Error message from part of program (Not always used)
+# Return Values:
+#       none
+abort_script()
+{
+_err_time_=`$DATE '+%Y-%b-%d_%H.%M.%S'`
+
+if [ "$1" ]; then
+    _err_msg_="${_err_time_} - $1"
+else
+    _err_msg_="${_err_time_} - Script aborted.......\n"
+fi
+if [ "${LOGFILE}" ]; then
+    $ECHO "\nERROR : $_err_msg_\n" | $TEE -a ${LOGFILE}
+else
+    $ECHO "\nERROR : $_err_msg_\n"
+fi
+
+cd $SCRIPTHOME
+$RM -rf ${TEM_DIR}
+if [ "$2" ]; then
+    ${2}
+else
+   exit 1
+fi
+}
+
+# Check/Create Logfile
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+chk_create_logfile()
+{
+$MKDIR -p `$DIRNAME ${LOGFILE}`
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not create directory `$DIRNAME ${LOGFILE}`"
+     abort_script "$_err_msg_"
+fi
+
+$TOUCH -a ${LOGFILE}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not write to file ${LOGFILE}"
+    abort_script "$_err_msg_"
+fi
+
+_log_id_str="-l ${LOGFILE}"
+if [ -s ${LOGFILE} ]; then
+    $ECHO "\n\n" >> ${LOGFILE}
+fi
+
+}
+
+### Function: check_id ###
+#
+#   Check that the effective id of the user is correct
+#   If not print error msg and exit.
+#
+# Arguments:
+#       $1 : User ID name
+# Return Values:
+#       none
+check_id()
+{
+_get_id_=`$ENV |$GREP -w SUDO_USER | $EGREP "^[[:blank:]]*SUDO_USER="|$AWK -F\= '{print $2}'|$SED -e 's|"||g'`
+
+_check_id_=`$ID | $AWK -F\( '{print $2}' | $AWK -F\) '{print $1}'`
+
+_check_group_=`$ID $_get_id_ | $AWK -F\( '{print $3}' | $AWK -F\) '{print $1}'`
+
+
+    if [ "${_get_id_}" == "" ]; then
+
+        if [ "${_check_id_}" == "root" ]; then
+           # Set 1 for true
+           _user_root=1
+
+        else
+           _err_msg_="You must be root or admin to execute this script."
+           abort_script "${_err_msg_}"
+        fi
+          else
+            if [ "${_check_group_}" == "ENIQ_ADMIN_ROLE" ]; then
+               # Set 0 for false
+               _user_root=0
+
+            else
+               _err_msg_="You must be root or admin to execute this script." 
+               abort_script "${_err_msg_}"
+            fi
+    fi
+
+}
+
+### Function: list_snapshots ###
+#
+# To list snap label.
+#
+# Arguments:
+#    none
+# Return Values:
+#     none
+list_snapshots()
+{
+#Get fs snapshots label
+for _line_ in `$CAT ${TEM_DIR}/server_order_list`; do
+    local _count_=`$ECHO "${_line_}" | grep -o "::" | wc -l`
+
+	if [ "${_ip_type_}" == "IPv6" -a "${_count_}" == 3 ]; then
+		local _ip_address_=`$ECHO ${_line_} | grep -oE '([a-fA-F0-9]{1,4}::?){1,7}[a-fA-F0-9]{1,4}' | head -n 1 | awk -F "::" '{ print $1 "::" $2}'`
+		local _serv_hostname_=`$ECHO ${_line_} | $AWK -F"::" '{print $3}'`
+		local _serv_type_=`$ECHO ${_line_} | $AWK -F"::" '{print $4}'`
+	else
+		local _ip_address_=`$ECHO ${_line_} | $AWK -F"::" '{print $1}'`
+		local _serv_hostname_=`$ECHO ${_line_} | $AWK -F"::" '{print $2}'`
+		local _serv_type_=`$ECHO ${_line_} | $AWK -F"::" '{print $3}'`
+
+	fi
+    if [ ! "${_ip_address_}" -o ! "${_serv_hostname_}" -o ! "${_serv_type_}" ]; then
+        _err_msg_="Unable to retrieve IP or hostname or server type.\n"
+        abort_script "${_err_msg_}"
+    fi
+    if [ "${_ip_address_}" == "${HOST_IP}" ]; then
+        get_label fs
+    else
+        get_label fs $_serv_hostname_
+    fi
+done
+
+exit 0
+}
+
+
+### Function: get_label ###
+#
+# To get snap shot label.
+#
+# Arguments:
+#    none
+# Return Values:
+#     none
+get_label()
+{
+if [ ! "$1" ]; then
+  _err_msg_="Snapshot type not passed\n"
+  abort_script "${_err_msg_}"
+fi
+
+if [ "$2" ]; then
+    _hostname_=$2
+fi
+
+_type_=$1
+_run_list_cmd_="$BASH ${ENIQ_TEMP_SW_BIN_DIR}/manage_${_type_}_snapshots.bsh -a list -f ALL -t"
+
+    if [ ! -f "${VAR_TMP_DIR}/snap_list" ]; then
+        $TOUCH ${VAR_TMP_DIR}/snap_list
+        if [ $? -ne 0 ]; then
+            _err_msg_="Could not make snap list file"
+            abort_script "$_err_msg_"
+        fi
+    fi
+
+    if [ ${_hostname_} ]; then
+        run_remote_cmd "${_hostname_}" "${_run_list_cmd_}" > ${VAR_TMP_DIR}/snap_list
+        if [ $? -ne 0 ]; then
+            _err_msg_="Could not fetch snapshot name from ${_serv_hostname_}"
+            abort_script "${_err_msg_}"
+        fi
+    else
+        ${_run_list_cmd_} > ${VAR_TMP_DIR}/snap_list
+        if [ $? -ne 0 ]; then
+            _err_msg_="Could not fetch snapshot name from ${_serv_hostname_}"
+            abort_script "${_err_msg_}"
+        fi
+    fi
+
+
+    $CAT ${VAR_TMP_DIR}/snap_list | $SED '1,8d' | $AWK '{print $2,$3,$4}'| $AWK -F'-' '{print $2, $3, $4, $5}' | $SORT -u -k 1,1 > ${VAR_TMP_DIR}/snap_extract_list
+
+
+    case ${_type_} in
+        fs) while read _line_; do
+                _label_name_=`$ECHO ${_line_} | $AWK '{print $1}'`
+                _year_=`$ECHO ${_line_} | $AWK '{print $2}'`
+                _month_=`$ECHO ${_line_} | $AWK '{print $3}'`
+                _date_=`$ECHO ${_line_} | $AWK '{print $4}'`
+                _time_=`$ECHO ${_line_} | $AWK '{print $5}'`
+                $ECHO $_label_name_ ${_year_}-${_month_}-${_date_} $_time_ >> ${VAR_TMP_DIR}/final_snapshot_list
+          done < ${VAR_TMP_DIR}/snap_extract_list
+          _message_to_display_="Snap shot label on ${_serv_hostname_}"
+           ;;
+      \?) $ECHO "Invalid type"
+          usage_msg
+          exit 1
+         ;;
+    esac
+
+    $ECHO "\n=========================================="
+    $ECHO "\n${_message_to_display_}"
+
+    if [ ! -f "${VAR_TMP_DIR}/final_snapshot_list" ]; then
+         $ECHO "\n          No ${_type_} snap shot exists"
+    else
+        $CAT ${VAR_TMP_DIR}/final_snapshot_list
+    fi
+
+    $RM -rf ${VAR_TMP_DIR}/final_snapshot_list
+    $RM -rf ${VAR_TMP_DIR}/snap_list
+	$RM -rf ${VAR_TMP_DIR}/snap_extract_list
+
+}
+
+### Function: chk_scripts_exist ###
+#
+# Check that the 3 required snapshot scripts exist
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+chk_scripts_exist()
+{
+if [ ! -s ${ENIQ_BKUP_DIR}/prepare_eniq_bkup.bsh ]; then
+
+	_err_msg_="$ENIQ_BKUP_DIR/prepare_eniq_bkup.bsh script not found"
+	abort_script "$_err_msg_"
+fi
+if [ ! -s ${ENIQ_CORE_INST_DIR}/lib/get_ip_order.pl ]; then
+
+	_err_msg_="${ENIQ_CORE_INST_DIR}/lib/get_ip_order.pl script not found"
+	abort_script "$_err_msg_"
+fi
+
+
+}
+# create required snapshots
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+create_snapshots()
+{
+
+local _server_order_file_=$1
+
+log_msg -l ${LOGFILE} -s "=============================================================================================="
+log_msg -t -l ${LOGFILE} -s "Prepare eniq snapshots started \n"
+log_msg -l ${LOGFILE} -s "Stopping Rolling Snapshot Service \n"
+log_msg -l ${LOGFILE} -q -s "Running ${ENIQ_ADMIN_DIR}/bin/manage_deployment_services.bsh  -a stop -s roll-snap -N  "
+$BASH ${ENIQ_ADMIN_DIR}/bin/manage_deployment_services.bsh  -a stop -s roll-snap -N
+	if [ $? -ne 0 ]; then
+		_err_msg_="Could not stop ${ROLL_SMF_ID}"
+		abort_script "${_err_msg_}"
+	fi
+	
+if [ -s ${SNAP_SERVER_LIST} ]; then
+	log_msg -l ${LOGFILE} -s "\n$SNAP_SERVER_LIST exists on the server so carrying on from the server which was not successful last time\n" 
+fi
+
+$RM -rf ${ENIQ_ADMIN_BIN_DIR}/snap_label
+
+for _line_ in `$CAT ${_server_order_file_}`; do
+	unset _ip_address_ _serv_hostname_ _serv_type_ _count_
+	
+	local _count_=`$ECHO "${_line_}" | grep -o "::" | wc -l`
+
+	if [ "${_ip_type_}" == "IPv6" -a "${_count_}" == 3 ]; then
+		local _ip_address_=`$ECHO ${_line_} | grep -oE '([a-fA-F0-9]{1,4}::?){1,7}[a-fA-F0-9]{1,4}' | head -n 1 | awk -F "::" '{ print $1 "::" $2}'`
+		local _serv_hostname_=`$ECHO ${_line_} | $AWK -F"::" '{print $3}'`
+		local _serv_type_=`$ECHO ${_line_} | $AWK -F"::" '{print $4}'`
+	else
+		local _ip_address_=`$ECHO ${_line_} | $AWK -F"::" '{print $1}'`
+		local _serv_hostname_=`$ECHO ${_line_} | $AWK -F"::" '{print $2}'`
+		local _serv_type_=`$ECHO ${_line_} | $AWK -F"::" '{print $3}'`
+	fi
+	
+	#checking if snapshot is done for current server
+	if [ -s ${SNAP_SERVER_LIST} ]; then
+		$CAT "${SNAP_SERVER_LIST}" | $EGREP -w "${_serv_hostname_}" >> /dev/null 2>&1
+    if [ $? -eq 0 ]; then
+    	continue
+    fi
+	fi	
+    if [ ! "${_ip_address_}" -o ! "${_serv_hostname_}" ]; then
+        _err_msg_="Could not read required info from ${_server_order_file_}"
+        abort_script "${_err_msg_}"
+    fi
+
+	if [ "${_ip_address_}" == "${HOST_IP}" ]; then
+		log_msg -l ${LOGFILE} -s "\nRolling snapshot starting on ${HNAME}\n" 
+		log_msg -l ${LOGFILE} -s "----------------------------------------------------------------------------------"
+		log_msg -t -l ${LOGFILE} -s "Starting  $ENIQ_BKUP_DIR/prepare_eniq_bkup.bsh on ${HNAME}"
+    if [ -f ${ENIQ_ADMIN_BIN_DIR}/called_through_upgrade ]; then
+    	$ECHO "${HNAME} : " >> ${ENIQ_ADMIN_BIN_DIR}/snap_label
+    fi
+		${BASH} $ENIQ_BKUP_DIR/prepare_eniq_bkup.bsh -N -R 
+    if [ $? -ne 0 ]; then
+    	_err_msg_="prepare_eniq_backup failed for ${HNAME} ,for more information check snapshot logs ${ROLL_SNAP_LOG} on that server"
+    	#cleanup will run in case of Multiblade and for Rack and singleblade this function is skipped.
+    	# multiblade_cleanup ${TEM_DIR}/server_order_list
+    	abort_script "${_err_msg_}"
+    else
+    	log_msg -s "\nSuccessfully finished $ENIQ_BKUP_DIR/prepare_eniq_bkup.bsh on server ${HNAME} " | $TEE -a ${LOGFILE}	
+    	log_msg -l ${LOGFILE} -s "-------------------------------------------------------------------------"
+    fi	
+	else
+		log_msg -l ${LOGFILE} -s "\nRolling snapshot starting on ${_serv_hostname_}\n"
+		log_msg -l ${LOGFILE} -s "---------------------------------------------------------------------------------"
+		log_msg -t -l ${LOGFILE} -s "Starting  $ENIQ_BKUP_DIR/prepare_eniq_bkup.bsh on ${_serv_hostname_}"
+    if [ -f ${ENIQ_ADMIN_BIN_DIR}/called_through_upgrade ]; then
+    	$ECHO "${_serv_hostname_} : " >> ${ENIQ_ADMIN_BIN_DIR}/snap_label
+    fi
+	
+	
+	if [ "${_user_root}" == 1 ]; then
+
+	run_remote_cmd "${_serv_hostname_}" "${BASH} $ENIQ_BKUP_DIR/prepare_eniq_bkup.bsh -N -R  " "${LOGFILE}"
+     if [ $? -ne 0 ]; then
+         _err_msg_="prepare_eniq_backup failed for ${_serv_hostname_} ,for more information check snapshot logs ${ROLL_SNAP_LOG} on that server "
+         #multiblade_cleanup will run in case of Multiblade and for Rack and singleblade this function is skipped.
+         # multiblade_cleanup ${TEM_DIR}/server_order_list
+         abort_script "${_err_msg_}"
+     else
+         log_msg -s "\nSuccessfully finished $ENIQ_BKUP_DIR/prepare_eniq_bkup.bsh on server ${_serv_hostname_} " | $TEE -a ${LOGFILE}
+         log_msg -l ${LOGFILE} -s "-------------------------------------------------------------------------"
+     fi
+
+else
+
+    run_remote_cmd "${_serv_hostname_}" "$SUDO ${BASH} $ENIQ_BKUP_DIR/prepare_eniq_bkup.bsh -N -R" "${LOGFILE}" "$_get_id_"
+     if [ $? -ne 0 ]; then
+         _err_msg_="prepare_eniq_backup failed for ${_serv_hostname_} ,for more information check snapshot logs ${ROLL_SNAP_LOG} on that server "
+         #multiblade_cleanup will run in case of Multiblade and for Rack and singleblade this function is skipped.
+         # multiblade_cleanup ${TEM_DIR}/server_order_list
+         abort_script "${_err_msg_}"
+     else
+         log_msg -s "\nSuccessfully finished $ENIQ_BKUP_DIR/prepare_eniq_bkup.bsh on server ${_serv_hostname_} " | $TEE -a ${LOGFILE}
+        log_msg -l ${LOGFILE} -s "-------------------------------------------------------------------------"
+     fi
+
+fi
+	
+	fi
+	# Building list of the servers which are done	
+	$ECHO " ${_serv_hostname_} " >> ${SNAP_SERVER_LIST} 
+done	
+
+#To delete old snapshots on all blades	
+#multiblade_cleanup will run in case of Multiblade and for Rack and single blade this function is skipped.	
+# multiblade_cleanup ${TEM_DIR}/server_order_list
+
+
+if [ -f ${ENIQ_ADMIN_BIN_DIR}/called_through_upgrade ]; then
+    if [ -s ${ENIQ_ADMIN_BIN_DIR}/snap_label ]; then
+        $SED 'N;s/\n/ /' ${ENIQ_ADMIN_BIN_DIR}/snap_label >> ${ENIQ_ADMIN_BIN_DIR}/snap_label_1
+        $MV ${ENIQ_ADMIN_BIN_DIR}/snap_label_1 ${VAR_TMP_DIR}/rollback_conf
+        $RM -rf ${ENIQ_ADMIN_BIN_DIR}/snap_label
+    fi
+fi
+
+}
+
+### Function: get_absolute_path ###
+#
+# Determine absolute path to software
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+get_absolute_path() 
+{
+_dir_=`$DIRNAME $0`
+SCRIPTHOME=`cd $_dir_ 2>/dev/null && pwd || $ECHO $_dir_`
+}
+### Function: get_deployment_order ###
+#
+# Get the order of the deployment
+# for taking snapshot
+#
+# Arguments:
+#	none
+# Return Values:
+#	none
+get_deployment_order()
+{
+$RM -rf ${TEM_DIR}/server_order_list	
+# get the list for  order
+/usr/bin/perl ${ENIQ_CORE_INST_DIR}/lib/get_ip_order.pl -f ${TEM_DIR}/server_order_list
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not get an ordered list of servers"
+    abort_script "$_err_msg_"
+fi
+}
+
+### Function: multiblade_cleanup ###
+# Handles clean up of snapshot in Multiblade
+#
+# Arguments:
+#	$1 : server order list
+# Return Values:
+#	none
+
+multiblade_cleanup()
+{
+local _server_order_file_=$1
+
+if [ "${CURR_SERVER_TYPE}" != "eniq_stats"  ]; then
+
+	if [ ! -f ${VAR_TMP_DIR}/snapname ]; then
+		_err_msg_="Could not get snap name for latest snapshot"
+		abort_script "${_err_msg_}"
+	fi
+
+	_server_count_=`$CAT ${SNAP_SERVER_LIST} | $WC -l`
+
+	# lets figure it out which snapshot to delete
+	if [[ ${_server_count_} == 4 ]]; then
+		if [ `$CAT ${VAR_TMP_DIR}/snapname` == "${_snap_id_1_}" ]; then
+    SNAP_DELETE="${_snap_id_2_}"
+		else
+    SNAP_DELETE="${_snap_id_1_}"
+		fi
+	else
+		if [ `$CAT ${VAR_TMP_DIR}/snapname` == "${_snap_id_1_}" ]; then
+    SNAP_DELETE="${_snap_id_1_}"
+		else
+    SNAP_DELETE="${_snap_id_2_}"
+		fi
+	fi
+
+	for _line_ in `$CAT ${_server_order_file_}`; do
+		unset _ip_address_ _serv_hostname_ _serv_type_ _count_
+		
+		local _count_=`$ECHO "${_line_}" | grep -o "::" | wc -l`
+
+		if [ "${_ip_type_}" == "IPv6" -a "${_count_}" == 3 ]; then
+			local _ip_address_=`$ECHO ${_line_} | grep -oE '([a-fA-F0-9]{1,4}::?){1,7}[a-fA-F0-9]{1,4}' | head -n 1 | awk -F "::" '{ print $1 "::" $2}'`
+			local _serv_hostname_=`$ECHO ${_line_} | $AWK -F"::" '{print $3}'`
+			local _serv_type_=`$ECHO ${_line_} | $AWK -F"::" '{print $4}'`
+		else
+			local _ip_address_=`$ECHO ${_line_} | $AWK -F"::" '{print $1}'`
+			local _serv_hostname_=`$ECHO ${_line_} | $AWK -F"::" '{print $2}'`
+			local _serv_type_=`$ECHO ${_line_} | $AWK -F"::" '{print $3}'`
+
+		fi
+	
+		#checking if snapshot is done for current server
+		if [ -s ${SNAP_SERVER_LIST} ]; then
+    $CAT "${SNAP_SERVER_LIST}" | $EGREP -w "${_serv_hostname_}" >> /dev/null 2>&1
+    	if [ $? -ne 0 ]; then
+    		continue
+    	fi
+		fi	
+	
+		if [ ! "${_ip_address_}" -o ! "${_serv_hostname_}" ]; then
+    _err_msg_="Could not read required info from ${_server_order_file_}"
+    abort_script "${_err_msg_}"
+		fi
+
+		if [ "${_ip_address_}" == "${HOST_IP}" ]; then
+    log_msg -s "\n`$DATE +%d.%m.%y_%H:%M:%S` - Cleaning up old snapshot with label \"${SNAP_DELETE}\" on \"${_serv_hostname_}\"" -l ${LOGFILE} ${SNAP_QUIET}
+    $BASH ${SCRIPTHOME}/cleanup_eniq_backup.bsh -N -R -S "${SNAP_DELETE}" ${SNAP_QUIET}
+    	if [ $? -ne 0 ]; then
+    		_err_msg_="Cleanup failed for ${_serv_hostname_} "
+    		abort_script "${_err_msg_}"
+    	else
+    		log_msg -s "\nCleanup finished $SCRIPTHOME/cleanup_eniq_backup.bsh on server ${_serv_hostname_} " | $TEE -a ${LOGFILE}
+    		log_msg -l ${LOGFILE} -s "-------------------------------------------------------------------------"
+    fi
+		else
+    log_msg -l ${LOGFILE} -s "\nCleaning up snapshot on ${_serv_hostname_}\n"
+    log_msg -l ${LOGFILE} -s "---------------------------------------------------------------------------------"
+    log_msg -t -l ${LOGFILE} -s "Starting  ${SCRIPTHOME}/cleanup_eniq_backup.bsh on ${_serv_hostname_}"
+		
+	if [ "${_user_root}" == 1 ]; then
+
+     run_remote_cmd "${_serv_hostname_}" "${BASH} $SCRIPTHOME/cleanup_eniq_backup.bsh -N -R -S "${SNAP_DELETE}"" "${SNAP_QUIET}"
+         if [ $? -ne 0 ]; then
+                 _err_msg_="Cleanup failed for ${_serv_hostname_} "
+                 abort_script "${_err_msg_}"
+         else
+                 log_msg -s "\nCleanup finished $SCRIPTHOME/cleanup_eniq_backup.bsh on server ${_serv_hostname_} " | $TEE -a ${LOGFILE}
+                 log_msg -l ${LOGFILE} -s "-------------------------------------------------------------------------"
+		 fi
+
+else
+
+	run_remote_cmd "${_serv_hostname_}" "$SUDO ${BASH} $SCRIPTHOME/cleanup_eniq_backup.bsh -N -R -S "${SNAP_DELETE}"" "${SNAP_QUIET}" "$_get_id_"
+         if [ $? -ne 0 ]; then
+                 _err_msg_="Cleanup failed for ${_serv_hostname_} "
+                 abort_script "${_err_msg_}"
+         else
+                 log_msg -s "\nCleanup finished $SCRIPTHOME/cleanup_eniq_backup.bsh on server ${_serv_hostname_} " | $TEE -a ${LOGFILE}
+                 log_msg -l ${LOGFILE} -s "-------------------------------------------------------------------------"
+		 fi
+fi
+		
+		fi	
+	done
+
+	$RM -rf ${SNAP_SERVER_LIST}
+
+fi
+
+}
+
+### Function: setup_env ###
+#
+# Setup up path environment etc
+#
+# Arguments:
+#	none
+# Return Values:
+#	none
+setup_env()
+{
+#eniq base dir
+ENIQ_BASE_DIR=/eniq
+
+# ENIQ Admin Directory
+ENIQ_ADMIN_DIR=${ENIQ_BASE_DIR}/admin
+
+# ENIQ Admin Bin Directory
+ENIQ_ADMIN_BIN_DIR=${ENIQ_ADMIN_DIR}/bin
+
+# VAR TMP directory
+VAR_TMP_DIR=/var/tmp
+
+# TO DO
+#Roll-snap service
+ROLL_SMF_ID="eniq-roll-snap"
+
+#Set sw conf dir
+ENIQ_SW_CONF_DIR=${ENIQ_BASE_DIR}/sw/conf
+
+# Main Directory for the Core Installation SW
+ENIQ_INST_DIR=${ENIQ_BASE_DIR}/installation
+
+# Main Directory for the Core Installation SW
+ENIQ_CORE_INST_DIR=${ENIQ_INST_DIR}/core_install
+
+# File to hold  server list whose snapshots are done 
+SNAP_SERVER_LIST=/var/tmp/snap_server_list
+
+# ENIQ Config Directory
+ENIQ_CONF_DIR=${ENIQ_INST_DIR}/config
+
+# ENIQ Template Directory
+ENIQ_TEMP_SW_BIN_DIR=${ENIQ_CORE_INST_DIR}/templates/common/bkup_sw/bin
+
+# Coordinator server list
+CO_SERVER_TYPE="eniq_coordinator|stats_coordinator|eniq_events|eniq_stats|eniq_iqw|son_coordinator|eniq_es"
+
+#eniq back dir
+ENIQ_BKUP_DIR=${ENIQ_BASE_DIR}/bkup_sw/bin
+
+# Source the common functions
+if [ -s ${ENIQ_BASE_DIR}/admin/lib/common_functions.lib ]; then
+    . ${ENIQ_BASE_DIR}/admin/lib/common_functions.lib
+else
+    _err_msg_="File ${ENIQ_BASE_DIR}/admin/lib/common_functions.lib not found"
+    abort_script "$_err_msg_"
+fi
+
+# BKUP_CONF_FILE="`$DIRNAME ${SCRIPTHOME}`/etc/eniq_backup.conf"
+# if [ ! -s ${BKUP_CONF_FILE} ]; then
+    # _err_msg_="Could not locate file ${BKUP_CONF_FILE}"
+    # abort_script "$_err_msg_"
+# fi
+
+# SNAP_ID_STR=`$CAT ${BKUP_CONF_FILE} | $EGREP '^[[:blank:]]*ROLL_SNAP_ID_STR=' | $AWK -F"=" '{print $2}'`
+# if [ ! "${SNAP_ID_STR}" ]; then
+    # _err_msg_="Could not read ROLL_SNAP_ID_STR parameter from ${BKUP_CONF_FILE}"
+    # abort_script "$_err_msg_"
+# else 
+	# _snap_id_1_=`$ECHO ${SNAP_ID_STR} | $AWK -F:: '{print $1}'`
+	# _snap_id_2_=`$ECHO ${SNAP_ID_STR} | $AWK -F:: '{print $2}'`
+# fi
+
+# Determine the current server type
+CURR_SERVER_TYPE=`$CAT $ENIQ_CONF_DIR/installed_server_type | $EGREP -v '^[[:blank:]]*#' | $SED -e 's/ //g'`
+if [ ! "${CURR_SERVER_TYPE}" ]; then
+	_err_msg_="Could not determine which server type this is"
+    abort_script "$_err_msg_"
+fi
+$ECHO "${CURR_SERVER_TYPE}" | $EGREP "${CO_SERVER_TYPE}" >> /dev/null 2>&1
+if [ $? -eq 0 ]; then
+        SERVER_TYPE="CO"
+else
+        SERVER_TYPE="${SERVER_TYPE}"
+fi
+
+# File containing the type of OSS installation. Eg. events or statistics
+INST_TYPE_FILE=$ENIQ_BASE_DIR/installation/config/ericsson_use_config
+if [ ! -s "${INST_TYPE_FILE}" ]; then
+    _err_msg_="ENIQ install type not defined in ${INST_TYPE_FILE}"
+    abort_script "$_err_msg_"  "${EXEC_SHELL_CMD}"
+fi
+
+# Read the installation type - should be "events" or "stats"
+INSTALL_TYPE=`$CAT ${INST_TYPE_FILE} | $AWK -F\= '{print $2}'`
+if [ ! "${INSTALL_TYPE}" ]; then
+    _err_msg_="Could not read INSTALL_TYPE param "
+    abort_script "$_err_msg_" "${EXEC_SHELL_CMD}"
+fi
+
+#set host name and host ip
+HNAME=`${HOSTNAME}`
+HOST_IP=`$HOSTNAME -i | $AWK '{print $1}' | $HEAD -1`
+
+#set rolling snapshot log dir varibale for local servers. 
+ ROLL_SNAP_LOG=${ENIQ_BASE_DIR}/local_logs/rolling_snapshot_logs/
+ 
+#Fetching IP Type from IPMP_INI file.
+check_ip_type
+
+if [ ! "${_ip_type_}" ]; then
+    _err_msg_="Could not read parameter _IP_TYPE_ from file ${ENIQ_CONF_DIR}/${IPMP_INI}"
+    abort_script "$_err_msg_"
+fi
+}
+
+### Function: usage_msg ###
+#
+#   Print out the usage message
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+usage_msg()
+{
+$ECHO "
+Usage: `$BASENAME $0` 
+
+
+Note: 	Due to any reason , if you want to start snapshot from first server 
+		then remove $CUR_SERVER_FILE and start the script again.
+"
+}
+
+### Function: user_confirm ###
+#
+# Get confirmation from user to proceed with snapshot action
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+user_confirm()
+{
+local _server_order_file_=$1
+while :; do
+    unset USER_CONF
+    $CLEAR
+	$ECHO "\nDeployed Servers\n================"
+	
+	
+	> ${VAR_TMP_DIR}/server_hostname.txt
+	for _line_ in `$CAT ${_server_order_file_}`; do
+		unset _serv_hostname_ _count_
+		
+		local _count_=`$ECHO "${_line_}" | grep -o "::" | wc -l`
+
+		if [ "${_ip_type_}" == "IPv6" -a "${_count_}" == 3 ]; then
+			local _serv_hostname_=`$ECHO ${_line_} | $AWK -F"::" '{print $3}'`
+		else
+			local _serv_hostname_=`$ECHO ${_line_} | $AWK -F"::" '{print $2}'`
+		fi
+		$ECHO ${_serv_hostname_} >> ${VAR_TMP_DIR}/server_hostname.txt
+	done
+	$CAT ${VAR_TMP_DIR}/server_hostname.txt
+	
+	$ECHO "\nAre you sure you wish to create a rolling snapshots on all the above servers?"
+    $ECHO "Enter [Yes | No] (case sensitive) : \c"
+
+	rm -rf ${VAR_TMP_DIR}/server_hostname.txt
+    read USER_CONF
+    if [ "$USER_CONF" == "Yes" -o "$USER_CONF" == "No" ]; then
+        break
+    fi
+done
+
+}
+
+# ********************************************************************
+#
+#   Main body of program
+#
+# ********************************************************************
+#
+RUN_TIME=`$DATE '+%Y-%b-%d_%H.%M.%S'`
+
+# Determine absolute path to software
+get_absolute_path
+
+# Check that the effective id of the user is root
+check_id
+
+while getopts ":uN" arg; do
+  case $arg in
+    u) LIST_SNAP="YES"
+	   ;;
+    N) NO_CONFIRM="YES"
+       ;;
+    \?) _err_msg_="Usage: `$BASENAME $0` "
+       abort_script "$_err_msg_"
+       ;;
+  esac
+done
+shift `expr $OPTIND - 1`
+
+# Check if post_restore is ongoing
+if [ -f "/var/tmp/post_restore_in_progress" ]; then
+	$ECHO "\n OMBS post restore is in progress. Cannot proceed with snapshot creation."
+	exit 1
+fi
+
+# Setup up path environment etc
+setup_env
+
+# Set up default logfile 
+
+readonly LOGDIR="/eniq/log/sw_log/rolling_snapshot_logs"
+LOGFILE="${LOGDIR}/prep_eniq_snapshots.log"
+
+# Check Input Params
+#check_params
+
+# Check to make sure all the snapshot scripts exist
+chk_scripts_exist
+
+
+# Check/Create Logfile
+chk_create_logfile
+
+# Create a temporary Directory
+TEM_DIR=/var/tmp/manage_snapshots.$$.$$
+$RM -rf ${TEM_DIR}
+$MKDIR -p ${TEM_DIR}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not create directory ${TEM_DIR}"
+    abort_script "$_err_msg_"
+fi
+
+$CHMOD 640 ${TEM_DIR}
+# Only run on the coordinator
+if [ "${SERVER_TYPE}" != "CO" ]; then
+        _err_msg_="$0 can not be executed on ${SERVER_TYPE} server type"
+    abort_script "$_err_msg_"
+fi
+
+#call in the function to create file with eniq server IPs in order
+get_deployment_order
+
+if [ ! "$NO_CONFIRM" ]; then
+   user_confirm ${TEM_DIR}/server_order_list
+   if [ $USER_CONF == No ]; then
+	  $RM -rf ${TEM_DIR}
+	  exit 0
+   fi
+fi
+
+if [ "${LIST_SNAP}" == "YES" ]; then
+	if [ -s /var/tmp/rollback_conf ]; then
+		log_msg -l ${LOGFILE} -s "\n=========================================="
+		log_msg -l ${LOGFILE} -s "Snapshot created during upgrade\n"
+		$CAT "${VAR_TMP_DIR}/rollback_conf"
+		log_msg -l ${LOGFILE} -s "\n=========================================="
+	fi
+	log_msg -l ${LOGFILE} -s "\nListing all the available snapshots"
+	list_snapshots
+fi
+
+create_snapshots ${TEM_DIR}/server_order_list 
+
+# Rotate and compress the logs if necessary
+rotate_compress_logs ${LOGFILE} ${NUM_LOGS} ${SIZE_LOGS} ${COMPRESS_LOG}
+$RM -rf ${TEM_DIR}
+if [ -s ${SNAP_SERVER_LIST} ]; then
+	$RM -rf $SNAP_SERVER_LIST
+	if [ $? -ne 0 ]; then
+		_err_msg_="Could not remove ${SNAP_SERVER_LIST}"
+        abort_script "$_err_msg_"
+	fi
+fi
+
+
+log_msg -t -l ${LOGFILE} -s "Prepare ENIQ snapshots finished successfully"
+$ECHO "\nLOGFILE: $LOGFILE\n\n"
+exit 0
+
+

@@ -1,0 +1,1530 @@
+#!/bin/bash
+# ********************************************************************
+# Ericsson Radio Systems AB                                     SCRIPT
+# ********************************************************************
+#
+#
+# (c) Ericsson Radio Systems AB 2019 - All rights reserved.
+#
+# The copyright to the computer program(s) herein is the property
+# of Ericsson Radio Systems AB, Sweden. The programs may be used 
+# and/or copied only with the written permission from Ericsson Radio 
+# Systems AB or in accordance with the terms and conditions stipulated 
+# in the agreement/contract under which the program(s) have been 
+# supplied.
+#
+# ********************************************************************
+# Name    : get_disk_info.bsh
+# Date    : 30/07/2023
+# Revision: main\39
+# Purpose : Script to determine number of nodes to be managed,
+#        whether to mirror storage pool, and to lay out disks
+#        and node numbers in ini files
+#
+# Usage   : get_disk_info.bsh
+#
+# ********************************************************************
+#
+#     Command Section
+#
+# ********************************************************************
+#
+AWK=/usr/bin/awk
+BASENAME=/usr/bin/basename
+BC=/usr/bin/bc
+CAT=/usr/bin/cat
+CFGADM=/usr/sbin/cfgadm
+CHMOD=/usr/bin/chmod
+CP=/usr/bin/cp
+CUT=/usr/bin/cut
+DATE=/usr/bin/date
+DF=/usr/bin/df
+DIRNAME=/usr/bin/dirname
+DOMAINNAME=/usr/bin/domainname
+DTCONFIG=/usr/dt/bin/dtconfig
+ECHO=/usr/bin/echo
+EGREP=/usr/bin/egrep
+EJECT=/usr/bin/eject
+ENV=/usr/bin/env
+EXPR=/usr/bin/expr
+FORMAT=/usr/sbin/format
+FUSER=/usr/sbin/fuser
+GEGREP=/usr/sfw/bin/gegrep
+GETENT=/usr/bin/getent
+GETTEXT=/usr/bin/gettext
+GREP=/usr/bin/grep
+GTAR=/usr/sfw/bin/gtar
+GZCAT=/usr/bin/gzcat
+HEAD=/usr/bin/head
+HOSTID=/usr/bin/hostid
+HOSTNAME=/usr/bin/hostname
+ID=/usr/bin/id
+INIT=/usr/sbin/init
+LS=/usr/bin/ls
+METASTAT=/usr/sbin/metastat
+MKDIR=/usr/bin/mkdir
+MORE=/usr/bin/more
+MV=/usr/bin/mv
+NAWK=/usr/bin/nawk
+NETSTAT=/usr/bin/netstat
+PG=/usr/bin/pg
+PGREP=/usr/bin/pgrep
+PING=/usr/sbin/ping
+PKGADD=/usr/sbin/pkgadd
+PKGINFO=/usr/bin/pkginfo
+PRINTF=/usr/bin/printf
+PRTCONF=/usr/sbin/prtconf
+PRTVTOC=/usr/sbin/prtvtoc
+PSRINFO=/usr/sbin/psrinfo
+PWD=/usr/bin/pwd
+RM=/usr/bin/rm
+RCP=/usr/bin/rcp
+ROUTE=/usr/sbin/route
+RSH=/usr/bin/rsh
+SED=/usr/bin/sed
+SLEEP=/usr/bin/sleep
+SORT=/usr/bin/sort
+SU=/usr/bin/su
+SVCADM=/usr/sbin/svcadm
+SVCCFG=/usr/sbin/svccfg
+SVCS=usr/bin/svcs
+SYNC=/usr/sbin/sync
+TAIL=/usr/bin/tail
+TEE=/usr/bin/tee
+TOUCH=/usr/bin/touch
+TPUT=/usr/bin/tput
+UADMIN=/usr/sbin/uadmin
+UNAME=/usr/bin/uname
+VOLD=/usr/sbin/vold
+WC=/usr/bin/wc
+
+
+# ********************************************************************
+#
+#       Configuration Section
+#
+# ********************************************************************
+# Name of SunOS & ENIQ ini Files
+ENIQ_INI=niq.ini
+SYM_INI=sym_links.ini
+LUN_MAP_INI=lun_map.ini
+RBAC_INI=RBAC.ini
+SUNOS_INI=SunOS.ini
+
+# DVD LABEL or Jumpstart Directory where all ENIQ SW will reside
+ENIQ_BASE_SW=eniq_base_sw
+
+# These are the disks that are not allowed to be a root mirror. They must
+# be delimited by "|" for regex to work.
+NOT_ALLOWED_ROOT_MIRROR="SUN[ ]+T300|SUN[ ]+StorEdge[ ]*3[0-9][0-9][0-9]"
+
+# ********************************************************************
+#
+#       Pre-execution Operations
+#
+# ********************************************************************
+
+if [ -e "/etc/zoned" ]; then
+    export ZONE=yes
+fi
+
+# ********************************************************************
+#
+#     Functions
+#
+# ********************************************************************
+### Function: abort_script ###
+#
+#   This will is called if the script is aborted thru an error
+#   error signal sent by the kernel such as CTRL-C or if a serious
+#   error is encountered during runtime
+#
+# Arguments:
+#       $1 - Error message from part of program (Not always used)
+# Return Values:
+#       none
+abort_script()
+{
+_err_time_=`$DATE '+%Y-%b-%d_%H.%M.%S'`
+    
+if [ "$1" ]; then
+    _err_msg_="${_err_time_} - $1"
+else
+    _err_msg_="${_err_time_} - Script aborted.......\n"    
+fi
+
+if [ "${LOGFILE}" ]; then
+    $ECHO -e "\n$_err_msg_\n" | $TEE -a ${LOGFILE}
+else
+    $ECHO -e "\n$_err_msg_\n"
+fi
+
+cd $SCRIPTHOME
+
+# Remove TEM_DIR if this script created it
+if [ ${TEM_DIR_FLAG} -eq 1 ]; then
+    $RM -rf ${TEM_DIR}
+fi
+
+if [ ${DISK_FILE_FLAG} -eq 1 ]; then
+    $RM -f ${DISK_LIST}
+fi
+
+if [ "$2" ]; then
+    ${2}
+else
+   exit 1
+fi
+}
+
+### Function: allocate_disks ###
+#
+# Allocate disks to specific purposes
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+allocate_disks()
+{
+local _disk_lun_id_
+
+if [ ! ${RESTORE} ]; then
+
+    LUN_INI=${ENIQ_CONF_DIR}/${LUN_MAP_INI}
+if [ ! -s ${LUN_INI} ]; then
+    _err_msg_="Could not locate any data disks in ${LUN_INI}"
+    abort_script "$_err_msg_" 
+fi
+
+
+# Initialise variables
+_field1_=0
+_field2_=0
+_field3_=0
+_field4_=0
+
+_cnt_=1
+for _lun_map_det_ in `iniget LUN_MAP_DETAILS -f ${LUN_INI}`; do
+  
+    # Get the Lun ID 
+    _disk_lun_id_=`iniget ${_lun_map_det_} -f ${LUN_INI} -v LUN_ID`
+    if [ ! "${_disk_lun_id_}" ]; then
+        _err_msg_="Could not read ${_lun_map_det_}:LUN_ID param from ${LUN_INI}"
+        abort_script "$_err_msg_" 
+    fi
+
+    if [ "${_disk_lun_id_}" == "local" ]; then
+        continue
+    fi
+       
+  
+        if [ "${SERVER_TYPE}" != "CO" ]; then
+        if [ -s ${ENIQ_CONF_DIR}/${COORD_SYM_LINK_FILE} ]; then
+            $CAT ${ENIQ_CONF_DIR}/${COORD_SYM_LINK_FILE}|$EGREP -w "^[[:blank:]]*Lun_ID=${_disk_lun_id_}[[:blank:]]*$" >> /dev/null 2>&1
+            if [ $? -eq 0 ]; then
+                continue
+            fi
+        fi
+            
+    fi
+
+    if [ "${EXPAND}" ]; then
+        #$ECHO "Expanding the system P1" 
+        if [ ! -s ${ENIQ_CONF_DIR}/${SYM_INI} ]; then
+            err_msg_="Could not find SYM_LINK_INI FILE: ${ENIQ_CONF_DIR}/${SYM_INI} "
+            abort_script "$_err_msg_"
+        fi
+        
+        #List the LUNS already used and don't display them
+        $CAT ${ENIQ_CONF_DIR}/${SYM_INI} |$EGREP "^[[:blank:]]*Lun_ID=${_disk_lun_id_}[[:blank:]]*$" >> /dev/null 2>&1
+        if [ $? -eq 0 ]; then
+                  continue
+        fi
+    
+    fi
+    
+    # Get the disk id
+    _disk_id_array_val_=`iniget ${_lun_map_det_} -f ${LUN_INI} -v DISK_ID`
+    if [ ! "${_disk_id_array_val_}" ]; then
+        _err_msg_="Could not read ${_lun_map_det_}:DISK_ID param from ${LUN_INI}"
+        abort_script "$_err_msg_" 
+    fi
+#Code which needs to be modified for Rack Expansion
+if [ "${EXPAND}" ]; then
+    for _fs_pool_ in `iniget SunOS_FS_POOL -f ${ENIQ_CONF_DIR}/${SUNOS_INI}`; do
+        _ext4_disks_used_="no"
+        #List the EXT4 disks already used and don't display them
+        iniget ${_fs_pool_} -f ${ENIQ_CONF_DIR}/${SUNOS_INI} -v disk_layout > ${TEM_DIR}/_ext4_disks_used_
+        $EGREP -w "${_disk_id_array_val_}" ${TEM_DIR}/_ext4_disks_used_  >> /dev/null 2>&1
+        if [ $? -eq 0 ]; then
+            _ext4_disks_used_="yes"
+            break
+        fi
+    done
+
+    if [ "${_ext4_disks_used_}" == "yes" ]; then
+        continue
+    fi
+fi
+
+    
+    #Save disk_opt value to the array
+    _disk_opt_array_[${_cnt_}]=${_cnt_}
+    
+    _len_=`$EXPR "${_disk_opt_array_[${_cnt_}]}" : '.*'`
+    if [ ${_len_} -gt ${_field1_} ]; then
+        _field1_=${_len_}
+    fi
+        
+    # Save disk lun id to array
+    _disk_lun_id_array_[${_cnt_}]=${_disk_lun_id_}
+    _len_=`$EXPR "${_disk_lun_id_array_[${_cnt_}]}" : '.*'`
+    if [ ${_len_} -gt ${_field2_} ]; then
+        _field2_=${_len_}
+    fi
+    
+    # Save the disk id to the array
+    _disk_id_array_[${_cnt_}]=${_disk_id_array_val_}
+    if [ ! "${_disk_id_array_[${_cnt_}]}" ]; then
+        _err_msg_="Could not read ${_lun_map_det_}:DISK_ID param from ${LUN_INI}"
+        abort_script "$_err_msg_" 
+    fi
+    _len_=`$EXPR "${_disk_id_array_[${_cnt_}]}" : '.*'`
+    if [ ${_len_} -gt ${_field2_} ]; then
+        _field2_=${_len_}
+    fi
+    
+    # Get the disk size
+    _disk_size_array_[${_cnt_}]=`iniget ${_lun_map_det_} -f ${LUN_INI} -v SIZE`
+    if [ ! "${_disk_size_array_[${_cnt_}]}" ]; then
+        _err_msg_="Could not read ${_lun_map_det_}:SIZE param from ${LUN_INI}"
+        abort_script "$_err_msg_" 
+    fi
+    _len_=`$EXPR "${_disk_size_array_[${_cnt_}]}" : '.*'`
+    if [ ${_len_} -gt ${_field3_} ]; then
+        _field3_=${_len_}
+    fi
+    
+    # Get the disk vendor
+    _disk_vendor_array_[${_cnt_}]=`iniget ${_lun_map_det_} -f ${LUN_INI} -v VENDOR`
+    if [ ! "${_disk_vendor_array_[${_cnt_}]}" ]; then
+        _err_msg_="Could not read ${_lun_map_det_}:VENDOR param from ${LUN_INI}"
+        abort_script "$_err_msg_" 
+    fi
+    _len_=`$EXPR "${_disk_vendor_array_[${_cnt_}]}" : '.*'`
+    if [ ${_len_} -gt ${_field4_} ]; then
+        _field4_=${_len_}
+    fi
+    
+    # Get the Lun Description 
+    _disk_lun_desc_array_[${_cnt_}]=`iniget ${_lun_map_det_} -f ${LUN_INI} -v LUN_DESC`
+    if [ ! "${_disk_lun_desc_array_[${_cnt_}]}" ]; then
+        _err_msg_="Could not read ${_lun_map_det_}:LUN_DESC param from ${LUN_INI}"
+        abort_script "$_err_msg_" 
+    fi
+    _len_=`$EXPR "${_disk_lun_desc_array_[${_cnt_}]}" : '.*'`
+    if [ ${_len_} -gt ${_field3_} ]; then
+        _field3_=${_len_}
+    fi
+    
+    let _cnt_=${_cnt_}+1
+done
+
+let _field1_=_field1_+4
+let _field2_=_field2_+2
+let _field3_=_field3_+2
+let _field4_=_field4_+2
+
+_line1_str_="%-${_field1_}s%-${_field2_}s%-${_field3_}s%-${_field4_}s\n"
+_line2_str_="%-${_field1_}s%-${_field2_}s%-${_field3_}s\n\n"
+# _disp_file_ contains the formated disk list
+_disp_file_=${TEM_DIR}/disp_file
+#_disk_menu_opt_file_ will hold the questions to display on the screen for the different disk types
+_disk_menu_opt_file_=${TEM_DIR}/_disk_menu_opt_file_
+$RM -f ${_disk_menu_opt_file_}
+_menu_opt_list_=""
+if [ ! "${EXPAND}" ]; then
+    # Select the FS Pool Disks
+    _pool_list_=`iniget SunOS_FS_POOL -f ${TEM_DIR}/${SUNOS_INI}`
+    for _pool_ in ${_pool_list_}; do
+        _pool_name_=`iniget ${_pool_} -f ${TEM_DIR}/${SUNOS_INI} -v name`
+        _str1_="${_pool_name_}"
+        _str2_="${_pool_name_} FS DISK ALLOCATION OPTIONS"
+        _str3_="to the ${_pool_name_} FS Storage Pool"
+        _str4_="\\\nSelect Range of disks you want to allocate ${_str3_}\\\nusing the format [n,n,n-n,n...n]\\tE.G. 1,2,3-8,9,10"
+        _max_lun_=999999
+        $ECHO -e "${_str1_}@@@${_str2_}@@@${_str3_}@@@${_str4_}@@@${_max_lun_}" >> ${_disk_menu_opt_file_}
+        
+        if [ ! "${_menu_opt_list_}" ]; then
+            _menu_opt_list_="${_str1_}"
+        else
+            _menu_opt_list_="${_menu_opt_list_} ${_str1_}"
+        fi
+    done
+fi
+
+
+# Only add IQ main info to the list if I'm a coordinator
+if [ "${SERVER_TYPE}" == "CO" -o "${EXPAND}" == "YES" ]; then
+    if [ ${EXPAND_IQ_SYS_MAIN} ]; then  
+        # Add IQ System Main to menu opt file
+        _str1_="IQ_SYS_MAIN"
+        _str2_="IQ SYS MAIN DISK ALLOCATION OPTIONS"
+        _str3_="for IQ SYS MAIN database usage"
+        _str4_="\\\nSelect the disk you want to allocate ${_str3_}"
+        if [ ! ${EXPAND} ];then
+            _max_lun_=1
+        else
+            _str4_="\\\nSelect the disks you want to allocate ${_str3_}\\\nusing the format [n,n,n-n,n...n]\\tE.G. 1,2,3-8,9,10"
+            _max_lun_=2
+        fi
+        $ECHO -e "${_str1_}@@@${_str2_}@@@${_str3_}@@@${_str4_}@@@${_max_lun_}" >> ${_disk_menu_opt_file_}
+        if [ ! "${_menu_opt_list_}" ]; then
+            _menu_opt_list_="${_str1_}"
+        else
+            _menu_opt_list_="${_menu_opt_list_} ${_str1_}"
+        fi
+    fi
+    
+    if [ ${EXPAND_MAIN} ]; then 
+        # Add Main DB spaces to menu opt file
+        _str1_="MainDB"
+        _str2_="MainDB DISK ALLOCATION OPTIONS"
+        _str3_="for MainDB database usage"
+        _str4_="\\\nSelect Range of disks you want to allocate ${_str3_}\\\nusing the format [n,n,n-n,n...n]\\tE.G. 1,2,3-8,9,10"
+        _max_lun_=999999
+        $ECHO -e "${_str1_}@@@${_str2_}@@@${_str3_}@@@${_str4_}@@@${_max_lun_}" >> ${_disk_menu_opt_file_}
+        if [ ! "${_menu_opt_list_}" ]; then
+            _menu_opt_list_="${_str1_}"
+        else
+            _menu_opt_list_="${_menu_opt_list_} ${_str1_}"
+        fi
+    fi
+fi
+
+
+if [  "${CURR_SERVER_TYPE}" != "stats_engine" ]; then
+    if [ ${EXPAND_TEMP} ]; then 
+        # Add Temp DB spaces to menu opt file
+        _str1_="TempDB"
+        _str2_="TempDB DISK ALLOCATION OPTIONS"
+        _str3_="for TempDB database usage"
+        if [ "${EXPAND}" == "YES" -a "${EXPAND_TEMP}" == "YES" ]; then
+            _str4_="\\\nSelect Range of disks you want to allocate ${_str3_}\\\nusing the format [n,n,n-n,n...n]\\tE.G. 1,2,3-8,9,10 or none"
+        else
+            _str4_="\\\nSelect Range of disks you want to allocate ${_str3_}\\\nusing the format [n,n,n-n,n...n]\\tE.G. 1,2,3-8,9,10"
+        fi
+        _max_lun_=999999
+        $ECHO -e "${_str1_}@@@${_str2_}@@@${_str3_}@@@${_str4_}@@@${_max_lun_}" >> ${_disk_menu_opt_file_}
+        if [ ! "${_menu_opt_list_}" ]; then
+            _menu_opt_list_="${_str1_}"
+        else
+            _menu_opt_list_="${_menu_opt_list_} ${_str1_}"
+        fi
+    fi
+fi
+
+while :; do
+    $CP /dev/null ${TEM_DIR}/selected_disks
+    for _menu_opt_ in ${_menu_opt_list_}; do
+        _str1_=`$EGREP "^${_menu_opt_}" ${_disk_menu_opt_file_} | $AWK -F"@@@" '{print $1}'`
+        _str2_=`$EGREP "^${_menu_opt_}" ${_disk_menu_opt_file_} | $AWK -F"@@@" '{print $2}'`
+        _str3_=`$EGREP "^${_menu_opt_}" ${_disk_menu_opt_file_} | $AWK -F"@@@" '{print $3}'`
+        _str4_=`$EGREP "^${_menu_opt_}" ${_disk_menu_opt_file_} | $AWK -F"@@@" '{print $4}'`
+        _max_lun_=`$EGREP "^${_menu_opt_}" ${_disk_menu_opt_file_} | $AWK -F"@@@" '{print $5}'`
+        
+        while :; do
+            unset _opt_
+            $RM -f ${_disp_file_}
+            
+            #The purpose of the following if statement is to prevent it displaying the message unless there are actually disks to select
+            if [ "$_cnt_" -le "1" ]; then
+                $ECHO "There are no disks to select. Exiting." | $TEE -a $LOGFILE
+                if [ "${EXPAND}" == "YES" -a "${EXPAND_TEMP}" == "YES" ]; then
+                    $CP ${TEM_DIR}/selected_disks ${VAR_TMP_DIR}/selected_disks
+                fi
+                exit 0
+            fi    
+            
+            $ECHO "${_str2_}"  >> ${_disp_file_} 
+            $ECHO -e "------------------------------------------------------------\n" >> ${_disp_file_}
+                
+            printf "${_line1_str_}" "" "DISK" "Size" "Vendor" >> ${_disp_file_}
+            printf "${_line2_str_}" "" "LUN ID" "Lun Description" >> ${_disp_file_}                
+            
+            #Display the disks that have not yet been selected in previous iterations of this while loop
+            _loop_opt_cnt_=${#_disk_opt_array_[@]}
+            for (( i=1; i<=${_loop_opt_cnt_}; i++ )); do        
+                $EGREP -w "${_disk_id_array_[${i}]}" ${TEM_DIR}/selected_disks >> /dev/null 2>&1
+                if [ $? -eq 0 ]; then
+                    continue
+                fi
+                    
+                printf "${_line1_str_}" "[${_disk_opt_array_[${i}]}]" "${_disk_id_array_[${i}]}" "${_disk_size_array_[${i}]} GB" "${_disk_vendor_array_[${i}]}" >> ${_disp_file_}
+                printf "${_line2_str_}" "" "${_disk_lun_id_array_[${i}]}" "${_disk_lun_desc_array_[${i}]}" >> ${_disp_file_}
+            done
+            
+            _numerror_=0
+            _no_disk_=0
+            clear
+            $CAT ${_disp_file_} #List the disks
+            $ECHO "${_str4_}"
+            if [ "${dbexpansion_flag}" == "true" ]; then
+                if [ "${CURR_SERVER_TYPE}" == "stats_coordinator" ]; then 
+                    if [ -e /eniq/sw/conf/expansion_disp_file ]; then
+                        new_main_lun_ids=$(grep "Available new MainDB LUN IDs for Co" /eniq/sw/conf/expansion_disp_file)
+                        $ECHO "$new_main_lun_ids" | $AWK -F ": " '{print $2}' | tr ',' '\n' >> /var/tmp/mainids
+                    else 
+                        _err_msg_="MainDb Luns Input file does not exists"
+                        abort_script $"{_err_msg_}"
+                    fi
+                    for id in `$CAT /var/tmp/mainids`; do
+                        mainid=$($CAT ${_disp_file_} | $GREP -B1 "$id" | $HEAD -1 | $AWK -F " " '{print $1}' | tr -d "[]")
+                        if [ -n "$mainid" ]; then
+                            $ECHO "$mainid" >> /var/tmp/main_ids
+                        fi
+                    done
+                    
+                    echo ${lun_inputs}
+                    _opt_=$($CAT /var/tmp/main_ids | paste -s -d, -)
+                elif [ "${CURR_SERVER_TYPE}" == "stats_iqr" ]; then
+                    current_reader_type=$($CAT ${ENIQ_CONF_DIR}/install_reader_type)
+                    if [ "${current_reader_type}" == "dwh_reader_1" ]; then
+                        reader_number=1
+                    else
+                        reader_number=2
+                    fi
+                    if [ -e /eniq/sw/conf/expansion_disp_file ]; then
+                        new_temp_lun_ids=$(grep "Available new TempDB LUN IDs for Reader-${reader_number}" /eniq/sw/conf/expansion_disp_file)
+                        $ECHO "$new_temp_lun_ids" | $AWK -F ": " '{print $2}' | tr ',' '\n' >> /var/tmp/tempids
+                    else 
+                        _err_msg_="TempDB Luns Input file does not exists"
+                        abort_script $"{_err_msg_}"
+                    fi
+                    for id in `$CAT /var/tmp/tempids`; do
+                        tempid=$($CAT ${_disp_file_} | $GREP -B1 "$id" | $HEAD -1 | $AWK -F " " '{print $1}' | tr -d "[]")
+                        if [ -n "$tempid" ]; then
+                            $ECHO "$tempid" >> /var/tmp/temp_ids
+                        fi
+                    done 
+                    $ECHO ${lun_inputs}
+                    _opt_=$($CAT /var/tmp/temp_ids | paste -s -d, -)
+                    fi
+            else
+                read _opt_
+            fi
+            
+            # If the User hit nothing and there is a default. that will do
+            if [ ! "${_opt_}" ]; then
+                continue
+            fi
+            
+            if [ "${EXPAND}" == "YES" -a "${EXPAND_TEMP}" == "YES" ]; then
+                # Where user selects no TEMP DB disk
+                if [[ "${_opt_}" == 'None' ||  "${_opt_}" == 'none'  ]]; then
+                    _no_disk_=1
+                    $ECHO "${_str1_}::None" >> ${TEM_DIR}/selected_disks
+                    break
+                fi
+            fi
+            
+            #Iterate through each comma seperated item of the user input
+            unset _num_ # - item of user input
+            _opt_sel_="," # - validated list of items
+            for _num_ in `$ECHO ${_opt_} | $SED -e 's| ||g' -e 's|,| |g'`; do 
+                $ECHO ${_num_} | $EGREP '-' >> /dev/null 2>&1
+                if [ $? -eq 0 ]; then # it's a range.
+                    # Only one disk required?
+                    if [ ${_max_lun_} -eq 1 ]; then
+                        _numerror_=1
+                        break
+                    fi
+                    
+                    _start_=`$ECHO ${_num_} | $AWK -F\- '{print $1}'`
+                    if [ ! "${_start_}" ]; then
+                        _numerror_=1
+                        break
+                    fi
+                     # Check if the first number is numeric
+                    $ECHO ${_start_} | $EGREP '^[0-9]+$' >> /dev/null 2>&1
+                    if [ $? -ne 0 ]; then
+                        _numerror_=1
+                        break
+                    fi
+                    
+                    _end_=`$ECHO ${_num_} | $AWK -F\- '{print $2}'`
+                    if [ ! "${_end_}" ]; then
+                        _numerror_=1
+                        break
+                    fi
+                    # Check if the last number is numeric
+                    $ECHO ${_end_} | $EGREP '^[0-9]+$' >> /dev/null 2>&1
+                    if [ $? -ne 0 ]; then
+                        _numerror_=1
+                        break
+                    fi
+
+                    if [ "${_start_}" -ge  "${_end_}" >> /dev/null 2>&1 ]; then
+                        _numerror_=1
+                        break
+                    fi
+
+                    for (( _sel_=${_start_}; _sel_<=${_end_}; _sel_++ )); do
+                        # Check if already selected
+                        $ECHO $_opt_sel_ | $GREP ",${_sel_}," >> /dev/null 2>&1
+                        if [ $? -eq 0 ]; then
+                            _numerror_=1
+                            break
+                        fi
+                        
+                        # Check it's within range
+                        if [ ${_sel_} -lt 1 -o ${_sel_} -gt ${_loop_opt_cnt_} ]; then
+                            _numerror_=1
+                            break
+                        fi
+                        
+                        #Add to list of validated disk numbers
+                        _opt_sel_="${_opt_sel_}${_sel_},"
+                    done
+                else # it's not a range.
+                    # Check for numeric
+                    $ECHO ${_num_} | $EGREP '^[0-9]+$' >> /dev/null 2>&1
+                    if [ $? -ne 0 ]; then
+                        _numerror_=1
+                        break
+                    fi
+                    
+                    # Only one disk required?
+                    if [ ${_max_lun_} -eq 1 ]; then
+                        _chk_=`$ECHO ${_opt_} | $SED -e 's| ||g' -e 's|,| |g'|$WC -w`
+                        if [ ${_chk_} -ne 1 ]; then 
+                            _numerror_=1
+                            break
+                        fi
+                    fi
+                    
+                    # Check if already selected
+                    $ECHO $_opt_sel_ | $GREP ",${_num_}," >> /dev/null 2>&1
+                    if [ $? -eq 0 ]; then
+                        _numerror_=1
+                        break
+                    fi
+                    
+                    # Check it's within range
+                    if [ ${_num_} -lt 1 -o ${_num_} -gt ${_loop_opt_cnt_} ]; then
+                        _numerror_=1
+                        break
+                    fi
+                    
+                    #Add to list of validated disk numbers
+                    _opt_sel_="${_opt_sel_}${_num_},"
+                fi  
+            done
+            if [ ${_numerror_} -eq 0 ]; then
+                #User input is valid. Iterate through each disk number and write selections(s) to file
+                unset _num_
+                for _num_ in `$ECHO ${_opt_sel_} | $SED -e 's| ||g' -e 's|,| |g'`; do 
+                                                            
+                    _dsk_=`$ECHO ${_disk_id_array_[${_num_}]}|$AWK  -F\@ '{print $1}'`
+                    _dsk_lun_id_=`$ECHO ${_disk_lun_id_array_[${_num_}]}`
+                    $GREP -w ${_dsk_} ${TEM_DIR}/selected_disks >> /dev/null 2>&1
+                    if [ $? -ne 0 ]; then
+                        $ECHO "${_num_}::${_str1_}::${_dsk_}::${_dsk_lun_id_}" >> ${TEM_DIR}/selected_disks
+                        $CP ${TEM_DIR}/selected_disks ${TEM_DIR}/selected_disks_bkp
+                        $CP ${TEM_DIR}/selected_disks ${VAR_TMP_DIR}/selected_disks
+                    fi
+                done
+                break
+            fi
+        done
+    done
+    
+    #To get the lun_ids that are added
+    if [ "${EXPAND}" -a ${_no_disk_} -eq 0 ]; then
+        _Added_lun_=`$CAT ${TEM_DIR}/selected_disks_bkp | $AWK -F "::" '{print $4}' | tr '\n' ',' | $SED 's/,$/\n/'`
+        if [ $? -ne 0 ]; then
+            _err_msg_="Could not get the Added luns"
+            abort_script "$_err_msg_"
+        fi
+    fi
+    
+    if [ ${_no_disk_} -eq 1 ]; then
+        if [ "${EXPAND}" == "YES" -a "${EXPAND_TEMP}" == "YES" ]; then
+            $RM -f ${_disp_file_}
+            $ECHO "Allocation \t DISK" >> ${_disp_file_}
+            _allocation_=`$CAT ${TEM_DIR}/selected_disks | $AWK -F"::" '{print $1}'`
+            _disk_selected_=`$CAT ${TEM_DIR}/selected_disks | $AWK -F"::" '{print $2}'`
+            $ECHO "${_allocation_} \t\t ${_disk_selected_}" >> ${_disp_file_}
+            $ECHO -e "\n" >> ${_disp_file_}
+        fi
+    else
+        # Check if overall disk allocation is correct
+        $RM -f ${_disp_file_}
+        _line3_str_="%-25s%-${_field3_}s\n"
+        printf "${_line3_str_}" "Allocation" "DISK" >> ${_disp_file_}
+    
+        for _menu_opt_ in ${_menu_opt_list_}; do
+            _disk_ids_=`$EGREP "::${_menu_opt_}" ${TEM_DIR}/selected_disks | $AWK -F"::" '{print $3}'`
+            _first_=1
+            for _dsk_ in ${_disk_ids_}; do
+                if [ ${_first_} -eq 1 ]; then
+                    printf "${_line3_str_}"  "${_menu_opt_}" "${_dsk_}" >> ${_disp_file_}
+                    _first_=0
+                else
+                    printf "${_line3_str_}"  ""  "${_dsk_}" >> ${_disp_file_}
+                fi
+            done
+            $ECHO -e "\n" >> ${_disp_file_}
+        done
+    fi
+    
+    while :; do
+        clear
+        $CAT ${_disp_file_}
+        
+        $ECHO -e "\n\nAre the disk allocations above correct (Yy/Nn)"
+        #Automated in case flag for autmation is 1 else ask for input.
+        if [ "${dbexpansion_flag}" == "true" ]; then
+            _user_conf_="y"
+        else
+            read _user_conf_
+        fi
+        
+        # If the User hit nothing and there is a default. that will do
+        if [ ! "${_user_conf_}" ]; then
+            continue
+        fi
+        
+        # Did the user input (Y/y/N/n)
+        if [ "${_user_conf_}" == "Y" -o "${_user_conf_}" == "y" ]; then
+            break
+        elif [ "${_user_conf_}" == "N" -o "${_user_conf_}" == "n" ]; then
+            break
+        else
+            :
+        fi
+    done
+    
+    if [ "${_user_conf_}" == "Y" -o "${_user_conf_}" == "y" ]; then
+        break
+    fi
+done
+
+log_msg -s "\nUser disk selection:" -l ${LOGFILE}
+$CAT ${_disp_file_} | $TEE -a ${LOGFILE}
+fi
+
+if [ ${_no_disk_} -eq 1 ]; then
+    if [ "${EXPAND}" == "YES" -a "${EXPAND_TEMP}" == "YES" ]; then
+        $CP ${TEM_DIR}/selected_disks ${VAR_TMP_DIR}/selected_disks
+        exit 0
+    fi
+fi
+
+# Populate the ZFS Entries in ${SUNOS_INI}
+_pool_list_=`iniget SunOS_FS_POOL -f ${TEM_DIR}/${SUNOS_INI}`
+for _pool_ in ${_pool_list_}; do
+    _pool_name_=`iniget ${_pool_} -f ${TEM_DIR}/${SUNOS_INI} -v name`
+    _pool_dsk_list_=`$CAT ${TEM_DIR}/selected_disks | $EGREP "::${_pool_name_}::" | $AWK -F"::" '{print $3}'`
+    # Remove any CR/LF
+    _pool_dsk_list_=`$ECHO ${_pool_dsk_list_}`
+    if [ "${_pool_dsk_list_}" ]; then
+        log_msg -s "\nSetting disk_layout for ${_pool_} in ${TEM_DIR}/${SUNOS_INI} to\n${_pool_dsk_list_}" -l ${LOGFILE}
+        iniset ${_pool_} -f ${TEM_DIR}/${SUNOS_INI} disk_layout="${_pool_dsk_list_}"
+        if [ $? -ne 0 ]; then
+            _err_msg_="Could not set disk_layout=\"${_pool_dsk_list_}\" for ${_pool_} in ${TEM_DIR}/${SUNOS_INI}"
+            abort_script "$_err_msg_"
+        fi
+    else
+        log_msg -s "\nNo EXT4 disks need to be set" -l ${LOGFILE}
+    fi
+done
+
+# Store the IQ disks
+_iq_db_dsk_list_=`$CAT ${TEM_DIR}/selected_disks | $EGREP "::IQ_SYS_MAIN::" | $AWK -F"::" '{print $3}'`
+_iq_db_dsk_list_=`$ECHO ${_iq_db_dsk_list_}`
+_main_db_dsk_list_=`$CAT ${TEM_DIR}/selected_disks | $EGREP "::MainDB::" | $AWK -F"::" '{print $3}'`
+_main_db_dsk_list_=`$ECHO ${_main_db_dsk_list_}`
+_temp_db_dsk_list_=`$CAT ${TEM_DIR}/selected_disks | $EGREP "::TempDB::" | $AWK -F"::" '{print $3}'`
+_temp_db_dsk_list_=`$ECHO ${_temp_db_dsk_list_}`
+
+# check if the DB_DISK_ALLOC information is already set
+if [ ! ${RESTORE} ]; then
+    _db_disk_alloc_chk_=`iniget DB_DISK_ALLOC -f ${TEM_DIR}/${SYM_INI}`
+    if [ ! "${_db_disk_alloc_chk_}" ]; then
+        $ECHO -e "\n[DB_DISK_ALLOC]" >> ${TEM_DIR}/${SYM_INI}
+        $ECHO "IQ_SYS_MAIN_DISKS=${_iq_db_dsk_list_}" >> ${TEM_DIR}/${SYM_INI}
+        $ECHO "MAINDB_DISKS=${_main_db_dsk_list_}" >> ${TEM_DIR}/${SYM_INI}
+        $ECHO "TEMPDB_DISKS=${_temp_db_dsk_list_}" >> ${TEM_DIR}/${SYM_INI}    
+    else    
+        # check the orginal values and add the new values to them
+        _iq_db_dsk_list_org_=`iniget DB_DISK_ALLOC -f ${TEM_DIR}/${SYM_INI} -v IQ_SYS_MAIN_DISKS | $SED -e 's/^[ ]*//'`
+        log_msg -s "\nSetting DB_DISK_ALLOC in ${TEM_DIR}/${SYM_INI} with IQ_SYS_MAIN_DISKS=${_iq_db_dsk_list_org_} ${_iq_db_dsk_list_}" -l ${LOGFILE}
+        iniset DB_DISK_ALLOC -f ${TEM_DIR}/${SYM_INI} IQ_SYS_MAIN_DISKS="${_iq_db_dsk_list_org_} ${_iq_db_dsk_list_}"
+        if [ $? -ne 0 ]; then
+            _err_msg_="Could not update ${TEM_DIR}/${SYM_INI} with IQ_SYS_MAIN_DISKS=${_iq_db_dsk_list_org_} ${_main_db_dsk_list_}"
+            abort_script "$_err_msg_"
+        fi
+        
+        _main_db_dsk_list_org=`iniget DB_DISK_ALLOC -f ${TEM_DIR}/${SYM_INI} -v MAINDB_DISKS | $SED -e 's/^[ ]*//'`
+        log_msg -s "\nSetting DB_DISK_ALLOC in ${TEM_DIR}/${SYM_INI} with MAINDB_DISKS=${_main_db_dsk_list_org} ${_main_db_dsk_list_}" -l ${LOGFILE}
+        iniset DB_DISK_ALLOC -f ${TEM_DIR}/${SYM_INI} MAINDB_DISKS="${_main_db_dsk_list_org} ${_main_db_dsk_list_}"
+        if [ $? -ne 0 ]; then
+            _err_msg_="Could not update ${TEM_DIR}/${SYM_INI} with MAINDB_DISKS=${_main_db_dsk_list_org} ${_main_db_dsk_list_}"
+            abort_script "$_err_msg_"
+        fi
+        
+        _temp_db_dsk_list_org_=`iniget DB_DISK_ALLOC -f ${TEM_DIR}/${SYM_INI} -v TEMPDB_DISKS | $SED -e 's/^[ ]*//'`
+        log_msg -s "\nSetting DB_DISK_ALLOC in ${TEM_DIR}/${SYM_INI} with TEMPDB_DISKS=${_temp_db_dsk_list_org_} ${_temp_db_dsk_list_}" -l ${LOGFILE}
+        iniset DB_DISK_ALLOC -f ${TEM_DIR}/${SYM_INI} TEMPDB_DISKS="${_temp_db_dsk_list_org_} ${_temp_db_dsk_list_}"
+        if [ $? -ne 0 ]; then
+            _err_msg_="Could not update ${TEM_DIR}/${SYM_INI} with TEMPDB_DISKS=${_temp_db_dsk_list_org_} ${_temp_db_dsk_list_}"
+            abort_script "$_err_msg_"
+        fi
+    fi
+    
+else
+    if [ "${_iq_db_dsk_list_}" ]; then
+        log_msg -s "\nSetting DB_DISK_ALLOC in ${TEM_DIR}/${SYM_INI} with IQ_SYS_MAIN_DISKS=${_iq_db_dsk_list_}" -l ${LOGFILE}
+        iniset DB_DISK_ALLOC -f ${TEM_DIR}/${SYM_INI} IQ_SYS_MAIN_DISKS="${_iq_db_dsk_list_}"
+        if [ $? -ne 0 ]; then
+                _err_msg_="Could not update ${TEM_DIR}/${SYM_INI} with IQ_SYS_MAIN_DISKS=${_iq_db_dsk_list_}"
+                abort_script "$_err_msg_"
+        fi
+    fi
+    if [ "${_main_db_dsk_list_}" ]; then
+        log_msg -s "\nSetting DB_DISK_ALLOC in ${TEM_DIR}/${SYM_INI} with MAINDB_DISKS=${_main_db_dsk_list_}" -l ${LOGFILE}
+        iniset DB_DISK_ALLOC -f ${TEM_DIR}/${SYM_INI} MAINDB_DISKS="${_main_db_dsk_list_}"
+        if [ $? -ne 0 ]; then
+            _err_msg_="Could not update ${TEM_DIR}/${SYM_INI} with MAINDB_DISKS=${_main_db_dsk_list_}"
+            abort_script "$_err_msg_"
+        fi
+    fi
+    if [ "${_temp_db_dsk_list_}" ]; then
+        log_msg -s "\nSetting DB_DISK_ALLOC in ${TEM_DIR}/${SYM_INI} with TEMPDB_DISKS=${_temp_db_dsk_list_}" -l ${LOGFILE}
+        iniset DB_DISK_ALLOC -f ${TEM_DIR}/${SYM_INI} TEMPDB_DISKS="${_temp_db_dsk_list_}"
+        if [ $? -ne 0 ]; then
+            _err_msg_="Could not update ${TEM_DIR}/${SYM_INI} with TEMPDB_DISKS=${_temp_db_dsk_list_}"
+            abort_script "$_err_msg_"
+        fi
+    fi
+
+fi
+}
+
+### Function: check_id ###
+#
+#   Check that the effective id of the user is correct
+#   If not print error msg and exit.
+#
+# Arguments:
+#       $1 : User ID name
+# Return Values:
+#       none
+check_id()
+{
+
+_get_id_=`$ENV |$GREP -w SUDO_USER | $EGREP "^[[:blank:]]*SUDO_USER="|$AWK -F\= '{print $2}'|$SED -e 's|"||g'`
+
+_check_id_=`$ID | $AWK -F\( '{print $2}' | $AWK -F\) '{print $1}'`
+
+_check_group_=`$ID $_get_id_ | $AWK -F\( '{print $3}' | $AWK -F\) '{print $1}'`
+
+
+    if [ "${_get_id_}" == "" ]; then
+
+        if [ "${_check_id_}" == "root" ]; then
+           # Set 1 for true
+           _user_root=1
+
+        else
+           _err_msg_="You must be root or admin to execute this script."
+           abort_script "${_err_msg_}"
+        fi
+          else
+            if [ "${_check_group_}" == "ENIQ_ADMIN_ROLE" ]; then
+               # Set 0 for false
+               _user_root=0
+
+            else
+               _err_msg_="You must be root or admin to execute this script." 
+               abort_script "${_err_msg_}"
+            fi
+    fi
+}
+
+### Function: chk_create_logfile ###
+#
+# Check/Create Logfile
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+chk_create_logfile()
+{
+$MKDIR -p `$DIRNAME ${LOGFILE}`
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not create directory `$DIRNAME ${LOGFILE}`"
+     abort_script "$_err_msg_"
+fi
+
+$TOUCH -a ${LOGFILE}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not write to file ${LOGFILE}"
+    abort_script "$_err_msg_"
+fi
+}
+
+### Function: check_params ###
+#
+# Check Input Params
+#
+# Arguments:
+#    none
+# Return Values:
+#    none
+check_params()
+{
+# For restore, we need the '-r' flag, and the directory
+# containing the .ini files
+if [ ${RESTORE} ]; then
+    if [ ! "${RST_DIR}" -o ! "${RESTORE}" ]; then
+        usage_msg
+        exit 1
+    fi
+else
+    # For initial set-up, we only need the tem_dir used 
+    # by create_eniq_ini.bsh
+    if [ ! "${TEM_DIR}" -o ! "${STORAGE_TYPE}" ]; then
+        if [ ! "${EXPAND}" ]; then
+            usage_msg
+            exit 1
+        fi
+    fi
+fi
+if [ ! "${STORAGE_TYPE}" ]; then
+        usage_msg
+        exit 1
+fi
+if [ "${STORAGE_TYPE}" != "fs" -a "${STORAGE_TYPE}" != "raw" ]; then
+    usage_msg
+    exit 1
+fi
+}
+
+### Function: clear ### 
+#
+# To clear the screen
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+clear()
+{
+
+# Clearing the screen without removing scrollback buffer
+$PRINTF '\33[H\33[2J'
+
+}
+
+### Function: create_disk_list ###
+#
+# This will create a formatted ouptput of the disks on the
+# machine. 
+#
+# Arguments:
+#       $1 - File to write output into
+# Return Values:
+#       none
+create_disk_list()
+{
+if [ ! "${1}" ]; then
+    _err_msg_="Function Usage : create_disk_list <ouput_file>"
+    abort_script "$_err_msg_" 
+fi
+
+_out_file_=${1}
+$TOUCH ${_out_file_} >> /dev/null 2>&1
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not create output file ${_out_file_}"
+    abort_script "$_err_msg_" 
+fi
+
+if [ ! -x ${SCRIPTHOME}/get_disk_list.sh ]; then
+    _err_msg_="${SCRIPTHOME}/get_disk_list.sh not found or not executable"
+    abort_script "$_err_msg_"    
+fi
+
+$ECHO -e "\nBuilding Disk Table.......Please Wait"
+
+# Get the list of the disks seperated by "@" delimiter
+${SCRIPTHOME}/get_disk_list.sh -f -r -d "@" > ${TEM_DIR}/tem_disk_file
+if [ ! -s ${TEM_DIR}/tem_disk_file ]; then
+    _err_msg_="No disk details returned from command\n${SCRIPTHOME}/get_disk_list.sh -f -d -r "@""
+    abort_script "$_err_msg_" 
+fi
+
+$GREP -w "ERROR" ${TEM_DIR}/tem_disk_file >> /dev/null 2>&1
+if [ $? -eq 0 ]; then
+    $ECHO -e "\n"
+    $GREP -w "ERROR" ${TEM_DIR}/tem_disk_file
+    $ECHO -e "\nCould not read disk information from the listed disks above"
+    $ECHO "They will be excluded from the avaiable disk list"
+    $ECHO -e "\nPress any key to continue"
+    read _any_ 
+fi
+$CP ${TEM_DIR}/tem_disk_file ${_out_file_}
+}
+
+### Function: get_absolute_path ###
+#
+# Determine absolute path to software
+#
+# Arguments:
+#    none
+# Return Values:
+#    none
+get_absolute_path() 
+{
+_dir_=`$DIRNAME $0`
+SCRIPTHOME=`cd $_dir_ 2>/dev/null && pwd || $ECHO $_dir_`
+}
+
+### Function: get_fs_disks ###
+#
+# Get list of other disks that the user wants to use
+# These disks will be given to FS
+#
+# Arguments:
+#    none
+# Return Values:
+#    none
+get_fs_disks()
+{
+_fs_options_=${DISK_LIST}
+
+if [ ! -s ${_fs_options_} ]; then
+    _err_msg_="Could not locate any data disks"
+    abort_script "$_err_msg_" 
+fi
+# _disp_file_ contains the formated disk list
+_disp_file_=${TEM_DIR}/disp_file
+$RM -f ${_disp_file_}
+
+$ECHO "FS DATA DISK OPTIONS" >> ${_disp_file_}
+$ECHO "---------------------" >> ${_disp_file_}
+
+unset _fs_opt_array_
+_cnt_=1
+while read _line_; do
+    _dsk_=`$ECHO $_line_|$AWK -F\@ '{print $1}'`
+    _size_=`$ECHO $_line_|$AWK -F\@  '{print $3}'`
+    _desc_=`$ECHO $_line_|$AWK -F\@ '{print $2}'`
+
+    $ECHO -e "[${_cnt_}]   ${_dsk_}\t${_size_}\t${_desc_}" >> ${_disp_file_}
+
+    _fs_opt_array_[${_cnt_}]=${_line_}
+    let _cnt_=_cnt_+1
+done < ${_fs_options_}
+
+
+_fs_opt_cnt_=${#_fs_opt_array_[@]}
+_def_disk_list_="1-${_fs_opt_cnt_}"
+
+
+while :; do
+    _numerror_=0
+    clear
+    $CP /dev/null ${TEM_DIR}/fs_disk_selection
+    $CAT ${_disp_file_}
+    $ECHO -e "\nSelect Range of disks you want to allocate to the FS Storage Pool"
+    $ECHO -e "using the format [n,n,n-n,n...n]\tE.G. 1,2,3-8,9,10"
+    
+    
+    $ECHO "Hit enter to select default [${_def_disk_list_}] or enter the disks you wish to use"
+    
+    read _opt_
+
+    # If the User hit nothing and there is a default. that will do
+    if [ ! "${_opt_}" ]; then
+        _start_=`$ECHO ${_def_disk_list_} | $AWK -F\- '{print $1}'`
+        _end_=`$ECHO ${_def_disk_list_} | $AWK -F\- '{print $2}'`
+        for (( _sel_=${_start_}; _sel_<=${_end_}; _sel_++ )); do
+            $ECHO ${_fs_opt_array_[${_sel_}]}|$AWK  -F\@ '{print $1}' >> ${TEM_DIR}/fs_disk_selection
+        done
+        break
+    fi
+
+    unset _num_
+    for _num_ in `$ECHO ${_opt_} | $SED -e 's| ||g' -e 's|,| |g'`; do 
+        $ECHO ${_num_} | $EGREP '-' >> /dev/null 2>&1
+        if [ $? -eq 0 ]; then            
+            _start_=`$ECHO ${_num_} | $AWK -F\- '{print $1}'`
+            if [ ! "${_start_}" ]; then
+                continue
+            fi
+            _end_=`$ECHO ${_num_} | $AWK -F\- '{print $2}'`
+            for (( _sel_=${_start_}; _sel_<=${_end_}; _sel_++ )); do
+                $ECHO ${_sel_} | $EGREP '^[0-9]+$' >> /dev/null 2>&1
+                if [ $? -ne 0 ]; then
+                    _numerror_=1
+                    break
+                fi
+                if [ ${_sel_} -lt 1 -o ${_sel_} -gt ${_fs_opt_cnt_} ]; then
+                    _numerror_=1
+                    break
+                fi
+                _dsk_=`$ECHO ${_fs_opt_array_[${_sel_}]}|$AWK  -F\@ '{print $1}'`
+                $GREP -w ${_dsk_} ${TEM_DIR}/fs_disk_selection >> /dev/null 2>&1
+                if [ $? -ne 0 ]; then
+                    $ECHO ${_dsk_} >> ${TEM_DIR}/fs_disk_selection
+                fi
+            done
+        else
+            $ECHO ${_num_} | $EGREP '^[0-9]+$' >> /dev/null 2>&1
+            if [ $? -ne 0 ]; then
+                _numerror_=1
+                break
+            fi
+            if [ ${_num_} -lt 1 -o ${_num_} -gt ${_fs_opt_cnt_} ]; then
+                _numerror_=1
+                break
+            fi
+            _dsk_=`$ECHO ${_fs_opt_array_[${_num_}]}|$AWK  -F\@ '{print $1}'`
+            $GREP -w ${_dsk_} ${TEM_DIR}/fs_disk_selection >> /dev/null 2>&1
+            if [ $? -ne 0 ]; then
+                $ECHO ${_dsk_} >> ${TEM_DIR}/fs_disk_selection
+            fi
+        fi  
+    done
+    
+
+    if [ ${_numerror_} -eq 0 ]; then
+        break
+    fi
+done
+
+unset POOL_LIST
+while read _dsk_; do
+    if [ "${POOL_LIST}" ]; then
+        POOL_LIST="${POOL_LIST} ${_dsk_}"
+    else
+        POOL_LIST=${_dsk_}
+    fi
+done < ${TEM_DIR}/fs_disk_selection
+
+
+DISK_SIZE_CHK_LIST="${POOL_LIST}"
+FS_DISK_LIST_CMD="${POOL_LIST}"
+iniset SunOS_FS_POOL_1 -f ${TEM_DIR}/${SUNOS_INI} disk_layout="$FS_DISK_LIST_CMD"
+    if [ $? -ne 0 ]; then
+        _err_msg_="Could not update ${TEM_DIR}/${SUNOS_INI} disk_layout=$FS_DISK_LIST_CMD"
+        abort_script "$_err_msg_" 
+    fi    
+}
+
+### Function: setup_env ###
+#
+# Setup up path environment etc
+#
+# Arguments:
+#    none
+# Return Values:
+#    none
+setup_env()
+{
+if [ ! "${ENIQ_BASE_DIR}" ]; then
+    ENIQ_BASE_DIR=/eniq
+fi
+# ENIQ Config Directory
+ENIQ_CONF_DIR=${ENIQ_BASE_DIR}/installation/config
+
+# ENIQ SW Config Directory
+CLI_CONF_DIR=${ENIQ_BASE_DIR}/sw/conf
+
+# Core install bin dir
+ENIQ_CORE_BIN_DIR=${ENIQ_BASE_DIR}/installation/core_install/bin
+
+# File containing LUN Ids for the coordinator
+COORD_SYM_LINK_FILE=coordinator_sym_links.ini
+
+#/var/tmp directory
+VAR_TMP_DIR=/var/tmp
+
+# Determine the current server type
+CURR_SERVER_TYPE=`$CAT $ENIQ_CONF_DIR/installed_server_type`
+if [ "${CURR_SERVER_TYPE}" == "eniq_coordinator"   -o "${CURR_SERVER_TYPE}" == "eniq_iqw" -o "${CURR_SERVER_TYPE}" == "stats_coordinator" -o "${CURR_SERVER_TYPE}" == "eniq_stats" ]; then
+    SERVER_TYPE="CO"
+else
+    SERVER_TYPE="${CURR_SERVER_TYPE}"
+fi
+
+#Get deployment type
+if [ -s ${ENIQ_CONF_DIR}/extra_params/deployment ]; then
+      _deployment_=`$CAT ${ENIQ_CONF_DIR}/extra_params/deployment`
+else
+      _err_msg_="Parameter \"deployment\" incorrectly specified, or is missing from boot command"
+      abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+fi
+      
+}
+
+### Function: usage_msg ###
+#
+#   Print out the usage message
+#
+# Arguments:
+#    none
+# Return Values:
+#    none
+usage_msg() 
+{
+clear
+$ECHO "
+Usage: `$BASENAME $0` [ -b <eniq_base_dir> ] [ -d restore_dir ] -f <temporary_dir>
+              [ -l <path_to_logfile> ] [ -r ] -t  [ raw | fs ] [ -e -S -M -T ]
+                      
+options:
+
+-b  : Parameter specifying the full path to where the ENIQ
+      BASEDIR directory is (eg. /eniq). If not specified, then the 
+      script will assume the the base directory is 
+      ../../<directory_that_this_script_is_in>
+
+-d  : Parameter specifying the full path to the directory 
+      containing the files for the restoration of ENIQ
+      
+-f  : Temporary directory for managing files during initial install   
+
+-i  : Installation type: stats or events 
+
+-l  : Optional parameter specifying the full path to logfile.
+
+-r  : Flag to specify that the script is used as part of a restore
+
+-e  : Flag to specify that the script is used as part of an expansion
+
+-S    : EXPAND_IQ_SYS_MAIN ( Only used as part of an expansion )
+        
+-M    : EXPAND_MAIN ( Only used as part of an expansion )
+        
+-T    : EXPAND_TEMP ( Only used as part of an expansion )
+
+-t  : Flag to specify which stoage type for databases [ raw | fs ]
+"
+}
+
+# ********************************************************************
+#
+#     Main body of program
+#
+# ********************************************************************
+#
+RUN_TIME=`$DATE '+%Y-%b-%d_%H.%M.%S'`
+TEM_DIR_FLAG=0
+DISK_FILE_FLAG=0
+
+# Determine absolute path to software
+get_absolute_path
+
+# Check that the effective id of the user is root
+check_id 
+
+# Pass in b - /eniq
+#      d - directory containing ini files from restore_eniq.bsh
+#      f - TEM_DIR used in other scripts, passed in by create_eniq_ini.bsh
+#         l - logfile, passed in from calling scripts
+#      r - if this been called from restore_eniq.bsh
+#      t - Storage Type [ fs | raw ]
+while getopts ":b:d:f:i:l:ret:SMTk:a:" arg; do
+    case $arg in
+    b) ENIQ_BASE_DIR="$OPTARG" 
+        ;;
+    d) RST_DIR="$OPTARG"
+        ;;   
+    f) TEM_DIR="$OPTARG"
+        ;;
+    i) INST_TYPE="$OPTARG"
+        ;;   
+    l) LOGFILE="$OPTARG"
+        ;;
+    r) RESTORE="YES" 
+        ;;
+    e) EXPAND="YES"
+        ;;
+    t) STORAGE_TYPE="$OPTARG"
+        ;;
+    S) EXPAND_IQ_SYS_MAIN="YES"
+        ;;
+    M) EXPAND_MAIN="YES"
+        ;;
+    T) EXPAND_TEMP="YES"
+        ;;
+    a) AUTOMATION="YES"
+       ;;
+    esac
+done
+shift `expr $OPTIND - 1`
+
+# Check the params passed are correct
+check_params
+#set -xv
+# By Default Expand IQ_MAIN, Main and TEMP, 
+# only when an expansion option is set should these options be specified
+if [ ! "${EXPAND}" ]; then
+    EXPAND_IQ_SYS_MAIN="YES"
+    EXPAND_MAIN="YES"
+    EXPAND_TEMP="YES"
+else
+    #Need to check that at least one of these 
+    #EXPAND_IQ_SYS_MAIN EXPAND_MAIN EXPAND_TEMP is set
+    if [ ! "${EXPAND_IQ_SYS_MAIN}" -a ! "${EXPAND_MAIN}" -a ! "${EXPAND_TEMP}" ]; then
+        usage_msg
+        _err_msg_="Need to specify what to be expanded IQ_SYS_MAIN, MAIN or TEMP's LUN's "
+        abort_script "$_err_msg_" 
+    fi
+fi
+
+if [ ! -s $SCRIPTHOME/../lib/common_functions.lib ]; then
+    _err_msg_="Cannot locate $SCRIPTHOME/../lib/common_functions.lib"
+    abort_script "$_err_msg_" 
+else
+    . $SCRIPTHOME/../lib/common_functions.lib
+fi
+
+if [ ! -s $SCRIPTHOME/get_cell_count.bsh ]; then
+    _err_msg_="Cannot locate $SCRIPTHOME/get_cell_count.bsh"
+    abort_script "$_err_msg_" 
+fi
+
+#Setting dbexpansion flag
+dbexpansion_flag=""
+if [ "${AUTOMATION}" == "YES" ]; then
+        dbexpansion_flag="true"
+else
+        dbexpansion_flag="false"
+fi
+
+# Make TEM_DIR if it doesn't exist
+if [ ! "${RESTORE}" ]; then
+    if [ ! ${TEM_DIR} ]; then
+                            
+        TEM_DIR=/tmp/get_disk_info.${RUN_TIME}
+        $MKDIR -p ${TEM_DIR}
+        if [ $? -ne 0 ]; then
+            _err_msg_="Could not create ${TEM_DIR}"
+            abort_script "$_err_msg_" 
+        fi
+        # Set a flag so we can delete the correct TEM_DIR
+        TEM_DIR_FLAG=1
+    fi
+else
+        TEM_DIR=/tmp/restore_get_disk_info
+        if [ $? -ne 0 ]; then
+            _err_msg_="Could not locate ${TEM_DIR}"
+            abort_script "$_err_msg_" 
+        fi 
+fi
+
+# Setup up path environment etc
+setup_env
+
+if [ "${LOGFILE}" ]; then
+    # Check/Create Logfile
+    chk_create_logfile
+fi
+
+if [ "${EXPAND}" ]; then
+    _expand_time_=`$DATE '+%Y-%b-%d_%H.%M.%S'`
+    log_msg -s "${_expand_time_}: Expanding the system" -l $LOGFILE
+    
+    if [ ! -d ${ENIQ_CONF_DIR}/backup/ ]; then
+        $MKDIR -p ${ENIQ_CONF_DIR}/backup/
+    fi
+    
+    if [ -s ${ENIQ_CONF_DIR}/${LUN_MAP_INI} ]; then
+        log_msg -s "Backing up the lun_map.ini File" -l $LOGFILE
+        $CP ${ENIQ_CONF_DIR}/${LUN_MAP_INI} ${ENIQ_CONF_DIR}/backup/${LUN_MAP_INI}_bkup.$$.${_expand_time_}
+    fi
+    
+    if [ -s ${ENIQ_CONF_DIR}/${SYM_INI} ]; then
+        log_msg -s "Backing up the sym_links.ini File" -l $LOGFILE
+        $CP ${ENIQ_CONF_DIR}/${SYM_INI} ${ENIQ_CONF_DIR}/backup/${SYM_INI}_bkup.$$.${_expand_time_}
+    fi
+    
+    log_msg -s "Updating the lun_map.ini File with the latest Luns" -l $LOGFILE
+    ${ENIQ_CORE_BIN_DIR}/eniq_core_install.bsh -s create_lun_map -n >> $LOGFILE
+    if [ $? -ne 0 ]; then
+        _err_msg_="Could not update the LUN MAP file"
+        abort_script "$_err_msg_" 
+    fi
+    
+    log_msg -s "Copying ${ENIQ_CONF_DIR}/${SUNOS_INI} to ${TEM_DIR}/${SUNOS_INI}" -l $LOGFILE
+    $CP ${ENIQ_CONF_DIR}/${SUNOS_INI} ${TEM_DIR}/${SUNOS_INI}
+    if [ $? -ne 0 ]; then
+        _err_msg_="Could not copy ${ENIQ_CONF_DIR}/${SUNOS_INI} to ${TEM_DIR}/${SUNOS_INI}"
+        abort_script "$_err_msg_" 
+    fi
+    
+    log_msg -s "Copying ${ENIQ_CONF_DIR}/${SYM_INI} to ${TEM_DIR}/${SYM_INI}" -l $LOGFILE
+    $CP ${ENIQ_CONF_DIR}/${SYM_INI} ${TEM_DIR}/${SYM_INI}
+    if [ $? -ne 0 ]; then
+        _err_msg_="Could not copy ${ENIQ_CONF_DIR}/${SYM_INI} to ${TEM_DIR}/${SYM_INI}"
+        abort_script "$_err_msg_" 
+    fi
+fi
+
+# Make copies of SunOs.ini and niq.ini if this is a restore
+# These files should exist in the directory passed in by restore_eniq.bsh
+if [ ${RESTORE} ]; then
+    # Check that the SunOs.ini SYM_INI file exists in the directory, and
+    # copy it to TEM_DIR if it does, otherwise, exit
+    if [ -s ${RST_DIR}/${SUNOS_INI} ]; then
+        log_msg -s "Copying ${RST_DIR}/${SUNOS_INI} to ${TEM_DIR}/${SUNOS_INI}" -l $LOGFILE
+        $CP ${RST_DIR}/${SUNOS_INI} ${TEM_DIR}/${SUNOS_INI}
+        if [ $? -ne 0 ]; then
+            _err_msg_="Could not copy ${RST_DIR}/${SUNOS_INI} to ${TEM_DIR}/${SUNOS_INI}"
+            abort_script "$_err_msg_" 
+        fi
+    else
+        _err_msg_="Could not locate ${RST_DIR}/${SUNOS_INI}"
+        abort_script "$_err_msg_" 
+    fi
+
+    # Check that the sym_links.ini file exists in the directory, and
+    # copy it to TEM_DIR if it does, otherwise, exit
+    if [ -s ${RST_DIR}/${SYM_INI} ]; then
+        log_msg -s "Copying ${RST_DIR}/${SYM_INI} to ${TEM_DIR}/${SYM_INI}" -l $LOGFILE
+        $CP ${RST_DIR}/${SYM_INI} ${TEM_DIR}/${SYM_INI}
+        if [ $? -ne 0 ]; then
+            _err_msg_="Could not copy ${RST_DIR}/${SYM_INI} to ${TEM_DIR}/${SYM_INI}"
+            abort_script "$_err_msg_" 
+        fi
+    else
+        _err_msg_="Could not locate ${RST_DIR}/${SYM_INI}"
+        abort_script "$_err_msg_" 
+    fi
+# Check that the sym_links.ini file exists in the directory, and
+    # copy it to TEM_DIR if it does, otherwise, exit
+    if [ -s ${RST_DIR}/${ENIQ_INI} ]; then
+        log_msg -s "Copying ${RST_DIR}/${ENIQ_INI} to ${TEM_DIR}/${ENIQ_INI}" -l $LOGFILE
+         $CP ${RST_DIR}/${ENIQ_INI} ${TEM_DIR}/${ENIQ_INI}
+            if [ $? -ne 0 ]; then
+                _err_msg_="Could not copy ${RST_DIR}/${ENIQ_INI} to ${TEM_DIR}/${ENIQ_INI}"
+                abort_script "$_err_msg_" 
+            fi
+    else
+        _err_msg_="Could not locate ${RST_DIR}/${ENIQ_INI}"
+        abort_script "$_err_msg_" 
+    fi
+fi
+
+clear
+
+if [ "${STORAGE_TYPE}" == "fs" ]; then
+    DISK_LIST=/tmp/disk_list
+
+    # I will create this DISK LIST only once
+    if [ "$ZONE" != "yes" ]; then
+        if [ ! -s ${DISK_LIST} ]; then
+            # Set a flag so we can delete the correct TEM_DIR
+            DISK_FILE_FLAG=1
+            # Create a list of the disks on the system
+            create_disk_list ${DISK_LIST}
+        fi
+    
+        # Distribute disks to the pool
+        get_fs_disks
+    fi
+else    
+    # Allocate disks to specific purposes
+    allocate_disks
+fi
+
+
+_fs_events_disk_size_=""
+
+if [ ! "${EXPAND}" ]; then
+    # Get the number of nodes/cells to be managed
+    if [ "${CURR_SERVER_TYPE}" != "stats_engine"  ]; then
+        log_msg -s "Running the following command to set dbspace sizes" -l ${LOGFILE}
+        
+        if [ ${RESTORE} ]; then    
+            log_msg -s "/usr/bin/bash $SCRIPTHOME/get_cell_count.bsh -b ${ENIQ_BASE_DIR} -d ${TEM_DIR} -t ${STORAGE_TYPE} -e "${INST_TYPE}" -r ${_zfs_events_disk_size_} -l $LOGFILE" -l ${LOGFILE}
+            /usr/bin/bash $SCRIPTHOME/get_cell_count.bsh -b ${ENIQ_BASE_DIR} -d ${TEM_DIR} -t ${STORAGE_TYPE} -e "${INST_TYPE}" -r ${_fs_events_disk_size_} -l $LOGFILE 
+            _res_code_=$?
+        else
+            log_msg -s "/usr/bin/bash $SCRIPTHOME/get_cell_count.bsh -b ${ENIQ_BASE_DIR} -d ${TEM_DIR} -t ${STORAGE_TYPE} -e "${INST_TYPE}" ${_zfs_events_disk_size_} -l $LOGFILE" -l ${LOGFILE}
+            /usr/bin/bash $SCRIPTHOME/get_cell_count.bsh -b ${ENIQ_BASE_DIR} -d ${TEM_DIR} -t ${STORAGE_TYPE} -e "${INST_TYPE}" ${_fs_events_disk_size_} -l $LOGFILE 
+            _res_code_=$?
+        fi
+        if [ ${_res_code_} -ne 0 ]; then
+            _err_msg_="Problem encountered when running $SCRIPTHOME/get_cell_count.bsh"
+            abort_script "$_err_msg_" 
+        fi
+    fi
+fi
+
+if [ ${RESTORE} ]; then
+    # Overwrite SunOs.ini with new disk layout
+    $CP ${TEM_DIR}/${SUNOS_INI} ${RST_DIR}/${SUNOS_INI} 
+    if [ $? -ne 0 ]; then
+        _err_msg_="Could not copy ${TEM_DIR}/${SUNOS_INI} to ${RST_DIR}/${SUNOS_INI}"
+        abort_script "$_err_msg_" 
+    fi
+fi
+
+if [ "${EXPAND}" ]; then
+    log_msg -s "Updating the files after expansion" -l $LOGFILE
+    if [ "${CURR_SERVER_TYPE}" == "eniq_coordinator" -o "${CURR_SERVER_TYPE}" == "stats_coordinator" -o "${CURR_SERVER_TYPE}" == "son_coordinator" ]; then
+        log_msg -s "Copying ${TEM_DIR}/${SYM_INI} to ${CLI_CONF_DIR}/${COORD_SYM_LINK_FILE}" -l $LOGFILE
+        $CP ${TEM_DIR}/${SYM_INI} ${ENIQ_CONF_DIR}/${COORD_SYM_LINK_FILE}
+        if [ $? -ne 0 ]; then
+            _err_msg_="Could not copy ${TEM_DIR}/${SYM_INI} to ${ENIQ_CONF_DIR}/${COORD_SYM_LINK_FILE}"
+            abort_script "$_err_msg_" 
+        fi
+    fi
+    
+    log_msg -s "Copying ${TEM_DIR}/${SYM_INI} to ${ENIQ_CONF_DIR}/${SYM_INI}" -l $LOGFILE
+    $CP ${TEM_DIR}/${SYM_INI} ${ENIQ_CONF_DIR}/${SYM_INI}
+    if [ $? -ne 0 ]; then
+        _err_msg_="Could not copy ${TEM_DIR}/${SYM_INI} to ${ENIQ_CONF_DIR}/${SYM_INI}"
+        abort_script "$_err_msg_" 
+    else 
+        if [ "${EXPAND_MAIN}" == "YES" ]; then
+            update_block_storage_ini
+        else 
+            if [ "${EXPAND_TEMP}" == "YES" ]; then
+                update_block_storage_ini
+            fi
+        fi
+    fi
+fi
+
+# Remove TEM_DIR if this script created it
+if [ ${TEM_DIR_FLAG} -eq 1 ]; then
+    $RM -rf ${TEM_DIR}
+    if [ $? -ne 0 ]; then
+        _err_msg_="Could remove ${TEM_DIR}"
+        abort_script "$_err_msg_" 
+    fi
+fi
+
+if [ "$ZONE" != "yes" ]; then
+    if [ ${DISK_FILE_FLAG} -eq 1 ]; then
+        $RM -f ${DISK_LIST}
+        if [ $? -ne 0 ]; then
+            _err_msg_="Could remove ${DISK_LIST}"
+            abort_script "$_err_msg_" 
+        fi
+    fi
+fi
+exit 0
+
+
+
+
+

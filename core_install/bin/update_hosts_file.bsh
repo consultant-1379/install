@@ -1,0 +1,266 @@
+#!/bin/bash
+# ********************************************************************
+# Ericsson Radio Systems AB                                     SCRIPT
+# ********************************************************************
+#
+#
+# (c) Ericsson Radio Systems AB 2018 - All rights reserved.
+#
+# The copyright to the computer program(s) herein is the property
+# of Ericsson Radio Systems AB, Sweden. The programs may be used
+# and/or copied only with the written permission from Ericsson Radio
+# Systems AB or in accordance with the terms and conditions stipulated
+# in the agreement/contract under which the program(s) have been
+# supplied.
+#
+# ********************************************************************
+# Name    : update_hosts_file.bsh
+# Date    : 24/07/2023
+# Author  : efrador
+# Revision: \main\3
+# Purpose : Script to manipulate hosts file and add/remove alias entries
+#
+# Usage   : update_hosts_file.bsh
+#
+# ********************************************************************
+#
+#   Command Section
+#
+# ********************************************************************
+BASENAME=/usr/bin/basename
+CAT=/usr/bin/cat
+CP=/usr/bin/cp
+DATE=/usr/bin/date
+ECHO='/usr/bin/echo -e'
+EXPR=/usr/bin/expr
+GREP=/usr/bin/grep
+SED=/usr/bin/sed
+TEE=/usr/bin/tee
+TOUCH=/usr/bin/touch
+
+# ********************************************************************
+#
+#   Functions
+#
+# ********************************************************************
+### Function: add_alias_entry ###
+#
+#   Add an alias to hosts
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+add_alias_entry()
+{
+$GREP -w ${_srv_name_} /etc/hosts > /tmp/hosts_entry
+$SED -e "/#.*/s///g" /tmp/hosts_entry > /tmp/hosts_entry_1
+
+# Create new entry for host file
+entry=`$CAT /tmp/hosts_entry_1`
+new_entry=`$ECHO $entry ${_alias_name_}`
+
+# Create file to update
+$GREP -w ${_srv_name_} /etc/hosts > /tmp/tmp_hosts
+$ECHO "$new_entry" >> /tmp/tmp_hosts
+if [ $? -ne 0 ]; then
+	$ECHO "Failed to update tmp host file" | $TEE -a ${LOGFILE}
+	exit 2
+else
+	$ECHO "Successfully updated tmp host file" | $TEE -a ${LOGFILE}
+	$CP /tmp/tmp_hosts /etc/hosts
+	if [ $? -ne 0 ]; then
+		$ECHO "Failed to copy in updated host file\nReplacing with original" | $TEE -a ${LOGFILE}
+		$CP /etc/hosts.orig /etc/hosts
+		if [ $? -eq 0 ]; then
+			$ECHO "Failed to copy /etc/hosts.orig to /etc/hosts" | $TEE -a ${LOGFILE}
+			exit 43
+		fi
+		exit 5
+	else
+		$ECHO "Host file successfully updated" | $TEE -a ${LOGFILE}
+	fi
+fi
+return 0
+}
+
+### Function: add_host_entry ###
+#
+#   Add an alias to hosts
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+add_host_entry()
+{
+# Make sure entry does not exist
+$GREP -w ${_srv_name_} /etc/hosts >> /dev/null 2>&1
+if [ $? -ne 0 ]; then
+	$ECHO "Host entry does not exist. Need to add entry to the host file." | $TEE -a ${LOGFILE}
+	$GREP -w ${_alias_name_} /etc/hosts >> /dev/null 2>&1
+	if [ $? -eq 0 ]; then
+		$ECHO "Alias entry ${_alias_name_} exists. Need to remove it before continuing" | $TEE -a ${LOGFILE}
+		remove_alias_entry
+	fi
+	
+	$ECHO "${_ip_address_} ${_srv_name_} ${_alias_name_}" >> /etc/hosts
+	if [ $? -eq 0 ]; then
+		$ECHO "Successfully added ${_ip_address_} ${_srv_name_} ${_alias_name_} to /etc/hosts file" | $TEE -a ${LOGFILE}
+	else
+		$ECHO "Failed to add ${_ip_address_} ${_srv_name_} ${_alias_name_} to /etc/hosts file" | $TEE -a ${LOGFILE}
+		exit 4
+	fi
+else
+	$ECHO "Host entry already exists" | $TEE -a ${LOGFILE}
+	$GREP -w ${_srv_name_} /etc/hosts | $GREP ${_alias_name_} >> /dev/null 2>&1
+	if [ $? -eq 0 ]; then
+		$ECHO "Entry for hostname and alias already exists" | $TEE -a ${LOGFILE}
+	else
+		$GREP -w ${_alias_name_} /etc/hosts > /dev/null 2>&1
+		if [ $? -eq 0 ]; then
+			$ECHO "Alias entry (${_alias_name_}) exists. Removing it before continuing" | $TEE -a ${LOGFILE}
+			remove_alias_entry
+			$ECHO "Alias entry (${_alias_name_}) no longer exists. Need to add it before continuing" | $TEE -a ${LOGFILE}
+			add_alias_entry
+		fi
+	fi	
+fi
+return 0
+}
+
+### Function: remove_alias_entry ###
+#
+#   Remove an alias to hosts
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+remove_alias_entry()
+{
+$ECHO "Removing Alias name from hosts file" | $TEE -a ${LOGFILE}
+$GREP -wv ${_alias_name_} /etc/hosts > /tmp/tmp_host
+$GREP -w ${_alias_name_} /etc/hosts > /tmp/tmp_alias_entry
+$SED -e "/${_alias_name_}/s///g" /tmp/tmp_alias_entry > /tmp/tmp_alias_entry_update
+new_entry=`$CAT /tmp/tmp_alias_entry_update`
+$ECHO "$new_entry" >> /tmp/tmp_host
+if [ $? -eq 0 ]; then
+	$CP /tmp/tmp_host /etc/hosts
+	if [ $? -eq 0 ]; then
+		$ECHO "Successfully Removed Alias From hostfile" | $TEE -a ${LOGFILE}
+	else
+		$ECHO "Failed to remove alias in updated host file\nReplacing with original" | $TEE -a ${LOGFILE}
+		$CP /etc/hosts.orig /etc/hosts
+		if [ $? -eq 0 ]; then
+			$ECHO "Failed to copy /etc/hosts.orig to /etc/hosts" | $TEE -a ${LOGFILE}
+			exit 44
+		fi
+   		exit 6
+	fi
+fi
+
+return 0
+}
+
+### Function: usage_msg ###
+#
+#   Add an alias to hosts
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+usage_msg()
+{
+$ECHO "
+Usage: `$BASENAME $0` -h <hostname> -a <alias> -i <ip_address>
+
+options:
+
+-h : Hostname of the server where the alias will reside.
+
+-a : Alias name you wish to add to the host file.
+
+-i : IP Address of the host where the Alias will reside.
+"
+} 
+
+# ********************************************************************
+#
+#   Main body of program
+#
+# ********************************************************************
+#
+
+while getopts ":h:a:i:l:" arg; do
+	case $arg in
+		h)	_srv_name_="$OPTARG"
+			;;
+		a)	_alias_name_="$OPTARG"
+			;;
+		i)	_ip_address_="$OPTARG"
+			;;
+		l)	LOGFILE="$OPTARG"
+	        ;;
+		\?)	usage_msg
+			exit 1
+			;;
+	esac
+done
+shift `$EXPR $OPTIND - 1`
+
+#if [ -z "$CONF_DIR" ] ; then
+#  $ECHO "ERROR: CONF_DIR is not set"
+#  exit 1
+#fi
+
+if [ ! "${LOGFILE}" ]; then
+	if [ ! -z "${LOG_DIR}" ]; then
+		LOG_DIR=/eniq/log
+	fi
+	
+	TIMESTAMP=`$DATE +%d.%m.%y_%H:%M:%S`
+	LOGFILE=${LOG_DIR}/update_hosts.log
+	$TOUCH -a ${LOGFILE}
+	if [ $? -ne 0 ]; then
+	    _err_msg_="Could not write to file ${LOGFILE}"
+	    exit 11 
+	fi
+fi
+
+$ECHO "Checking the host file for the following entries\n${_ip_address_} ${_srv_name_} ${_alias_name_}\n"  | $TEE -a ${LOGFILE}
+
+# Backup the hostfile
+$ECHO "Backing up the host file" | $TEE -a ${LOGFILE}
+$CP /etc/hosts /etc/hosts.orig
+if [ $? -ne 0 ]; then
+    $ECHO "Failed to backup host file" | $TEE -a ${LOGFILE}
+    exit 8
+else
+	$ECHO "Backed up original host file" | $TEE -a ${LOGFILE}
+fi
+
+#Need to check server entry exists in the hosts file
+$GREP -w ${_srv_name_} /etc/hosts > /dev/null 2>&1
+if [ $? -ne 0 ]; then
+	$ECHO "No Entry for hostname exists in file, need to update"  | $TEE -a ${LOGFILE}
+	add_host_entry
+else
+	$GREP -w ${_alias_name_} /etc/hosts | $GREP ${_srv_name_} > /dev/null 2>&1
+	if [ $? -eq 0 ]; then
+		$ECHO "Alias already exists for hostname. Don't need to change." | $TEE -a ${LOGFILE}
+	else
+		$ECHO "Alias may exist for other Host. Need to check."
+		$GREP -w ${_alias_name_} /etc/hosts > /dev/null 2>&1
+		if [ $? -eq 0 ]; then
+			remove_alias_entry
+			add_alias_entry
+		else
+			$ECHO "No Entry for alias exists in file, need to update"  | $TEE -a ${LOGFILE}
+			add_alias_entry
+		fi
+	fi
+fi
+
+exit 0

@@ -1,0 +1,651 @@
+#!/bin/bash
+# ********************************************************************
+# Ericsson Radio Systems AB                                     SCRIPT
+# ********************************************************************
+#
+#
+# (c) Ericsson Radio Systems AB 2019 - All rights reserved.
+#
+# The copyright to the computer program(s) herein is the property
+# of Ericsson Radio Systems AB, Sweden. The programs may be used 
+# and/or copied only with the written permission from Ericsson Radio 
+# Systems AB or in accordance with the terms and conditions stipulated 
+# in the agreement/contract under which the program(s) have been 
+# supplied.
+#
+# ********************************************************************
+# Name    : cleanup_eniq_backup.bsh
+# Date    : 17/12/2021
+# Revision: main/21
+# Purpose : This script will cleanup after a successful/failed ENIQ Backup. 
+#           It will delete all BACKUP snapshos and clone snapshots.
+#
+# Usage   : clean_eniq_backup.bsh [ -l <path_to_logfile> ] [ -N ] -q
+#
+# ********************************************************************
+#
+# 	Command Section
+#
+# ********************************************************************
+AWK=/usr/bin/awk
+BASENAME=/usr/bin/basename
+BASH=/usr/bin/bash
+CAT=/usr/bin/cat
+CLEAR=/usr/bin/clear
+DATE=/usr/bin/date
+DIRNAME=/usr/bin/dirname
+ECHO='/usr/bin/echo -e'
+EGREP=/usr/bin/egrep
+EXPR=/usr/bin/expr
+GREP=/usr/bin/grep
+ID=/usr/bin/id
+MKDIR=/usr/bin/mkdir
+MOUNT=/usr/sbin/mount
+PWD=/usr/bin/pwd
+RM=/usr/bin/rm
+SED=/usr/bin/sed
+TEE=/usr/bin/tee
+TOUCH=/usr/bin/touch
+UMOUNT=/usr/sbin/umount
+UNSHARE=/usr/sbin/unshare
+
+# ********************************************************************
+#
+#       Configuration Section
+#
+# ********************************************************************
+# Flag to determine whether to compress log or not (Must be y/n)
+COMPRESS_LOG=y
+
+# Name of SunOS & ENIQ ini Files
+ENIQ_INI=niq.ini
+SUNOS_INI=SunOS.ini
+STORAGE_INI=storage.ini
+
+# This directory should always be deleted
+TEMP_SCHED_DIR=/tmp/.bp_sched_dir
+
+# Number of log files to keep
+NUM_LOGS=10
+
+# Size in kbytes that the log file is allowed to grow to
+SIZE_LOGS=2048000
+
+# ********************************************************************
+#
+#       Pre-execution Operations
+#
+# ********************************************************************
+unset CLEAN_QUIET
+
+# ********************************************************************
+#
+# 	Functions
+#
+# ********************************************************************
+### Function: abort_script ###
+#
+#   This will is called if the script is aborted thru an error
+#   error signal sent by the kernel such as CTRL-C or if a serious
+#   error is encountered during runtime
+#
+# Arguments:
+#       $1 - Error message from part of program (Not always used)
+# Return Values:
+#       none
+abort_script()
+{
+if [ "$1" ]; then
+    _err_msg_=$1
+else
+    _err_msg_="Script aborted.......\n"    
+fi
+
+# Check if log_msg() is defined, else define log()
+type log_msg > /dev/null 2>&1
+if [ $? -gt 0 ]; then
+    if [ "${LOGFILE}" ]; then
+		if [ ! "${CLEAN_QUIET}" ]; then
+		    $ECHO "\n${_err_msg_}\n" |$TEE -a ${LOGFILE}
+		else
+		    $ECHO "\n${_err_msg_}\n" >> ${LOGFILE}
+        fi
+    else
+		$ECHO "\n${_err_msg_}\n"
+    fi
+else
+    if [ "${LOGFILE}" ]; then
+		log_msg -s "\n${_err_msg_}\n" -l ${LOGFILE} ${CLEAN_QUIET}
+    else
+		log_msg -s "\n${_err_msg_}\n" ${CLEAN_QUIET}
+    fi
+fi
+
+cd $SCRIPTHOME
+
+$RM -rf  ${TEM_DIR}
+
+# Get rid of this directory if we are not a rolling snapshot and 
+# we are not in debug mode
+if [ ! "${ROLL_DEL}" ]; then
+    if [ ! "${BKUP_DEBUG}" ]; then
+        $RM -rf ${TEMP_SCHED_DIR}
+    fi
+fi
+
+if [ "$2" ]; then
+    exit ${2}
+else
+   exit 1
+fi
+}
+
+### Function: check_id ###
+#
+#   Check that the effective id of the user is correct
+#   If not print error msg and exit.
+#
+# Arguments:
+#       $1 : User ID name
+# Return Values:
+#       none
+check_id()
+{
+_check_id_=`$ID  | $AWK -F\( '{print $2}' | $AWK -F\) '{print $1}'`
+if [ "$_check_id_" != "$1" ]; then
+    _err_msg_="You must be $1 to execute this script."
+    abort_script "$_err_msg_"
+fi
+}
+
+### Function: chk_create_logfile ###
+#
+# Check/Create Logfile
+#
+# Arguments:
+#	none
+# Return Values:
+#	none
+chk_create_logfile()
+{
+$MKDIR -p `$DIRNAME ${LOGFILE}`
+if [ $? -ne 0 ]; then
+    unset LOGFILE
+    _err_msg_="Could not create directory `$DIRNAME ${LOGFILE}`"
+     abort_script "$_err_msg_"
+fi	
+
+$TOUCH -a ${LOGFILE}
+if [ $? -ne 0 ]; then
+    unset LOGFILE
+    _err_msg_="Could not write to file ${LOGFILE}"
+    abort_script "$_err_msg_"
+fi	
+
+_log_id_str_="-l ${LOGFILE}"
+
+if [ -s ${LOGFILE} ]; then
+    $ECHO "\n\n" >> ${LOGFILE}
+fi
+
+_run_time_=`$DATE '+%Y-%m-%d_%H.%M.%S'`
+$ECHO "================================================================" >> ${LOGFILE}
+$ECHO "================================================================" >> ${LOGFILE}
+if [ "${ROLL_DEL}" ]; then
+    $ECHO "Rolling snapshot cleanup started at ${_run_time_}\n" >> ${LOGFILE}
+else
+    $ECHO "Backup snapshot cleanup started at ${_run_time_}\n" >> ${LOGFILE}
+fi	
+}
+
+
+### Function: delete_nas_snapshot ###
+#
+# Delete NAS snapshots
+#
+# Arguments:
+#	$1 NAS snap name
+# Return Values:
+#	non
+delete_nas_snapshot()
+{
+local _nas_snap_
+_nas_snap_=$1
+
+log_msg -s "\nChecking for NAS snapshots with label \"${_nas_snap_}\"\n" ${_log_id_str_} ${CLEAN_QUIET}
+${SCRIPTHOME}/manage_nas_snapshots.bsh -a list -f ALL -n ${_nas_snap_} -N ${_roll_snap_} ${CLEAN_QUIET} | $GREP -w ${_nas_snap_} >> /dev/null 2>&1
+if [ $? -eq 0 ]; then
+	log_msg -s "\nDeleting NAS snapshots with label \"${_nas_snap_}\"\n" ${_log_id_str_} ${CLEAN_QUIET}
+    ${SCRIPTHOME}/manage_nas_snapshots.bsh -a delete -f ALL -n ${_nas_snap_} -N ${CLEAN_QUIET} ${_roll_snap_} -l ${LOGFILE} ${CLEAN_QUIET}
+    if [ $? -ne 0 ]; then
+        _err_msg_="Failed to delete NAS snapshots with label \"${_nas_snap_}\""
+        abort_script "$_err_msg_"
+    fi
+else
+	_run_time_=`$DATE '+%Y-%m-%d_%H.%M.%S'`
+    log_msg -s "\n${_run_time_} - No NAS snapshots with label \"${_nas_snap_}\" found to delete\n" ${_log_id_str_} ${CLEAN_QUIET}
+fi
+}
+
+### Function: delete_san_snapshot ###
+#
+# Delete SAN snapshots
+#
+# Arguments:
+#	$1 SAN snap label
+# Return Values:
+#	none
+delete_san_snapshot()
+{
+local _san_snap_
+_san_snap_=$1
+
+log_msg -s "\nChecking for SAN snapshots with label \"${_san_snap_}\"\n" ${_log_id_str_} ${CLEAN_QUIET}
+${SCRIPTHOME}/manage_san_snapshots.bsh -a list -f ALL -N ${CLEAN_QUIET} | $GREP -w ${_san_snap_} >> /dev/null 2>&1
+if [ $? -eq 0 ]; then
+    log_msg -s "\nDeleting SAN snapshots with label \"${_san_snap_}\"\n" ${_log_id_str_} ${CLEAN_QUIET}
+    ${SCRIPTHOME}/manage_san_snapshots.bsh -a delete -f ALL -n ${_san_snap_} -N ${CLEAN_QUIET} -l ${LOGFILE} ${CLEAN_QUIET}
+    if [ $? -ne 0 ]; then
+        _err_msg_="Failed to delete SAN snapshots with label \"${_san_snap_}\""
+        abort_script "$_err_msg_"
+    fi
+else
+    _run_time_=`$DATE '+%Y-%m-%d_%H.%M.%S'`
+    log_msg -s "\n${_run_time_} - No SAN snapshots with label \"${_san_snap_}\" found to delete\n" ${_log_id_str_} ${CLEAN_QUIET}
+fi
+}
+
+### Function: delete_fs_snapshot ###
+#
+# Delete FS snapshots
+#
+# Arguments:
+#	$1 FS snap name
+# Return Values:
+#	none
+delete_fs_snapshot()
+{
+local _fs_snap_
+_fs_snap_=$1
+
+log_msg -s "Checking for FS snapshots with label \"${_fs_snap_}\"\n" ${_log_id_str_} ${CLEAN_QUIET}
+${SCRIPTHOME}/manage_fs_snapshots.bsh -a list -f ALL | $GREP -w ${_fs_snap_} >> /dev/null 2>&1
+if [ $? -eq 0 ]; then
+    log_msg -s "Deleting FS snapshots with label \"${_fs_snap_}\"\n" ${_log_id_str_} ${CLEAN_QUIET}
+    ${SCRIPTHOME}/manage_fs_snapshots.bsh -a delete -f ALL=${_fs_snap_} -N ${CLEAN_QUIET} -l ${LOGFILE}  
+    if [ $? -ne 0 ]; then
+        _err_msg_="Failed to delete FS snapshots with label \"${_fs_snap_}\""
+        abort_script "$_err_msg_"
+    fi
+else
+    _run_time_=`$DATE '+%Y-%m-%d_%H.%M.%S'`
+    log_msg -s "\n${_run_time_} - No FS snapshots with label \"${_fs_snap_}\" found to delete\n" ${_log_id_str_} ${CLEAN_QUIET}
+fi
+}
+
+### Function: delete_be ###
+#
+# Delete required Boot Environment
+#
+# Arguments:
+#       $1 BE snap name
+# Return Values:
+#       none
+delete_be()
+{
+local _be_id_
+_be_id_=$1
+
+log_msg -s "Checking for BE with label \"${_be_id_}\"\n" ${_log_id_str_} ${CLEAN_QUIET}
+$BASH ${SCRIPTHOME}/manage_root_fs.bsh -a list -n ALL | $GREP -w ${_be_id_} >> /dev/null 2>&1
+if [ $? -eq 0 ]; then
+        log_msg -s "Deleting Boot Environemnt with label \"${_be_id_}\"\n" ${_log_id_str_} ${CLEAN_QUIET}
+                $BASH ${SCRIPTHOME}/manage_root_fs.bsh -a delete -n ${_be_id_} -N -l ${LOGFILE} ${CLEAN_QUIET}
+                if [ $? -ne 0 ]; then
+                        _err_msg_="Failed to delete Boot Environment with label \"${_be_id_}\""
+                        abort_script "$_err_msg_"
+                fi
+else
+    _run_time_=`$DATE '+%Y-%m-%d_%H.%M.%S'`
+    log_msg -s "\n${_run_time_} - No Boot Environmnet with label \"${_be_id_}\" found to delete\n" ${_log_id_str_} ${CLEAN_QUIET}
+fi
+
+if [ -s "${ENIQ_BASE_DIR}/bkup_sw/etc/Corrupt_Root_BE.txt" ]; then
+        log_msg -s "Corrupted BE exists.. proceeding with deletion\n" ${_log_id_str_} ${CLEAN_QUIET}
+        corrupt_be_id_=`$CAT ${ENIQ_BASE_DIR}/bkup_sw/etc/Corrupt_Root_BE.txt`
+        $BASH ${SCRIPTHOME}/manage_root_fs.bsh -a delete -n ${corrupt_be_id_} -N -l ${LOGFILE} ${CLEAN_QUIET}
+        if [ $? -ne 0 ]; then
+                _err_msg_="Failed to delete Boot Environment with label \"${_be_id_}\""
+                abort_script "$_err_msg_"
+        else
+                $RM -rf ${ENIQ_BASE_DIR}/bkup_sw/etc/Corrupt_Root_BE.txt >> /dev/null 2>&1
+        fi
+fi
+}
+
+### Function: get_absolute_path ###
+#
+# Determine absolute path to software
+#
+# Arguments:
+#	none
+# Return Values:
+#	none
+get_absolute_path()
+{
+_dir_=`$DIRNAME $0`
+SCRIPTHOME=`cd $_dir_ 2>/dev/null && pwd || $ECHO $_dir_`
+}
+
+### Function: setup_env ###
+#
+# Setup up path environment etc
+#
+# Arguments:
+#	none
+# Return Values:
+#	none
+setup_env()
+{
+BKUP_CONF_FILE="`$DIRNAME ${SCRIPTHOME}`/etc/eniq_backup.conf"
+if [ ! -s ${BKUP_CONF_FILE} ]; then
+    _err_msg_="Could not locate file ${BKUP_CONF_FILE}"
+    abort_script "$_err_msg_"
+fi
+
+BKUP_MOUNT_DIR=`$CAT ${BKUP_CONF_FILE} | $EGREP '^[[:blank:]]*BKUP_MOUNT_DIR=' | $AWK -F"=" '{print $2}'`
+if [ ! "${BKUP_MOUNT_DIR}" ]; then
+    _err_msg_="Could not read BKUP_MOUNT_DIR param from ${BKUP_CONF_FILE}"
+    abort_script "$_err_msg_"
+fi
+
+RBAC_ROLE=`$CAT ${BKUP_CONF_FILE}| $EGREP '^[[:blank:]]*RBAC_ROLE=' | $AWK -F"=" '{print $2}'`
+if [ ! "${RBAC_ROLE}" ]; then
+    _err_msg_="Could not read RBAC_ROLE param from ${BKUP_CONF_FILE}"
+    abort_script "$_err_msg_"
+fi
+
+ENIQ_BASE_DIR=/eniq
+
+ENIQ_CONF_DIR=${ENIQ_BASE_DIR}/installation/config
+
+# Source the common functions
+if [ -s ${ENIQ_BASE_DIR}/admin/lib/common_functions.lib ]; then
+    . ${ENIQ_BASE_DIR}/admin/lib/common_functions.lib
+else
+    _err_msg_="File ${ENIQ_BASE_DIR}/admin/lib/common_functions.lib not found"
+    abort_script "$_err_msg_"
+fi
+
+# File containing the type of OSS installation
+INST_TYPE_FILE=${ENIQ_CONF_DIR}/ericsson_use_config
+if [ ! -s "${INST_TYPE_FILE}" ]; then
+    _err_msg_="ENIQ install type not defined in ${INST_TYPE_FILE}"
+    abort_script "$_err_msg_"
+fi
+
+# Read the installation type
+INSTALL_TYPE=`$CAT ${INST_TYPE_FILE} | $AWK -F\= '{print $2}'`
+
+# Determine the current server type
+CURR_SERVER_TYPE=`$CAT $ENIQ_CONF_DIR/installed_server_type | $EGREP -v '^[[:blank:]]*#' | $SED -e 's/ //g'`
+if [ ! "${CURR_SERVER_TYPE}" ]; then
+    _err_msg_="Could not determine which server type this is"
+    abort_script "$_err_msg_"
+fi
+
+STORAGE_TYPE=`iniget STOR_TYPE -f ${ENIQ_CONF_DIR}/${SUNOS_INI} -v STORAGE_TYPE`
+if [ ! "${STORAGE_TYPE}" ]; then
+    _err_msg_="Could not read STORAGE_TYPE parameter from ${ENIQ_CONF_DIR}/${SUNOS_INI}"
+    abort_script "$_err_msg_"
+fi
+
+if [ "${STORAGE_TYPE}" != "fs" ]; then
+    SYS_ID=`iniget Storage_NAS_GENERAL -f ${ENIQ_CONF_DIR}/${STORAGE_INI} -v SYS_ID`
+    if [ $? -ne 0 ]; then
+        _err_msg_="Could read SYS_ID parameter from ${ENIQ_CONF_DIR}/${STORAGE_INI}"
+        abort_script "$_err_msg_"
+    fi
+fi
+
+BKUP_SNAP_FILE_INDICATOR="/eniq/bkup_sw/etc/.create_backup_snapshot"
+BKUP_SNAP_PROGRESS_INDICATOR="/eniq/bkup_sw/etc/.rolling_backup_in_progress"
+}
+
+### Function: user_confirm ###
+#
+# Get confirmation from user to proceed with snapshot action
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+user_confirm()
+{
+while :; do
+    unset USER_CONF
+    $CLEAR
+    if [ "${ROLL_DEL}" ]; then
+		$ECHO "\nAre you sure you wish to delete the specified rolling snapshots"
+    else
+		$ECHO "\nAre you sure you wish to delete all backup snapshots"
+    fi
+    $ECHO "Enter [Yes | No] (case sensitive) : \c"
+
+    read USER_CONF
+    if [ "$USER_CONF" == "Yes" -o "$USER_CONF" == "No" ]; then
+        break
+    fi
+done
+}
+
+# ********************************************************************
+#
+# 	Main body of program
+#
+# ********************************************************************
+#
+# Determine absolute path to software
+get_absolute_path
+
+# Check that the effective id of the user is root
+check_id root
+
+while getopts ":dl:Nqs:S:B:R" arg; do
+  case $arg in
+    d) BKUP_DEBUG="YES"
+       ;;
+    l) LOGFILE="$OPTARG" 
+       ;;
+    N) NO_CONFIRM="YES"
+       ;;
+    q) CLEAN_QUIET="-q"
+       ;;
+    s) BKUP_STREAM_NUMBER="$OPTARG" 
+       ;;
+    S) BKUP_SNAP_ID_STR="$OPTARG" 
+       ;;
+    B) BKUP_BE_ID_STR="$OPTARG"
+       ;;
+    R) ROLL_DEL="YES"
+       _roll_snap_="-R"
+       ;;
+   \?) _err_msg_="`$BASENAME $0` [ -l <path_to_logfile> ] [ -N ] -q"
+       abort_script "$_err_msg_"
+       ;;
+  esac
+done
+shift `expr $OPTIND - 1`
+
+if [ "${BKUP_DEBUG}" -a "${BKUP_STREAM_NUMBER}" ]; then
+	TRACE_DIR=/tmp/cleanup_trace
+	$MKDIR -p ${TRACE_DIR}
+	/usr/ucb/ps -auxww >> ${TRACE_DIR}/ps.out
+	/usr/bin/ptree $$ >> ${TRACE_DIR}/ptree.out
+	exec 1>>${TRACE_DIR}/cleanup_trace_${BKUP_STREAM_NUMBER}
+	exec 2>>${TRACE_DIR}/cleanup_trace_${BKUP_STREAM_NUMBER}
+fi
+
+# Default Logfile location
+if [ "${ROLL_DEL}" ]; then
+    DEF_LOGFILE="/eniq/local_logs/rolling_snapshot_logs/clean_roll_snap.log"
+else
+    DEF_LOGFILE="/eniq/local_logs/backup_logs/clean_backup.log"
+fi
+
+# Set up default logfile if required
+if [ ! "${LOGFILE}" ]; then
+    LOGFILE="${DEF_LOGFILE}"
+fi
+
+# Check/Create Logfile
+chk_create_logfile
+
+# Setup up path environment etc
+setup_env
+    
+# Create a temporary Directory
+TEM_DIR=/tmp/clean_eniq_backup.$$.$$
+$RM -rf ${TEM_DIR}
+$MKDIR -p ${TEM_DIR}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not create directory ${TEM_DIR}"
+    abort_script "$_err_msg_"
+fi	
+
+if [ ! "$NO_CONFIRM" ]; then
+    user_confirm 
+    if [ "$USER_CONF" == "No" ]; then
+		$RM -rf ${TEM_DIR}
+		exit 0
+    fi
+fi
+
+# Get rid of this directory if we are not a rolling snapshot and 
+# we are not in debug mode
+if [ ! "${ROLL_DEL}" ]; then
+    if [ ! "${BKUP_DEBUG}" ]; then
+        $RM -rf ${TEMP_SCHED_DIR}
+    fi
+fi
+
+##### Commenting below for Linux Porting. Please uncomment when the Linux equivalent is ready #####
+
+#if [ "${INSTALL_TYPE}" == "stats" ]; then
+#    if [ "${ROLL_DEL}" ]; then
+#	if [ "${BKUP_BE_ID_STR}" ]; then
+	
+  	    #log_msg -s "\nDeleting Boot Environment with tag ${BKUP_BE_ID_STR}" ${_log_id_str_} ${CLEAN_QUIET}
+	    #delete_be ${BKUP_BE_ID_STR}
+#	fi
+#    fi
+#fi
+
+if [ "${ROLL_DEL}" ]; then
+    if [ ! "${BKUP_SNAP_ID_STR}" ]; then
+        _snap_id_str_=`$CAT ${BKUP_CONF_FILE} | $EGREP '^[[:blank:]]*ROLL_SNAP_ID_STR=' | $AWK -F"=" '{print $2}'`
+        if [ ! "${_snap_id_str_}" ]; then
+            _err_msg_="Could not read ROLL_SNAP_ID_STR parameter from ${BKUP_CONF_FILE}"
+            abort_script "$_err_msg_"
+        fi
+        
+        # Determine string/s to delete
+        BKUP_SNAP_ID_STR_1=`$ECHO ${_snap_id_str_} | $AWK -F:: '{print $1}'`
+        BKUP_SNAP_ID_STR_2=`$ECHO ${_snap_id_str_} | $AWK -F:: '{print $2}'`
+    fi
+else
+    if [ ! "${BKUP_SNAP_ID_STR}" ]; then
+        _bkup_id_str_=`$CAT ${BKUP_CONF_FILE} | $EGREP '^[[:blank:]]*BKUP_SNAP_ID_STR=' | $AWK -F"=" '{print $2}'`
+        if [ ! "${_bkup_id_str_}" ]; then
+            _err_msg_="Could not read BKUP_SNAP_ID_STR parameter from ${BKUP_CONF_FILE}"
+            abort_script "$_err_msg_"
+        fi
+        BKUP_SNAP_ID_STR=${_bkup_id_str_}
+    fi
+fi
+
+# Are we dealing with a backup?
+if [ ! "${ROLL_DEL}" ]; then
+    # Remove any Backup Flags previously set
+    $RM -f ${BKUP_SNAP_FILE_INDICATOR} ${BKUP_SNAP_PROGRESS_INDICATOR}
+ 
+    $MOUNT | $GREP -w ${BKUP_MOUNT_DIR} | $AWK '{print $1}' > ${TEM_DIR}/backup_mount_points_fs
+          
+    log_msg -t -s "Starting to unmount ${_fs_} for FS Snapshots" -h -l ${LOGFILE}
+    if [ -s ${TEM_DIR}/backup_mount_points_fs ]; then
+        for _fs_ in `$CAT ${TEM_DIR}/backup_mount_points_fs`; do
+            $MOUNT | $GREP -w ${_fs_} >> /dev/null 2>&1
+            if [ $? -eq 0 ]; then
+                $UMOUNT -f ${_fs_} 
+                    if [ $? -ne 0 ]; then
+                        $UMOUNT -l ${_fs_} 
+                        if [ $? -ne 0 ]; then
+                            _err_msg_="Error unmounting directory ${_fs_}"
+                            abort_script "$_err_msg_"
+                        else
+                            log_msg -s "\nsuccessfully unmounted ${_fs_}" -l ${LOGFILE}
+                        fi
+                    else
+                        log_msg -s "\nSuccessfully unmounted ${_fs_}" -l ${LOGFILE}
+                    fi
+            fi
+        done
+        $UNSHARE ${_fs_} > /dev/null 2>&1
+     else
+          log_msg -t -s "No FS Snapshot found to Unmount." -h -l ${LOGFILE}
+    fi
+     
+    $RM -rf ${BKUP_MOUNT_DIR}
+    if [ $? -ne 0 ]; then
+        _err_msg_="Error removing directory ${BKUP_MOUNT_DIR}"
+	abort_script "$_err_msg_"
+    fi
+fi
+
+if [ "${BKUP_SNAP_ID_STR_1}" ]; then
+    _tags_="${BKUP_SNAP_ID_STR_1} ${BKUP_SNAP_ID_STR_2} "
+else
+    _tags_="${BKUP_SNAP_ID_STR} "
+fi
+
+_coord_=""
+if [ "${CURR_SERVER_TYPE}" == "eniq_coordinator" -o "${CURR_SERVER_TYPE}" == "son_coordinator" -o "${CURR_SERVER_TYPE}" == "eniq_events" \
+	-o "${CURR_SERVER_TYPE}" == "eniq_iqw" -o "${CURR_SERVER_TYPE}"  == "eniq_stats"  -o "${CURR_SERVER_TYPE}" == "stats_coordinator" -o "${CURR_SERVER_TYPE}" == "eniq_es" ]; then
+    _coord_="YES"
+fi
+
+for _tag_ in ${_tags_}; do
+    if [ "${_coord_}" == "YES" -a "${STORAGE_TYPE}" != "fs" ]; then
+        # Delete the NAS snapshots
+        log_msg -t -s "Deleting NAS snapshots with tag ${_tag_}" -h ${_log_id_str_} ${CLEAN_QUIET}
+        delete_nas_snapshot ${_tag_}
+
+        if [ "${ROLL_DEL}" -o "${INSTALL_TYPE}" == "events" -o "${INSTALL_TYPE}" == "es" ]; then
+        	# Delete the SAN snaps
+        	log_msg -s "\nDeleting SAN snapshots with tag ${_tag_}\n" ${_log_id_str_} ${CLEAN_QUIET}
+        	delete_san_snapshot ${_tag_}
+        fi
+    fi
+
+    log_msg -s "\nDeleting FS snapshots with tag ${_tag_}" ${_log_id_str_} ${CLEAN_QUIET}
+    delete_fs_snapshot ${_tag_}
+done
+
+log_msg -s "All ENIQ snapshots successfully deleted" -l ${LOGFILE} ${CLEAN_QUIET}
+
+_run_time_=`$DATE '+%Y-%m-%d_%H.%M.%S'`
+if [ "${ROLL_DEL}" ]; then
+    $ECHO "\nRolling snapshot cleanup finished at ${_run_time_}\n" >> ${LOGFILE}
+else
+    $ECHO "\nBackup snapshot cleanup finished at ${_run_time_}\n" >> ${LOGFILE}
+fi	
+
+$ECHO "================================================================" >> ${LOGFILE}
+$ECHO "================================================================" >> ${LOGFILE}
+
+# Rotate and compress the logs if necessary
+rotate_compress_logs ${LOGFILE} ${NUM_LOGS} ${SIZE_LOGS} ${COMPRESS_LOG}
+
+$RM -rf ${TEM_DIR}
+exit 0
+

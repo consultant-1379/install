@@ -1,0 +1,9 @@
+#
+# NFS_resource	NFS_share_on_Master_server    Mount_Point_relative_to_OSS_Alias       Description
+# ip/hostname
+OSS	<IP>	/ossrc/data/sgw/sgwcg			/ossrc/data/sgw/sgwcg					NWS_SGw
+NAS	<IP>	/vx/<OSS_POOL_ID>-sgwcg			/sgwcg									NWS_SGw
+OSS	<IP>	/ossrc/data/pms/segment1		/ossrc/data/pms/segment1				NWS_PMS
+NAS	<IP>	/vx/<OSS_POOL_ID>-segment1		/segment1								NWS_PMS
+ENM     <IP>    /vx/<OSS_POOL_ID>-pm1   		/       						ENM_PM
+

@@ -1,0 +1,1125 @@
+#!/bin/bash
+# ********************************************************************
+# Ericsson Radio Systems AB                                     SCRIPT
+# ********************************************************************
+#
+#
+# (c) Ericsson Radio Systems AB 2020 - All rights reserved.
+#
+# The copyright to the computer program(s) herein is the property
+# of Ericsson Radio Systems AB, Sweden. The programs may be used 
+# and/or copied only with the written permission from Ericsson Radio 
+# Systems AB or in accordance with the terms and conditions stipulated 
+# in the agreement/contract under which the program(s) have been 
+# supplied.
+#
+# ********************************************************************
+# Name    : extractdb.bsh
+# Date    : 31/01/2020
+# Revision: /main/11
+# Purpose : This script extracts all  tables by date and measurement type.
+#            Each time the script is run only raw tables that have changed 
+#            from the previous run are extracted.  If an extract fails the 
+#            date used to track is reset to the successful previous run date.
+#    
+# Usage   :  bash extractdb.bsh
+#
+# ********************************************************************
+#
+#     Command Section
+#
+# ********************************************************************
+AWK=/usr/bin/awk
+BASENAME=/usr/bin/basename
+CAT=/usr/bin/cat
+CP=/usr/bin/cp
+DF=/usr/bin/df
+DATE=/usr/bin/date
+DIRNAME=/usr/bin/dirname
+ECHO=/usr/bin/echo
+EGREP=/usr/bin/egrep
+EXPR=/usr/bin/expr
+GREP=/usr/bin/grep
+KILL=/usr/bin/kill
+LS=/usr/bin/ls
+MOUNT=/usr/sbin/mount
+PS=/usr/bin/ps
+PWD=/usr/bin/pwd
+RM=/usr/bin/rm
+SED=/usr/bin/sed
+SLEEP=/usr/bin/sleep
+SORT=/usr/bin/sort
+TAIL=/usr/bin/tail
+TEE=/usr/bin/tee
+TOUCH=/usr/bin/touch
+WC=/usr/bin/wc
+
+# Name of SunOS & ENIQ ini Files
+ENIQ_INI=niq.ini
+
+abort_script()
+{
+if [ "$1" ]; then
+    _err_msg_=$1
+else
+    _err_msg_="Script aborted.......\n"    
+fi
+$ECHO $_err_msg_  | $TEE -a $RESULTSDIR/ExtractedTables_${RUNNUMBER}.log >>${LOGFILE}
+
+$RM -rf ${EXTRACT_TMPDIR} 
+exit 1
+}
+
+# ********************************************************************
+#
+#  TRAP handling
+#
+# ********************************************************************
+trap "trap_stop_extractdb" QUIT TERM INT HUP KILL 
+
+trap_stop_extractdb()
+{
+    _err_msg_="Received a KILL SIGNAL from parent"
+    abort_script "${_err_msg_}"
+}
+
+### Function: create_templates ###
+#
+#   Create template file 
+#
+# Arguments:
+#       none 
+# Return Values:
+#       none
+create_templates()
+{
+#creating ExtractTable.template file
+
+printf %s "-- Do not modify this file
+set temporary option ISQL_PRINT_RESULT_SET = 'ALL';
+set temporary option ISQL_SHOW_MULTIPLE_RESULT_SETS='ON';
+set temporary option ON_ERROR='EXIT';
+set temporary option TEMP_EXTRACT_QUOTES='OFF';
+set temporary option temp_extract_binary='off';
+set temporary option temp_extract_swap = 'off';
+set temporary option temp_extract_column_delimiter = '|';
+set temporary option temp_extract_row_delimiter = '\n';
+set temporary option temp_extract_name1='EXTRACTS/USER_TABLExyzdate_holder';
+set temporary option temp_extract_size1='9999999999999';
+select * from USER.TABLE as extract_data where DATE_ID = 'date_holder';
+commit;
+set temporary option temp_extract_name1='';
+commit;
+" >$RESULTSDIR/ExtractTable.template
+
+if [ ! -s $RESULTSDIR/ExtractTable.template ]; then
+    $ECHO "Could not create $RESULTSDIR/ExtractTable.template"
+    exit 1
+fi
+
+
+#creating ExtractTable_dim.template
+printf %s "-- Do not modify this file
+set temporary option ISQL_PRINT_RESULT_SET = 'ALL';
+set temporary option ISQL_SHOW_MULTIPLE_RESULT_SETS='ON';
+set temporary option ON_ERROR='EXIT';
+set temporary option TEMP_EXTRACT_QUOTES='OFF';
+set temporary option temp_extract_binary='off';
+set temporary option temp_extract_swap = 'off';
+set temporary option temp_extract_column_delimiter = '|';
+set temporary option temp_extract_row_delimiter = '\n';
+set temporary option temp_extract_name1='EXTRACTS/USER_TABLExyzdate_holder';
+set temporary option temp_extract_size1='9999999999999';
+select * from USER.TABLE as extract_data;
+commit;
+set temporary option temp_extract_name1='';
+commit;
+" >$RESULTSDIR/ExtractTable_dim.template
+
+if [ ! -s $RESULTSDIR/ExtractTable_dim.template ]; then
+    $ECHO "Could not create $RESULTSDIR/ExtractTable_dim.template"
+    exit 1
+fi
+
+#creating ExtractTable_pdp_session.template
+printf %s "-- Do not modify this file
+set temporary option ISQL_PRINT_RESULT_SET = 'ALL';
+set temporary option ISQL_SHOW_MULTIPLE_RESULT_SETS='ON';
+set temporary option ON_ERROR='EXIT';
+set temporary option TEMP_EXTRACT_QUOTES='OFF';
+set temporary option temp_extract_binary='off';
+set temporary option temp_extract_swap = 'off';
+set temporary option temp_extract_column_delimiter = '|';
+set temporary option temp_extract_row_delimiter = '\n'; 
+set temporary option temp_extract_name1='EXTRACTS/USER_TABLExyzdate_holder';
+set temporary option temp_extract_size1='9999999999999';
+select * from USER.TABLE as extract_data where LOCAL_DATE_ID = 'date_holder';
+commit;
+set temporary option temp_extract_name1='';
+commit;
+" >$RESULTSDIR/ExtractTable_pdp_session.template
+
+if [ ! -s $RESULTSDIR/ExtractTable_pdp_session.template ]; then
+    $ECHO "Could not create $RESULTSDIR/ExtractTable_pdp_session.template"
+    exit 1
+fi
+
+
+#creating countTable.template
+printf %s "select count(1) from USER.TABLE where DATE_ID = 'date_holder';output to 'TMPDIR/count_TABLE_date_holder.txt'
+" >$RESULTSDIR/countTable.template
+if [ ! -s $RESULTSDIR/countTable.template ]; then
+    $ECHO "Could not create $RESULTSDIR/countTable.template"
+    exit 1
+fi
+
+
+#creating countTable_dim.template
+printf %s "select count(1) from USER.TABLE;output to 'TMPDIR/count_TABLE_date_holder.txt'
+" >$RESULTSDIR/countTable_dim.template
+if [ ! -s $RESULTSDIR/countTable_dim.template ]; then
+    $ECHO "Could not create $RESULTSDIR/countTable_dim.template"
+    exit 1
+fi
+
+#creating countTable_pdp_session.template
+printf %s "select count(1) from USER.TABLE where LOCAL_DATE_ID = 'date_holder';output to 'TMPDIR/count_TABLE_date_holder.txt'
+" >$RESULTSDIR/countTable_pdp_session.template
+if [ ! -s $RESULTSDIR/countTable_pdp_session.template ]; then
+    $ECHO "Could not create $RESULTSDIR/countTable_pdp_session.template"
+    exit 1
+fi
+
+#creating extr_tabs.template
+
+printf %s "-- Do not modify this file
+select  c.user_name, a.table_name
+from systab a , sysiqtab b, sysuser c
+where a.table_id = b.table_id
+and b.update_time >= 'LASTUPDATE'
+and c.user_id = a.creator
+and a.table_type_str like 'base'
+order by b.update_time desc;
+output to 'RUNDIR/Extract_tables_RUNNUMBER.txt';
+" >$RESULTSDIR/extr_tabs.template
+if [ ! -s $RESULTSDIR/extr_tabs.template ]; then
+    $ECHO "Could not create $RESULTSDIR/extr_tabs.template"
+    exit 1
+fi
+
+#creating getnow.sql
+printf %s "-- Do not modify this file
+select now();
+output to './nowdate';
+" >$RESULTSDIR/getnow.sql
+
+if [ ! -s $RESULTSDIR/getnow.sql ]; then
+    $ECHO "Could not create $RESULTSDIR/getnow.sql"
+    exit 1
+fi
+}
+
+
+### Function: get_cols ###
+#
+# gets the cols list for the tables to be extracted
+#
+# Arguments:
+#    none
+# Return Values:
+#    none
+get_cols()
+{
+
+if [ -e $RESULTSDIR/pause_process.txt ]; then 
+            
+        $ECHO "`$DATE` : Pausing the column extract process" | $TEE -a $RESULTSDIR/ExtractedTables_${RUNNUMBER}.log >>${LOGFILE}
+        pause_resume_check
+fi
+
+check_mount 
+
+User_cols=`$ECHO $1 | cut -d',' -f1 | $SED "s/'//g"`
+Table_cols=`$ECHO $1 | cut -d',' -f2 | $SED "s/'//g"`
+_tbl_end_=`$ECHO ${Table_cols: -3}` 
+if [[ $_tbl_end_ =~ ^_?[0-9]+$ ]]; then
+    partition_table_type=`$ECHO ${Table_cols} | $AWK -F "${_tbl_end_}" '{print $1}'`
+else
+    partition_table_type=${Table_cols}    
+fi
+
+
+$CAT $EXTRACTS/Extract_tables_cols.txt |$GREP "${partition_table_type} " > /dev/null 2>&1 
+if [ $? -ne 0 ]
+then 
+
+$CAT > $EXTRACT_TMPDIR/get_cols_sql_${Table_cols}  <<STOP_SQL_CODE_POINT
+select * from ${User_cols}.${Table_cols} where 1=2;
+go
+STOP_SQL_CODE_POINT
+
+cols=$(${IQISQL} -UDBA -P${DBA_PASSWORD} -S${DWH_ENG} -i $EXTRACT_TMPDIR/get_cols_sql_${Table_cols} | tail -n+1)
+cols=$($ECHO ${cols}| $SED 's/--.*//') 
+cols=$($ECHO \(\"${cols}\))
+cols=$($ECHO ${cols}| $SED 's/ /" NULL('NULL'),"/g') 
+
+
+$ECHO "${partition_table_type} ${cols}" >$EXTRACT_TMPDIR/Extract_tables_cols_${partition_table_type}.txt
+
+$CAT $EXTRACT_TMPDIR/Extract_tables_cols_${partition_table_type}.txt | $SED 's/NULL(NULL),")/NULL(NULL))/g' | $SED "s/(NULL)/('NULL')/g"> $EXTRACT_TMPDIR/temp_cols_${Table_cols} 2>/dev/null
+
+$CAT $EXTRACT_TMPDIR/temp_cols_${Table_cols} |$GREP "CT-LIBRARY" 2>/dev/null 1>/dev/null
+if [ $? -ne 0 ]
+then 
+    $CAT $EXTRACT_TMPDIR/temp_cols_${Table_cols} >> $EXTRACTS/Extract_tables_cols.txt
+fi
+
+$RM $EXTRACT_TMPDIR/get_cols_sql_${Table_cols} $EXTRACT_TMPDIR/temp_cols_${Table_cols} $EXTRACT_TMPDIR/Extract_tables_cols_${partition_table_type}.txt
+fi
+}
+
+### Function: get_absolute_path ###
+#
+# Determine absolute path to software
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+get_absolute_path()
+{
+_dir_=`$DIRNAME $0`
+SCRIPTHOME=`cd $_dir_ 2>/dev/null && pwd || $ECHO $_dir_`
+}
+
+
+### Function: setup_env ###
+#
+# Setup up path environment etc
+#
+# Arguments:
+#    none
+# Return Values:
+#    DWH_port,DWH_eng and DBA password
+setup_env()
+{
+ENIQ_BASE_DIR=/eniq
+ENIQ_SW_DIR=${ENIQ_BASE_DIR}/sw
+ENIQ_BKUPSW_DIR=${ENIQ_BASE_DIR}/bkup_sw
+CLI_CONF_DIR=${ENIQ_BASE_DIR}/sw/conf
+ENIQ_ADMIN_DIR=${ENIQ_BASE_DIR}/admin
+ENIQ_ADMIN_ETC=${ENIQ_ADMIN_DIR}/etc
+ENIQ_CORE_BIN_DIR=${ENIQ_BASE_DIR}/installation/core_install/bin/
+IQDIR=/eniq/sybase_iq/IQ-*
+MAXNUMLOG=4
+
+
+ENIQ_CONF_DIR=${ENIQ_BASE_DIR}/installation/config
+if [ ! -s ${ENIQ_CONF_DIR}/SunOS.ini ]; then
+    _err_msg_="Could not locate file ${ENIQ_CONF_DIR}/SunOS.ini"
+    abort_script "$_err_msg_"
+fi
+
+# Source the common functions
+if [ -s ${ENIQ_BASE_DIR}/admin/lib/common_functions.lib ]; then
+    . ${ENIQ_BASE_DIR}/admin/lib/common_functions.lib
+else
+    _err_msg_="File ${ENIQ_BASE_DIR}/admin/lib/common_functions.lib not found"
+    abort_script "$_err_msg_"
+fi
+
+    
+DWH_PORT=`iniget DWH -v PortNumber -f ${CLI_CONF_DIR}/niq.ini`
+DWH_ENG=`iniget DWH -v ServerName -f ${CLI_CONF_DIR}/niq.ini`
+if [ ! "${DWH_PORT}" -o ! "${DWH_ENG}" ]; then
+        _err_msg_="Could not read db values from ${CLI_CONF_DIR}/${ENIQ_INI}"
+        abort_script "$_err_msg_"
+fi
+
+DBA_PASSWORD=`inigetpassword DB -f ${CLI_CONF_DIR}/${ENIQ_INI} -v DBAPassword`
+if [ ! ${DBA_PASSWORD} ]; then
+  if [ -f ${ENIQ_BASE_DIR}/sw/installer/dbusers ]; then
+            DBA_PASSWORD=`${ENIQ_BASE_DIR}/sw/installer/dbusers dba dwh`
+     if [ ! "${DBA_PASSWORD}" ] ; then
+                _err_msg_="Could not get dwhdb DBA Password"
+                abort_script "$_err_msg_"
+     fi
+   fi
+fi
+
+DBEXTRACT_ENV_FILE=${ENIQ_ADMIN_ETC}/dbextract_load.env
+
+_dwh_eng_=`iniget DWH -f ${ENIQ_CONF_DIR}/${ENIQ_INI} -v ServerName`
+
+
+#Initialising the connection string for dwhdb
+connection_string="-nogui -onerror exit -c \"eng=${DWH_ENG};links=tcpip{host=localhost;port=${DWH_PORT}};uid=dba;pwd=${DBA_PASSWORD}\""
+
+
+. /eniq/sybase_iq/IQ-*/IQ-*.sh >> /dev/null
+sybase_env_variables_ec=$?
+if [ $sybase_env_variables_ec -ne 0 ]; then
+    _err_msg_="Could not source sybase environment"
+    abort_script "$_err_msg_"
+fi
+
+IQISQL=$(which iqisql)
+
+#tables to be Excluded, as they are auto-populated on target server
+TABLE_EXCLUDE_LIST="DIM_E_BSS_ELEMBH_BHTYPE|DIM_E_BSS_CELLBH_BHTYPE|DIM_E_BSS_BSCBH_BHTYPE|DIM_E_CN_MGW_DEVICETYPE|DIM_E_CNAXE_ELEMBH_BHTYPE|DIM_E_CNAXE_ISDNESGBH_BHTYPE|DIM_E_CNAXE_LOSSROUTEBH_BHTYPE|DIM_E_CNAXE_NEBH_BHTYPE|DIM_E_CNAXE_TRAFFDEST1BH_BHTYPE|DIM_E_CNAXE_TRARBH_BHTYPE|DIM_E_CPP_pmProcessorLoadDistr|DIM_E_CNAXE_TRUNKROUTEBH_BHTYPE|DIM_E_ENERGY_MEASURES|DIM_E_CPP_pmProcessorLoadLcDistr|DIM_E_ENERGY_MEASURES_CURRENT_DC|DIM_E_ERBS_pmLicConnectedUsersDistr|DIM_E_ERBS_pmLicDlCapDistr|DIM_E_ERBS_pmLicDlPrbCapDistr|DIM_E_ERBS_pmLicUlCapDistr|DIM_E_ERBS_pmLicUlPrbCapDistr|DIM_E_ERBS_pmPdcchCceUtil|DIM_E_ERBS_pmProcessorLoadLcDistr|DIM_E_ERBSG2_pmLicConnectedUsersDistr|DIM_E_ERBSG2_pmLicDlCapDistr|DIM_E_ERBS_pmUeThp2DlDistr|DIM_E_ERBS_pmUeThp2UlDistr|DIM_E_ERBSG2_pmLicDlPrbCapDistr|DIM_E_ERBSG2_pmLicUlCapDistr|DIM_E_ERBSG2_pmLicUlPrbCapDistr|DIM_E_ERBSG2_pmPdcchCceUtil|DIM_E_LLE_pdcchCfiMode|DIM_E_LTE_OPTIMIZATION_CM_ATTRIBUTES_CURRENT_DC|DIM_E_LTE_OPTIMIZATION_CM_ATTRIBUTES|DIM_E_ERBSG2_pmProcessorLoadLcDistr|DIM_E_RAN_UCELL_PMRES|DIM_E_RAN_MIMVERSION|DIM_E_LTE_OPTIMIZATION_SINR_RANGE|DIM_E_LTE_OPTIMIZATION_KPI_CURRENT_DC|DIM_E_LTE_OPTIMIZATION_KPI|DIM_E_RAN_UERC|DIM_E_RAN_UCELLBH_BHTYPE|DIM_E_RBS_pmTransmittedPower|DIM_E_RBSG2_pmch|DIM_E_RBS_pmch|DIM_E_RAN_UERCBH_BHTYPE|DIM_E_RBSG2_pmTransmittedPower|DIM_E_SGSN_DLCIBH_BHTYPE|DIM_E_WLE_CE_LADDER|DIM_E_SOEM_MBH_PPMERRORCODES|DIM_E_WLE_pmHwCePoolEul|DIM_E_WLE_pmUsedHsPdschCodes|DIM_E_WLE_pmOwnUuLoad|DIM_E_LTE_MIMVERSION|LOG_MonitoredTypes"
+}
+
+### Function: update_run_number ###
+#
+# Updating RUNNUMBER in env file in case of successful or abrupt termination of script
+#
+# Arguments:
+#       none
+# Return Values:
+update_run_number()
+{
+$ECHO "Updating RUNNUMBER in ${DBEXTRACT_ENV_FILE}" >> $RESULTSDIR/ExtractedTables_${RUNNUMBER}.log 
+OLD_RUNNUMBER=${RUNNUMBER} 
+let 'OLD_RUNNUMBER = OLD_RUNNUMBER + 1'
+$SED "s/RUNNUMBER=${RUNNUMBER}/RUNNUMBER=$OLD_RUNNUMBER/" ${DBEXTRACT_ENV_FILE}  > $EXTRACT_TMPDIR/tempf
+$CP $EXTRACT_TMPDIR/tempf ${DBEXTRACT_ENV_FILE}
+if [ $? -ne 0 ]; then
+    $ECHO "Failed to update RUNNUMBER in ${DBEXTRACT_ENV_FILE}" >> $RESULTSDIR/ExtractedTables_${RUNNUMBER}.log 
+fi
+ 
+}
+
+check_mount()
+{
+check_mount_timeout=0
+while [ 1 = 1 ]; do
+    _mount_dir_exists_=`$MOUNT -l | $GREP "${EXTRACTS}"`
+    if [ ! "${_mount_dir_exists_}" ]; then
+        $ECHO "\n\n----------------------------------------------------------------------------------\n!!! ERROR !!! \n`$DATE` : Extract directory $EXTRACTS does not exist to export the data... \nPausing the extract process, please mount the directory and resume the extract process \n\n----------------------------------------------------------------------------------\n\n" | $TEE -a $RESULTSDIR/ExtractedTables_${RUNNUMBER}.log >>${LOGFILE}
+        $TOUCH $RESULTSDIR/pause_process.txt
+        pause_resume_check
+    else
+        break
+    fi
+done
+}
+
+
+pause_resume_check()
+{
+_pause_count_=0
+_pause_timeout_=1000
+_pause_sleep_time_=30
+
+while [ -e $RESULTSDIR/pause_process.txt ]; do
+    Pruns=$($PS -ef | $GREP "extracttable.bsh" | $GREP -v $GREP | $GREP -v "Final"| $AWK '{print $2}' | $GREP -v ${PID} | $WC -l )
+    if [ $Pruns -gt 2 ]; then
+        loop_break=0
+        while [ $Pruns -gt 1 ]; do
+            Pruns=$($PS -ef | $GREP "extracttable.bsh" | $GREP -v $GREP | $GREP -v "Final"| $AWK '{print $2}' | $GREP -v ${PID} | $WC -l)
+            $ECHO ".\c" >> ${LOGFILE}
+            $SLEEP ${_pause_sleep_time_}
+            if [ ! -e $RESULTSDIR/pause_process.txt ]; then
+                loop_break=1
+                break
+            fi
+            (( _pause_count_ = _pause_count_ + 1 ))
+            if [ ${_pause_count_} -eq ${_pause_timeout_} ]; then
+                _err_msg_="Timeout has occurred, script has been paused for too long, Exiting"
+                abort_script "${_err_msg_}"
+            fi
+        done
+        if [ $loop_break -eq 1 ]; then
+            break
+        fi
+        $ECHO "\n----------------------------------------------\n" >> ${LOGFILE}
+        $ECHO "`$DATE` : EXTRACT PROCESS HAS BEEN PAUSED " >> ${LOGFILE}
+        $ECHO "\n----------------------------------------------\n" >> ${LOGFILE}
+    else
+        $SLEEP ${_pause_sleep_time_}
+    fi
+    
+    if (( $_pause_count_ % 50 == 0 ))
+    then
+        $ECHO "\n----------------------------------------------" >> ${LOGFILE}
+        $ECHO "EXTRACT PROCESS HAS BEEN PAUSED" >> ${LOGFILE}
+        $ECHO "----------------------------------------------\n" >> ${LOGFILE}
+    else
+        $ECHO ".\c" >>${LOGFILE}
+    fi
+    (( _pause_count_ = _pause_count_ + 1 ))
+    if [ ${_pause_count_} -eq ${_pause_timeout_} ]; then
+        _err_msg_="Timeout has occurred, script has been paused for too long, Exiting"
+        abort_script "${_err_msg_}"
+    fi
+done
+
+
+$ECHO "\n----------------------------------------------\n" | $TEE -a $RESULTSDIR/ExtractedTables_${RUNNUMBER}.log >>${LOGFILE}
+$ECHO "`$DATE` : Resuming the extract table process\n" | $TEE -a $RESULTSDIR/ExtractedTables_${RUNNUMBER}.log >>${LOGFILE}
+$ECHO "----------------------------------------------\n" | $TEE -a $RESULTSDIR/ExtractedTables_${RUNNUMBER}.log >>${LOGFILE}
+
+}
+
+extract_column_list()
+{
+# ********************************************************************
+#       Section to get cols for tables listed in the tablelist.
+# ********************************************************************
+if [ -f $RESULTSDIR/.get_cols_completed.txt -a -s $RESULTSDIR/Extract_tables_cols.txt ]; then
+    $ECHO "Extract of column list for the tables is already created" | $TEE -a $RESULTSDIR/ExtractedTables_${RUNNUMBER}.log >> ${LOGFILE}
+else
+    col_count=1
+    $ECHO "\n$($DATE +'%Y-%m-%d %H:%M:%S') - Initiating extract of column list for tables fetched...\n"  | $TEE -a $RESULTSDIR/ExtractedTables_${RUNNUMBER}.log >> ${LOGFILE}
+    for tablelistname_cols in `< $RESULTSDIR/Extract_tables_${RUNNUMBER}.txt`
+    do
+        ${IQDIR}/bin64/dbping -q -c "con=dwhdb;eng=$DWH_ENG;links=tcpip{host=dwhdb;port=${DWH_PORT};dobroadcast=none;verify=no};uid=dba;pwd=${DBA_PASSWORD}" 2>&1
+        _resp_=$?
+        if [ ${_resp_} -eq 0 ]; then
+            get_cols ${tablelistname_cols}
+                if (( $col_count % 500 == 0 ))
+                then
+                           $ECHO "Finished extracting column list for table ${col_count} of ${NumTab}."  | $TEE -a $RESULTSDIR/ExtractedTables_${RUNNUMBER}.log >>$LOGFILE
+                    fi
+                let col_count=col_count+1
+        else
+            _retry_=0
+             while [ ${_retry_} -lt 6 ]; do
+                ${IQDIR}/bin64/dbping -q -c "con=dwhdb;eng=$DWH_ENG;links=tcpip{host=dwhdb;port=${DWH_PORT};dobroadcast=none;verify=no};uid=dba;pwd=${DBA_PASSWORD}" 2>&1
+                _resp1_=$?
+                if [ ${_resp1_} -ne 0 ]; then
+                    $ECHO "dwhdb is not running, will wait for sometime and retry ..!" | $TEE -a $RESULTSDIR/ExtractedTables_${RUNNUMBER}.log >>${LOGFILE}
+                    $SLEEP 60
+                    (( _retry_ = _retry_ + 1 ))
+                else
+                    $ECHO "dwhdb is running fine... resuming extract of column list." | $TEE -a $RESULTSDIR/ExtractedTables_${RUNNUMBER}.log >>${LOGFILE}
+                    get_cols ${tablelistname_cols}
+                    if (( $col_count % 500 == 0 ))
+                    then
+                        $ECHO "Finished extracting column list for table ${col_count} of ${NumTab}."  | $TEE -a $RESULTSDIR/ExtractedTables_${RUNNUMBER}.log >>${LOGFILE}
+                    fi
+                    let col_count=col_count+1
+                    break
+                fi
+            done
+            if [ ${_retry_} -eq 6 ]; then
+                $ECHO "Maximum timeout reached trying to wait for dwhdb... Exiting!" | $TEE -a $RESULTSDIR/ExtractedTables_${RUNNUMBER}.log >>${LOGFILE}
+                exit 2
+            fi
+        fi
+    done
+    #Creating indicator file so that column file is not recreated, if already present
+    $TOUCH $RESULTSDIR/.get_cols_completed.txt
+    if [ $? -ne 0 ];then
+        _err_msg_="Failed to create $RESULTSDIR/.get_cols_completed.txt indicator file"
+        abort_script "${_err_msg_}"
+    else
+        (( col_count = col_count - 1 ))
+        if [ ${col_count} -eq ${NumTab} ]; then
+            $ECHO "\n$($DATE +'%Y-%m-%d %H:%M:%S') - Completed extracting column list for table ${col_count} of ${NumTab}."  | $TEE -a $RESULTSDIR/ExtractedTables_${RUNNUMBER}.log >>${LOGFILE}
+        fi
+        $ECHO "Successfully created $RESULTSDIR/.get_cols_completed.txt indicator file" >>$RESULTSDIR/ExtractedTables_${RUNNUMBER}.log
+        
+        $CP -rp $EXTRACTS/Extract_tables_cols.txt $RESULTSDIR/Extract_tables_cols.txt
+        if [ $? -ne 0 ];then
+            _err_msg_="Failed to create copy of $EXTRACTS/Extract_tables_cols.txt in $RESULTSDIR directory"
+            abort_script "${_err_msg_}"
+        else
+            $ECHO "Successfully created copy of $EXTRACTS/Extract_tables_cols.txt in $RESULTSDIR directory" >>$RESULTSDIR/ExtractedTables_${RUNNUMBER}.log
+        fi
+    fi
+fi
+}
+
+### Function: remove_DIM_tables ###
+#
+# Removing the DIM tables from all the runs except active export.Called just before the extraction of tables by extracttable.sh
+#
+# Arguments:
+#       none
+# Return Values:
+remove_DIM_tables()
+{
+	$ECHO "Removing DIM tables from file $RESULTSDIR/Extract_tables_${RUNNUMBER}_date.txt in ${RUNNUMBER} run" >>${LOGFILE}
+	#Section to exclude DIM tables from extraction during all runs except RUN-3
+    $CP $RESULTSDIR/Extract_tables_${RUNNUMBER}_date.txt $RESULTSDIR/Extract_tables_${RUNNUMBER}_date_copy.txt
+    
+	$CAT $RESULTSDIR/Extract_tables_${RUNNUMBER}_date.txt | $GREP -v "DIM_*" > ${EXTRACT_TMPDIR}/Extract_tables_${RUNNUMBER}_date_temp.txt
+    if [ $? -ne 0 ]; then
+         _err_msg_="Failed to recreate $RESULTSDIR/Extract_tables_${RUNNUMBER}_date.txt during the exclusion of DIM tables."
+         log_msg -s "Reverting back the changes done in  Extract_tables_${RUNNUMBER}_date.txt"
+         abort_script "${_err_msg_}"
+    else
+         $CP ${EXTRACT_TMPDIR}/Extract_tables_${RUNNUMBER}_date_temp.txt $RESULTSDIR/Extract_tables_${RUNNUMBER}_date.txt
+         $RM -rf $RESULTSDIR/Extract_tables_${RUNNUMBER}_date_copy.txt
+    fi
+}
+
+# ********************************************************************
+#
+#     Main body of program
+#
+# ********************************************************************
+#
+# Pull in the environment
+#Setting environment variables
+setup_env
+
+#get absolute path of the script
+get_absolute_path
+
+PID=$$
+if [ ! -f "${DBEXTRACT_ENV_FILE}" ]
+then
+    _err_msg_="You need to be in the install directory to run extractdb"
+    abort_script "$_err_msg_"
+fi
+
+while getopts ":e:l:" arg; do
+  case $arg in
+    l) LOGFILE="$OPTARG"
+       ;;
+    e) RETRY_FLAG="YES"
+       RETRY_FAILED_TABLES_FILE="$OPTARG"
+       ;;
+    \?) _err_msg_="`$BASENAME $0` -s <stage>"
+       abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+       ;;
+  esac
+done
+shift `expr $OPTIND - 1`
+
+
+#Sourcing the environment file
+. "${DBEXTRACT_ENV_FILE}"
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not source ${DBEXTRACT_ENV_FILE}"
+    abort_script "${_err_msg_}"
+fi
+
+if [ ! -s  ${RESULTSDIR}/extract_info_${RUNNUMBER}.txt ]; then
+    $TOUCH ${RESULTSDIR}/extract_info_${RUNNUMBER}.txt
+    if [ $? -ne 0 ]; then
+        _err_msg_="Could not create ${RESULTSDIR}/extract_info_${RUNNUMBER}.txt"
+        abort_script "${_err_msg_}"
+    else
+        $ECHO "TABLE_NAME \t\t | FILE_NAME \t\t\t\t | SIZE \t | E_START_TIME \t | E_END_TIME \t | ROW_COUNT_DB \t | ROW_COUNT_FILE \t | DATE \t | STATUS " >> ${RESULTSDIR}/extract_info_${RUNNUMBER}.txt
+    fi
+fi
+
+
+$ECHO Initializing Extract log | $TEE -a $RESULTSDIR/ExtractedTables_${RUNNUMBER}.log >>${LOGFILE}
+$TOUCH $RESULTSDIR/ErrorExtractingTable_${RUNNUMBER}.log
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not create $RESULTSDIR/ErrorExtractingTable_${RUNNUMBER}.log"
+    abort_script "${_err_msg_}"
+fi
+
+$TOUCH $RESULTSDIR/ExtractedTables_${RUNNUMBER}.log
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not create $RESULTSDIR/ExtractedTables_${RUNNUMBER}.log"
+    abort_script "${_err_msg_}"
+fi
+
+$TOUCH $RESULTSDIR/FinishedTables_date_${RUNNUMBER}.list
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not create $RESULTSDIR/FinishedTables_date_${RUNNUMBER}.list"
+    abort_script "${_err_msg_}"
+fi
+
+$RM -rf ${RESULTSDIR}/distinct_date.txt >> /dev/null
+$TOUCH $RESULTSDIR/distinct_date.txt
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not create $RESULTSDIR/distinct_date.txt"
+    abort_script "${_err_msg_}"
+fi
+
+$ECHO "LAST EXTRACT STARTTIME : $LASTEXTRACTSTARTTIME" | $TEE -a $RESULTSDIR/ExtractedTables_${RUNNUMBER}.log >>${LOGFILE}
+
+#creating templates for extracting data from database
+create_templates
+
+#Save start date
+dbisql ${connection_string} $RESULTSDIR/getnow.sql > /dev/null
+if [ $? -ne 0 ]; then
+    $ECHO "Could not execute $RESULTSDIR/getnow.sql\n" | $TEE -a $RESULTSDIR/ExtractedTables_${RUNNUMBER}.log >>${LOGFILE}
+    exit 2
+fi
+
+runstart=`$SED "s/'//g"< nowdate`
+$RM -f nowdate
+
+if [ -z ${RETRY_FLAG} ];then
+    if [ -s ${RESULTSDIR}/extractdb_attempts.txt ]; then
+        _extractdb_attempts_=`$CAT ${RESULTSDIR}/extractdb_attempts.txt`
+    else
+        _err_msg_="Could not find ${RESULTSDIR}/extractdb_attempts.txt file...Exiting!"
+        abort_script "${_err_msg_}"
+    fi
+    # ********************************************************************
+    #     Section to get tablelist to be extracted.
+    # ********************************************************************
+    if [ -f "${RESULTSDIR}/.selective_feature_on" ]; then
+    #Check if dwhdb is up and running
+
+        ${IQDIR}/bin64/dbping -q -c "con=dwhdb;eng=$DWH_ENG;links=tcpip{host=dwhdb;port=${DWH_PORT};dobroadcast=none;verify=no};uid=dba;pwd=${DBA_PASSWORD}" 2>&1
+        if [ $? -eq 0 ]; then
+            if [ ${_extractdb_attempts_} -ne 1 ]; then
+                $ECHO "Recreating table list" |$TEE -a $RESULTSDIR/ExtractedTables_${RUNNUMBER}.log >>${LOGFILE}
+                if [ -s "${RESULTSDIR}/features.lst" ]; then
+                    _feature_arg_=`$CAT ${RESULTSDIR}/features.lst | $TR -s "\n" ","`
+                    $BASH ${SCRIPTHOME}/tablelist_perfeature.bsh -f "${_feature_arg_}" | $TEE -a $RESULTSDIR/ExtractedTables_${RUNNUMBER}.log
+                    _check_script_status_=`$ECHO ${PIPESTATUS[0]}`    
+                    if [ "${_check_script_status_}" -ne 0 ]; then
+                            _err_msg_="Could not identify list of Tables for features selected...Exiting!"
+                            abort_script "${_err_msg_}"
+                    fi
+                else
+                        _err_msg_="Could not locate the selected feature list file"
+                        abort_script "${_err_msg_}"
+                fi
+            fi
+        else
+            $ECHO "$DWH_ENG is not running... Cannot get table list\n" | $TEE -a $RESULTSDIR/ExtractedTables_${RUNNUMBER}.log >>${LOGFILE}
+            exit 2
+        fi
+        
+        if [ ! -s $RESULTSDIR/Extract_tables_${RUNNUMBER}.txt ]; then
+            _err_msg_="$RESULTSDIR/Extract_tables_${RUNNUMBER}.txt file not present"
+            abort_script "${_err_msg_}"
+        fi
+    else
+
+        #Check if dwhdb is up and running
+
+        ${IQDIR}/bin64/dbping -q -c "con=dwhdb;eng=$DWH_ENG;links=tcpip{host=dwhdb;port=${DWH_PORT};dobroadcast=none;verify=no};uid=dba;pwd=${DBA_PASSWORD}" 2>&1
+        if [ $? -eq 0 ]; then
+            
+            if [ ! -s $RESULTSDIR/Extract_tables_${RUNNUMBER}.txt ]; then
+                $ECHO Getting Table List to extract ...| $TEE -a $RESULTSDIR/ExtractedTables_${RUNNUMBER}.log >>${LOGFILE}
+                $SED "s:RUNDIR:$RESULTSDIR:g" < ${RESULTSDIR}/extr_tabs.template | $SED "s/LASTUPDATE/${LASTEXTRACTSTARTTIME}/"| $SED "s/RUNNUMBER/${RUNNUMBER}/" > $EXTRACT_TMPDIR/extr_tabs.sql
+
+                if [ ! -s $EXTRACT_TMPDIR/extr_tabs.sql ]; then
+                    _err_msg_="Failed to execute $EXTRACT_TMPDIR/extr_tabs.sql"
+                    abort_script "${_err_msg_}"
+                fi
+            
+                dbisql ${connection_string}  $EXTRACT_TMPDIR/extr_tabs.sql > /dev/null
+                if [ $? -ne 0 ]; then
+                    _err_msg_="Failed to get list of tables for extraction...!" 
+                    abort_script "${_err_msg_}"
+                fi
+                $RM -f $EXTRACT_TMPDIR/extr_tabs.sql
+            fi
+        else
+            $ECHO "$DWH_ENG is not running... Cannot get table list\n" | $TEE -a $RESULTSDIR/ExtractedTables_${RUNNUMBER}.log >>${LOGFILE}
+            exit 2
+        fi
+    fi
+
+
+    if [ -s "$RESULTSDIR/custom_techpack_table.txt" ]; then
+        $CP $RESULTSDIR/Extract_tables_${RUNNUMBER}.txt ${EXTRACT_TMPDIR}/Extract_tables_${RUNNUMBER}_tmp.txt
+        if [ $? -ne 0 ]; then
+            _err_msg_="Failed to create copy of $RESULTSDIR/Extract_tables_${RUNNUMBER}.txt"
+            abort_script "${_err_msg_}"
+        fi
+        $CAT $RESULTSDIR/custom_techpack_table.txt >> ${EXTRACT_TMPDIR}/Extract_tables_${RUNNUMBER}_tmp.txt
+        $CP ${EXTRACT_TMPDIR}/Extract_tables_${RUNNUMBER}_tmp.txt $RESULTSDIR/Extract_tables_${RUNNUMBER}.txt
+        if [ $? -eq 0 ]; then
+            $ECHO "\n--------------------------------------------------------------------------------------------------" | $TEE -a $RESULTSDIR/ExtractedTables_${RUNNUMBER}.log >> ${LOGFILE}
+             $ECHO "NOTE : Custom Techpack tables present and ready for extraction" | $TEE -a $RESULTSDIR/ExtractedTables_${RUNNUMBER}.log >> ${LOGFILE}
+            $ECHO "---------------------------------------------------------------------------------------------------\n" | $TEE -a $RESULTSDIR/ExtractedTables_${RUNNUMBER}.log >> ${LOGFILE}
+        fi
+    else
+        $ECHO "\n---------------------------------------------------------------------------------------------------" | $TEE -a $RESULTSDIR/ExtractedTables_${RUNNUMBER}.log >> ${LOGFILE}
+        $ECHO "NOTE : No Custom Teckpack tables available for extraction"  | $TEE -a $RESULTSDIR/ExtractedTables_${RUNNUMBER}.log >> ${LOGFILE}
+        $ECHO "---------------------------------------------------------------------------------------------------\n" | $TEE -a $RESULTSDIR/ExtractedTables_${RUNNUMBER}.log >> ${LOGFILE}
+    fi
+
+    # Excluding CURRENT_DC and vector tables _V_
+    $CAT ${RESULTSDIR}/Extract_tables_${RUNNUMBER}.txt | $EGREP -v "_CURRENT_DC\'$|DIM.*_V_.*|_CALC\'$" > $EXTRACT_TMPDIR/Extract_tables_${RUNNUMBER}_tmp.txt
+    if [ $? -ne 0 ];then
+        _err_msg_="Could not remove the unwanted table names from the extract table list"
+        abort_script "${_err_msg_}"
+    fi
+
+    $CP $EXTRACT_TMPDIR/Extract_tables_${RUNNUMBER}_tmp.txt ${RESULTSDIR}/Extract_tables_${RUNNUMBER}.txt
+    if [ $? -ne 0 ];then
+        _err_msg_="Could not get the required list of tables"
+        abort_script "${_err_msg_}"
+    fi 
+
+    #  Section to exclude Auto-populated tables from extraction
+    $CP $RESULTSDIR/Extract_tables_${RUNNUMBER}.txt $RESULTSDIR/Extract_tables_${RUNNUMBER}_copy.txt
+    $CAT $RESULTSDIR/Extract_tables_${RUNNUMBER}.txt | $EGREP -v "${TABLE_EXCLUDE_LIST}" > ${EXTRACT_TMPDIR}/Extract_tables_${RUNNUMBER}_temp.txt
+    if [ $? -ne 0 ]; then
+         _err_msg_="Failed to recreate $RESULTSDIR/Extract_tables_${RUNNUMBER}.txt"
+         log_msg -s "Reverting back the changes done in  Extract_tables_${RUNNUMBER}.txt"
+         abort_script "${_err_msg_}"
+    else
+         $CP ${EXTRACT_TMPDIR}/Extract_tables_${RUNNUMBER}_temp.txt $RESULTSDIR/Extract_tables_${RUNNUMBER}.txt
+         $RM -rf $RESULTSDIR/Extract_tables_${RUNNUMBER}_copy.txt
+    fi
+	
+	# Section to copy the DIM tables from each run.
+	$CAT $RESULTSDIR/Extract_tables_${RUNNUMBER}.txt | $GREP  "DIM_*" >> $RESULTSDIR/Extract_tables_DIM.txt
+	
+	$CAT $RESULTSDIR/Extract_tables_${RUNNUMBER}.txt | $GREP  "DIM_*" >  $RESULTSDIR/Extract_tables_${RUNNUMBER}_DIM.txt
+	
+	# Section to include Topology tables during the export-3
+	if [ -e ${RESULTSDIR}/.export_run_three_running ] ; then
+		DIM_tables_count=`$CAT $RESULTSDIR/Extract_tables_DIM.txt | $SORT -u | wc -l`
+		$CAT $RESULTSDIR/Extract_tables_DIM.txt | $SORT -u >> $RESULTSDIR/Extract_tables_${RUNNUMBER}.txt
+		if [ $? -ne 0 ]; then
+			 _err_msg_="Failed to append $RESULTSDIR/Extract_tables_DIM.txt during the Export-3."
+			 log_msg -s "Reverting back the changes done in Extract_tables_${RUNNUMBER}.txt"
+			 abort_script "${_err_msg_}"
+		else
+			 $ECHO "Successfully appended ${DIM_tables_count} Topology Tables to $RESULTSDIR/Extract_tables_${RUNNUMBER}.txt during export-3" >>${LOGFILE} 
+			 unset DIM_tables_count
+		fi
+
+		$CP $RESULTSDIR/Extract_tables_${RUNNUMBER}.txt $RESULTSDIR/Extract_tables_${RUNNUMBER}_copy.txt
+		$CAT $RESULTSDIR/Extract_tables_${RUNNUMBER}_copy.txt | $SORT -u > $RESULTSDIR/Extract_tables_${RUNNUMBER}.txt
+		if [ $? -ne 0 ]; then
+			_err_msg_="Failed to Sort $RESULTSDIR/Extract_tables_${RUNNUMBER}.txt during the export-3."
+			log_msg -s "Reverting back the changes done in Extract_tables_${RUNNUMBER}.txt"
+			abort_script "${_err_msg_}"
+		else
+			$ECHO "Successfully sorted file $RESULTSDIR/Extract_tables_${RUNNUMBER}.txt during Export-3 to avoid topology duplicates" >>${LOGFILE}
+			$RM -rf $RESULTSDIR/Extract_tables_${RUNNUMBER}_copy.txt	 
+		fi
+
+	fi 
+	
+    if [ -s $RESULTSDIR/Extract_tables_${RUNNUMBER}.txt ]; then
+        NumTab=`wc -l $RESULTSDIR/Extract_tables_${RUNNUMBER}.txt |$AWK '{print $1}'`
+        if [ ! "${NumTab}" ]; then
+            _err_msg_="Failed to get NumTab from $RESULTSDIR/Extract_tables_${RUNNUMBER}.txt"
+            abort_script "${_err_msg_}"
+        fi
+    fi
+    $ECHO "\n$NumTab tables exist for selected feature(s)" | $TEE -a $RESULTSDIR/ExtractedTables_${RUNNUMBER}.log >>${LOGFILE}
+
+    extract_column_list &
+
+    # ********************************************************************
+    #     Section to get dates for tables listed in the tablelist.
+    # ********************************************************************
+    if [ -f $RESULTSDIR/.date_list_${RUNNUMBER}_completed.txt -a -s $RESULTSDIR/Extract_tables_${RUNNUMBER}_date.txt ];then
+        $ECHO "Date list for the tables is already created" |$TEE -a $RESULTSDIR/ExtractedTables_${RUNNUMBER}.log >>${LOGFILE}
+    else
+        dateTab_count=1
+        $ECHO "\n$($DATE +'%Y-%m-%d %H:%M:%S') - Initiating extract of date list for the tables fetched...\n"  | $TEE -a $RESULTSDIR/ExtractedTables_${RUNNUMBER}.log >>${LOGFILE}
+        for tablelistname in `< $RESULTSDIR/Extract_tables_${RUNNUMBER}.txt`
+        do
+            if [ -e $RESULTSDIR/pause_process.txt ]; then 
+                
+                $ECHO "`$DATE` : Pausing the date extract process" | $TEE -a $RESULTSDIR/ExtractedTables_${RUNNUMBER}.log >>${LOGFILE}
+                pause_resume_check
+            fi
+
+            check_mount 
+            
+            User1=`$ECHO $tablelistname | cut -d',' -f1 | $SED "s/'//g"`
+            Table1=`$ECHO $tablelistname | cut -d',' -f2 | $SED "s/'//g"`
+            number=`$ECHO ${tablelistname: -2}`
+
+            if [[ "${Table1}" == LOG_BusyhourHistory ]]
+            then
+                    $GREP  $Table1 $RESULTSDIR/Extract_tables_${RUNNUMBER}_date.txt 2>/dev/null 1>/dev/null
+                    if [ $? -ne 0 ]
+                    then
+                        $ECHO $tablelistname >>$RESULTSDIR/Extract_tables_${RUNNUMBER}_date.txt
+                    fi
+            elif [[ "${Table1}" == DC_E_* ]] || [[ "${Table1}" == DC_AP_* ]]  || [[ "${Table1}" == DC_X_* ]]  || [[ "${Table1}" == LOG_* ]] 
+            then
+                $GREP  $Table1 $RESULTSDIR/Extract_tables_${RUNNUMBER}_date.txt 2>/dev/null 1>/dev/null
+                if [ $? -ne 0 ]
+                then
+                    $ECHO "select distinct dateformat( DATE_ID, 'YYYY-MM-DD' ) from ${User1}.${Table1} where DATE_ID >= '${LASTEXTRACTSTARTTIME}';" > $EXTRACT_TMPDIR/distinct_date_${Table1}  
+                    $ECHO "go">> $EXTRACT_TMPDIR/distinct_date_${Table1}  
+
+                    ${IQDIR}/bin64/dbping -q -c "con=dwhdb;eng=$DWH_ENG;links=tcpip{host=dwhdb;port=${DWH_PORT};dobroadcast=none;verify=no};uid=dba;pwd=${DBA_PASSWORD}" 2>&1
+                    _resp_=$?
+                    if [ ${_resp_} -eq 0 ]; then
+                        ${IQISQL} -UDBA -P${DBA_PASSWORD} -S${DWH_ENG} -w999 -i $EXTRACT_TMPDIR/distinct_date_${Table1} -o $EXTRACT_TMPDIR/distinct_date_${Table1}_temp.txt
+                    else
+                        _retry_=0
+                        while [ ${_retry_} -lt 6 ]; do
+                            ${IQDIR}/bin64/dbping -q -c "con=dwhdb;eng=$DWH_ENG;links=tcpip{host=dwhdb;port=${DWH_PORT};dobroadcast=none;verify=no};uid=dba;pwd=${DBA_PASSWORD}" 2>&1
+                            _resp1_=$?
+                            if [ ${_resp1_} -ne 0 ]; then
+                                $ECHO "dwhdb is not running, will wait for sometime and retry ..!"  | $TEE -a $RESULTSDIR/ExtractedTables_${RUNNUMBER}.log >>${LOGFILE}
+                                $SLEEP 60
+                                (( _retry_ = _retry_ + 1 ))
+                            else
+                                $ECHO "dwhdb is running fine... resuming extraction of distinct date(s) list."
+                                ${IQISQL} -UDBA -P${DBA_PASSWORD} -S${DWH_ENG} -w999 -i $EXTRACT_TMPDIR/distinct_date_${Table1} -o $EXTRACT_TMPDIR/distinct_date_${Table1}_temp.txt
+                                break
+                            fi
+                        done
+                        if [ ${_retry_} -eq 6 ]; then
+                            $ECHO "Maximum timeout reached trying to wait for dwhdb... Exiting!"  | $TEE -a $RESULTSDIR/ExtractedTables_${RUNNUMBER}.log >>${LOGFILE}
+                            exit 2
+                        fi
+
+                    fi
+                
+                    $CAT $EXTRACT_TMPDIR/distinct_date_${Table1}_temp.txt | $SED '$d' | $SED '1,2d' |$SED 's/ //g'| $SED 's/-*//'|$SED '/^$/d' > $EXTRACT_TMPDIR/distinct_date_${Table1}.txt 
+
+                    $CAT $EXTRACT_TMPDIR/distinct_date_${Table1}.txt |$SED "s/^/'${User1}','${Table1}','/g"  > $EXTRACT_TMPDIR/temp_${Table1}
+            
+                    $CAT $EXTRACT_TMPDIR/temp_${Table1} >>$RESULTSDIR/Extract_tables_${RUNNUMBER}_date.txt
+
+                    $RM -f  $EXTRACT_TMPDIR/distinct_date_${Table1}_temp.txt $EXTRACT_TMPDIR/distinct_date_${Table1} $EXTRACT_TMPDIR/distinct_date_${Table1}.txt $EXTRACT_TMPDIR/temp_${Table1}
+                fi
+            
+            else
+
+                $GREP  $Table1 $RESULTSDIR/Extract_tables_${RUNNUMBER}_date.txt 2>/dev/null 1>/dev/null
+                if [ $? -ne 0 ]
+                then 
+                    $ECHO $tablelistname >>$RESULTSDIR/Extract_tables_${RUNNUMBER}_date.txt
+                fi
+            fi
+            
+            
+            if (( $dateTab_count % 500 == 0 ))
+            then
+                $ECHO "Finished extracting distinct date(s) list for ${dateTab_count} of ${NumTab}."  | $TEE -a $RESULTSDIR/ExtractedTables_${RUNNUMBER}.log >>${LOGFILE}
+            fi
+            let dateTab_count=dateTab_count+1
+        done
+        
+        if [ ! -s $RESULTSDIR/Extract_tables_${RUNNUMBER}_date.txt ]; then
+            _err_msg_="Could not create $RESULTSDIR/Extract_tables_${RUNNUMBER}_date.txt"
+            abort_script "${_err_msg_}"
+        fi
+        #Creating indicator file so that date file is not created again for same runnumber 
+        $TOUCH $RESULTSDIR/.date_list_${RUNNUMBER}_completed.txt
+        if [ $? -ne 0 ];then
+            _err_msg_="Failed to create $RESULTSDIR/.date_list_${RUNNUMBER}_completed.txt indicator file"
+            abort_script "${_err_msg_}"
+        else
+                (( dateTab_count = dateTab_count - 1 ))    
+            if [ ${dateTab_count} -eq ${NumTab} ]; then
+                $ECHO "\n$($DATE +'%Y-%m-%d %H:%M:%S') - Completed extracting date list for table ${dateTab_count} of ${NumTab}." | $TEE -a $RESULTSDIR/ExtractedTables_${RUNNUMBER}.log >>${LOGFILE}
+            fi
+            $ECHO "Successfully created $RESULTSDIR/.date_list_${RUNNUMBER}_completed.txt indicator file" >>$RESULTSDIR/ExtractedTables_${RUNNUMBER}.log
+        fi
+    fi
+
+    if  [ $NumTab -gt 0 ]
+    then
+        NumTab_date=`wc -l $RESULTSDIR/Extract_tables_${RUNNUMBER}_date.txt |awk '{print $1}'`
+    else
+        NumTab_date=0
+    fi
+
+    $ECHO "$NumTab_date date instances to Extract" | $TEE -a $RESULTSDIR/ExtractedTables_${RUNNUMBER}.log >>${LOGFILE}
+
+    #Appending the files that failed to extract in last run
+    if [ ${_extractdb_attempts_} -gt 1 ]; then
+        (( _last_runnumber_ = RUNNUMBER - 1 ))
+        
+        if [ -s $RESULTSDIR/ErrorExtractingTable_${_last_runnumber_}.log ]; then
+            _last_run_error_=`$CAT $RESULTSDIR/ErrorExtractingTable_${_last_runnumber_}.log | $WC -l`
+            if  [ ${_last_run_error_} -ne 0 ]; then
+                if [ -s $RESULTSDIR/Failure_Extract_${_last_runnumber_}.txt ];then
+                    $CP $RESULTSDIR/Extract_tables_${RUNNUMBER}_date.txt $EXTRACT_TMPDIR/temp_Failure_Extract_file
+                    if [ $? -ne 0 ]; then
+                        _err_msg_="Failed to create a copy of $RESULTSDIR/Extract_tables_${RUNNUMBER}_date.txt"
+                        abort_script "${_err_msg_}"
+                    fi
+                    
+                    $CAT $RESULTSDIR/Failure_Extract_${_last_runnumber_}.txt | sed "s/dc./'dc','/g" | sed "s/ | /','/g" |sed "s/$/'/g" >>$EXTRACT_TMPDIR/temp_Failure_Extract_file
+                    $CP $EXTRACT_TMPDIR/temp_Failure_Extract_file $RESULTSDIR/Extract_tables_${RUNNUMBER}_date.txt
+                    if [ $? -eq 0 ]; then
+                        $ECHO  "Successfully appended failed tables list to $RESULTSDIR/Extract_tables_${RUNNUMBER}_date.txt" | $TEE -a $RESULTSDIR/ExtractedTables_${RUNNUMBER}.log 
+                    else
+                        _err_msg_="Failed to append failed tables list to $RESULTSDIR/Extract_tables_${RUNNUMBER}_date.txt"
+                        abort_script "${_err_msg_}"
+                    fi
+                fi
+                
+            fi
+        fi
+    fi
+fi
+
+# ********************************************************************
+#     Section to extract tables listed in the tablelist.
+# ********************************************************************
+
+$ECHO "`date` : Starting the table extract for run ${RUNNUMBER}" | $TEE -a $RESULTSDIR/ExtractedTables_${RUNNUMBER}.log >> ${LOGFILE}
+count_table_extracts=0 
+
+if [ ! -e ${RESULTSDIR}/.export_run_three_running ] ; then
+        remove_DIM_tables
+fi
+
+if [ -z ${RETRY_FLAG} ];then
+    _final_extract_list_=$RESULTSDIR/Extract_tables_${RUNNUMBER}_date.txt
+else
+    _final_extract_list_=${RETRY_FAILED_TABLES_FILE}
+    if [ -s ${RETRY_FAILED_TABLES_FILE} ]; then
+        NumTab=`wc -l ${RETRY_FAILED_TABLES_FILE} |$AWK '{print $1}'`
+        echo $NumTab
+        if [ -z ${NumTab} ]; then
+            _err_msg_="Failed to get number of files from ${RETRY_FAILED_TABLES_FILE}"
+            abort_script "${_err_msg_}"
+        else
+            if  [ $NumTab -gt 0 ]
+            then
+                NumTab_date=`wc -l ${RETRY_FAILED_TABLES_FILE} |awk '{print $1}'`
+            else
+                NumTab_date=0
+            fi
+            $ECHO "\n$NumTab failed tables exist for re-extract" | $TEE -a $RESULTSDIR/ExtractedTables_${RUNNUMBER}.log >>${LOGFILE}
+        fi
+    else
+        err_msg_="\nCould not find ${RETRY_FAILED_TABLES_FILE}" 
+        abort_script "${_err_msg_}"
+    fi
+fi
+
+if  [ $NumTab -ne 0 ]
+then
+    for tablelistname in `$CAT ${_final_extract_list_} | $SORT -t "," -rk3`
+    do
+        table_date_value=`$ECHO $tablelistname | $SED "s/'dc','//g" | $SED "s/','/xyz/g"  |$SED "s/'//g"`
+        if [ -s $RESULTSDIR/extract_info_${RUNNUMBER}.txt ]; then
+            $CAT $RESULTSDIR/extract_info_${RUNNUMBER}.txt | $GREP $table_date_value | $EGREP "Success|Empty" >>/dev/null 2>&1
+            if [ $? -ne 0 ]; then
+                extract_table=yes
+            else
+                extract_table=no
+            fi
+        else
+            extract_table=yes
+        fi
+        
+        if [ "$extract_table" == "yes" ]; then
+            if [ -e $RESULTSDIR/pause_process.txt ]; then 
+                
+                $ECHO "`$DATE` : Pausing the table extract process" | $TEE -a $RESULTSDIR/ExtractedTables_${RUNNUMBER}.log >>${LOGFILE}
+                $ECHO "Some table extracts are still in progress, please wait for the process to get completed" | $TEE -a $RESULTSDIR/ExtractedTables_${RUNNUMBER}.log >>${LOGFILE}
+                pause_resume_check
+            fi
+
+            while [ 1 = 1 ]
+            do
+                _resp_count_=0
+                _resp_break_=0
+                Pruns=$($PS -ef | $GREP "extracttable.bsh" | $GREP -v $GREP | $GREP -v "Final"| $AWK '{print $2}' | $GREP -v ${PID} | $WC -l)
+                if [ $Pruns -lt $MAXPARALLEL ]
+                then
+                    avail_space=$($DF -k $EXTRACTS | $AWK '{print $4}'|tail -n+2)
+                
+                    while [[ $avail_space -lt 524288000 ]]
+                    
+                    do
+                        $ECHO "`$DATE` : Running out of space in the extract folder ${EXTRACTS} " | $TEE -a $RESULTSDIR/ExtractedTables_${RUNNUMBER}.log >>${LOGFILE}
+                        $ECHO "Pausing the table extract process" | $TEE -a $RESULTSDIR/ExtractedTables_${RUNNUMBER}.log >>${LOGFILE}
+                        $TOUCH $RESULTSDIR/pause_process.txt
+                        $ECHO "Unmount the ${EXTRACTS} directory and mount another file system with sufficient space on ${EXTRACTS}\n\nNOTE:: The new filesystem must be mounted with the same name i.e. ${EXTRACTS} and resume the extract process\n" | $TEE -a $RESULTSDIR/ExtractedTables_${RUNNUMBER}.log >>${LOGFILE}
+                        pause_resume_check
+                        
+                        
+                        _dir_perm_=`$LS -ld $EXTRACTS | $AWK '{ if($3 == "dcuser") print $3,$4;}'`
+                        while [ "${_dir_perm_}" != "dcuser dc5000" ]; do
+                            $TOUCH $RESULTSDIR/pause_process.txt
+                            $ECHO "`$DATE` : Pausing the table extract process" | $TEE -a $RESULTSDIR/ExtractedTables_${RUNNUMBER}.log >>${LOGFILE}
+                            $ECHO "Change the ${EXTRACTS} directory permission to dcuser:dc5000 manually with root user and resume the extract process \n" | $TEE -a $RESULTSDIR/ExtractedTables_${RUNNUMBER}.log >>${LOGFILE}
+                            pause_resume_check
+                            _dir_perm_=`$LS -ld $EXTRACTS | $AWK '{ if($3 == "dcuser") print $3,$4;}'`
+                        done
+                        
+                        
+                        avail_space=$($DF -k $EXTRACTS | $AWK '{print $4}'|tail -n+2)
+                    done
+
+
+                    while [ $_resp_count_ -lt 1000 ]; do
+                        RESP=`${IQDIR}/bin64/dbping -q -c "con=dwhdb;eng=$DWH_ENG;links=tcpip{host=dwhdb;port=${DWH_PORT};dobroadcast=none;verify=no};uid=dba;pwd=${DBA_PASSWORD}" 2>&1`
+                        if [ $? -eq 0 ] ; then    
+                            #checking if the exports directory is mounted
+                            check_mount
+                            
+                            $BASH ${SCRIPTHOME}/extracttable.bsh $tablelistname >/dev/null & 
+                            let count_table_extracts=$count_table_extracts+1
+                            if [[ count_table_extracts -ge 50 ]]
+                            then
+                                $ECHO "$($DATE +'%Y-%m-%d %H:%M:%S'): $(cat $RESULTSDIR/FinishedTables_date_${RUNNUMBER}.list | sort -u | wc -l ) of $NumTab_date extracts completed." | $TEE -a $RESULTSDIR/ExtractedTables_${RUNNUMBER}.log >>${LOGFILE}
+                                count_table_extracts=0
+                            fi
+                            _resp_break_=1
+                            break
+                        else
+                            xPS=`ps -ef | grep asiqsrv12 | grep dwhdb`
+                            if [ -z "${xPS}" ] ; then
+                                (( _resp_count_ = _resp_count_ + 1 ))
+                            else
+                                (( _resp_count_ = _resp_count_ + 1 ))
+                            fi
+                            $SLEEP 1
+                            if (( $_resp_count_ % 5 == 0 ))
+                            then
+                                $ECHO "dwhdb is not running or  does not accept requests" | $TEE -a $RESULTSDIR/ExtractedTables_${RUNNUMBER}.log   >>${LOGFILE}
+                            fi
+                            if [ $_resp_count_ = 900 ]; then
+                                $ECHO "Maximum timeout reached while waiting for DWHDB to come up" | $TEE -a $RESULTSDIR/ExtractedTables_${RUNNUMBER}.log >>${LOGFILE}
+                                exit 2 
+                            fi
+                        fi
+                    done
+                else
+                    $SLEEP 5
+                fi
+            if [ ${_resp_break_} -eq 1 ]; then
+                break
+            fi
+            done
+        else
+            $ECHO "${tablelistname} already extracted successfully" >> $RESULTSDIR/ExtractedTables_${RUNNUMBER}.log 
+        fi
+    done 
+
+    while [ 1 = 1 ]
+    do
+        Pruns_endLoop=$(ps -ef | grep "extracttable.bsh" | grep -v grep | grep -v "Final" | awk '{print $2}' |grep -v ${PID}  | wc -l)
+        if [ $Pruns_endLoop -lt 1 ]
+        then
+            $ECHO "$($DATE +'%Y-%m-%d %H:%M:%S'): $(cat $RESULTSDIR/FinishedTables_date_${RUNNUMBER}.list | sort -u |wc -l) of $NumTab_date extracts completed."| $TEE -a $RESULTSDIR/ExtractedTables_${RUNNUMBER}.log >>${LOGFILE}
+            break
+        else
+            $ECHO "$($DATE +'%Y-%m-%d %H:%M:%S'): Waiting for few of the extracts to get completed"| $TEE -a $RESULTSDIR/ExtractedTables_${RUNNUMBER}.log >>${LOGFILE}
+            $SLEEP 120
+        fi
+    done
+fi
+
+count_error=$($CAT $RESULTSDIR/ErrorExtractingTable_${RUNNUMBER}.log | wc -l)
+
+$ECHO "$($DATE +'%Y-%m-%d %H:%M:%S'): Finishing extracting and zipping the tables for run ${RUNNUMBER}" | $TEE -a $RESULTSDIR/ExtractedTables_${RUNNUMBER}.log >>${LOGFILE}
+
+
+if [ $count_error -gt 1 ]
+then
+    $ECHO "A number of instances have failed to extract" | $TEE -a $RESULTSDIR/ExtractedTables_${RUNNUMBER}.log >>${LOGFILE}
+else
+    $ECHO "The tables have been extracted successfully" | $TEE -a $RESULTSDIR/ExtractedTables_${RUNNUMBER}.log >>${LOGFILE}
+fi
+
+if [ "$RETRY_FLAG" != "YES" ]; then
+    #Updating LASTEXTRACTSTARTTIME in env file
+    $CAT ${DBEXTRACT_ENV_FILE} |$SED "s/$LASTEXTRACTSTARTTIME/$runstart/" > $EXTRACT_TMPDIR/tempf
+    $CP $EXTRACT_TMPDIR/tempf ${DBEXTRACT_ENV_FILE}
+    $RM -f $EXTRACT_TMPDIR/tempf
+fi
+update_run_number
+if [ $? -eq 0 ]; then
+        $ECHO "RUNNUMBER updated in ${DBEXTRACT_ENV_FILE}" >> $RESULTSDIR/ExtractedTables_${RUNNUMBER}.log 
+fi

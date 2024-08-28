@@ -1,0 +1,420 @@
+#!/bin/bash
+# ********************************************************************
+# Ericsson Radio Systems AB                                     SCRIPT
+# ********************************************************************
+#
+#
+# (c) Ericsson Radio Systems AB 2011 - All rights reserved.
+#
+# The copyright to the computer program(s) herein is the property
+# of Ericsson Radio Systems AB, Sweden. The programs may be used
+# and/or copied only with the written permission from Ericsson Radio
+# Systems AB or in accordance with the terms and conditions stipulated
+# in the agreement/contract under which the program(s) have been
+# supplied.
+#
+# ********************************************************************
+# Name    : migrate_tunneld.bsh
+# Date    : 08/11/2011
+# Revision: A.5
+# Purpose : Main script to move files from tunneld to connectd
+#
+# Usage   : migrate_tunneld.bsh
+#
+# ********************************************************************
+#
+#   Command Section
+#
+# ********************************************************************
+AWK=/usr/bin/awk
+BASENAME=/usr/bin/basename
+BASH=/usr/bin/bash
+BC=/usr/bin/bc
+BOOTADM=/usr/sbin/bootadm
+CAT=/usr/bin/cat
+CFGADM=/usr/sbin/cfgadm
+CHMOD=/usr/bin/chmod
+CHOWN=/usr/bin/chown
+CLEAR=/usr/bin/clear
+CMP=/usr/bin/cmp
+CP=/usr/bin/cp
+CPIO=/usr/bin/cpio
+CUT=/usr/bin/cut 
+DATE=/usr/bin/date
+DF=/usr/bin/df 
+DIRNAME=/usr/bin/dirname
+DOMAINNAME=/usr/bin/domainname
+DTCONFIG=/usr/dt/bin/dtconfig
+DUMPADM=/usr/sbin/dumpadm
+ECHO=/usr/bin/echo
+EGREP=/usr/bin/egrep
+EJECT=/usr/bin/eject
+ENV=/usr/bin/env
+EXPR=/usr/bin/expr
+FIND=/usr/bin/find
+FLARCREATE=/usr/sbin/flarcreate
+FORMAT=/usr/sbin/format
+FUSER=/usr/sbin/fuser
+GEGREP=/usr/sfw/bin/gegrep
+GETENT=/usr/bin/getent
+GETTEXT=/usr/bin/gettext
+GREP=/usr/bin/grep
+GROUPADD=/usr/sbin/groupadd
+GROUPMOD=/usr/sbin/groupmod 
+GTAR=/usr/sfw/bin/gtar
+GZCAT=/usr/bin/gzcat
+GZIP=/usr/bin/gzip
+HEAD=/usr/bin/head
+HOSTID=/usr/bin/hostid 
+MYHOSTNAME=/usr/bin/hostname
+ID=/usr/bin/id
+IFCONFIG=/usr/sbin/ifconfig
+INIT=/usr/sbin/init
+LS=/usr/bin/ls
+MKDIR=/usr/bin/mkdir
+MORE=/usr/bin/more
+MOUNT=/usr/sbin/mount
+MV=/usr/bin/mv
+NAWK=/usr/bin/nawk
+NETSTAT=/usr/bin/netstat
+NSLOOKUP=/usr/sbin/nslookup
+PGREP=/usr/bin/pgrep
+PING=/usr/sbin/ping
+PKGADD=/usr/sbin/pkgadd
+PKGINFO=/usr/bin/pkginfo
+PKGRM=/usr/sbin/pkgrm
+PRTCONF=/usr/sbin/prtconf
+PRTVTOC=/usr/sbin/prtvtoc 
+PSRINFO=/usr/sbin/psrinfo
+PWD=/usr/bin/pwd
+REBOOT=/usr/sbin/reboot
+RM=/usr/bin/rm
+RCP=/usr/bin/rcp
+ROLEADD=/usr/sbin/roleadd 
+ROLEMOD=/usr/sbin/rolemod
+ROUTE=/usr/sbin/route
+ROLES=/usr/bin/roles 
+RSH=/usr/bin/rsh
+SED=/usr/bin/sed
+SEVEN_Z=/usr/bin/7z
+SLEEP=/usr/bin/sleep
+SORT=/usr/bin/sort
+STMSBOOT=/usr/sbin/stmsboot
+SU=/usr/bin/su
+SVCADM=/usr/sbin/svcadm
+SVCCFG=/usr/sbin/svccfg
+SVCS=/usr/bin/svcs
+SWAP=/usr/sbin/swap
+SYNC=/usr/sbin/sync
+TAIL=/usr/bin/tail
+TAR=/usr/sbin/tar
+TEE=/usr/bin/tee
+TOUCH=/usr/bin/touch
+TPUT=/usr/bin/tput
+TR=/usr/bin/tr
+UADMIN=/usr/sbin/uadmin
+UMOUNT=/usr/sbin/umount
+UNAME=/usr/bin/uname
+UNZIP=/usr/bin/unzip 
+USERADD=/usr/sbin/useradd
+USERMOD=/usr/sbin/usermod
+VOLD=/usr/sbin/vold
+WC=/usr/bin/wc
+YES=/usr/bin/yes
+ZFS=/usr/sbin/zfs
+ZPOOL=/usr/sbin/zpool
+
+# ********************************************************************
+#
+#       Configuration Section
+#
+# ********************************************************************
+# Default user
+DEFAULT_USER=root
+
+# Jumpstart Directory where all ENIQ SW will reside
+ENIQ_BASE_SW=eniq_base_sw
+
+# Name of SunOS & ENIQ ini Files
+ENIQ_ENV=niq.rc
+ENIQ_INI=niq.ini
+SUNOS_INI=SunOS.ini
+
+OSS_REF_STR=eniq_oss_
+
+# ********************************************************************
+#
+#       Pre-execution Operations
+#
+# ********************************************************************
+
+# ********************************************************************
+#
+#   Functions
+#
+# ********************************************************************
+### Function: abort_script ###
+#
+#   This will is called if the script is aborted thru an error
+#   signal sent by the kernel such as CTRL-C or if a serious
+#   error is encountered during runtime
+#
+# Arguments:
+#       $1 - Error message from part of program (Not always used)
+# Return Values:
+#       none
+abort_script()
+{
+_err_time_=`$DATE '+%Y-%b-%d_%H.%M.%S'`
+
+if [ "$1" ]; then
+	_err_msg_="${_err_time_} - $1"
+else
+	_err_msg_="${_err_time_} - ERROR : Script aborted.......\n"
+fi
+
+if [ "${LOGFILE}" ]; then
+	$ECHO "\nERROR : $_err_msg_\n" | $TEE -a ${LOGFILE}
+else
+	$ECHO "\nERROR : $_err_msg_\n"
+fi
+
+cd $SCRIPTHOME
+$RM -rf ${TEM_DIR}
+
+if [ "$2" ]; then
+	${2}
+	exit 1
+else
+	exit 1
+fi
+}
+
+### Function: chk_create_logfile ###
+#
+# Check/Create Logfile
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+chk_create_logfile()
+{
+$MKDIR -p `$DIRNAME ${LOGFILE}`
+if [ $? -ne 0 ]; then
+	_err_msg_="Could not create directory `$DIRNAME ${LOGFILE}`"
+	abort_script "$_err_msg_"
+fi
+
+$TOUCH -a ${LOGFILE}
+if [ $? -ne 0 ]; then
+	_err_msg_="Could not write to file ${LOGFILE}"
+	abort_script "$_err_msg_"
+fi
+}
+
+### Function: check_files_and_scripts ###
+#
+#   Checks required files/scripts are present
+#
+# Arguments:
+#       $1 : User ID name
+# Return Values:
+#       none
+check_files_and_scripts()
+{
+$ECHO "\nChecking for required files and scripts" | $TEE -a ${LOGFILE}
+}
+
+### Function: check_id ###
+#
+#   Check that the effective id of the user is correct
+#   If not print error msg and exit.
+#
+# Arguments:
+#       $1 : User ID name
+# Return Values:
+#       none
+check_id()
+{
+_check_id_=`$ID  | $AWK -F\( '{print $2}' | $AWK -F\) '{print $1}'`
+if [ "$_check_id_" != "$1" ]; then
+    _err_msg_="You must be $1 to execute this script."
+    abort_script "$_err_msg_"
+fi
+}
+
+### Function: get_absolute_path ###
+#
+# Determine absolute path to software
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+get_absolute_path()
+{
+_dir_=`$DIRNAME $0`
+SCRIPTHOME=`cd $_dir_ 2>/dev/null && pwd || $ECHO $_dir_`
+}
+
+### Function: migrate_data_files ###
+#
+# Migrate the tunneld files
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+migrate_data_files()
+{
+$LS ${TUNNEL_FILES_DIR} | $GEGREP ${OSS_REF_STR} > $TEM_DIR/tunnel_dir_list
+if [ ! -s $TEM_DIR/tunnel_dir_list ]; then
+	_err_msg_="Could not build a list of directories to migrate from ${TUNNEL_FILES_DIR}"
+    abort_script "$_err_msg_"
+fi
+
+$MKDIR -p ${ENIQ_CONNECTD_DIR}/mount_info
+if [ $? -ne 0 ]; then
+	_err_msg_="Could not create ${ENIQ_CONNECTD_DIR}/mount_info"
+    abort_script "$_err_msg_"
+fi
+
+# Copy the files
+cd ${TUNNEL_FILES_DIR} 
+while read _line_; do
+	$ECHO "Migrating ${_line_} to ${ENIQ_CONNECTD_DIR}/mount_info" | $TEE -a ${LOGFILE}
+	$FIND ${_line_} -depth -print | $CPIO -pdmu ${ENIQ_CONNECTD_DIR}/mount_info
+	if [ $? -ne 0 ]; then
+		_err_msg_="Could not migrate ${TUNNEL_FILES_DIR}/${_line_} to ${ENIQ_CONNECTD_DIR}/mount_info"
+	    abort_script "$_err_msg_"
+	fi
+done < $TEM_DIR/tunnel_dir_list
+}
+
+### Function: setup_env ###
+#
+# Setup up path environment etc
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+setup_env()
+{
+if [ ! "${ENIQ_BASE_DIR}" ]; then
+    ENIQ_BASE_DIR=/eniq
+fi
+
+# Admin directory
+ENIQ_ADMIN_DIR=${ENIQ_BASE_DIR}/admin
+
+# ENIQ admin bin directory
+ENIQ_CONNECTD_DIR=${ENIQ_BASE_DIR}/connectd
+
+if [ ! -s ${ENIQ_ADMIN_DIR}/lib/common_functions.lib ]; then
+    _err_msg_="Cannot locate ${ENIQ_ADMIN_DIR}/lib/common_functions.lib"
+    abort_script "$_err_msg_"
+else
+   . ${ENIQ_ADMIN_DIR}/lib/common_functions.lib
+fi
+
+# Has debug flag been used?
+if [ -s ${ENIQ_CONF_DIR}/extra_params/debug ]; then
+    set -xv
+    BASH="/usr/bin/bash -xv"
+fi
+}
+
+### Function: usage_msg ###
+#
+#   Print out the usage message
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+usage_msg()
+{
+$CLEAR
+$ECHO "
+Usage: `$BASENAME $0` [ -b <eniq_base_dir> ] [ -l <path_to_logfile> ]
+
+options:
+
+-b  : Optional parameter specifying the full path to where the ENIQ
+      BASEDIR directory is (eg. /eniq). If not specified, then the
+      script will assume the the base directory is /eniq
+
+-l  : Optional parameter specifying the full path to logfile. If not specified, a 
+      logfile will be created in <ENIQ BASEDIR>/local_logs/upgrade
+"
+}
+# ********************************************************************
+#
+#   Main body of program
+#
+# ********************************************************************
+#
+RUN_TIME=`$DATE '+%Y-%b-%d_%H.%M.%S'`
+
+# Determine absolute path to software
+get_absolute_path
+
+# Check that the effective id of the user is root
+check_id $DEFAULT_USER
+
+while getopts ":b:l:t:" arg; do
+  case $arg in
+    b) ENIQ_BASE_DIR="$OPTARG"
+       ;;
+    l) LOGFILE="$OPTARG"
+       ;;
+    t) TUNNEL_FILES_DIR="$OPTARG"
+       ;;       
+   \?) usage_msg
+       exit 1
+       ;;
+  esac
+done
+shift `expr $OPTIND - 1`
+
+
+# Setup up path environment etc
+setup_env
+
+if [ ! "${LOGFILE}" ]; then
+	LOGFILE=${ENIQ_BASE_DIR}/local_logs/upgrade/core_sw_upgrade_${RUN_TIME}.log
+fi	
+  
+# Check/Create Logfile
+chk_create_logfile
+
+# Check all required files/scripts exist on the server
+check_files_and_scripts
+
+# Create a temporary Directory
+TEM_DIR=/tmp/migrate_tunnel.$$.$$
+$RM -rf ${TEM_DIR}
+$MKDIR -p ${TEM_DIR}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not create directory ${TEM_DIR}"
+    abort_script "$_err_msg_"
+fi
+$CHMOD 777 ${TEM_DIR}
+
+$LS ${TUNNEL_FILES_DIR} | $GEGREP ${OSS_REF_STR} >> /dev/null 2>&1
+if [ $? -eq 0 ]; then
+	# Move the tunnel files
+	migrate_data_files
+	
+	# Remove the old files
+	cd $SCRIPTHOME
+	$RM -rf ${TUNNEL_FILES_DIR}
+fi
+
+
+
+$RM -rf ${TEM_DIR} 
+
+exit 0

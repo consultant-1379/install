@@ -1,0 +1,21 @@
+-gm 200
+-gn 300
+
+-ti 4400
+-tl 300
+
+-sb 0
+
+-gd dba
+-gk dba
+
+-s none
+
+-cl 5000m
+-ch 10000m
+
+# Uncomment the lines below if you need to enable for debugging
+#-zr all
+#-zs 5G
+#-zo @@path_to_log@@/iqtrace@@dwh_instance@@.log
+

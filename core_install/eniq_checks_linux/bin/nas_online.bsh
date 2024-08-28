@@ -1,0 +1,251 @@
+#!/usr/bin/bash
+#********************************************************************
+# Ericsson Radio Systems AB SCRIPT
+#********************************************************************
+#
+# (c) Ericsson Radio Systems AB 2019 - All rights reserved.
+#
+# The copyright to the computer program(s) herein is the property
+# of Ericsson Radio Systems AB, Sweden. The programs may be used
+# and/or copied only with the written permission from Ericsson Radio
+# Systems AB or in accordance with the terms and conditions stipulated
+# in the agreement/contract under which the program(s) have been
+# supplied.
+#
+#********************************************************************
+# Name     : nas_online.bsh
+# Date     : 25/01/2019
+# Revision : /main/6
+# Purpose  : Objective of the script is to enable users to check if
+#            NAS is up and running
+#
+# Usage    : nas_online.bsh
+# Exit Values:
+#    0   : Success
+#    3   : No Run: Abort Script
+#    16  : No Run: Not Applicable
+#    116 : Fail  : NAS down
+#********************************************************************
+#
+#       Command Section
+#
+#********************************************************************
+AWK=/usr/bin/awk
+CAT=/usr/bin/cat
+DATE=/usr/bin/date
+ECHO="/usr/bin/echo -e"
+GETENT=/usr/bin/getent
+GREP=/usr/bin/grep
+HEAD=/usr/bin/head
+ID=/usr/bin/id
+MKDIR=/usr/bin/mkdir
+RM=/usr/bin/rm
+SYSTEMCTL=/usr/bin/systemctl
+TEE=/usr/bin/tee
+TOUCH=/usr/bin/touch
+
+# ********************************************************************
+#
+#       Configuration Section
+#
+# ********************************************************************
+
+# Default user
+DEFAULT_USER=root
+
+#Present Working Directory
+CURR_DIR=`pwd`
+
+# NAS services
+NASD="NASd"
+NAS_ONLINE="NAS-online"
+
+# Default return code
+RET_CODE=0
+
+# ********************************************************************
+#
+#   Functions
+#
+# ********************************************************************
+
+### Function: abort_script ###
+#
+#   This will be called if the script is aborted through an error
+#   error is encountered during runtime
+#
+# Arguments:
+#       $1 - Error message from part of program (Not always used)
+# Return Values:
+#       none
+abort_script()
+{
+_err_time_=`$DATE '+%Y-%b-%d_%H.%M.%S'`
+
+if [ "$1" ]; then
+    _err_msg_="${_err_time_} - $1"
+else
+    _err_msg_="${_err_time_} - ERROR : Script aborted.......\n"
+fi
+
+if [ "${LOGFILE}" ]; then
+    $ECHO "\nERROR : ${_err_msg_}\n" | $TEE -a ${LOGFILE}
+else
+    $ECHO "\nERROR : ${_err_msg_}\n"
+fi
+
+$RM -rf ${TEM_DIR}
+exit 3
+}
+
+
+### Function: check_id ###
+#
+#   Check that the effective id of the user is correct
+#   If not print error msg and exit.
+#
+# Arguments:
+#       $1 : User ID name
+# Return Values:
+#       none
+check_id()
+{
+_check_id_=`$ID | $AWK -F\( '{print $2}' | $AWK -F\) '{print $1}'`
+if [ "$_check_id_" != "$1" ]; then
+    _err_msg_="You must be $1 to execute this script."
+    abort_script "${_err_msg_}"
+fi
+}
+
+
+### Function: nas_online_check ###
+#
+# Checks NAS online service.
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+nas_online_check()
+{
+# Get NAS-online service status
+_nas_status_=`$SYSTEMCTL show -p ActiveState ${NAS_ONLINE} | $AWK -F\= '{print $2}'`
+if [ $? -ne 0 ]; then
+    _err_msg_="Unable to obtain status of ${NAS_ONLINE} service."
+    abort_script "${_err_msg_}"
+fi
+
+log_msg -t -s "${NAS_ONLINE} service state: ${_nas_status_}" -l $LOGFILE
+if [ "${_nas_status_}" == "active" ]; then
+    log_msg -s "\nSUCCESS : NAS services are up and running.\n" -l $LOGFILE
+    RET_CODE=0
+else
+    _nasd_status_=`$SYSTEMCTL show -p ActiveState ${NASD} | $AWK -F\= '{print $2}'`
+    log_msg -t -s "${NASD} service state: ${_nasd_status_}\n" -l $LOGFILE
+    log_msg -s "ERROR : All NAS Services are not up and running.\n" -l $LOGFILE
+    RET_CODE=116
+fi
+}
+
+### Function: setup_env ###
+#
+# Set up environment variables for script.
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+setup_env()
+{
+# ENIQ Base Directory
+ENIQ_BASE_DIR=/eniq
+
+# ENIQ Admin Directory
+ENIQ_ADMIN_DIR=${ENIQ_BASE_DIR}/admin
+
+# ENIQ Installation Directory
+ENIQ_INST_DIR=${ENIQ_BASE_DIR}/installation
+
+# ENIQ Core Installation SW Directory
+ENIQ_CORE_INST_DIR=${ENIQ_INST_DIR}/core_install
+
+# ENIQ Log Directory
+ENIQ_LOG_DIR=${ENIQ_BASE_DIR}/local_logs
+PRECHECK_LOG_DIR=${ENIQ_LOG_DIR}/nas_online
+
+# ENIQ Config Directory
+ENIQ_CONF_DIR=${ENIQ_INST_DIR}/config
+
+# Source the common function
+if [ -s ${ENIQ_CORE_INST_DIR}/lib/common_functions.lib ]; then
+    . ${ENIQ_CORE_INST_DIR}/lib/common_functions.lib
+else
+    _err_msg_="File ${ENIQ_CORE_INST_DIR}/${LIB_DIR}/common_functions.lib not found"
+    abort_script "${_err_msg_}"
+fi
+
+# Read the installation type
+INST_TYPE_FILE=${ENIQ_CONF_DIR}/ericsson_use_config
+if [ ! -s "${INST_TYPE_FILE}" ]; then
+    _err_msg_="ENIQ install type not defined in ${INST_TYPE_FILE}"
+    abort_script "${_err_msg_}"
+fi
+
+INST_TYPE=`$CAT ${INST_TYPE_FILE} | $AWK -F\= '{print $2}'`
+
+# Storage type
+STORAGE_TYPE=`iniget STOR_TYPE -f ${ENIQ_CONF_DIR}/SunOS.ini -v STORAGE_TYPE`
+if [ ! "${STORAGE_TYPE}" ]; then
+    _err_msg_="Could not obtain storage type from ${ENIQ_CONF_DIR}/SunOS.ini"
+    abort_script "${_err_msg_}"
+fi
+}
+
+
+# ********************************************************************
+#
+#   Main body of program
+#
+# ********************************************************************
+
+# Ctrl+C Handling
+trap "abort_script" INT
+
+# Check that the effective id of the user is root
+check_id $DEFAULT_USER
+
+# Set up environment variables for script.
+setup_env
+
+# Log file creation
+LOGFILE="${PRECHECK_LOG_DIR}/nas_status.log"
+if [ ! -d ${PRECHECK_LOG_DIR} ]; then
+   $MKDIR -p ${PRECHECK_LOG_DIR}
+fi
+
+if [ ! -f $LOGFILE ]; then
+   $TOUCH $LOGFILE
+fi
+
+# Create a temporary Directory
+TEM_DIR=/tmp/nas_online.$$.$$
+$RM -rf ${TEM_DIR}
+$MKDIR -p ${TEM_DIR}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not create directory $TEM_DIR"
+    abort_script "${_err_msg_}"
+fi
+
+# Check Storage type
+if [ "${STORAGE_TYPE}" == "fs" ]; then
+    log_msg -s "This check is not applicable for RACK servers." -l $LOGFILE
+    RET_CODE=16
+else
+    # Check Status of NAS services
+    log_msg -t -s "Checking status of NAS services\n" -l $LOGFILE
+    nas_online_check
+    log_msg -t -s "Completed NAS services check." -l $LOGFILE
+fi
+
+$RM -rf ${TEM_DIR}
+exit ${RET_CODE}

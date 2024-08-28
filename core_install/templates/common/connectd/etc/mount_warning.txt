@@ -1,0 +1,4 @@
+
+Please ensure the above filesystems are shared by the
+master server before continuing. 
+Use the '/usr/sbin/dfshares' command on the master server to check.

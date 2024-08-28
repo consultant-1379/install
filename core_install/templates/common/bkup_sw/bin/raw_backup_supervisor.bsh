@@ -1,0 +1,451 @@
+#!/bin/bash
+# ********************************************************************
+# Ericsson Radio Systems AB                                     SCRIPT
+# ********************************************************************
+#
+#
+# (c) Ericsson Radio Systems AB 2019 - All rights reserved.
+#
+# The copyright to the computer program(s) herein is the property
+# of Ericsson Radio Systems AB, Sweden. The programs may be used
+# and/or copied only with the written permission from Ericsson Radio
+# Systems AB or in accordance with the terms and conditions stipulated
+# in the agreement/contract under which the program(s) have been
+# supplied.
+#
+# ********************************************************************
+# Name    : raw_backup_supervisor.bsh
+# Date    : 17/12/2021
+# Revision: main/07
+# Purpose : This script will run after a successful/failed ENIQ raw Backup.
+#           It will delete the SAN snapshots with the label "omss"
+#
+# Usage   : raw_backup_supervisor.bsh
+#
+# ********************************************************************
+#
+#       Command Section
+#
+# ********************************************************************
+AWK=/usr/bin/awk
+BASH=/usr/bin/bash
+CAT=/usr/bin/cat
+DATE=/usr/bin/date
+DIRNAME=/usr/bin/dirname
+ECHO='/usr/bin/echo -e'
+EGREP=/usr/bin/egrep
+EXPR=/usr/bin/expr
+GREP=/usr/bin/grep
+MKDIR=/usr/bin/mkdir
+PS=/usr/bin/ps
+PWD=/usr/bin/pwd
+RM=/usr/bin/rm
+TOUCH=/usr/bin/touch
+
+# ********************************************************************
+#
+#       Configuration Section
+#
+# ********************************************************************
+
+# Flag to determine whether to compress log or not (Must be y/n)
+COMPRESS_LOG=n
+
+# Directory on the root filesystem
+ENIQ_ROOT_DIR=/eniq
+
+# Number of log files to keep
+NUM_LOGS=10
+
+# Size in kbytes that the log file is allowed to grow to
+SIZE_LOGS=50000
+
+# ********************************************************************
+#
+#   Functions
+#
+# ********************************************************************
+### Function: abort_script ###
+#
+#   This will is called if the script is aborted through an error
+#   error signal sent by the kernel such as CTRL-C or if a serious
+#   error is encountered during runtime
+#
+# Arguments:
+#       $1 - Error message from part of program (Not always used)
+# Return Values:
+#       none
+abort_script()
+{
+if [ "$1" ]; then
+    _err_msg_=$1
+else
+    _err_msg_="Script aborted.......\n"
+fi
+
+# Check if log_msg() is defined, else define log()
+type log_msg > /dev/null 2>&1
+if [ $? -gt 0 ]; then
+    if [ "${LOGFILE}" ]; then
+        if [ ! "${CLEAN_QUIET}" ]; then
+            $ECHO "\n${_err_msg_}\n" >> ${LOGFILE}
+        else
+            $ECHO "\n${_err_msg_}\n" >> ${LOGFILE}
+        fi
+    else
+        $ECHO "\n${_err_msg_}\n"
+    fi
+else
+    if [ "${LOGFILE}" ]; then
+        log_msg -s "\n${_err_msg_}\n" -l ${LOGFILE} ${CLEAN_QUIET}
+    else
+        log_msg -s "\n${_err_msg_}\n" ${CLEAN_QUIET}
+    fi
+fi
+
+cd ${SCRIPTHOME}
+
+$RM -rf  ${TEM_DIR}
+
+exit 1
+}
+
+### Function: chk_create_logfile ###
+#
+# Check/Create Logfile
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+chk_create_logfile()
+{
+$MKDIR -p `$DIRNAME ${LOGFILE}`
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not create directory `$DIRNAME ${LOGFILE}`"
+    abort_script "${_err_msg_}"
+fi
+
+$TOUCH -a ${LOGFILE}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not write to file ${LOGFILE}"
+    abort_script "${_err_msg_}"
+fi
+
+_log_id_str_="-l ${LOGFILE}"
+}
+
+### Function: check_files_and_scripts ### 
+#
+# Check required files and scripts exist
+#
+# Arguments:
+#    none
+# Return Values:
+#    none
+check_files_and_scripts()
+{
+if [ ! -s ${SCRIPTHOME}/manage_nas_snapshots.bsh ]; then
+    _err_msg_="File ${SCRIPTHOME}/manage_nas_snapshots.bsh not found"
+    abort_script "${_err_msg_}"
+fi
+
+if [ ! -s ${SCRIPTHOME}/manage_san_snapshots.bsh ]; then
+    _err_msg_="File ${SCRIPTHOME}/manage_san_snapshots.bsh not found"
+    abort_script "${_err_msg_}"
+fi
+}
+
+### Function: check_multiple_instances ###
+#
+# Multiple instances of the same script should not run
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+check_multiple_instances()
+{
+if [ -s "${VAR_TMP_DIR}/raw_backup_supervisor_pid" ]; then 
+    PREV_PID=`$CAT "${VAR_TMP_DIR}/raw_backup_supervisor_pid"`
+    if [ ! -z "${PREV_PID}" ]; then
+        $PS -eaf | $GREP -w "raw_backup_supervisor.bsh" | $GREP -v $GREP | $GREP -w "${PREV_PID}" >> /dev/null 2>&1
+        if [ $? -eq 0 ]; then
+            $ECHO "Exiting... Another instance of raw_backup_supervisor is already in progress."
+            exit 0
+        fi
+    fi
+fi
+
+CURRENT_PID=`$ECHO $$`
+$RM -rf "${VAR_TMP_DIR}/raw_backup_supervisor_pid"
+$ECHO "${CURRENT_PID}" >> "${VAR_TMP_DIR}/raw_backup_supervisor_pid"
+}
+
+### Function: delete_san_snapshots###
+#
+# Delete SAN snapshots
+#
+# Arguments:
+#    $1 SAN snap label
+# Return Values:
+#    none
+delete_san_snapshots()
+{
+
+get_snapshot_name
+
+log_msg -s "\nChecking for SAN snapshots with label \"${_san_snap_id_}\"\n" ${_log_id_str_} ${CLEAN_QUIET}
+$BASH ${SCRIPTHOME}/manage_san_snapshots.bsh -a list -f ALL -N ${CLEAN_QUIET} | $GREP -w ${_san_snap_id_} >> /dev/null 2>&1
+if [ $? -eq 0 ]; then
+    log_msg -s "\nDeleting SAN snapshots with label \"${_san_snap_id_}\"\n" ${_log_id_str_} ${CLEAN_QUIET}
+    $BASH ${SCRIPTHOME}/manage_san_snapshots.bsh -a delete -f ALL -n ${_san_snap_id_} -N ${CLEAN_QUIET} ${_log_id_str_} ${CLEAN_QUIET}
+    if [ $? -ne 0 ]; then
+        _err_msg_="Failed to delete SAN snapshots with label \"${_san_snap_id_}\""
+        abort_script "${_err_msg_}"
+    else
+        log_msg -s "`$DATE +%d.%m.%y_%H:%M:%S` - Successfully Deleted SAN snapshots with label \"${_san_snap_id_}\" \n" ${_log_id_str_} ${CLEAN_QUIET}
+				
+        #log_msg -s "`$DATE +%d.%m.%y_%H:%M:%S` - Deleting the ${OMBS_SHARED_DIR}/backup_stat file  ...\n" ${_log_id_str_} ${CLEAN_QUIET}
+        $RM -rf ${OMBS_SHARED_DIR}/backup_stat
+        if [ $? -ne 0 ]; then
+            _err_msg_="Failed to delete ${OMBS_SHARED_DIR}/backup_stat"
+            abort_script "${_err_msg_}"
+        fi
+    fi
+else
+    _run_time_=`$DATE '+%Y-%m-%d_%H.%M.%S'`
+    log_msg -s "\n${_run_time_} - No SAN snapshots with label \"${_san_snap_id_}\" found to delete\n" ${_log_id_str_} ${CLEAN_QUIET}
+fi
+}
+
+### Function: delete_snapshots ###
+#
+# Delete SAN snapshots according to the status of the RAW backup
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+delete_snapshots()
+{
+
+if [ -s "${OMBS_SHARED_DIR}/backup_stat" ]; then
+    # Check the status of the "${OMBS_SHARED_DIR}/backup_stat" file 
+    _backup_status_=`$CAT "${OMBS_SHARED_DIR}/backup_stat" | $AWK '{print $NF}'`
+    # Check if the modified time of the file is more than ${MODIFIED_TIME} mins
+    if [ "${_backup_status_}" == "inprogress" ]; then
+        _find_mtime_=`$FIND ${OMBS_SHARED_DIR}/backup_stat -mmin +${MODIFIED_TIME} | $WC -l`
+        if [ ${_find_mtime_} -eq 1 ]; then 
+            log_msg -s "`$DATE +%d.%m.%y_%H:%M:%S` - ${OMBS_SHARED_DIR}/backup_stat file has not been modified in the last half an hour...\n" ${_log_id_str_} ${CLEAN_QUIET}
+            delete_san_snapshots
+        else
+            log_msg -s "`$DATE +%d.%m.%y_%H:%M:%S` - RAW backup is still in Progress..\n" ${_log_id_str_} ${CLEAN_QUIET}
+        fi
+    elif [ "${_backup_status_}" == "success" ]; then
+        log_msg -s "`$DATE +%d.%m.%y_%H:%M:%S` - RAW backup has been successfully completed...\n" ${_log_id_str_} ${CLEAN_QUIET}
+        delete_san_snapshots
+    elif [ "${_backup_status_}" == "failed" ]; then
+        log_msg -s "`$DATE +%d.%m.%y_%H:%M:%S` - RAW backup has failed...\n" ${_log_id_str_} ${CLEAN_QUIET}
+        delete_san_snapshots
+    fi
+fi
+
+}
+
+### Function: get_absolute_path ###
+#
+# Determine absolute path to software
+#
+# Arguments:
+#    none
+# Return Values:
+#    none
+get_absolute_path()
+{
+_dir_=`$DIRNAME $0`
+SCRIPTHOME=`cd ${_dir_} 2>/dev/null && pwd || $ECHO ${_dir_}`
+}
+
+### Function: get_snapshot_name ###
+#
+# Gets the snapshot label which is associated with OMBS 
+#
+# Arguments:
+#    none
+# Return Values:
+#    none
+get_snapshot_name()
+{
+_san_snap_id_=`$CAT ${BKUP_CONF_FILE} | $EGREP '^[[:blank:]]*BKUP_SNAP_ID_STR_SAN=' | $AWK -F"=" '{print $2}'`
+if [ ! "${_san_snap_id_}" ]; then
+    _err_msg_="Could not read BKUP_SNAP_ID_STR_SAN parameter from ${BKUP_CONF_FILE}"
+    abort_script "${_err_msg_}" 
+fi
+
+_nas_snap_id_=`$CAT ${BKUP_CONF_FILE} | $EGREP '^[[:blank:]]*BKUP_SNAP_ID_STR=' | $AWK -F"=" '{print $2}'`
+if [ ! "${_nas_snap_id_}" ]; then
+    _err_msg_="Could not read BKUP_SNAP_ID_STR parameter from ${BKUP_CONF_FILE}"
+    abort_script "${_err_msg_}" 
+fi
+
+}
+
+### Function: setup_env ###
+#
+# Setup up path environment etc
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+setup_env()
+{
+ENIQ_BASE_DIR=${ENIQ_ROOT_DIR}
+
+ENIQ_BKUPSW_DIR=${ENIQ_BASE_DIR}/bkup_sw
+
+OMBS_SHARED_DIR=${ENIQ_BKUPSW_DIR}/ombs_cfg 
+
+CLEAN_QUIET="-q"
+
+MODIFIED_TIME=20
+
+# Source the common functions
+if [ -s ${ENIQ_ROOT_DIR}/installation/core_install/lib/common_functions.lib ]; then
+    . ${ENIQ_ROOT_DIR}/installation/core_install/lib/common_functions.lib
+else
+    _err_msg_="File ${ENIQ_ROOT_DIR}/installation/core_install/lib/common_functions.lib not found"
+    abort_script "${_err_msg_}"
+fi
+
+# Set temporary upgrade directory
+VAR_TMP_DIR=/var/tmp
+
+BKUP_CONF_FILE="${ENIQ_BKUPSW_DIR}/etc/eniq_backup.conf"
+if [ ! -s ${BKUP_CONF_FILE} ]; then
+    _err_msg_="Could not locate file ${BKUP_CONF_FILE}"
+    abort_script "${_err_msg_}"
+fi
+
+}
+
+
+
+# ********************************************************************
+#
+#   Main body of program
+#
+# ********************************************************************
+#
+RUN_TIME=`$DATE '+%Y-%b-%d_%H.%M.%S'`
+
+# Determine absolute path to software
+get_absolute_path
+
+while getopts ":l:" arg; do
+  case $arg in
+    l) LOGFILE="$OPTARG"
+       ;;
+    \?) usage_msg
+       exit 1
+       ;;
+  esac
+done
+shift `$EXPR $OPTIND - 1`
+
+# Multiple instances of the same script should not run in parallel.
+check_multiple_instances
+
+# Setup up path environment etc
+setup_env
+
+# Check the files and scripts exist
+check_files_and_scripts
+
+if [ ! "${LOGFILE}" ]; then
+    LOGFILE="${ENIQ_ROOT_DIR}/local_logs/backup_logs/raw_backup_supervisor.log"
+fi
+
+# Check/Create Logfile
+chk_create_logfile
+
+log_msg -s "\n-------------------------------------------------------" ${_log_id_str_} ${CLEAN_QUIET}
+log_msg -s "${RUN_TIME} - Starting to run the cron to monitor RAW snapshots for OMBS backup" ${_log_id_str_} ${CLEAN_QUIET}
+log_msg -s "-------------------------------------------------------" ${_log_id_str_} ${CLEAN_QUIET}
+
+# Create a temporary Directory
+TEM_DIR=/tmp/raw_backup_supervisor.$$.$$
+$RM -rf ${TEM_DIR}
+$MKDIR -p ${TEM_DIR}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not create directory ${TEM_DIR}"
+    abort_script "${_err_msg_}"
+fi
+
+# Check if the shared directory between ENIQ and OMBS is present or not
+if [ -d "${OMBS_SHARED_DIR}" ]; then
+    # Check if backup_stat file containing OMBS Backup status is being created by OMBS or not
+    if [ -s "${OMBS_SHARED_DIR}/backup_stat" ]; then 
+        if [ -f ${VAR_TMP_DIR}/nas_snapshot_not_present ]; then
+		    log_msg -s "`$DATE` - ${OMBS_SHARED_DIR}/backup_stat file found so deleting the flag "${VAR_TMP_DIR}/nas_snapshot_not_present"  \n" ${_log_id_str_} ${CLEAN_QUIET}
+            $RM -rf ${VAR_TMP_DIR}/nas_snapshot_not_present 
+            if [ $? -ne 0 ]; then
+                _err_msg_="`$DATE` - Failed to remove ${VAR_TMP_DIR}/nas_snapshot_not_present flag file \n" 
+                abort_script "${_err_msg_}"
+            fi
+        fi
+        delete_snapshots
+    else
+        log_msg -s "`$DATE` - RAW Backup is not running. \n" ${_log_id_str_} ${CLEAN_QUIET}
+        if [ -f ${VAR_TMP_DIR}/nas_snapshot_not_present ]; then
+            log_msg -s "`$DATE` - ${VAR_TMP_DIR}/nas_snapshot_not_present flag found on the server  \n" ${_log_id_str_} ${CLEAN_QUIET}		
+			get_snapshot_name
+            # Checking the presence of NAS snapshot
+            $BASH ${SCRIPTHOME}/manage_nas_snapshots.bsh -a list -f ALL -n "${_nas_snap_id_}" >> /dev/null 2>&1
+            if [ $? -eq 0 ]; then
+                log_msg -s "`$DATE` - Data Policy Backup is still running  \n" ${_log_id_str_} ${CLEAN_QUIET}
+                $RM -rf ${VAR_TMP_DIR}/nas_snapshot_not_present
+            else
+                log_msg -s "`$DATE` - NAS Snapshot Still not Present, Deleting the SAN snapshots \n" ${_log_id_str_} ${CLEAN_QUIET}	 
+                delete_san_snapshots
+                if [ -f ${VAR_TMP_DIR}/nas_snapshot_not_present ]; then
+			        log_msg -s "`$DATE` -Deleting ${VAR_TMP_DIR}/nas_snapshot_not_present flag file \n" ${_log_id_str_} ${CLEAN_QUIET}
+                    $RM -rf ${VAR_TMP_DIR}/nas_snapshot_not_present 
+                    if [ $? -ne 0 ]; then
+                        _err_msg_="`$DATE` - Failed to remove ${VAR_TMP_DIR}/nas_snapshot_not_present flag file \n" 
+                        abort_script "${_err_msg_}"
+                    fi
+                fi
+			fi
+        else
+            log_msg -s "`$DATE` - Checking whether NAS Snapshot is present or not \n" ${_log_id_str_} ${CLEAN_QUIET}
+            get_snapshot_name
+            # Checking the presence of NAS snapshot
+            $BASH ${SCRIPTHOME}/manage_nas_snapshots.bsh -a list -f ALL -n "${_nas_snap_id_}" >> /dev/null 2>&1
+            if [ $? -eq 0 ]; then
+                log_msg -s "`$DATE` - Data Policy Backup is still running  \n" ${_log_id_str_} ${CLEAN_QUIET}
+            else
+                log_msg -s "`$DATE` - NAS Snapshot not Present, will wait for the next run to delete the SAN snapshots \n" ${_log_id_str_} ${CLEAN_QUIET}
+                log_msg -s "`$DATE` - Creating a NAS_Snapshot file  \n" ${_log_id_str_} ${CLEAN_QUIET}
+                # Creating nas_snapshot_not_present flag file to delete SAN Snapshot in the second run of the script 
+                $TOUCH ${VAR_TMP_DIR}/nas_snapshot_not_present
+                if [ $? -eq 0 ]; then
+                    log_msg -s "`$DATE` - Successfully created ${VAR_TMP_DIR}/nas_snapshot_not_present flag file \n" ${_log_id_str_} ${CLEAN_QUIET}
+                else
+                    _err_msg_="`$DATE` - Failed to create ${VAR_TMP_DIR}/nas_snapshot_not_present flag file \n" 
+                    abort_script "${_err_msg_}"
+                fi
+            fi
+        fi
+    fi
+else
+    log_msg -s "`$DATE` - OMBS is not configured with this server \n" ${_log_id_str_} ${CLEAN_QUIET}
+fi
+
+# Rotate and compress the logs if necessary
+rotate_compress_logs ${LOGFILE} ${NUM_LOGS} ${SIZE_LOGS} ${COMPRESS_LOG}
+
+# Removing the Temporary Directory
+$RM -rf ${TEM_DIR}
+exit 0

@@ -1,0 +1,622 @@
+#!/bin/bash
+# ********************************************************************
+# Ericsson Radio Systems AB                                     SCRIPT
+# ********************************************************************
+#
+#
+# (c) Ericsson Radio Systems AB 2019 - All rights reserved.
+#
+# The copyright to the computer program(s) herein is the property
+# of Ericsson Radio Systems AB, Sweden. The programs may be used 
+# and/or copied only with the written permission from Ericsson Radio 
+# Systems AB or in accordance with the terms and conditions stipulated 
+# in the agreement/contract under which the program(s) have been 
+# supplied.
+#
+# ********************************************************************
+# Name    : update_sym_links_ini.bsh
+# Date    : 25/07/2019
+# Revision: main\15
+# Purpose : This script will check the sym link ini a successful upgrade
+#           to verify the entries in the ini file 
+#
+# Usage   : update_sym_link_ini.bsh [ -l <path_to_logfile> ] [ -N ] -q
+#
+# ********************************************************************
+#
+#     Command Section
+#
+# ********************************************************************
+AWK=/usr/bin/awk
+BASENAME=/usr/bin/basename
+CAT=/usr/bin/cat
+CHMOD=/usr/bin/chmod
+CHOWN=/usr/bin/chown
+CLEAR=/usr/bin/clear
+CMP=/usr/bin/cmp
+CP=/usr/bin/cp
+DATE=/usr/bin/date
+DIRNAME=/usr/bin/dirname
+ECHO='/usr/bin/echo -e'
+EGREP=/usr/bin/egrep
+EXPR=/usr/bin/expr
+FIND=/usr/bin/find
+GREP=/usr/bin/grep
+HEAD=/usr/bin/head
+ID=/usr/bin/id
+INIT=/usr/sbin/init
+LS=/usr/bin/ls
+MKDIR=/usr/bin/mkdir
+MOUNT=/usr/sbin/mount
+MULTIPATH=/usr/sbin/multipath
+MV=/usr/bin/mv
+PWD=/usr/bin/pwd
+RM=/usr/bin/rm
+SED=/usr/bin/sed
+SLEEP=/usr/bin/sleep
+SORT=/usr/bin/sort
+SU=/usr/bin/su
+TAIL=/usr/bin/tail
+TEE=/usr/bin/tee
+TOUCH=/usr/bin/touch
+WC=/usr/bin/wc
+XARGS=/usr/bin/xargs
+
+
+# ********************************************************************
+#
+#       Configuration Section
+#
+# ********************************************************************
+# Flag to determine whether to compress log or not (Must be y/n)
+COMPRESS_LOG=n
+
+# Name of SunOS & ENIQ ini Files
+ENIQ_ENV=niq.rc
+ENIQ_INI=niq.ini
+SUNOS_INI=SunOS.ini
+STORAGE_INI=storage.ini
+SYM_INI=sym_links.ini
+COORD_INI=coordinator_sym_links.ini
+LUN_MAP_INI=lun_map.ini
+
+# Number of log files to keep
+NUM_LOGS=10
+
+# Size in kbytes that the log file is allowed to grow to
+SIZE_LOGS=204800
+
+
+# ********************************************************************
+#
+#       Pre-execution Operations
+#
+# ********************************************************************
+unset SNAP_QUIET
+
+# ********************************************************************
+#
+#     functions
+#
+# ********************************************************************
+### Function: abort_script ###
+#
+#   This will is called if the script is aborted thru an error
+#   error signal sent by the kernel such as CTRL-C or if a serious
+#   error is encountered during runtime
+#
+# Arguments:
+#       $1 - Error message from part of program (Not always used)
+# Return Values:
+#       none
+abort_script()
+{
+if [ "$1" ]; then
+    _err_msg_=$1
+else
+    _err_msg_="Script aborted.......\n"    
+fi
+
+# Check if log_msg() is defined, else define log()
+type log_msg > /dev/null 2>&1
+if [ $? -gt 0 ]; then
+    if [ "${LOGFILE}" ]; then
+    if [ ! "${SNAP_QUIET}" ]; then
+        $ECHO "\n${_err_msg_}\n" |$TEE -a ${LOGFILE}
+    else
+        $ECHO "\n${_err_msg_}\n" >> ${LOGFILE}
+        fi
+    else
+    $ECHO "\n${_err_msg_}\n"
+    fi
+else
+    if [ "${LOGFILE}" ]; then
+    log_msg -s "\n${_err_msg_}\n" -l ${LOGFILE} ${SNAP_QUIET}
+    else
+    log_msg -s "\n${_err_msg_}\n" ${SNAP_QUIET}
+    fi
+fi
+
+cd $SCRIPTHOME
+
+$RM -rf  ${TEM_DIR}
+
+if [ "$2" ]; then
+    exit ${2}
+else
+   exit 1
+fi
+}
+
+### Function: check_id ###
+#
+#   Check that the effective id of the user is correct
+#   If not print error msg and exit.
+#
+# Arguments:
+#       $1 : User ID name
+# Return Values:
+#       none
+check_id()
+{
+_check_id_=`$ID  | $AWK -F\( '{print $2}' | $AWK -F\) '{print $1}'`
+if [ "$_check_id_" != "$1" ]; then
+    _err_msg_="You must be $1 to execute this script."
+    abort_script "$_err_msg_"
+fi
+}
+
+### Function: chk_create_logfile ###
+#
+# Check/Create Logfile
+#
+# Arguments:
+#    none
+# Return Values:
+#    none
+chk_create_logfile()
+{
+$MKDIR -p `$DIRNAME ${LOGFILE}`
+if [ $? -ne 0 ]; then
+    unset LOGFILE
+    _err_msg_="Could not create directory `$DIRNAME ${LOGFILE}`"
+     abort_script "$_err_msg_"
+fi    
+
+$TOUCH -a ${LOGFILE}
+if [ $? -ne 0 ]; then
+    unset LOGFILE
+    _err_msg_="Could not write to file ${LOGFILE}"
+    abort_script "$_err_msg_"
+fi    
+
+}
+
+### Function: get_absolute_path ###
+#
+# Determine absolute path to software
+#
+# Arguments:
+#    none
+# Return Values:
+#    none
+get_absolute_path()
+{
+_dir_=`$DIRNAME $0`
+SCRIPTHOME=`cd $_dir_ 2>/dev/null && pwd || $ECHO $_dir_`
+}
+
+### Function: setup_env ###
+#
+# Setup up path environment etc
+#
+# Arguments:
+#    none
+# Return Values:
+#    none
+setup_env()
+{
+ENIQ_BASE_DIR=/eniq
+
+ADMIN_BIN=${ENIQ_BASE_DIR}/admin/bin
+
+ADMIN_SQL=${ENIQ_BASE_DIR}/admin/sql
+
+CLI_CONF_DIR=${ENIQ_BASE_DIR}/sw/conf
+
+ENIQ_CONF_DIR=${ENIQ_BASE_DIR}/installation/config
+
+# ENIQ Log Directory
+ENIQ_LOG_DIR=${ENIQ_BASE_DIR}/local_logs
+
+# Source the common functions
+if [ -s ${ENIQ_BASE_DIR}/admin/lib/common_functions.lib ]; then
+    . ${ENIQ_BASE_DIR}/admin/lib/common_functions.lib
+else
+    _err_msg_="File ${ENIQ_BASE_DIR}/admin/lib/common_functions.lib not found"
+    abort_script "$_err_msg_"
+fi
+
+# Read location of storage API command
+BLKCLI=`iniget STOR_API -f ${ENIQ_CONF_DIR}/${SUNOS_INI} -v STOR_API_CMD`
+if [ ! "${BLKCLI}" ]; then
+    _err_msg_="Could not read STOR_API_CMD param from ${ENIQ_CONF_DIR}/${SUNOS_INI}"
+    abort_script "$_err_msg_" "${EXEC_SHELL_CMD}"
+fi
+
+if [ ! -x ${BLKCLI} ]; then
+    _err_msg_="${BLKCLI} is not found or is not executable"
+    abort_script "$_err_msg_" "${EXEC_SHELL_CMD}"
+fi
+
+# Determine the current server type
+CURR_SERVER_TYPE=`$CAT $ENIQ_CONF_DIR/installed_server_type | $EGREP -v '^[     ]*#' | $SED -e 's/ //g'`
+if [ ! "${CURR_SERVER_TYPE}" ]; then
+        _err_msg_="Could not determine which server type this is"
+    abort_script "$_err_msg_"
+fi
+
+# File containing the type of OSS installation. Eg. events or statistics
+INST_TYPE_FILE=${ENIQ_CONF_DIR}/ericsson_use_config
+if [ ! -s "${INST_TYPE_FILE}" ]; then
+    _err_msg_="ENIQ install type not defined in ${INST_TYPE_FILE}"
+    abort_script "$_err_msg_"  "${EXEC_SHELL_CMD}"
+fi
+# Read the installation type - should be "events" or "stats"
+INSTALL_TYPE=`$CAT ${INST_TYPE_FILE} | $AWK -F\= '{print $2}'`
+
+_coord_=""
+if [ "${CURR_SERVER_TYPE}" == "eniq_coordinator" -o "${CURR_SERVER_TYPE}" == "son_coordinator" -o "${CURR_SERVER_TYPE}" == "stats_coordinator" -o "${CURR_SERVER_TYPE}" == "eniq_events" -o "${CURR_SERVER_TYPE}" == "eniq_iqw" -o "${CURR_SERVER_TYPE}"  == "eniq_stats" ]; then
+    _coord_="YES"
+fi
+
+}
+
+### Function: update_lun_id_info ###
+#
+# Update Sybase Sym Link Information etc
+#
+# Arguments:
+#       $1 : ini file to update
+#       $2 : block in ini file to update
+# Return Values:
+#       none
+update_lun_id_info()
+{
+if [ ! "$1" ]; then
+    _err_msg_="No file specified to update the Lun_ID for"
+    abort_script "$_err_msg_"
+fi
+
+_ini_file_=$1
+if [ ! -f ${_ini_file_} ]; then
+    _err_msg_="File ${_ini_file_} not found or does not exist"
+    abort_script "$_err_msg_"
+fi
+
+_parent_block_=$2
+if [ ! "${_parent_block_}" ]; then
+    _err_msg_="No parent block specified to update the Lun_ID's for"
+    abort_script "$_err_msg_"
+fi
+
+# Get iqheader binary
+_iqheader_=`$FIND ${ENIQ_BASE_DIR}/sybase_iq/IQ*|$EGREP "\/IQ-.*\/bin.*\/iqheader[[:blank:]]*$"|$HEAD -1`
+if [ ! -x ${_iqheader_} ]; then
+    _err_msg_="Could not locate iqheader binary"
+    abort_script "${_err_msg_}"
+fi
+
+if [ ! -s ${TEM_DIR}/lun_map_details ]; then
+    for _lun_map_det_ in `iniget LUN_MAP_DETAILS -f  ${ENIQ_CONF_DIR}/${LUN_MAP_INI}`; do
+    
+        # Get the Lun ID 
+    _disk_lun_id_=`iniget ${_lun_map_det_} -f  ${ENIQ_CONF_DIR}/${LUN_MAP_INI} -v LUN_ID`
+    if [ ! "${_disk_lun_id_}" ]; then
+        _err_msg_="Could not read ${_lun_map_det_}:LUN_ID param from  ${ENIQ_CONF_DIR}/${LUN_MAP_INI}"
+        abort_script "$_err_msg_" 
+    fi
+
+        # Get the disk id
+    _disk_id_=`iniget ${_lun_map_det_} -f  ${ENIQ_CONF_DIR}/${LUN_MAP_INI} -v DISK_ID`
+    if [ ! "${_disk_id_}" ]; then
+        _err_msg_="Could not read ${_lun_map_det_}:DISK_ID param from  ${ENIQ_CONF_DIR}/${LUN_MAP_INI}"
+        abort_script "$_err_msg_" 
+    fi
+
+        # Get the raw link
+        _link_=`iniget ${_lun_map_det_} -f  ${ENIQ_CONF_DIR}/${LUN_MAP_INI} -v LINK`
+
+    # Check if it is an IQ disk
+    _file_id_=`${_iqheader_} ${_link_} 2>/dev/null |$EGREP "^[[:blank:]]*File[[:blank:]]+ID:"|$AWK '{print $NF}'`
+    if [ ! "${_file_id_}" ]; then
+        continue
+    fi
+
+    $ECHO "${_file_id_} ${_disk_lun_id_} ${_link_} ${_disk_id_}" >> ${TEM_DIR}/lun_map_details
+    done
+fi
+
+
+$ECHO "\nChecking Path values in ${_ini_file_} for ${_parent_block_} devices" >> ${LOGFILE}
+
+# get sys main   
+_block_list_=`iniget ${_parent_block_} -f ${_ini_file_}`
+if [ ! "${_block_list_}" ]; then
+    _err_msg_="Could not find values for ${_parent_block_} in ${_ini_file_}"
+    abort_script "$_err_msg_"
+fi
+
+_tot_disk_id_list_=""
+_use_old_values_=""
+for _block_ in ${_block_list_}; do
+    _path_=`iniget ${_block_} -f ${_ini_file_} -v Path`
+        if [ ! "${_path_}" ]; then
+        _err_msg_="Could not read Path value for ${_block_} in ${_ini_file_}"
+        abort_script "$_err_msg_"
+        fi
+
+    _chk_tmp_file_=`$ECHO ${_path_}|$EGREP '.*\.iqtmp[[:blank:]]*$' 2>/dev/null`
+    if [ "${_chk_tmp_file_}" -a ! "${MIGRATION}" ]; then
+        _new_lun_id_=`iniget ${_block_} -f ${_ini_file_} -v Lun_ID`
+        if [ ! "${_new_lun_id_}" ]; then
+            _err_msg_="Could not read old Lun_ID value for ${_block_} in ${_ini_file_}"
+            abort_script "$_err_msg_"
+        fi
+
+        _new_link_=`iniget ${_block_} -f ${_ini_file_} -v Link`
+        if [ ! "${_new_link_}" ]; then
+            _err_msg_="Could not read old Link value for ${_block_} in ${_ini_file_}"
+            abort_script "$_err_msg_"
+        fi
+
+        _new_disk_id_=`iniget ${_block_} -f ${_ini_file_} -v Disk`
+        _new_disk_id_=`$ECHO "${_new_disk_id_::-1}"`
+        if [ ! "${_new_disk_id_}" ]; then
+            _err_msg_="Could not determine old Disk ID value for ${_block_} in ${_ini_file_}"
+            abort_script "$_err_msg_"
+        fi
+
+    else
+        if [ -s ${ENIQ_CONF_DIR}/iq_header_info ]; then
+            _chk_file_id_=`$CAT ${ENIQ_CONF_DIR}/iq_header_info|$EGREP -w "${_path_}"|$AWK '{print $2}'`
+            if [ ! "${_chk_file_id_}" ]; then
+            _err_msg_="Could not read IQ File ID for path ${_path_} from \n${ENIQ_CONF_DIR}/iq_header_info"
+            abort_script "$_err_msg_"
+            fi
+        else
+            _file_id_=`${_iqheader_} ${_path_} 2>/dev/null |$EGREP "^[[:blank:]]*File[[:blank:]]+ID:"|$AWK '{print $NF}'`
+            if [ ! "${_file_id_}" ]; then
+            _err_msg_="Could not read IQ File ID value for ${_path_}"
+            abort_script "$_err_msg_"
+            fi
+
+            _chk_file_id_=${_file_id_}
+        fi
+
+        _new_lun_id_=`$CAT ${TEM_DIR}/lun_map_details|$EGREP -w ${_chk_file_id_}|$AWK '{print $2}'`
+        if [ ! "${_new_lun_id_}" ]; then
+            _err_msg_="Could not read LUN ID using IQ Header file id value ${_chk_file_id_}"
+            abort_script "$_err_msg_"
+        fi
+
+        _new_link_=`$CAT ${TEM_DIR}/lun_map_details|$EGREP -w ${_chk_file_id_}|$AWK '{print $3}'`
+        if [ ! "${_new_link_}" ]; then
+            _err_msg_="Could not read Link Path using IQ Header file id value ${_chk_file_id_}"
+            abort_script "$_err_msg_"
+        fi
+
+        _new_disk_id_=`$CAT ${TEM_DIR}/lun_map_details|$EGREP -w ${_chk_file_id_}|$AWK '{print $4}'`
+        if [ ! "${_new_disk_id_}" ]; then
+            _err_msg_="Could not read Disk ID using IQ Header file id value ${_chk_file_id_}"
+            abort_script "$_err_msg_"
+        fi
+
+        $ECHO "Setting ${_block_} Lun_ID=${_new_lun_id_} in ${_ini_file_}" >> ${LOGFILE}
+        iniset ${_block_} -f ${_ini_file_} Lun_ID=${_new_lun_id_}
+        if [ $? -ne 0 ]; then
+            _err_msg_="Could not update ${_ini_file_} with Lun_ID=${_new_lun_id_}"
+            abort_script "$_err_msg_"
+        fi
+
+        $ECHO "Setting ${_block_} Link=${_new_link_} in ${_ini_file_}" >> ${LOGFILE}
+        iniset ${_block_} -f ${_ini_file_} Link=${_new_link_}
+        if [ $? -ne 0 ]; then
+            _err_msg_="Could not update ${_ini_file_} with Lun_ID=${_new_link_}"
+            abort_script "$_err_msg_"
+        fi
+
+        $ECHO "Setting ${_block_} Disk=${_new_disk_id_}1 in ${_ini_file_}" >> ${LOGFILE}
+        iniset ${_block_} -f ${_ini_file_} Disk="${_new_disk_id_}1"
+        if [ $? -ne 0 ]; then
+            _err_msg_="Could not update ${_ini_file_} with Disk=${_new_disk_id_}1"
+            abort_script "${_err_msg_}"
+        fi
+
+        _main_wwn_id_=`$MULTIPATH -l | $GREP -w ${_new_disk_id_} | $AWK -F "(" '{print $2}' | $AWK -F ")" '{print $1}'`
+        $ECHO "Setting ${_block_} WWN=${_main_wwn_id_} in ${_ini_file_}" >> ${LOGFILE}
+        iniset ${_block_} -f ${_ini_file_} WWN=${_main_wwn_id_}
+        if [ $? -ne 0 ]; then
+            _err_msg_="Could not update ${_ini_file_} with WWN=${_main_wwn_id_}"
+            abort_script "${_err_msg_}"
+        fi
+
+    fi
+
+    if [ "${_tot_disk_id_list_}" ]; then
+    _tot_disk_id_list_="${_tot_disk_id_list_} ${_new_disk_id_}"
+    else
+    _tot_disk_id_list_="${_new_disk_id_}"
+    fi
+
+done
+
+if [ "${_parent_block_}" == "DWH_SYSTEM_MAIN" ]; then
+    $ECHO "Setting DB_DISK_ALLOC IQ_SYS_MAIN_DISKS=${_tot_disk_id_list_} \nin ${_ini_file_}" >> ${LOGFILE}
+    iniset DB_DISK_ALLOC -f ${_ini_file_} IQ_SYS_MAIN_DISKS="${_tot_disk_id_list_}"
+elif [ "${_parent_block_}" == "DWH_DBSPACES_MAIN" ]; then
+    $ECHO "Setting DB_DISK_ALLOC MAINDB_DISKS=${_tot_disk_id_list_} \nin ${_ini_file_}" >> ${LOGFILE}
+    iniset DB_DISK_ALLOC -f ${_ini_file_} MAINDB_DISKS="${_tot_disk_id_list_}"
+else
+    $ECHO "Setting DB_DISK_ALLOC TEMPDB_DISKS=${_tot_disk_id_list_} \nin ${_ini_file_}" >> ${LOGFILE}
+    iniset DB_DISK_ALLOC -f ${_ini_file_} TEMPDB_DISKS="${_tot_disk_id_list_}"
+fi
+}
+
+### Function: user_confirm ###
+#
+# Get confirmation from user to proceed with snapshot action
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+user_confirm()
+{
+while :; do
+    unset USER_CONF
+    $CLEAR
+    $ECHO "\nAre you sure you wish to update the sym link ini file?"
+    $ECHO "Enter [Yes | No] (case sensitive) : \c"
+
+    read USER_CONF
+    if [ "$USER_CONF" == "Yes" -o "$USER_CONF" == "No" ]; then
+        break
+    fi
+done
+}
+
+# ********************************************************************
+#
+#     Main body of program
+#
+# ********************************************************************
+#
+# Save the time of running. I do this here as I want all
+# dates and time to be the same
+RUN_TIME=`$DATE '+%Y-%m-%d_%H.%M.%S'`
+
+# Determine absolute path to software
+get_absolute_path
+
+# Check that the effective id of the user is root
+check_id root
+
+while getopts ":l:MNq" arg; do
+  case $arg in
+    l) LOGFILE="$OPTARG" 
+       ;;
+    M) MIGRATION="YES"
+       ;;
+    N) NO_CONFIRM="YES"
+       ;;
+    q) SNAP_QUIET="-q"
+       ;;
+   \?) _err_msg_="`$BASENAME $0` [ -l <path_to_logfile> ] [ -N ] -q -f <file containing the list>"
+       abort_script "$_err_msg_"
+       ;;
+  esac
+done
+shift `expr $OPTIND - 1`
+
+# Setup up path environment etc
+setup_env
+
+# Default Logfile location
+DEF_LOGFILE="${ENIQ_LOG_DIR}/update_sym_ini/update_sym_link_ini.log"
+
+# Set up default logfile if required
+if [ ! "${LOGFILE}" ]; then
+    LOGFILE="${DEF_LOGFILE}"
+fi
+
+# Check/Create Logfile
+chk_create_logfile
+
+# Create a temporary Directory
+TEM_DIR=/tmp/update_sym_link_ini.$$.$$
+$RM -rf ${TEM_DIR}
+$MKDIR -p ${TEM_DIR}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not create directory ${TEM_DIR}"
+    abort_script "$_err_msg_"
+fi    
+
+if [ ! "$NO_CONFIRM" ]; then
+    user_confirm 
+    if [ $USER_CONF == No ]; then
+    $RM -rf ${TEM_DIR}
+    exit 0
+    fi
+fi
+
+$ECHO "Create temp ${CLI_CONF_DIR}/${COORD_INI} before updating" >> ${LOGFILE}
+# Copying ini files to temp directory for updating
+$CP ${CLI_CONF_DIR}/${COORD_INI} ${TEM_DIR}/${COORD_INI}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not copy ${CLI_CONF_DIR}/${COORD_INI} to ${TEM_DIR}/${COORD_INI}"
+    abort_script "$_err_msg_"
+fi
+$ECHO "Create temp ${ENIQ_CONF_DIR}/${SYM_INI} before updating" >> ${LOGFILE}
+$CP ${ENIQ_CONF_DIR}/${SYM_INI} ${TEM_DIR}/${SYM_INI}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not copy ${ENIQ_CONF_DIR}/${SYM_INI} to ${TEM_DIR}/${SYM_INI}"
+    abort_script "$_err_msg_"
+fi
+
+_par_tag_list_="DWH_SYSTEM_MAIN DWH_DBSPACES_MAIN DWH_DBSPACES_TEMP" 
+if [ "${_coord_}" == "YES" ]; then 
+    _ini_file_list_="${TEM_DIR}/${COORD_INI} ${TEM_DIR}/${SYM_INI}"
+else
+    _ini_file_list_="${TEM_DIR}/${SYM_INI}"
+fi
+
+for _file_ in `$ECHO ${_ini_file_list_}`; do
+    for _par_tag_ in `$ECHO ${_par_tag_list_}`; do
+    update_lun_id_info "${_file_}" "${_par_tag_}"
+    done
+done
+
+# Copy back temp ini files after updates completed OK
+if [ "${_coord_}" == "YES" ]; then
+    $ECHO "Updating ${CLI_CONF_DIR}/${COORD_INI}" >> ${LOGFILE}
+
+    # Strip all duplicate blank lines out
+    $CAT ${TEM_DIR}/${COORD_INI} |$AWK '/^$/{ if (! blank++) print; next } { blank=0; print }' > ${CLI_CONF_DIR}/${COORD_INI}
+    if [ $? -ne 0 ]; then
+    _err_msg_="Could not copy ${TEM_DIR}/${COORD_INI} to ${CLI_CONF_DIR}/${COORD_INI}"
+    abort_script "$_err_msg_"
+    fi
+
+    $ECHO "Updating ${ENIQ_CONF_DIR}/${SYM_INI}" >> ${LOGFILE}
+    # Strip all duplicate blank lines out
+    $CAT ${TEM_DIR}/${SYM_INI} |$AWK '/^$/{ if (! blank++) print; next } { blank=0; print }' > ${ENIQ_CONF_DIR}/${SYM_INI}
+    if [ $? -ne 0 ]; then
+    _err_msg_="Could not copy ${TEM_DIR}/${SYM_INI} to ${ENIQ_CONF_DIR}/${SYM_INI}"
+    abort_script "$_err_msg_"
+    fi
+
+    $ECHO "Updating ${ENIQ_CONF_DIR}/${COORD_INI}" >> ${LOGFILE}
+    $CP ${CLI_CONF_DIR}/${COORD_INI} ${ENIQ_CONF_DIR}/${COORD_INI}
+    if [ $? -ne 0 ]; then
+    _err_msg_="Could not copy ${CLI_CONF_DIR}/${COORD_INI} to ${ENIQ_CONF_DIR}/${COORD_INI}"
+    abort_script "$_err_msg_"
+    fi
+else
+    $ECHO "Updating ${ENIQ_CONF_DIR}/${SYM_INI}" >> ${LOGFILE}
+
+    # Strip all duplicate blank lines out
+    $CAT ${TEM_DIR}/${SYM_INI} |$AWK '/^$/{ if (! blank++) print; next } { blank=0; print }' > ${ENIQ_CONF_DIR}/${SYM_INI}
+    if [ $? -ne 0 ]; then
+    _err_msg_="Could not copy ${TEM_DIR}/${SYM_INI} to ${ENIQ_CONF_DIR}/${SYM_INI}"
+    abort_script "$_err_msg_"
+    fi
+fi
+
+# Rotate and compress the logs if necessary
+rotate_compress_logs ${LOGFILE} ${NUM_LOGS} ${SIZE_LOGS} ${COMPRESS_LOG}
+
+$RM -rf ${INPUT_LIST}
+$RM -rf ${TEM_DIR}
+
+exit 0

@@ -1,0 +1,179 @@
+#!/bin/bash
+# ********************************************************************
+# Ericsson Radio Systems AB                                     SCRIPT
+# ********************************************************************
+#
+#
+# (c) Ericsson Radio Systems AB 2022 - All rights reserved.
+#
+# The copyright to the computer program(s) herein is the property
+# of Ericsson Radio Systems AB, Sweden. The programs may be used
+# and/or copied only with the written permission from Ericsson Radio
+# Systems AB or in accordance with the terms and conditions stipulated
+# in the agreement/contract under which the program(s) have been
+# supplied.
+#
+# ********************************************************************
+# Name    : dwh_dir_perm_check.bsh
+# Date    : 11/02/2022
+# Revision: /main/1
+# Purpose : To track the permission of dwh_main directory
+#
+# ********************************************************************
+#
+#     Command Section
+#
+# ********************************************************************
+AWK=/usr/bin/awk
+CHMOD=/usr/bin/chmod
+DIRNAME=/usr/bin/dirname
+DATE=/usr/bin/date
+ECHO=/usr/bin/echo
+ID=/usr/bin/id
+RM=/usr/bin/rm
+STAT=/usr/bin/stat
+TEE=/usr/bin/tee
+
+# ********************************************************************
+#
+#       Configuration Section
+#
+# ********************************************************************
+# Default user
+DEFAULT_USER=root
+
+# Name of SunOS & ENIQ ini Files
+SUNOS_INI=SunOS.ini
+
+### Function: setup_env ###
+#
+# Set up environment variables for script.
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+setup_env()
+{
+# ENIQ Base Directory
+ENIQ_BASE_DIR=/eniq
+
+# ENIQ IQ Log Directory
+ENIQ_LOG_DIR="${ENIQ_BASE_DIR}/local_logs/iq"
+
+# Archieve Log Path Directory
+LOG_PATH="${ENIQ_BASE_DIR}/log/sw_log/iq/"
+
+# Permission Change Log
+LOGFILE="${LOG_PATH}dwh_dir_perm_check.log"
+
+# ENIQ Installation Directory
+ENIQ_INST_DIR="${ENIQ_BASE_DIR}/installation"
+
+# ENIQ Config Directory
+ENIQ_CONF_DIR="${ENIQ_INST_DIR}/config"
+
+# Current Directory
+_dir_=`$DIRNAME $0`
+SCRIPTHOME=`cd $_dir_ 2>/dev/null && pwd || $ECHO $_dir_`
+EXEC_SHELL_CMD="exec /bin/bash -o emacs"
+}
+# ********************************************************************
+#
+#   Functions
+#
+# ********************************************************************
+### Function: abort_script ###
+#
+#   This will is called if the script is aborted thru an error
+#   signal sent by the kernel such as CTRL-C or if a serious
+#   error is encountered during runtime
+#
+# Arguments:
+#       $1 - Error message from part of program (Not always used)
+# Return Values:
+#       none
+abort_script()
+{
+_err_time_=`$DATE '+%Y-%b-%d_%H.%M.%S'`
+
+if [ "$1" ]; then
+    _err_msg_="${_err_time_} - $1"
+else
+    _err_msg_="${_err_time_} - ERROR : Script aborted.......\n"
+fi
+
+if [ "${LOGFILE}" ]; then
+    $ECHO -e "\nERROR : ${_err_msg_}\n" | $TEE -a ${LOGFILE}
+else
+    $ECHO -e "\nERROR : ${_err_msg_}\n"
+fi
+
+}
+
+### Function: check_id ###
+#
+#   Check that the effective id of the user is correct
+#   If not print error msg and exit.
+#
+# Arguments:
+#       $1 : User ID name
+# Return Values:
+#       none
+check_id()
+{
+_check_id_=`$ID | $AWK -F\( '{print $2}' | $AWK -F\) '{print $1}'`
+if [ "$_check_id_" != "$1" ]; then
+    _err_msg_="You must be $1 to execute this script."
+    abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+fi
+}
+# ********************************************************************
+#
+#   Main body of program
+#
+# ********************************************************************
+#
+# Check that the effective id of the user is root
+check_id $DEFAULT_USER
+
+# Set up environment variables for script.
+setup_env
+
+# Source the common functions
+if [ -s ${SCRIPTHOME}/../../installation/core_install/lib/common_functions.lib ]; then
+    . ${SCRIPTHOME}/../../installation/core_install/lib/common_functions.lib
+else
+    _err_msg_="File ${SCRIPTHOME}/../lib/common_functions.lib not found"
+    abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+fi
+#Getting list of required fs filesystems from SunOs.ini
+_fs_list_=`iniget SunOS_ZFS_FS -f ${ENIQ_CONF_DIR}/${SUNOS_INI}`
+for _fs_ in ${_fs_list_}; do
+    _fs_mount_pt_=`iniget ${_fs_} -f ${ENIQ_CONF_DIR}/${SUNOS_INI} -v mountpoint`
+    _fs_perms_=`iniget ${_fs_} -f ${ENIQ_CONF_DIR}/${SUNOS_INI} -v perms`
+    if [ "${_fs_mount_pt_}" == "/eniq/database/dwh_main" ]; then
+        permission=$($STAT -c '%04a' ${_fs_mount_pt_})
+        if [ "$permission" -ne "${_fs_perms_}" ]; then
+            log_msg -s "Debug information" -l ${LOGFILE} -q
+            log_msg -s "=========================================================================" -l ${LOGFILE} -q
+            log_msg -s "$($DATE '+%Y-%m-%d_%H.%M.%S'): Listing the contents of database directory" -l ${LOGFILE} -q
+            log_msg -s "=========================================================================" -l ${LOGFILE} -q
+            log_msg -s "`$LS -lhrt /eniq/database/`" -l ${LOGFILE} -q
+            log_msg -s "The permission of ${_fs_mount_pt_} is `$STAT -c '%04a' ${_fs_mount_pt_}`" -l ${LOGFILE} -q
+            log_msg -s "=========================================================================" -l ${LOGFILE} -q
+            log_msg -s "$($DATE '+%Y-%m-%d_%H.%M.%S'): Listing the contents ${_fs_mount_pt_} " -l ${LOGFILE} -q
+            log_msg -s "=========================================================================" -l ${LOGFILE} -q
+            log_msg -s "`$LS -lhrt ${_fs_mount_pt_}`" -l ${LOGFILE} -q
+            log_msg -s "=========================================================================" -l ${LOGFILE} -q
+            log_msg -s "$($DATE '+%Y-%m-%d_%H.%M.%S'): Listing the contents ${ENIQ_LOG_DIR}" -l ${LOGFILE} -q
+            log_msg -s "=========================================================================" -l ${LOGFILE} -q
+            log_msg -s "`$LS -lhrt ${ENIQ_LOG_DIR}`" -l ${LOGFILE} -q
+            log_msg -s "=========================================================================" -l ${LOGFILE} -q
+            log_msg -s "$($DATE '+%Y-%m-%d_%H.%M.%S'): Changing permission form $permission to ${_fs_perms_}" -l ${LOGFILE} -q
+            $CHMOD ${_fs_perms_} ${_fs_mount_pt_}
+            log_msg -s "=========================================================================" -l ${LOGFILE} -q
+        fi
+     break
+    fi
+done

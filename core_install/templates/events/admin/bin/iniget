@@ -1,0 +1,59 @@
+#!/bin/bash
+# ----------------------------------------------------------------------
+# Ericsson Network IQ utility script for reading ini-files
+#
+# Usage: iniget <block> [-<p|v> <line>] [-f <configfile>] [raw]
+#
+# ----------------------------------------------------------------------
+# Copyright (c) 2003 - 2006 AB Ericsson Oy  All rights reserved.
+# ----------------------------------------------------------------------
+
+if [ -n "$1" ]; then
+  INIBLOCK="$1"
+  shift 1
+else
+  echo "Usage: iniget <block> [-<p|v> <line>] [-f <configfile>] [raw]"
+  exit 1
+fi
+
+
+unset INIWLINE INILINE INICONFIGFILE INIPRINTTYPE
+
+while [ -n "$1" ]
+do
+  case $1 in
+		-p)	INIWLINE=parameter
+			INILINE=$2
+			shift 2
+			;;
+		-v)	INIWLINE=value
+			INILINE=$2
+			shift 2
+			;;
+		-f)	INICONFIGFILE=$2
+			shift 2
+			;;
+		raw)	INIPRINTTYPE=raw
+			shift 1
+			;;
+		*)	exit 1
+			;;
+  esac
+done
+
+[ -z "$INICONFIGFILE" ] && INICONFIGFILE=/ericsson/config/system.ini
+
+nawk -F= -v printtype=$INIPRINTTYPE -v line="$INILINE" -v way=$INIWLINE '
+{ sub(/[	 ]*$/,"");	#remove trailing whitespace and tabs
+  if ($1=="['$INIBLOCK']") {
+	while ((getline) > 0) {
+		if ($0 ~ /^ *\[/) exit
+		if (($0 ~ /^ *;/) && (printtype!="raw")) continue
+		if ($1==line) {
+			if (way=="parameter") {print $0; exit}
+			if (way=="value")     {sub(/^[^=]*=/,""); print $0; exit}
+		}
+		else if (! line) print $0
+	}
+    }
+}' $INICONFIGFILE

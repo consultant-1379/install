@@ -1,0 +1,882 @@
+#!/bin/bash
+# ********************************************************************
+# Ericsson Radio Systems AB                                     SCRIPT
+# ********************************************************************
+#
+# (c) Ericsson Radio Systems AB 2021 - All rights reserved.
+#
+# The copyright to the computer program(s) herein is the property
+# of Ericsson Radio Systems AB, Sweden. The programs may be used
+# and/or copied only with the written permission from Ericsson Radio
+# Systems AB or in accordance with the terms and conditions stipulated
+# in the agreement/contract under which the program(s) have been
+# supplied.
+#
+# ********************************************************************
+# Name    : manage_ilo_nodes.bash
+# Date    : 04/10/2023
+# Revision: main/03
+# Purpose : This script will accept ILO info like  hostname, ip,
+#           username & password from user and store it in one config
+#           file i.e ilo.cfg
+# Usage   : manage_ilo_nodes.bash
+#
+# ********************************************************************
+#
+#   Command Section
+#
+# ********************************************************************
+
+ECHO=/usr/bin/echo
+MKDIR=/usr/bin/mkdir
+CP=/usr/bin/cp
+
+OUTPUT_FILE_LOCATION=/eniq/installation/config
+ILO_NODE_CONF_DIR="${OUTPUT_FILE_LOCATION}/ilo_nodes_conf_file"
+CONFIG_FILE_NAME=ilo.cfg
+ERROR_TXT='\033[0;31m'
+STD_TXT='\033[0m'
+SERVER_TYPE=`cat /eniq/installation/config/installed_server_type  2> /dev/null`
+SANFILE_PATH=/eniq/installation/config
+SAN_DEVICE=`cat /eniq/installation/config/san_details | awk -F'=' '/SAN_DEVICE=/{print $2}' 2> /dev/null`
+
+if [[ $SERVER_TYPE == "stats_coordinator" ]]; then
+    if [[ $SAN_DEVICE == "unityXT" ]]; then #for multirack
+        TYPE="MultiRack"
+        $ECHO -e "\nServer deployment is ${TYPE}."
+    else
+        TYPE="Multiblade"
+        $ECHO -e "\nServer deployment is ${TYPE}."
+    fi
+elif [[ $SERVER_TYPE == "eniq_stats" ]]; then
+    TYPE="Standalone"
+    $ECHO -e "\nServer deployment is ${TYPE}."
+    . ${SANFILE_PATH}/san_details
+else
+    $ECHO -e "\nInvalid deployment so terminating execution of script.\n"
+    exit 1
+fi
+
+if [ ! -d ${ILO_NODE_CONF_DIR} ]; then
+    $MKDIR -p ${ILO_NODE_CONF_DIR} 2> /dev/null
+    if [ $? -ne 0 ]; then
+        $ECHO -e "\nFailed to create directory ${ILO_NODE_CONF_DIR}"
+    fi
+fi
+
+function checkTypeValue {
+    if [[ $# -eq 1 ]]; then
+        server_type=$1
+        awk 'BEGIN { FS="@" };{ print $1 }' "${ILO_NODE_CONF_DIR}/${CONFIG_FILE_NAME}" | awk 'BEGIN { FS=":" };{ print $1 }' | grep -qw "${server_type}" 2> /dev/null
+        echo $?
+    fi
+}
+
+function changeServerTypeCase {
+    if [[ $# -eq 1 ]]; then
+        change_type=$1
+        if [ "${change_type,,}" = "eniq_stats" ]; then
+            final_type="Eniq_stats"
+        elif [ "${change_type,,}" = "nas_node1" ]; then
+            final_type="NAS_Node1"
+        elif [ "${change_type,,}" = "nas_node2" ]; then
+            final_type="NAS_Node2"
+        elif [ "${change_type,,}" = "mws" ]; then
+            final_type="MWS"
+        elif [ "${change_type,,}" = "bis" ]; then
+            final_type="BIS"
+        elif [ "${change_type,,}" = "netan" ]; then
+            final_type="Netan"
+        elif [ "${change_type,,}" = "ocs_without_citrix" ]; then
+            final_type="OCS_WITHOUT_CITRIX"
+        elif [ "${change_type,,}" = "coordinator" ]; then
+            final_type="Coordinator"
+        elif [ "${change_type,,}" = "reader1" ]; then
+            final_type="Reader1"
+        elif [ "${change_type,,}" = "engine" ]; then
+            final_type="Engine"
+        elif [ "${change_type,,}" = "reader2" ]; then
+            final_type="Reader2"
+        else
+            final_type=$change_type
+        fi
+        echo $final_type
+    fi
+}
+
+function modifyDetails {
+    if [[ $SERVER_TYPE == "eniq_stats" ]]; then
+        if [[ $STORAGE_TYPE == "raw" ]]; then #for blade
+            while true
+            do
+                $ECHO -e "\nEnter server type which needs to be modify [ Eniq_stats/NAS_Node1/NAS_Node2/MWS/BIS/Netan/OCS_WITHOUT_CITRIX ] : \c"
+                read modify_type
+                modify_type=`changeServerTypeCase "${modify_type}"`
+                if [[ -z "${modify_type}" ]]; then
+                    $ECHO -e "\n${ERROR_TXT}Empty server type not allowed ....  Enter server type again.${STD_TXT}"
+                    continue
+                else
+                    case "$modify_type" in
+                        Eniq_stats|NAS_Node1|NAS_Node2|MWS|BIS|Netan|OCS_WITHOUT_CITRIX)
+
+                        del_st_co=`checkAndDeleteType "${modify_type}"`
+                        if [[ ${del_st_co} -ne 0 ]]; then
+                            $ECHO -e "\nPlease add ${modify_type} details\n"
+                            addIloDetails "Append" $modify_type $SERVER_TYPE
+                        elif [[ ${del_st_co} -eq 0 ]]; then
+                            $ECHO -e "\n${ERROR_TXT}Entered server type is not found in file.${STD_TXT}\n"
+                        fi
+                        break
+                        ;;
+                        *)
+                        $ECHO -e "\n${ERROR_TXT}Invalid server type.....Enter server type again.${STD_TXT}"
+                        continue
+                        ;;
+                    esac
+                fi
+            done
+        elif [[ $STORAGE_TYPE == "fs" ]]; then #for rack
+            while true
+            do
+                $ECHO -e "\nEnter server type which needs to be modify [ Eniq_stats/MWS/BIS/Netan/OCS_WITHOUT_CITRIX ] : \c"
+                read modify_type
+                modify_type=`changeServerTypeCase "${modify_type}"`
+                if [[ -z "${modify_type}" ]]; then
+                    $ECHO -e "\n${ERROR_TXT}Empty server type not allowed ....  Enter server type again.${STD_TXT}"
+                    continue
+                else
+                    case "$modify_type" in
+                        Eniq_stats|MWS|BIS|Netan|OCS_WITHOUT_CITRIX)
+                        del_st_co=`checkAndDeleteType "${modify_type}"`
+                        if [[ ${del_st_co} -ne 0 ]]; then
+                            $ECHO -e "\nPlease add ${modify_type} details\n"
+                            addIloDetails "Append" $modify_type $SERVER_TYPE
+                        elif [[ ${del_st_co} -eq 0 ]]; then
+                            $ECHO -e "\n${ERROR_TXT}Entered server type is not found in file.${STD_TXT}\n"
+                        fi
+                        break
+                        ;;
+                        *)
+                        $ECHO -e "\n${ERROR_TXT}Invalid server type.....Enter server type again.${STD_TXT}"
+                        continue
+                        ;;
+                    esac
+                fi
+            done
+        fi
+    elif [[ $SERVER_TYPE == "stats_coordinator" ]]; then
+        if [[ $SAN_DEVICE == "unityXT" ]]; then #for multirack
+            while true
+            do
+                $ECHO -e "\nEnter server type which needs to be modify [ Coordinator/Engine/Reader1/Reader2/MWS/BIS/Netan/OCS_WITHOUT_CITRIX ] : \c"
+                read modify_type
+                modify_type=`changeServerTypeCase "${modify_type}"`
+                if [[ -z "${modify_type}" ]]; then
+                    $ECHO -e "\n${ERROR_TXT}Empty server type not allowed ....  Enter server type again.${STD_TXT}"
+                    continue
+                else
+                    case "$modify_type" in
+                        Coordinator|Engine|Reader1|Reader2|MWS|BIS|Netan|OCS_WITHOUT_CITRIX)
+                        del_st_co=`checkAndDeleteType "${modify_type}"`
+                        if [[ ${del_st_co} -ne 0 ]]; then
+                            $ECHO -e "\nPlease add ${modify_type} details\n"
+                            addIloDetails "Append" $modify_type $SERVER_TYPE
+                        elif [[ ${del_st_co} -eq 0 ]]; then
+                            $ECHO -e "\n${ERROR_TXT}Entered server type is not found in file.${STD_TXT}\n"
+                        fi
+                        break
+                        ;;
+                        *)
+                        $ECHO -e "\n${ERROR_TXT}Invalid server type.....Enter server type again.${STD_TXT}"
+                        continue
+                        ;;
+                    esac
+                fi
+            done
+        else
+            while true
+            do
+                $ECHO -e "\nEnter server type which needs to be modify [ Coordinator/Engine/Reader1/Reader2/NAS_Node1/NAS_Node2/MWS/BIS/Netan/OCS_WITHOUT_CITRIX ] : \c"
+                read modify_type
+                modify_type=`changeServerTypeCase "${modify_type}"`
+                if [[ -z "${modify_type}" ]]; then
+                    $ECHO -e "\n${ERROR_TXT}Empty server type not allowed ....  Enter server type again.${STD_TXT}"
+                    continue
+                else
+                    case "$modify_type" in
+                        Coordinator|Engine|Reader1|Reader2|NAS_Node1|NAS_Node2|MWS|BIS|Netan|OCS_WITHOUT_CITRIX)
+                        del_st_co=`checkAndDeleteType "${modify_type}"`
+                        if [[ ${del_st_co} -ne 0 ]]; then
+                            $ECHO -e "\nPlease add ${modify_type} details\n"
+                            addIloDetails "Append" $modify_type $SERVER_TYPE
+                        elif [[ ${del_st_co} -eq 0 ]]; then
+                            $ECHO -e "\n${ERROR_TXT}Entered server type is not found in file.${STD_TXT}\n"
+                        fi
+                        break
+                        ;;
+                        *)
+                        $ECHO -e "\n${ERROR_TXT}Invalid server type.....Enter server type again.${STD_TXT}"
+                        continue
+                        ;;
+                    esac
+                fi
+            done
+        fi
+    fi
+}
+
+function checkValidationSingleRack {
+    eniq_stats=`checkTypeValue "Eniq_stats"`
+    mws=`checkTypeValue "MWS"`
+    if [[ ${eniq_stats} -ne 0 ]]; then
+        $ECHO -e "\nPlease add eniq stats details\n"
+        addIloDetails "Append" "Eniq_stats" $SERVER_TYPE
+    fi
+    if [[ ${mws} -ne 0 ]]; then
+        $ECHO -e "\nPlease add MWS details\n"
+        addIloDetails "Append" "MWS" $SERVER_TYPE
+    fi
+}
+
+function checkValidationSingleBlade {
+    eniq_stats=`checkTypeValue "Eniq_stats"`
+    nas_node1=`checkTypeValue "NAS_Node1"`
+    nas_node2=`checkTypeValue "NAS_Node2"`
+    mws=`checkTypeValue "MWS"`
+    if [[ ${eniq_stats} -ne 0 ]]; then
+        $ECHO -e "\nPlease add eniq stats details\n"
+        addIloDetails "Append" "Eniq_stats" $SERVER_TYPE
+    fi
+    if [[ ${nas_node1} -ne 0 ]]; then
+        $ECHO -e "\nPlease add nas node1 details\n"
+        addIloDetails "Append" "NAS_Node1" $SERVER_TYPE
+    fi
+    if [[ ${nas_node2} -ne 0 ]]; then
+        $ECHO -e "\nPlease add nas node2 details\n"
+        addIloDetails "Append" "NAS_Node2" $SERVER_TYPE
+    fi
+    if [[ ${mws} -ne 0 ]]; then
+        $ECHO -e "\nPlease add MWS details\n"
+        addIloDetails "Append" "MWS" $SERVER_TYPE
+    fi
+
+}
+
+function checkValidationMultiBlade {
+    coordinator=`checkTypeValue "Coordinator"`
+    engine=`checkTypeValue "Engine"`
+    reader1=`checkTypeValue "Reader1"`
+    reader2=`checkTypeValue "Reader2"`
+    nas_node1=`checkTypeValue "NAS_Node1"`
+    nas_node2=`checkTypeValue "NAS_Node2"`
+    mws=`checkTypeValue "MWS"`
+    if [[ ${coordinator} -ne 0 ]]; then
+        $ECHO -e "\nPlease add coordinator details\n"
+        addIloDetails "Append" "Coordinator" $SERVER_TYPE
+    fi
+    if [[ ${engine} -ne 0 ]]; then
+        $ECHO -e "\nPlease add engine details\n"
+        addIloDetails "Append" "Engine" $SERVER_TYPE
+    fi
+    if [[ ${reader1} -ne 0 ]]; then
+        $ECHO -e "\nPlease add reader1 details\n"
+        addIloDetails "Append" "Reader1" $SERVER_TYPE
+    fi
+    if [[ ${reader2} -ne 0 ]]; then
+        $ECHO -e "\nPlease add reader2 details\n"
+        addIloDetails "Append" "Reader2" $SERVER_TYPE
+    fi
+    if [[ ${nas_node1} -ne 0 ]]; then
+        $ECHO -e "\nPlease add nas node1 details\n"
+        addIloDetails "Append" "NAS_Node1" $SERVER_TYPE
+    fi
+    if [[ ${nas_node2} -ne 0 ]]; then
+        $ECHO -e "\nPlease add nas node2 details\n"
+        addIloDetails "Append" "NAS_Node2" $SERVER_TYPE
+    fi
+    if [[ ${mws} -ne 0 ]]; then
+        $ECHO -e "\nPlease add MWS details\n"
+        addIloDetails "Append" "MWS" $SERVER_TYPE
+    fi
+}
+
+function checkValidationMultiRack {
+    coordinator=`checkTypeValue "Coordinator"`
+    engine=`checkTypeValue "Engine"`
+    reader1=`checkTypeValue "Reader1"`
+    reader2=`checkTypeValue "Reader2"`
+    mws=`checkTypeValue "MWS"`
+    if [[ ${coordinator} -ne 0 ]]; then
+        $ECHO -e "\nPlease add coordinator details\n"
+        addIloDetails "Append" "Coordinator" $SERVER_TYPE
+    fi
+    if [[ ${engine} -ne 0 ]]; then
+        $ECHO -e "\nPlease add engine details\n"
+        addIloDetails "Append" "Engine" $SERVER_TYPE
+    fi
+    if [[ ${reader1} -ne 0 ]]; then
+        $ECHO -e "\nPlease add reader1 details\n"
+        addIloDetails "Append" "Reader1" $SERVER_TYPE
+    fi
+    if [[ ${reader2} -ne 0 ]]; then
+        $ECHO -e "\nPlease add reader2 details\n"
+        addIloDetails "Append" "Reader2" $SERVER_TYPE
+    fi
+    if [[ ${mws} -ne 0 ]]; then
+        $ECHO -e "\nPlease add MWS details\n"
+        addIloDetails "Append" "MWS" $SERVER_TYPE
+    fi
+}
+
+function addNonMandetoryIliDetails {
+    if [[ $# -eq 3 ]]; then
+        mode=$1
+        type=$2
+        server_type_input=$3
+        while true
+        do
+            $ECHO -e "\nPlease continue if you have installed $type.\nc - To continue.\ns - To skip.\nEnter [c/s]:"
+            read input
+            case "$input" in
+                [cC])
+                addIloDetails "Append" $type $SERVER_TYPE
+                break
+                ;;
+                [sS])
+                $ECHO -e "\nSkip adding ILO details for $type.\n"
+                break
+                ;;
+                *)
+                $ECHO -e "\n${ERROR_TXT}Invalid option.....Enter option again.${STD_TXT}"
+                continue
+                ;;
+            esac
+        done
+    fi
+}
+
+function appendIloDetails {
+    if [[ $# -eq 2 ]]; then
+        mode=$1
+        server_type_input=$2
+
+        while true
+        do
+            $ECHO -e "\nEnter server type [ BIS/Netan/OCS_WITHOUT_CITRIX ] : \c"
+            read append_type
+            append_type=`changeServerTypeCase "${append_type}"`
+            if [[ -z "${append_type}" ]]; then
+                $ECHO -e "\n${ERROR_TXT}Empty server type not allowed....  Enter server type again.${STD_TXT}"
+                continue
+            else
+                if awk 'BEGIN { FS="@" };{ print $1 }' "${ILO_NODE_CONF_DIR}/${CONFIG_FILE_NAME}" | grep -qw "${append_type}"  ; then
+                    $ECHO -e "\n${ERROR_TXT} ${append_type} is already provided....  Do you wish to provide any other server type ? [y/n]:${STD_TXT}"
+
+                    read chk_user_input
+                    case ${chk_user_input} in
+                        [yY])
+                        continue
+                        ;;
+                        [nN])
+                        $ECHO -e "\nexiting\n"
+                        exit 1
+                        ;;
+                        *)
+                        $ECHO -e "\n${ERROR_TXT}Invalid input...exiting${STD_TXT}"
+                        exit 1
+                        ;;
+                    esac
+
+                else
+                    case "$append_type" in
+                        BIS|Netan|OCS_WITHOUT_CITRIX)
+                        break
+                        ;;
+                        *)
+                        $ECHO -e "\n${ERROR_TXT}Invalid server type.....Enter server type again.${STD_TXT}"
+                        continue
+                        ;;
+                    esac
+                fi
+            fi
+        done
+
+        while true
+        do
+            $ECHO -e "\nEnter hostname of ILO for ${append_type} : \c"
+            read node_name_input
+            if [[ -z "${node_name_input}" ]]; then
+                $ECHO -e "\n${ERROR_TXT}Empty hostname not allowed ....  Enter hostname again.${STD_TXT}"
+                continue
+            else
+                if awk 'BEGIN { FS="@" };{ print $1 }' "${ILO_NODE_CONF_DIR}/${CONFIG_FILE_NAME}" | grep -qw "${node_name_input}"  ; then
+                    $ECHO -e "\n${ERROR_TXT}This hostname ${node_name_input} is already provided. Do you wish to provide any other hostname ? [y/n]:${STD_TXT}"
+                    read chk_user_input
+                    case ${chk_user_input} in
+                        [yY])
+                        continue
+                        ;;
+                        [nN])
+                        $ECHO -e "\nexiting\n"
+                        exit 1
+                        ;;
+                        *)
+                        $ECHO -e "\n${ERROR_TXT}Invalid input...exiting${STD_TXT}"
+                        exit 1
+                        ;;
+                    esac
+                else
+                    break
+                fi
+            fi
+        done
+
+        while true
+        do
+            $ECHO -e "\nEnter IP Address of ILO for ${append_type} : \c"
+            read node_ip_input
+            if [[ ! -z "${node_ip_input}" ]]; then
+                if awk 'BEGIN { FS="@" };{ print $2 }'  "${ILO_NODE_CONF_DIR}/${CONFIG_FILE_NAME}" | grep -qw "${node_ip_input}" ; then
+                    $ECHO -e "\n${ERROR_TXT}This IP Address ${node_ip_input} is already provided. Do you wish to provide any other IP Address ? [y/n]:${STD_TXT}"
+                    read chk_user_input
+                    case ${chk_user_input} in
+                        [yY])
+                        continue
+                        ;;
+                        [nN])
+                        $ECHO -e "\nexiting\n"
+                        exit 1
+                        ;;
+                        *)
+                        $ECHO -e "\n${ERROR_TXT}Invalid input...exiting${STD_TXT}"
+                        exit 1
+                        ;;
+                    esac
+                else
+                    if [[ ${node_ip_input} =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]]; then
+                        IFS='.'
+                        node_ip=($node_ip_input)
+                        if [[ ${node_ip[0]} -le 255 && ${node_ip[1]} -le 255 && ${node_ip[2]} -le 255 && ${node_ip[3]} -le 255 ]]; then
+                            break
+                        else
+                            $ECHO -e "\n${ERROR_TXT}Invalid IP Address....  Enter IP Address again.${STD_TXT}"
+                            continue
+                        fi
+                    else
+                        $ECHO -e "\n${ERROR_TXT}Invalid IP Address....  Enter IP Address again.${STD_TXT}"
+                        continue
+                    fi
+                fi
+            else
+                $ECHO -e "\n${ERROR_TXT}Empty IP Address not allowed ....  Enter IP Address again.${STD_TXT}"
+                continue
+            fi
+        done
+
+        while true
+        do
+            $ECHO -e "\nEnter Username of ILO for ${append_type} : \c"
+            read node_username_input
+
+            if [[ -z "${node_username_input}" ]]; then
+                $ECHO -e "\n${ERROR_TXT}Empty username not allowed....  Enter username again.${STD_TXT}"
+                continue
+            else
+                break
+            fi
+        done
+
+        while true
+        do
+            $ECHO -e "\nEnter Password of ILO for ${append_type} : \c"
+            read -s node_password_input
+
+            $ECHO -e "\nRe-enter Password : \c"
+            read -s re_password_input
+
+            if [[ -z "${node_password_input}" ||  -z "${re_password_input}" ]]; then
+                $ECHO -e "\n${ERROR_TXT}Empty password is not allowed....  Enter password again.${STD_TXT}"
+                continue
+            fi
+
+            if [[ $re_password_input = $node_password_input ]]; then
+                node_password_input=$(echo "${node_password_input}" | openssl enc -base64 )
+                $ECHO -e "${append_type}:${node_name_input}@${node_ip_input}@${node_username_input}@/opt/ericsson/ERICddc/monitor/appl/ENIQ/getpw ${node_password_input}" >> "${ILO_NODE_CONF_DIR}/${CONFIG_FILE_NAME}"
+                $ECHO -e "\n\nILO details are added successfully for $append_type."
+                showFileContent
+                break
+            else
+                $ECHO -e "\n${ERROR_TXT}Password not matched...Try Again.${STD_TXT}"
+                continue
+            fi
+        done
+    fi
+}
+
+function checkAndDeleteType {
+    delete_type=$1
+    TYPE_COUNT=`grep -c "${delete_type}" ${ILO_NODE_CONF_DIR}/${CONFIG_FILE_NAME}`
+    if [ $TYPE_COUNT -eq 0 ]; then
+        :
+    else
+        sed -i "/$delete_type/d" ${ILO_NODE_CONF_DIR}/${CONFIG_FILE_NAME}
+    fi
+    echo $TYPE_COUNT
+}
+
+function addIloDetails {
+    if [[ $# -eq 3 ]]; then
+        mode=$1
+        type=$2
+        server_type_input=$3
+        if [[ $mode == "Overwrite" ]]; then
+            > "${ILO_NODE_CONF_DIR}/${CONFIG_FILE_NAME}"
+        fi
+
+        while true
+        do
+            $ECHO -e "\nEnter hostname of ILO for $type : \c"
+            read node_name_input
+            if [[ -z "${node_name_input}" ]]; then
+                $ECHO -e "\n${ERROR_TXT}Empty hostname not allowed ....  Enter hostname again.${STD_TXT}"
+                continue
+            else
+                if awk 'BEGIN { FS="@" };{ print $1 }' "${ILO_NODE_CONF_DIR}/${CONFIG_FILE_NAME}" | grep -qw "${node_name_input}"  ; then
+                    $ECHO -e "\n${ERROR_TXT}This hostname ${node_name_input} is already provided. Do you wish to provide any other hostname ? [y/n]:${STD_TXT}"
+                    read chk_user_input
+                    case ${chk_user_input} in
+                        [yY])
+                        continue
+                        ;;
+                        [nN])
+                        $ECHO -e "\nexiting\n"
+                        exit 1
+                        ;;
+                        *)
+                        $ECHO -e "\n${ERROR_TXT}Invalid input...exiting${STD_TXT}"
+                        exit 1
+                        ;;
+                    esac
+                else
+                    break
+                fi
+            fi
+        done
+
+        while true
+        do
+            $ECHO -e "\nEnter IP Address of ILO for $type : \c"
+            read node_ip_input
+            if [[ ! -z "${node_ip_input}" ]]; then
+                if awk 'BEGIN { FS="@" };{ print $2 }'  "${ILO_NODE_CONF_DIR}/${CONFIG_FILE_NAME}" | grep -qw "${node_ip_input}" ; then
+                    $ECHO -e "\n${ERROR_TXT}This IP Address ${node_ip_input} is already provided. Do you wish to provide any other IP Address ? [y/n]:${STD_TXT}"
+                    read chk_user_input
+                    case ${chk_user_input} in
+                        [yY])
+                        continue
+                        ;;
+                        [nN])
+                        $ECHO -e "\nexiting\n"
+                        exit 1
+                        ;;
+                        *)
+                        $ECHO -e "\n${ERROR_TXT}Invalid input...exiting${STD_TXT}"
+                        exit 1
+                        ;;
+                    esac
+                else
+                    if [[ ${node_ip_input} =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]]; then
+                        IFS='.'
+                        node_ip=($node_ip_input)
+                        if [[ ${node_ip[0]} -le 255 && ${node_ip[1]} -le 255 && ${node_ip[2]} -le 255 && ${node_ip[3]} -le 255 ]]; then
+                            break
+                        else
+                            $ECHO -e "\n${ERROR_TXT}Invalid IP Address....  Enter IP Address again.${STD_TXT}"
+                            continue
+                        fi
+                    else
+                        $ECHO -e "\n${ERROR_TXT}Invalid IP Address....  Enter IP Address again.${STD_TXT}"
+                        continue
+                    fi
+                fi
+            else
+                $ECHO -e "\n${ERROR_TXT}Empty IP Address not allowed ....  Enter IP Address again.${STD_TXT}"
+                continue
+            fi
+        done
+
+        while true
+        do
+            $ECHO -e "\nEnter Username of ILO for $type : \c"
+            read node_username_input
+
+            if [[ -z "${node_username_input}" ]]; then
+                $ECHO -e "\n${ERROR_TXT}Empty username not allowed....  Enter username again.${STD_TXT}"
+                continue
+            else
+                break
+            fi
+        done
+
+        while true
+        do
+            $ECHO -e "\nEnter Password of ILO for $type : \c"
+            read -s node_password_input
+
+            $ECHO -e "\nRe-enter Password : \c"
+            read -s re_password_input
+
+            if [[ -z "${node_password_input}" ||  -z "${re_password_input}" ]]; then
+                $ECHO -e "\n${ERROR_TXT}Empty password is not allowed....  Enter password again.${STD_TXT}"
+                continue
+            fi
+
+            if [[ $re_password_input = $node_password_input ]]; then
+                node_password_input=$(echo "${node_password_input}" | openssl enc -base64 )
+                $ECHO -e "${type}:${node_name_input}@${node_ip_input}@${node_username_input}@/opt/ericsson/ERICddc/monitor/appl/ENIQ/getpw ${node_password_input}" >> "${ILO_NODE_CONF_DIR}/${CONFIG_FILE_NAME}"
+                $ECHO -e "\n\nILO details are added successfully for $type."
+                showFileContent
+                break
+            else
+                $ECHO -e "\n${ERROR_TXT}Password not matched...Try Again.${STD_TXT}"
+                continue
+            fi
+        done
+    fi
+}
+
+function fileReCheck {
+    showFileContent
+    while true
+    do
+        $ECHO -e "\n\nPlease verify above provided ILO details.\nd -  To delete any entered ILO detail.\ne - To save & exit script execution.\nEnter [d/e]: \c"
+        read delete_input
+
+        case ${delete_input} in
+            [dD])
+            deleteIp
+            if [[ $SERVER_TYPE == "eniq_stats" ]]; then
+                if [[ $STORAGE_TYPE == "raw" ]]; then #for blade
+                    checkValidationSingleBlade
+                elif [[ $STORAGE_TYPE == "fs" ]]; then #for rack
+                    checkValidationSingleRack
+                fi
+            elif [[ $SERVER_TYPE == "stats_coordinator" ]]; then
+                if [[ $SAN_DEVICE == "unityXT" ]]; then #for multirack
+                    checkValidationMultiRack
+                else
+                    checkValidationMultiBlade
+                fi
+            fi
+            continue
+            ;;
+            [eE])
+            $ECHO -e "\nExiting from script execution !!!${STD_TXT}\n"
+            break
+            ;;
+            *)
+            $ECHO -e "\nPlease give correct input [d/e].${STD_TXT}\n"
+            continue
+            ;;
+        esac
+    done
+}
+
+function deleteIp {
+    while true
+    do
+        $ECHO -e "\nEnter the IP Address of ILO which needs to be remove from file: \c"
+        read delete_ip_input
+        if [[ ! -z "${delete_ip_input}" ]]; then
+
+            if [[ ${delete_ip_input} =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]]; then
+                IFS='.'
+                node_ip=($delete_ip_input)
+                if [[ ${node_ip[0]} -le 255 && ${node_ip[1]} -le 255 && ${node_ip[2]} -le 255 && ${node_ip[3]} -le 255 ]]; then
+                    #IP is valid
+                    IFS=' '
+                else
+                    $ECHO -e "\n${ERROR_TXT}Invalid IP Address....  Enter IP Address again.${STD_TXT}"
+                    continue
+                fi
+            else
+                $ECHO -e "\n${ERROR_TXT}Invalid IP Address....  Enter IP Address again.${STD_TXT}"
+                continue
+            fi
+            FILE_COUNT=`grep -c "${delete_ip_input}" ${ILO_NODE_CONF_DIR}/${CONFIG_FILE_NAME}`
+            if [ $FILE_COUNT -eq 0 ]; then
+                $ECHO -e "\n${ERROR_TXT}Entered IP Address is not found in file.${STD_TXT}"
+            fi
+
+            sed -i "/\b$delete_ip_input\b/d" ${ILO_NODE_CONF_DIR}/${CONFIG_FILE_NAME}
+
+            showFileContent
+            break
+
+        else
+            $ECHO -e "\n${ERROR_TXT}Empty IP Address not allowed ....  Enter IP Address again.${STD_TXT}"
+            continue
+        fi
+    done
+}
+
+function showFileContent {
+    $ECHO -e "\n\n-: File content ${ILO_NODE_CONF_DIR}/${CONFIG_FILE_NAME} :- \n"
+    if [ ! -s "${ILO_NODE_CONF_DIR}/${CONFIG_FILE_NAME}" ]
+    then
+        $ECHO -e  "File is Empty."
+    else
+        while read line;
+        do
+            # reading each line
+            IFS='@'
+            FILE_ROW=($line)
+            $ECHO -e  "${FILE_ROW[0]} ${FILE_ROW[1]} ${FILE_ROW[2]}"
+
+        done < "${ILO_NODE_CONF_DIR}/${CONFIG_FILE_NAME}"
+        $ECHO -e  "\n"
+    fi
+}
+
+if [ -f "${ILO_NODE_CONF_DIR}/${CONFIG_FILE_NAME}" ]; then
+    $ECHO -e "${CONFIG_FILE_NAME} file is already present."
+    showFileContent
+    while true
+    do
+
+        $ECHO -e "\nPlease verify above ILO details.\n\nm - To modify existing ILO details.\no - To overwrite existing ILO details.\ns - To skip adding ILO details.\nd - To delete existing ILO details.\na - To append new ILO details.\nEnter [m/o/s/d/a]: \c"
+        read input
+        case ${input} in
+            [oO]) #Upgrade/Replacement/Expansion
+                if [[ $SERVER_TYPE == "stats_coordinator" ]]; then
+                    if [[ $SAN_DEVICE == "unityXT" ]]; then #multirack
+                        #Coordinator|Engine|Reader1|Reader2|BIS|Netan|OCS_WITHOUT_CITRIX
+                        addIloDetails "Overwrite" "Coordinator" $SERVER_TYPE
+                        addIloDetails "Append" "Engine" $SERVER_TYPE
+                        addIloDetails "Append" "Reader1" $SERVER_TYPE
+                        addIloDetails "Append" "Reader2" $SERVER_TYPE
+                        addIloDetails "Append" "MWS" $SERVER_TYPE
+                        addNonMandetoryIliDetails "Append" "BIS" $SERVER_TYPE
+                        addNonMandetoryIliDetails "Append" "Netan" $SERVER_TYPE
+                        addNonMandetoryIliDetails "Append" "OCS_WITHOUT_CITRIX" $SERVER_TYPE
+                    else
+                        #Coordinator|Engine|Reader1|Reader2|BIS|Netan|Nas Node1|Nas Node2|OCS_WITHOUT_CITRIX
+                        addIloDetails "Overwrite" "Coordinator" $SERVER_TYPE
+                        addIloDetails "Append" "Engine" $SERVER_TYPE
+                        addIloDetails "Append" "Reader1" $SERVER_TYPE
+                        addIloDetails "Append" "Reader2" $SERVER_TYPE
+                        addIloDetails "Append" "NAS_Node1" $SERVER_TYPE
+                        addIloDetails "Append" "NAS_Node2" $SERVER_TYPE
+                        addIloDetails "Append" "MWS" $SERVER_TYPE
+                        addNonMandetoryIliDetails "Append" "BIS" $SERVER_TYPE
+                        addNonMandetoryIliDetails "Append" "Netan" $SERVER_TYPE
+                        addNonMandetoryIliDetails "Append" "OCS_WITHOUT_CITRIX" $SERVER_TYPE
+                    fi
+                elif [[ $SERVER_TYPE == "eniq_stats" ]]; then
+                    #Eniq_stats|BIS|Netan|Nas Node1|Nas Node2|OCS_WITHOUT_CITRIX
+                    if [[ $STORAGE_TYPE == "raw" ]]; then #for blade
+                        addIloDetails "Overwrite" "Eniq_stats" $SERVER_TYPE
+                        addIloDetails "Append" "NAS_Node1" $SERVER_TYPE
+                        addIloDetails "Append" "NAS_Node2" $SERVER_TYPE
+                        addIloDetails "Append" "MWS" $SERVER_TYPE
+                        addNonMandetoryIliDetails "Append" "BIS" $SERVER_TYPE
+                        addNonMandetoryIliDetails "Append" "Netan" $SERVER_TYPE
+                        addNonMandetoryIliDetails "Append" "OCS_WITHOUT_CITRIX" $SERVER_TYPE
+                    elif [[ $STORAGE_TYPE == "fs" ]]; then #for rack
+                        addIloDetails "Overwrite" "Eniq_stats" $SERVER_TYPE
+                        addIloDetails "Append" "MWS" $SERVER_TYPE
+                        addNonMandetoryIliDetails "Append" "BIS" $SERVER_TYPE
+                        addNonMandetoryIliDetails "Append" "Netan" $SERVER_TYPE
+                        addNonMandetoryIliDetails "Append" "OCS_WITHOUT_CITRIX" $SERVER_TYPE
+                    fi
+                fi
+                break
+            ;;
+            [sS])
+            $ECHO -e "\nTerminating Execution of script.\n"
+            break
+            ;;
+            [mM])
+            modifyDetails
+            continue
+            ;;
+            [dD])
+            deleteIp
+            if [[ $SERVER_TYPE == "eniq_stats" ]]; then
+                if [[ $STORAGE_TYPE == "raw" ]]; then #for blade
+                    checkValidationSingleBlade
+                elif [[ $STORAGE_TYPE == "fs" ]]; then #for rack
+                    checkValidationSingleRack
+                fi
+            elif [[ $SERVER_TYPE == "stats_coordinator" ]]; then
+                if [[ $SAN_DEVICE == "unityXT" ]]; then #for multirack
+                    checkValidationMultiRack
+                else
+                    checkValidationMultiBlade
+                fi
+            fi
+            continue
+            ;;
+            [aA])
+            appendIloDetails "Append" $SERVER_TYPE
+            continue
+            ;;
+            *)
+            $ECHO -e "\n${ERROR_TXT}Invalid input...Try again.${STD_TXT}"
+            continue
+            ;;
+        esac
+    done
+
+else
+    #II\Migration
+    $ECHO -e "\nPlease proceed with providing ILO details.\n"
+    if [[ $SERVER_TYPE == "stats_coordinator" ]]; then
+        if [[ $SAN_DEVICE == "unityXT" ]]; then
+            #Coordinator|Engine|Reader1|Reader2|BIS|Netan|OCS_WITHOUT_CITRIX
+            addIloDetails "Overwrite" "Coordinator" $SERVER_TYPE
+            addIloDetails "Append" "Engine" $SERVER_TYPE
+            addIloDetails "Append" "Reader1" $SERVER_TYPE
+            addIloDetails "Append" "Reader2" $SERVER_TYPE
+            addIloDetails "Append" "MWS" $SERVER_TYPE
+            addNonMandetoryIliDetails "Append" "BIS" $SERVER_TYPE
+            addNonMandetoryIliDetails "Append" "Netan" $SERVER_TYPE
+            addNonMandetoryIliDetails "Append" "OCS_WITHOUT_CITRIX" $SERVER_TYPE
+            fileReCheck
+        else
+            #Coordinator|Engine|Reader1|Reader2|BIS|Netan|Nas Node1|Nas Node2|OCS_WITHOUT_CITRIX
+            addIloDetails "Overwrite" "Coordinator" $SERVER_TYPE
+            addIloDetails "Append" "Engine" $SERVER_TYPE
+            addIloDetails "Append" "Reader1" $SERVER_TYPE
+            addIloDetails "Append" "Reader2" $SERVER_TYPE
+            addIloDetails "Append" "NAS_Node1" $SERVER_TYPE
+            addIloDetails "Append" "NAS_Node2" $SERVER_TYPE
+            addIloDetails "Append" "MWS" $SERVER_TYPE
+            addNonMandetoryIliDetails "Append" "BIS" $SERVER_TYPE
+            addNonMandetoryIliDetails "Append" "Netan" $SERVER_TYPE
+            addNonMandetoryIliDetails "Append" "OCS_WITHOUT_CITRIX" $SERVER_TYPE
+            fileReCheck
+        fi
+
+    elif [[ $SERVER_TYPE == "eniq_stats" ]]; then
+        #Eniq_stats|BIS|Netan|Nas Node1|Nas Node2|MWS|OCS_WITHOUT_CITRIX
+        if [[ $STORAGE_TYPE == "raw" ]]; then #for blade
+            addIloDetails "Overwrite" "Eniq_stats" $SERVER_TYPE
+            addIloDetails "Append" "NAS_Node1" $SERVER_TYPE
+            addIloDetails "Append" "NAS_Node2" $SERVER_TYPE
+            addIloDetails "Append" "MWS" $SERVER_TYPE
+            addNonMandetoryIliDetails "Append" "BIS" $SERVER_TYPE
+            addNonMandetoryIliDetails "Append" "Netan" $SERVER_TYPE
+            addNonMandetoryIliDetails "Append" "OCS_WITHOUT_CITRIX" $SERVER_TYPE
+            fileReCheck
+        elif [[ $STORAGE_TYPE == "fs" ]]; then #for rack
+            addIloDetails "Overwrite" "Eniq_stats" $SERVER_TYPE
+            addIloDetails "Append" "MWS" $SERVER_TYPE
+            addNonMandetoryIliDetails "Append" "BIS" $SERVER_TYPE
+            addNonMandetoryIliDetails "Append" "Netan" $SERVER_TYPE
+            addNonMandetoryIliDetails "Append" "OCS_WITHOUT_CITRIX" $SERVER_TYPE
+            fileReCheck
+        fi
+    fi
+fi
+

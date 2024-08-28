@@ -1,0 +1,60 @@
+#!/bin/bash
+
+BASH=/usr/bin/bash
+ECHO='/usr/bin/echo -e'
+EXIT=/usr/bin/exit
+RM=/usr/bin/rm
+if [ ! "${ENIQ_BASE_DIR}" ]; then
+    # Directory on the root filesystem
+    ENIQ_BASE_DIR=/eniq
+fi
+ENIQ_CORE_INST_DIR=${ENIQ_BASE_DIR}/installation/core_install
+
+# ENIQ admin bin directory
+ENIQ_ADMIN_BIN=${ENIQ_BASE_DIR}/admin/bin
+
+
+if [ ! -s ${ENIQ_CORE_INST_DIR}/bin/add_iq_sys_main_dbspaces.bsh ]; then
+        $ECHO "ERROR: ${ENIQ_CORE_INST_DIR}/bin/add_iq_sys_main_dbspaces.bsh File not found"
+        exit 1
+fi
+
+if [ ! -s ${ENIQ_CORE_INST_DIR}/bin/add_main_dbspaces.bsh ]; then
+        $ECHO "ERROR: ${ENIQ_CORE_INST_DIR}/bin/add_main_dbspaces.bsh File not found"
+        exit 1
+fi
+
+if [ ! -s ${ENIQ_CORE_INST_DIR}/bin/add_temp_dbspaces.bsh ]; then
+        $ECHO "ERROR: ${ENIQ_CORE_INST_DIR}/bin/add_temp_dbspaces.bsh File not found"
+        exit 1
+fi
+
+
+##### Main
+if [ ! -f ${ENIQ_ADMIN_BIN}/rack_exp_in_progress ]; then
+    $ECHO "\nExpanding the IQ SYS Main DB spaces\n"
+    $BASH ${ENIQ_CORE_INST_DIR}/bin/add_iq_sys_main_dbspaces.bsh -c ${ENIQ_BASE_DIR}/sw/conf/ -d ${ENIQ_BASE_DIR}/sw/conf/niq.ini -s ${ENIQ_BASE_DIR}/installation/config/sym_links.ini 2>/dev/null
+    if [ $? -ne 0 ] ; then
+        $ECHO "ERROR: Expanding the IQ SYS Main DB spaces"
+        exit 1
+    fi
+fi
+
+
+$ECHO "\nExpanding the Main DB spaces\n"
+$BASH ${ENIQ_CORE_INST_DIR}/bin/add_main_dbspaces.bsh -c ${ENIQ_BASE_DIR}/sw/conf/ -d ${ENIQ_BASE_DIR}/sw/conf/niq.ini -s ${ENIQ_BASE_DIR}/installation/config/sym_links.ini 2>/dev/null
+if [ $? -ne 0 ] ; then
+    $ECHO "ERROR: Expanding the Main DB spaces"
+    exit 1
+fi
+
+$ECHO "\nExpanding the Temp DB spaces\n"
+$BASH ${ENIQ_CORE_INST_DIR}/bin/add_temp_dbspaces.bsh -c ${ENIQ_BASE_DIR}/sw/conf/ -d ${ENIQ_BASE_DIR}/sw/conf/niq.ini -s ${ENIQ_BASE_DIR}/installation/config/sym_links.ini 2>/dev/null
+if [ $? -ne 0 ] ; then
+    $ECHO "ERROR: Expanding the Temp DB spaces"
+    exit 1
+fi
+
+$RM -rf ${ENIQ_ADMIN_BIN}/rack_exp_in_progress
+
+exit 0

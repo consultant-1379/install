@@ -1,0 +1,5 @@
+# This file contains the names of the different partition plans
+# that can be used during installation
+#
+DEFAULT
+LIMITED

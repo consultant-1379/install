@@ -1,0 +1,501 @@
+#!/usr/bin/bash
+#********************************************************************
+# Ericsson Radio Systems AB SCRIPT
+#********************************************************************
+#
+# (c) Ericsson Radio Systems AB 2018 - All rights reserved.
+#
+# The copyright to the computer program(s) herein is the property
+# of Ericsson Radio Systems AB, Sweden. The programs may be used
+# and/or copied only with the written permission from Ericsson Radio
+# Systems AB or in accordance with the terms and conditions stipulated
+# in the agreement/contract under which the program(s) have been
+# in the agreement/contract under which the program(s) have been
+# supplied.
+#
+#********************************************************************
+# Name     : counter_vol_exp_zfs.bsh
+# Date     : 07/03/2018
+# Revision : \main\5
+# Purpose  : A wrapper script to update database size and partition plan to support
+#             higher counter volume on Rack server
+# Usage    : counter_vol_exp_zfs.bsh -e -p <partition plan> [ -l <path_to_logfile> ]
+#
+#********************************************************************
+#
+#       Command Section
+#
+#********************************************************************
+AWK=/usr/bin/awk
+BASENAME=/usr/bin/basename
+CAT=/usr/bin/cat
+CHMOD=/usr/bin/chmod
+CLEAR=/usr/bin/clear
+CP=/usr/bin/cp
+DATE=/usr/bin/date
+DIRNAME=/usr/bin/dirname
+ECHO=/usr/bin/echo
+EXPR=/usr/bin/expr
+GEGREP=/usr/sfw/bin/gegrep
+GETENT=/usr/bin/getent
+GGREP=/usr/sfw/bin/ggrep
+GREP=/usr/bin/grep
+HEAD=/usr/bin/head
+ID=/usr/bin/id
+LS=/usr/bin/ls
+MYHOSTNAME=/usr/bin/hostname
+MKDIR=/usr/bin/mkdir
+NAWK=/usr/bin/nawk
+PERL=/usr/bin/perl
+PS=/usr/bin/ps
+RM=/usr/bin/rm
+SED=/usr/bin/sed
+SORT=/usr/bin/sort
+SLEEP=/usr/bin/sleep
+SSH=/usr/bin/ssh
+SU=/usr/bin/su
+SVCADM=/usr/sbin/svcadm
+SVCS=/usr/bin/svcs
+TEE=/usr/bin/tee
+TOUCH=/usr/bin/touch
+UNIQ=/usr/bin/uniq
+WC=/usr/bin/wc
+ZFS=/usr/sbin/zfs
+ZPOOL=/usr/sbin/zpool
+# ********************************************************************
+#
+#       Configuration Section
+#
+# ********************************************************************
+
+# Name of SunOS File
+SUNOS_INI=SunOS.ini
+ENIQ_INI=niq.ini
+
+# Default user
+DEFAULT_USER=root
+#********************************************************************
+#
+#       Functions Section
+#
+#********************************************************************
+### Function: abort_script ###
+#
+# This Function will abort the script if any issues or errors.
+#
+# Arguments:
+#       $1 - Error message from part of program (Not always used)
+#        $2 - Exec Shell cmd (Not always used)
+# Return Values:
+#       none
+abort_script()
+{
+ABORT_TIME=`$DATE '+%Y-%b-%d_%H.%M.%S'`
+if [ "$1" ]; then
+    _err_msg_=$1
+else
+    _err_msg_="$ABORT_TIME - ERROR : Script aborted.......\n"
+fi
+
+if [ -d ${TEM_DIR} ]; then
+    $RM -rf ${TEM_DIR}
+    if [ $? -ne 0 ]; then
+        _err_msg_="Could not delete directory $TEM_DIR. Please delete it manually."
+    fi
+fi
+
+if [ "${LOGFILE}" ]; then
+    $ECHO "\n${ABORT_TIME} - ERROR : $_err_msg_\n" | $TEE -a ${LOGFILE}
+else
+    $ECHO "\n${ABORT_TIME} - ERROR : $_err_msg_\n"
+fi
+
+if [ "$2" ]; then
+    ${2}
+    exit 1
+else
+    exit 1
+fi
+}
+
+### Function: check_params ###
+#
+# Check Input Params
+#
+# Arguments:
+#    none
+# Return Values:
+#    none
+check_params()
+{
+# Checking if the parameters are passed
+if [ ! "${EXPAND_DWHDB}" -a ! "${PARTITION_PLAN}" ]; then
+    usage_msg
+	exit 1 
+fi
+
+# Checking if the entered partition plan is valid
+if [ ! -z "${PARTITION_PLAN}" ]; then
+    if [ "${PARTITION_PLAN}" != "limited_plan" -a "${PARTITION_PLAN}" != "default_plan" ]; then
+        _err_msg_="The partition plan type passed with -p is invalid."
+	    abort_script "${_err_msg_}" 
+    fi
+fi
+
+# Checking if expansion parameter is passed with default_plan 
+if [ "${PARTITION_PLAN}" == "default_plan" -a ! "${EXPAND_DWHDB}" ]; then
+    _err_msg_="The parameter -e needs to be passed with partition plan default_plan to expand dwhdb"
+	abort_script "${_err_msg_}" 
+fi
+}
+
+
+### Function: check_user_id ###
+#
+#   Check that the effective id of the user is correct
+#   If not print error msg and exit.
+#
+# Arguments:
+#       $1 : User ID name
+# Return Values:
+#       none
+check_user_id()
+{
+_check_id_=`$ID | $AWK -F\( '{print $2}' | $AWK -F\) '{print $1}'`
+if [ "$_check_id_" != "$1" ]; then
+    _err_msg_="You must be $1 to execute this script"
+    abort_script "${_err_msg_}" 
+fi
+}
+
+### Function: get_absolute_path ###
+#
+# Determine absolute path to software
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+get_absolute_path()
+{
+_dir_=`$DIRNAME $0`
+SCRIPTHOME=`cd $_dir_ 2>/dev/null && pwd || $ECHO $_dir_`
+}
+
+### Function: setup_env ###
+#
+# Set up environment variables for script.
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+setup_env()
+{
+
+#Check parameters
+check_params
+
+if [ ! "${ENIQ_BASE_DIR}" ]; then
+    # Directory on the root filesystem
+    ENIQ_BASE_DIR=/eniq
+fi
+
+# ENIQ Admin Directory
+ENIQ_ADMIN_DIR=${ENIQ_BASE_DIR}/admin
+
+# ENIQ Log Directory
+ENIQ_LOG_DIR=${ENIQ_BASE_DIR}/local_logs
+
+# ENIQ Admin Bin Directory
+ENIQ_ADMIN_BIN_DIR=${ENIQ_ADMIN_DIR}/bin
+
+# ENIQ TP Installer
+TP_INSTALLER=tp_installer
+
+# ENIQ SW conf
+CLI_CONF_DIR=${ENIQ_BASE_DIR}/sw/conf
+
+# Main Directory for the Core Installation SW
+ENIQ_INST_DIR=${ENIQ_BASE_DIR}/installation
+
+# Main Directory for the Core Installation SW
+ENIQ_CORE_INST_DIR=${ENIQ_INST_DIR}/core_install
+
+# Main Directory for the Core Installation etc SW
+ENIQ_CORE_ETC_DIR=${ENIQ_CORE_INST_DIR}/etc
+
+# ENIQ Config Directory
+ENIQ_CONF_DIR=${ENIQ_INST_DIR}/config
+
+# Installer directory in the ENIQ filesystem
+ENIQ_INSTALLER_DIR=${ENIQ_BASE_DIR}/sw/installer
+
+# File containing the type of OSS installation. Eg. events or statistics
+INST_TYPE_FILE=${ENIQ_CONF_DIR}/ericsson_use_config
+if [ ! -s "${INST_TYPE_FILE}" ]; then
+    _err_msg_="ENIQ install type not defined in ${INST_TYPE_FILE}"
+    abort_script "${_err_msg_}"  
+fi
+# Read the installation type - should be "events" or "stats"
+INSTALL_TYPE=`$CAT ${INST_TYPE_FILE} | $NAWK -F\= '{print $2}'`
+
+# Templates Directory
+ENIQ_TEMPL_DIR="`$DIRNAME ${SCRIPTHOME}`/templates/${INSTALL_TYPE}"
+
+# Common SW directory
+ENIQ_COMMON_SW_DIR="`$DIRNAME ${SCRIPTHOME}`/templates/common"
+
+# File containg IP address of jumpstart server (if any)
+SERVERFILE=${ENIQ_CONF_DIR}/INSTALL_SERVER
+
+# Location of ENIQ status file. This contains overall version of ENIQ
+ENIQ_STATUS_FILE=${ENIQ_ADMIN_DIR}/${ENIQ_VERSION_DIR}/${ENIQ_STATUS}
+
+# File containing the list of server types
+SERVER_TYPE_LIST_FILE=${ENIQ_CORE_INST_DIR}/etc/${INSTALL_TYPE}_server_list
+
+#var tmp directory
+VAR_TMP=/var/tmp
+
+#Checking the storage type raw/zfs
+if [ -s ${ENIQ_CONF_DIR}/san_details ]; then
+    STORAGE_TYPE=`$CAT ${ENIQ_CONF_DIR}/san_details | $GEGREP "^STORAGE_TYPE=" | $NAWK -F\= '{print $2}'`
+	if [ $? -ne 0 ]; then
+        _err_msg_="Could not get storage type from ${ENIQ_CONF_DIR}/san_details file"
+        abort_script "${_err_msg_}"
+	else
+	    if [ "${STORAGE_TYPE}" != "zfs" ]; then
+		    _err_msg_="The current storage type is not zfs. This script should be run only on Rack server"
+            abort_script "${_err_msg_}"
+		fi
+    fi
+fi
+
+# Source the common functions
+if [ -s ${ENIQ_CORE_INST_DIR}/lib/common_functions.lib ]; then
+    . ${ENIQ_CORE_INST_DIR}/lib/common_functions.lib
+else
+    _err_msg_="File ${ENIQ_CORE_INST_DIR}/lib/common_functions.lib not found"
+    abort_script "${_err_msg_}" 
+fi
+# Get the System User.
+_sysuser_=`iniget ENIQ_INSTALL_CONFIG -f ${ENIQ_CONF_DIR}/${SUNOS_INI} -v ENIQ_SYSUSER`
+if [ ! "${_sysuser_}" ]; then
+    _err_msg_="Could not read parameter ENIQ_SYSUSER from ${ENIQ_CONF_DIR}/${SUNOS_INI} file"
+    abort_script "${_err_msg_}" 
+fi
+
+}
+
+### Function: usage_msg ###
+#
+# Print out the usage message
+#
+# Arguments:
+#	none
+# Return Values:
+#	none
+usage_msg() 
+{
+$CLEAR
+$ECHO "
+Usage: `$BASENAME $0` { -e | -p <partition_plan> }
+						 [ -l <path_to_logfile> ]
+                      
+options:
+
+-e  : Parameter specifying the database needs to be expanded to support higher counter volume
+
+-p  : Parameter specifying the partition plan that needs to be updated
+  
+-l  : Optional parameter specifying the full path to logfile. If not specified, a 
+      logfile will be created in ${ENIQ_LOG_DIR}/counter_vol_exp_zfs directory
+"   
+}
+
+#********************************************************************
+#
+#       Main body of program
+#
+#********************************************************************
+RUNTIME=`$DATE '+%Y-%b-%d'`
+
+# Determine absolute path to software
+get_absolute_path
+
+# Check that the effective id of the user is root
+check_user_id $DEFAULT_USER
+
+while getopts ":p:l:e" arg; do
+    case $arg in
+    p) PARTITION_PLAN="$OPTARG"
+        ;;
+    e) EXPAND_DWHDB="YES"
+        ;;
+    l) LOGFILE="$OPTARG"
+        ;;
+    esac
+done
+
+# Set up environment variables for script.
+setup_env
+
+# Log file
+if [ ! "${LOGFILE}" ]; then
+    $MKDIR -p ${ENIQ_LOG_DIR}/counter_vol_exp_zfs
+    LOGFILE="${ENIQ_LOG_DIR}/counter_vol_exp_zfs/${RUNTIME}_counter_vol_exp_zfs.log"
+fi
+
+# If log file doesn't exist, create log file
+if [ ! -f "${LOGFILE}" ]; then
+    $TOUCH ${LOGFILE}
+    if [ $? -ne 0 ]; then
+        _err_msg_="Could not make log file"
+        abort_script "$_err_msg_"
+    fi
+
+    $CHMOD 777 ${LOGFILE}
+    if [ $? -ne 0 ]; then
+        _err_msg_="Could not change permissions of log file"
+        abort_script "$_err_msg_"
+    fi
+fi
+
+# Create a temporary Directory
+TEM_DIR=/tmp/counter_vol_exp.$$.$$
+if [ -d ${TEM_DIR} ]; then
+    $RM -rf ${TEM_DIR}
+    if [ $? -ne 0 ]; then
+        _err_msg_="Could not delete directory $TEM_DIR. Please delete it manually."
+        abort_script "${_err_msg_}" 
+    fi
+fi
+
+$MKDIR -p ${TEM_DIR}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not create directory $TEM_DIR"
+    abort_script "${_err_msg_}" 
+fi
+
+#Change deployment type
+if [ "${PARTITION_PLAN}" == "limited_plan" ]; then
+    log_msg -s "Changing the current deployment type to large" -l ${LOGFILE}
+    log_msg -q -s "Starting to run $BASH ${ENIQ_ADMIN_BIN_DIR}/exp_set_deployment.bsh to change deployment type" -l ${LOGFILE}
+    $BASH ${ENIQ_ADMIN_BIN_DIR}/exp_set_deployment.bsh -l ${LOGFILE}
+	if [ $? -ne 0 ]; then
+        _err_msg_="Could not change the deployment type to Large"
+        abort_script "${_err_msg_}" 
+    fi
+fi
+
+if [ "${EXPAND_DWHDB}" == "YES" -a ! -f ${VAR_TMP}/database_resize_complete ]; then
+    # Stopping all the ENIQ services
+    log_msg -s "Stopping all the ENIQ services" -l ${LOGFILE}
+    log_msg -q -s "Starting to run ${ENIQ_ADMIN_BIN_DIR}/manage_eniq_services.bsh -a stop -s ALL to stop ENIQ services" -l ${LOGFILE}
+    $BASH ${ENIQ_ADMIN_BIN_DIR}/manage_eniq_services.bsh -a stop -s ALL -N
+    if [ $? -ne 0 ]; then
+        _err_msg_="Could not stop ENIQ services"
+	abort_script "${_err_msg_}" 
+    fi
+
+    #Turn on dwhdb service
+    log_msg -s "Starting dwhdb service ..." -l ${LOGFILE}
+    $SVCADM enable -s svc:/eniq/dwhdb:default
+    if [ $? -ne 0 ]; then
+	_err_msg_="Could not start dwhdb service"
+	abort_script "${_err_msg_}" 
+    fi	
+    
+    if [ ! -f "${VAR_TMP}/update_cell_node_complete" ]; then
+	#Update niq.ini and sym_link.ini file with new dbfiles 
+	log_msg -s "Starting to update ${ENIQ_INI} and sym_lini.ini files with new dbfiles" -l ${LOGFILE}
+	log_msg -q -s "Starting to run $BASH ${ENIQ_ADMIN_BIN_DIR}/update_cell_node_count.bsh to update ${ENIQ_INI} and sym_lini.ini files" -l ${LOGFILE}
+	$BASH ${ENIQ_ADMIN_BIN_DIR}/update_cell_node_count.bsh -l ${LOGFILE}
+	if [ $? -ne 0 ]; then
+    	    _err_msg_="Could not update the required configuration files"
+	    abort_script "${_err_msg_}" 
+	else
+     	    $TOUCH ${VAR_TMP}/update_cell_node_complete
+	fi
+    fi
+		
+    # Resize database
+    log_msg -h -t -s "Resizing database...." -l ${LOGFILE}
+    log_msg -q -s "Starting to run ${ENIQ_ADMIN_BIN_DIR}/resizedb to resize database" -l ${LOGFILE}
+    $SU - ${_sysuser_} -c "$BASH ${ENIQ_ADMIN_BIN_DIR}/resizedb -l ${LOGFILE}"
+    if [ $? -ne 0 ]; then
+	_err_msg_="Could not resize dwhdb"
+	abort_script "${_err_msg_}" 
+    fi 
+		
+    # Starting all the ENIQ services
+    log_msg -s "\nStarting to run ${ENIQ_ADMIN_BIN_DIR}/manage_eniq_services.bsh -a start -s ALL -N to start ENIQ services" -l ${LOGFILE}
+    $BASH ${ENIQ_ADMIN_BIN_DIR}/manage_eniq_services.bsh -a start -s ALL -N
+    if [ $? -ne 0 ] ; then
+	_err_msg_="Could no start ENIQ services"
+	abort_script "${_err_msg_}" 
+    fi
+
+    $TOUCH ${VAR_TMP}/database_resize_complete
+fi
+
+#Updating the partition plan
+
+#Checking the existing partition plan
+_plan_value_=`iniget PARTITION_PLAN -f ${ENIQ_CONF_DIR}/${ENIQ_INI} -v Partition_Plan`
+if [ ! "${_plan_value_}" ]; then
+    _err_msg_="Could not read parameter PARTITION_PLAN from ${ENIQ_CONF_DIR}/${ENIQ_INI} file"
+    abort_script "$_err_msg_"
+fi
+
+if [ "${_plan_value_}" != "${PARTITION_PLAN}" ]; then
+
+    #Updating the partition plan
+    log_msg -h -t -s "Updating the partition plan...." -l ${LOGFILE}
+    log_msg -q -s "Starting to run ${ENIQ_INSTALLER_DIR}/update_partition_plan.bsh -p -a ${PARTITION_PLAN} to update partition plan" -l ${LOGFILE}
+    $SU - ${_sysuser_} -c "$BASH ${ENIQ_INSTALLER_DIR}/update_partition_plan.bsh -p -a ${PARTITION_PLAN}"
+    if [ $? -ne 0 ]; then
+	_err_msg_="Could not update the partition plan"
+	abort_script "${_err_msg_}" 
+    fi 
+
+    # Taking backup of ${ENIQ_INI} to update partition plan
+    $CP ${ENIQ_CONF_DIR}/${ENIQ_INI} ${TEM_DIR}/${ENIQ_INI}
+    if [ $? -ne 0 ]; then
+        _err_msg_="Could not copy ${ENIQ_CONF_DIR}/${ENIQ_INI} to ${TEM_DIR}/${ENIQ_INI}"
+        abort_script "${_err_msg_}" 
+    fi
+	
+    # Starting all the ENIQ services
+    log_msg -q -s "\nChanging the Partition_Plan parameter in ${TEM_DIR}/${ENIQ_INI} to ${PARTITION_PLAN}" -l ${LOGFILE}
+    iniset PARTITION_PLAN -f ${TEM_DIR}/${ENIQ_INI} Partition_Plan=${PARTITION_PLAN}
+    if [ $? -ne 0 ]; then
+        _err_msg_="Could not update ${TEM_DIR}/${ENIQ_INI}} with Partition_Plan=${PARTITION_PLAN}"
+        abort_script "$_err_msg_"
+    fi
+
+    log_msg -q -s "\nCopying ${TEM_DIR}/${ENIQ_INI} to ${ENIQ_CONF_DIR}/${ENIQ_INI}" -l ${LOGFILE} 
+    $CP ${TEM_DIR}/${ENIQ_INI} ${ENIQ_CONF_DIR}/${ENIQ_INI}
+    if [ $? -ne 0 ]; then
+        _err_msg_="Could not copy ${TEM_DIR}/${ENIQ_INI} to ${ENIQ_CONF_DIR}/${ENIQ_INI}"
+        abort_script "${_err_msg_}" 
+    fi
+
+    log_msg -q -s "\nCopying ${TEM_DIR}/${ENIQ_INI} to ${CLI_CONF_DIR}/${ENIQ_INI}" -l ${LOGFILE}	
+    $CP ${TEM_DIR}/${ENIQ_INI} ${CLI_CONF_DIR}/${ENIQ_INI}
+    if [ $? -ne 0 ]; then
+        _err_msg_="Could not copy ${TEM_DIR}/${ENIQ_INI} to ${CLI_CONF_DIR}/${ENIQ_INI}"
+        abort_script "${_err_msg_}" 
+    fi
+
+    log_msg -s "Updated the partition plan parameter in niq.ini file to ${PARTITION_PLAN}" -l ${LOGFILE}
+fi
+
+$RM -rf ${TEM_DIR}
+
+$RM -rf ${VAR_TMP}/update_cell_node_complete
+
+$RM -rf ${VAR_TMP}/database_resize_complete
+
+exit 0

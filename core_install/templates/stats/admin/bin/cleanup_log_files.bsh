@@ -1,0 +1,1370 @@
+#!/bin/bash
+# ********************************************************************
+# Ericsson Radio Systems AB                                     SCRIPT
+# ********************************************************************
+#
+#
+# (c) Ericsson Radio Systems AB 2019 - All rights reserved.
+#
+# The copyright to the computer program(s) herein is the property
+# of Ericsson Radio Systems AB, Sweden. The programs may be used
+# and/or copied only with the written permission from Ericsson Radio
+# Systems AB or in accordance with the terms and conditions stipulated
+# in the agreement/contract under which the program(s) have been
+# supplied.
+#
+# ********************************************************************
+# Name:         cleanup_log_files.bsh
+# Date:         09/10/2023
+# Purpose:      Cleanup archives from specific directory.
+# Revision:     \main\17
+# Usage:        ./cleanup_log_files.bsh
+#
+# ********************************************************************
+#
+#   Command Section
+#
+# ********************************************************************
+AWK=/usr/bin/awk
+BASH=/usr/bin/bash
+BC=/usr/bin/bc
+CAT=/usr/bin/cat
+COMPRESS=/usr/bin/compress
+CUT=/usr/bin/cut
+DATE=/usr/bin/date
+DF=/usr/bin/df
+DIRNAME=/usr/bin/dirname
+ECHO='/usr/bin/echo -e'
+EGREP=/usr/bin/egrep
+FIND=/usr/bin/find
+GREP=/usr/bin/grep
+GUNZIP=/usr/bin/gunzip
+GZIP=/usr/bin/gzip
+HEAD=/usr/bin/head
+ID=/usr/bin/id
+LS=/usr/bin/ls
+MKDIR=/usr/bin/mkdir
+MYHOSTNAME=/usr/bin/hostname
+RM=/usr/bin/rm
+SORT=/usr/bin/sort
+TAIL=/usr/bin/tail
+TEE=/usr/bin/tee
+TOUCH=/usr/bin/touch
+TR=/usr/bin/tr
+UNIQ=/usr/bin/uniq
+VGS=/usr/sbin/vgs
+WC=/usr/bin/wc
+XARGS=/usr/bin/xargs
+
+# ********************************************************************
+#
+#       Configuration Section
+#
+# ********************************************************************
+
+# Flag to determine whether to compress log or not (Must be y/n)
+COMPRESS_LOG=n
+
+# Default user
+DEFAULT_USER=root
+
+# Index value
+INDEX_VAL="1"
+
+# Number of log files to keep
+NUM_LOGS=10
+
+# NAS partition size limit beyond which engine would be set to no loads
+_nas_limit_=90
+
+# Root partition size limit beyond which engine would be set to no loads
+_root_limit_=95
+
+# Flag value for setting engine to noloads  
+_set_engine_no_loads_=0
+
+# Size in kbytes that the log file is allowed to grow to
+SIZE_LOGS=50000
+
+# FS partition size limit beyond which engine would be set to no loads
+_fs_limit_=90
+
+# ********************************************************************
+#
+#   Functions
+#
+# ********************************************************************
+### Function: abort_script ###
+#
+#   This will be called if error is encountered during runtime
+#
+# Arguments:
+#       $1 - Error message from part of program 
+# Return Values:
+#       none
+abort_script()
+{
+_err_time_=`$DATE '+%Y-%b-%d_%H.%M.%S'`
+
+if [ "$1" ]; then
+    _err_msg_="${_err_time_} - $1"
+else
+    _err_msg_="${_err_time_} - ERROR : Script aborted.......\n"
+fi
+
+if [ "${LOGFILE}" ]; then
+    $ECHO "\nERROR : ${_err_msg_}\n" | $TEE -a ${LOGFILE}
+else
+    $ECHO "\nERROR : ${_err_msg_}\n"
+fi
+
+cd $SCRIPTHOME
+$RM -rf ${TEM_DIR}
+exit 1
+}
+
+### Function:check_iqtrace_file  ###
+#
+#  check the iqtrace file 
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+check_iqtrace_file()
+{
+log_msg -s "===================================================================" -l ${LOGFILE}
+log_msg -s "INFO:: Handling iqtrace_file" -l ${LOGFILE} | $TEE -a ${DEBUG_LOGFILE} 
+
+if [ "${CURR_SERVER_TYPE}" == "stats_iqr" ]; then
+    _cfg_loc_=${ENIQ_DATABASE_RD}
+else
+    _cfg_loc_=${ENIQ_DATABASE}
+fi
+
+if [ -f ${_cfg_loc_}/dwhdb.cfg ]; then
+    _log_location_=`$GREP -w zo ${_cfg_loc_}/dwhdb.cfg | $AWK -F" " '{print $2}'`
+    if [ -f ${_log_location_} ]; then
+        log_msg -s "checking partition size" -l ${LOGFILE} | $TEE -a ${DEBUG_LOGFILE}
+        _dir_path_=`dirname $_log_location_`
+        $DF -kh $_dir_path_ | $GREP "pool" >> /dev/null 2>&1
+        if [ $? -eq 0 ]; then
+            _file_system_=`$DF -kh $_dir_path_ |$AWK '{if (NR!=1) {print $1}}' `
+           _size_=`$DF -kh  $_dir_path_ |$AWK '{if (NR!=1) {print $5}}'|$AWK -F"%" '{print $1}'`
+			if [ $? -ne 0 ]; then
+                            _err_msg_="Could not found size"
+                            abort_script "${_err_msg_}"
+            fi
+            
+        else
+            _size_=`$DF -kh $_dir_path_ | $TR -s " " "" | $TAIL -1 | $CUT -d" " -f5 | $AWK -F"%" '{print $1}'`
+			if [ $? -ne 0 ]; then
+                            _err_msg_="Could not found size"
+                            abort_script "${_err_msg_}"
+            fi
+        fi
+        if [ $_size_ -ge 90 ]; then
+          # call handle_iqtrace_file function to handle iqtrace file  
+          log_msg -s "Partition size reached  threshold value: IQ handling  needed" -l ${LOGFILE} | $TEE -a ${DEBUG_LOGFILE} 
+          handle_iqtrace_file 
+        else
+            log_msg -s "Partition size not exceeded the threshold value: IQ handling not needed" -l ${LOGFILE} | $TEE -a ${DEBUG_LOGFILE}
+            log_msg -s "===================================================================" -l ${LOGFILE}
+        fi
+    else
+          _debug_log_=`$GREP "^#.*-zo" ${_cfg_loc_}/dwhdb.cfg`
+         if [ -z "${_debug_log_}" ]; then 
+             log_msg -s "${_log_location_} does not exist" -l ${LOGFILE} | $TEE -a ${DEBUG_LOGFILE} 
+             log_msg -s "===================================================================" -l ${LOGFILE}
+         else
+            log_msg -s "INFO::IQ handling not needed" -l ${LOGFILE} | $TEE -a ${DEBUG_LOGFILE}
+ 
+         fi
+    fi
+else
+  log_msg -s "INFO::IQ handling not needed" -l ${LOGFILE} | $TEE -a ${DEBUG_LOGFILE}
+fi
+}
+
+
+
+### Function:check_partiion_size ###
+#
+#  check the filesystem size
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+check_partition_size()
+{
+insert_header_footer head "INFO:: Launching Force Cleanup" ${LOGFILE} | $TEE -a ${DEBUG_LOGFILE}
+log_msg -s "===================================================================" -l ${LOGFILE}
+log_msg -s "Partition check status" -l ${LOGFILE} | $TEE -a ${DEBUG_LOGFILE}
+log_msg -s "Checking filesystem size" -l ${LOGFILE}
+
+for _entry_ in `$CAT ${TEM_DIR}/cfg_file_loc` ; do
+    log_msg -q -t -s "Info::Checking the entry ${_entry_}" -l ${DEBUG_LOGFILE}
+    _dir_path_to_check_=`$ECHO ${_entry_} | $AWK -F:: '{ print $1 }'`  
+    _log_file_name_=`$ECHO ${_entry_} | $AWK -F:: '{ print $2 }'`
+    if [ -z "${_dir_path_to_check_}" -o -z "${_log_file_name_}" ]; then
+      log_msg -s "WARNING::Skipping cleanup of old logfile for ${_entry_}" -l ${DEBUG_LOGFILE}
+      continue
+    fi
+
+    if [ "${_dir_path_to_check_}" == "{dir_path}" -o "${_log_file_name_}" == "{log_file_pattern}" ]; then
+           log_msg -q -t -s "INFO::This is pattern for IQ log handling which will be added during runtime skip this pattern while processing" -l ${DEBUG_LOGFILE}
+          continue
+    else
+        if [ ! -d ${_dir_path_to_check_} ]; then
+            log_msg -q -t -s "INFO::${_dir_path_to_check_} directory not present" -l ${DEBUG_LOGFILE}
+            continue
+        fi
+    fi
+        $DF -hk ${_dir_path_to_check_} | $GREP -i nas >> /dev/null 2>&1
+        if [ $? -eq 0 ]; then
+                if [ "${CURR_SERVER_TYPE}" != "stats_coordinator" -a "${CURR_SERVER_TYPE}" != "eniq_stats" ]; then
+                log_msg -t -s "INFO::Skipping the entry ${_entry_} as it is not coordinator server." -l ${LOGFILE} | $TEE -a ${DEBUG_LOGFILE}
+                continue
+                fi
+        fi
+    $DF -kh $_dir_path_to_check_ | $GREP "pool" >> /dev/null 2>&1
+    if [ $? -eq 0 ]; then
+          _file_system_=`$DF -kh $_dir_path_to_check_|$AWK '{if (NR!=1) {print $1}}'`
+          _size_=`$DF -kh $_dir_path_to_check_|$AWK -F"%" '{print $1}'|$AWK '{if (NR!=1) {print $5}}'`  
+		  if [ $? -ne 0 ]; then
+            _err_msg_="Could not found size"
+            abort_script "${_err_msg_}"
+          fi
+		  if [ "${_size_}" -ge "80" ]; then
+             $ECHO "${_dir_path_to_check_}">>${TEM_DIR}/directory_path
+            _file_system_=`$DF -kh $_dir_path_to_check_ | $AWK '{if (NR!=1) {print $1}}'>> ${TEM_DIR}/file_system`
+		  fi
+	    #done <<< "$($DF -hk | $GREP eniq_stats_pool| $AWK '{print $1 " " $5}')"
+   
+	else
+        _size_=`$DF -kh $_dir_path_to_check_ |  $TAIL -1 |  $AWK '{print $5'} | $AWK -F"%" '{print $1}'`
+		if [ $? -ne 0 ]; then
+            _err_msg_="Could not found size"
+            abort_script "${_err_msg_}"
+        fi
+		if [ "${_size_}" -ge "80" ]; then
+         $ECHO "${_dir_path_to_check_}">>${TEM_DIR}/directory_path
+        _file_system_=`$DF -kh $_dir_path_to_check_ | $AWK '{if (NR!=1) {print $1}}'>> ${TEM_DIR}/file_system`
+        fi
+    fi
+done
+
+if [ -f ${TEM_DIR}/directory_path ]; then
+    _file_sys_=`$CAT ${TEM_DIR}/file_system | $SORT | $UNIQ | $TEE /${TEM_DIR}/file_system`
+    _partition_=`$CAT ${TEM_DIR}/directory_path | $SORT | $UNIQ | $TR -s "\n" " " | $TEE /${TEM_DIR}/directory_path`
+    _index_val_=`$CAT "${TEM_DIR}/directory_path"`
+    _files_system_=`$CAT "${TEM_DIR}/file_system"`
+    log_msg -s "INFO:: Below filesystem reach maximum size(80%) so it needs a force cleanup" -l ${LOGFILE} | $TEE -a ${DEBUG_LOGFILE}
+    log_msg -s "${_files_system_}" -l ${LOGFILE} | $TEE -a ${DEBUG_LOGFILE}
+    log_msg -s "===================================================================" -l ${LOGFILE}
+    cleanup_logfiles "$_index_val_"
+else
+    log_msg -s "INFO:: Force Cleanup not required because size limit is not exceeded " -l ${DEBUG_LOGFILE} | $TEE -a ${LOGFILE}
+    log_msg -s "===================================================================" -l ${LOGFILE}
+fi
+
+
+insert_header_footer head "INFO:: Checking partition size to set Engine to NoLoads" ${LOGFILE} | $TEE -a ${DEBUG_LOGFILE}
+#Checking if FS partition size is greater than $_fs_limit_ to set engine to no loads
+log_msg -q -t -s "Info::Checking FS partition size" -l ${DEBUG_LOGFILE}
+
+$CAT ${FSTAB} | $GREP ${_installed_server_type_}_pool | $AWK '{print $2}' | $GREP -v swap >> ${TEM_DIR}/mount_pt
+for line in `$CAT ${TEM_DIR}/mount_pt`; do 
+    $DF -hk ${line} | $AWK '{print $1 " " $5}' |  $TAIL -1;
+done >> ${TEM_DIR}/mount_info
+
+while read output
+do
+_fs_name_=`$ECHO $output|$AWK '{print $1}'|$AWK -F"/" '{print $4}'`
+_fs_size_=`$ECHO $output|$AWK '{print $2}'|$CUT -d'%' -f1`
+if [ ${_storage_type_} == "fs" ]; then
+    if [ "${_fs_name_}" == "eniq_stats_pool-dwh_main_dbspace" -o  "${_fs_name_}" == "eniq_stats_pool-dwh_temp_dbspace" -o "${_fs_name_}" == "eniq_stats_pool-sql_anywhere" ];then
+      continue
+    elif [ $_fs_size_ -ge $_fs_limit_ ] ;then
+       _set_engine_no_loads_=1
+	  $ECHO "$_fs_name_ : Current Usage: $_fs_size_%,  Threshold Value :$_fs_limit_%" >> ${TEM_DIR}/engine_noloads_fs
+    fi
+elif [ $_fs_size_ -ge $_fs_limit_ ] ;then
+       _set_engine_no_loads_=1
+	  $ECHO "$_fs_name_ : Current Usage: $_fs_size_%,  Threshold Value :$_fs_limit_%" >> ${TEM_DIR}/engine_noloads_fs
+fi    
+
+done < ${TEM_DIR}/mount_info
+
+#Checking if root partition size is greater than $_root_limit_ to set engine to no loads
+log_msg -q -t -s "Info::Checking ROOT partition size" -l ${DEBUG_LOGFILE}
+_fs_name_=`$DF -hk /|$AWK '{if (NR!=1) {print $1}}'`
+_fs_size_=`$DF -hk /|$AWK '{if (NR!=1) {print $5}}'|$CUT -d'%' -f1`
+if [ $_fs_size_ -ge $_root_limit_ ]; then
+        _set_engine_no_loads_=1
+	$ECHO "$_fs_name_ : Current Usage: $_fs_size_%,  Threshold Value :$_root_limit_%" >>${TEM_DIR}/engine_noloads_fs
+fi
+
+#Checking if NFS partition size is greater than $_nas_limit_ to set engine to no loads
+
+$CAT $ENIQ_BASE_DIR/smf/nasd/nasd_config | $GREP nas | $AWK -F"::" '{print $NF}'>> ${TEM_DIR}/nas_mount_pt
+for line in `$CAT ${TEM_DIR}/nas_mount_pt`; do 
+    $DF -hk ${line} | $AWK '{print $1 " " $5}' | $TAIL -1;
+done >> ${TEM_DIR}/nas_mount_info
+
+if [ ${_storage_type_} == "raw" ]; then
+   log_msg -q -t -s "Info::Checking NFS partition size" -l ${DEBUG_LOGFILE}
+   while read output
+     do
+     _fs_name_=`$ECHO $output|$AWK '{print $1}'`
+     _fs_size_=`$ECHO $output|$AWK '{print $2}'|$CUT -d'%' -f1`
+        if [ $_fs_size_ -ge $_nas_limit_ ] ;then
+         _set_engine_no_loads_=1
+	     $ECHO "$_fs_name_ : Current Usage: $_fs_size_%,  Threshold Value :$_nas_limit_%" >> ${TEM_DIR}/engine_noloads_fs
+        fi
+   done < ${TEM_DIR}/nas_mount_info
+fi
+
+log_msg -s "Partition check status" -l ${LOGFILE} | $TEE -a ${DEBUG_LOGFILE}
+if [[ "${_set_engine_no_loads_}" -eq "1" ]]; then
+        log_msg -s "INFO:: Partition size limit exceeded for below filesystems:" -l ${LOGFILE} | $TEE -a ${DEBUG_LOGFILE}
+        $CAT ${TEM_DIR}/engine_noloads_fs | $TEE -a ${DEBUG_LOGFILE} ${LOGFILE}
+        log_msg -s "Setting engine to no loads." -l ${LOGFILE} | $TEE -a ${DEBUG_LOGFILE}
+        set_engine_no_loads
+else
+        log_msg -s "INFO:: Partition size limit has not exceeded for any partition." -l ${LOGFILE} | $TEE -a ${DEBUG_LOGFILE}
+fi
+
+}
+
+
+### Function: check_user ###
+#
+#   Check that the effective id of the user is correct
+#   If not print error msg and exit.
+#
+# Arguments:
+#       $1 : User ID name
+# Return Values:
+#       none
+check_user()
+{
+_check_id_=`$ID  | $AWK -F\( '{print $2}' | $AWK -F\) '{print $1}'`
+if [ "$_check_id_" != "$1" ]; then
+    _err_msg_="You must be $1 to execute this script."
+    abort_script "${_err_msg_}"
+fi
+}
+
+
+### Function: chk_create_logfile ###
+#
+# Check/Create Logfile
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+chk_create_logfile()
+{
+DEBUG_LOGFILE=${ENIQ_LOG_DIR}/cleanup_log/${HNAME}_debug_log
+LOGFILE=${ENIQ_LOG_DIR}/cleanup_log/${HNAME}_status_log
+if [ ! -d ${DEBUG_LOGFILE} ]; then 
+$MKDIR -p `$DIRNAME ${DEBUG_LOGFILE}`
+fi
+
+$TOUCH -a ${DEBUG_LOGFILE}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not write to file ${DEBUG_LOGFILE}"
+    abort_script "${_err_msg_}"
+fi
+
+$TOUCH -a ${LOGFILE}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not write to file ${LOGFILE}"
+    abort_script "${_err_msg_}"
+fi
+}
+
+
+### Function:cleanup_logfiles  ###
+#
+# cleanup the old log files
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+cleanup_logfiles()
+{
+if [ "$1" == "1" ]; then
+insert_header_footer head "INFO:: Launching cleanup" ${LOGFILE} | $TEE -a ${DEBUG_LOGFILE}
+
+# Call update_cfg_file to get the cfg file loctaion
+update_cfg_file
+
+for _entry_ in `$CAT ${TEM_DIR}/cfg_file_loc` ; do
+     log_msg -q -s "------------------------------------------------" -l ${DEBUG_LOGFILE}
+    log_msg -q -t -s "Info::Checking the entry ${_entry_}" -l ${DEBUG_LOGFILE}
+    _dir_path_to_check_=`$ECHO ${_entry_} | $AWK -F:: '{ print $1 }'`
+    _log_file_name_=`$ECHO ${_entry_} | $AWK -F:: '{ print $2 }'`
+    if [ -z "${_dir_path_to_check_}" -o -z "${_log_file_name_}" ]; then
+      log_msg -s "WARNING::Skipping cleanup of old logfile for ${_entry_}" -l ${DEBUG_LOGFILE}
+      continue
+    fi
+
+    if [ "${_dir_path_to_check_}" == "{dir_path}" -o "${_log_file_name_}" == "{log_file_pattern}" ]; then
+        log_msg -q -t -s "INFO::This is pattern for IQ log handling which will be added during runtime skip this pattern while processing" -l ${DEBUG_LOGFILE}
+        continue
+    else
+        if [ ! -d ${_dir_path_to_check_} ]; then
+            log_msg -q -t -s "INFO::${_dir_path_to_check_} directory not present" -l ${DEBUG_LOGFILE}
+            continue
+        fi
+    fi
+        $DF -hk ${_dir_path_to_check_} | $GREP -i nas >> /dev/null 2>&1
+        if [ $? -eq 0 ]; then
+                if [ "${CURR_SERVER_TYPE}" != "stats_coordinator" -a "${CURR_SERVER_TYPE}" != "eniq_stats" ]; then
+                log_msg -t -s "INFO::Skipping the entry ${_entry_} as it is not coordinator server." -l ${LOGFILE} | $TEE -a ${DEBUG_LOGFILE} 
+                continue
+                fi
+        fi
+
+
+    if [ "$_dir_path_to_check_" == "<DEFAULT>" -o "$_log_file_name_" == "<DEFAULT>" ]; then
+        log_msg -q -t -s "ERROR:Entry has null directory name or file name.Please check the cfg file." -l ${DEBUG_LOGFILE}
+        continue
+    fi
+    if [ "$_log_file_name_" == "<ALL>" ]; then
+        _log_file_name_=""
+    fi
+
+    _log_file_size_=`$ECHO ${_entry_} | $AWK -F:: '{ print $3 }'`
+    _compresion_day_=`$ECHO ${_entry_} | $AWK -F:: '{ print $4 }'`
+    _removal_day_=`$ECHO ${_entry_} | $AWK -F:: '{ print $5 }'`
+    _no_of_files_=`$ECHO ${_entry_} | $AWK -F:: '{ print $6 }'`
+    if [ -z "${_log_file_size_}" -o -z "${_compresion_day_}" -o -z "${_removal_day_}" -o -z "${_no_of_files_}" ]; then
+       log_msg -s "WARNING::Skipping cleanup of old logfile for ${_entry_}" -l ${DEBUG_LOGFILE}
+       continue
+    fi
+
+    log_msg -q -t -s "Checking if cleanup of file is required." -l ${DEBUG_LOGFILE}
+
+    if [ ${_removal_day_} -eq 0 ]; then
+        log_msg -q -t -s "Removal day equal to zero so cleanup not required for the files present in ${_dir_path_to_check_}" -l ${DEBUG_LOGFILE}
+        continue
+    fi
+    log_msg -s "===================================================================" -l ${LOGFILE}
+    log_msg -s "Checking cleanup criteria for the log files with names containing ${_log_file_name_} in directory ${_dir_path_to_check_}" -l ${LOGFILE}
+    # Checking if cleanup of file is required.
+
+    if [ ${_removal_day_} -ne 0 ]; then
+        log_msg -q -t  -s "INFO :Removal day not equal to zero so cleanup required for the files present in ${_dir_path_to_check_}" -l ${DEBUG_LOGFILE}
+        # Find the  no of files which are older than a predefined value
+        _file_count_=`$FIND ${_dir_path_to_check_} -type f -name "*${_log_file_name_}*" -mtime +${_removal_day_} | $GREP -v ".pid$" | $WC -l`
+        log_msg -s "Checking ${_removal_day_} days older files for cleanup" -l ${LOGFILE} | $TEE -a ${DEBUG_LOGFILE}
+        if [ ${_file_count_} -eq 0 ]; then
+            log_msg -s  "INFO :Files older than ${_removal_day_} days are not present " -l  ${LOGFILE} | $TEE -a ${DEBUG_LOGFILE}
+            log_msg -s "===================================================================" -l ${LOGFILE}
+        else
+            log_msg -q -s "INFO :Checking if cleanup is possible for ${_dir_path_to_check_}/${_log_file_name_}" -l ${DEBUG_LOGFILE}
+            log_msg -q -t -s "no of files older than ${_removal_day_} days :${_file_count_}  " -l ${DEBUG_LOGFILE}
+            log_msg -q -t -s "Minimum no of  files for reference :${_no_of_files_} " -l ${DEBUG_LOGFILE}
+            if [ ${_file_count_} -eq ${_no_of_files_} ]
+            then
+                log_msg -q -t -s "file count of ${_removal_day_} days older file and minimum no of files to keep for reference are equal" -l ${DEBUG_LOGFILE}
+                log_msg -q -t -s "checking for the files less than ${_removal_day_} days" -l ${DEBUG_LOGFILE}
+                # Find the no of files less than predefined (removal day) value
+                _file_count_comp_=`$FIND ${_dir_path_to_check_} -type f -name "*${_log_file_name_}*" -mtime -${_removal_day_} | $GREP -v ".gz$" | $GREP -v ".pid$" | $WC -l`
+                # increase file count by 1 to perform cleanup
+                if [ ${_file_count_comp_} -ne 0 ]; then
+                    log_msg -q -t -s "${_file_count_comp_} files present" -l ${DEBUG_LOGFILE}
+                    (( _file_count_ = _file_count_ + 1 ))
+                else
+                    log_msg -q -t -s "no files less than ${_removal_day_} days" -l ${DEBUG_LOGFILE}
+                    _files_=`$FIND ${_dir_path_to_check_} -type f -name "*${_log_file_name_}*" -mtime +${_removal_day_} -exec $LS {} \; | $GREP -v ".pid$"`
+                    $LS -rt ${_files_}>>${TEM_DIR}/file
+                    log_msg -s "Below files are older than ${_removal_day_} days" -l ${LOGFILE} | $TEE -a ${DEBUG_LOGFILE}
+                    $CAT ${TEM_DIR}/file | $TEE -a ${DEBUG_LOGFILE} ${LOGFILE}
+                    log_msg -s "INFO::Cleanup not possible for above files,they need to be kept for reference " -l  ${LOGFILE} | $TEE -a ${DEBUG_LOGFILE}
+                fi
+            fi
+
+            if [ ${_file_count_} -gt ${_no_of_files_} ]
+            then
+                _file_count_comp_=`$FIND ${_dir_path_to_check_} -type f -name "*${_log_file_name_}*" -mtime -${_removal_day_} | $GREP -v ".gz$" | $GREP -v ".pid$"| $WC -l`
+                _file_count_=`$FIND ${_dir_path_to_check_} -type f -name "*${_log_file_name_}*" -mtime +${_removal_day_} | $GREP -v ".pid$" | $WC -l`
+                # calculate no of files to cleanup
+                if [ ${_file_count_comp_} -eq 0 ]; then
+                    no_of_files_to_delete_=`expr $_file_count_ - $_no_of_files_`
+                    log_msg -q -t -s "INFO::${no_of_files_to_delete_} files will be deleted from ${_file_count_} files which is ${_removal_day_} days older" -l ${DEBUG_LOGFILE}
+                else
+                    ((_count_=$_file_count_comp_+_file_count_))
+		     if [ ${_count_} -gt ${_no_of_files_} ]; then
+                         no_of_files_to_delete_=`expr ${_count_} - ${_no_of_files_}`
+                         log_msg -q -t -s "INFO::${no_of_files_to_delete_} files will be deleted from ${_file_count_} files which is ${_removal_day_} days older" -l ${DEBUG_LOGFILE}
+                     fi
+                fi
+                log_msg -q -s "INFO :Cleanup possible for the files present in ${_dir_path_to_check_}" -l ${DEBUG_LOGFILE}
+                _files_to_delete_=`$FIND ${_dir_path_to_check_} -type f -name "*${_log_file_name_}*" -mtime +${_removal_day_} -exec $LS {} \; | $GREP -v ".pid$"`
+                if [ ! -z "${_files_to_delete_}" ]; then
+
+                    log_msg -s "Below files are ${_removal_day_} days older" -l ${LOGFILE} | $TEE -a ${DEBUG_LOGFILE}
+                    $LS -rt ${_files_to_delete_}|$HEAD -n ${no_of_files_to_delete_} | $TEE -a ${DEBUG_LOGFILE} ${LOGFILE} ${TEM_DIR}/cleanup_list
+                    $LS -rt ${_files_to_delete_}|$HEAD -n ${no_of_files_to_delete_} |$XARGS $RM
+                    if [ $? -eq 0 ]; then
+                        log_msg -s "INFO::Cleanup completed successfully for above files" -l ${LOGFILE} | $TEE -a ${DEBUG_LOGFILE}
+                        log_msg -s "===================================================================" -l ${LOGFILE} | $TEE -a ${DEBUG_LOGFILE}
+                    fi
+
+                else
+                   log_msg -s "WARNING::Files to be cleaned up  under ${_dir_path_to_check_} directory  not found" -l  ${LOGFILE} | $TEE -a ${DEBUG_LOGFILE}
+                fi
+
+
+            else
+                if [ ${_file_count_} -lt ${_no_of_files_} ]
+                then
+                    log_msg -q -t -s "file count of ${_removal_day_} days older file is less than minimum no of files for reference " -l ${DEBUG_LOGFILE}
+                    log_msg -q -t -s "checking for the files less than ${_removal_day_} days" -l ${DEBUG_LOGFILE}
+                    _file_count_comp_=`$FIND ${_dir_path_to_check_} -type f -name "*${_log_file_name_}*" -mtime -${_removal_day_} | $GREP -v ".gz$" | $GREP -v ".pid$" | $WC -l` 
+                    # calculate no of files to cleanup
+                   if [ ${_file_count_comp_} -eq 0 ]; then
+                       log_msg -q -t -s "no files less than ${_removal_day_}" days -l ${DEBUG_LOGFILE}
+                       _files_=`$FIND ${_dir_path_to_check_} -name "*${_log_file_name_}*" -mtime +${_removal_day_} -exec $LS {} \; |$GREP -v ".pid$"` 
+                       $LS -rt ${_files_}>>${TEM_DIR}/files
+                       log_msg -s "Below files are older than ${_removal_day_} days" -l ${LOGFILE} | $TEE -a ${DEBUG_LOGFILE}
+                       $CAT ${TEM_DIR}/files | $TEE -a ${DEBUG_LOGFILE} ${LOGFILE}
+                       log_msg -s "INFO::Cleanup not possible for above files,they need to be kept for reference " -l  ${LOGFILE} | $TEE -a ${DEBUG_LOGFILE}
+
+
+                       log_msg -s "===================================================================" -l ${LOGFILE}
+                       continue
+                   else
+                       _files_=`$FIND ${_dir_path_to_check_} -type f -name "*${_log_file_name_}*" -mtime +${_removal_day_} -exec $LS {} \; | $GREP -v ".pid$" | $WC -l` 
+                       (( _files_count_ = $_file_count_comp_ + $_files_ ))                  
+                       if [ ${_files_count_} -gt ${_no_of_files_} ]; then
+                           no_of_files_to_delete_=`expr ${_files_count_} - ${_no_of_files_}`
+                           log_msg -q -t -s "INFO::${no_of_files_to_delete_} files will be deleted from ${_files_count_} files which is ${_removal_day_} days older" -l ${DEBUG_LOGFILE}
+                           log_msg -q -t -s "INFO :Cleanup possible for the files present in ${_dir_path_to_check_}" -l ${DEBUG_LOGFILE}
+                           _files_to_delete_=`$FIND ${_dir_path_to_check_} -type f -name "*${_log_file_name_}*" -mtime +${_removal_day_} -exec $LS {} \; | $GREP -v ".pid$"`
+                           if [ ! -z "${_files_to_delete_}" ]; then
+                               log_msg -s "Below files are ${_removal_day_} days older" -l ${LOGFILE} | $TEE -a ${DEBUG_LOGFILE}
+                               $LS -rt ${_files_to_delete_}|$HEAD -n ${no_of_files_to_delete_} | $TEE -a ${DEBUG_LOGFILE} ${LOGFILE} ${TEM_DIR}/cleanup_list
+                               $LS -rt ${_files_to_delete_}|$HEAD -n ${no_of_files_to_delete_} |$XARGS $RM
+                               if [ $? -eq 0 ]; then
+                                   log_msg -s "INFO::Cleanup completed successfully for above files" -l ${LOGFILE} | $TEE -a ${DEBUG_LOGFILE} 
+                                   log_msg -s "===================================================================" -l ${LOGFILE} 
+                               fi   
+                           else
+                               log_msg -s "WARNING::Files to be cleaned up not found" -l  ${LOGFILE} | $TEE -a ${DEBUG_LOGFILE}
+                           fi
+                      else
+                           _files_=`$FIND ${_dir_path_to_check_} -type f -name "*${_log_file_name_}*" -mtime +${_removal_day_} -exec $LS {} \; | $GREP -v ".pid$"`
+                           $LS -rt ${_files_}>>${TEM_DIR}/files
+                           log_msg -s "Below files are older than ${_removal_day_} days" -l ${LOGFILE} | $TEE -a ${DEBUG_LOGFILE}
+                           $CAT ${TEM_DIR}/files | $TEE -a ${DEBUG_LOGFILE} ${LOGFILE}
+                           log_msg -s "INFO::Cleanup not possible for above files,they need to be kept for reference " -l  ${LOGFILE} | $TEE -a ${DEBUG_LOGFILE}
+                           log_msg -s "===================================================================" -l ${LOGFILE}
+                      fi
+                   fi
+                fi
+            fi
+        fi
+     fi
+done
+else
+    log_msg -s "Force Cleanup status" -l ${LOGFILE} | $TEE -a ${DEBUG_LOGFILE}
+    for _index_ in $1 ; do
+        for _mount_ in `$CAT ${TEM_DIR}/cfg_file_loc | $GREP $_index_` ; do
+            _dir_path_to_check_=`$ECHO ${_mount_} | $AWK -F:: '{ print $1 }'`
+            _log_file_size_=`$ECHO ${_mount_} | tr ":" " " | $CUT -d" " -f5 | $AWK -F"M" '{print $1}'`
+            _force_removal_=`$ECHO ${_mount_} | $AWK -F:: '{ print $7 }'`
+            _log_file_size_=`expr $_log_file_size_ \* 1024 \* 1000`
+            _log_file_name_=`$ECHO ${_mount_} | $AWK -F:: '{ print $2 }'`
+            if [ -z "${_dir_path_to_check_}" -o -z "${_log_file_name_}" -o -z "${_log_file_size_}" -o -z "${_force_removal_}" ]; then
+               log_msg -s "WARNING::Skipping Cleanup of old logfile for ${_entry_}" -l ${DEBUG_LOGFILE}
+               continue
+            fi
+            if [ "${_dir_path_to_check_}" == "{dir_path}" -o "${_log_file_name_}" == "{log_file_pattern}" ]; then
+                log_msg -q -t -s "INFO::This is pattern for IQ log handling which will be added during runtime skip this pattern while processing" -l ${DEBUG_LOGFILE}
+                continue
+            else
+                if [ ! -d ${_dir_path_to_check_} ]; then
+                    log_msg -q -t -s "INFO::${_dir_path_to_check_} directory not present" -l ${DEBUG_LOGFILE}
+                    continue
+                fi
+            fi
+        $DF -hk ${_dir_path_to_check_} | $GREP -i nas >> /dev/null 2>&1
+        if [ $? -eq 0 ]; then
+                if [ "${CURR_SERVER_TYPE}" != "stats_coordinator" -a "${CURR_SERVER_TYPE}" != "eniq_stats" ]; then
+                log_msg -t -s "INFO::Skipping the entry ${_entry_} as it is not coordinator server." -l ${LOGFILE} | $TEE -a ${DEBUG_LOGFILE} 
+                continue
+                fi
+        fi
+
+            if [ "$_log_file_name_" == "<ALL>" ]; then
+                _log_file_name_=""
+            fi
+
+            if [ "${_force_removal_}" != "0" ]; then
+            # Find the files which needs force cleanup
+                log_msg -s "===================================================================" -l ${LOGFILE}
+                log_msg -s "Checking force cleanup criteria for the log files with names containing ${_log_file_name_} in directory ${_dir_path_to_check_}" -l ${LOGFILE}
+                log_msg -s "Checking for the files less than ${_force_removal_} days old and  size greater than ${_log_file_size_}M" -l ${LOGFILE} | $TEE -a ${DEBUG_LOGFILE}  
+                log_msg -q -t  -s "INFO :: Find the files which needs force cleanup" -l ${DEBUG_LOGFILE}
+               _files_removal_=`$FIND ${_dir_path_to_check_} -type f -name "*${_log_file_name_}*" -mtime +${_force_removal_} -exec $LS -l {} \; | $GREP -v ".pid$"| $AWK '{if ($5 >= '${_log_file_size_}') print $9}'`
+
+                if [ -z "${_files_removal_}" ]; then
+                    log_msg -s "INFO::Files older than ${_force_removal_} days and size greater than ${_log_file_size_}M not present in${_dir_path_to_check_}" -l ${LOGFILE} | $TEE -a ${DEBUG_LOGFILE}
+                    continue
+                fi
+                log_msg -s "Info : Below files are forcefully removed from ${_dir_path_to_check_}." -l ${LOGFILE} | $TEE -a ${DEBUG_LOGFILE}
+                for _entry_ in `$ECHO "${_files_removal_}"` ; do
+                    $RM -f $_entry_
+                    $ECHO "${_entry_}" | $TEE -a ${DEBUG_LOGFILE} ${LOGFILE} 
+                    # check size
+                    $DF -kh $_dir_path_to_check_ | $GREP "pool" >> /dev/null 2>&1
+                    if [ $? -eq 0 ]; then
+
+                        _file_system_=`$DF -kh $_dir_path_to_check_|$AWK '{if (NR!=1) {print $1}}' | $AWK -F"/" '{print $1}'`
+                        _free_=`$VGS --no-headings  | $GREP pool | $AWK '{print $7'} | $SED 's/g$//g'`
+			            _avl_=`$VGS --no-headings  | $GREP pool | $AWK '{print $6'} | $AWK -F "<" '{print $2'}|$SED 's/g$//g'`
+			            gt=$($ECHO "scale=3;($_free_/ $_avl_)*100" | $BC  )
+                        _size_=$($ECHO "100-${gt%%.*}" | $BC  )
+						if [ $? -ne 0 ]; then
+                            _err_msg_="Could not found size"
+                            abort_script "${_err_msg_}"
+                        fi	   
+                    else
+                        _size_=`$DF -kh $_dir_path_to_check_ | $TR -s " " "" | $TAIL -1 | $CUT -d" " -f5 | $AWK -F"%" '{print $1}'`
+                        if [ $? -ne 0 ]; then
+                            _err_msg_="Could not found size"
+                            abort_script "${_err_msg_}"
+                        fi
+					fi 
+
+                    if [ "${_size_}" -ge "80" ]; then
+                        continue
+                    else
+                        break
+                    fi
+                done
+         fi
+        done
+    done
+fi
+
+}
+
+cleanup_lc_logfiles()
+{
+directory="/eniq/log/log_collector /eniq/local_logs/log_collector"
+    log_msg -s "Log Collector Clean up " -l ${LOGFILE} | $TEE -a ${DEBUG_LOGFILE}
+    for dir in $directory; do
+        
+         
+            _removal_=`$CAT ${ENIQ_ADMIN_DIR}/etc/cleanup_files.cfg | $GREP $dir | $AWK -F:: '{ print $5 }'`
+  
+            if [  -z "${_removal_}" ]; then
+               log_msg -s "WARNING::Skipping Cleanup for ${dir}" -l ${DEBUG_LOGFILE}
+               continue
+            fi
+            
+        $DF -hk ${dir} | $GREP -i nas >> /dev/null 2>&1
+        if [ $? -eq 0 ]; then
+                if [ "${CURR_SERVER_TYPE}" != "stats_coordinator" -a "${CURR_SERVER_TYPE}" != "eniq_stats" ]; then
+                log_msg -t -s "INFO::Skipping the entry ${_entry_} as it is not coordinator server." -l ${LOGFILE} | $TEE -a ${DEBUG_LOGFILE} 
+                continue
+                fi
+        fi
+
+
+            while [ "${_removal_}" -ge "0" ]; do
+            # Find the files which needs  cleanup
+                log_msg -s "===================================================================" -l ${LOGFILE}
+                log_msg -s "Checking  cleanup criteria for the log files with in ${dir} directory " -l ${LOGFILE}
+                log_msg -q -t  -s "INFO :: Find the files which needs cleanup" -l ${DEBUG_LOGFILE}
+               _files_removal_=`$FIND ${dir} -type f -name "*log_collector_*" -mtime ${_removal_} -exec $LS -l {} \; | $GREP -v ".pid$"`
+
+                if [ -z "${_files_removal_}" ]; then
+                    log_msg -s "INFO::Files older than ${_removal_} days are not present" -l ${LOGFILE} | $TEE -a ${DEBUG_LOGFILE}
+                    let _removal_=_removal_-1
+					continue
+                fi
+                log_msg -s "Info : Below files are removed from ${dir}." -l ${LOGFILE} | $TEE -a ${DEBUG_LOGFILE}
+				let _removal_=_removal_-1
+                for _entry_ in `$ECHO "${_files_removal_}"` ; do
+                    $RM -f $_entry_
+                    $ECHO "${_entry_}" | $TEE -a ${DEBUG_LOGFILE} ${LOGFILE} 
+                    # check size
+                        _size_=`$DF -kh $dir | $TAIL -1 | $CUT -d "%" -f1| $AWK -F " " '{print $5}'`
+                        if [ $? -ne 0 ]; then
+                            _err_msg_="Could not found size"
+                            abort_script "${_err_msg_}"
+                        fi
+					#fi 
+                    
+                    if [ "${_size_}" -gt "80" ]; then
+                        continue
+                    else
+                        break
+                    fi
+                done
+            done
+    done
+	}
+
+
+### Function:cleanup_uncommited_files  ###
+#
+# cleanup the old connection files
+# under /tmp/.SQLAnywhere/ and /eniq/database/tmp/iq  dir
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+cleanup_uncommited_files()
+{
+for i in "/tmp/.SQLAnywhere" "/eniq/database/tmp/iq"
+do 
+_sqlanywhere_dir_=$i
+if [ -d "${_sqlanywhere_dir_}" ] 
+then
+    log_msg -s "INFO::${_sqlanywhere_dir_} directory exists" -l ${LOGFILE} | $TEE -a ${DEBUG_LOGFILE}
+    log_msg -s "INFO::Removing uncommitted connection files older than 15 days" -l ${LOGFILE} | $TEE -a ${DEBUG_LOGFILE}
+    $FIND ${_sqlanywhere_dir_} -type d -mtime +0 -exec $RM -rf {} \+ >> /dev/null 2>&1 
+    if [ $? -ne 0 ]; then
+        log_msg -s "ERROR::Could not remove uncommitted connection files older than 15 days" -l ${LOGFILE} | $TEE -a ${DEBUG_LOGFILE}
+    else
+        log_msg -s "INFO::Successfully removed uncommitted connection files older than 15 days" -l ${LOGFILE} | $TEE -a ${DEBUG_LOGFILE}
+    fi
+else
+    log_msg -s "INFO::${_sqlanywhere_dir_} directory not present. Skipping cleanup of uncommitted connection files" -l ${LOGFILE} | $TEE -a ${DEBUG_LOGFILE}
+fi
+done
+}
+
+
+### Function:compression_logfiles  ###
+#
+#  compress the old log files
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+compression_logfiles()
+{
+insert_header_footer head "INFO:: Launching Compression" ${LOGFILE} | $TEE -a ${DEBUG_LOGFILE}
+
+
+# perform compression for required files
+for _entry_ in `$CAT ${TEM_DIR}/cfg_file_loc`  ; do
+    log_msg -q -s "------------------------------------------------" -l ${DEBUG_LOGFILE}
+    log_msg -q -t -s "Info::Checking the entry ${_entry_}" -l ${DEBUG_LOGFILE}
+    _dir_path_to_check_=`$ECHO ${_entry_} | $AWK -F:: '{ print $1 }'`
+    _log_file_name_=`$ECHO ${_entry_} | $AWK -F:: '{ print $2 }'`
+    if [ -z "${_dir_path_to_check_}" -o -z "${_log_file_name_}" ]; then
+      log_msg -s "WARNING::Skipping compression of old logfile for ${_entry_}" -l ${DEBUG_LOGFILE}
+      continue
+    fi
+    if [ "${_dir_path_to_check_}" == "{dir_path}" -o "${_log_file_name_}" == "{log_file_pattern}" ]; then
+        log_msg -q -t -s "INFO::This is pattern for IQ log handling which will be added during runtime skip this pattern while processing" -l ${DEBUG_LOGFILE}
+        continue
+    else
+        if [ ! -d ${_dir_path_to_check_} ]; then
+            log_msg -q -t -s "INFO::${_dir_path_to_check_} directory not present" -l ${DEBUG_LOGFILE}
+            continue
+        fi
+    fi
+        $DF -hk ${_dir_path_to_check_} | $GREP -i nas >> /dev/null 2>&1
+        if [ $? -eq 0 ]; then
+                if [ "${CURR_SERVER_TYPE}" != "stats_coordinator" -a "${CURR_SERVER_TYPE}" != "eniq_stats" ]; then
+                log_msg -t -s "INFO::Skipping the entry ${_entry_} as it is not coordinator server." -l ${LOGFILE} | $TEE -a ${DEBUG_LOGFILE}
+                continue
+                fi
+        fi
+
+
+    if [ "$_dir_path_to_check_" == "<DEFAULT>" -o "$_log_file_name_" == "<DEFAULT>" ]; then
+        log_msg -q -t -s "ERROR:Entry has null directory name or file name.Please check the cfg file." -l ${DEBUG_LOGFILE}
+        continue
+    fi
+    if [ "$_log_file_name_" == "<ALL>" ]; then
+        _log_file_name_=""
+    fi
+
+     _log_file_size_=`$ECHO ${_entry_} | $AWK -F:: '{ print $3 }'`
+     _compresion_day_=`$ECHO ${_entry_} | $AWK -F:: '{ print $4 }'`
+     _removal_day_=`$ECHO ${_entry_} | $AWK -F:: '{ print $5 }'`
+     _no_of_files_=`$ECHO ${_entry_} | $AWK -F:: '{ print $6 }'`
+     if [ -z "${_log_file_size_}" -o -z "${_compresion_day_}" -o -z "${_removal_day_}" -o -z "${_no_of_files_}" ]; then
+        log_msg -s "WARNING::Skipping compression of old logfile for ${_entry_}" -l ${DEBUG_LOGFILE}
+       continue
+     fi
+     log_msg -q -t -s "checking if compression of file is required" -l ${DEBUG_LOGFILE}
+     if [ "${_compresion_day_}" != "0" -a "${_compresion_day_}" != "<ALL>" ]; then
+         log_msg -q -s "compression day not equal to zero so compression required" -l ${DEBUG_LOGFILE}
+         log_msg -s "===================================================================" -l ${LOGFILE}
+         log_msg -s "Checking Compression criteria for the log files with names containing ${_log_file_name_} in directory ${_dir_path_to_check_}" -l ${LOGFILE}
+         log_msg -s "Checking ${_compresion_day_} days older files for compression" -l ${LOGFILE} | $TEE -a ${DEBUG_LOGFILE}
+         _no_of_files_comp_=`$FIND ${_dir_path_to_check_} -type f -name "*${_log_file_name_}*" -mtime +${_compresion_day_} |$GREP -v ".gz$"| $GREP -v ".pid$" | $WC -l`
+
+         if [ ${_no_of_files_comp_} -eq 0 ]; then
+             log_msg -s  "INFO::Files older than ${_compresion_day_} days are not present" -l ${LOGFILE} | $TEE -a ${DEBUG_LOGFILE}
+             log_msg -s "===================================================================" -l ${LOGFILE}
+         else
+             _minimum_files_=${_no_of_files_}
+             _files_lessthan_compday_=`$FIND ${_dir_path_to_check_} -type f -name "*${_log_file_name_}*" -mtime -${_compresion_day_}| $GREP -v ".gz$"|$GREP -v ".pid$"| $WC -l`
+             _files_greaterthan_compday_=`$FIND ${_dir_path_to_check_} -type f -name "*${_log_file_name_}*" -mtime +${_compresion_day_}| $GREP -v ".gz$"| $GREP -v ".pid$" |$WC -l`
+
+             if [ ${_files_lessthan_compday_} -lt ${_minimum_files_} ]
+             then
+                 (( _files_to_compress_ = $_minimum_files_ - $_files_lessthan_compday_ ))
+                 (( _no_of_file_to_compress_ = $_files_greaterthan_compday_ - $_files_to_compress_ ))
+                 log_msg -q -t -s "INFO :check compression posiible for the of files present in ${_dir_path_to_check_}" -l ${DEBUG_LOGFILE}
+
+                 if [ $_no_of_file_to_compress_ -le 0 ]; then
+                    _files_=`$FIND ${_dir_path_to_check_} -type f -name "*${_log_file_name_}*" -mtime +${_compresion_day_} -exec $LS {} \;|$GREP -v ".gz$" | $GREP -v ".pid$"`
+                    $LS -rt ${_files_}>${TEM_DIR}/compress
+
+                    log_msg -s "Below files are older than ${_compresion_day_} days" -l ${LOGFILE} | $TEE -a ${DEBUG_LOGFILE}
+                    $CAT ${TEM_DIR}/compress | $TEE -a ${DEBUG_LOGFILE} ${LOGFILE}
+                    log_msg -s "INFO::Compression not possible for above files,they need to be kept for reference" -l ${LOGFILE} | $TEE -a ${DEBUG_LOGFILE}
+                    log_msg -s "===================================================================" -l ${LOGFILE}
+                 else
+                     log_msg -q -t -s "INFO : Compression possible for the of files present in ${_dir_path_to_check_}" -l ${DEBUG_LOGFILE}
+                     _files_to_compress_=`$FIND ${_dir_path_to_check_} -type f -name "*${_log_file_name_}*" -mtime +${_compresion_day_} -exec $LS {} \; |$GREP -v ".gz" | $GREP -v ".pid$"` 
+                    if [ ! -z "${_files_to_compress_}" ]; then
+                        $LS -rt ${_files_to_compress_}|$HEAD -n ${_no_of_file_to_compress_}>>${TEM_DIR}/compression_list
+                        log_msg -s "\n Below files are ${_compresion_day_} days older " -l ${LOGFILE} | $TEE -a ${DEBUG_LOGFILE}
+                        $LS -rt ${_files_to_compress_}|$HEAD -n ${_no_of_file_to_compress_} | $TEE -a ${DEBUG_LOGFILE} ${LOGFILE}
+                         $LS -rt ${_files_to_compress_}|$HEAD -n ${_no_of_file_to_compress_}|$XARGS $GZIP -f
+                        if [ $? -eq 0 ]; then
+                           log_msg -s  "INFO::Compression completed successfully for above files" -l ${LOGFILE} | $TEE -a ${DEBUG_LOGFILE}
+                           log_msg -s "===================================================================" -l ${LOGFILE}
+                        else
+                           log_msg -s "ERROR:Could not compress ${_dir_path_to_check_}/${_log_file_name_} file" -l ${LOGFILE} | $TEE -a ${DEBUG_LOGFILE}
+                        fi
+                    else
+                        log_msg -s "WARNING::Files to be compressed under ${_dir_path_to_check_} directory not found" -l  ${LOGFILE} | $TEE -a ${DEBUG_LOGFILE}
+                   fi
+                 fi
+             else
+                 _files_to_compress_=`$FIND ${_dir_path_to_check_} -type f -name "*${_log_file_name_}*" -mtime +${_compresion_day_} -exec $LS {} \; |$GREP -v ".gz" | $GREP -v ".pid$"`
+                 if [ ! -z "${_files_to_compress_}" ]; then
+                    log_msg -s "Below files are older than ${_compresion_day_} days" -l ${LOGFILE} | $TEE -a ${DEBUG_LOGFILE}
+                    $LS -rt ${_files_to_compress_}|$HEAD -n ${_files_greaterthan_compday_} |$GREP -v ".gz$" | $TEE -a ${DEBUG_LOGFILE} ${LOGFILE} ${TEM_DIR}/compression_list
+                    $LS -rt ${_files_to_compress_}|$HEAD -n ${_files_greaterthan_compday_} |$GREP -v ".gz$" |$XARGS $GZIP -f
+                    if [ $? -eq 0 ]; then
+                       log_msg -s "INFO:: Compression completed successfully for above files" -l ${LOGFILE} | $TEE -a ${DEBUG_LOGFILE}
+                       log_msg -s "===================================================================" -l ${LOGFILE}
+                   fi
+                 else
+                        log_msg -s "WARNING::Files to be compressed under ${_dir_path_to_check_} directory found" -l  ${LOGFILE} | $TEE -a ${DEBUG_LOGFILE}
+
+                fi   
+             fi
+         fi
+     else
+     if [ "${_compresion_day_}" == "<ALL>" ]; then
+         log_msg -s "Checking Compression criteria for the log files with names containing ${_log_file_name_} in directory ${_dir_path_to_check_}" -l ${LOGFILE}
+
+         log_msg -s "Checking the log file name containing ${_log_file_name_} for compression" -l ${LOGFILE} | $TEE -a ${DEBUG_LOGFILE}
+
+         _file_count_=`$FIND ${_dir_path_to_check_} -type f -name "*${_log_file_name_}*" |$GREP -v ".gz$" | $GREP -v ".pid$" | $WC -l`
+         if [ ${_file_count_} -eq 0 ]; then
+             log_msg -s "INFO::No files present with that pattern" -l ${LOGFILE} | $TEE -a ${DEBUG_LOGFILE}
+             log_msg -s "===================================================================" -l ${LOGFILE}
+             continue
+         fi
+         if [ ${_file_count_} -gt ${_no_of_files_} ]; then
+              no_of_files_to_com_=`expr $_file_count_ - $_no_of_files_`
+             _files_to_compress_=`$FIND ${_dir_path_to_check_} -type f -name "*${_log_file_name_}*" -exec $LS {} \; |$GREP -v ".gz" | $GREP -v ".pid$"`
+             if [ ! -z "${_files_to_compress_}" ]; then
+                log_msg -s "Below files need to be compressed" -l ${LOGFILE} | $TEE -a ${DEBUG_LOGFILE}
+                $LS -rt ${_files_to_compress_} |$HEAD -n ${no_of_files_to_com_} |$GREP -v ".gz$" | $GREP -v ".pid$" | $TEE -a ${DEBUG_LOGFILE} ${LOGFILE} ${TEM_DIR}/compression_list
+                $LS -rt ${_files_to_compress_} |$HEAD -n ${no_of_files_to_com_} |$GREP -v ".gz$"| $GREP -v ".pid$" | $XARGS $GZIP -f
+                if [ $? -eq 0 ]; then
+                    log_msg -s  "INFO::Compression completed successfully for above files" -l ${LOGFILE} | $TEE -a ${DEBUG_LOGFILE}
+                    log_msg -s "===================================================================" -l ${LOGFILE}
+                else
+                    log_msg -s "ERROR:Could not compress ${_dir_path_to_check_}/${_log_file_name_} file" -l ${LOGFILE} | $TEE -a ${DEBUG_LOGFILE}
+                fi
+             else
+                log_msg -s "WARNING::Files to be compressed  under ${_dir_path_to_check_} directory not found"  -l ${LOGFILE} | $TEE -a ${DEBUG_LOGFILE}
+             fi
+                    
+         else
+            _file_=`$FIND ${_dir_path_to_check_} -type f -name "*${_log_file_name_}*" -exec $LS {} \; |$GREP -v ".gz" |$GREP -v ".pid$"`
+            $LS -rt ${_file_}>>${TEM_DIR}/compression
+            $CAT ${TEM_DIR}/compression | $TEE -a ${DEBUG_LOGFILE} ${LOGFILE}
+
+            log_msg -s  "INFO::Compression not possible for above files,they need to be kept for reference" -l ${LOGFILE} | $TEE -a ${DEBUG_LOGFILE}
+
+            log_msg -s "===================================================================" -l ${LOGFILE}
+         fi
+     fi
+     log_msg -q -t -s  "INFO::Compression day equal to zero compression not required" -l ${DEBUG_LOGFILE}
+ fi
+done
+}
+
+
+### Function: get_absolute_path ###
+#
+# Determine absolute path to software
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+get_absolute_path()
+{
+_dir_=`$DIRNAME $0`
+SCRIPTHOME=`cd $_dir_ 2>/dev/null && pwd || $$ECHO $_dir_`
+}
+
+
+### Function: get_summary ###
+#
+# Get the consolidated summary and display on console
+# Arguments:
+#       none
+# Return Values:
+#       none
+
+get_summary()
+{
+# Summary of cleaned files
+if [ -f ${TEM_DIR}/cleanup_list ]; then
+    log_msg -h -s "Summary of removed files" -l ${LOGFILE} | $TEE -a ${DEBUG_LOGFILE}
+    log_msg -s "Info : Below files are removed successfully." -l ${LOGFILE} | $TEE -a ${DEBUG_LOGFILE}
+    _cleanup_list_=`$CAT ${TEM_DIR}/cleanup_list`
+    insert_header_footer status "$_cleanup_list_" ${LOGFILE} | $TEE -a ${DEBUG_LOGFILE}
+fi
+
+# Summary of compressed files
+if [ -f ${TEM_DIR}/compression_list ]; then
+    log_msg -h -s "Summary of compressed files" -l ${LOGFILE} | $TEE -a ${DEBUG_LOGFILE}
+    log_msg -s "Info : Below files are compressed successfully." -l ${LOGFILE} | $TEE -a ${DEBUG_LOGFILE}
+    _compression_list_=`$CAT ${TEM_DIR}/compression_list`
+    insert_header_footer status "$_compression_list_" ${LOGFILE} | $TEE -a ${DEBUG_LOGFILE}
+fi
+
+insert_header_footer foot "INFO:: Cleanup completed successfully for required files" ${LOGFILE} | $TEE -a ${DEBUG_LOGFILE}
+
+}
+
+
+### Function: handle_iqtrace_file ###
+#
+# handle the iqtracedwhdb.log  
+# Arguments:
+#       none
+# Return Values:
+#       none
+handle_iqtrace_file()
+{
+if [ "${CURR_SERVER_TYPE}" == "stats_iqr" ]; then
+    _cfg_loc_=${ENIQ_DATABASE_RD}
+else
+    _cfg_loc_=${ENIQ_DATABASE}
+fi
+        _log_location_=`$GREP -w zo ${_cfg_loc_}/dwhdb.cfg | $AWK -F" " '{print $2}'`
+        _dir_path_=`dirname $_log_location_`
+        _log_file_name_=`basename $_log_location_ |$CUT -d "." -f1`
+        _debug_log_=`$GREP  ^-z  ${_cfg_loc_}/dwhdb.cfg | $WC -l`
+        log_msg -s "Checking if debugging is enabled" -l ${LOGFILE} | $TEE -a ${DEBUG_LOGFILE}
+        if [ $_debug_log_ -ne 0 ]; then
+            log_msg -s "Turning off -z switch" -l ${LOGFILE} | $TEE -a ${DEBUG_LOGFILE} 
+            $SED '/^-z/s!^!#!' ${_cfg_loc_}/dwhdb.cfg >${TEM_DIR}/tmp_dwhdp.cfg 
+            $CP ${TEM_DIR}/tmp_dwhdp.cfg ${_cfg_loc_}/dwhdb.cfg
+            
+            # Set enigne profile to no loads
+            set_engine_no_loads
+
+            # restart dwhdb
+            insert_header_footer head "INFO : restarting service dwhdb"  ${LOGFILE} | $TEE -a ${DEBUG_LOGFILE}
+            ${BASH} ${ENIQ_ADMIN_BIN_DIR}/manage_eniq_services.bsh -a restart -N -s dwhdb -l ${LOGFILE} | $TEE -a ${DEBUG_LOGFILE}
+            if [ $? -ne 0 ]; then
+                _err_msg_="Failed to start the dwhdb"
+                abort_script "$_err_msg_"
+            fi
+
+            # Set enigne profile to normal
+            set_engine_normal
+
+            # Compress iqtracedwhdb file 
+            log_msg -s "===================================================================" -l ${LOGFILE}
+            log_msg -s "Compress iqtracedwhdb file" -l ${LOGFILE} | $TEE -a ${DEBUG_LOGFILE}
+            $FIND  ${_dir_path_} -type f  -name "*${_log_file_name_}*"  | $GREP -v ".gz$" |$XARGS $GZIP -f
+            if [ $? -eq 0 ]; then
+                log_msg -s "iqtracedwhdb file compressed successfully" -l ${LOGFILE} | $TEE -a ${DEBUG_LOGFILE}
+                log_msg -s "===================================================================" -l ${LOGFILE}
+            else
+                log_msg -s "ERROR:Could not compress the file" -l ${LOGFILE} | $TEE -a ${DEBUG_LOGFILE}
+            fi
+
+
+        else
+            log_msg -s "debugging already disabled : IQ handling not needed" -l ${LOGFILE} | $TEE -a ${DEBUG_LOGFILE}
+            log_msg -s "===================================================================" -l ${LOGFILE}
+       fi
+     
+}
+
+
+
+### Function: set_engine_normal ###
+#
+# Set Engine profile to Normal
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+set_engine_normal()
+{
+
+insert_header_footer head "INFO:: Launching Set Engine Normal" ${LOGFILE} | $TEE -a ${DEBUG_LOGFILE}
+log_msg -s "Set Engine Normal status" -l ${LOGFILE} | $TEE -a ${DEBUG_LOGFILE}
+log_msg -s "Changing engine profile to Normal" -l ${LOGFILE} | $TEE -a ${DEBUG_LOGFILE}
+
+_sysuser_=`iniget ENIQ_INSTALL_CONFIG -f ${ENIQ_CONF_DIR}/${SUNOS_INI} -v ENIQ_SYSUSER`
+CURRENT_ENGINE_PROFILE=`$SU - ${_sysuser_} -c "engine -e getCurrentProfile"`
+$ECHO ${CURRENT_ENGINE_PROFILE} | $GREP -i -w "normal" > /dev/null 2>&1
+if [ $? -ne 0 ] ; then
+    local RETRY_COUNT=3
+    while [ ${RETRY_COUNT} -gt 0 ]; do
+        set_engine_profile "Normal"
+        if [ $? -ne 0 ]; then
+            log_msg -q -t -s "Failed to set engine to Normal profile." -l ${LOGFILE} | $TEE -a ${DEBUG_LOGFILE}
+        fi
+
+            let RETRY_COUNT=RETRY_COUNT-1
+
+    done
+fi
+insert_header_footer foot "INFO::Successfully set engine to normal"  ${LOGFILE} | $TEE -a ${DEBUG_LOGFILE}
+}
+
+
+
+### Function: insert_header_footer ###
+#
+#   Insert a stage header/footer message
+#
+# Arguments:
+#   $1 : head/foot
+#   $2 : Message
+#   $3 : Logfile
+# Return Values:
+#   none
+insert_header_footer()
+{
+if [ $# -ne 3 ]; then
+    _err_msg_="3 Parameters must be passed to header/footer function"
+    abort_script "${_err_msg_}" 
+fi
+
+if [ "$1" != "head" -a "$1" != "foot" -a "$1" != "status" ]; then
+    _err_msg_="Only Param of head/foot is allowed...exiting!"
+    abort_script "${_err_msg_}" 
+fi
+_type_=$1
+
+_msg_=$2
+
+_logfile_=$3
+$MKDIR -p `$DIRNAME ${_logfile_}`
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not create directory `$DIRNAME ${_logfile_}`"
+    abort_script "${_err_msg_}"
+fi
+
+$TOUCH -a ${_logfile_}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not write to file ${_logfile_}"
+    abort_script "${_err_msg_}" 
+fi
+
+_time_=`$DATE '+%Y-%b-%d_%H.%M.%S'`
+if [ "$_type_" == "head" ]; then
+    $ECHO "\n-----------------------------------------------------" | $TEE -a ${_logfile_}
+    $ECHO "-----------------------------------------------------" | $TEE -a ${_logfile_}
+    $ECHO "$_time_ : $_msg_" | $TEE -a ${_logfile_}
+    $ECHO "-----------------------------------------------------" | $TEE -a ${_logfile_}
+fi
+
+if [ "$_type_" == "foot" ]; then
+    $ECHO "\n-----------------------------------------------------" | $TEE -a ${_logfile_}
+    $ECHO "$_time_ : $_msg_" | $TEE -a ${_logfile_}
+    $ECHO "-----------------------------------------------------" | $TEE -a ${_logfile_}
+    $ECHO "-----------------------------------------------------\n" | $TEE -a ${_logfile_}
+fi
+
+if [ "$_type_" == "status" ]; then
+    $ECHO "\n=====================================================" | $TEE -a ${_logfile_}
+    $ECHO "$_msg_" | $TEE -a ${_logfile_}
+    $ECHO "=======================================================" | $TEE -a ${_logfile_}
+fi
+
+}
+
+
+### Function: run_remote_engine ###
+#
+# Run a command on a remote server
+# Arguments:
+#       $1 : Command to run on remote server
+# Return Values:
+#       none
+
+run_remote_engine()
+{
+        if [ "${_installed_server_type_}" == "stats_coordinator" ];then
+
+           run_remote_cmd "${_host_name_}" "su - dcuser -c '$1' " "$LOGFILE"
+
+        else
+
+           su - dcuser -c "$1"
+
+        fi
+}
+
+
+### Function: set_engine_no_loads ###
+#
+# Set engine to no loads
+# Arguments:
+#       none
+# Return Values:
+#       none
+
+set_engine_no_loads()
+{
+insert_header_footer head "INFO:: Launching Set Engine NoLoads" ${LOGFILE} | $TEE -a ${DEBUG_LOGFILE}
+log_msg -s "Set Engine NoLoads status" -l ${LOGFILE} | $TEE -a ${DEBUG_LOGFILE}
+log_msg -s "Changing engine profile to NoLoads" -l ${LOGFILE} | $TEE -a ${DEBUG_LOGFILE}
+
+run_remote_engine "${BIN_DIR}/engine -e changeProfile NoLoads"
+
+NOLOADS_EXIT_STATUS=$?
+
+if [ ${NOLOADS_EXIT_STATUS} -ne 0 ] ; then
+  log_msg -s "ERROR:Engine status NoLoads could not be changed." -l ${LOGFILE} | $TEE -a ${DEBUG_LOGFILE}
+  else
+  log_msg -s "Engine status changed to NoLoads." -l ${LOGFILE} | $TEE -a ${DEBUG_LOGFILE}
+  insert_header_footer foot "INFO :: Engine profile changed successfully at `$DATE +%Y.%m.%d_%H:%M:%S`" ${LOGFILE} | $TEE -a ${DEBUG_LOGFILE}
+fi
+
+}
+
+
+### Function: setup_env ###
+#
+# Determine valued from configuration file
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+setup_env()
+{
+# ENIQ Base Dir
+ENIQ_BASE_DIR=/eniq
+
+# ENIQ Admin Directory
+ENIQ_ADMIN_DIR=${ENIQ_BASE_DIR}/admin
+ENIQ_ADMIN_BIN_DIR=${ENIQ_ADMIN_DIR}/bin
+
+# ENIQ Log Directory
+ENIQ_LOG_DIR=${ENIQ_BASE_DIR}/log
+
+# ENIQ Database directory
+ENIQ_DATABASE=${ENIQ_BASE_DIR}/database/dwh_main
+ENIQ_DATABASE_RD=${ENIQ_BASE_DIR}/database/dwh_reader
+
+# Main Directory for the Core Installation SW
+ENIQ_INST_DIR=${ENIQ_BASE_DIR}/installation
+
+# Main Directory for the Core Installation SW
+ENIQ_CORE_INST_DIR=${ENIQ_INST_DIR}/core_install
+
+# ENIQ Config Directory
+ENIQ_CONF_DIR=${ENIQ_INST_DIR}/config
+SUNOS_INI=SunOS.ini
+
+
+# ENIQ SW BIN Directory
+BIN_DIR=/eniq/sw/bin
+
+# File containing the list of mount points
+FSTAB=/etc/fstab
+
+# check_files_scripts
+if [ ! -s ${ENIQ_ADMIN_DIR}/etc/cleanup_files.cfg ] ; then
+        _err_msg_="${ENIQ_ADMIN_DIR}/etc/cleanup_files.cfg file not found, or is empty"
+        abort_script "${_err_msg_}"
+fi
+
+# Source the common functions
+if [ -s ${SCRIPTHOME}/../lib/common_functions.lib ]; then
+    . ${SCRIPTHOME}/../lib/common_functions.lib
+else
+    _err_msg_="File ${SCRIPTHOME}/../lib/common_functions.lib not found"
+    abort_script "${_err_msg_}" 
+fi
+
+# Get installed server type
+_installed_server_type_=`$CAT ${ENIQ_CONF_DIR}/installed_server_type`
+
+# Get IP address of engine server
+_ip_address_=`$GREP -w engine /etc/hosts |$AWK '{print $1}'`
+if [ ! "${_ip_address_}" ]; then
+    log_msg -s "ERROR: Could not determine IP Address on engine server" -l ${LOGFILE} | $TEE -a ${DEBUG_LOGFILE}
+fi
+
+_host_name_=`$GREP -w engine /etc/hosts |$AWK '{print $2}'`
+if [ ! "${_host_name_}" ]; then
+    log_msg -s "ERROR: Could not determine Hostname on engine server" -l ${LOGFILE} | $TEE -a ${DEBUG_LOGFILE}
+fi
+
+CURR_SERVER_TYPE=`$CAT $ENIQ_CONF_DIR/installed_server_type | $EGREP -v  '^[[:blank:]]*#' | $SED -e 's/ //g'`
+
+# Get the hostname
+HNAME=`${MYHOSTNAME}`
+
+#Storage type
+_storage_type_=`$CAT /${ENIQ_CONF_DIR}/san_details | $GREP STORAGE_TYPE | $AWK -F"=" '{print $2}'`
+}
+
+### Function: update_cfg_file ###
+#
+# Update the cfg file
+# 
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+
+update_cfg_file()
+{
+
+if [ "${CURR_SERVER_TYPE}" == "stats_coordinator" -o "${CURR_SERVER_TYPE}" == "eniq_stats" -o "${CURR_SERVER_TYPE}" == "stats_iqr" ]; then
+    if [ "${CURR_SERVER_TYPE}" == "stats_iqr" ]; then
+        _cfg_loc_=${ENIQ_DATABASE_RD}
+    else
+        _cfg_loc_=${ENIQ_DATABASE}
+    fi
+
+    if [ -f ${_cfg_loc_}/dwhdb.cfg ]; then
+        _log_location_=`$GREP -w zo ${_cfg_loc_}/dwhdb.cfg | $AWK -F" " '{print $2}'`
+        if [ ! -z "${_log_location_}" ]; then
+            _directory_path_=`dirname $_log_location_`
+            _dir_path_="${_directory_path_}/"
+            _log_file_=`basename $_log_location_ |$CUT -d "." -f1`
+            _dir_log_=`$GREP "${_dir_path_}::${_log_file_}::" ${ENIQ_ADMIN_DIR}/etc/cleanup_files.cfg`
+            if [ -z ${_dir_log_} ]; then
+    
+               $SED "s|\\{dir_path}|$_dir_path_|g;s|\\{log_file_pattern}|$_log_file_|g" ${ENIQ_ADMIN_DIR}/etc/cleanup_files.cfg > ${TEM_DIR}/cleanup_files.cfg
+
+               $CP ${TEM_DIR}/cleanup_files.cfg ${TEM_DIR}/tmp_cleanup_files.cfg
+               $GREP "${_dir_path_}::${_log_file_}::" ${TEM_DIR}/tmp_cleanup_files.cfg >> ${ENIQ_ADMIN_DIR}/etc/cleanup_files.cfg
+
+
+
+               $CAT ${TEM_DIR}/tmp_cleanup_files.cfg | $EGREP -v '^[[:blank:]]*#'> ${TEM_DIR}/cfg_file_loc
+
+          else
+              $CAT ${ENIQ_ADMIN_DIR}/etc/cleanup_files.cfg | $EGREP -v '^[[:blank:]]*#'> ${TEM_DIR}/cfg_file_loc
+          fi 
+        else
+            $CAT ${ENIQ_ADMIN_DIR}/etc/cleanup_files.cfg | $EGREP -v '^[[:blank:]]*#'> ${TEM_DIR}/cfg_file_loc
+        fi 
+    
+    else
+           $CAT ${ENIQ_ADMIN_DIR}/etc/cleanup_files.cfg | $EGREP -v '^[[:blank:]]*#'> ${TEM_DIR}/cfg_file_loc
+	
+    fi
+else
+    $CAT ${ENIQ_ADMIN_DIR}/etc/cleanup_files.cfg | $EGREP -v '^[[:blank:]]*#'> ${TEM_DIR}/cfg_file_loc
+fi
+}
+
+
+# ********************************************************************
+#
+#   Main body of program
+#
+# ********************************************************************
+#
+RUN_TIME=`$DATE '+%Y-%b-%d_%H.%M.%S'`
+
+# Determine absolute path to software
+get_absolute_path
+
+# Check that the effective id of the user is root
+check_user $DEFAULT_USER
+
+# Setup script variables
+setup_env
+
+# Create the logfile
+chk_create_logfile
+
+# Create a temporary Directory
+TEM_DIR=/tmp/cleanup_log.$$.$$
+$RM -rf ${TEM_DIR}
+$MKDIR -p ${TEM_DIR}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not create directory $TEM_DIR"
+    abort_script "${_err_msg_}"
+fi
+
+# creating the new execution directory so that nothing is deleted from current directory
+TEMP_DIR=/var/tmp/cleanup_exec_dir
+$MKDIR -p ${TEMP_DIR}
+cd ${TEMP_DIR} 
+
+#clean_up_lc
+dir1="/eniq/log/log_collector"
+dir2="/eniq/local_logs/log_collector"
+_size1_=`$DF -kh $dir1 | $TAIL -1 | $CUT -d "%" -f1| $AWK -F " " '{print $5}'`
+_size2_=`$DF -kh $dir2 | $TAIL -1 | $CUT -d "%" -f1| $AWK -F " " '{print $5}'`
+if [ "$_size1_" -gt "80" -o "$_size2_" -gt "80" ];then
+     cleanup_lc_logfiles
+fi
+
+# Removal of log files
+cleanup_logfiles $INDEX_VAL 
+
+# compression of log files
+compression_logfiles 
+
+# check iqtrace file 
+if [ "${CURR_SERVER_TYPE}" == "stats_coordinator" -o "${CURR_SERVER_TYPE}" == "eniq_stats" -o "${CURR_SERVER_TYPE}" == "stats_iqr" ]; then
+check_iqtrace_file
+fi
+
+# remove uncommitted transaction file 
+cleanup_uncommited_files
+
+# check filesystem size
+check_partition_size
+
+# get summary
+get_summary
+
+# Rotate and compress the logs if necessary
+rotate_compress_logs ${LOGFILE} ${NUM_LOGS} ${SIZE_LOGS} ${COMPRESS_LOG}
+rotate_compress_logs ${DEBUG_LOGFILE} ${NUM_LOGS} ${SIZE_LOGS} ${COMPRESS_LOG}
+
+$RM -rf ${TEM_DIR}
+exit 0

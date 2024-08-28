@@ -1,0 +1,380 @@
+#!/bin/bash
+# ********************************************************************
+# Ericsson Radio Systems AB                                     SCRIPT
+# ********************************************************************
+#
+#
+# (c) Ericsson Radio Systems AB 2022 - All rights reserved.
+#
+# The copyright to the computer program(s) herein is the property
+# of Ericsson Radio Systems AB, Sweden. The programs may be used
+# and/or copied only with the written permission from Ericsson Radio
+# Systems AB or in accordance with the terms and conditions stipulated
+# in the agreement/contract under which the program(s) have been
+# supplied.
+#
+# ********************************************************************
+# Name    : sp_diag.bsh
+# Date    : 09/10/2023
+# Revision: main/4
+# Purpose : Collect output of Stored Procedures
+#
+# ********************************************************************
+#
+#     Command Section
+#
+# ********************************************************************
+AWK=/usr/bin/awk
+CAT=/usr/bin/cat
+DIRNAME=/usr/bin/dirname
+DBISQL=/eniq/sybase_iq/IQ-16_1/bin64/dbisql
+DATE=/usr/bin/date
+EGREP=/usr/bin/egrep
+ECHO=/usr/bin/echo
+FIND=/usr/bin/find
+HEAD=/usr/bin/head
+ID=/usr/bin/id
+LS=/usr/bin/ls
+RM=/usr/bin/rm
+TAR=/usr/bin/tar
+
+# ********************************************************************
+#
+#       Configuration Section
+#
+# ********************************************************************
+# Default user
+DEFAULT_USER=dcuser
+
+# Name of SunOS & ENIQ ini Files
+SUNOS_INI=SunOS.ini
+ENIQ_INI=niq.ini
+
+# ********************************************************************
+#
+#   Functions
+#
+# ********************************************************************
+### Function: dwhdb_diagnostics ###
+#
+# Get SP output from dwhdb
+#
+# Arguments:
+#    none
+# Return Values:
+#    none
+dwhdb_diagnostics()
+{
+log_msg -s "============== Diagnostic Collection Started ==============" -l ${diag_folder}/sp_iqcontext_dwhdb.txt -q
+$DBISQL @${conn_str_co_enc} "select getdate(),* from sp_iqcontext(); Output TO '${diag_folder}/sp_iqcontext_dwhdb.txt'  APPEND;" >> /dev/null 2>&1
+log_msg -s "============== Diagnostic Collection Completed ==============" -l ${diag_folder}/sp_iqcontext_dwhdb.txt -q
+
+log_msg -s "============== Diagnostic Collection Started ==============" -l ${diag_folder}/sp_iqlocks_dwhdb.txt -q
+$DBISQL @${conn_str_co_enc} "select getdate(),* from sp_iqlocks(); Output TO '${diag_folder}/sp_iqlocks_dwhdb.txt' APPEND;" >> /dev/null 2>&1
+log_msg -s "============== Diagnostic Collection Completed ==============" -l ${diag_folder}/sp_iqlocks_dwhdb.txt -q
+
+log_msg -s "============== Diagnostic Collection Started ==============" -l ${diag_folder}/sp_iqstatus_dwhdb.txt -q
+$DBISQL @${conn_str_co_enc} "select getdate(),* from sp_iqstatus(); Output TO '${diag_folder}/sp_iqstatus_dwhdb.txt' APPEND;" >> /dev/null 2>&1
+log_msg -s "============== Diagnostic Collection Completed ==============" -l ${diag_folder}/sp_iqstatus_dwhdb.txt -q
+
+log_msg -s "============== Diagnostic Collection Started ==============" -l ${diag_folder}/sp_iqtransaction_dwhdb.txt -q
+$DBISQL @${conn_str_co_enc} "select getdate(),* from sp_iqtransaction(); Output TO '${diag_folder}/sp_iqtransaction_dwhdb.txt' APPEND;" >> /dev/null 2>&1
+log_msg -s "============== Diagnostic Collection Completed ==============" -l ${diag_folder}/sp_iqtransaction_dwhdb.txt -q
+
+log_msg -s "============== Diagnostic Collection Started ==============" -l ${diag_folder}/sp_iqversionuse_dwhdb.txt -q
+$DBISQL @${conn_str_co_enc} "select getdate(),* from sp_iqversionuse(); Output TO '${diag_folder}/sp_iqversionuse_dwhdb.txt' APPEND;" >> /dev/null 2>&1
+log_msg -s "============== Diagnostic Collection Completed ==============" -l ${diag_folder}/sp_iqversionuse_dwhdb.txt -q
+
+}
+### Function: reader_diagnostics ###
+#
+# Get SP output from dwhdb
+#
+# Arguments:
+#    none
+# Return Values:
+#    none
+reader_diagnostics()
+{
+log_msg -s "============== Diagnostic Collection Started ==============" -l ${diag_folder}/sp_iqcontext_dwh_reader_1.txt -q
+$DBISQL @${conn_str_reader_1_enc_} "select getdate(),* from sp_iqcontext(); Output TO '${diag_folder}/sp_iqcontext_dwh_reader_1.txt' APPEND ;" >> /dev/null 2>&1
+log_msg -s "============== Diagnostic Collection Completed ==============" -l ${diag_folder}/sp_iqcontext_dwh_reader_1.txt -q
+
+log_msg -s "============== Diagnostic Collection Started ==============" -l ${diag_folder}/sp_iqlocks_dwh_reader_1.txt -q
+$DBISQL @${conn_str_reader_1_enc_} "select getdate(),* from sp_iqlocks(); Output TO '${diag_folder}/sp_iqlocks_dwh_reader_1.txt' APPEND;" >> /dev/null 2>&1
+log_msg -s "============== Diagnostic Collection Completed ==============" -l ${diag_folder}/sp_iqlocks_dwh_reader_1.txt -q
+
+log_msg -s "============== Diagnostic Collection Started ==============" -l ${diag_folder}/sp_iqstatus_dwh_reader_1.txt -q
+$DBISQL @${conn_str_reader_1_enc_} "select getdate(),* from sp_iqstatus(); Output TO '${diag_folder}/sp_iqstatus_dwh_reader_1.txt' APPEND;" >> /dev/null 2>&1
+log_msg -s "============== Diagnostic Collection Completed ==============" -l ${diag_folder}/sp_iqstatus_dwh_reader_1.txt -q
+
+log_msg -s "============== Diagnostic Collection Started ==============" -l ${diag_folder}/sp_iqtransaction_dwh_reader_1.txt -q
+$DBISQL @${conn_str_reader_1_enc_} "select getdate(),* from sp_iqtransaction(); Output TO '${diag_folder}/sp_iqtransaction_dwh_reader_1.txt' APPEND;" >> /dev/null 2>&1
+log_msg -s "============== Diagnostic Collection Completed ==============" -l ${diag_folder}/sp_iqtransaction_dwh_reader_1.txt -q
+
+log_msg -s "============== Diagnostic Collection Started ==============" -l ${diag_folder}/sp_iqversionuse_dwh_reader_1.txt -q
+$DBISQL @${conn_str_reader_1_enc_} "select getdate(),* from sp_iqversionuse(); Output TO '${diag_folder}/sp_iqversionuse_dwh_reader_1.txt' APPEND;" >> /dev/null 2>&1
+log_msg -s "============== Diagnostic Collection Completed ==============" -l ${diag_folder}/sp_iqversionuse_dwh_reader_1.txt -q
+
+log_msg -s "============== Diagnostic Collection Started ==============" -l ${diag_folder}/sp_iqcontext_dwh_reader_2.txt -q
+$DBISQL @${conn_str_reader_2_enc_} "select getdate(),* from sp_iqcontext(); Output TO '${diag_folder}/sp_iqcontext_dwh_reader_2.txt' APPEND;" >> /dev/null 2>&1
+log_msg -s "============== Diagnostic Collection Completed ==============" -l ${diag_folder}/sp_iqcontext_dwh_reader_2.txt -q
+
+log_msg -s "============== Diagnostic Collection Started ==============" -l ${diag_folder}/sp_iqlocks_dwh_reader_2.txt -q
+$DBISQL @${conn_str_reader_2_enc_} "select getdate(),* from sp_iqlocks(); Output TO '${diag_folder}/sp_iqlocks_dwh_reader_2.txt' APPEND;" >> /dev/null 2>&1
+log_msg -s "============== Diagnostic Collection Completed ==============" -l ${diag_folder}/sp_iqlocks_dwh_reader_2.txt -q
+
+log_msg -s "============== Diagnostic Collection Started ==============" -l ${diag_folder}/sp_iqstatus_dwh_reader_2.txt -q
+$DBISQL @${conn_str_reader_2_enc_} "select getdate(),* from sp_iqstatus(); Output TO '${diag_folder}/sp_iqstatus_dwh_reader_2.txt' APPEND;" >> /dev/null 2>&1
+log_msg -s "============== Diagnostic Collection Completed ==============" -l ${diag_folder}/sp_iqstatus_dwh_reader_2.txt -q
+
+log_msg -s "============== Diagnostic Collection Started ==============" -l ${diag_folder}/sp_iqtransaction_dwh_reader_2.txt -q
+$DBISQL @${conn_str_reader_2_enc_} "select getdate(),* from sp_iqtransaction(); Output TO '${diag_folder}/sp_iqtransaction_dwh_reader_2.txt' APPEND;" >> /dev/null 2>&1
+log_msg -s "============== Diagnostic Collection Completed ==============" -l ${diag_folder}/sp_iqtransaction_dwh_reader_2.txt -q
+
+log_msg -s "============== Diagnostic Collection Started ==============" -l ${diag_folder}/sp_iqversionuse_dwh_reader_2.txt -q
+$DBISQL @${conn_str_reader_2_enc_} "select getdate(),* from sp_iqversionuse(); Output TO '${diag_folder}/sp_iqversionuse_dwh_reader_2.txt' APPEND;" >> /dev/null 2>&1
+log_msg -s "============== Diagnostic Collection Completed ==============" -l ${diag_folder}/sp_iqversionuse_dwh_reader_2.txt -q
+
+}
+
+### Function: setup_env ###
+#
+# Setup up path environment etc
+#
+# Arguments:
+#	none
+# Return Values:
+#	none
+setup_env()
+{
+ENIQ_BASE_DIR=/eniq
+
+ENIQ_LOG_DIR=/eniq/log/sw_log/iq
+
+ENIQ_CONF_DIR=${ENIQ_BASE_DIR}/installation/config
+
+EXEC_SHELL_CMD="exec /bin/bash -o emacs"
+
+TEM=/tmp
+
+# Source the common functions
+if [ -s ${SCRIPTHOME}/../lib/common_functions.lib ]; then
+    . ${SCRIPTHOME}/../lib/common_functions.lib
+else
+    _err_msg_="File ${SCRIPTHOME}/../lib/common_functions.lib not found"
+    abort_script "${_err_msg_}" 
+fi
+
+# Determine the current server type
+CURR_SERVER_TYPE=`$CAT $ENIQ_CONF_DIR/installed_server_type | $EGREP -v '^[     ]*#' | $SED -e 's/ //g'`
+if [ ! "${CURR_SERVER_TYPE}" ]; then
+        _err_msg_="Could not determine which server type this is"
+    abort_script "$_err_msg_"
+fi
+
+#Creating the dwhdb connection string
+
+DWH_PORT=`iniget DWH -v PortNumber -f ${ENIQ_CONF_DIR}/${ENIQ_INI}`
+DWH_ENG=`iniget DWH -v ServerName -f ${ENIQ_CONF_DIR}/${ENIQ_INI}`
+
+if [ ! "${DWH_PORT}" -o ! "${DWH_ENG}" ]; then
+    _err_msg_="Could not read DB values from ${ENIQ_INI}"
+    abort_script "$_err_msg_"
+fi
+
+DBA_PASSWORD=`inigetpassword DB -f ${ENIQ_CONF_DIR}/${ENIQ_INI} -v DBAPassword`
+if [ ! ${DBA_PASSWORD} ]; then
+    if [ -f ${ENIQ_BASE_DIR}/sw/installer/dbusers ]; then
+        DBA_PASSWORD=`${ENIQ_BASE_DIR}/sw/installer/dbusers dba dwh`
+        if [ ! "${DBA_PASSWORD}" ] ; then
+            _err_msg_="Could not get dwhdb DBA Password"
+            abort_script "$_err_msg_"
+        fi
+    else
+        _err_msg_="Could not get dwhdb DBA Password"
+        abort_script "$_err_msg_"
+    fi
+fi
+
+#Fetching IP Type from ipmp.ini file.
+check_ip_type
+
+if [ ! "${_ip_type_}" ]; then
+    _err_msg_="Could not read parameter _IP_TYPE_ from file ${ENIQ_CONF_DIR}/${IPMP_INI}"
+    abort_script "$_err_msg_"
+fi
+
+conn_str_dwh="-nogui -onerror exit -c \"eng=$DWH_ENG;links=tcpip{host=$DWH_ENG;port=${DWH_PORT}};uid=dba;pwd=${DBA_PASSWORD}\""
+conn_str_co_enc=${TEM}/_conn_str_idle_enc.`uuidgen`
+
+# encrypt the connection string.
+get_encrypt_file "${conn_str_dwh}" "${conn_str_co_enc}"
+
+#Creating the reader connection string
+
+_reader_number_=2
+_check_flag_=1
+
+READER_PORT=`iniget DWH_READER_SETTINGS -v PortNumber -f /eniq/installation/config/niq.ini`
+DBA_PASSWORD=`inigetpassword DB -f /eniq/installation/config/niq.ini -v DBAPassword`
+while [ ${_check_flag_} -ne 0 ]; do
+    _reader_name_="dwh_reader_${_reader_number_}"
+    
+	_count_=`$CAT /eniq/installation/config/service_names | $GREP dwh_reader_${_reader_number_} | grep -o "::" | wc -l`
+	if [ "${_ip_type_}" == "IPv6" ] && [ "${_count_}" == 3 ]; then
+		_reader_value_=`$CAT /eniq/installation/config/service_names | $GREP dwh_reader_${_reader_number_} | $AWK -F"::" '{print $4}'`
+	else
+		_reader_value_=`$CAT /eniq/installation/config/service_names | $GREP dwh_reader_${_reader_number_} | $AWK -F"::" '{print $3}'`
+	fi
+	
+    if [[ ${_reader_name_} -eq ${_reader_value_} ]] && [[ ${_reader_number_} -ge 1 ]]; then
+        # Initialising the connection string
+        conn_str_reader="-nogui -onerror exit -c \"eng=${_reader_name_};links=tcpip{host=${_reader_name_};port=${READER_PORT}};uid=dba;pwd=${DBA_PASSWORD}\""
+        if [[ ${_reader_number_} -eq 1 ]]; then
+        conn_str_reader_1=${conn_str_reader}
+        conn_str_reader_1_enc_=${TEM}/_conn_str_idle_encrypt.`uuidgen`
+
+       # encrypt the connection string for reader 1.
+       get_encrypt_file "${conn_str_reader_1}" "${conn_str_reader_1_enc_}"
+        else
+        conn_str_reader_2=${conn_str_reader}
+        conn_str_reader_2_enc_=${TEM}/_conn_str_idle_encrypt.`uuidgen`
+
+        # encrypt the connection string for reader 2.
+        get_encrypt_file "${conn_str_reader_2}" "${conn_str_reader_2_enc_}"
+        fi
+       let _reader_number_=_reader_number_-1
+       continue
+    else
+       _check_flag_=0
+    fi
+done
+}
+
+### Function: abort_script ###
+#
+#   This will is called if the script is aborted thru an error
+#   signal sent by the kernel such as CTRL-C or if a serious
+#   error is encountered during runtime
+#
+# Arguments:
+#       $1 - Error message from part of program (Not always used)
+# Return Values:
+#       none
+abort_script()
+{
+_err_time_=`$DATE '+%Y-%b-%d_%H.%M.%S'`
+
+if [ "$1" ]; then
+    _err_msg_="${_err_time_} - $1"
+else
+    _err_msg_="${_err_time_} - ERROR : Script aborted.......\n"
+fi
+
+if [ "${LOGFILE}" ]; then
+    $ECHO -e "\nERROR : ${_err_msg_}\n" | $TEE -a ${LOGFILE}
+else
+    $ECHO -e "\nERROR : ${_err_msg_}\n"
+fi
+
+$RM -rf ${conn_str_reader_2_enc_}
+$RM -rf ${conn_str_reader_1_enc_}
+$RM -rf ${conn_str_co_enc}
+
+exit
+
+}
+### Function: check_id ###
+#
+#   Check that the effective id of the user is correct
+#   If not print error msg and exit.
+#
+# Arguments:
+#       $1 : User ID name
+# Return Values:
+#       none
+check_id()
+{
+_check_id_=`$ID  | $AWK -F\( '{print $2}' | $AWK -F\) '{print $1}'`
+if [ "$_check_id_" != "$1" ]; then
+    _err_msg_="You must be $1 to execute this script."
+    abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+fi
+}
+### Function: check_server_type ###
+#
+#   Check the server type is equal to coordinator or not.
+#   If not print error msg and exit.
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+check_server_type()
+{
+if [ "$CURR_SERVER_TYPE" != "stats_coordinator" -a "$CURR_SERVER_TYPE" != "eniq_stats" ]; then
+    exit 0
+fi
+}
+
+### Function: get_absolute_path ###
+#
+# Determine absolute path to software
+#
+# Arguments:
+#	none
+# Return Values:
+#	none
+get_absolute_path()
+{
+_dir_=`$DIRNAME $0`
+SCRIPTHOME=`cd $_dir_ 2>/dev/null && pwd || $ECHO $_dir_`
+}
+
+# ********************************************************************
+#
+#    Main body of program
+#
+# ********************************************************************
+#
+
+# Determine absolute path to software
+get_absolute_path
+
+# Check that the effective id of the user is root
+check_id $DEFAULT_USER
+
+# Setup up path environment etc
+setup_env
+
+#Checking the server type.
+check_server_type
+
+#Making the folder to store the diagnostics
+Folder=`date '+%Y-%m-%d'`
+$MKDIR -p ${ENIQ_LOG_DIR}/iq_diag/"$Folder"_diagnostic
+diag_folder=${ENIQ_LOG_DIR}/iq_diag/"$Folder"_diagnostic
+
+if [ "${CURR_SERVER_TYPE}" == "stats_coordinator" ]; then
+    dwhdb_diagnostics
+    reader_diagnostics
+else
+    dwhdb_diagnostics
+fi
+
+$RM -rf ${conn_str_reader_2_enc_}
+$RM -rf ${conn_str_reader_1_enc_}
+$RM -rf ${conn_str_co_enc}
+
+#zipping the older log and removing zip file.
+if [ `$DATE +"%H"` == "23" ]; then
+    old_dir=`$FIND ${ENIQ_LOG_DIR}/iq_diag/ -type d -name "*_diagnostic" -exec $LS -ld {} + | $HEAD -n -1 | $AWK '{print $NF}'`
+    old_file=`$FIND ${ENIQ_LOG_DIR}/iq_diag/ -name "*.tar.gz" -type f -mtime +10`
+    for dir in ${old_dir}
+    do
+    $TAR -czf ${dir}.tar.gz ${dir}
+    $RM -rf ${dir}
+    done
+    $FIND ${ENIQ_LOG_DIR}/iq_diag/ -name "*.tar.gz" -type f -mtime +10 -delete
+fi

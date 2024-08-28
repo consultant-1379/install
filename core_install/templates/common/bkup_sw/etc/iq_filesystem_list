@@ -1,0 +1,10 @@
+######################################################
+# This contains a list of filesystems that contain
+# need to be snapshot at the time of the DB Virtual
+# Backup. It has the format of
+#
+# <db_name>::niq.ini section::<filesys>,<filesys>.....,<filesys>
+#
+# Comments are preceded by '#' 
+######################################################
+dwhdb::DWH::dwh_main,dwh_main_dbspace,dwh_temp_dbspace::<CHANGE><ENIQ_BASE_DIR>/database/dwh_main

@@ -1,0 +1,20 @@
+[Unit]
+Description=ENIQ Rolling Snapshot Service
+Requires=NAS-online.service
+After=NAS-online.service
+
+[Service]
+Type=forking
+User=root
+Group=root
+ExecStart=/eniq/bkup_sw/bin/eniq_smf_roll_snap.sh -a start
+ExecStop=/eniq/bkup_sw/bin/eniq_smf_roll_snap.sh -a stop
+TimeoutStartSec=0
+TimeoutStopSec=0
+StartLimitInterval=60
+StartLimitBurst=3
+Restart=always
+RestartSec=15
+
+[Install]
+WantedBy=NAS-online.service

@@ -1,0 +1,2160 @@
+#!/bin/bash
+# ********************************************************************
+# Ericsson Radio Systems AB                                     SCRIPT
+# ********************************************************************
+#
+# (c) Ericsson Radio Systems AB 2020 - All rights reserved.
+#
+# The copyright to the computer program(s) herein is the property
+# of Ericsson Radio Systems AB, Sweden. The programs may be used
+# and/or copied only with the written permission from Ericsson Radio
+# Systems AB or in accordance with the terms and conditions stipulated
+# in the agreement/contract under which the program(s) have been
+# supplied.
+#
+# ********************************************************************
+# Name    : eniq_data_migration.bsh
+# Date    : 24/01/2020
+# Revision: /main/13
+# Purpose : Main wrapper script handling the extract and import. It will
+#           call all necessary scripts to complete the migration
+#
+# Usage   : eniq_data_migration.bsh -a <export|import|pause|resume> -t <active|historic>
+#
+# ********************************************************************
+#
+#   Command Section
+#
+# ********************************************************************
+AWK=/usr/bin/awk
+BASENAME=/usr/bin/basename
+BASH=/usr/bin/bash
+CAT=/usr/bin/cat
+CHMOD=/usr/bin/chmod
+CHOWN=/usr/bin/chown
+CLEAR=/usr/bin/clear
+CP=/usr/bin/cp
+DATE=/usr/bin/date
+DF=/usr/bin/df
+DIRNAME=/usr/bin/dirname
+ECHO=/usr/bin/echo
+EGREP=/usr/bin/egrep
+EXPR=/usr/bin/expr
+GETENT=/usr/bin/getent
+GREP=/usr/bin/grep
+HEAD=/usr/bin/head
+MYHOSTNAME=/usr/bin/hostname
+ID=/usr/bin/id
+KILL=/usr/bin/kill
+LS=/usr/bin/ls
+MKDIR=/usr/bin/mkdir
+MOUNT=/usr/sbin/mount
+MV=/usr/bin/mv
+PASTE=/usr/bin/paste
+PS=/usr/bin/ps
+PWD=/usr/bin/pwd
+RM=/usr/bin/rm
+SED=/usr/bin/sed
+SLEEP=/usr/bin/sleep
+SORT=/usr/bin/sort
+SYSTEMCTL=/usr/bin/systemctl
+SU=/usr/bin/su
+TAIL=/usr/bin/tail
+TEE=/usr/bin/tee
+TOUCH=/usr/bin/touch
+TR=/usr/bin/tr
+UNAME=/usr/bin/uname
+WC=/usr/bin/wc
+XARGS=/usr/bin/xargs
+
+# ********************************************************************
+#
+#       Configuration Section
+#
+# ********************************************************************
+# Default user
+DEFAULT_USER=root
+
+# Cmd to exec a shell and drop user to it in case of an error
+EXEC_SHELL_CMD="exec /uin/bash -o emacs"
+
+# Name of SunOS & ENIQ ini Files
+BLK_STOR_INI=block_storage.ini
+ENIQ_ENV=niq.rc
+ENIQ_INI=niq.ini
+SYM_INI=sym_links.ini
+IPMP_INI=ipmp.ini
+LUN_MAP_INI=lun_map.ini
+SUNOS_INI=SunOS.ini
+STORAGE_INI=storage.ini
+
+
+ENIQ_STOP_SERVICES="scheduler engine webserver repdb dwhdb licmgr rmiregistry connectd"
+ENIQ_START_SERVICES="connectd rmiregistry licmgr repdb dwhdb engine scheduler webserver"
+
+# Variables used in ENIQ version
+ENIQ_VERSION_DIR="version"
+ENIQ_STATUS="eniq_status"
+
+SMF_ID_COMMON_STR="svc:/eniq"
+
+# ********************************************************************
+#
+#  TRAP handling
+#
+# ********************************************************************
+
+trap "trap_shutdown_and_exit 1" QUIT TERM ABRT TSTP INT HUP KILL # detects a trap and handles it
+
+### Function: trap_shutdown_and_exit ###
+#
+# Shutdown and Exit is called by trapping any of the Terminate interrupts
+#
+trap_shutdown_and_exit()
+{
+local exit_status
+if [[ -n "${1}" ]]; then
+    exit_status=${1}
+else
+    exit_status=1
+fi
+
+log_msg -t -s "INFO:: Trapped a TERMINATE signal for eniq_data_migration.bsh, will stop child process." -l ${LOGFILE}
+
+_extract_db_=${SCRIPTHOME}/extractdb.bsh
+_extract_db_pid_=`$PS -ef | $GREP ${_extract_db_} | $GREP -v $GREP | $AWK '{print $2}'`
+_import_db_pid_=`$PS -ef | $EGREP "${SCRIPTHOME}/active_loaddb.bsh|${SCRIPTHOME}/historic_loaddb.bsh" | $GREP -v $GREP | $AWK '{print $2}'`
+
+if [ "${_extract_db_pid_}" ]; then
+    stop_extracttable
+    stop_extractdb
+elif [ "${_import_db_pid_}" ]; then
+    stop_loaddb
+fi
+
+shutdown_and_exit ${exit_status}
+
+}
+
+stop_extracttable()
+{
+_extract_tbl_=${SCRIPTHOME}/extracttable.bsh
+
+_extract_tbl_pid_=`$PS -ef | $GREP ${_extract_tbl_} | $GREP -v $GREP | $AWK '{print $2}' | $TR -s "\n" " "`
+if [ ! -z "${_extract_tbl_pid_}" ]; then
+    $ECHO "\nSending KILL signal to extracttable.bsh"
+    $KILL -KILL ${_extract_tbl_pid_} >> /dev/null
+    if [ $? -eq 0 ]; then
+        $ECHO "INFO:: EXITING child process extracttable.bsh" | $TEE -a ${LOGFILE}
+    fi
+else
+    $ECHO "WARNING: Unable to get ProcessID for extracttable.bsh" | $TEE -a ${LOGFILE}
+fi
+}
+
+stop_extractdb()
+{
+_extract_db_=${SCRIPTHOME}/extractdb.bsh
+
+_extract_db_pid_=`$PS -ef | $GREP ${_extract_db_} | $GREP -v $GREP | $AWK '{print $2}'`
+if [ ! -z "${_extract_db_pid_}" ]; then
+    $ECHO "\nSending KILL signal to extractdb.bsh"
+    $KILL -KILL ${_extract_db_pid_} >> /dev/null
+    if [ $? -eq 0 ]; then
+        $ECHO "INFO:: EXITING child process extractdb.bsh" | $TEE -a ${LOGFILE}
+    else
+        $ECHO "ERROR: Could not send KILL SIGNAL to child process" | $TEE -a ${LOGFILE}
+    fi
+else
+    $ECHO "WARNING: No process running for extractdb.bsh" | $TEE -a ${LOGFILE}
+fi
+
+}
+
+stop_loaddb()
+{
+_active_loaddb_=`$PS -ef | $GREP "${SCRIPTHOME}/active_loaddb.bsh" | $GREP -v $GREP | $AWK '{print $2}'`
+_historic_loaddb_=`$PS -ef | $GREP "${SCRIPTHOME}/historic_loaddb.bsh" | $GREP -v $GREP | $AWK '{print $2}'`
+
+if [ "${_active_loaddb_}" ]; then
+    $ECHO "\nSending KILL signal to active_loaddb.bsh" | $TEE -a ${LOGFILE}
+    $KILL -KILL ${_active_loaddb_} >> /dev/null
+    if [ $? -eq 0 ]; then
+        $ECHO "INFO:: EXITING child process active_loaddb.bsh" | $TEE -a ${LOGFILE}
+    else
+        $ECHO "ERROR: Could not send KILL SIGNAL to child process" | $TEE -a ${LOGFILE}
+    fi
+elif [ "${_historic_loaddb_}" ]; then
+    $ECHO "\nSending KILL signal to historic_loaddb.bsh" | $TEE -a ${LOGFILE}
+    $KILL -KILL ${_historic_loaddb_} >> /dev/null
+    if [ $? -eq 0 ]; then
+        $ECHO "INFO:: EXITING child process historic_loaddb.bsh" | $TEE -a ${LOGFILE}
+    else
+        $ECHO "ERROR: Could not send KILL SIGNAL to child process" | $TEE -a ${LOGFILE}
+    fi
+fi
+}
+
+### Function: shutdown_and_exit ###
+#
+# Shutdown Shutdown the NASd cleanly.
+# First disable the NAS milestone to stop all dependencies.
+# Then unmount all filesystems.
+# Lastly ensure there are no hanging or unfinished subprocesses.
+#
+shutdown_and_exit()
+{
+local exit_status
+if [[ -n "${1}" ]]; then
+    exit_status=${1}
+else
+    exit_status=1
+fi
+
+log_msg -t -s "INFO:: EXITING eniq_data_migration.bsh" -l ${LOGFILE}
+abort_script 
+
+}
+
+
+# ********************************************************************
+#
+#   Functions
+#
+# ********************************************************************
+### Function: abort_script ###
+#
+#   This will is called if the script is aborted thru an error
+#   signal sent by the kernel such as CTRL-C or if a serious
+#   error is encountered during runtime
+#
+# Arguments:
+#       $1 - Error message from part of program (Not always used)
+# Return Values:
+#       none
+abort_script()
+{
+_err_time_=`$DATE '+%Y-%b-%d_%H.%M.%S'`
+
+if [ "$1" ]; then
+    _err_msg_="${_err_time_} - $1"
+else
+    _err_msg_="${_err_time_} - ERROR : Script aborted.......\n"
+fi
+
+if [ "${LOGFILE}" ]; then
+    $ECHO "\nERROR : ${_err_msg_}\n" | $TEE -a ${LOGFILE}
+else
+    $ECHO "\nERROR : ${_err_msg_}\n"
+fi
+
+cd $SCRIPTHOME
+$RM -rf ${TEM_DIR}
+$RM -rf $RESULTSDIR/.selective_feature_on $RESULTSDIR/.extract_process_running $RESULTSDIR/pause_process.txt >> /dev/null 2>&1
+
+_tail_pid_=`$PS -ef | $GREP "$TAIL -f ${LOGFILE}" |$GREP -v grep | $AWK '{print $2}'`
+if [ ! -z "${_tail_pid_}" ]; then
+$KILL -9 ${_tail_pid_} >/dev/null
+fi
+
+if [ "$2" ]; then
+    if [ ! "${UPGRADE}" -a ! "${RESTORE}" -a ! "${MIGRATION}" ]; then
+        ${2}
+    fi
+    exit 1
+else
+   exit 1
+fi
+}
+
+### Function: put_engine_to_normal ###
+#
+# Bring engine to .normal. state from NoLoads.
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+put_engine_to_normal()
+{
+log_msg -s "\nPutting the engine in Normal mode\n" -l ${LOGFILE}
+_command_="engine -e changeProfile Normal"
+$SU - $SYSUSER -c "${_command_}" >> /dev/null 2>&1
+if [ $? -ne 0 ];then
+    if [ "${_catalog_change_option_}" == "r" ]; then
+        log_msg -s "Failed to put the engine in Normal mode, follow the document to put the engine in Normal mode"
+    else
+        _err_msg_="Failed to put the engine in Normal mode"
+        abort_script "${_err_msg_}"
+    fi
+else
+    log_msg -s "\nSuccessfully put the engine in Normal mode\n" -l ${LOGFILE}
+fi
+} 
+
+### Function: revert_catalog_cache ###
+#
+# Revert Catalog cache values to default.
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+revert_catalog_cache()
+{
+log_msg -s "\nReverting the catalog cache" -l ${LOGFILE}
+${BASH} ${ENIQ_CORE_BIN_DIR}/set_core_memcache.bsh -d ${ENIQ_CONF_DIR} -m -f 
+if [ $? -ne 0 ];then
+    log_msg -s "Failed to revert catalog cache, follow the document to revert the catalog cache manually"
+else
+    log_msg -s "Successfully reverted  catalog cache " -l ${LOGFILE}
+fi
+}
+
+### Function: setup_env ###
+#
+# Set up environment variables for script.
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+setup_env()
+{
+# Determine Solaris OS version
+unset SOLARIS_10
+OS_VERSION=`$UNAME -r`
+if [ "${OS_VERSION}" == "5.10" ]; then
+    SOLARIS_10="YES"
+fi
+
+# Define root user's home 
+ROOT_HOME=/
+if [ ! "${SOLARIS_10}" ]; then
+    ROOT_HOME=/root
+
+    # Setting the env HOME to /root for console run
+    export HOME=/root
+fi
+
+if [ ! "${ENIQ_BASE_DIR}" ]; then
+    # Directory on the root filesystem
+    ENIQ_BASE_DIR=/eniq
+fi
+
+
+# ENIQ Admin Directory
+ENIQ_ADMIN_DIR=${ENIQ_BASE_DIR}/admin
+
+# ENIQ Admin etc Directory
+ENIQ_ADMIN_ETC=${ENIQ_ADMIN_DIR}/etc
+
+# ENIQ Admin bin Directory
+ENIQ_ADMIN_BIN_DIR=${ENIQ_ADMIN_DIR}/bin
+
+
+# ENIQ Log Directory
+ENIQ_LOG_DIR=${ENIQ_BASE_DIR}/local_logs
+
+# ENIQ Installer Directory
+ENIQ_INSTALLER_DIR=${ENIQ_BASE_DIR}/sw/installer
+
+# ENIQ TP Installer
+TP_INSTALLER=tp_installer
+
+# ENIQ SW conf
+CLI_CONF_DIR=${ENIQ_BASE_DIR}/sw/conf
+
+# Main Directory for the Core Installation SW
+ENIQ_INST_DIR=${ENIQ_BASE_DIR}/installation
+
+# Main Directory for the Core Installation SW
+ENIQ_CORE_INST_DIR=${ENIQ_INST_DIR}/core_install
+
+# Core install bin dir
+ENIQ_CORE_BIN_DIR=${ENIQ_CORE_INST_DIR}/bin
+
+# ENIQ Config Directory
+ENIQ_CONF_DIR=${ENIQ_INST_DIR}/config
+
+# File containing the type of OSS installation. Eg. events or statistics
+INST_TYPE_FILE=${ENIQ_CONF_DIR}/ericsson_use_config
+if [ ! -s "${INST_TYPE_FILE}" ]; then
+    _err_msg_="ENIQ install type not defined in ${INST_TYPE_FILE}"
+    abort_script "${_err_msg_}"  "${EXEC_SHELL_CMD}"
+fi
+# Read the installation type - should be "events" or "stats"
+INSTALL_TYPE=`$CAT ${INST_TYPE_FILE} | $AWK -F\= '{print $2}'`
+
+# Templates Directory
+ENIQ_TEMPL_DIR="`$DIRNAME ${SCRIPTHOME}`/templates/${INSTALL_TYPE}"
+
+# Location of ENIQ status file. This contains overall version of ENIQ
+ENIQ_STATUS_FILE=${ENIQ_ADMIN_DIR}/${ENIQ_VERSION_DIR}/${ENIQ_STATUS}
+
+# File containing the list of server types
+SERVER_TYPE_LIST_FILE=${ENIQ_CORE_INST_DIR}/etc/${INSTALL_TYPE}_server_list
+
+
+# Source the common functions
+if [ -s ${SCRIPTHOME}/../lib/common_functions.lib ]; then
+    . ${SCRIPTHOME}/../lib/common_functions.lib
+else
+    _err_msg_="File ${SCRIPTHOME}/../lib/common_functions.lib not found"
+    abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+fi
+
+if [ -s ${SCRIPTHOME}/../lib/common_core_install_functions.lib ]; then
+    . ${SCRIPTHOME}/../lib/common_core_install_functions.lib
+else
+    _err_msg_="File ${SCRIPTHOME}/../lib/common_core_install_functions.lib not found"
+    abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+fi
+
+if [ -s ${SCRIPTHOME}/../lib/common_inirator_functions.lib ]; then
+    . ${SCRIPTHOME}/../lib/common_inirator_functions.lib
+else
+    _err_msg_="File ${SCRIPTHOME}/../lib/common_inirator_functions.lib not found"
+    abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+fi
+
+# Get the System User/Group. All directories are owned by this
+SYSUSER=`iniget ENIQ_INSTALL_CONFIG -f ${ENIQ_CONF_DIR}/${SUNOS_INI} -v ENIQ_SYSUSER`
+if [ ! "${SYSUSER}" ]; then
+    _err_msg_="Could not read SYSUSER param from ${ENIQ_CONF_DIR}/${SUNOS_INI}"
+    abort_script "$_err_msg_"
+fi
+
+SYSGROUP=`iniget SunOS_GROUP_1 -f ${ENIQ_CONF_DIR}/${SUNOS_INI} -v name`
+if [ ! "${SYSGROUP}" ]; then
+    _err_msg_="Could not read SYSGROUP param from ${ENIQ_CONF_DIR}/${SUNOS_INI}"
+    abort_script "$_err_msg_"
+fi
+
+DBA_PASSWORD=`inigetpassword DB -f ${ENIQ_CONF_DIR}/${ENIQ_INI} -v DBAPassword`
+if [ ! "${DBA_PASSWORD}" ]; then
+    _err_msg_="Could not read DBA_PASSWORD param from ${ENIQ_CONF_DIR}/${ENIQ_INI}"
+    abort_script "$_err_msg_"
+fi
+
+HNAME=`${MYHOSTNAME}`
+HOST_IP=`$GETENT hosts ${HNAME} | $AWK '{print $1}' | $HEAD -1`
+
+#Engine IP adress
+ENGINE_IP=`$CAT /etc/hosts |$EGREP -w engine |$AWK '{print $1}'`
+
+#Current server blade type
+CURR_SERVER_TYPE=`$CAT $ENIQ_CONF_DIR/installed_server_type | $EGREP -v '^[[:blank:]]*#' | $SED -e 's/ //g'`
+
+DBEXTRACT_ENV_FILE=${ENIQ_ADMIN_ETC}/dbextract_load.env
+if [ ! "${DBEXTRACT_ENV_FILE}" ]; then
+    _err_msg_="${DBEXTRACT_ENV_FILE} does not exists"
+    abort_script "${_err_msg_}"
+fi
+
+# Initializing Extract RUN NUMBER variable
+if [ ! "${EXTRACT_RUN_NUM}" ]; then
+    EXTRACT_RUN_NUM=0
+fi
+
+RESULTSDIR=`$CAT ${DBEXTRACT_ENV_FILE} | $GREP "RESULTSDIR=" | $GREP -v "^#" | $AWK -F"=" '{print $2}'`
+if [ ! "${RESULTSDIR}" ]; then
+    _err_msg_="Could not find RESULTSDIR value from file ${DBEXTRACT_ENV_FILE}"
+     abort_script "$_err_msg_"
+else
+    if [ ! -d "${RESULTSDIR}" ]; then
+        $MKDIR -p ${RESULTSDIR}
+        if [ $? -ne 0 ]; then
+            _err_msg_="failed to create $RESULTSDIR folder. Exiting script"
+            abort_script "$_err_msg_"
+        else
+            $CHOWN ${SYSUSER}:${SYSGROUP} ${RESULTSDIR}
+            if [ $? -ne 0 ]; then
+                _err_msg_="failed change ownership of $RESULTSDIR folder. Exiting script"
+                abort_script "$_err_msg_"
+            fi
+        fi
+    fi
+fi
+
+RUNNUMBER=`$CAT ${DBEXTRACT_ENV_FILE} | $GREP "RUNNUMBER=" | $GREP -v "^#" | $AWK -F"=" '{print $2}'`
+if [ ! "${RUNNUMBER}" ]; then
+    _err_msg_="${RUNNUMBER} does not exists"
+    abort_script "${_err_msg_}"
+fi
+
+# Initializing Extract RUN NUMBER variable
+if [ ! "${EXTRACT_RUN_NUM}" ]; then
+    EXTRACT_RUN_NUM=0
+fi
+
+FLS_TABLES="RoleTable ENIQS_Policy_Criteria ENIQS_Node_Assignment"
+
+if [ ! -s "${SCRIPTHOME}/extractdb.bsh" -o ! -s "${SCRIPTHOME}/tablelist_perfeature.bsh" -o ! -s "${SCRIPTHOME}/extracttable.bsh" -o ! -s "${SCRIPTHOME}/active_loaddb.bsh" -o ! -s "${SCRIPTHOME}/historic_loaddb.bsh" ]; then
+    _err_msg_="Could not find required scripts to run Extract procedure"
+    abort_script "$_err_msg_"
+fi
+
+REP_PORT=`iniget REP -v PortNumber -f ${ENIQ_CONF_DIR}/niq.ini`
+REP_ENG=`iniget REP -v ServerName -f ${ENIQ_CONF_DIR}/niq.ini`
+if [ ! "${REP_PORT}" -o ! "${REP_ENG}" ]; then
+        _err_msg_="Could not read repdb values from ${ENIQ_CONF_DIR}/${ENIQ_INI}"
+        abort_script "$_err_msg_"
+fi
+
+REPDBA_PASSWORD=`inigetpassword REP -f ${ENIQ_CONF_DIR}/${ENIQ_INI} -v DWHREPPassword`
+if [ ! "${REPDBA_PASSWORD}" ]; then
+    _err_msg_="Could not read REPDBA_PASSWORD param from ${ENIQ_CONF_DIR}/${ENIQ_INI}"
+    abort_script "$_err_msg_"
+fi
+
+#Initialising the connection string for dwhdb
+connection_string="-nogui -c \"eng=${REP_ENG};links=tcpip{host=localhost;port=${REP_PORT}};uid=dwhrep;pwd=${REPDBA_PASSWORD}\""
+    
+}
+
+### Function: set_conf_values ###
+#
+#   Common function to set value in file
+#   having the param=value format
+#
+# Arguments:
+#       $1 : Parameter name
+#       $2 : Value
+#       $3 : File name
+# Return Values:
+#       none
+set_conf_values()
+{
+if [ $# -ne 3 ];then
+    _err_msg_="Incorrect number of parameters passed to set_conf_value"
+    abort_script "${_err_msg_}"
+fi
+
+_param_=$1
+_value_=$2
+_file_=$3
+
+# Update param=value
+# Check if the param exists in file
+
+$GREP "${_param_}=" ${_file_} >> /dev/null 2>&1
+
+if [ $? -ne 0 ];then
+    $ECHO "export ${_param_}=${_value_}" >> ${_file_}
+else
+    #$CAT ${_file_} | $SED 's/"${_param_}=*"/"${_param_}=${_value_}"/' > ${TEM_DIR}/updated_file.$$.$$
+    $CAT ${_file_} | $SED -e 's|'${_param_}'=.*|'${_param_}="${_value_}"'|' > ${TEM_DIR}/updated_file.$$.$$
+    if [ $? -ne 0 ];then
+        _err_msg_="Failed to update ${_param_} value in ${_file_}"
+        abort_script "${_err_msg_}"
+    fi
+    $MV ${TEM_DIR}/updated_file.$$.$$ ${_file_}
+    if [ $? -ne 0 ];then
+        _err_msg_="Failed to save ${_param_} value in ${_file_}"
+        abort_script "${_err_msg_}"
+    fi
+fi
+}
+
+### Function: user_input ###
+#
+# 
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+user_input()
+{
+$ECHO "sp_iqspaceused" > ${TEM_DIR}/dbspaceused.sql
+$ECHO "go" >> ${TEM_DIR}/dbspaceused.sql
+_buffer_space_=52428800
+$SU - $SYSUSER -c "isql -Udba -P${DBA_PASSWORD} -Sdwhdb -w999 -i ${TEM_DIR}/dbspaceused.sql" > ${TEM_DIR}/dbspaceused_output.txt 2>&1
+if [ -s "${TEM_DIR}/dbspaceused_output.txt" ]; then
+    _error_check_=`$EGREP -i "SQL Anywhere Error|error" ${TEM_DIR}/dbspaceused_output.txt`
+    if [ ! "${_error_check_}" ]; then
+        $CAT ${TEM_DIR}/dbspaceused_output.txt | $EGREP -B10 "-" | $EGREP -A20 "Return parameters:" | $TR -s " " "\n" | $GREP -v Return | $GREP -v parameters: | $GREP -v "-" > ${TEM_DIR}/column.txt
+        $CAT ${TEM_DIR}/dbspaceused_output.txt | $EGREP -A30 "-" | $GREP -v "(1 row affected)" | $TR -s " " "\n" | $GREP -v "-" | $SED '/^$/d' > ${TEM_DIR}/values.txt
+
+        $PASTE ${TEM_DIR}/column.txt ${TEM_DIR}/values.txt | $TR -s "\t" "|" > ${TEM_DIR}/final.txt
+
+        _total_db_size_=`$CAT ${TEM_DIR}/final.txt | $GREP -w "mainKB" | $AWK -F"|" '{print $2}'`
+        _db_size_used_=`$CAT ${TEM_DIR}/final.txt | $GREP -w "mainKBUsed" | $AWK -F"|" '{print $2}'`
+
+        if [ "${_total_db_size_}" -a "${_db_size_used_}" ]; then
+            _min_space_reqd_=`$EXPR ${_db_size_used_} + ${_buffer_space_}`
+           #  log_msg -s "\nNOTE :: Please ensure that the export directory has minimum `$EXPR ${_min_space_reqd_} / 1024 / 1024` GB of space.\nThis is used space in the database for all the features.\nThe final space occupied by the export directory might be lesser than the above given value, depending on the number of features selected\n" -l ${LOGFILE}
+        else 
+            _err_msg_="Could not read values for total DB size and User DB size"
+            abort_script "$_err_msg_"
+        fi
+    else
+        _err_msg_="Database error observed while determining DB size. Please check if DB is running...!"
+        abort_script  "$_err_msg_"
+    fi
+else
+    _err_msg_="Error determining the size of database"
+    abort_script  "$_err_msg_"
+fi
+    
+while :; do
+    $ECHO "\nPlease enter the export directory path : \c"
+    read _user_value_
+    if [ ! "${_user_value_}" ]; then
+        continue
+    else
+        _mount_dir_exists_=`$MOUNT -l | $GREP "${_user_value_}"`    
+        if [ ! "${_mount_dir_exists_}" ]; then
+            _err_msg_="Mount ${_extract_dir_} does not exist to export the data... Please mount the directory before proceeding with Extraction!"
+            abort_script "$_err_msg_"    
+        fi
+    fi
+
+        
+    set_conf_values EXTRACTS ${_user_value_} ${DBEXTRACT_ENV_FILE}
+    
+    $CHMOD 777 ${DBEXTRACT_ENV_FILE}
+    if [ $? -ne 0 ]; then
+        _err_msg_="Could not change the permissions of ${DBEXTRACT_ENV_FILE}"
+        abort_script "${_err_msg_}"
+    fi
+    
+    $CHOWN ${SYSUSER}:${SYSGROUP} ${DBEXTRACT_ENV_FILE}
+    if [ $? -ne 0 ]; then
+        _err_msg_="Could not change the permissions of ${DBEXTRACT_ENV_FILE}"
+        abort_script "${_err_msg_}"
+    fi
+    break
+done
+log_msg -q -s "User selected EXTRACTS directory : ${_user_value_}" -l ${LOGFILE}
+}
+
+
+### Function: user_input_import ###
+#
+# 
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+user_input_import()
+{
+while :; do
+    $ECHO "\nPlease enter the number of directories from where data is to be imported: \c"
+    read _dir_num_
+    if [[ "${_dir_num_}" =~ ^[0-9]$ ]]; then
+        break
+    else
+        $ECHO "\nPlease enter a valid number\n"
+    fi
+done
+    
+_count_dir_=1
+while [ "${_count_dir_}" -le "${_dir_num_}" ]; do
+    while :; do
+        $ECHO "\nPlease enter the import directory path ${_count_dir_}: \c"
+        read _user_value_
+        if [ ! "${_user_value_}" ]; then
+            continue
+        else
+            _mount_dir_exists_=`$MOUNT -l | $GREP "${_user_value_}"`    
+            if [ ! "${_mount_dir_exists_}" ]; then
+                _err_msg_="Mount ${_extract_dir_} does not exist to import the data... Please mount the directory before proceeding with Loading of data!"
+                abort_script "$_err_msg_"    
+            fi
+            log_msg -q -s "\nUser selected directory path to import data : ${_user_value_} " -l ${LOGFILE}
+        fi
+        if [ "${_count_dir_}" -eq "1" ]; then
+            _extract_dir_val_=${_user_value_}
+        else
+            _extract_dir_val_=`$ECHO ${_extract_dir_val_}:${_user_value_}`
+        fi
+        
+        log_msg -s "\nChanging permissions on ${_user_value_}, this may take some time, please wait ...\n" -l ${LOGFILE}
+        $CHOWN -R ${SYSUSER}:${SYSGROUP} ${_user_value_}
+        if [ $? -ne 0 ]; then
+            _err_msg_="Could not change the permissions of ${_user_value_}"
+            abort_script "${_err_msg_}"
+        fi
+        
+        $CHMOD -R 777 ${_user_value_}
+        if [ $? -ne 0 ]; then
+            _err_msg_="Could not change the permission of ${_user_value_} to 777"
+            abort_script "$_err_msg_"
+        fi
+        break
+    done
+    (( _count_dir_ = _count_dir_ + 1 ))
+done
+
+set_conf_values EXTRACTS "${_extract_dir_val_}" ${DBEXTRACT_ENV_FILE}
+        
+$CHMOD 777 ${DBEXTRACT_ENV_FILE}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not change the permissions of ${DBEXTRACT_ENV_FILE}"
+    abort_script "${_err_msg_}"
+fi
+
+$CHOWN ${SYSUSER}:${SYSGROUP} ${DBEXTRACT_ENV_FILE}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not change the permissions of ${DBEXTRACT_ENV_FILE}"
+    abort_script "${_err_msg_}"
+fi
+
+log_msg -q -s "User selected EXTRACTS directory : ${_extract_dir_val_}" -l ${LOGFILE}
+}
+
+
+### Function: get_absolute_path ###
+#
+# Determine absolute path to software
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+get_absolute_path()
+{
+_dir_=`$DIRNAME $0`
+SCRIPTHOME=`cd $_dir_ 2>/dev/null && pwd || $ECHO $_dir_`
+}
+
+
+
+### Function: insert_header_footer ###
+#
+#   Insert a stage header/footer message
+#
+# Arguments:
+#   $1 : head/foot
+#   $2 : Message
+#   $3 : Logfile
+# Return Values:
+#   none
+insert_header_footer()
+{
+if [ $# -ne 3 ]; then
+    _err_msg_="3 Parameters must be passed to header/footer function"
+    abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+fi
+
+if [ "$1" != "head" -a "$1" != "foot" ]; then
+    _err_msg_="Only Param of head/foot is allowed...exiting!"
+    abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+fi
+_type_=$1
+
+_msg_=$2
+
+_logfile_=$3
+$MKDIR -p `$DIRNAME ${_logfile_}`
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not create directory `$DIRNAME ${_logfile_}`"
+    abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+fi
+
+$TOUCH -a ${_logfile_}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not write to file ${_logfile_}"
+    abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+fi
+
+_time_=`$DATE '+%Y-%b-%d_%H.%M.%S'`
+if [ "$_type_" == "head" ]; then
+    $ECHO "\n-----------------------------------------------------------------------------------------" | $TEE -a ${_logfile_}
+    $ECHO "-----------------------------------------------------------------------------------------" | $TEE -a ${_logfile_}
+    $ECHO "$_time_ : $_msg_" | $TEE -a ${_logfile_}
+    $ECHO "-----------------------------------------------------------------------------------------" | $TEE -a ${_logfile_}
+fi
+
+if [ "$_type_" == "foot" ]; then
+    $ECHO "\n-----------------------------------------------------------------------------------------" | $TEE -a ${_logfile_}
+    $ECHO "$_time_ : $_msg_" | $TEE -a ${_logfile_}
+    $ECHO "-----------------------------------------------------------------------------------------" | $TEE -a ${_logfile_}
+    $ECHO "-----------------------------------------------------------------------------------------\n" | $TEE -a ${_logfile_}
+fi
+}
+
+display_source_feature()
+{
+_extract_dir_val_=`$CAT ${DBEXTRACT_ENV_FILE} | $GREP "EXTRACTS=" | $GREP -v "^#" | $AWK -F"=" '{print $2}'`
+IMPORTS=`$ECHO ${_extract_dir_val_} |sed "s/:/ /g"`
+_feature_list_file_=$(find ${IMPORTS}/ -type f -name "features.lst" | head -1)
+
+if [ ${_feature_list_file_} ]; then
+    log_msg -s "\n------------------------------------------\nSource server: Data extracted for below features   \n------------------------------------------" -l ${LOGFILE}
+    $CAT ${_feature_list_file_} | $TEE -a ${LOGFILE}
+
+    log_msg -s "\n\n------------------------------------------\nTarget server: Installed Feature list  \n------------------------------------------" -l ${LOGFILE}
+    $CAT ${ENIQ_ADMIN_DIR}/managed_oss/total_feature_install_list | $AWK -F "::" '{print $2}' | $TEE -a ${LOGFILE}
+
+    $RM ${TEM_DIR}/features_absent_list.txt 2>/dev/null
+    while read _feature_ 
+    do
+        $GREP "${_feature_}" ${ENIQ_ADMIN_DIR}/managed_oss/total_feature_install_list >/dev/null
+        if [ $? -ne 0 ];then
+            $ECHO ${_feature_} >>${TEM_DIR}/features_absent_list.txt
+        fi
+    done<${_feature_list_file_}
+
+    if [ -s ${TEM_DIR}/features_absent_list.txt ]; then
+        log_msg -s "\n\n------------------------------------------\nBelow features are not installed on the current server.\nIgnore the errors that may occur during import of tables associated with these features.\n------------------------------------------" -l ${LOGFILE}
+        $CAT ${TEM_DIR}/features_absent_list.txt | $TEE -a ${LOGFILE}
+        $SLEEP 3
+    fi
+else
+    log_msg -q -s "\nfeatures.lst file does not exist in Imports directory" -l ${LOGFILE}
+fi
+}
+
+### Function: fls_export ###
+#
+#
+#
+# Arguments:
+#   none
+# Return Values:ca
+#   none
+fls_export()
+{
+insert_header_footer head "Preparing for FLS table extract..." ${LOGFILE}
+
+for _fls_ in `$ECHO ${FLS_TABLES}`
+do
+    $ECHO "select * from systab where table_name='${_fls_}'; OUTPUT TO '${TEM_DIR}/${_fls_}_check.txt'" > ${TEM_DIR}/fls_check.sql
+    if [ -s "${TEM_DIR}/fls_check.sql" ]; then
+        $SU - $SYSUSER -c "dbisql ${connection_string} ${TEM_DIR}/fls_check.sql" > /dev/null 2>&1
+        if [ ! -s "${TEM_DIR}/${_fls_}_check.txt" ]; then
+            log_msg -s "Table ${_fls_} does not exist... skipping extract for this table." -l ${LOGFILE}
+        else
+            $ECHO "select * from ${_fls_}; OUTPUT TO '${_extract_dir_}/${_fls_}.txt'" > ${TEM_DIR}/fls_extract.sql
+            $ECHO "FORMAT TEXT;" >> ${TEM_DIR}/fls_extract.sql
+            if [ -s "${TEM_DIR}/fls_extract.sql" ]; then
+                $SU - $SYSUSER -c "dbisql ${connection_string} ${TEM_DIR}/fls_extract.sql" > /dev/null 2>>$RESULTSDIR/Error_Fls_ExtractingTable_${RUNNUMBER}.log
+                if [ $? -ne 0 ]; then
+                    _err_msg_="Error while extracting FLS table ${_fls_}."
+                    abort_script "${_err_msg_}"
+                else
+                    log_msg -s "Table ${_fls_} exported successfully." -l ${LOGFILE}
+                fi
+            else
+                _err_msg_="Failed to create sql file for FLS extract"
+                 abort_script "${_err_msg_}"
+            fi
+        fi
+    else
+        _err_msg_="Failed to create sql file for checking FLS table."
+        abort_script "${_err_msg_}"
+
+    fi
+done   
+insert_header_footer foot "Completed FLS table extract." ${LOGFILE}
+}
+
+### Function: fls_import ###
+#
+#
+#
+# Arguments:
+#   none
+# Return Values:ca
+#   none
+fls_import()
+{
+_extract_dir_full_val_=`$CAT ${DBEXTRACT_ENV_FILE} | $GREP "EXTRACTS=" | $GREP -v "^#" | $AWK -F"=" '{print $2}'`
+if [ ! "${_extract_dir_full_val_}" ]; then
+    _err_msg_="Failed to get import directory path from ${DBEXTRACT_ENV_FILE}"
+    abort_script "$_err_msg_"
+fi
+
+for _dir_ in `$ECHO ${_extract_dir_full_val_} | $SED "s/:/ /g"`
+do
+    _table_val_=`$ECHO ${FLS_TABLES} | $TR -s " " "|"`
+    $LS -lrth ${_dir_} | $EGREP "${_table_val_}"
+    if [ $? -eq 0 ];then
+        _extract_dir_=${_dir_}
+        $ECHO "FLS TABLES exist in ${_dir_}" >> ${LOGFILE}
+        break
+    fi
+done
+
+if [ "${_extract_dir_}" ]; then
+
+    log_msg -t -s "Preparing for FLS table import..." -l ${LOGFILE}
+    $MKDIR -p ${_extract_dir_}/fls_loaded
+
+    for _fls_ in `$ECHO ${FLS_TABLES}`
+    do
+        if [ -s "${_extract_dir_}/${_fls_}.txt" ]; then
+                $ECHO "INPUT INTO ${_fls_} FROM '${_extract_dir_}/${_fls_}.txt'" > ${TEM_DIR}/fls_import.sql
+                $ECHO "FORMAT TEXT;" >> ${TEM_DIR}/fls_import.sql
+                if [ -s "${TEM_DIR}/fls_import.sql" ]; then
+                    $SU - $SYSUSER -c "dbisql -onerror continue ${connection_string} ${TEM_DIR}/fls_import.sql" > /dev/null 2>>$RESULTSDIR/Error_Fls_ImportingTable_${RUNNUMBER}.log
+                    if [ $? -ne 0 ]; then
+                        _err_msg_="Error while importing FLS table ${_fls_}."
+                        abort_script "$_err_msg_"
+                    else
+                        $ECHO "Table ${_fls_} imported successfully." >> ${LOGFILE}
+                        $CP ${_extract_dir_}/${_fls_}.txt ${_extract_dir_}/fls_loaded/
+                        if [ $? -eq 0 ]; then
+                            $RM -rf ${_extract_dir_}/${_fls_}.txt
+                            $ECHO "Moved ${_extract_dir_}/${_fls_}.txt to ${_extract_dir_}/fls_loaded/" >> ${LOGFILE}
+                        else
+                            $ECHO "Failed to move ${_extract_dir_}/${_fls_}.txt to ${_extract_dir_}/fls_loaded/" >> ${LOGFILE}
+                        fi
+                    fi
+                else
+                    _err_msg_="Failed to create sql file for FLS import"
+                    abort_script "$_err_msg_"
+                fi
+        else
+            $LS -l ${_extract_dir_}/${_fls_}.txt >>/dev/null 2>&1
+            if [ $? -eq 0 ]; then
+                $ECHO "File ${_extract_dir_}/${_fls_}.txt is empty, nothing to load."  >> ${LOGFILE}
+                $CP ${_extract_dir_}/${_fls_}.txt ${_extract_dir_}/fls_loaded/
+                if [ $? -eq 0 ]; then
+                   $RM -rf ${_extract_dir_}/${_fls_}.txt
+                   $ECHO "Moved ${_extract_dir_}/${_fls_}.txt to ${_extract_dir_}/fls_loaded/" >> ${LOGFILE}
+                else
+                   $ECHO "Failed to move ${_extract_dir_}/${_fls_}.txt to ${_extract_dir_}/fls_loaded/" >> ${LOGFILE}
+                fi
+            else
+                $ECHO "File ${_extract_dir_}/${_fls_}.txt does not exist to import data into the table." >> ${LOGFILE}
+            fi    
+
+        fi
+    done
+    log_msg -t -s  "Completed FLS table import." -l ${LOGFILE}
+else
+    $ECHO "There are no FLS files to import" >> ${LOGFILE}
+       
+fi
+
+}
+
+
+### Function: selective_extract ###
+#
+#
+#
+# Arguments:
+#   none
+# Return Values:ca
+#   none
+selective_extract()
+{
+
+while :; do
+        $ECHO "\nDo you wish to extract ALL data from database(Yy/Nn) : \c" 
+        read _user_value_
+    
+        if [ "${_user_value_}" ]; then
+                if [ ${_user_value_} == "Y" -o ${_user_value_} == "y" -o ${_user_value_} == "N" -o ${_user_value_} == "n" ]; then
+                        break;
+                else
+                        log_msg -s "Incorrect value entered" -l ${LOGFILE}
+                fi
+        fi
+done
+
+if [ ${_user_value_} == "N" -o ${_user_value_} == "n" ]; then
+    
+    if [ -s "${RESULTSDIR}/features.lst" ]; then
+        while :; do
+            $ECHO "\n\n\n--------------------------------------------"
+            $ECHO "Already selected features list"
+            $ECHO "--------------------------------------------"
+            $CAT ${RESULTSDIR}/features.lst
+            $ECHO "\n\nDo you wish to continue with existing feature selection(Yy/Nn) : \c" 
+            read _user_value1_
+
+            if [ "${_user_value1_}" ]; then
+                    if [ ${_user_value1_} == "Y" -o ${_user_value1_} == "y" -o ${_user_value1_} == "N" -o ${_user_value1_} == "n" ]; then
+                            $TOUCH ${RESULTSDIR}/.selective_feature_on
+                            break;
+                    else
+                            log_msg -s "Incorrect value entered" -l ${LOGFILE}
+                    fi
+            fi
+        done
+    else 
+        _user_value1_=N
+    fi    
+    
+    
+    if [ ${_user_value1_} == "N" -o ${_user_value1_} == "n" ]; then
+        $RM ${RESULTSDIR}/features.lst 2>/dev/null
+        
+        $TOUCH ${RESULTSDIR}/.selective_feature_on
+        if [ $? -ne 0 ]; then
+            _err_msg_="Could not create ${RESULTSDIR}/.selective_feature_on"
+            abort_script "${_err_msg_}"
+        fi
+
+    #Redirecting user input to a file
+    $ECHO "Extract all database data : ${_user_value_}" >> ${RESULTSDIR}/user_input_extract.txt
+    $ECHO "Continue with already existing feature : ${_user_value1_}" >> ${RESULTSDIR}/user_input_extract.txt
+
+        if [ ! -s "${ENIQ_ADMIN_DIR}/managed_oss/total_feature_install_list" ]; then
+                _err_msg_="Could not find list of features installed on the server"
+                abort_script "$_err_msg_"
+        else
+            _feature_count_=1
+             $CAT ${ENIQ_ADMIN_DIR}/managed_oss/total_feature_install_list | $AWK -F"::" '{print $1 "::" $2}' | $SORT -u > ${TEM_DIR}/server_features.txt
+            while read _feature_details_
+            do
+                if [ "${_feature_details_}" ]; then    
+                    _feature_name_=`$ECHO ${_feature_details_} | $AWK -F"::" '{print $2}'`
+                    $ECHO "[${_feature_count_}]:${_feature_name_}" >> ${TEM_DIR}/feature_list.txt
+                    _feature_count_=`$EXPR ${_feature_count_} + 1`
+                fi
+            done < ${TEM_DIR}/server_features.txt
+
+            _cnt_=`$CAT ${ENIQ_INSTALLER_DIR}/installed_features | $WC -l`
+
+            $ECHO "\nPlease select the features you wish to extract the data for using the following format [n,n,n-n,n...n]" >> ${TEM_DIR}/feature_list.txt | $TEE -a ${LOGFILE}
+            $ECHO "E.G. 1,2,3-8,9,10" >> ${TEM_DIR}/feature_list.txt | $TEE -a ${LOGFILE}
+        
+            if [ -s "${TEM_DIR}/feature_list.txt" ]; then
+                while :; do
+                    $CLEAR
+                    $CAT ${TEM_DIR}/feature_list.txt | $AWK -F":" '{print $1" "$2}' | $TEE -a ${LOGFILE}
+                    $ECHO "\n"
+                    read _opt_
+
+                    # If the User hit nothing
+                    if [ ! "${_opt_}" ]; then
+                            continue
+                    fi
+
+                    _numerror_=0
+
+                    for _num_ in `$ECHO ${_opt_} | $SED -e 's| ||g' -e 's|,| |g'`; do
+                            $ECHO ${_num_} | $EGREP '-' >> /dev/null 2>&1
+                            if [ $? -eq 0 ]; then
+                                    _start_=`$ECHO ${_num_} | $AWK -F\- '{print $1}'`
+                                    if [ ! "${_start_}" ]; then
+                                            continue
+                                    fi
+
+                                    _end_=`$ECHO ${_num_} | $AWK -F\- '{print $2}'`
+                                    for (( _sel_=${_start_}; _sel_<=${_end_}; _sel_++ )); do
+                                    $ECHO ${_sel_} | $EGREP '[^0-9]' >> /dev/null 2>&1
+                                    if [ $? -eq 0 ]; then
+                                            _numerror_=1
+                                            break
+                                    fi
+
+                                    if [ ${_sel_} -lt 1 -o ${_sel_} -gt ${_cnt_} ]; then
+                                         _numerror_=1
+                                         break
+                                    fi
+
+                                    $ECHO ${_sel_} >> ${TEM_DIR}/feature_selection
+                                    done
+                            else
+                                    $ECHO ${_num_} | $EGREP '[^0-9]' >> /dev/null 2>&1
+                                    if [ $? -eq 0 ]; then
+                                     _numerror_=1
+                                      break
+                                    fi
+
+                                    if [ ${_num_} -lt 1 -o ${_num_} -gt ${_cnt_} ]; then
+                                    _numerror_=1
+                                    break
+                                    fi
+
+                                    $ECHO ${_num_} >> ${TEM_DIR}/feature_selection
+                            fi
+                    done
+                    if [ ${_numerror_} -eq 0 ]; then
+                        break
+                    fi
+                done
+            else
+                _err_msg_="Could not find list of Features installed on the server"
+                abort_script "${_err_msg_}"
+            fi
+        fi
+    
+        
+        
+        if [ -s "${TEM_DIR}/feature_selection" ]; then
+                for _feature_sel_ in `$CAT ${TEM_DIR}/feature_selection | $XARGS`
+                do
+                        _feature_=`$GREP -w "\[${_feature_sel_}\]" ${TEM_DIR}/feature_list.txt | $AWK -F":" '{print $2}'`
+                        if [ "${_feature_}" ]; then
+                                $ECHO "${_feature_}" >> ${RESULTSDIR}/features.lst
+                        else
+                                _err_msg_="Selected feature(s) does not exist!"
+                                abort_script "${_err_msg_}"
+                        fi
+                done
+        else
+            _err_msg_="Could not read the user selected feature(s) file"
+            abort_script "${_err_msg_}"
+        fi
+    
+    else
+        log_msg -s "\nUser selected to continue with the same feature list\n" -l ${LOGFILE}
+        $ECHO "Continue with already existing feature : ${_user_value1_}" >> ${RESULTSDIR}/user_input_extract.txt
+    fi
+
+    #Redirecting user input to a file
+    $ECHO "Feature selected : `$CAT ${RESULTSDIR}/features.lst | $TR -s '\n' '::'`" >> ${RESULTSDIR}/user_input_extract.txt
+    
+    $ECHO "\n--------------------------------------------" 
+    $ECHO "Preparing for Table list generation..." 
+    $ECHO "--------------------------------------------\n" 
+
+    if [ -s "${RESULTSDIR}/features.lst" ]; then
+            _feature_arg_=`$CAT ${RESULTSDIR}/features.lst | $TR -s "\n" ","`
+            
+            $BASH ${SCRIPTHOME}/tablelist_perfeature.bsh -f "${_feature_arg_}"
+            
+            _check_script_status_=`$ECHO ${PIPESTATUS[0]}`    
+            if [ "${_check_script_status_}" -ne 0 ]; then
+                    _err_msg_="Could not identify list of Tables for features selected...Exiting!"
+                    abort_script "${_err_msg_}"
+            fi
+    else
+            _err_msg_="Could not locate the selected feature list file"
+            abort_script "${_err_msg_}"
+    fi
+    log_msg -q -s "User selected features list:" -l ${LOGFILE}
+    $CAT ${RESULTSDIR}/features.lst >>${LOGFILE}
+else
+    log_msg -q -s "User selected to extract ALL data from database" -l ${LOGFILE}
+    $RM ${RESULTSDIR}/.selective_feature_on >>/dev/null 2>&1
+fi
+
+}
+
+
+
+### Function: catalog_cache_change ###
+#
+# 
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+catalog_cache_change()
+{
+#Change the catalog cache for the initial extract
+insert_header_footer head "Adjusting the Catalog Cache " ${LOGFILE}
+log_msg -s "\nPutting the engine in NoLoads mode\n " -l ${LOGFILE}
+
+_command_="engine -e changeProfile NoLoads"
+$SU - $SYSUSER -c "${_command_}" >> /dev/null 2>&1
+if [ $? -ne 0 ];then
+     _err_msg_="Failed to put the engine in NoLoads mode"
+     abort_script "${_err_msg_}"
+fi
+
+log_msg -s "\nChecking the execution slots\n " -l ${LOGFILE}
+#check the execution slots are empty of Loader and Aggregation sets.
+_timeout_=0
+while true ;do
+    _command_="engine -e showSetsInExecutionSlots | $EGREP 'Count|Loader'"
+    $SU - $SYSUSER -c "${_command_}"  >> /dev/null 2>&1
+        
+    if [ $? -eq 0 ];then
+        log_msg -s "Waiting for execution slots to get empty of Loader and Aggregation sets" -l ${LOGFILE}
+        $SLEEP 5
+        (( _timeout_ = _timeout_ + 5 ))
+        if [ ${_timeout_} -eq 120 ]; then
+            #_err_msg_="Failed to put the engine in noload mode, timeout"
+            #abort_script "${_err_msg_}"
+            break
+        else    
+            continue
+        fi
+    else
+        log_msg -s "\nExecution slots are empty of Loader and Aggregation sets" -l ${LOGFILE}
+        break
+    fi
+done
+
+#increase the cache values
+log_msg -s "\nAdjusting the catalog cache" -l ${LOGFILE}
+_catalog_change_option_=$1
+if [ "${_catalog_change_option_}" == "a" ]; then
+    log_msg -s "\nIncreasing the catalog cache" -l ${LOGFILE}
+    ${BASH} ${ENIQ_CORE_BIN_DIR}/set_core_memcache.bsh -d ${ENIQ_CONF_DIR} -m -T 25 -M 25 -L 25 -C 25 -f 
+    if [ $? -ne 0 ];then
+        #Due to failure, reverting engine to Normal state
+        put_engine_to_normal
+        _err_msg_="Failed to increase catalog cache"
+        abort_script "${_err_msg_}"
+    else
+        log_msg -s "Successfully increased the catalog cache" -l ${LOGFILE}
+    fi
+elif [ "${_catalog_change_option_}" == "r" ]; then
+    revert_catalog_cache
+fi
+
+#Restart dwhdb after catalog cache refactoring
+log_msg -s "\nRestarting dwhdb ..... " -l ${LOGFILE}
+$SU - $SYSUSER -c "dwhdb restart" >> /dev/null 2>&1
+if [ $? -ne 0 ];then
+    if [ "${_catalog_change_option_}" == "r" ]; then
+        log_msg -s "Failed to restart dwhdb, follow the document to restart dwhdb"
+    else
+        #Due to failure, reverting catalog cache values to default and putting engine back to Normal state
+        revert_catalog_cache
+        put_engine_to_normal
+        _err_msg_="Failed to restart dwhdb"
+        abort_script "${_err_msg_}"
+    fi
+else
+    log_msg -s "Successfully restarted dwhdb" -l ${LOGFILE}
+fi
+
+#Put the engine back to .normal. after adjusting the caches
+put_engine_to_normal
+}    
+
+### Function: check_dbcc_run ###
+#
+# 
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+check_dbcc_run()
+{
+if [ -f ${ENIQ_ADMIN_ETC}/dbcheck.env ]; then
+
+    # Checking if Database Consistency Check script reported any errors
+    insert_header_footer head "Checking for Database Consistency " ${LOGFILE}
+
+    _alloc_status_=`$GREP db_allocation_LASTRUN_STATE ${ENIQ_ADMIN_ETC}/dbcheck.env | $AWK -F\= '{print $2}'`
+    _verifytables_status_=`$GREP verify_tables_LASTRUN_STATE ${ENIQ_ADMIN_ETC}/dbcheck.env | $AWK -F\= '{print $2}'`
+    _iqmsgchk_status_=`$GREP iqmsg_check_LASTRUN_STATE ${ENIQ_ADMIN_ETC}/dbcheck.env | $AWK -F\= '{print $2}'`
+    if [ "$_alloc_status_" == "" -o "$_verifytables_status_" == "" -o "$_iqmsgchk_status_" == "" ]; then
+            log_msg -l ${LOGFILE} -t -s "\nERROR: Could not read last run status pass or fail from ${ENIQ_ADMIN_ETC}/dbcheck.env"
+    fi
+
+    # Throw error if any errors or inconsistency reported by DbCheck.bsh
+    if [ "${_alloc_status_}" == "FAIL" ] || [ "${_verifytables_status_}" == "FAIL" ] || [ "${_iqmsgchk_status_}" == "FAIL" ]; then
+            log_msg -l ${LOGFILE} -s "\nINFO: Error reported by DbCheck.bsh script. Cannot proceed further.\nKindly contact Ericsson Support"
+
+              # Setting the generic message for touch file.
+              error="failed due to database corruption, kindly contact Ericsson support to correct the database and re run the DBCC check."
+
+
+            log_msg -l ${LOGFILE} -s "Below are the last run status for all three actions\nAlloction status : $_alloc_status_\nVerify tables : $_verifytables_status_\nIqmsg check state : $_iqmsgchk_status_\n"
+            _err_msg_="Database might be corrupted. Exiting...$0"
+            abort_script "$_err_msg_"
+
+    else
+            log_msg -l ${LOGFILE} -s "\nThere is no database corruption."
+    fi
+fi
+}
+
+
+### Function: check_space_availability ###
+#
+# check initial space availeable on external media before proceeding with Extraction procedure
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+check_space_availability()
+{
+## temporarily defined here, need to add in environment file
+_buffer_space_=524288000
+
+_extract_dir_=`$CAT ${DBEXTRACT_ENV_FILE} | $GREP "EXTRACTS=" | $GREP -v "^#" | $AWK -F"=" '{print $2}'`
+insert_header_footer head "Checking for available space on ${_extract_dir_}" ${LOGFILE}
+
+if [ ! "${_extract_dir_}" ]; then
+    _err_msg_="Could not fetch EXTRACTS parameter value from  ${DBEXTRACT_ENV_FILE} file"
+    abort_script "${_err_msg_}"
+else
+    _fs_size_=`$DF -k ${_extract_dir_} | $TAIL -1 | $TR -s " " " " | $CUT -d" " -f4`
+    _fs_size_used_=`$DF -k ${_extract_dir_} | $TAIL -1 | $TR -s " " " " | $CUT -d" " -f3`
+
+     if [ "${_fs_size_}" ]; then
+
+        $ECHO "sp_iqspaceused" > ${TEM_DIR}/dbspaceused.sql
+        $ECHO "go" >> ${TEM_DIR}/dbspaceused.sql
+
+
+        $SU - $SYSUSER -c "isql -Udba -P${DBA_PASSWORD} -Sdwhdb -w999 -i ${TEM_DIR}/dbspaceused.sql" > ${TEM_DIR}/dbspaceused_output.txt 2>&1
+        if [ -s "${TEM_DIR}/dbspaceused_output.txt" ]; then
+            _error_check_=`$EGREP -i "SQL Anywhere Error|error" ${TEM_DIR}/dbspaceused_output.txt`
+            if [ ! "${_error_check_}" ]; then
+                $CAT ${TEM_DIR}/dbspaceused_output.txt | $EGREP -B10 "-" | $EGREP -A20 "Return parameters:" | $TR -s " " "\n" | $GREP -v Return | $GREP -v parameters: | $GREP -v "-" > ${TEM_DIR}/column.txt
+                $CAT ${TEM_DIR}/dbspaceused_output.txt | $EGREP -A30 "-" | $GREP -v "(1 row affected)" | $TR -s " " "\n" | $GREP -v "-" | $SED '/^$/d' > ${TEM_DIR}/values.txt
+
+                $PASTE ${TEM_DIR}/column.txt ${TEM_DIR}/values.txt | $TR -s "\t" "|" > ${TEM_DIR}/final.txt
+
+                _total_db_size_=`$CAT ${TEM_DIR}/final.txt | $GREP -w "mainKB" | $AWK -F"|" '{print $2}'`
+                _total_db_size_used_=`$CAT ${TEM_DIR}/final.txt | $GREP -w "mainKBUsed" | $AWK -F"|" '{print $2}'`
+                # Calculate the db size used in case some data has already been extracted.If this is fresh extraction then fs size used will ideally be 0.
+
+                _db_size_used_=`$EXPR ${_total_db_size_used_} - ${_fs_size_used_}` 
+
+                if [ "${_total_db_size_}" -a "${_db_size_used_}" ]; then
+                    _min_space_reqd_=`$EXPR ${_db_size_used_} + ${_buffer_space_}`
+
+                    if [ ${_fs_size_} -lt ${_min_space_reqd_} ]; then
+                        if [ -f ${RESULTSDIR}/.selective_feature_on ]; then
+                            $CLEAR
+                            $ECHO "WARNING: Insufficient space on the mount point ${_extract_dir_}.\n\nSpace Required for export of all the installed features : `$EXPR ${_min_space_reqd_} / 1024 / 1024` GB\nSpace Available on the media : `$EXPR ${_fs_size_} / 1024 / 1024` GB\n\n Please extend the mount point, or provide another mount point with size greater than `$EXPR ${_min_space_reqd_} / 1024 / 1024` GB"
+
+                            $ECHO "\n For selective features, the required space for export may be less than `$EXPR ${_min_space_reqd_} / 1024 / 1024` GB\n It may result in failure if the mount point gets filled up during export\n"
+                            
+                            
+                            while :; do
+                                $ECHO "Do you still want to continue (Yy/Nn) :"
+                                read _user_response_
+                                if [ "${_user_response_}" ]; then
+                                    if [ ${_user_response_} == "Y" -o ${_user_response_} == "y" -o ${_user_response_} == "N" -o ${_user_response_} == "n" ]; then
+                                        break;
+                                    else
+                                        log_msg -s "Incorrect value entered" -l ${LOGFILE}
+                                    fi
+                                fi
+                            done
+                            if [ "${_user_response_}" == "Y" -o "${_user_response_}" == "y" ];then
+                                log_msg -l ${LOGFILE} -s "\nUser has chosen to proceed with insufficient space"
+                                $ECHO "Used space on Database : `$EXPR ${_total_db_size_used_}  / 1024 / 1024` GB\nSize of already exported data : `$EXPR ${_fs_size_used_} / 1024 / 1024` GB\nMinimum space required on media : `$EXPR ${_min_space_reqd_} / 1024 / 1024` GB\nSpace Available on the media : `$EXPR ${_fs_size_} / 1024 / 1024` GB" | $TEE -a ${LOGFILE}
+                                $CHOWN ${SYSUSER}:${SYSGROUP} ${_extract_dir_}
+                                if [ $? -ne 0 ]; then
+                                    _err_msg_="Could not change the permissions of ${_extract_dir_}"
+                                    abort_script "${_err_msg_}"
+                                fi
+                                $CHMOD 777 ${_extract_dir_}
+                                if [ $? -ne 0 ]; then
+                                    _err_msg_="Could not change the permission of ${_extract_dir_} to 777"
+                                    abort_script "$_err_msg_"
+                                fi
+                                $RM -rf ${RESULTSDIR}/DB_data.txt                                
+                                $ECHO "DB_SIZE=${_total_db_size_}" > ${RESULTSDIR}/DB_data.txt
+                                $ECHO "DB_SIZE_USED=${_total_db_size_used_}" >> ${RESULTSDIR}/DB_data.txt
+                            else
+                                _err_msg_="Cannot export data, insufficient space on the mount point ${_extract_dir_}.\n\nSpace Required : `$EXPR ${_min_space_reqd_} / 1024 / 1024` GB\nSpace Available on the media : `$EXPR ${_fs_size_} / 1024 / 1024` GB\n\nPlease extend the mount point, or provide another mount point with size greater than `$EXPR ${_min_space_reqd_} / 1024 / 1024` GB"
+                                abort_script "$_err_msg_"
+                            fi
+                        else
+                             _err_msg_="Cannot export data, insufficient space on the mount point ${_extract_dir_}.\n\nSpace Required : `$EXPR ${_min_space_reqd_} / 1024 / 1024` GB\nSpace Available on the media : `$EXPR ${_fs_size_} / 1024 / 1024` GB\n\nPlease extend the mount point, or provide another mount point with size greater than `$EXPR ${_min_space_reqd_} / 1024 / 1024` GB"
+                             abort_script "$_err_msg_"
+                        fi
+                    else
+                        log_msg -l ${LOGFILE} -s "\nSufficient space available in ${_extract_dir_}"
+                        $ECHO "Used space on Database : `$EXPR ${_total_db_size_used_}  / 1024 / 1024` GB\nSize of already exported data : `$EXPR ${_fs_size_used_} / 1024 / 1024` GB\nMinimum space required on media : `$EXPR ${_min_space_reqd_} / 1024 / 1024` GB\nSpace Available on the media : `$EXPR ${_fs_size_} / 1024 / 1024` GB" | $TEE -a ${LOGFILE}
+                        
+                        $CHOWN ${SYSUSER}:${SYSGROUP} ${_extract_dir_}
+                        if [ $? -ne 0 ]; then
+                            _err_msg_="Could not change the permissions of ${_extract_dir_}"
+                            abort_script "${_err_msg_}"
+                        fi
+                        $CHMOD 777 ${_extract_dir_}
+                        if [ $? -ne 0 ]; then
+                            _err_msg_="Could not change the permission of ${_extract_dir_} to 777"
+                            abort_script "$_err_msg_"
+                        fi
+                        $RM -rf ${RESULTSDIR}/DB_data.txt                                
+                        $ECHO "DB_SIZE=${_total_db_size_}" > ${RESULTSDIR}/DB_data.txt
+                        $ECHO "DB_SIZE_USED=${_db_size_used_}" >> ${RESULTSDIR}/DB_data.txt
+                    fi
+                else
+                     _err_msg_="Could not read values for total DB size and User DB size"
+                     abort_script "$_err_msg_"
+                fi
+            else
+                $ECHO "Database error observed while determining DB size. Please check if DB is running...!"
+                abort_script  "$_err_msg_"
+            fi
+        else
+            _err_msg_="Error determining the size of database"
+            abort_script  "$_err_msg_"
+        fi
+    else
+        _err_msg_="Could not determine size of the directory ${_extract_dir_}"
+        abort_script "$_err_msg_"
+    fi
+fi
+}
+
+### Function: usage_msg ###
+#
+# print usage message if user input is invalid
+#
+# Arguments:
+#   variable
+# Return Values:
+#   none
+usage_msg()
+{
+$ECHO "USAGE:"
+$ECHO "bash eniq_data_migration.bsh -a <export|import|pause|resume> -t <active|historic> [ -l <logfile> ]"
+$ECHO "ex. bash eniq_data_migration.bsh -a export -l /tmp/extract_logfile"
+$ECHO "ex. bash eniq_data_migration.bsh -a import -t <active|historic>  -l /tmp/extract_logfile"
+exit
+}
+
+### Function: check_id ###
+#
+#   Check that the effective id of the user is correct
+#   If not print error msg and exit.
+#
+# Arguments:
+#       $1 : User ID name
+# Return Values:
+#       none
+check_id()
+{
+_check_id_=`$ID | $AWK -F\( '{print $2}' | $AWK -F\) '{print $1}'`
+if [ "$_check_id_" != "$1" ]; then
+    _err_msg_="You must be $1 to execute this script."
+    abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+fi
+}
+
+### Function: run_extract ###
+#
+#   
+#
+# Arguments:
+#       
+# Return Values:
+#       none
+run_extract()
+{
+_max_count_attempts_=`$CAT ${DBEXTRACT_ENV_FILE} | $GREP "MAX_COUNT_ATTEMPTS=" | $GREP -v "^#" | $AWK -F"=" '{print $2}'`
+if [ -z ${_max_count_attempts_} ]; then
+    err_msg_="Could not fetch the value of MAX_COUNT_ATTEMPTS from ${DBEXTRACT_ENV_FILE}"
+    abort_script "$_err_msg_"
+fi
+
+_count_attempts_=1
+
+while [ ${_count_attempts_} -lt ${_max_count_attempts_} ]
+do
+    #export _extractdb_attempts_=${_count_attempts_}
+    $ECHO ${_count_attempts_} >${RESULTSDIR}/extractdb_attempts.txt
+    insert_header_footer head "Starting to extract tables from database, attempt no:${_count_attempts_} " ${LOGFILE}
+    log_msg -s "\nExecuting ${SCRIPTHOME}/extractdb.bsh -l ${LOGFILE}\n " -l ${LOGFILE}
+    
+    $SU - $SYSUSER -c "$BASH ${SCRIPTHOME}/extractdb.bsh -l ${LOGFILE} " | $EGREP -v "Oracle|mail" | $TEE -a ${LOGFILE}
+    _res_=`$ECHO ${PIPESTATUS[0]}`
+    if [ ${_res_} -eq 1 ]; then
+    #Exiting beacuse could not create file or other standard exit
+        _err_msg_="Error encountered during data export"
+        abort_script "$_err_msg_"
+    elif [ ${_res_} -eq 2 ]; then
+    #Exiting beacause DWHDB is down
+        _err_msg_="Exiting due to database error.. Please check if DB is running!"
+         abort_script "$_err_msg_"    
+    fi
+    insert_header_footer foot "Completed extracting tables from database for attempt no:${_count_attempts_}" ${LOGFILE}
+    let _count_attempts_='_count_attempts_+1'
+done
+
+
+exit
+}
+
+### Function: run_extract_final ###
+#
+# Extracting Final Run
+#
+# Arguments:
+#   variable
+# Return Values:
+#   none
+run_extract_final()
+{
+insert_header_footer head "Executing Final extract with engine in noloads mode" ${LOGFILE}
+
+log_msg -s "\nPutting the engine in NoLoads mode\n " -l ${LOGFILE}
+
+_command_="engine -e changeProfile NoLoads"
+$SU - $SYSUSER -c "${_command_}" >> /dev/null 2>&1
+
+if [ $? -ne 0 ];then
+     _err_msg_="Failed to put the engine in NoLoads mode"
+     abort_script "${_err_msg_}"
+fi
+
+log_msg -s "\nChecking the execution slots\n " -l ${LOGFILE}
+#check the execution slots are empty of Loader and Aggregation sets.
+_timeout_=0
+while true ;do
+    _command_="engine -e showSetsInExecutionSlots | $EGREP 'Count|Loader'"
+    $SU - $SYSUSER -c "${_command_}" >> /dev/null 2>&1
+        
+    if [ $? -eq 0 ];then
+        log_msg -s "Waiting for execution slots to get empty of Loader and Aggregation sets" -l ${LOGFILE}
+        $SLEEP 30
+        (( _timeout_ = _timeout_ + 5 ))
+        if [ ${_timeout_} -eq 14400 ]; then
+            #timeout of 2 hours
+            #_err_msg_="Failed to put the engine in noload mode, timeout"
+            #abort_script "${_err_msg_}"
+            log_msg -s "Timeout waiting for execution slots to get empty of Loader and Aggregation sets, proceeding with extract.." -l ${LOGFILE}
+            break
+        else    
+            continue
+        fi
+    else
+        log_msg -s "\nExecution slots are empty of Loader and Aggregation sets" -l ${LOGFILE}
+        break
+    fi
+done
+
+if [ ${EXTRACT_RUN_NUM} -eq 3 ] ; then
+	log_msg -q -s "Creating export run three running file" -l ${LOGFILE}
+	$TOUCH ${RESULTSDIR}/.export_run_three_running
+	if [ $? -ne 0 ]; then
+        _err_msg_="Could not able to create the flag file for third export"
+        abort_script "$_err_msg_"
+    fi
+fi
+
+#Final Exporting of the data from database from current server
+log_msg -s "\nExecuting ${SCRIPTHOME}/extractdb.bsh -l ${LOGFILE}\n " -l ${LOGFILE}
+
+$SU - $SYSUSER -c "$BASH ${SCRIPTHOME}/extractdb.bsh -l ${LOGFILE}" | $EGREP -v "Oracle|mail" | $TEE -a ${LOGFILE}
+_res_=`$ECHO ${PIPESTATUS[0]}`
+if [ ${_res_} -eq 1 ]; then
+    #Exiting beacuse could not create file or other standard exit
+    _err_msg_="Error encountered during data export"
+    abort_script "$_err_msg_"
+elif [ ${_res_} -eq 2 ]; then
+    #Exiting beacause DWHDB is down
+    _err_msg_="Exiting due to database error.. Please check if DB is running!"
+     abort_script "$_err_msg_"    
+fi
+
+$ECHO "-------------------------------------------------------------------"  | $TEE -a ${LOGFILE}
+$ECHO "`$DATE` : Checking for failed tables during final run of extract"  | $TEE -a ${LOGFILE}
+$ECHO "-------------------------------------------------------------------"  | $TEE -a ${LOGFILE}
+
+#checking for failed tables during third run and re-executing extractdb.bsh
+RUNNUMBER=`$CAT ${DBEXTRACT_ENV_FILE} | $GREP "RUNNUMBER=" | $GREP -v "^#" | $AWK -F"=" '{print $2}'`
+(( _last_runnumber_ = RUNNUMBER - 1 ))
+if [ -s $RESULTSDIR/ErrorExtractingTable_${_last_runnumber_}.log ]; then
+    _current_run_error_=`$CAT $RESULTSDIR/ErrorExtractingTable_${_last_runnumber_}.log | $WC -l`
+    if  [ ${_current_run_error_} -ne 0 ]; then
+        if [ -s $RESULTSDIR/Failure_Extract_${_last_runnumber_}.txt ];then
+            $CAT $RESULTSDIR/Failure_Extract_${_last_runnumber_}.txt | sed "s/dc./'dc','/g" | sed "s/ | /','/g" |sed "s/$/'/g" >$RESULTSDIR/retry_tables_${_last_runnumber_}_list.txt
+            if [ -s $RESULTSDIR/retry_tables_${_last_runnumber_}_list.txt ]; then
+                $CHOWN ${SYSUSER}:${SYSGROUP} $RESULTSDIR/retry_tables_${_last_runnumber_}_list.txt
+                if [ $? -ne 0 ]; then
+                    _err_msg_="Could not change the permissions of $RESULTSDIR/retry_tables_${_last_runnumber_}_list.txt"
+                    abort_script "${_err_msg_}"
+                fi
+                $CHMOD 777 $RESULTSDIR/retry_tables_${_last_runnumber_}_list.txt
+                if [ $? -ne 0 ]; then
+                    _err_msg_="Could not change the permission of $RESULTSDIR/retry_tables_${_last_runnumber_}_list.txt to 777"
+                    abort_script "$_err_msg_"
+                fi
+                
+                $ECHO  "Successfully created failed tables list $RESULTSDIR/retry_tables_${_last_runnumber_}_list.txt" | $TEE -a ${LOGFILE} 
+                $ECHO "`$DATE` : Starting extract of failed tables" | $TEE -a ${LOGFILE}
+                $SU - $SYSUSER -c "$BASH ${SCRIPTHOME}/extractdb.bsh -l ${LOGFILE} -e $RESULTSDIR/retry_tables_${_last_runnumber_}_list.txt" | $EGREP -v "Oracle|mail" | $TEE -a ${LOGFILE}
+                _res_=`$ECHO ${PIPESTATUS[0]}`
+                if [ ${_res_} -eq 1 ]; then
+                    #Exiting because could not create file or other standard exit
+                    _err_msg_="Error encountered during data export"
+                    abort_script "$_err_msg_"
+                elif [ ${_res_} -eq 2 ]; then
+                    #Exiting beacause DWHDB is down
+                    _err_msg_="Exiting due to database error.. Please check if DB is running!"
+                     abort_script "$_err_msg_"    
+                fi
+            else
+                $ECHO "No failed tables to re-extract" | $TEE -a ${LOGFILE}
+            fi
+            
+        fi
+    fi
+else
+    $ECHO "No failed tables to re-extract" | $TEE -a ${LOGFILE}
+fi
+#Copying Column list to extracts directory
+$CP -rp $RESULTSDIR/Extract_tables_cols.txt ${_extract_dir_}/Extract_tables_cols.txt 
+if [ $? -ne 0 ];then
+    _err_msg_="Aborting Script: Could not copy $RESULTSDIR/Extract_tables_cols.txt to ${_extract_dir_}/Extract_tables_cols.txt "
+    abort_script "${_err_msg_}"
+else
+    log_msg -s "\nSuccessfully copied $RESULTSDIR/Extract_tables_cols.txt to ${_extract_dir_}/Extract_tables_cols.txt " -l ${LOGFILE}
+fi
+
+#Passing argument "r" to increase the catalog cache
+catalog_cache_change r
+
+#cleanup of indicator and temporary files 
+delete_indicator
+
+#copying the feature list to extracts directory
+if [ -f ${RESULTSDIR}/.selective_feature_on ]; then
+    $CP -p $RESULTSDIR/features.lst ${_extract_dir_}/features.lst
+else
+    if [ -s "${ENIQ_ADMIN_DIR}/managed_oss/total_feature_install_list" ]; then
+        $CAT ${ENIQ_ADMIN_DIR}/managed_oss/total_feature_install_list | $AWK -F "::" '{print $2}' | $SORT -u > ${_extract_dir_}/features.lst
+    else
+        log_msg -s "Could not find list of features installed on the server" -l ${LOGFILE}
+    fi
+fi
+$RM -rf ${TEM_DIR}
+$RM -rf $RESULTSDIR/.selective_feature_on $RESULTSDIR/.extract_process_running $RESULTSDIR/pause_process.txt $RESULTSDIR/.date_list_*_completed.txt $RESULTSDIR/.get_cols_completed.txt $RESULTSDIR/features.lst>> /dev/null 2>&1
+$RM -rf ${RESULTSDIR}/.export_run_three_running
+
+
+insert_header_footer foot "Finished exporting tables from database" ${LOGFILE}
+}
+
+
+create_indicator()
+{
+log_msg -q -s "Creating process running indicator file" -l ${LOGFILE}
+$TOUCH ${RESULTSDIR}/.extract_process_running
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not create process running indicator file"
+    abort_script "${err_msg_}"
+else
+    log_msg -q -s "Process running indicator file created successfully" -l ${LOGFILE}
+fi
+    
+}
+
+delete_indicator()
+{
+log_msg -q -s "Deleting process running indicator file" -l ${LOGFILE}
+$RM ${RESULTSDIR}/.extract_process_running
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not delete process running indicator file"
+    abort_script "${err_msg_}"
+else
+    log_msg -q -s "Process running indicator file removed successfully" -l ${LOGFILE}
+fi
+
+}
+
+start_active_load()
+{
+if [ "${FLS_TOPO}" ]; then
+    _msg_string_="FLS and Topology"
+fi
+
+insert_header_footer head "Starting to import ${_msg_string_}data into active partition " ${LOGFILE}
+
+if [ -z "${RETRY_FLAG}" ];then
+    if [ "${FLS_TOPO}" ]; then
+        # Importing FLS data
+        fls_import
+
+        #importing the topology  data into active partition
+        $SU - $SYSUSER -c "$BASH ${SCRIPTHOME}/active_loaddb.bsh -l ${LOGFILE} -f"
+    else
+        #importing the data into active partition
+        $SU - $SYSUSER -c "$BASH ${SCRIPTHOME}/active_loaddb.bsh -l ${LOGFILE}"
+    fi
+    
+    if [ $? -ne 0 ];then
+        _err_msg_="Failed to load ${_msg_string_}data into active partitions"
+        abort_script "${_err_msg_}"
+    fi
+    
+    RUNNUMBER=`$CAT ${DBEXTRACT_ENV_FILE} | $GREP "RUNNUMBER=" | $GREP -v "^#" | $AWK -F"=" '{print $2}'`
+    (( _last_runnumber_ = RUNNUMBER - 1 ))
+    count_error=$($CAT $RESULTSDIR/ActiveLoadTableError_${_last_runnumber_}.log | wc -l)
+
+    
+    if [ $count_error -gt 1 ]
+    then
+        _retry_count_=1
+        while [ $_retry_count_ -le 2 ];do
+            RUNNUMBER=`$CAT ${DBEXTRACT_ENV_FILE} | $GREP "RUNNUMBER=" | $GREP -v "^#" | $AWK -F"=" '{print $2}'`
+            if [ ! "${RUNNUMBER}" ]; then
+                _err_msg_="${RUNNUMBER} does not exists"
+                abort_script "${_err_msg_}"
+            fi
+            (( _last_runnumber_ = RUNNUMBER - 1 ))
+            count_error=$($CAT $RESULTSDIR/ActiveLoadTableError_${_last_runnumber_}.log | wc -l)
+            if [ $count_error -gt 1 ]
+            then
+                $ECHO  "\n\n`$DATE` : Re-running import for failed files, attempt no : ${_retry_count_} \n" | $TEE -a ${LOGFILE}
+                $CAT $RESULTSDIR/ActiveLoadTableError_${_last_runnumber_}.log | $GREP "\.gz" | $SORT -u >$RESULTSDIR/retry_failed_import_${_last_runnumber_}_list.txt
+                if [ ! -s $RESULTSDIR/retry_failed_import_${_last_runnumber_}_list.txt ]; then
+                    _err_msg_="Failed to create $RESULTSDIR/retry_failed_import_${_last_runnumber_}_list.txt"
+                    abort_script "${_err_msg_}"
+                else
+                    $CHOWN ${SYSUSER}:${SYSGROUP} $RESULTSDIR/retry_failed_import_${_last_runnumber_}_list.txt
+                    if [ $? -ne 0 ]; then
+                        _err_msg_="Could not change the permissions of $RESULTSDIR/retry_failed_import_${_last_runnumber_}_list.txt"
+                        abort_script "${_err_msg_}"
+                    fi
+                    $CHMOD 777 $RESULTSDIR/retry_failed_import_${_last_runnumber_}_list.txt
+                    if [ $? -ne 0 ]; then
+                        _err_msg_="Could not change the permission of $RESULTSDIR/retry_failed_import_${_last_runnumber_}_list.txt to 777"
+                        abort_script "$_err_msg_"
+                    fi
+                    if [ "${FLS_TOPO}" ]; then
+                        $SU - $SYSUSER -c "$BASH ${SCRIPTHOME}/active_loaddb.bsh -l ${LOGFILE} -e $RESULTSDIR/retry_failed_import_${_last_runnumber_}_list.txt -f" 
+                    else
+                        $SU - $SYSUSER -c "$BASH ${SCRIPTHOME}/active_loaddb.bsh -l ${LOGFILE} -e $RESULTSDIR/retry_failed_import_${_last_runnumber_}_list.txt" 
+                    fi
+                    
+                    if [ $? -ne 0 ];then
+                        _err_msg_="Failed to load ${_msg_string_}data into active partitions"
+                        abort_script "${_err_msg_}"
+                    fi
+                fi
+            fi
+            (( _retry_count_ = _retry_count_ + 1 ))
+        done
+    fi
+else
+    $ECHO  "`$DATE` : Running import for failed files" | $TEE -a ${LOGFILE}
+    if [ ! -s $RETRY_FAILED_TABLES_FILE ]; then
+        _err_msg_="$RETRY_FAILED_TABLES_FILE does not exist"
+        abort_script "${_err_msg_}"
+    else
+        $CHOWN ${SYSUSER}:${SYSGROUP} $RETRY_FAILED_TABLES_FILE
+        if [ $? -ne 0 ]; then
+            _err_msg_="Could not change the permissions of $RETRY_FAILED_TABLES_FILE"
+            abort_script "${_err_msg_}"
+        fi
+        $CHMOD 777 $RETRY_FAILED_TABLES_FILE
+        if [ $? -ne 0 ]; then
+            _err_msg_="Could not change the permission of $RETRY_FAILED_TABLES_FILE to 777"
+            abort_script "$_err_msg_"
+        fi
+        
+        if [ "${FLS_TOPO}" ]; then
+            $SU - $SYSUSER -c "$BASH ${SCRIPTHOME}/active_loaddb.bsh  -l ${LOGFILE} -e $RETRY_FAILED_TABLES_FILE -f" 
+        else
+            $SU - $SYSUSER -c "$BASH ${SCRIPTHOME}/active_loaddb.bsh -l ${LOGFILE} -e $RETRY_FAILED_TABLES_FILE" 
+        fi
+        
+        if [ $? -ne 0 ];then
+            _err_msg_="Failed to load ${_msg_string_}data into active partitions"
+            abort_script "${_err_msg_}"
+        fi
+    fi
+fi
+
+
+
+#start all the eniq services
+insert_header_footer head "Starting all the ENIQ services " ${LOGFILE}
+$BASH ${ENIQ_ADMIN_BIN_DIR}/manage_deployment_services.bsh -a start -s ALL -N | $TEE -a ${LOGFILE}
+_res_=`$ECHO ${PIPESTATUS[0]}`
+if [ ${_res_} -ne 0 ];then
+    _err_msg_="Failed to start services"
+    abort_script "${_err_msg_}"
+fi
+
+# Checking the active partitions in all the sets
+$ECHO "$($DATE +'%Y-%m-%d %H:%M:%S') \t Checking the active partitions in all the sets" | $TEE -a $RESULTSDIR/ActiveLoad_${_last_runnumber_}.log >>${LOGFILE}
+$ECHO "$($DATE +'%Y-%m-%d %H:%M:%S') \t This may take time from 5mins to 15mins" | $TEE -a $RESULTSDIR/ActiveLoad_${_last_runnumber_}.log >>${LOGFILE}
+
+#Checking the status of Engine
+$SYSTEMCTL show engine -p ActiveState | $AWK -F= '{print $2}' > /dev/null 2>&1
+if [ $? -eq 0 ]; then
+	su - dcuser -c '/eniq/sw/bin/engine -e startAndWaitSet DWH_BASE Trigger_Partitioning'
+    if [ $? -ne 0 ]; then
+	    $ECHO "$($DATE +'%Y-%m-%d %H:%M:%S') \t Could not verify the active  partitions in all the sets" | $TEE -a $RESULTSDIR/ActiveLoad_${_last_runnumber_}.log >>${LOGFILE}
+    else
+        $ECHO "$($DATE +'%Y-%m-%d %H:%M:%S') \t Completed checking the active partitions in all the sets" | $TEE -a $RESULTSDIR/ActiveLoad_${_last_runnumber_}.log >>${LOGFILE}
+    fi
+else 
+    $ECHO "$($DATE +'%Y-%m-%d %H:%M:%S') \t Engine is not Online" | $TEE -a $RESULTSDIR/ActiveLoad_${_last_runnumber_}.log >>${LOGFILE}
+    $ECHO "$($DATE +'%Y-%m-%d %H:%M:%S') \t Could not verify the active  partitions in all the sets" | $TEE -a $RESULTSDIR/ActiveLoad_${_last_runnumber_}.log >>${LOGFILE}
+fi
+
+insert_header_footer foot "Finished importing ${_msg_string_} active tables into database" ${LOGFILE}
+delete_indicator
+
+}
+
+start_historic_load()
+{
+if [ -z "${RETRY_FLAG}" ];then
+    #importing the data into historic partition
+    insert_header_footer head "Starting to import the data into historic partition" ${LOGFILE}
+    $SU - $SYSUSER -c "$BASH ${SCRIPTHOME}/historic_loaddb.bsh -l ${LOGFILE}"
+    if [ $? -ne 0 ];then
+        _err_msg_="Failed to load data into historic partitions"
+        abort_script "${_err_msg_}"
+    fi
+    RUNNUMBER=`$CAT ${DBEXTRACT_ENV_FILE} | $GREP "RUNNUMBER=" | $GREP -v "^#" | $AWK -F"=" '{print $2}'`
+    (( _last_runnumber_ = RUNNUMBER - 1 ))
+    count_error=$($CAT $RESULTSDIR/HistoricLoadTableError_${_last_runnumber_}.log | wc -l)
+
+    if [ $count_error -gt 1 ]
+    then
+        _retry_count_=1
+        while [ $_retry_count_ -le 2 ];do
+            RUNNUMBER=`$CAT ${DBEXTRACT_ENV_FILE} | $GREP "RUNNUMBER=" | $GREP -v "^#" | $AWK -F"=" '{print $2}'`
+            if [ ! "${RUNNUMBER}" ]; then
+                _err_msg_="${RUNNUMBER} does not exists"
+                abort_script "${_err_msg_}"
+            fi
+            (( _last_runnumber_ = RUNNUMBER - 1 ))
+            count_error=$($CAT $RESULTSDIR/HistoricLoadTableError_${_last_runnumber_}.log | wc -l)
+            if [ $count_error -gt 1 ]
+            then
+                $ECHO  "\n\n`$DATE` : Re-running import for failed files, attempt no : ${_retry_count_}\n" | $TEE -a ${LOGFILE}
+                $CAT $RESULTSDIR/HistoricLoadTableError_${_last_runnumber_}.log | $GREP "\.gz" | $SORT -u >$RESULTSDIR/retry_failed_import_${_last_runnumber_}_list.txt
+                if [ ! -s $RESULTSDIR/retry_failed_import_${_last_runnumber_}_list.txt ]; then
+                    _err_msg_="Failed to create $RESULTSDIR/retry_failed_import_${_last_runnumber_}_list.txt"
+                    abort_script "${_err_msg_}"
+                else
+                    $CHOWN ${SYSUSER}:${SYSGROUP} $RESULTSDIR/retry_failed_import_${_last_runnumber_}_list.txt
+                    if [ $? -ne 0 ]; then
+                        _err_msg_="Could not change the permissions of $RESULTSDIR/retry_failed_import_${_last_runnumber_}_list.txt"
+                        abort_script "${_err_msg_}"
+                    fi
+                    $CHMOD 777 $RESULTSDIR/retry_failed_import_${_last_runnumber_}_list.txt
+                    if [ $? -ne 0 ]; then
+                        _err_msg_="Could not change the permission of $RESULTSDIR/retry_failed_import_${_last_runnumber_}_list.txt to 777"
+                        abort_script "$_err_msg_"
+                    fi
+                    $SU - $SYSUSER -c "$BASH ${SCRIPTHOME}/historic_loaddb.bsh -l ${LOGFILE} -e $RESULTSDIR/retry_failed_import_${_last_runnumber_}_list.txt" 
+
+                    if [ $? -ne 0 ];then
+                        _err_msg_="Failed to load ${_msg_string_}data into historic partitions"
+                        abort_script "${_err_msg_}"
+                    fi
+                fi
+            fi
+            (( _retry_count_ = _retry_count_ + 1 ))
+        done
+    fi
+else
+    $ECHO  "Running import for failed files" | $TEE -a ${LOGFILE}
+    if [ ! -s $RETRY_FAILED_TABLES_FILE ]; then
+        _err_msg_="$RETRY_FAILED_TABLES_FILE does not exist"
+        abort_script "${_err_msg_}"
+    else
+        $CHOWN ${SYSUSER}:${SYSGROUP} $RETRY_FAILED_TABLES_FILE
+        if [ $? -ne 0 ]; then
+            _err_msg_="Could not change the permissions of $RETRY_FAILED_TABLES_FILE"
+            abort_script "${_err_msg_}"
+        fi
+        $CHMOD 777 $RETRY_FAILED_TABLES_FILE
+        if [ $? -ne 0 ]; then
+            _err_msg_="Could not change the permission of $RETRY_FAILED_TABLES_FILE to 777"
+            abort_script "$_err_msg_"
+        fi
+        
+        $SU - $SYSUSER -c "$BASH ${SCRIPTHOME}/historic_loaddb.bsh -l ${LOGFILE} -e $RETRY_FAILED_TABLES_FILE" 
+
+        if [ $? -ne 0 ];then
+            _err_msg_="Failed to load ${_msg_string_}data into historic partitions"
+            abort_script "${_err_msg_}"
+        fi
+    fi
+fi
+
+insert_header_footer foot "Finished importing historic tables into database" ${LOGFILE}
+delete_indicator
+
+
+}
+
+run_extract_failed_tables()
+{       
+if [ -s "${RETRY_FAILED_TABLES_FILE}" ];then
+    $CAT ${RETRY_FAILED_TABLES_FILE} | sed "s/dc./'dc','/g" | sed "s/ | /','/g" |sed "s/$/'/g" >$RESULTSDIR/retry_tables_${RUNNUMBER}_list.txt
+    if [ $? -eq 0 ]; then
+        $ECHO  "Successfully created failed tables list $RESULTSDIR/retry_tables_${RUNNUMBER}_list.txt" | $TEE -a ${LOGFILE} 
+        $CHOWN ${SYSUSER}:${SYSGROUP} $RESULTSDIR/retry_tables_${RUNNUMBER}_list.txt
+        if [ $? -ne 0 ]; then
+            _err_msg_="Could not change the permissions of $RESULTSDIR/retry_tables_${RUNNUMBER}_list.txt"
+            abort_script "${_err_msg_}"
+        fi
+        $CHMOD 777 $RESULTSDIR/retry_tables_${RUNNUMBER}_list.txt
+        if [ $? -ne 0 ]; then
+            _err_msg_="Could not change the permission of $RESULTSDIR/retry_tables_${RUNNUMBER}_list.txt to 777"
+            abort_script "$_err_msg_"
+        fi
+        
+        $SU - $SYSUSER -c "$BASH ${SCRIPTHOME}/extractdb.bsh -l ${LOGFILE} -e $RESULTSDIR/retry_tables_${RUNNUMBER}_list.txt" | $EGREP -v "Oracle|mail" | $TEE -a ${LOGFILE}
+        _res_=`$ECHO ${PIPESTATUS[0]}`
+        if [ ${_res_} -eq 1 ]; then
+            #Exiting because could not create file or other standard exit
+            _err_msg_="Error encountered during data export"
+            abort_script "$_err_msg_"
+        elif [ ${_res_} -eq 2 ]; then
+            #Exiting because DWHDB is down
+            _err_msg_="Exiting due to database error.. Please check if DB is running!"
+             abort_script "$_err_msg_"    
+        fi
+    else
+        $ECHO "Failed to create failed tables list $RESULTSDIR/retry_tables_${RUNNUMBER}_list.txt" | $TEE -a ${LOGFILE} 
+    fi
+    
+else
+    $ECHO "Could not find the ${RETRY_FAILED_TABLES_FILE} file to extract tables" | $TEE -a ${LOGFILE} 
+fi
+
+
+#Passing argument "r" to increase the catalog cache
+catalog_cache_change r
+
+#cleanup of indicator and temporary files 
+delete_indicator
+
+$RM -rf ${TEM_DIR}
+$RM -rf $RESULTSDIR/.selective_feature_on $RESULTSDIR/.extract_process_running $RESULTSDIR/pause_process.txt $RESULTSDIR/.date_list_*_completed.txt $RESULTSDIR/.get_cols_completed.txt $RESULTSDIR/features.lst>> /dev/null 2>&1
+
+insert_header_footer foot "Finished exporting tables from database" ${LOGFILE}
+}
+# ********************************************************************
+#
+#   Main body of program
+#
+# ********************************************************************
+#
+RUN_TIME=`$DATE '+%Y-%b-%d_%H.%M.%S'`
+PID=$$
+# Determine absolute path to software
+get_absolute_path
+
+# Check that the effective id of the user is root
+check_id $DEFAULT_USER
+
+while getopts ":a:t:e:l:fr" arg; do
+  case $arg in
+    a) ACTION="$OPTARG"
+       ;;
+    l) LOGFILE="$OPTARG"
+       ;;
+    t) ACTION_TYPE="$OPTARG"
+       ;;
+    f) FLS_TOPO="YES"
+       ;;
+    r) EXTRACT_RUN_NUM=3
+       ;;
+    e) RETRY_FLAG="YES"
+       RETRY_FAILED_TABLES_FILE="$OPTARG"
+       ;;
+   \?) _err_msg_="`$BASENAME $0` -s <stage>"
+       abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+       ;;
+  esac
+done
+shift `expr $OPTIND - 1`
+
+if [ -z "$ACTION" ]; then
+    usage_msg
+fi
+
+#Script parameter check
+if [ "$ACTION" == "export" -o "$ACTION" == "import" -o "$ACTION" == "pause" -o "$ACTION" == "resume" ]; then
+    if [ "$ACTION" == "import" ]; then
+        if [ -z "$ACTION_TYPE" ]; then
+            usage_msg
+        else 
+            if [ "$ACTION_TYPE" == "active" -o "$ACTION_TYPE" == "historic" ]; then
+                $ECHO >/dev/null
+            else
+                usage_msg
+            fi
+        fi
+    fi
+else
+    usage_msg
+fi
+
+
+# Set up environment variables for script.
+setup_env
+SqlFile=`mktemp -t ExportTabSql.XXXXXXXXXX`
+# Log file
+if [ ! "${LOGFILE}" ]; then
+    $MKDIR -p ${ENIQ_LOG_DIR}/extract_load
+    LOGFILE="${ENIQ_LOG_DIR}/extract_load/${HNAME}_extract_load_${RUN_TIME}.log"
+fi
+
+$TOUCH ${LOGFILE}
+$CHMOD 766 ${LOGFILE}
+
+if [ -s "${RESULTSDIR}/.selective_feature_on" ]; then
+    $RM -rf ${RESULTSDIR}/.selective_feature_on >> /dev/null 2>&1
+fi
+
+
+if [ "$ACTION" == "pause" ]; then
+    if [ ! -d ${RESULTSDIR} ]; then
+        _err_msg_="${RESULTSDIR} does not exists, cannot pause the process"
+        abort_script "${_err_msg_}"
+    else
+        if [ -f ${RESULTSDIR}/.extract_process_running ]; then
+            $TOUCH ${RESULTSDIR}/pause_process.txt
+            if [ $? -ne 0 ]; then
+                 _err_msg_="Could not create ${RESULTSDIR}/pause_process.txt"
+                abort_script "${_err_msg_}"
+            else
+                $ECHO "`$DATE` : Successfully created ${RESULTSDIR}/pause_process.txt \nNOTE: Pause will timeout after 8 hours, please perform necessary actions before timeout" 
+                exit 0
+            fi
+            
+        else
+            _err_msg_="${SCRIPTHOME}/eniq_data_migration has not started or already completed"
+            abort_script "${_err_msg_}"
+        fi
+    fi
+elif [ "$ACTION" == "resume" ]; then
+    if [ ! -f ${RESULTSDIR}/pause_process.txt ]; then
+        _err_msg_="${SCRIPTHOME}/eniq_data_migration has not started or already completed"
+        abort_script "${_err_msg_}"
+    else
+        $RM ${RESULTSDIR}/pause_process.txt
+        if [ $? -ne 0 ]; then
+             _err_msg_="Could not remove ${RESULTSDIR}/pause_process.txt"
+            abort_script "${_err_msg_}"
+        else
+            $ECHO "\n`$DATE` : Successfully removed ${RESULTSDIR}/pause_process.txt"
+            exit 0
+        fi
+    fi
+fi
+
+# Create a temporary Directory
+TEM_DIR=/tmp/extract_load.$$.$$
+$RM -rf ${TEM_DIR}
+$MKDIR -p ${TEM_DIR}
+$CHMOD 777 ${TEM_DIR}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not create directory $TEM_DIR"
+    abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+fi
+
+if [ -f ${RESULTSDIR}/.extract_process_running ]; then
+    $PS -ef |$GREP eniq_data_migration.bsh |$GREP -v grep |grep -v $$ >/dev/null
+    if [ $? -eq 0 ]; then 
+        log_msg -s "${SCRIPTHOME}/eniq_data_migration.bsh is already in progress ... Exiting !!!"
+        exit 0
+    else
+        $RM ${RESULTSDIR}/.extract_process_running
+    fi
+fi
+log_msg -q -s "\n\n\n\n=========================================================================\n`$DATE` Starting execution of eniq_data_migration.bsh \n=========================================================================\n\n" -l ${LOGFILE}
+
+if [ "${ACTION}" == "export" ]; then
+    if [ -z "${RETRY_FLAG}" ];then
+        if [ ${EXTRACT_RUN_NUM} -eq 3 ];then
+            #creating process running indicator file
+            create_indicator
+        
+            user_input
+        
+            #Passing argument "a" to increase the catalog cache
+            catalog_cache_change a
+            
+            log_msg -s "\n\n\n\n=========================================================================\n`$DATE` Starting to execute eniq_data_migration.bsh in background\nExecute below command to monitor logs \n# tail -f ${LOGFILE} \n=========================================================================\n\n" -l ${LOGFILE}
+            
+            run_extract_final >/dev/null & 
+            
+        else
+            #creating process running indicator file
+            create_indicator
+
+            #Ask user for type of Extraction (ALL or Feature specific)
+            selective_extract
+        
+            #Taking input from user,extracts location where data would be exported
+            user_input
+    
+            #Checking if optimum space is available in the extracts location provided by user
+            check_space_availability
+
+            #Ask for FLS tables extract
+            fls_export
+        
+            #Checking for any corruption in database before proceeding with export
+            check_dbcc_run
+
+            #Passing argument "a" to increase the catalog cache
+            catalog_cache_change a
+        
+            #running extractdb script for 3 times
+        
+            log_msg -s "\n\n\n\n=========================================================================\n`$DATE` Starting to execute eniq_data_migration.bsh in background\nExecute below command to monitor logs \n# tail -f ${LOGFILE} \n=========================================================================\n\n" -l ${LOGFILE}
+        
+            run_extract >/dev/null &
+        fi
+
+    else
+        #creating process running indicator file
+        create_indicator
+        
+        user_input
+        
+        #Passing argument "a" to increase the catalog cache
+        catalog_cache_change a
+        
+        log_msg -s "\n\n\n\n=========================================================================\n`$DATE` Starting to execute eniq_data_migration.bsh in background\nExecute below command to monitor logs \n# tail -f ${LOGFILE} \n=========================================================================\n\n" -l ${LOGFILE}
+      
+        run_extract_failed_tables >/dev/null &
+    fi
+    
+elif [ "${ACTION}" == "import" ]; then
+    #creating process running indicator file
+    create_indicator
+    
+    #Taking input from user,extracts location from where data would be imported
+    user_input_import
+    
+    #Display the feature from source server
+    display_source_feature
+   
+    if [ "${ACTION_TYPE}" == "active" ]; then
+        #stop all the eniq services
+        insert_header_footer head "Stopping all the ENIQ services " ${LOGFILE}
+        $BASH ${ENIQ_ADMIN_BIN_DIR}/manage_deployment_services.bsh -a stop -s ALL -N | $TEE -a ${LOGFILE}
+        _res_1_=`$ECHO ${PIPESTATUS[0]}`
+        if [ ${_res_1_} -ne 0 ];then
+            _err_msg_="Failed to stop services"
+            abort_script "${_err_msg_}"
+        fi
+        
+        insert_header_footer head "Starting repdb and dwhdb services " ${LOGFILE}
+        #starting repdb and dwhdb services
+        $BASH ${ENIQ_ADMIN_BIN_DIR}/manage_eniq_services.bsh -a start -s repdb,dwhdb -N | $TEE -a ${LOGFILE}
+        _res_2_=`$ECHO ${PIPESTATUS[0]}`
+        if [ ${_res_2_} -ne 0 ];then
+            _err_msg_="Failed to start repdb and dwhdb services"
+            abort_script "${_err_msg_}"
+        fi
+        
+        log_msg -s "\n\n\n\n=====================================================================================\n`date` Starting to execute eniq_data_migration.bsh in background\nExecute below command to monitor logs \n# tail -f ${LOGFILE} \n=====================================================================================\n\n" -l ${LOGFILE}
+        
+        start_active_load >/dev/null &
+
+        
+    elif [ "${ACTION_TYPE}" == "historic" ]; then 
+    
+        #start all the eniq services
+        insert_header_footer head "Starting all the ENIQ services " ${LOGFILE}
+        $BASH ${ENIQ_ADMIN_BIN_DIR}/manage_deployment_services.bsh -a start -s ALL -N | $TEE -a ${LOGFILE}
+        _res_3_=`$ECHO ${PIPESTATUS[0]}`
+        if [ ${_res_3_} -ne 0 ];then
+            _err_msg_="Failed to start services"
+            abort_script "${_err_msg_}"
+        fi
+        
+        log_msg -s "\n\n\n\n=====================================================================================\n`date` Starting to execute eniq_data_migration.bsh in background\nExecute below command to monitor logs \n# tail -f ${LOGFILE} \n=====================================================================================\n\n" -l ${LOGFILE}
+        
+        start_historic_load >/dev/null &
+
+        
+    fi  
+    
+fi

@@ -1,0 +1,1560 @@
+#!/bin/bash
+# ********************************************************************
+# Ericsson Radio Systems AB                                     SCRIPT
+# ********************************************************************
+#
+#
+# (c) Ericsson Radio Systems AB 2022 - All rights reserved.
+#
+# The copyright to the computer program(s) herein is the property
+# of Ericsson Radio Systems AB, Sweden. The programs may be used
+# and/or copied only with the written permission from Ericsson Radio
+# Systems AB or in accordance with the terms and conditions stipulated
+# in the agreement/contract under which the program(s) have been
+# supplied.
+#
+# ********************************************************************
+# Name    : manage_nas_snapshot.bsh
+# Date    : 25/07/2023
+# Revision: \main\45
+# Purpose : Main ENIQ script to that handles snapshots.
+#
+# Usage   : manage_snapshot.bsh -a <snap_action> -f <fs_name>
+#                               -t <snapshot_type> -n <snap_name>
+#                               [ -N ] [ -l <logfile> ]
+#
+# ********************************************************************
+#
+#   Command Section
+#
+# ********************************************************************
+AWK=/usr/bin/awk
+BASENAME=/usr/bin/basename
+CAT=/usr/bin/cat
+CHMOD=/usr/bin/chmod
+CLEAR=/usr/bin/clear
+CP=/usr/bin/cp
+CUT=/usr/bin/cut
+DATE=/usr/bin/date
+DF=/usr/bin/df
+DIRNAME=/usr/bin/dirname
+ECHO='/usr/bin/echo -e'
+EGREP=/usr/bin/egrep
+EXPR=/usr/bin/expr
+GREP=/usr/bin/grep
+HEAD=/usr/bin/head
+HOSTNAME=/usr/bin/hostname
+MKDIR=/usr/bin/mkdir
+PWD=/usr/bin/pwd
+RM=/usr/bin/rm
+SED=/usr/bin/sed
+SORT=/usr/bin/sort
+TAIL=/usr/bin/tail
+TEE=/usr/bin/tee
+TOUCH=/usr/bin/touch
+UEMCLI=/usr/bin/uemcli
+
+
+# ********************************************************************
+#
+#       Configuration Section
+#
+# ********************************************************************
+ENIQ_ENV=niq.rc
+ENIQ_INI=niq.ini
+IPMP_INI=ipmp.ini
+SUNOS_INI=SunOS.ini
+STORAGE_INI=storage.ini
+
+# String Identifier for Snapshots
+SNAP_STR_ID="ENIQ_UPGRADE"
+
+# Directory on the root filesystem
+ENIQ_ROOT_DIR=/eniq
+
+# mount for backup exclude list
+MOUNT_EXCLUDE_LIST="eventdata|pushdata"
+
+# ********************************************************************
+#
+#       Pre-execution Operations
+#
+# ********************************************************************
+
+
+# ********************************************************************
+#
+#   Functions
+#
+# ********************************************************************
+### Function: abort_script ###
+#
+#   This will is called if the script is aborted thru an error
+#   error signal sent by the kernel such as CTRL-C or if a serious
+#   error is encountered during runtime
+#
+# Arguments:
+#       $1 - Error message from part of program (Not always used)
+# Return Values:
+#       none
+abort_script()
+{
+if [ "$1" ]; then
+    _err_msg_=$1
+else
+    _err_msg_="Script aborted.......\n"
+fi
+
+# Check if log_msg() is defined
+type log_msg > /dev/null 2>&1
+if [ $? -gt 0 ]; then
+    if [ "${LOGFILE}" ]; then
+        if [ ! "${SNAP_QUIET}" ]; then
+            $ECHO "\n${_err_msg_}\n" |$TEE -a ${LOGFILE}
+        else
+            $ECHO "\n${_err_msg_}\n" >> ${LOGFILE}
+        fi
+    else
+        $ECHO "\n${_err_msg_}\n"
+    fi
+else
+    if [ "${LOGFILE}" ]; then
+	    log_msg -s "\n${_err_msg_}\n" -l ${LOGFILE} ${SNAP_QUIET}
+    else
+	    log_msg -s "\n${_err_msg_}\n" ${SNAP_QUIET}
+    fi
+fi
+
+cd $SCRIPTHOME
+$RM -rf ${TEM_DIR}
+if [ "$2" ]; then
+    ${2}
+else
+   exit 1
+fi
+}
+
+# Check/Create Logfile
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+chk_create_logfile()
+{
+$MKDIR -p `$DIRNAME ${LOGFILE}`
+if [ $? -ne 0 ]; then
+	_err_msg_="Could not create directory `$DIRNAME ${LOGFILE}`"
+	abort_script "${_err_msg_}"
+fi
+
+$TOUCH -a ${LOGFILE}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not write to file ${LOGFILE}"
+    abort_script "${_err_msg_}"
+fi
+
+_log_id_str="-l ${LOGFILE}"
+}
+
+### Function: collect_nas_fs_info ###
+#
+# Get confirmation of NAS filesystems
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+collect_nas_fs_info()
+{
+##Collect NAS fs info from storage.ini file
+
+$RM -rf ${TEM_DIR}/nas_fs_info
+
+_fs_list_=`iniget Storage_NAS_FS_LIST -f ${ENIQ_CONF_DIR}/${STORAGE_INI}`
+
+if [ -z "${_fs_list_}" ]; then
+    _err_msg_="Could not read Storage information from storage.ini"
+    abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+fi
+
+for _fs_ in ${_fs_list_}; do
+
+    _fs_name_=`iniget $_fs_ -f ${ENIQ_CONF_DIR}/${STORAGE_INI} -v FS_NAME | $SED 's/\//-/g'`
+	_fs_id_=`iniget $_fs_ -f ${ENIQ_CONF_DIR}/${STORAGE_INI} -v ID`
+	_nfs_host_=`iniget $_fs_ -f ${ENIQ_CONF_DIR}/${STORAGE_INI} -v NFS_HOST`
+	if [ -z "${_fs_name_}" -o -z "${_fs_id_}" -o -z "${_nfs_host_}" ]; then
+         _err_msg_="Could not read filesystem block information information from ${ENIQ_CONF_DIR}/${STORAGE_INI}"
+         abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+    fi
+	
+	$ECHO "${POOL_ID}-${_fs_name_} ${_fs_id_} ${_nfs_host_}" >> ${TEM_DIR}/nas_fs_info
+	
+done
+
+}
+
+### Function: check_params ###
+#
+# Check Input Params
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+check_params()
+{
+# Must have SNAP_ACTION, & SNAP_FS
+if [ ! "${SNAP_ACTION}" -o ! "${NAS_FS}" ]; then
+    usage_msg
+    exit 1
+fi
+
+# Check that the only options with -t are
+# upgrade or complete
+if [ "${SNAP_ACTION}" == "create" ]; then
+    if [ ! "${SNAP_NAME}" ]; then
+        usage_msg
+        exit 1
+    fi
+fi
+
+case "${SNAP_ACTION}" in
+	create)		SNAP_OPT=snapshot
+				;;
+	delete)		SNAP_OPT=destroy
+				;;
+	list)		SNAP_OPT=list
+				;;
+	rollback)	SNAP_OPT=rollback
+				;;
+	mount)		SNAP_OPT=mount
+				;;
+	*)			usage_msg
+				exit 1
+				;;
+esac
+}
+
+### Function: configure_snap_list ###
+#
+# Configure the snap list
+#
+# Arguments:
+#   $1 : FS name   
+# Return Values:
+#   none
+configure_snap_list()
+{
+    _fs_name_=$1
+    _is_fs_present_=0
+
+    # Check if FLEX_DATA_BKUP flag is set or not
+    _flex_data_flag_=`$CAT ${ENIQ_BKUPSW_DIR}/etc/eniq_backup.conf |$GREP FLEX_DATA_BKUP | $AWK -F= '{print $2}' 2>/dev/null`
+
+    if [ "${_flex_data_flag_}" == "YES" ]; then
+        _is_fs_present_=1
+    else
+        if [ -f ${SYS_FLEX_BKUP_CONF} ]; then
+            log_msg -q -s "filesystem : ${_file_name_} exist" -l ${LOGFILE}
+            _is_fs_present_=1
+        fi
+    fi
+
+    if [ "${_is_fs_present_}" -eq 0 ]; then
+        unset _file_name_ 
+    fi
+}
+
+# Create required Snapshots
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+create_snapshots()
+{
+if [ "${SNAP_NAME}" ]; then
+    _snap_chk_str_=${SNAP_NAME}
+fi
+
+# Get a list of the filesystems
+$RM -rf ${TEM_DIR}/fs_list_file
+
+log_msg -s "\nBuilding a list of relevant filesystems from ${FS_SNAP_DET}" ${_log_id_str}
+$CAT ${FS_SNAP_DET} | $EGREP -v '^[[:blank:]]*#' > ${TEM_DIR}/fs_list_file
+if [ ! -s ${TEM_DIR}/fs_list_file ]; then
+    _err_msg_="${TEM_DIR}/fs_list_file does not exist, or is empty"
+    abort_script "${_err_msg_}"
+fi
+
+# Build a list of filesystems that are NOT to be snapped
+_exclude_list_=""
+for _fs_ in `$CAT ${TEM_DIR}/fs_list_file`; do
+    _fs_name_=`$ECHO ${_fs_} | $AWK -F\:: '{print $1}' | $SED -e 's|\-|\/|g'`
+    _snap_opt_=`$ECHO ${_fs_} | $AWK -F\:: '{print $2}'`
+    if [ "${_snap_opt_}" == "N" ]; then
+        if [ "${_exclude_list_}" == "" ]; then
+            _exclude_list_="${_fs_name_}"
+        else
+            _exclude_list_="${_exclude_list_}|${_fs_name_}"
+        fi
+    fi
+done
+
+# Create list of filesytems to be snapped
+log_msg -s "Building a list of filesystems to be snapped from ${ENIQ_CONF_DIR}/${STORAGE_INI}" ${_log_id_str}
+if [ "${NAS_FS}" == "ALL" ]; then
+    if [ ${_exclude_list_} ]; then
+        $CAT ${ENIQ_CONF_DIR}/${STORAGE_INI} | $GREP -w FS_NAME | $EGREP -v "${_exclude_list_}" | $AWK -F"=" '{print $2}' > ${TEM_DIR}/nas_snap_list
+    else
+        $CAT ${ENIQ_CONF_DIR}/${STORAGE_INI} | $GREP -w FS_NAME | $AWK -F"=" '{print $2}' > ${TEM_DIR}/nas_snap_list
+    fi
+else
+    for _fs_ in `$ECHO ${NAS_FS} | $SED -e 's|,| |g'`; do
+        $ECHO ${_fs_} >> ${TEM_DIR}/nas_snap_list
+    done
+fi
+
+#To include oss fs for snap. Only for first calling through prepare_eniq_backup.bsh to avoid recreation of snap for unityXT NAS
+if [ "${NAS_FS}" != "backup" ] && [ "${NAS_FS}" != "ALL" ]; then
+     if [ -f "${FLS_CONFIG_FILE}" ]; then
+          while read _line_ ;do
+                $ECHO "${_line_}" >> "${TEM_DIR}/nas_snap_list"
+          done<${FLS_CONFIG_FILE}
+     fi
+fi
+
+
+if [ ${_is_fs_present_} -eq 1 ]; then
+    for _fs_detail_ in $_file_name_; do
+        $ECHO "${_fs_detail_}" >> "${TEM_DIR}/nas_snap_list"
+    done
+fi
+
+let _field1_=_field1_+40
+let _field2_=_field2_+40
+
+_line1_str_="\n%-${_field1_}s%-${_field2_}s\n\n"
+_line2_str_="%-${_field1_}s%-${_field2_}s\n"
+
+if [ -s ${TEM_DIR}/nas_snap_list ]; then
+    printf "${_line1_str_}" "NFS Filesystem Name" >> ${TEM_DIR}/nas_list
+
+    while read _entry_;do
+        _nfs_id_=`$ECHO ${_entry_} | $AWK '{print $1}'`
+        printf "${_line2_str_}" "${_nfs_id_}" >> ${TEM_DIR}/nas_list 
+    done < ${TEM_DIR}/nas_snap_list
+else
+    _err_msg_="No Filesystems found to be snapshot"
+    abort_script "${_err_msg_}"
+fi
+
+if [ ! "${NO_CONFIRM}" ]; then
+    user_confirm "snapshot the filesystems" ${TEM_DIR}/nas_list
+    if [ $USER_CONF == No ]; then
+        $RM -rf ${TEM_DIR}
+        exit 0
+    fi
+fi
+
+_snap_list_=""
+for _fs_ in `$CAT ${TEM_DIR}/nas_snap_list`; do
+    if [ "${_snap_list_}" == "" ]; then
+        _snap_list_="${_fs_}"
+    else
+        _snap_list_="${_snap_list_} ${_fs_}"
+    fi
+    _create_list_="${_fs_} ${_create_list_}"
+done
+
+# Set up the string for snapshot name
+if [ "${SNAP_NAME}" ]; then
+    _snap_label_=${SNAP_NAME}
+fi
+
+if [ "${SAN_DEVICE}" != "unityXT" ]; then
+log_msg -s "Creating snapshots with label \"${_snap_label_}\"" ${_log_id_str} ${SNAP_QUIET} -t
+log_msg -s "using command \"$NASCLI create_snapshot - - - ${_snap_label_} ${_snap_list_}\"" ${_log_id_str} ${SNAP_QUIET}
+log_msg -s "\nFilesystems to be snapped: ${_snap_list_}" ${_log_id_str} ${SNAP_QUIET}
+$NASCLI create_snapshot - - - ${_snap_label_} ${_snap_list_} | $TEE -a ${LOGFILE}
+_snap_sttaus_=`$ECHO ${PIPESTATUS[0]}`
+if [ ${_snap_sttaus_} -ne 0 ]; then
+    _err_msg_="Failed to create snapshots with label \"${SNAP_NAME}\""
+    abort_script "${_err_msg_}"
+fi
+else
+create_unity_snapshots
+fi
+
+log_msg -s "Snapshots with label ${_snap_label_} created successfully" ${_log_id_str} ${SNAP_QUIET} -t
+}
+
+### Function: create_unity_snapshots ###
+#
+# List unity snapshots for NAS filesystems
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+create_unity_snapshots()
+{
+##Collect NAS fs info from storage.ini file
+
+log_msg -s "Creating snapshots with label \"${_snap_label_}\"" ${_log_id_str} ${SNAP_QUIET} -t
+
+log_msg -s "\nFilesystems to be snapped: ${_snap_list_}\n" ${_log_id_str} ${SNAP_QUIET}
+for _fs_ in ${_snap_list_}; do
+
+    _fs_name_=`$ECHO $_fs_ | $SED 's/\//-/g'`
+	_fs_id_=`$CAT ${TEM_DIR}/nas_fs_info | $GREP -w ${_fs_name_} | $AWK '{print $2}'`
+	_snap_name_=${POOL_ID}-${_fs_name_}-${_snap_label_}
+
+	if [ -z "${_fs_id_}" -o -z "${_snap_name_}" ]; then
+         _err_msg_="Could not read snapshot creation info"
+         abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+        fi
+	
+	log_msg -s "Creating snapshot \"${_snap_name_}\" of filesystem \"${POOL_ID}-${_fs_name_}\"" ${_log_id_str} ${SNAP_QUIET} 
+	log_msg -s "using command \"$UEMCLI -d ${_spa_ip_} -noHeader /prot/snap create -name ${_snap_name_} -source ${_fs_id_}\"" ${_log_id_str} ${SNAP_QUIET}
+	
+	$UEMCLI -d ${_spa_ip_} -noHeader /prot/snap create -name ${_snap_name_} -source ${_fs_id_} >> /dev/null 2>&1 
+	if [ $? -ne 0 ]; then
+        _err_msg_="Failed to create snapshot ${_snap_name_} "
+        abort_script "$_err_msg_"
+        fi
+	
+	log_msg -s "Snapshot \"${_snap_name_}\" is created successfully.\n" ${_log_id_str} ${SNAP_QUIET}
+	$SLEEP 10
+	
+done
+
+}
+
+
+### Function: destroy_snapshots ###
+#
+# Destroy required Snapshots
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+destroy_snapshots()
+{
+if [ ! ${SNAP_NAME} ]; then
+    _err_msg_="Snap label not set"
+    abort_script "${_err_msg_}"
+fi
+
+# Lets build the snapshot list
+log_msg -s "Building snapshot list" ${_log_id_str} ${SNAP_QUIET} -t
+
+if [ "${SAN_DEVICE}" != "unityXT" ]; then
+if [ "${NAS_FS}" == "ALL" ]; then
+    $NASCLI list_snapshots -  | $EGREP "\/${SNAP_NAME}[[:blank:]]" > ${TEM_DIR}/nas_delete_list
+else
+    _nas_list_=`$ECHO ${NAS_FS} | $SED -e 's|,|\||g'`
+    $NASCLI list_snapshots - | $EGREP ${_nas_list_} | $EGREP "\/${SNAP_NAME}[[:blank:]]" > ${TEM_DIR}/nas_delete_list
+fi
+else
+
+if [ "${NAS_FS}" == "ALL" ]; then
+     list_unity_snap
+     $CAT ${TEM_DIR}/nas_snap_list > ${TEM_DIR}/nas_delete_list 
+    
+else
+    _nas_list_=`$ECHO ${NAS_FS} | $SED -e 's|,|\||g'`
+    list_unity_snap
+    $CAT ${TEM_DIR}/nas_snap_list | $EGREP ${_nas_list_} > ${TEM_DIR}/nas_delete_list
+fi
+
+
+fi
+
+let _field1_=_field1_+40
+let _field2_=_field2_+40
+
+_line1_str_="\n%-${_field1_}s%-${_field2_}s\n\n"
+_line2_str_="%-${_field1_}s%-${_field2_}s\n"
+
+if [ -s ${TEM_DIR}/nas_delete_list ]; then
+    printf "${_line1_str_}" "NFS Snapshot Name" "NFS Filesystem Name" >> ${TEM_DIR}/nas_list
+
+    while read _entry_;do
+        _nfs_snap_id_=`$ECHO ${_entry_} | $AWK '{print $1}'`
+        _nfs_id_=`$ECHO ${_entry_} | $AWK '{print $2}'`
+        printf "${_line2_str_}" "${_nfs_snap_id_}" "${_nfs_id_}" >> ${TEM_DIR}/nas_list 
+    done < ${TEM_DIR}/nas_delete_list
+else
+    log_msg -s "No snapshots found to delete\n" ${_log_id_str} -t
+    $RM -rf ${TEM_DIR}
+    exit 0
+fi
+
+if [ ! "${NO_CONFIRM}" ]; then
+    user_confirm "delete the snapshots" ${TEM_DIR}/nas_list
+    if [ $USER_CONF == No ]; then
+        $RM -rf ${TEM_DIR}
+        exit 0
+    fi
+fi
+
+log_msg -s "Building list of snapshots with label \"${SNAP_NAME}\"" ${_log_id_str} ${SNAP_QUIET} -t
+
+_delete_list_=""
+while read _entry_; do
+    _fs_name_=`$ECHO ${_entry_} | $AWK '{print $2}' | $SED -e "s|${POOL_ID}\/||g"` 
+   if [ "${SAN_DEVICE}" != "unityXT" ]; then
+    # Verify snap exists
+    $NASCLI list_snapshots - | $EGREP "\/${SNAP_NAME}[[:blank:]]" | $GREP ${_fs_name_} >> /dev/null 2>&1
+    if [ $? -eq 0 ]; then
+        if [ "${_delete_list_}" == "" ]; then
+            _delete_list_=${_fs_name_}
+        else
+            _delete_list_="${_delete_list_} ${_fs_name_}"
+        fi
+    fi
+   else
+        if [ "${_delete_list_}" == "" ]; then
+            _delete_list_=${_fs_name_}
+        else
+            _delete_list_="${_delete_list_} ${_fs_name_}"
+        fi
+   fi
+done < "${TEM_DIR}/nas_delete_list"
+
+log_msg -s "Deleting snapshots of filesystems (\"${_delete_list_}\")\nwith label \"${SNAP_NAME}\"" ${_log_id_str} ${SNAP_QUIET} -t
+$CAT ${TEM_DIR}/nas_list >> $LOGFILE
+if [ "${SAN_DEVICE}" != "unityXT" ]; then
+$NASCLI delete_snapshot - ${SNAP_NAME} ${_delete_list_} >> ${LOGFILE}
+if [ $? -ne 0 ]; then
+    _err_msg_="Failed to delete snapshots of ${_delete_list_} with label ${SNAP_NAME}"
+    abort_script "${_err_msg_}"         
+fi
+else
+for _fs_ in ${_delete_list_}; do
+
+    _fs_name_=`$ECHO $_fs_ | $SED 's/\//-/g'`
+    _snap_name_=${POOL_ID}-${_fs_name_}-${SNAP_NAME}
+
+        $UEMCLI -d ${_spa_ip_} -noHeader /prot/snap/nfs -name ${_snap_name_} show >> /dev/null 2>&1
+        if [ $? -eq 0 ]; then
+           log_msg -s "NFS share of snapshot \"${_snap_name_}\" exists. Need to clean up." ${_log_id_str} ${SNAP_QUIET}
+           log_msg -s "using command \"$UEMCLI -d ${_spa_ip_} -noHeader /prot/snap/nfs -name ${_snap_name_} delete\"" ${_log_id_str} ${SNAP_QUIET}
+           $UEMCLI -d ${_spa_ip_} -noHeader /prot/snap/nfs -name ${_snap_name_} delete >> /dev/null 2>&1
+           if [ $? -ne 0 ]; then
+                _err_msg_="Failed to delete snapshot share ${_snap_name_} "
+                abort_script "$_err_msg_"
+           fi
+           $SLEEP 2
+        fi
+
+        log_msg -s "Deleting snapshot \"${_snap_name_}\" of filesystem \"${POOL_ID}-${_fs_name_}\"" ${_log_id_str} ${SNAP_QUIET}
+        log_msg -s "using command \"$UEMCLI -d ${_spa_ip_} -noHeader /prot/snap -name ${_snap_name_} delete\"" ${_log_id_str} ${SNAP_QUIET}
+
+        $UEMCLI -d ${_spa_ip_} -noHeader /prot/snap -name ${_snap_name_} delete >> /dev/null 2>&1
+        if [ $? -ne 0 ]; then
+        _err_msg_="Failed to delete snapshot ${_snap_name_} "
+        abort_script "$_err_msg_"
+        fi
+
+        log_msg -s "Snapshot \"${_snap_name_}\" is deleted successfully.\n" ${_log_id_str} ${SNAP_QUIET}
+        $SLEEP 10
+
+done
+fi
+
+log_msg -s "Snapshot of filesystems (\"${_delete_list_}\")\nwith label \"${SNAP_NAME}\" successfully deleted" ${_log_id_str} ${SNAP_QUIET} -t
+}
+
+### Function: get_absolute_path ###
+#
+# Determine absolute path to software
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+get_absolute_path()
+{
+_dir_=`$DIRNAME $0`
+SCRIPTHOME=`cd $_dir_ 2>/dev/null && pwd || $ECHO $_dir_`
+}
+
+### Function: list_snapshots ### 
+#
+# List required Snapshots
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+list_snapshots()
+{
+$ECHO "${NAS_FS}" | $EGREP '^[  ]*ALL' >> /dev/null 2>&1
+if [ $? -ne 0 ]; then
+    usage_msg
+    exit 1
+fi
+_sys_id_=`$CAT $ENIQ_CONF_DIR/$STORAGE_INI |$EGREP SYS_ID= |$CUT -d "=" -f2`
+log_msg -s "Building snapshot list" ${_log_id_str} ${SNAP_QUIET} -t
+if [ "${SAN_DEVICE}" != "unityXT" ]; then
+if [ ${SNAP_NAME} ]; then
+    if [ ! "${TIME}" ]; then
+    $NASCLI list_snapshots - | $EGREP "\/${SNAP_NAME}[[:blank:]]" > ${TEM_DIR}/nas_snap_list
+    else
+    $NASCLI list_snapshots raw |$EGREP "\/${SNAP_NAME}[[:blank:]]"|$EGREP -v "storage rollback list|NAME" | $SED '/^$/d' | $AWK '{print $1" " $3" " $5"-" $4}'|$GREP -w $_sys_id_ > ${TEM_DIR}/nas_snap_list
+    fi
+else
+   if [ ! "${TIME}" ] ; then
+   $NASCLI list_snapshots - > ${TEM_DIR}/nas_snap_list
+   else
+   $NASCLI list_snapshots raw | $EGREP -v "storage rollback list|NAME" | $SED '/^$/d'| $AWK '{print $1" " $3" " $5"-" $4}'|$GREP -w $_sys_id_ > ${TEM_DIR}/nas_snap_list
+   fi
+fi
+else
+list_unity_snap
+fi
+
+let _field1_=_field1_+40
+let _field2_=_field2_+40
+let _field3_=_field2_+20
+
+
+_line1_str_="\n%-${_field1_}s%-${_field2_}s%-${_field2_}s\n\n"
+_line2_str_="%-${_field1_}s%-${_field2_}s%-${_field3_}s\n"
+
+if [ -s ${TEM_DIR}/nas_snap_list -a ! "${TIME}" ]; then
+   printf "${_line1_str_}" "NFS Snapshot Name" "NFS Filesystem Name" >> ${TEM_DIR}/nas_list
+
+    while read _entry_;do
+        _nfs_snap_id_=`$ECHO ${_entry_} | $AWK '{print $1}'`
+        _nfs_id_=`$ECHO ${_entry_} |$AWK '{print $2}' `
+   printf "${_line2_str_}" "${_nfs_snap_id_}" "${_nfs_id_}" >> ${TEM_DIR}/nas_list
+    done < ${TEM_DIR}/nas_snap_list
+
+    $CAT ${TEM_DIR}/nas_list | $TEE -a ${LOGFILE}
+    $ECHO "\n"
+elif [ ${TIME} ]; then
+   printf "${_line1_str_}" "NFS Snapshot Name" "NFS Filesystem Name" "NFS CreationTime" >> ${TEM_DIR}/nas_list
+
+    while read _entry_;do
+        _nfs_snap_id_=`$ECHO ${_entry_} | $AWK '{print $1}'`
+        _nfs_id_=`$ECHO ${_entry_} |$AWK '{print $2}' `
+       _nfs_time_id_=`$ECHO ${_entry_} | $AWK -F " " '{print $3,$4}'`
+
+    printf "${_line2_str_}" "${_nfs_snap_id_}" "${_nfs_id_}" "${_nfs_time_id_}" >> ${TEM_DIR}/nas_list
+    done < ${TEM_DIR}/nas_snap_list
+
+    $CAT ${TEM_DIR}/nas_list | $TEE -a ${LOGFILE}
+    $ECHO "\n"
+
+else
+    log_msg -s "No NAS snapshots found" ${_log_id_str} ${SNAP_QUIET} -t
+    $RM -rf ${TEM_DIR}
+    exit 1
+fi
+}
+
+### Function: list_unity_snap ###
+#
+# List unity snapshots for NAS filesystems
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+list_unity_snap()
+{
+
+if [ ${SNAP_NAME} ]; then
+
+$UEMCLI -d ${_spa_ip_} -noHeader /prot/snap show -filter "Name,Source,Creation time" -output csv |$TAIL -n +2| $SED 's/"//g'| $GREP $POOL_ID |  $GREP "${SNAP_NAME}"  > ${TEM_DIR}/unity_snap_list
+ if [ "${TIME}" ]; then
+   while read i ; do
+    snap_name=`$ECHO ${i} | $AWK -F, '{print $1}'`
+    if [ ! "${snap_name}" ]; then
+         _err_msg_="Could not fetch nas snapshot name "
+         abort_script "${_err_msg_}"
+    fi
+    fs_id=`$ECHO ${i} | $AWK -F, '{print $2}'`
+    if [ ! "${fs_id}" ]; then
+         _err_msg_="Could not fetch nas fs id"
+         abort_script "${_err_msg_}"
+    fi
+   _date_=`$ECHO ${i} | $AWK -F, '{print $3}'|$SED 's/-/\//g'|$AWK '{print $2"-"$1}'`
+   if [ ! "${_date_}" ]; then
+        _err_msg_="Could not fetch nas snapshot creation time details"
+        abort_script "${_err_msg_}"
+   fi
+   #fs_name=`$UEMCLI -d ${_spa_ip_} -noHeader /stor/prov/fs -id ${fs_id} show -filter "Name" -output csv |$TAIL -n +2| $SED 's/"//g'`
+   fs_name=`$CAT ${TEM_DIR}/nas_fs_info | $GREP -w ${fs_id} | $AWK '{print $1}'`
+   if [ ! "${fs_name}" ]; then
+        _err_msg_="Could not fetch nas fs name"
+        abort_script "${_err_msg_}"
+   fi
+   $ECHO "${snap_name} ${fs_name} ${_date_}" >> ${TEM_DIR}/nas_snap_list
+  done < ${TEM_DIR}/unity_snap_list
+ else
+  while read i ; do
+   snap_name=`$ECHO ${i} | $AWK -F, '{print $1}'|$SED 's/-/\//g'`
+   if [ ! "${snap_name}" ]; then
+        _err_msg_="Could not fetch nas snapshot name "
+        abort_script "${_err_msg_}"
+   fi
+   fs_id=`$ECHO ${i} | $AWK -F, '{print $2}'`
+   if [ ! "${fs_id}" ]; then
+        _err_msg_="Could not fetch nas fs id"
+        abort_script "${_err_msg_}"
+   fi
+   #fs_name=`$UEMCLI -d ${_spa_ip_} -noHeader /stor/prov/fs -id ${fs_id} show -filter "Name" -output csv |$TAIL -n +2| $SED 's/"//g'|$SED 's/-/\//g'`
+   fs_name=`$CAT ${TEM_DIR}/nas_fs_info | $GREP -w ${fs_id} | $AWK '{print $1}' |$SED 's/-/\//g'`
+   if [ ! "${fs_name}" ]; then
+        _err_msg_="Could not fetch nas fs name"
+        abort_script "${_err_msg_}"
+   fi
+   $ECHO "${snap_name} ${fs_name}" >> ${TEM_DIR}/nas_snap_list
+  done < ${TEM_DIR}/unity_snap_list
+ fi
+
+else
+
+ $UEMCLI -d ${_spa_ip_} -noHeader /prot/snap show -filter "Name,Source,Creation time" -output csv |$TAIL -n +2| $SED 's/"//g'| $GREP $POOL_ID  > ${TEM_DIR}/unity_snap_list
+ if [ "${TIME}" ]; then
+  while read i ; do
+   snap_name=`$ECHO ${i} | $AWK -F, '{print $1}'`
+   if [ ! "${snap_name}" ]; then
+        _err_msg_="Could not fetch nas snapshot name "
+        abort_script "${_err_msg_}"
+   fi
+   fs_id=`$ECHO ${i} | $AWK -F, '{print $2}'`
+   if [ ! "${fs_id}" ]; then
+        _err_msg_="Could not fetch nas fs id"
+        abort_script "${_err_msg_}"
+   fi
+   _date_=`$ECHO ${i} | $AWK -F, '{print $3}'|$SED 's/-/\//g'|$AWK '{print $2"-"$1}'`
+   if [ ! "${_date_}" ]; then
+         _err_msg_="Could not fetch nas snapshot creation time details"
+         abort_script "${_err_msg_}"
+   fi
+   #fs_name=`$UEMCLI -d ${_spa_ip_} -noHeader /stor/prov/fs -id ${fs_id} show -filter "Name" -output csv |$TAIL -n +2| $SED 's/"//g'`
+   fs_name=`$CAT ${TEM_DIR}/nas_fs_info | $GREP -w ${fs_id} | $AWK '{print $1}'`
+   if [ ! "${fs_name}" ]; then
+        _err_msg_="Could not fetch nas fs name"
+        abort_script "${_err_msg_}"
+   fi
+   $ECHO "${snap_name} ${fs_name} ${_date_}" >> ${TEM_DIR}/nas_snap_list
+  done < ${TEM_DIR}/unity_snap_list
+ else
+  while read i ; do
+   snap_name=`$ECHO ${i} | $AWK -F, '{print $1}'|$SED 's/-/\//g'`
+   if [ ! "${snap_name}" ]; then
+        _err_msg_="Could not fetch nas snapshot name "
+        abort_script "${_err_msg_}"
+   fi
+   fs_id=`$ECHO ${i} | $AWK -F, '{print $2}'`
+   if [ ! "${fs_id}" ]; then
+         _err_msg_="Could not fetch nas fs id"
+          abort_script "${_err_msg_}"
+   fi
+   #fs_name=`$UEMCLI -d ${_spa_ip_} -noHeader /stor/prov/fs -id ${fs_id} show -filter "Name" -output csv |$TAIL -n +2| $SED 's/"//g'| $SED 's/-/\//g'`
+   fs_name=`$CAT ${TEM_DIR}/nas_fs_info | $GREP -w ${fs_id} | $AWK '{print $1}' | $SED 's/-/\//g'`
+   if [ ! "${fs_name}" ]; then
+        _err_msg_="Could not fetch nas fs name"
+        abort_script "${_err_msg_}"
+   fi
+   $ECHO "${snap_name} ${fs_name}" >> ${TEM_DIR}/nas_snap_list
+  done < ${TEM_DIR}/unity_snap_list
+ fi
+
+fi
+
+}
+### Function: mount_snapshots ### 
+#
+# Rollback required Snapshots
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+mount_snapshots()
+{
+local _chk_snap_
+if [ ! ${SNAP_NAME} ]; then
+    _err_msg_="Snap label not set see usage"
+    abort_script "${_err_msg_}"
+fi
+
+
+log_msg -s "Building list of filesystems to mount" ${_log_id_str} ${SNAP_QUIET} -t
+_mount_list_=""
+_create_share_list_=""
+# Lets build the list to mount
+if [ "${NAS_FS}" == "ALL" ]; then
+    $CP ${FS_SNAP_DET} ${TEM_DIR}/snap_list_file
+    if [ -f "${FLS_CONFIG_FILE}" ]; then
+        while read _line_ ;do
+              $ECHO "${_line_}::Y::Y" >>${TEM_DIR}/snap_list_file 
+        done<${FLS_CONFIG_FILE}
+    fi 
+    FS_SNAP_DET=${TEM_DIR}/snap_list_file
+
+
+    if [ ${_is_fs_present_} -eq 1 ]; then
+        $CP ${FS_SNAP_DET} ${TEM_DIR}/snap_list_file
+        for _fs_detail_ in $_file_name_; do
+            log_msg -q -s "filesystem : ${_fs_detail_} exist" -l ${LOGFILE}
+            $ECHO "${_fs_detail_}::Y::Y" >> ${TEM_DIR}/snap_list_file
+        done
+        FS_SNAP_DET=${TEM_DIR}/snap_list_file
+    fi
+
+    _user_input_=`$CAT ${ENIQ_BKUPSW_DIR}/etc/eniq_backup.conf |$GREP -w BKUP_OPTION_STR |$AWK -F= '{print $2}' 2>/dev/null`
+    if [ $? -ne 0 ]; then
+        _err_msg_="Could not get the value of BKUP_OPTION_STR from  ${ENIQ_BKUPSW_DIR}/etc/eniq_backup.conf"
+        abort_script "${_err_msg_}"
+    fi
+    
+    if [ "${_user_input_}" == "NoData" ]; then
+         MOUNT_EXCLUDE_LIST="${MOUNT_EXCLUDE_LIST}|archive" 
+    fi
+  
+    $CAT ${FS_SNAP_DET} | $EGREP -v "^[[:blank:]]*#|${MOUNT_EXCLUDE_LIST}" > ${TEM_DIR}/fs_list_file
+    if [ ! -s ${TEM_DIR}/fs_list_file ]; then
+       _err_msg_="${TEM_DIR}/fs_list_file does not exist, or is empty"
+        abort_script "${_err_msg_}"
+    fi
+   
+    # Build a list of filesystems that are to be mounted
+    for _fs_ in `$CAT ${TEM_DIR}/fs_list_file`; do
+        _fs_name_=`$ECHO ${_fs_} | $AWK -F\:: '{print $1}'`
+        _snap_opt_=`$ECHO ${_fs_} | $AWK -F\:: '{print $2}'`
+        if [ "${_snap_opt_}" == "Y" ]; then
+            if [ "${_mount_list_}" == "" ]; then
+                 _mount_list_="${_fs_name_}"
+                 _create_share_list_="${_fs_name_}/${SNAP_NAME}"
+            else
+                 _mount_list_="${_mount_list_} ${_fs_name_}"
+                 _create_share_list_="${_create_share_list_} ${_fs_name_}/${SNAP_NAME}"
+            fi
+        fi
+    done
+else
+     if [ ${_is_fs_present_} -eq 1 ]; then
+         for _fs_detail_ in $_file_name_; do
+             log_msg -q -s "filesystem : ${_fs_detail_} exist" -l ${LOGFILE}
+             NAS_FS+=",$_fs_detail_"
+         done
+     fi
+
+     if [ -f "${FLS_CONFIG_FILE}" ]; then
+         while read _line_ ;do
+              log_msg -q -s "filesystem : ${_line_}  exist" -l ${LOGFILE}
+              NAS_FS+=",$_line_"
+         done<${FLS_CONFIG_FILE}
+     fi
+     _mount_list_=`$ECHO ${NAS_FS} | $SED -e 's|,| |g'`
+     NAS_FS=`$ECHO ${NAS_FS} | $SED -e 's|,| |g'`
+     for fs_name in ${NAS_FS}; do
+      if [ "${_create_share_list_}" == "" ]; then
+          _create_share_list_=`$ECHO ${fs_name}/${SNAP_NAME} | $SED -e 's|,| |g'`
+      else
+         _create_share_list_=`$ECHO ${_mount_list_} ${fs_name}/${SNAP_NAME} | $SED -e 's|,| |g'`
+      fi
+     done
+ 
+fi
+
+# Build a list of snaps 
+log_msg -s "Building snapshot list" ${_log_id_str} ${SNAP_QUIET} -t
+$ECHO "Please wait..."
+if [ "${SAN_DEVICE}" != "unityXT" ]; then
+$NASCLI list_snapshots - >> ${TEM_DIR}/total_snap_list
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not build a list of existing snapshots"
+    abort_script "${_err_msg_}"  
+fi
+else
+list_unity_snap
+     $CAT ${TEM_DIR}/nas_snap_list > ${TEM_DIR}/total_snap_list
+fi
+
+if [ ! -s ${TEM_DIR}/total_snap_list ]; then
+    _err_msg_="No snapshots found to mount"
+    abort_script "${_err_msg_}"
+fi
+
+# Verify snaps to mount actually exist.
+log_msg -s "Verifying snapshots required to mount exist" ${_log_id_str} ${SNAP_QUIET}
+for _fs_ in ${_mount_list_}; do
+    # Check for the snapshot to be mounted
+    _chk_snap_=`$CAT ${TEM_DIR}/total_snap_list | $EGREP "\/${_fs_}\/(.*\/${SNAP_NAME}|${SNAP_NAME})[[:blank:]]+"` 
+    if [ $? -ne 0 ]; then
+        _err_msg_="Snapshot label ${SNAP_NAME} not found for ${_fs_}"
+        abort_script "${_err_msg_}"  
+    fi
+    $ECHO "${_chk_snap_}" >> ${TEM_DIR}/nas_list
+done
+
+if [ -s ${TEM_DIR}/nas_list ]; then
+    if [ ! "${NO_CONFIRM}" ]; then
+        user_confirm "mount the snapshots" ${TEM_DIR}/nas_list
+        if [ $USER_CONF == No ]; then
+            $RM -rf ${TEM_DIR}
+            exit 0
+        fi
+        log_msg -s "\nSnapshots to be mounted:" ${_log_id_str} ${SNAP_QUIET}
+    	$CAT ${TEM_DIR}/nas_list >> $LOGFILE
+    fi 
+else
+    log_msg -s "No snapshots found to mount\n" ${_log_id_str} -t
+fi
+
+if [ ! -s ${ENIQ_BASE_DIR}/smf/nasd/nasd_config ]; then
+	_err_msg_="${ENIQ_BASE_DIR}/smf/nasd/nasd_config file not found, or is empty"
+	abort_script "${_err_msg_}"
+fi
+
+#Code changes for OMBS NFS Share with ENIQ Jira 105821
+if [ -s ${ENIQ_CONF_DIR}/extra_params/deployment ]; then
+    _deployment_=`$CAT ${ENIQ_CONF_DIR}/extra_params/deployment`
+else
+    _err_msg_="Parameter \"deployment\" incorrectly specified, or is missing from boot command"
+    abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+fi
+
+if [ "${_deployment_}" == "ft" ]; then
+    # we only configure 1 vlan i.e. the oss services vlan
+    _intf_list_=`iniget IPMP -f ${ENIQ_CONF_DIR}/${IPMP_INI} | $HEAD -1`
+    if [ ! "${_intf_list_}" ]; then
+        _err_msg_="Could not build a list of IPMP blocks from ${ENIQ_CONF_DIR}/${IPMP_INI}"
+        abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+    fi
+else
+    # we configured both services and storage vlans
+    _intf_list_=`iniget IPMP -f ${ENIQ_CONF_DIR}/${IPMP_INI}`
+    if [ ! "${_intf_list_}" ]; then
+        _err_msg_="Could not build a list of IPMP blocks from ${ENIQ_CONF_DIR}/${IPMP_INI}"
+        abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+    fi
+fi
+
+for _intf_ in ${_intf_list_}; do
+    _vlan_name_=`iniget ${_intf_} -f ${ENIQ_CONF_DIR}/${IPMP_INI} -v IPMP_Group_Name`
+    if [ ! "${_vlan_name_}" ]; then
+        _err_msg_="Could not read IPMP_Group_Name for ${_intf_} in ${ENIQ_CONF_DIR}/${IPMP_INI}"
+        abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+    fi
+
+    if [ "${_deployment_}" != "ft" ]; then
+        if [ "${_vlan_name_}" != "stor_grp" ]; then
+            continue
+        fi
+    fi
+
+    _intf_ip_=`iniget ${_intf_} -f ${ENIQ_CONF_DIR}/${IPMP_INI} -v IPMP_Group_IP`
+    if [ ! "${_intf_ip_}" ]; then
+        _err_msg_="Could not read IPMP_Group_IP value for ${_intf_} in ${ENIQ_CONF_DIR}/${IPMP_INI}"
+        abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+    fi
+done
+
+
+log_msg -s "Mounting snapshots with label ${SNAP_NAME}\n" ${_log_id_str} ${SNAP_QUIET} -t
+    log_msg -s "Sharing out snapshot of \"${_create_share_list_}\" with label \"${SNAP_NAME}\"" ${_log_id_str} ${SNAP_QUIET} -t
+    if [ "${_create_share_list_}" != "" ]; then
+          if [ "${SAN_DEVICE}" != "unityXT" ]; then
+            $NASCLI add_client - ${_intf_ip_} "ro,no_root_squash" ${_create_share_list_} >> ${LOGFILE}
+		   if [ $? -ne 0 ]; then
+                _err_msg_="Failed to share out one or more snapshots"
+                abort_script "${_err_msg_}"
+           fi
+          else
+          for _share_ in ${_create_share_list_}; do
+
+             _share_name_=`$ECHO $_share_ | $SED 's/\//-/g'`
+             _snap_share_name_=${POOL_ID}-${_share_name_}
+	     _snap_id_=`$UEMCLI -d ${_spa_ip_} -noHeader /prot/snap -name ${_snap_share_name_} show -output csv -filter "ID" | $TAIL -n +2| $SED 's/"//g'`
+	     if [ ! "${_snap_id_}" ]; then
+                  _err_msg_="Could not read snapshot id to create nfs share  "
+                  abort_script "${_err_msg_}"
+             fi
+             _host_id_=`$UEMCLI -d ${_spa_ip_} -noHeader /remote/host -name ${_host_name_} show -output csv -filter "ID" | $TAIL -n +2| $SED 's/"//g'`
+             if [ -z "${_host_id_}" ]; then
+                  _err_msg_="Failed to get host id"
+                  abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+             fi
+             log_msg -s "Creating nfs share of snapshot \"${_snap_share_name_}\"" ${_log_id_str} ${SNAP_QUIET}
+             log_msg -s "using command \"$UEMCLI -d ${_spa_ip_} -noHeader /prot/snap/nfs create -name ${_snap_share_name_} -snap ${_snap_id_} -path "/" -defAccess root -rootHosts ${_host_id_}\"" ${_log_id_str} ${SNAP_QUIET}
+             $UEMCLI -d ${_spa_ip_} -noHeader /prot/snap/nfs create -name ${_snap_share_name_} -snap ${_snap_id_} -path "/" -defAccess root -rootHosts ${_host_id_} >> /dev/null 2>&1
+	     if [ $? -ne 0 ]; then
+                  _err_msg_="Failed to create nfs share of snapshot ${_snap_share_name_}"
+                  abort_script "$_err_msg_"
+             else
+             log_msg -s "Successfully created nfs share of snapshot \"${_snap_share_name_}\"" ${_log_id_str} ${SNAP_QUIET}
+             fi
+             $SLEEP 5
+             done
+          fi
+          log_msg -s "Snapshot \"${_create_share_list_}\" successfully shared" ${_log_id_str} ${SNAP_QUIET} -t
+   fi
+    # Determine the Mount Point for the SNAP
+for _fs_name_ in ${_mount_list_}; do
+     _mount_fs_=`$ECHO ${POOL_ID}-${_fs_name_} | $SED -e 's/\//-/g'` 
+     _mount_point_=`$CAT ${ENIQ_BASE_DIR}/smf/nasd/nasd_config | $GREP -w ${_mount_fs_} | $AWK -F:: '{print $NF}' | $SORT -u | $HEAD -1`
+
+    if [ ! -d ${SNAP_MOUNT_DIR}/${_mount_point_} ]; then
+        log_msg -s "Creating mount point ${SNAP_MOUNT_DIR}/${_mount_point_} for snapshot ${SNAP_NAME}" ${_log_id_str} ${SNAP_QUIET} -t
+        $MKDIR -p ${SNAP_MOUNT_DIR}/${_mount_point_} >> /dev/null 2>&1
+        if [ $? -ne 0 ]; then
+            _err_msg_="Could not create directory ${SNAP_MOUNT_DIR}/${_mount_point_}"
+            abort_script "${_err_msg_}"
+        fi
+    fi
+            
+    _nfs_server_ip_=`$CAT ${ENIQ_BASE_DIR}/smf/nasd/nasd_config | $GREP -w ${_mount_fs_} | $AWK -F:: '{print $1}' | $SORT -u | $HEAD -1`
+    _nfs_share_label_=`$ECHO ${POOL_ID}-${_fs_name_}-${SNAP_NAME} | $SED -e 's/\//-/g'`
+    if [ "${SAN_DEVICE}" != "unityXT" ]; then
+    _nfs_share_=`$NASCLI list_shares | $GREP ${_nfs_share_label_} | $AWK '{print $1}'`
+    else
+    _nfs_share_="/${_nfs_share_label_}"
+    fi
+    log_msg -s "Mounting the snapshot ${_nfs_share_} on ${SNAP_MOUNT_DIR}/${_mount_point_}\n" ${_log_id_str} ${SNAP_QUIET} -t
+    $MOUNT -t nfs ${_nfs_server_ip_}:${_nfs_share_} ${SNAP_MOUNT_DIR}/${_mount_point_} >> ${LOGFILE}
+    if [ $? -ne 0 ]; then
+        _err_msg_="Could not mount ${_nfs_server_ip_}:${_nfs_share_} on directory ${SNAP_MOUNT_DIR}/${_mount_point_}"
+        abort_script "${_err_msg_}"
+    fi
+done
+}
+
+### Function: rollback_snapshots ### 
+#
+# Rollback required Snapshots
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+rollback_snapshots() 
+{
+if [ ! ${SNAP_NAME} ]; then
+    _err_msg_="Snap label not set see usage"
+    abort_script "${_err_msg_}"
+fi
+
+log_msg -s "\nBuilding a list of relevant filesystems from ${FS_SNAP_DET}" ${_log_id_str}
+$CAT ${FS_SNAP_DET} | $EGREP -v '^[[:blank:]]*#' > ${TEM_DIR}/snap_opt_file
+if [ ! -s ${TEM_DIR}/snap_opt_file ]; then
+    _err_msg_="No info to be found in ${FS_SNAP_DET}"
+    abort_script "${_err_msg_}"
+fi
+
+# Build a list of filesystems to exclude in rollback
+log_msg -s "Building a list of filesystems to rollback" ${_log_id_str}
+_rollback_list_=""
+if [ "${NAS_FS}" == "ALL" ]; then
+    while read _line_; do
+        _fs_name_=`$ECHO ${_line_} | $AWK -F"::" '{print $1}'`
+        _rollback_opt_=`$ECHO ${_line_} | $AWK -F"::" '{print $3}'`
+        if [ ! "${_fs_name_}" -o ! "${_rollback_opt_}" ]; then
+            _err_msg_="Could not read values from ${FS_SNAP_DET}"
+            abort_script "${_err_msg_}"
+        fi
+            
+        if [ "${_rollback_opt_}" == "Y" ]; then
+            if [ "${_rollback_list_}" == "" ]; then
+                _rollback_list_=${_fs_name_}
+            else
+                _rollback_list_="${_rollback_list_}|${_fs_name_}"
+            fi
+        fi
+    done < ${TEM_DIR}/snap_opt_file
+else
+    _rollback_list_=`$ECHO ${NAS_FS} | $SED -e 's|,|\||g'`
+fi
+
+if [ -f "${FLS_CONFIG_FILE}" ]; then
+       while read _line_ ;do
+            log_msg -q -s "filesystem : ${_line_}  exist" -l ${LOGFILE}
+            _rollback_list_+="|$_line_"
+       done<${FLS_CONFIG_FILE}
+fi
+
+if [ ${_is_fs_present_} -eq 1 ]; then
+    for _fs_detail_ in $_file_name_; do
+        _rollback_list_+="|${_fs_detail_}"
+    done
+fi
+
+let _field1_=_field1_+40
+let _field2_=_field2_+40
+
+_line1_str_="\n%-${_field1_}s%-${_field2_}s\n\n"
+_line2_str_="%-${_field1_}s%-${_field2_}s\n"
+
+log_msg -s "Listing filesystems with snapshots named \"${SNAP_NAME}\"" ${_log_id_str}
+if [ "${SAN_DEVICE}" != "unityXT" ]; then
+$NASCLI list_snapshots - | $EGREP "\/${SNAP_NAME}[[:blank:]]" | $EGREP ${_rollback_list_} >> ${TEM_DIR}/nas_rollback_list
+else
+list_unity_snap
+$CAT ${TEM_DIR}/nas_snap_list | $EGREP ${_rollback_list_} > ${TEM_DIR}/nas_rollback_list
+fi
+
+# Build a file for the user to confirm action,
+# or exit if no snapshots found
+if [ -s ${TEM_DIR}/nas_rollback_list ]; then
+    printf "${_line1_str_}" "NFS Snapshot Name" "NFS Filesystem Name" >> ${TEM_DIR}/nas_list
+    
+    _nas_fs_rollback_list_=""
+    while read _entry_;do
+        _nfs_snap_id_=`$ECHO ${_entry_} | $AWK '{print $1}'`
+        _nfs_id_=`$ECHO ${_entry_} | $AWK '{print $2}'`
+        
+        _snap_id_=`$ECHO ${_nfs_id_} | $CUT -d"/" -f2-`
+        
+        if [ "${_nas_fs_rollback_list_}" == "" ]; then
+            _nas_fs_rollback_list_="${_snap_id_}"
+        else
+            _nas_fs_rollback_list_="${_nas_fs_rollback_list_}|${_snap_id_}"
+        fi
+            
+        printf "${_line2_str_}" "${_nfs_snap_id_}" "${_nfs_id_}" >> ${TEM_DIR}/nas_list 
+    done < ${TEM_DIR}/nas_rollback_list
+
+    printf "\n--------------------------------------------------------\n" >> ${TEM_DIR}/san_list    
+    $CAT ${TEM_DIR}/nas_list
+    $ECHO "\n"
+
+else
+    log_msg -s "No NAS snapshots found\n" ${_log_id_str} ${SNAP_QUIET} -t
+    $RM -rf ${TEM_DIR}
+    exit 1
+fi
+
+log_msg -s "\nFilesystems to be rolled back:" ${_log_id_str} ${SNAP_QUIET}
+$CAT ${TEM_DIR}/nas_list >> $LOGFILE
+
+if [ ! "${NO_CONFIRM}" ]; then
+    user_confirm "rollback to the snapshots" ${TEM_DIR}/nas_list
+    if [ "$USER_CONF" == "No" ]; then
+        $RM -rf ${TEM_DIR}
+        exit 0
+    fi
+fi
+
+_nas_fs_rollback_list_=`$ECHO ${_nas_fs_rollback_list_} | $SED -e 's|\-|\/|g' -e 's|\|| |g'`
+# Now rollback all snapshots to snap label
+log_msg -s "Rolling back to snapshots ${SNAP_NAME}\n" ${_log_id_str} ${SNAP_QUIET} -t
+if [ "${SAN_DEVICE}" != "unityXT" ]; then
+$NASCLI rollback_snapshot - ${SNAP_NAME} ${_nas_fs_rollback_list_} >> ${LOGFILE}
+if [ $? -ne 0 ]; then
+    _err_msg_="Failed to rollback snapshot ${SNAP_NAME}"
+    abort_script "${_err_msg_}"   
+fi
+else
+
+
+for _fs_ in ${_nas_fs_rollback_list_}; do
+
+    _fs_name_=`$ECHO $_fs_ | $SED 's/\//-/g'`
+    _snap_name_=${POOL_ID}-${_fs_name_}-${SNAP_NAME}
+	_restore_backup_snap_=${POOL_ID}-${_fs_name_}-${SNAP_NAME}-restoreBackup
+
+
+        log_msg -s "Restoring snapshot \"${_snap_name_}\" of filesystem \"${POOL_ID}-${_fs_name_}\"" ${_log_id_str} ${SNAP_QUIET}
+        log_msg -s "using command \"$UEMCLI -d ${_spa_ip_} -noHeader /prot/snap -name ${_snap_name_} restore -backupName ${_restore_backup_snap_}\"" ${_log_id_str} ${SNAP_QUIET}
+
+        $UEMCLI -d ${_spa_ip_} -noHeader /prot/snap -name ${_restore_backup_snap_} show >> /dev/null 2>&1
+        if [ $? -eq 0 ]; then
+		log_msg -s "Restore backup snapshot  \"${_restore_backup_snap_}\" exists. Need to clean it before restore." ${_log_id_str} ${SNAP_QUIET}
+        $UEMCLI -d ${_spa_ip_} -noHeader /prot/snap -name ${_restore_backup_snap_} delete >> /dev/null 2>&1
+		if [ $? -ne 0 ]; then
+        _err_msg_="Failed to clean backup snapshot ${_restore_backup_snap_} before restore"
+        abort_script "$_err_msg_"
+        fi
+        fi
+		
+        $ECHO "yes" | $UEMCLI -d ${_spa_ip_} -noHeader /prot/snap -name ${_snap_name_} restore -backupName ${_restore_backup_snap_} >> /dev/null 2>&1
+	if [ $? -ne 0 ]; then
+        _err_msg_="Failed to restore snapshot ${_snap_name_} "
+        abort_script "$_err_msg_"
+        fi
+        log_msg -s "Snapshot \"${_snap_name_}\" is restored successfully." ${_log_id_str} ${SNAP_QUIET}
+		
+	log_msg -s "Cleaning restore backup snapshot  \"${_restore_backup_snap_}\"\n" ${_log_id_str} ${SNAP_QUIET}
+	$UEMCLI -d ${_spa_ip_} -noHeader /prot/snap -name ${_restore_backup_snap_} delete >> /dev/null 2>&1
+	if [ $? -ne 0 ]; then
+        _err_msg_="Failed to clean backup snapshot ${_restore_backup_snap_}"
+        abort_script "$_err_msg_"
+        fi
+        $SLEEP 15
+
+done
+
+fi
+log_msg -s "Successfully rolled back to snapshots with label \"${SNAP_NAME}\"" ${_log_id_str} ${SNAP_QUIET} -t
+
+#Logging Eniq Activity
+SNAP_DATE=`$DATE '+%Y-%m-%d %H:%M:%S'`
+$ECHO "ENIQ ACTIVITY INFO=Snapshot_Rollback;${SNAP_DATE};NAS Snapshot Rollback" | $TEE -a /eniq/local_logs/eniq_activity_history.log >> ${LOGFILE}
+_hist_status_=$?
+if [ "${_hist_status_}" -ne 0 ]; then
+	_err_msg_="Failed to update Eniq Activity log file\n"
+	abort_script "$_err_msg_"
+else
+   $ECHO "Successfully logged Eniq Activity"
+fi
+}
+
+### Function: setup_env ###
+#
+# Setup up path environment etc
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+setup_env()
+{
+if [ ! "${ENIQ_BASE_DIR}" ]; then	
+	ENIQ_BASE_DIR=${ENIQ_ROOT_DIR}
+fi
+
+ENIQ_ADMIN_DIR=${ENIQ_BASE_DIR}/admin
+
+ENIQ_CONF_DIR=${ENIQ_BASE_DIR}/installation/config
+
+# Core install directory that contains scripts
+ENIQ_CORE_DIR=${ENIQ_BASE_DIR}/installation/core_install
+
+CLI_CONF_DIR=${ENIQ_BASE_DIR}/sw/conf
+
+ENIQ_BKUPSW_DIR=${ENIQ_BASE_DIR}/bkup_sw
+
+LOGDIR=${ENIQ_BASE_DIR}/local_logs
+
+# System conf file for backup fs
+SYS_FLEX_BKUP_CONF=${ENIQ_BKUPSW_DIR}/etc/.flex_data_bkup_conf
+
+if [ -f "${SYS_FLEX_BKUP_CONF}" ]; then
+    _file_name_=`$CAT $SYS_FLEX_BKUP_CONF | $GREP "FS_NAME=" | $AWK -F= '{print $2}'` 
+else
+    _file_name_="flex_data_bkup"
+fi
+
+# Checking the existence of File-system
+configure_snap_list "${_file_name_}"
+
+# Source the common functions
+if [ -s ${ENIQ_ADMIN_DIR}/lib/common_functions.lib ]; then
+    . ${ENIQ_ADMIN_DIR}/lib/common_functions.lib
+else
+    if [ -s ${ENIQ_CORE_DIR}/lib/common_functions.lib ]; then
+        . ${ENIQ_CORE_DIR}/lib/common_functions.lib
+    else
+        _err_msg_="File ${ENIQ_ADMIN_DIR}/lib/common_functions.lib or ${ENIQ_CORE_DIR}/lib/common_functions.lib not found"
+        abort_script "${_err_msg_}"
+    fi
+fi
+
+STORAGE_TYPE=`iniget STOR_TYPE -f ${ENIQ_CONF_DIR}/${SUNOS_INI} -v STORAGE_TYPE`
+if [ ! "${STORAGE_TYPE}" ]; then
+    _err_msg_="Could not read STORAGE_TYPE param "
+    abort_script "${_err_msg_}"
+fi
+
+# If I'm FS, no need to go any further
+if [ "${STORAGE_TYPE}" == "fs" ]; then
+	return 0
+fi
+
+SAN_DEVICE=`iniget SAN_DEV -f ${ENIQ_CONF_DIR}/${SUNOS_INI} -v SAN_DEVICE`
+if [ ! "${SAN_DEVICE}" ]; then
+    _err_msg_="Could not read SAN_DEVICE param "
+    abort_script "${_err_msg_}"
+fi
+
+_spa_ip_=`$CAT ${ENIQ_CONF_DIR}/block_storage.ini | $GREP -w "BLK_STORAGE_IP_SPA" | $CUT -d "=" -f 2`
+if [ ! "${_spa_ip_}" ]; then
+     _err_msg_="Could not get the value of san spa ip"
+     abort_script "$_err_msg_"
+fi
+
+_nas_sw_target_dir_=`iniget NAS_STORAGE_API -f ${ENIQ_CONF_DIR}/${SUNOS_INI} -v NAS_API_TARGET_DIR`
+if [ ! "${_nas_sw_target_dir_}" ]; then
+    _err_msg_="Failed to get NAS API target dir information from ${ENIQ_CONF_DIR}/${SUNOS_INI}"
+    abort_script "${_err_msg_}"
+fi
+
+if [ "${SAN_DEVICE}" != "unityXT" ]; then
+   NASCLI=${_nas_sw_target_dir_}/bin/nascli
+   if [ ! -s ${NASCLI} ]; then
+       _err_msg_="${NASCLI} not found"
+       abort_script "${_err_msg_}"
+   fi
+fi
+
+# Source niq.rc
+if [ -s ${CLI_CONF_DIR}/${ENIQ_ENV} ]; then
+    . ${CLI_CONF_DIR}/${ENIQ_ENV}
+fi
+
+BKUP_CONF_FILE="`$DIRNAME ${SCRIPTHOME}`/etc/eniq_backup.conf"
+if [ ! -s ${BKUP_CONF_FILE} ]; then
+    _err_msg_="Could not locate file ${BKUP_CONF_FILE}"
+    abort_script "${_err_msg_}"
+fi
+
+SNAP_MOUNT_DIR=`$CAT ${BKUP_CONF_FILE} | $EGREP '^[ 	]*BKUP_MOUNT_DIR=' | $AWK -F"=" '{print $2}'`
+if [ ! "${SNAP_MOUNT_DIR}" ]; then
+    _err_msg_="Could not read BKUP_MOUNT_DIR param from ${BKUP_CONF_FILE}"
+    abort_script "${_err_msg_}"
+fi
+
+POOL_ID=`iniget Storage_NAS_GENERAL -f ${ENIQ_CONF_DIR}/${STORAGE_INI} -v SYS_ID`
+if [ $? -ne 0 ]; then
+    _err_msg_="Could read ${ENIQ_CONF_DIR}/${ENIQ_INI} to get NAS_Storage_Pool"
+    abort_script "${_err_msg_}"
+fi
+
+_host_name_=`$HOSTNAME`
+if [ ! "${_host_name_}" ]; then
+     _err_msg_="Could not get the value of san spa ip"
+     abort_script "$_err_msg_"
+fi
+
+# File containing the type of OSS installation. Eg. events or statistics
+INST_TYPE_FILE=${ENIQ_CONF_DIR}/ericsson_use_config
+if [ ! -s "${INST_TYPE_FILE}" ]; then
+    _err_msg_="ENIQ install type not defined in ${INST_TYPE_FILE}"
+    abort_script "${_err_msg_}" 
+fi
+
+# Read the installation type - should be "events" or "stats"
+INSTALL_TYPE=`$CAT ${INST_TYPE_FILE} | $AWK -F\= '{print $2}'`
+if [ ! "${INSTALL_TYPE}" ]; then
+    _err_msg_="Could not read INSTALL_TYPE param "
+    abort_script "${_err_msg_}"
+fi
+
+# File containing details per FS for snapshots
+FS_SNAP_DET="${ENIQ_BKUPSW_DIR}/etc/${INSTALL_TYPE}_blade_nfs_filesys_snap_det"
+if [ ! -s ${FS_SNAP_DET} ]; then
+    _err_msg_="Could not find ${FS_SNAP_DET} file"
+    abort_script "${_err_msg_}" 
+fi
+
+FLS_CONFIG_FILE=${ENIQ_CONF_DIR}/fls_conf
+# Define root user's home
+HOME=/root
+
+export HOME
+}
+
+### Function: usage_msg ###
+#
+#   Print out the usage message
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+usage_msg()
+{
+$ECHO "
+Usage: `$BASENAME $0` -a <snap_action> -f <snap_fs,snap_fs,...snap_fs> -n <snap_name> [ -l <logfile> ]
+
+options:
+
+-a  : Snapshot Action. Must be either
+              create   --> Create a snapshot of list/ALL NAS filesystems
+              delete   --> Delete specified snapshot(s).
+              list     --> List of ALL/matching snapshot(s)
+              rollback --> Roll back to specified snapshot(s).
+              mount    --> Mount the specified snapshot(s) for Backup.
+
+-f  : In the case of create
+              Filesystem(s) to be Snapshot. Must be specified in the following format
+              '<fs_name>' e.g. admin. Multiple filesystems can be
+              specified if seperated by ','.
+
+              'ALL' can be specified to snapshot all filesystems
+
+              NOTE: None of the ENIQ services should be online from SMF point of view
+
+      In the case of delete
+              Snapshots(s) to be deleted. Must be specified in the following format
+              '<fs_name>' e.g. admin
+              Multiple snapshots can be specified if seperated by ','.
+
+              'ALL' can be specified to delete all snapshots which contain
+               the specified snapshot id string e.g. ALL -n <snap_label>
+
+      In the case of mount
+              Snapshots(s) to be mounted. Must be specified in the following format
+              '<fs_name>' e.g. admin
+              Multiple snapshots can be specified if seperated by ','.
+
+              'ALL' can be specified to delete all snapshots which contain
+               the specified snapshot id string e.g. ALL -n <snap_label>
+
+
+      In the case of list
+              List Snapshots. 'ALL' can be specified to list all snapshot
+
+              'ALL' can be specified to list all snapshots which contain
+               the specified snapshot id string e.g. ALL -n <snap_label>
+
+      In the case of rollback
+              Snapshots(s) to roll back to. Must be specified in the following format
+              '<pool_name/fs_name>@<snapshot_id_str>' e.g.eniq_sp_1/dwh@ENIQ_UPGRADE.2007-Apr-02_12.24.08
+              Multiple snapshots can be specified if seperated by ','.
+
+              'ALL' can be specified to roll back to all snapshots which contain
+               the specified snapshot id string in conjunction with the '-n' parameter
+
+               NOTE: None of the ENIQ services can be online from SMF point of view
+
+-n  : In the case of snapshot creation/rollback, specify a name or label that each
+      snapshot will use. e.g. -n upg_snap would create eniq_sp_1/dwh@upg_snap.
+
+-l  : Optional parameter specifying the full path to logfile. If not specified, a 
+      logfile will be created in ${ENIQ_ROOT_DIR}/local_logs/snapshot_logs/manage_nas_snapshot.log
+-t  : Optional parameter specifying the the time of the snapshots being taken
+"
+}
+
+### Function: user_confirm ###
+#
+# Get confirmation from user to proceed with snapshot action
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+user_confirm()
+{
+local _disp_msg_=$1
+local _disp_file_=$2
+	
+while :; do
+    unset USER_CONF
+    $CLEAR
+    $CAT ${_disp_file_}
+    $ECHO "\nAre you sure you wish to ${_disp_msg_} above"
+    $ECHO "Enter [Yes | No] (case sensitive) : \c"
+
+    read USER_CONF
+    if [ "$USER_CONF" == "Yes" -o "$USER_CONF" == "No" ]; then
+        break
+    fi
+done
+}
+
+# ********************************************************************
+#
+#   Main body of program
+#
+# ********************************************************************
+#
+# Determine absolute path to software
+get_absolute_path
+
+while getopts ":a:b:f:Fl:n:NqR:t" arg; do
+  case $arg in
+    a) SNAP_ACTION="$OPTARG"
+       ;;
+    b) ENIQ_BASE_DIR="$OPTARG"
+       ;;   
+    f) NAS_FS="$OPTARG"
+       ;;
+    F) SNAP_FORCE="YES"
+       ;;
+    l) LOGFILE="$OPTARG"
+       ;;
+    n) SNAP_NAME="$OPTARG"
+       ;;
+    N) NO_CONFIRM="YES"
+       ;;
+    q) SNAP_QUIET="-q"
+       ;;
+    R) ROLL_SNAP="YES"
+       ;;
+	t) TIME="YES"
+       ;;
+   \?) usage_msg
+       exit 1
+       ;;
+  esac
+done
+shift `expr $OPTIND - 1`
+
+# Setup up path environment etc
+setup_env
+
+# Check Input Params
+check_params
+
+# Set up default logfile if required
+if [ ! "${LOGFILE}" ]; then
+    LOGFILE="${LOGDIR}/snapshot_logs/manage_nas_snapshot.log"
+fi
+
+# Check/Create Logfile
+chk_create_logfile
+
+log_msg -s "Starting to ${SNAP_ACTION} NFS snapshots" ${_log_id_str} ${SNAP_QUIET} -h -t
+
+if [ "${STORAGE_TYPE}" != "raw" ]; then
+	log_msg -s "Storage type determined to be ${STORAGE_TYPE}, script will not execute" ${_log_id_str}
+	exit 0
+fi
+
+# Create a temporary Directory
+TEM_DIR=/tmp/manage_nas_snapshot.$$.$$
+$RM -rf ${TEM_DIR}
+$MKDIR -p ${TEM_DIR}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not create directory ${TEM_DIR}"
+    abort_script "${_err_msg_}"
+fi
+
+$CHMOD 640 ${TEM_DIR}
+
+if [ "${SAN_DEVICE}" == "unityXT" ]; then
+   collect_nas_fs_info
+fi
+
+case "${SNAP_OPT}" in
+    snapshot)
+    	create_snapshots
+        ;;
+
+    destroy)
+    	destroy_snapshots
+        ;;
+
+    list)
+    	list_snapshots
+        ;;
+
+    rollback)
+    	rollback_snapshots
+        ;;
+        
+    mount)
+    	mount_snapshots
+        ;;
+
+    *)  : # SHOULD NOT GET HERE
+       	;;
+esac
+
+$RM -rf ${TEM_DIR}
+
+exit 0
+

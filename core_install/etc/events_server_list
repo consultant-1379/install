@@ -1,0 +1,18 @@
+#
+# File containing the server type
+# that can be installed.
+#
+# Based on this selection, a different flow
+# of steps will be carried out during installation
+#
+# This file is ordered, and should not be altered
+#
+# File Format -	
+#	<server_type>::<description>
+#
+eniq_events::ENIQ Events (standalone)
+eniq_coordinator::ENIQ Events Coordinator Server
+son_coordinator::SON Coordinator Server
+eniq_iqr::ENIQ Events Reader Server 
+eniq_ui::ENIQ Events Presentation Server
+eniq_mz::ENIQ Events Mediation Server

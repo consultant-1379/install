@@ -1,0 +1,327 @@
+#!/bin/bash
+# ********************************************************************
+# Ericsson Radio Systems AB                                     SCRIPT
+# ********************************************************************
+#
+#
+# (c) Ericsson Radio Systems AB 2018 - All rights reserved.
+#
+# The copyright to the computer program(s) herein is the property
+# of Ericsson Radio Systems AB, Sweden. The programs may be used 
+# and/or copied only with the written permission from Ericsson Radio 
+# Systems AB or in accordance with the terms and conditions stipulated 
+# in the agreement/contract under which the program(s) have been 
+# supplied.
+#
+# ********************************************************************
+# Name    : add_eniq_role.bsh
+# Date    : 24/07/2023
+# Revision: main\8
+# Purpose : Script to add privileged role to sudoers 
+#
+# Usage   : add_eniq_role.bsh
+#
+# ********************************************************************
+#
+# 	Command Section
+#
+# ********************************************************************
+AWK=/usr/bin/awk
+BASENAME=/usr/bin/basename
+CAT=/usr/bin/cat
+CP=/usr/bin/cp
+CUT=/usr/bin/cut
+DATE=/usr/bin/date
+DIRNAME=/usr/bin/dirname
+ECHO=/usr/bin/echo
+GREP=/usr/bin/grep
+ID=/usr/bin/id
+LS=/usr/bin/ls
+MKDIR=/usr/bin/mkdir
+MV=/usr/bin/mv
+PWD=/usr/bin/pwd
+RM=/usr/bin/rm
+SED=/usr/bin/sed
+SU=/usr/bin/su
+TEE=/usr/bin/tee
+TOUCH=/usr/bin/touch
+TR=/usr/bin/tr
+
+
+# ********************************************************************
+#
+#       Configuration Section
+#
+# ********************************************************************
+
+# Default user
+DEFAULT_USER=root
+
+# Define sudo file
+SUDOFILE=/etc/sudoers
+
+# ********************************************************************
+#
+#       Pre-execution Operations
+#
+# ********************************************************************
+
+
+# ********************************************************************
+#
+# 	Functions
+#
+# ********************************************************************
+### Function: abort_script ###
+#
+#   This will be called if the script is aborted thru an error or 
+#   error signal sent by the kernel such as CTRL-C or if a serious
+#   error is encountered during runtime
+#
+# Arguments:
+#       $1 - Error message from part of program (Not always used)
+# Return Values:
+#       none
+abort_script()
+{
+_err_time_=`$DATE '+%Y-%b-%d_%H.%M.%S'`
+
+if [ "$1" ]; then
+	_err_msg_="${_err_time_} - $1"
+else
+	_err_msg_="${_err_time_} - ERROR : Script aborted.......\n"
+fi
+
+$ECHO "\n$_err_msg_\n" | $TEE -a ${LOGFILE}
+
+cd $SCRIPTHOME
+
+if [ "$2" ]; then
+    ${2}
+else
+   exit 1
+fi
+}
+
+
+### Function: check_id ###
+#
+#   Check that the effective id of the user is correct
+#   If not print error msg and exit.
+#
+# Arguments:
+#       $1 : User ID name
+# Return Values:
+#       none
+check_id()
+{
+_check_id_=`$ID  | $AWK -F\( '{print $2}' | $AWK -F\) '{print $1}'`
+if [ "$_check_id_" != "$1" ]; then
+    _err_msg_="You must be $1 to execute this script."
+    abort_script "$_err_msg_" 
+fi
+}
+
+### Function: check_params ###
+#
+# Check Input Params
+#
+# Arguments:
+#	none
+# Return Values:
+#	none
+check_params()
+{
+# Must have following Params
+if [ ! "${USER_NAME}" -o ! "${L_USER_ALIAS}" -o ! "${RUNAS_USER}" -o ! "${L_RUNAS_ALIAS}" -o ! "${L_CMD_ALIAS}" ]; then
+    usage_msg
+    exit 1
+fi
+}
+
+### Function: get_absolute_path ###
+#
+# Determine absolute path to software
+#
+# Arguments:
+#	none
+# Return Values:
+#	none
+get_absolute_path() 
+{
+_dir_=`$DIRNAME $0`
+SCRIPTHOME=`cd $_dir_ 2>/dev/null && pwd || $ECHO $_dir_`
+}
+
+### Function: logit ###
+#
+#  Logs Messages to default logfile "LOGFILE"
+#
+# Uses Global Variables: "LOGFILE"
+# Arguments:  log message
+# Return Values: 0 for success
+#                1 for error LOGFILE undefined
+logit()
+{
+_log_msg_="$*"
+
+if [ "${LOGFILE}" ]; then
+    $ECHO "`$DATE '+%Y-%b-%d_%H.%M.%S'` - ${_log_msg_}" >> ${LOGFILE}
+else
+    $ECHO "`$DATE '+%Y-%b-%d_%H.%M.%S'` - ${_log_msg_}\n"
+fi
+}
+
+### Function: usage_msg ###
+#
+#   Print out the usage message
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+usage_msg()
+{
+$ECHO "
+Usage: `$BASENAME $0` -u <user name> -U <user alias> -r <runas user> -R <runas alias> [-l <logfile>]
+
+Options:
+
+-C	: Alias name of the Commands
+
+-u	: User name to be added as privileged user. (e.g. dcuser)
+
+-U	: Alias of the user to be added as privileged user.
+
+-r 	: User name of the privileged user. (e.g. root)
+
+-R	: Alias of the privileged user.
+
+-l      : Optional argument to set the logfile
+
+"
+}
+
+# ********************************************************************
+#
+# 	Main body of program
+#
+# ********************************************************************
+#
+# Determine absolute path to software
+get_absolute_path
+
+# Check that the effective id of the user is root
+check_id $DEFAULT_USER
+
+while getopts ":C:l:R:r:U:u:" arg; do
+  case $arg in
+    C) L_CMD_ALIAS="$OPTARG"
+       ;;
+    l) LOGFILE="$OPTARG"
+       ;;
+    R) L_RUNAS_ALIAS="$OPTARG" 
+       ;;
+    r) RUNAS_USER="$OPTARG"
+       ;;
+    U) L_USER_ALIAS="$OPTARG"
+       ;;
+    u) USER_NAME="$OPTARG"
+       ;;
+    *) usage_msg
+       ;;
+  esac
+done
+shift `expr $OPTIND - 1`
+
+# Check Input Params
+check_params
+
+# Changing the case of aliases to upper
+CMD_ALIAS=`$ECHO ${L_CMD_ALIAS} | $TR [:lower:] [:upper:]`
+RUNAS_ALIAS=`$ECHO ${L_RUNAS_ALIAS} | $TR [:lower:] [:upper:]`
+USER_ALIAS=`$ECHO ${L_USER_ALIAS} | $TR [:lower:] [:upper:]`
+
+# Create logfile
+if [ ! "${LOGFILE}" ]; then
+    LOGFILE=${ENIQ_BASE_DIR}/local_logs/misc/create_sudo_roles.log
+fi
+$MKDIR -p `$DIRNAME ${LOGFILE}`
+$TOUCH ${LOGFILE} >>/dev/null 2>&1
+
+# Create a temporary Directory
+TEM_DIR=/tmp/$0.$$.$$
+$RM -rf ${TEM_DIR}
+$MKDIR -p ${TEM_DIR}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not create directory ${TEM_DIR}"
+    abort_script "$_err_msg_"
+fi
+
+# Add privileges to the user
+_temp_sudoers_=${TEM_DIR}/temp_sudoers
+$RM -rf ${_temp_sudoers_}
+
+logit "Starting to execute $0"
+
+# Add/update the User_Alias 
+$GREP -w "User_Alias" ${SUDOFILE} | $GREP "${USER_ALIAS}=" >>/dev/null 2>&1
+if [ $? -ne 0 ]; then
+    $CAT ${SUDOFILE} | $GREP "## ENIQ Role Configuration" >>/dev/null 2>&1
+    if [ $? -ne 0 ]; then
+        $ECHO "" >> ${SUDOFILE}
+        $ECHO "## ENIQ Role Configuration" >> ${SUDOFILE}
+    fi
+    $ECHO "User_Alias ${USER_ALIAS}=${USER_NAME}" >> ${SUDOFILE}
+    logit "Added ${USER_NAME} as ${USER_ALIAS}"
+else
+    _old_user_name_=`$CAT ${SUDOFILE} | $GREP "User_Alias" | $GREP "${USER_ALIAS}=" | $CUT -f2 -d=`
+    $CAT ${SUDOFILE} | $SED "s|${USER_ALIAS}=${_old_user_name_}|${USER_ALIAS}=${USER_NAME}|" > ${_temp_sudoers_}
+    if [ $? -ne 0 ]; then
+        _err_msg_="Could not replace new values for user alias."
+        abort_script "$_err_msg_"
+    fi
+    $MV -f ${_temp_sudoers_} ${SUDOFILE}
+    if [ $? -ne 0 ]; then
+        _err_msg_="Could not update ${SUDOFILE} for user alias."
+        abort_script "$_err_msg_"
+    fi
+    logit "Updated ${USER_NAME} as ${USER_ALIAS}"
+fi
+
+# Add/update the Runas_Alias
+$GREP -w "Runas_Alias" ${SUDOFILE} | $GREP "${RUNAS_ALIAS}=" >>/dev/null 2>&1
+if [ $? -ne 0 ]; then
+    $ECHO "Runas_Alias ${RUNAS_ALIAS}=${RUNAS_USER}" >> ${SUDOFILE}
+    logit "Added ${RUNAS_USER} as ${RUNAS_ALIAS}"
+else
+    _old_runas_user_=`$CAT ${SUDOFILE} | $GREP "Runas_Alias" | $GREP "${RUNAS_ALIAS}=" | $CUT -f2 -d=`
+    $CAT ${SUDOFILE} | $SED "s|${RUNAS_ALIAS}=${_old_runas_user_}|${RUNAS_ALIAS}=${RUNAS_USER}|" > ${_temp_sudoers_}
+    if [ $? -ne 0 ]; then
+        _err_msg_="Could not replace new values for runas alias."
+        abort_script "$_err_msg_"
+    fi
+    $MV -f ${_temp_sudoers_} ${SUDOFILE}
+    if [ $? -ne 0 ]; then
+        _err_msg_="Could not update ${SUDOFILE} for runas alias."
+        abort_script "$_err_msg_"
+    fi
+    logit "Updated ${RUNAS_USER} as ${RUNAS_ALIAS}"
+fi
+
+# Add the Cmnd_Alias
+$GREP -w "Cmnd_Alias" ${SUDOFILE} | $GREP "${CMD_ALIAS}" >>/dev/null 2>&1
+if [ $? -ne 0 ]; then
+    $ECHO "Cmnd_Alias ${CMD_ALIAS}=" >> ${SUDOFILE}
+fi
+
+# Add the privilege
+$CAT ${SUDOFILE} | $GREP "${USER_ALIAS} ALL=(${RUNAS_ALIAS}) NOPASSWD: ${CMD_ALIAS}" >>/dev/null 2>&1
+if [ $? -ne 0 ]; then
+    $ECHO "${USER_ALIAS} ALL=(${RUNAS_ALIAS}) NOPASSWD: ${CMD_ALIAS}" >> ${SUDOFILE}
+    $ECHO "" >> ${SUDOFILE}
+fi
+
+logit "Successfully updated sudo privileges for ${USER_NAME} as ${L_RUNAS_ALIAS} in ${SUDOFILE} file."
+
+exit 0

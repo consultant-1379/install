@@ -1,0 +1,2077 @@
+#!/bin/bash
+# ********************************************************************
+# Ericsson Radio Systems AB                                     SCRIPT
+# ********************************************************************
+#
+#
+# (c) Ericsson Radio Systems AB 2022 - All rights reserved.
+#
+# The copyright to the computer program(s) herein is the property
+# of Ericsson Radio Systems AB, Sweden. The programs may be used 
+# and/or copied only with the written permission from Ericsson Radio 
+# Systems AB or in accordance with the terms and conditions stipulated 
+# in the agreement/contract under which the program(s) have been 
+# supplied.
+#
+# ********************************************************************
+# Name    : prepare_eniq_bkup.bsh
+# Date    : 12/07/2023
+# Revision: main\92
+# Purpose : This primary purpose of this script is to prepare ENIQ for Backup. 
+#           It will snapshot all required filesystems and mount those under
+#           a pre-defined mountpoint.
+#           
+#           It is also used to create/maintain the Rolling Snapshots.
+#
+# Usage   : prepare_eniq_backup.bsh [ -l <path_to_logfile> ] [ -N ] 
+#
+# ********************************************************************
+#
+# 	Command Section
+#
+# ********************************************************************
+AWK=/usr/bin/awk
+BASENAME=/usr/bin/basename
+BASH=/usr/bin/bash
+BEADM=/usr/sbin/beadm
+BC=/usr/bin/bc
+CAT=/usr/bin/cat
+CD=/usr/bin/cd
+CHMOD=/usr/bin/chmod
+CHOWN=/usr/bin/chown
+CLEAR=/usr/bin/clear
+DATE=/usr/bin/date
+DIRNAME=/usr/bin/dirname
+ECHO='/usr/bin/echo -e'
+EGREP=/usr/bin/egrep
+ENV=/usr/bin/env
+EXPR=/usr/bin/expr
+FIND=/usr/bin/find
+GREP=/usr/bin/grep
+HOSTNAME=/usr/bin/hostname
+HEAD=/usr/bin/head
+ID=/usr/bin/id
+LS=/usr/bin/ls
+LVS=/usr/sbin/lvs
+MKDIR=/usr/bin/mkdir
+MV=/usr/bin/mv
+PS=/usr/bin/ps
+PWD=/usr/bin/pwd
+RM=/usr/bin/rm
+SED=/usr/bin/sed
+SLEEP=/usr/bin/sleep
+SORT=/usr/bin/sort
+SU=/usr/bin/su
+SUDO=/usr/bin/sudo
+TAR=/usr/bin/tar
+TEE=/usr/bin/tee
+TOUCH=/usr/bin/touch
+UNIQ=/usr/bin/uniq
+WC=/usr/bin/wc
+ZPOOL=/usr/sbin/zpool
+
+# ********************************************************************
+#
+#       Configuration Section
+#
+# ********************************************************************
+# Flag to determine whether to compress log or not (Must be y/n)
+COMPRESS_LOG=y
+
+# Name of SunOS & ENIQ ini Files
+ENIQ_ENV=niq.rc
+ENIQ_INI=niq.ini
+SUNOS_INI=SunOS.ini
+
+# Number of log files to keep
+NUM_LOGS=10
+
+# Size in kbytes that the log file is allowed to grow to
+SIZE_LOGS=2048000
+
+# NAS exclude list
+NAS_EXCLUDED_LIST=backup
+
+# Log FS list for OMBS backup
+LOG_FS_LIST="local_logs"
+
+
+# ********************************************************************
+#
+# 	Functions
+#
+# ********************************************************************
+### Function: abort_script ###
+#
+#   This will is called if the script is aborted thru an error
+#   error signal sent by the kernel such as CTRL-C or if a serious
+#   error is encountered during runtime
+#
+# Arguments:
+#       $1 - Error message from part of program (Not always used)
+# Return Values:
+#       none
+abort_script()
+{
+if [ "$1" ]; then
+    _err_msg_="`$DATE +%d.%m.%y_%H:%M:%S` - $1 \nCleaning up failed snapshot and exiting."
+else
+    _err_msg_="`$DATE +%d.%m.%y_%H:%M:%S` - Script aborted.......\n"    
+fi
+
+# Check if log_msg() is defined
+type log_msg > /dev/null 2>&1
+if [ $? -gt 0 ]; then
+    if [ "${LOGFILE}" ]; then
+		if [ ! "${SNAP_QUIET}" ]; then
+		    $ECHO "\nERROR - ${_err_msg_}\n" |$TEE -a ${LOGFILE}
+		else
+		    $ECHO "\nERROR - ${_err_msg_}\n" >> ${LOGFILE}
+        fi
+    else
+		$ECHO "\nERROR - ${_err_msg_}\n"
+    fi
+else
+    if [ "${LOGFILE}" ]; then
+		log_msg -s "\nERROR - ${_err_msg_}\n" -l ${LOGFILE} ${SNAP_QUIET}
+    else
+		log_msg -s "\nERROR - ${_err_msg_}\n" ${SNAP_QUIET}
+    fi
+fi
+
+cd $SCRIPTHOME
+$RM -rf ${TEM_DIR} ${TEM_IQ_VIRT_BKUP_DIR}
+$RM -rf ${Rep_conn_str_enc}
+$RM -rf ${DWH_CONN_STRING_enc}
+$RM -rf ${dbpng_en}
+$RM -rf ${enc_dbp}
+
+if [ "${SNAP_TAKEN}" ]; then
+    if [ "${ROLL_SNAP}" ]; then
+        log_msg -s "\n`$DATE +%d.%m.%y_%H:%M:%S` - Cleaning up old Failed snapshots\n" ${SNAP_QUIET}
+		$BASH ${SCRIPTHOME}/cleanup_eniq_backup.bsh -N ${SNAP_QUIET} -R -S "${SNAP_NAME}" 
+		$RM -f ${ROLL_SNAP_FILE_INDICATOR} ${ROLL_SNAP_PROGRESS_INDICATOR}
+    else
+        log_msg -s "\n`$DATE +%d.%m.%y_%H:%M:%S` - Cleaning up old Failed snapshots\n" ${SNAP_QUIET}
+		$BASH ${SCRIPTHOME}/cleanup_eniq_backup.bsh -N ${SNAP_QUIET} -S "${SNAP_NAME}" 
+        $RM -f ${BKUP_SNAP_FILE_INDICATOR} ${BKUP_SNAP_PROGRESS_INDICATOR}
+    fi
+fi
+
+exit 1
+}
+
+### Function: backup_mediation_db ###
+#
+# Backup the Mediation Zone derby DB
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+backup_mediation_db()
+{
+if [ "${CURR_SERVER_TYPE}" != "son_coordinator" ]; then
+    if [ ! -s ${MEDIATION_INTER}/bin/mg_derbydb_backup.sh ]; then
+        _err_msg_="File ${MEDIATION_INTER}/bin/mg_derbydb_backup.sh not found"
+        abort_script "$_err_msg_"
+    fi
+    
+	$ECHO "\n`$DATE +%d.%m.%y_%H:%M:%S` - Backing up the mediation derby database\n" >> ${LOGFILE}
+    # Backup mediation zone
+    $SU - ${SYSUSER} -c "$MEDIATION_INTER/bin/mg_derbydb_backup.sh" >> ${LOGFILE}
+    if [ $? -ne 0 ]; then
+        _err_msg_="Could not backup the mediation derby database"
+        abort_script "$_err_msg_"
+    fi
+else
+	:
+fi
+}
+
+### Function: check_id ###
+#
+#   Check that the effective id of the user is correct
+#   If not print error msg and exit.
+#
+# Arguments:
+#       $1 : User ID name
+# Return Values:
+#       none
+check_id()
+{
+_check_id_=`$ID  | $AWK -F\( '{print $2}' | $AWK -F\) '{print $1}'`
+if [ "$_check_id_" != "$1" ]; then
+    _err_msg_="You must be $1 to execute this script."
+    abort_script "$_err_msg_"
+fi
+}
+
+### Function: chk_create_logfile ###
+#
+# Check/Create Logfile
+#
+# Arguments:
+#	none
+# Return Values:
+#	none
+chk_create_logfile()
+{
+$MKDIR -p `$DIRNAME ${LOGFILE}`
+if [ $? -ne 0 ]; then
+	unset LOGFILE
+	_err_msg_="Could not create directory `$DIRNAME ${LOGFILE}`"
+	abort_script "$_err_msg_"
+fi	
+
+$TOUCH -a ${LOGFILE}
+if [ $? -ne 0 ]; then
+    unset LOGFILE
+    _err_msg_="Could not write to file ${LOGFILE}"
+    abort_script "$_err_msg_"
+fi
+
+if [ -s ${LOGFILE} ]; then
+    $ECHO "\n\n" >> ${LOGFILE}
+fi
+
+$ECHO "=========================================================================" >> ${LOGFILE}
+$ECHO "=========================================================================" >> ${LOGFILE}
+if [ "${ROLL_SNAP}" ]; then
+    $ECHO "Rolling snapshot started at `$DATE +%d.%m.%y_%H:%M:%S`\n" >> ${LOGFILE}
+else
+    $ECHO "Backup snapshot started at `$DATE +%d.%m.%y_%H:%M:%S`\n" >> ${LOGFILE}
+fi	
+}
+
+### Function: check_files_and_scripts ### 
+#
+# Check required files and scripts exist
+#
+# Arguments:
+#   none
+# Return Values:
+#	none
+check_files_and_scripts()
+{
+if [ ! -s ${SCRIPTHOME}/cleanup_eniq_backup.bsh ]; then 
+    _err_msg_="File ${SCRIPTHOME}/cleanup_eniq_backup.bsh not found"
+    abort_script "$_err_msg_"
+fi
+
+if [ ! -s ${SCRIPTHOME}/manage_fs_snapshots.bsh ]; then 
+    _err_msg_="File ${ADMIN_BIN}/manage_fs_snapshots.bsh not found"
+    abort_script "$_err_msg_"
+fi
+
+if [ ! -s ${SCRIPTHOME}/manage_nas_snapshots.bsh ]; then
+    _err_msg_="File ${SCRIPTHOME}/manage_nas_snapshots.bsh not found"
+    abort_script "$_err_msg_"
+fi
+
+if [ ! -s ${SCRIPTHOME}/manage_san_snapshots.bsh ]; then
+    _err_msg_="File ${SCRIPTHOME}/manage_san_snapshots.bsh not found"
+    abort_script "$_err_msg_"
+fi
+
+
+if [ ! -s ${SCRIPTHOME}/repdb_backup.bsh ]; then
+    _err_msg_="File ${SCRIPTHOME}/repdb_backup.bsh not found"
+    abort_script "$_err_msg_"
+fi	
+
+if [ "${INSTALL_TYPE}" == "events"  -a "${CO_SERVER}" == "YES" ]; then
+	if [ ! -s ${SCRIPTHOME}/ldap_backup.bsh ]; then
+		_err_msg_="File ${SCRIPTHOME}/ldap_backup.bsh not found"
+		abort_script "$_err_msg_"
+	fi
+fi	
+}
+
+### Function: create_archive_delete_list ###
+#
+# Determine a list of archive files to delete
+#
+# Arguments:
+#	none
+# Return Values:
+#	none
+create_archive_delete_list()
+{
+# Clear lists of archive files to be cleaned off the system
+$ECHO "\n`$DATE +%d.%m.%y_%H:%M:%S` - Creating lists of PM data archive files to be deleted" >> ${LOGFILE}
+$FIND ${PMDATA_DIR}/eventdata | $EGREP '.*\/archive\/' >> /dev/null 2>&1 >> ${TEM_DIR}/archive_list.txt
+_list_size_=`$CAT ${TEM_DIR}/archive_list.txt | $WC -l`
+$ECHO "\n`$DATE +%d.%m.%y_%H:%M:%S` - There are ${_list_size_} PM data archive files to be deleted\n" >> ${LOGFILE}
+}
+
+### Function: get_absolute_path ###
+#
+# Determine absolute path to software
+#
+# Arguments:
+#	none
+# Return Values:
+#	none
+get_absolute_path()
+{
+_dir_=`$DIRNAME $0`
+#SCRIPTHOME=`cd $_dir_ 2>/dev/null && pwd || $ECHO $_dir_`
+SCRIPTHOME=`$ECHO $_dir_`
+}
+
+
+### Function: get_nas_shares ###
+#
+# Generate all filesystems to share
+#
+# Arguments:
+#   none 
+# Return Values:
+#   none
+get_nas_shares() {
+if [ "${CO_SERVER}" == "YES" ]; then
+	_tmp_share_dir_=/tmp/shares.$$
+	# Temp NASCLI file
+	_tmp_nascli_file_=${_tmp_share_dir_}/NASCLI.txt
+	# Temp Block_storage file
+	_tmp_blk_stor_file_=${_tmp_share_dir_}/BLK_STORAGE.txt
+	# out access rights file
+	_tmp_access_file_=${_tmp_share_dir_}/shares.txt
+	# Temp shares file 
+	_nascli_shares_=${_tmp_share_dir_}/NASCLI_SHARES.txt
+	_ini_file_="${ENIQ_BASE_DIR}/installation/config/SunOS.ini"
+	
+	# Check storage.ini
+	if [ ! -s $ENIQ_BASE_DIR/installation/config/storage.ini ]; then
+	    _err_msg_="$ENIQ_BASE_DIR/installation/config/storage.ini does not exist"
+	    abort_script "$_err_msg_"
+	fi
+	
+	# Check SunOS.ini
+	if [ ! -s ${_ini_file_} ]; then
+	    _err_msg_="$ENIQ_BASE_DIR/installation/config/storage.ini does not exist"
+	    abort_script "$_err_msg_"
+	fi
+	
+	_nas_sw_target_dir_=`iniget NAS_STORAGE_API -f ${_ini_file_} -v NAS_API_TARGET_DIR`
+	if [ ! "${_nas_sw_target_dir_}" ]; then
+	    _err_msg_="Failed to get NAS API target dir information from ${_ini_file_}"
+	    abort_script "$_err_msg_"
+	fi
+	
+	_nascli_=${_nas_sw_target_dir_}/bin/nascli
+	if [ ! -s ${_nascli_} ]; then
+	    _err_msg_="${_nascli_} not found"
+	    abort_script "$_err_msg_"
+	fi
+
+	if [ -d ${_tmp_share_dir_} ]; then
+		# Remove old tmp directory
+		$RM -rf ${_tmp_share_dir_}
+	fi
+	
+	$MKDIR -p ${_tmp_share_dir_}
+	if [ $? -ne 0 ]; then
+	    _err_msg_="Problem encountered creating directory: ${_tmp_share_dir_}"
+	    abort_script "$_err_msg_"
+	fi
+
+	# remove hidden nas files
+	$RM /.shared.txt /.nas_share.txt > /dev/null 2>&1
+	$TOUCH ${_tmp_nascli_file_} ${_tmp_access_file_} ${_nascli_shares_}
+	if [ $? -ne 0 ]; then
+	    _err_msg_="Problem encountered creating tmp files"
+	    abort_script "$_err_msg_"
+	fi
+	
+	# Get nas filesystems
+	$ECHO "Generating shared filesystems from NASCLI" |$TEE -a ${LOGFILE}
+	${_nascli_} list_shares - > ${_tmp_nascli_file_}
+	if [ $? -ne 0 ]; then
+	    _err_msg_="Problem encountered listing shares to ${_tmp_nascli_file_}" |$TEE -a ${LOGFILE}
+	    abort_script "$_err_msg_"
+	fi
+	
+	# Get nas storage blocks
+	$CAT $ENIQ_BASE_DIR/installation/config/storage.ini | $GREP Storage_NAS | $SED 's/\[//g;s/\]//g' > ${_tmp_blk_stor_file_}
+	if [ $? -ne 0 ]; then
+	    _err_msg_="Problem encountered editing ${_tmp_blk_stor_file_} from $ENIQ_BASE_DIR/installation/config/storage.ini" |$TEE -a ${LOGFILE}
+	    abort_script "$_err_msg_"
+	fi
+	
+	$ECHO "Generating shared IP Addresses from storage.ini" |$TEE -a ${LOGFILE}
+	for i in `$CAT ${_tmp_blk_stor_file_}`; do
+		filesys=`iniget $i -f ${ENIQ_BASE_DIR}/installation/config/storage.ini -v SHARE_PATH `
+		if [ $? -ne 0 ]; then
+		    _err_msg_="SHARE_PATH Error - Encountered while editing file to ${_tmp_blk_stor_file_}" |$TEE -a ${LOGFILE}
+		    abort_script "$_err_msg_"
+		fi
+		access=`iniget $i -f ${ENIQ_BASE_DIR}/installation/config/storage.ini -v NFS_SHARE_OPTIONS | $SED 's|\"||g'`
+		if [ $? -ne 0 ]; then
+		    _err_msg_="NFS_SHARE_OPTIONS Error - Problem encountered editing file to ${_tmp_blk_stor_file_}" |$TEE -a ${LOGFILE}
+		    abort_script "$_err_msg_"
+		fi
+		path=`iniget $i -f ${ENIQ_BASE_DIR}/installation/config/storage.ini -v FS_NAME `
+		if [ $? -ne 0 ]; then
+		    _err_msg_="FS_NAME Error - Encountered while editing file to ${_tmp_blk_stor_file_}" |$TEE -a ${LOGFILE}
+		    abort_script "$_err_msg_"
+		fi
+		$ECHO $filesys" "$access " "${path} >> ${_tmp_access_file_} 
+		if [ $? -ne 0 ]; then
+		    _err_msg_="Error copying ${filesys} - ${access} - ${path} to ${_tmp_access_file_} " |$TEE -a ${LOGFILE}
+		    abort_script "$_err_msg_"
+		fi
+	done
+	
+	$ECHO "Building list of files and direcories."
+	# Merge two files together in the form: IP Shares FS
+	for j in `$CAT ${_tmp_access_file_} | $AWK '{print $1}'`; do
+		_nas_share_=`$CAT ${_tmp_access_file_} | $EGREP $j  | $AWK '{print $2}' | $UNIQ` 
+		for i in `$CAT ${_tmp_nascli_file_} | $AWK '{print $1}'`; do
+			if [ "{$j}" == "{$i}" ]; then
+				_fs_=`$CAT ${_tmp_access_file_} | $EGREP "$i*[[:blank:]]" | $AWK '{print $3}' | $UNIQ`
+				_ip_=`$CAT ${_tmp_nascli_file_} | $EGREP "$i " |$AWK '{print $3}' | $SED 's|\/32||g' | $UNIQ`
+			fi
+		done
+                if [ "${_ip_}" != "" -o "${_fs_}" != "" -o "${_nas_share_}" != "" ]; then
+                        for _new_ip_ in ${_ip_}; do
+                                $ECHO "${_new_ip_} ${_nas_share_} ${_fs_}" >> ${_nascli_shares_}
+                        done
+                fi
+	done
+
+        while read _line_; do
+            _word_count_=`$ECHO ${_line_} | $WC -w | $SED -e 's/^ *//g' -e 's/ *$//g'`
+                if [ "${_word_count_}" == "3" ]; then
+                    $ECHO ${_line_} >> ${_tmp_share_dir_}/nas_check.txt
+                fi
+        done < ${_nascli_shares_}
+
+        if [ -s ${_tmp_share_dir_}/nas_check.txt ]; then
+            $MV ${_tmp_share_dir_}/nas_check.txt ${_nascli_shares_}
+        fi
+
+	# Copy ${_nascli_shares_} to different directory
+	$CAT ${_nascli_shares_} | $SORT -u > /.nas_share.txt
+	if [ $? -ne 0 ]; then
+	    _err_msg_="Error copying nas shares to /.nas_share.txt" |$TEE -a ${LOGFILE}
+	    abort_script "$_err_msg_"
+	fi
+	$ECHO "List complete." |$TEE -a ${LOGFILE}
+else
+	# touch file, so we know not to share nas fs again
+	$TOUCH /.shared.txt
+	if [ $? -ne 0 ]; then
+	    _err_msg_="Error copying nas shares to /.shared.txt" |$TEE -a ${LOGFILE}
+	   	abort_script "$_err_msg_"
+	fi
+fi
+
+}
+
+
+### Function: get_nas_snap_list ###
+#
+# Determine list of NAS F/S to snap
+#
+# Arguments:
+#	$1  :  exclude list
+# Return Values:
+#	none
+get_nas_snap_list()
+{
+# Get a list of the filesystems
+$RM -rf ${TEM_DIR}/fs_list_file
+$RM -rf ${TEM_DIR}/snap_list
+
+$CAT ${NFS_SNAP_DET} | $EGREP -v '^[[:blank:]]*#' > ${TEM_DIR}/fs_list_file
+
+if [ ! -s ${TEM_DIR}/fs_list_file ]; then
+    _err_msg_="${TEM_DIR}/fs_list_file does not exist, or is empty"
+    abort_script "$_err_msg_"
+fi
+
+# Build a list of NAS filesystems that are to be snapped
+for _fs_ in `$CAT ${TEM_DIR}/fs_list_file`; do
+    _fs_name_=`$ECHO ${_fs_} | $AWK -F\:: '{print $1}'`
+    _snap_opt_=`$ECHO ${_fs_} | $AWK -F\:: '{print $2}'`
+     if [ "${_snap_opt_}" == "Y" ]; then
+          $ECHO ${_fs_name_} >> ${TEM_DIR}/snapable_list
+     fi
+done
+
+$CAT ${TEM_DIR}/snapable_list | $EGREP -v "$1" > ${TEM_DIR}/snap_list
+
+_nfs_snap_list_=""
+for _fs_ in `$CAT ${TEM_DIR}/snap_list`; do
+    if [ "${_nfs_snap_list_}" == "" ]; then
+        _nfs_snap_list_="${_fs_}"
+    else
+        _nfs_snap_list_="${_nfs_snap_list_},${_fs_}"
+    fi
+done
+}
+
+
+### Function: get_snapshot_name ###
+#
+# Gets the snapshot lable which is free to use
+#
+# Arguments:
+#	none
+# Return Values:
+#	none
+get_snapshot_name()
+{
+_snap_id_1_=`$ECHO ${SNAP_ID_STR} | $AWK -F:: '{print $1}'`
+_snap_id_2_=`$ECHO ${SNAP_ID_STR} | $AWK -F:: '{print $2}'`
+if [ ! "${_snap_id_1_}" -o ! "${_snap_id_2_}" ]; then
+	 _err_msg_="Could not determing snapshot IDs from ${SNAP_ID_STR}"
+    abort_script "$_err_msg_"
+fi
+
+if [ "${ROLL_SNAP}" ]; then 
+	for _i_ in ${_snap_id_1_} ${_snap_id_2_} ; do
+		if [ "${CO_SERVER}" == "YES" -a "${STORAGE_TYPE}" != "fs" ]; then
+			# verify thats its available on FS
+			_fs_chk_=`$LVS -o lv_name,lv_attr --noheadings -S "lv_attr=~[^s.*]" | $AWK '{print $1}' | $AWK -F'-' '{print $2}' | $GREP -w ${_i_}` >> /dev/null 2>&1
+				if [ $? -ne 0 ]; then
+				# verify thats its available on the SAN and then the NAS
+				_san_chk_=`${SCRIPTHOME}/manage_san_snapshots.bsh -a list -f ALL | $GREP -w ${_i_}` >> /dev/null 2>&1
+				if [ $? -ne 0 ]; then
+					_nas_chk_=`${SCRIPTHOME}/manage_nas_snapshots.bsh -a list -f ALL | $GREP -w ${_i_}` >> /dev/null 2>&1
+					if [ $? -ne 0 ]; then
+						# Then label is free to use
+						SNAP_NAME="${_i_}"
+						# $ECHO "${SNAP_NAME}" > ${VAR_TMP_DIR}/snapname
+						if [ -f ${ADMIN_BIN}/called_through_upgrade ]; then
+							$ECHO "${SNAP_NAME}" >> ${ADMIN_BIN}/snap_label
+						fi
+						break
+					fi
+				fi   
+			fi
+		else
+			# verify thats its available on FS
+			_fs_chk_=`$LVS -o lv_name,lv_attr --noheadings -S "lv_attr=~[^s.*]" | $AWK '{print $1}' | $AWK -F'-' '{print $2}' | $GREP -w ${_i_}` >> /dev/null 2>&1
+			if [ $? -ne 0 ]; then
+				# Then label is free to use
+				SNAP_NAME="${_i_}"
+				if [ -f ${ADMIN_BIN}/called_through_upgrade ]; then
+					$ECHO "${SNAP_NAME}" >> ${ADMIN_BIN}/snap_label
+				fi
+				break
+			fi
+		fi
+	done 
+else
+        SNAP_NAME="${BKUP_ID_STR}"
+        if [ "${INSTALL_TYPE}" == "stats" ]; then
+             SAN_SNAP_NAME="${BKUP_ID_STR_SAN}"
+        fi  
+fi
+
+if [ "${SNAP_NAME}" == "" ]; then
+	_err_msg_="Could not set snap string to use for snapshot, please check existing snapshot labels"
+	abort_script "$_err_msg_"
+else
+	# lets figure it out
+	if [ "${ROLL_SNAP}" ]; then 
+		if [ "${SNAP_NAME}" == "${_snap_id_1_}" ]; then
+			SNAP_DELETE="${_snap_id_2_}"
+		else
+			SNAP_DELETE="${_snap_id_1_}"
+		fi
+	fi
+fi
+}
+
+
+### Function: get_be_name ###
+#
+# get the Boot Environment name from config file
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+get_be_name()
+{
+#_failure_=0
+_be_id_1_=`$ECHO ${BE_ID_STR} | $AWK -F:: '{print $1}'`
+_be_id_2_=`$ECHO ${BE_ID_STR} | $AWK -F:: '{print $2}'`
+if [ ! "${_be_id_1_}" -o ! "${_be_id_2_}" ]; then
+    log_msg -s "Could not determine Boot Environment IDs from ${BE_ID_STR}" -l ${LOGFILE} ${SNAP_QUIET}
+    _failure_=1
+    #abort_script "$_err_msg_"
+fi
+
+if [ "${ROLL_SNAP}" ]; then
+        for _be_ in ${_be_id_1_} ${_be_id_2_}; do
+                _be_name_chk_=`$BEADM list | $AWK -F" " '{print $1}' | $GREP -w ${_be_}` >> /dev/null 2>&1
+                if [ ! "${_be_name_chk_}" ]; then
+                        # Then label is free to use
+                        BE_NAME="${_be_}"
+                 break
+        fi
+        done
+fi
+
+if [ "${BE_NAME}" == "" ]; then
+    log_msg -s "Could not set boot environment string to use for Boot Environment creation, please check existing BE labels" -l ${LOGFILE} ${SNAP_QUIET}
+    _failure_=1
+   # abort_script "$_err_msg_"
+else
+    # lets figure it out
+    if [ "${ROLL_SNAP}" ]; then
+        if [ "${BE_NAME}" == "${_be_id_1_}" ]; then
+                BE_DELETE="${_be_id_2_}"
+        else
+                BE_DELETE="${_be_id_1_}"
+        fi
+    fi
+fi
+}
+
+
+### Function: get_fs_snap_list ###
+#
+# Determine list of F/S to snap
+#
+# Arguments:
+#	$1  :  exclude list
+# Return Values:
+#	none
+get_fs_snap_list()
+{
+# Get a list of the filesystems
+$RM -rf ${TEM_DIR}/fs_list_file
+
+$CAT ${FS_SNAP_DET} | $EGREP -v '^[[:blank:]]*#' > ${TEM_DIR}/fs_list_file
+if [ ! -s ${TEM_DIR}/fs_list_file ]; then
+    _err_msg_="${TEM_DIR}/fs_list_file does not exist, or is empty"
+    abort_script "$_err_msg_" 
+fi
+
+# Build a list of filesystems that are NOT to be snapped
+_exclude_list_="$1"
+for _fs_ in `$CAT ${TEM_DIR}/fs_list_file`; do 
+    _fs_name_=`$ECHO ${_fs_} | $AWK -F\:: '{print $1}'`
+	_snap_opt_=`$ECHO ${_fs_} | $AWK -F\:: '{print $2}'`
+    if [ "${_snap_opt_}" == "N" ]; then
+    	if [ "${_exclude_list_}" == "" ]; then
+    	    _exclude_list_="${_fs_name_}"
+    	else
+    	    _exclude_list_="${_exclude_list_} ${_fs_name_}"
+    	fi
+    fi
+done
+
+if [ "${STORAGE_TYPE}" == "fs" -a ! "${ROLL_SNAP}" -a "${_user_input_}" == "NoData" ]; then
+    _fs_archive_=`$CAT ${TEM_DIR}/fs_list_file | $GREP -w "archive"`
+    _fs_name_exclude_=`$ECHO ${_fs_archive_} | $AWK -F\:: '{print $1}' | $SED -e 's|\-|\/|g'`
+    _exclude_list_="${_exclude_list_}|${_fs_name_exclude_}"
+	if [ $? -ne 0 ]; then
+	    _err_msg_="Could not add $fs_name_exclude_ in Exclude list "
+        abort_script "${_err_msg_}"
+	fi
+fi
+
+_exclude_fs_=0
+if [ "${_exclude_list_}" != "" ]; then
+    _exclude_list_=`$ECHO ${_exclude_list_} | $SED -e 's/ /|/g'`
+    if [ $? -ne 0 ]; then
+        _err_msg_="Could not re-format exclude list"
+        abort_script "$_err_msg_"
+    fi
+    _exclude_fs_=1
+fi
+
+if [ "${_exclude_fs_}" -eq 1 ]; then
+    $LVS -o lv_name --noheadings | $EGREP -v "${_exclude_list_}" >> ${TEM_DIR}/fs_list
+fi
+
+if [ ! -s ${TEM_DIR}/fs_list ]; then
+    _err_msg_="No filesystems found to be snapshot"
+    abort_script "$_err_msg_"
+fi  
+
+_fs_snap_list_=""
+for _fs_ in `$CAT ${TEM_DIR}/fs_list`; do
+    if [ "${_fs_snap_list_}" == "" ]; then
+        _fs_snap_list_="${_fs_}"
+    else
+        _fs_snap_list_="${_fs_snap_list_},${_fs_}"
+    fi
+done
+}
+
+### Function: make_dirs ###
+#
+# Make necessary directories
+#
+# Arguments:
+#	none
+# Return Values:
+#	none
+make_dirs()
+{
+# Remove and Make the backup mountpoint dir
+if [ ! "${ROLL_SNAP}" ]; then 
+    $RM -rf ${SNAP_MOUNT_DIR}
+fi
+
+$MKDIR -p ${SNAP_MOUNT_DIR}
+if [ $? -ne 0 ]; then
+    _err_msg_="Error creating directory ${SNAP_MOUNT_DIR}"
+    abort_script "$_err_msg_"
+fi
+
+# These are the directories that will contain the initial IQ virtual bkups. They
+# MUST NOT be on any filesystem that is snapshot with the database in question.
+# The database dump file will be moved to a permanent location ${IQ_VIRT_BKUP_DIR}
+IQ_VIRT_BKUP_DIR=${ENIQ_BASE_DIR}/backup/iq_virtual_bkup
+ASA_BKUP_DIR=${ENIQ_BASE_DIR}/bkup_sw/repdb_bkup
+TEM_IQ_VIRT_BKUP_DIR=${ENIQ_BASE_DIR}/backup/.iq_virtual_bkup.$$
+
+# Loop until I get a unique name for the dump DIR
+while :; do
+    $LS ${TEM_IQ_VIRT_BKUP_DIR} >> /dev/null 2>&1
+    if [ $? -ne 0 ]; then
+		break
+    fi
+    TEM_IQ_VIRT_BKUP_DIR=${TEM_IQ_VIRT_BKUP_DIR}.$$
+done
+ 	
+# Make the temporary Vitual back directory.
+$MKDIR -p ${TEM_IQ_VIRT_BKUP_DIR}
+if [ $? -ne 0 ]; then
+    _err_msg_="Error creating directory ${TEM_IQ_VIRT_BKUP_DIR}"
+    abort_script "$_err_msg_"
+fi
+
+$CHOWN -Rfh ${SYSUSER}:${SYSGRP} ${TEM_IQ_VIRT_BKUP_DIR}
+if [ $? -ne 0 ]; then
+    _err_msg_="Error setting permission on directory ${TEM_IQ_VIRT_BKUP_DIR}"
+    abort_script "$_err_msg_"
+fi
+
+# Make the permanent Virtual backup directory if required.
+$MKDIR -p ${IQ_VIRT_BKUP_DIR}
+if [ $? -ne 0 ]; then
+    _err_msg_="Error creating directory ${IQ_VIRT_BKUP_DIR}"
+    abort_script "$_err_msg_"
+fi
+
+$CHOWN -Rfh ${SYSUSER}:${SYSGRP} ${IQ_VIRT_BKUP_DIR}
+if [ $? -ne 0 ]; then
+    _err_msg_="Error setting permission on directory ${IQ_VIRT_BKUP_DIR}"
+    abort_script "$_err_msg_"
+fi
+
+# Make the permanent repdb backup directory if required.
+$MKDIR -p ${ASA_BKUP_DIR}
+if [ $? -ne 0 ]; then
+    _err_msg_="Error creating directory ${ASA_BKUP_DIR}"
+    abort_script "$_err_msg_"
+fi
+
+$CHOWN -Rfh ${SYSUSER}:${SYSGRP} ${ASA_BKUP_DIR}
+if [ $? -ne 0 ]; then
+    _err_msg_="Error setting permission on directory ${ASA_BKUP_DIR}"
+    abort_script "$_err_msg_"
+fi
+}
+
+### Function: setup_env ###
+#
+# Setup up path environment etc
+#
+# Arguments:
+#	none
+# Return Values:
+#	none
+setup_env()
+{
+ENIQ_BASE_DIR=/eniq
+
+ADMIN_BIN=${ENIQ_BASE_DIR}/admin/bin
+
+ADMIN_SQL=${ENIQ_BASE_DIR}/admin/sql
+
+ADMIN_ETC=${ENIQ_BASE_DIR}/admin/etc
+
+ENIQ_CONF_DIR=${ENIQ_BASE_DIR}/installation/config
+
+CLI_CONF_DIR=${ENIQ_BASE_DIR}/sw/conf
+
+ENIQ_BKUPSW_DIR=${ENIQ_BASE_DIR}/bkup_sw
+
+ENIQ_BKUP_SW_OMBS_CFG=${ENIQ_BKUPSW_DIR}/ombs_cfg
+
+ENIQ_LOG_DIR=${ENIQ_BASE_DIR}/local_logs
+
+#Temp directory.
+TEM=/tmp
+
+# ERICSSON Directory
+ERICSSON_DIR=/ericsson
+ERICSSON_STOR_DIR=${ERICSSON_DIR}/storage
+ERICSSON_STOR_PLUGIN_DIR=${ERICSSON_STOR_DIR}/plugins
+ERICSSON_FILESTOR_ETC=${ERICSSON_STOR_PLUGIN_DIR}/filestore/etc
+
+BACKUP_PRECHECK=${ENIQ_BKUPSW_DIR}/bin/backup_precheck.bsh 
+
+VAR_TMP_DIR=/var/tmp
+
+# Source the common functions
+if [ -s ${ENIQ_BASE_DIR}/admin/lib/common_functions.lib ]; then
+    . ${ENIQ_BASE_DIR}/admin/lib/common_functions.lib
+else
+    _err_msg_="File ${ENIQ_BASE_DIR}/admin/lib/common_functions.lib not found"
+    abort_script "$_err_msg_"
+fi
+
+# File containing the type of OSS installation. Eg. events or statistics
+INST_TYPE_FILE=${ENIQ_CONF_DIR}/ericsson_use_config
+if [ ! -s "${INST_TYPE_FILE}" ]; then
+    _err_msg_="ENIQ install type not defined in ${INST_TYPE_FILE}"
+    abort_script "$_err_msg_" 
+fi
+
+# Read the installation type - should be "events" or "stats"
+INSTALL_TYPE=`$CAT ${INST_TYPE_FILE} | $AWK -F\= '{print $2}'`
+if [ ! "${INSTALL_TYPE}" ]; then
+    _err_msg_="Could not read INSTALL TYPE from ${INST_TYPE_FILE}"
+    abort_script "$_err_msg_"
+fi
+
+STORAGE_TYPE=`iniget STOR_TYPE -f ${ENIQ_CONF_DIR}/${SUNOS_INI} -v STORAGE_TYPE`
+if [ ! "${STORAGE_TYPE}" ]; then
+    _err_msg_="Could not read STORAGE_TYPE paramater from ${ENIQ_CONF_DIR}/${SUNOS_INI}"
+    abort_script "$_err_msg_"
+fi
+
+# FS exclude list
+if [ "${STORAGE_TYPE}" == "fs" -a "${ROLL_SNAP}" ]; then
+    FS_EXCLUDED_LIST="backup dwh_main dwh_main_dbspace local_logs log"
+else
+    FS_EXCLUDED_LIST="backup dwh_main dwh_main_dbspace local_logs"
+fi
+
+# Read the value of Roll Snap integration with Root only restore
+#Roll_snap_ROR=`$CAT ${ENIQ_BKUPSW_DIR}/etc/eniq_backup.conf | $GREP -w "ROLL_SNAP_ROR" | $AWK -F= '{print $NF}'`
+#if [ ! "${Roll_snap_ROR}" ]; then
+#    _err_msg_="Could not read Roll Snap Integration with Root only Restore parameter from ${ENIQ_BKUPSW_DIR}/etc/eniq_backup.conf"
+#    abort_script "$_err_msg_"
+#fi
+
+if [ ! -s ${CLI_CONF_DIR}/${ENIQ_INI} ]; then
+    _err_msg_="Could not locate file ${CLI_CONF_DIR}/${ENIQ_INI}"
+    abort_script "$_err_msg_"
+fi
+
+if [ ! -s ${CLI_CONF_DIR}/${ENIQ_ENV} ]; then
+    _err_msg_="Could not locate file ${CLI_CONF_DIR}/${ENIQ_ENV}"
+    abort_script "$_err_msg_"
+fi
+
+BKUP_CONF_FILE="`$DIRNAME ${SCRIPTHOME}`/etc/eniq_backup.conf"
+if [ ! -s ${BKUP_CONF_FILE} ]; then
+    _err_msg_="Could not locate file ${BKUP_CONF_FILE}"
+    abort_script "$_err_msg_"
+fi
+
+SNAP_MOUNT_DIR=`$CAT ${BKUP_CONF_FILE} | $EGREP '^[[:blank:]]*BKUP_MOUNT_DIR=' | $AWK -F"=" '{print $2}'`
+if [ ! "${SNAP_MOUNT_DIR}" ]; then
+    _err_msg_="Could not read BKUP_MOUNT_DIR parameter from ${BKUP_CONF_FILE}"
+    abort_script "$_err_msg_"
+fi
+
+SNAP_ID_STR=`$CAT ${BKUP_CONF_FILE} | $EGREP '^[[:blank:]]*ROLL_SNAP_ID_STR=' | $AWK -F"=" '{print $2}'`
+if [ ! "${SNAP_ID_STR}" ]; then
+    _err_msg_="Could not read ROLL_SNAP_ID_STR parameter from ${BKUP_CONF_FILE}"
+    abort_script "$_err_msg_"
+fi
+
+if [ "${INSTALL_TYPE}" == "stats" ]; then
+    BE_ID_STR=`$CAT ${BKUP_CONF_FILE} | $EGREP '^[[:blank:]]*ROLL_BE_ID_STR=' | $AWK -F"=" '{print $2}'`
+    if [ ! "${BE_ID_STR}" ]; then
+        _err_msg_="Could not read ROLL_BE_ID_STR parameter from ${BKUP_CONF_FILE}"
+        abort_script "$_err_msg_"
+    fi
+fi
+
+BKUP_ID_STR=`$CAT ${BKUP_CONF_FILE} | $EGREP '^[[:blank:]]*BKUP_SNAP_ID_STR=' | $AWK -F"=" '{print $2}'`
+if [ ! "${BKUP_ID_STR}" ]; then
+    _err_msg_="Could not read BKUP_SNAP_ID_STR parameter from ${BKUP_CONF_FILE}"
+    abort_script "$_err_msg_"
+fi
+
+if [ "${INSTALL_TYPE}" == "stats" ]; then
+BKUP_ID_STR_SAN=`$CAT ${BKUP_CONF_FILE} | $EGREP '^[[:blank:]]*BKUP_SNAP_ID_STR_SAN=' | $AWK -F"=" '{print $2}'`
+ if [ ! "${BKUP_ID_STR_SAN}" ]; then
+    _err_msg_="Could not read BKUP_SNAP_ID_STR_SAN parameter from ${BKUP_CONF_FILE}"
+    abort_script "$_err_msg_"
+ fi
+fi
+
+RBAC_ROLE=`$CAT ${BKUP_CONF_FILE} | $EGREP '^[[:blank:]]*RBAC_ROLE=' | $AWK -F"=" '{print $2}'`
+if [ ! "${RBAC_ROLE}" ]; then
+    _err_msg_="Could not read RBAC_ROLE parameter from ${BKUP_CONF_FILE}"
+    abort_script "$_err_msg_"
+fi
+
+BKUP_IQ_DB_FILESYS_LIST="`$DIRNAME ${SCRIPTHOME}`/etc/iq_filesystem_list"
+if [ ! -s ${BKUP_IQ_DB_FILESYS_LIST} ]; then
+    _err_msg_="Could not locate file ${BKUP_IQ_DB_FILESYS_LIST}"
+    abort_script "$_err_msg_"
+fi
+
+BKUP_ASA_DB_FILESYS_LIST="`$DIRNAME ${SCRIPTHOME}`/etc/asa_filesystem_list"
+if [ ! -s ${BKUP_ASA_DB_FILESYS_LIST} ]; then
+    _err_msg_="Could not locate file ${BKUP_ASA_DB_FILESYS_LIST}"
+    abort_script "$_err_msg_"
+fi
+
+# List of iq databases to be backed up
+BACKUP_IQ_DB_LIST=`$CAT ${BKUP_IQ_DB_FILESYS_LIST} | $EGREP -v '^[[:blank:]]*#' | $EGREP "::" | $AWK -F"::" '{print $1}'`
+if [ ! "${BACKUP_IQ_DB_LIST}" ]; then
+    _err_msg_="Could not read BACKUP_IQ_DB_LIST parameter from ${BKUP_IQ_DB_FILESYS_LIST}"
+    abort_script "$_err_msg_"
+fi
+
+# List of asa databases to be backed up
+BACKUP_ASA_DB_LIST=`$CAT ${BKUP_ASA_DB_FILESYS_LIST} | $EGREP -v '^[[:blank:]]*#' | $EGREP "::" | $AWK -F"::" '{print $1}'`
+if [ ! "${BACKUP_ASA_DB_LIST}" ]; then
+    _err_msg_="Could not read BACKUP_ASA_DB_LIST parameter from ${BKUP_ASA_DB_FILESYS_LIST}"
+    abort_script "$_err_msg_"
+fi
+
+# File containing details per NFS FS for snapshots
+if [ "${STORAGE_TYPE}" != "fs" ]; then
+	NFS_SNAP_DET="${ENIQ_BKUPSW_DIR}/etc/${INSTALL_TYPE}_blade_nfs_filesys_snap_det"
+	if [ ! -s ${NFS_SNAP_DET} ]; then
+	    _err_msg_="Could not find ${NFS_SNAP_DET} file"
+	    abort_script "$_err_msg_" 
+    fi
+fi
+
+if [ "${STORAGE_TYPE}" == "fs" ]; then
+    FS_SNAP_DET="${ENIQ_BKUPSW_DIR}/etc/${INSTALL_TYPE}_rack_fs_filesys_snap_det"
+else
+    FS_SNAP_DET="${ENIQ_BKUPSW_DIR}/etc/${INSTALL_TYPE}_blade_fs_filesys_snap_det"
+fi
+    
+if [ ! -s ${FS_SNAP_DET} ]; then
+    _err_msg_="Could not find ${FS_SNAP_DET} file"
+    abort_script "$_err_msg_" 
+fi
+
+if [ "${STORAGE_TYPE}" == "raw" ]; then
+     SAN_DEVICE=`iniget SAN_DEV -f ${ENIQ_CONF_DIR}/${SUNOS_INI} -v SAN_DEVICE`
+     if [ ! "${SAN_DEVICE}" ]; then
+          _err_msg_="Could not read SAN_DEVICE param "
+          abort_script "${_err_msg_}"
+     fi
+fi
+
+_nas_sw_target_dir_=`iniget NAS_STORAGE_API -f ${ENIQ_CONF_DIR}/${SUNOS_INI} -v NAS_API_TARGET_DIR`
+if [ ! "${_nas_sw_target_dir_}" ]; then
+    _err_msg_="Failed to get NAS API target dir information from ${ENIQ_CONF_DIR}/${SUNOS_INI}"
+    abort_script "$_err_msg_"
+fi
+
+if [ "${SAN_DEVICE}" != "unityXT" ]; then
+    NASCLI=${_nas_sw_target_dir_}/bin/nascli
+    if [ ! -s ${_nascli_} ]; then
+        _err_msg_="${_nascli_} not found"
+        abort_script "$_err_msg_"
+    fi
+fi
+
+# Get the System User/Group. All directories are owned by this
+SYSUSER=`iniget ENIQ_INSTALL_CONFIG -f ${ENIQ_CONF_DIR}/${SUNOS_INI} -v ENIQ_SYSUSER`
+if [ ! "${SYSUSER}" ]; then
+    _err_msg_="Could not read parameter ENIQ_SYSUSER from file ${ENIQ_CONF_DIR}/${SUNOS_INI}"
+    abort_script "$_err_msg_"
+fi
+
+SYSGRP=`$ID ${SYSUSER} | $AWK '{print $2}' | $AWK -F\( '{print $2}' | $AWK -F\) '{print $1}'`
+if [ ! "${SYSGRP}" ]; then
+    _err_msg_="Could not determine group ID of ${SYSGRP}"
+    abort_script "$_err_msg_"
+fi
+
+# Determine the current server type
+CURR_SERVER_TYPE=`$CAT $ENIQ_CONF_DIR/installed_server_type | $EGREP -v '^[[:blank:]]*#' | $SED -e 's/ //g'`
+if [ ! "${CURR_SERVER_TYPE}" ]; then
+	_err_msg_="Could not determine which server type this is"
+	abort_script "$_err_msg_"
+fi
+
+CO_SERVER=""
+if [ "${CURR_SERVER_TYPE}" == "eniq_coordinator" -o "${CURR_SERVER_TYPE}" == "son_coordinator" -o "${CURR_SERVER_TYPE}" == "eniq_events" \
+	-o "${CURR_SERVER_TYPE}" == "eniq_iqw" -o "${CURR_SERVER_TYPE}"  == "eniq_stats"  -o "${CURR_SERVER_TYPE}" == "stats_coordinator" -o "${CURR_SERVER_TYPE}" == "eniq_es" ]; then
+    CO_SERVER="YES"
+fi
+
+# Checking SFS version for blade
+if [ "${STORAGE_TYPE}" != "fs" ]; then
+  if [ "${SAN_DEVICE}" != "unityXT" ]; then
+    _SFS_version_=`$CAT ${ERICSSON_FILESTOR_ETC}/nasplugin.conf |$GREP -w SFS_VERSION | $AWK -F"=" '{print $2}'`
+    if [ "${_SFS_version_}"  == "" ]; then
+        _err_msg_="Could not fetch SFS version Details from NAS Plugin Configuration file."
+        abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+    fi
+  fi
+fi
+
+# fstab file
+FSTAB=/etc/fstab
+
+# NASd config file
+NASD_CONFIG=${ENIQ_BASE_DIR}/smf/nasd/nasd_config
+
+#Precheck Logfile
+PRECHECK_LOGFILE=${ENIQ_LOG_DIR}/backup_logs/backup_precheck.log
+}
+
+### Function: test_asa_login ###
+#
+# Test that I can log into sybase ASA
+#
+# Arguments:
+#	$1 : Database to check
+#	$2 : Flag to indicate rolling snapshot or not (0/1)
+#	$3 : Flag to indicate quiet/verbose operation
+# Return Values:
+#	none
+test_asa_login()
+{
+local _bkup_quiet_ _db_up_res_code_ _roll_snap_flag_ 
+local _dbspace_list_ _dbspace_err_
+
+_dblist_=${1}
+_roll_snap_flag_=${2}
+if [ "${3}" ]; then
+    _bkup_quiet_="-q"
+fi
+
+_db_up_res_code_=0
+
+for _db_ in ${_dblist_}; do
+    # Is the database up. If not assume it is safe to backup
+    log_msg -s "\n`$DATE +%d.%m.%y_%H:%M:%S` - Testing database ${_db_} is running" -l ${LOGFILE} ${_bkup_quiet_}
+
+    INI_SECTION=`$CAT ${BKUP_ASA_DB_FILESYS_LIST} | $EGREP -v '^[[:blank:]]*#'    \
+                     | $EGREP "^[[:blank:]]*${_db_}::" | $AWK -F"::" '{print $2}'`
+    if [ ! "${INI_SECTION}" ]; then
+		_err_msg_="Could not read INI_SECTION parameter for ${_db_} from ${BKUP_ASA_DB_FILESYS_LIST}"
+		abort_script "$_err_msg_"
+    fi
+
+    REP_PORT=`iniget ${INI_SECTION} -f ${CLI_CONF_DIR}/${ENIQ_INI} -v PortNumber`
+    REP_ENG=`iniget ${INI_SECTION} -f ${CLI_CONF_DIR}/${ENIQ_INI} -v ServerName`
+    if [ ! "${REP_PORT}" -o ! "${REP_ENG}" ]; then
+        _err_msg_="Could not read repdb values from ${CLI_CONF_DIR}/${ENIQ_INI}"
+        abort_script "$_err_msg_"
+    fi
+    
+    DBA_PASSWORD=`inigetpassword DB -f ${CLI_CONF_DIR}/${ENIQ_INI} -v DBAPassword`
+    if [ ! ${DBA_PASSWORD} ]; then
+        if [ -f ${ENIQ_BASE_DIR}/sw/installer/dbusers ]; then
+            DBA_PASSWORD=`${ENIQ_BASE_DIR}/sw/installer/dbusers dba etlrep`
+            if [ ! "${DBA_PASSWORD}" ] ; then
+                _err_msg_="Could not get repdb DBA Password"
+                abort_script "$_err_msg_"
+            fi
+        else
+            err_msg_="Could not get repdb DBA Password"
+            abort_script "$_err_msg_"
+        fi
+    fi
+	dbp_st="-c \"con=$REP_ENG;eng=$REP_ENG;uid=dba;pwd=${DBA_PASSWORD};links=tcpip(host=localhost;port=$REP_PORT)\""
+    enc_dbp=/tmp/dbp_enc.`uuidgen`
+	# get the encrypted connection string
+	get_encrypt_file "${dbp_st}" "${enc_dbp}"
+	
+	${SQLANY}/bin64/dbping -q @${enc_dbp} 2>/dev/null
+    if [ $? -ne 0 ]; then
+		# If this is a rolling snapshot then all databases must be up
+		if [ "${_roll_snap_flag_}" -eq 1 ]; then
+		    _err_msg_="Rolling Snapshot not possible.\nDatabase ${_db_} is not running"
+		    abort_script "$_err_msg_"
+		else
+		    _db_up_res_code_=1
+		    log_msg -s "Database ${_db_} is not running" -l ${LOGFILE} ${_bkup_quiet_}
+		    continue
+		fi
+    fi
+	
+	
+	Rep_conn_str="-c \"con=$REP_ENG;eng=$REP_ENG;uid=dba;pwd=${DBA_PASSWORD};links=tcpip(host=localhost;port=$REP_PORT)\""
+	Rep_conn_str_enc=${TEM}/rep_connection_strng_pre_bkup.`uuidgen`
+	# get the encrypted connection string
+	get_encrypt_file "${Rep_conn_str}" "${Rep_conn_str_enc}"
+    log_msg -s "`$DATE +%d.%m.%y_%H:%M:%S` - Testing login of database ${_db_}" -l ${LOGFILE} ${_bkup_quiet_}
+    ${IQDIR}/bin64/dbisql -q @${Rep_conn_str_enc} sa_disk_free_space
+    if [ $? -ne 0 ]; then
+    	_err_msg_="Error logging on to database ${_db_} on ASA server."
+    	abort_script "$_err_msg_"
+    fi    
+
+done
+return ${_db_up_res_code_}
+}
+
+### Function: test_iq_login ###
+#
+# Test that I can log into sybase IQ
+#
+# Arguments:
+#	$1 : Database to check
+#	$2 : Flag to indicate rolling snapshot or not (0/1)
+#	$3 : Flag to indicate quiet/verbose operation
+# Return Values:
+#	none
+test_iq_login()
+{
+local _bkup_quiet_ _db_up_res_code_ _roll_snap_flag_ 
+local _dbspace_list_ _dbspace_err_
+
+_dblist_=${1}
+_roll_snap_flag_=${2}
+if [ "${3}" ]; then
+    _bkup_quiet_="-q"
+fi
+
+_db_up_res_code_=0
+
+for _db_ in ${_dblist_}; do
+    # Is the database up. If not assume it is safe to backup
+    log_msg -s "\n`$DATE +%d.%m.%y_%H:%M:%S` - Testing database ${_db_} is running" -l ${LOGFILE} ${_bkup_quiet_}
+
+    INI_SECTION=`$CAT ${BKUP_IQ_DB_FILESYS_LIST} | $EGREP -v '^[[:blank:]]*#'    \
+                     | $EGREP "^[[:blank:]]*${_db_}::" | $AWK -F"::" '{print $2}'`
+    if [ ! "${INI_SECTION}" ]; then
+        _err_msg_="Could not read INI_SECTION parameter for ${_db_} from ${BKUP_IQ_DB_FILESYS_LIST}"
+        abort_script "$_err_msg_"
+    fi
+
+    DWH_PORT=`iniget ${INI_SECTION} -f ${CLI_CONF_DIR}/${ENIQ_INI} -v PortNumber`
+    DWH_ENG=`iniget ${INI_SECTION} -f ${CLI_CONF_DIR}/${ENIQ_INI} -v ServerName`
+    if [ ! "${DWH_PORT}" -o ! "${DWH_ENG}" ]; then
+        _err_msg_="Could not read db values from ${CLI_CONF_DIR}/${ENIQ_INI}"
+        abort_script "$_err_msg_"
+    fi
+
+    DBA_PASSWORD=`inigetpassword DB -f ${CLI_CONF_DIR}/${ENIQ_INI} -v DBAPassword`
+    if [ ! ${DBA_PASSWORD} ]; then
+        if [ -f ${ENIQ_BASE_DIR}/sw/installer/dbusers ]; then
+            DBA_PASSWORD=`${ENIQ_BASE_DIR}/sw/installer/dbusers dba dwh`
+            if [ ! "${DBA_PASSWORD}" ] ; then
+                _err_msg_="Could not get dwhdb DBA Password"
+                abort_script "$_err_msg_"
+            fi
+        else
+            err_msg_="Could not get dwhdb DBA Password"
+            abort_script "$_err_msg_"
+        fi
+    fi
+    
+	
+	DWH_CONN_STRING="-c \"con=$DWH_ENG;eng=$DWH_ENG;links=tcpip{host=$DWH_ENG;port=${DWH_PORT};dobroadcast=none;verify=no};uid=dba;pwd=${DBA_PASSWORD}\""
+	DWH_CONN_STRING_enc=${TEM}/dwh_conn_string_pre_bkup.`uuidgen`
+	
+	# get the encrypted connection string.
+	get_encrypt_file "${DWH_CONN_STRING}" "${DWH_CONN_STRING_enc}"
+   
+	dbpng_st="-c \"con=$DWH_ENG;eng=$DWH_ENG;links=tcpip{host=$DWH_ENG;port=${DWH_PORT};dobroadcast=none;verify=no};uid=dba;pwd=${DBA_PASSWORD}\""
+    dbpng_en=/tmp/dbpng_str.`uuidgen`
+	
+	# get the encrypted connection string.
+	get_encrypt_file "${dbpng_st}" "${dbpng_en}"
+   ${IQDIR}/bin64/dbping -q @${dbpng_en}  2>/dev/null      
+    if [ $? -ne 0 ]; then
+        # If this is a rolling snapshot then all databases must be up
+        if [ "${_roll_snap_flag_}" -eq 1 ]; then
+            _err_msg_="Rolling Snapshot not possible.\nDatabase ${_db_} is not running"
+            abort_script "$_err_msg_"
+        else
+            _db_up_res_code_=1
+            log_msg -s "`$DATE +%d.%m.%y_%H:%M:%S` - Database ${_db_} is not running" -l ${LOGFILE} ${_bkup_quiet_}
+            continue
+        fi
+    fi
+
+    log_msg -s "`$DATE +%d.%m.%y_%H:%M:%S` - Testing login of database ${_db_}" -l ${LOGFILE} ${_bkup_quiet_}
+    ${IQDIR}/bin64/dbisql -nogui @${DWH_CONN_STRING_enc} sp_iqdbspace >> /dev/null 2>&1
+    if [ $? -ne 0 ]; then
+        _err_msg_="Error logging on to database ${_db_} on IQ server."
+        abort_script "$_err_msg_"
+    fi    
+
+    # If this is a rolling snapshot then we check that all dbspaces exist etc.
+    if [ "${_roll_snap_flag_}" -eq 1 ]; then
+         #Get the list of dbspaces
+        _dbspace_list_=`${IQDIR}/bin64/dbisql @${DWH_CONN_STRING_enc} sp_iqfile |$GREP -i IQ_MAIN | $AWK '{print $3}'`
+        if [ ! "${_dbspace_list_}" ]; then
+            _err_msg_="Rolling Snapshot not possible.\nNo IQ dbspaces found associated with database ${_db_}"
+            abort_script "$_err_msg_"
+        fi
+
+        # Check that each dbspace exists and is linked to a device
+        _dbspace_err_=0
+        for _dbspace_ in ${_dbspace_list_}; do
+            if [ ! -e ${_dbspace_} ]; then
+                _dbspace_err_=1
+                log_msg -s "${_dbspace_} not found or empty"
+            fi
+        done
+        if [ "${_dbspace_err_}" -eq 1 ]; then
+            _err_msg_="Rolling Snapshot not possible.\nSome dbspaces are missing"
+            abort_script "$_err_msg_"
+        fi
+    fi
+done
+return ${_db_up_res_code_}
+}
+
+### Function: user_confirm ###
+#
+# Get confirmation from user to proceed with snapshot action
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+user_confirm()
+{
+local _fs_type_msg_
+while :; do
+    unset USER_CONF
+    $CLEAR
+    if [ "${STORAGE_TYPE}" == "fs" ]; then
+       _fs_type_msg_="FS filesystems"
+    else
+        _fs_type_msg_="all filesystems and raw devices"
+    fi
+    if [ "${ROLL_SNAP}" ]; then
+        $ECHO "\nAre you sure you wish to create a rolling snapshot of ${_fs_type_msg_}?"
+    else
+        $ECHO "\nAre you sure you wish to snapshot ${_fs_type_msg_} in preparation for backup?"
+    fi
+
+    $ECHO "Enter [Yes | No] (case sensitive) : \c"
+
+    read USER_CONF
+    if [ "$USER_CONF" == "Yes" -o "$USER_CONF" == "No" ]; then
+        break
+    fi
+done
+}
+
+### Function: virtual_db_bkup_snapshot ###
+#
+# Do a Sybase IQ vitual backup and snapshot filesystems
+# at the same time
+#
+# Arguments:
+#       $1 : IQ database
+#       $2 : fs filesystems to be snapshot
+# Return Values:
+#       none
+virtual_db_bkup_snapshot()
+{
+local _iq_db_=${1}
+local _iq_dump_file_=${2}
+
+# I do this as it takes the complexity from IQ. It has only to
+# issue one command now
+$RM -f ${ADMIN_SQL}/virt_bkup_cmd.sql
+#$RM -f ${TEM_DIR}/virt_bkup_cmd.bsh
+$RM -f ${TEMP_DIR}/virt_bkup_cmd.bsh
+
+# Need to create a temp logfile for RBAC to log to
+_tmp_log_=${TEMP_DIR}/create_snapshot.log
+
+if [ ! "${ROLL_SNAP}" -a "${INSTALL_TYPE}" == "stats"  ]; then
+        $ECHO "$SUDO ${SCRIPTHOME}/create_snapshots.bsh -l ${_tmp_log_} -n ${SNAP_NAME} -s ${SAN_SNAP_NAME} -N -q ${_roll_snap_}" >> ${TEMP_DIR}/virt_bkup_cmd.bsh
+else
+       $ECHO "$SUDO ${SCRIPTHOME}/create_snapshots.bsh -l ${_tmp_log_} -n ${SNAP_NAME} -N -q ${_roll_snap_}" >> ${TEMP_DIR}/virt_bkup_cmd.bsh
+fi
+
+
+$ECHO "BACKUP DATABASE FULL VIRTUAL ENCAPSULATED" >> ${TEMP_DIR}/virt_bkup_cmd.sql
+$ECHO "'${TEMP_DIR}/virt_bkup_cmd.bsh'" >> ${TEMP_DIR}/virt_bkup_cmd.sql
+$ECHO "TO '${_iq_dump_file_}'" >> ${TEMP_DIR}/virt_bkup_cmd.sql
+
+$CHMOD 750 ${TEMP_DIR}/virt_bkup_cmd.sql
+$CHOWN ${SYSUSER}:${SYSGRP} ${TEMP_DIR}/virt_bkup_cmd.bsh
+$CHMOD 750 ${TEMP_DIR}/virt_bkup_cmd.bsh
+
+log_msg -s "\n`$DATE +%d.%m.%y_%H:%M:%S` - Creating snapshot of dwhdb via IQ Virtual Backup"  -l ${LOGFILE} ${SNAP_QUIET}
+${IQDIR}/bin64/dbisql -nogui -q @${DWH_CONN_STRING_enc} ${TEMP_DIR}/virt_bkup_cmd.sql
+if [ $? -ne 0 -o -f  $SCRIPTHOME/.failed_virtual_backup ]; then
+     $CAT ${_tmp_log_} >> ${LOGFILE}
+     if [ $? -ne 0 ]; then
+        _err_msg_="Could not copy ${_tmp_log_} to ${LOGFILE}"
+        abort_script "$_err_msg_"
+     fi
+      $RM -rf $SCRIPTHOME/.failed_virtual_backup
+      if [ -f  $SCRIPTHOME/.failed_virtual_backup ];then
+          log_msg -s "\nWARNING: ${SCRIPTHOME/.failed_virtual_backup} file not removed. This file must be deleted manually before proceeding further." -l ${LOGFILE}
+     fi
+
+     _err_msg_="Error encountered during virtual backup of ${_iq_db_}."
+     abort_script "$_err_msg_"
+fi 
+
+$CAT ${_tmp_log_} >> ${LOGFILE}
+if [ $? -ne 0 ]; then
+	_err_msg_="Could not append ${_tmp_log_} to ${LOGFILE}"
+	abort_script "$_err_msg_"
+fi
+
+}
+
+# ********************************************************************
+#
+# 	Main body of program
+#
+# ********************************************************************
+#
+# Determine absolute path to software
+get_absolute_path
+
+# Check that the effective id of the user is root
+check_id root
+
+while getopts ":Dl:NqR" arg; do
+  case $arg in
+    D) DB_ONLY="YES"
+       ;;
+    l) LOGFILE="$OPTARG" 
+       ;;
+    N) NO_CONFIRM="YES"
+       ;;
+    q) SNAP_QUIET="-q"
+       ;;
+    R) ROLL_SNAP="YES"
+       _roll_snap_="-R"
+       ;;
+   \?) _err_msg_="`$BASENAME $0` [ -l <path_to_logfile> ] [ -N ] -q"
+       abort_script "$_err_msg_"
+       ;;
+  esac
+done
+shift `expr $OPTIND - 1`
+
+# Default Logfile location
+if [ "${ROLL_SNAP}" ]; then
+    readonly LOGDIR="/eniq/local_logs/rolling_snapshot_logs"
+    DEF_LOGFILE="${LOGDIR}/prep_roll_snap.log"
+else
+    readonly LOGDIR="/eniq/local_logs/backup_logs"
+    DEF_LOGFILE="${LOGDIR}/prep_eniq_backup.log"
+fi
+
+# Set up default logfile if required
+if [ ! "${LOGFILE}" ]; then
+    LOGFILE="${DEF_LOGFILE}"
+fi
+
+# Check/Create Logfile
+chk_create_logfile
+
+# Setup up path environment etc
+setup_env
+    
+
+# Check Backup_precheck file 
+if [ ! -f ${BACKUP_PRECHECK} ]; then 
+    _err_msg_="${BACKUP_PRECHECK} file is not Present."
+    abort_script "$_err_msg_"
+fi  
+
+
+if [ ! -f ${VAR_TMP_DIR}/SKIP_BACKUP_PRECHECK ]; then    
+    if [ "${ROLL_SNAP}" ]; then 
+        # Running backup precheck for ROLL SNAP
+        $BASH ${BACKUP_PRECHECK}  
+        # Saving exit status of Backup Pre_check
+        exit_backup_precheck=$?
+    else
+        # Running backup precheck for OMBS backup
+        $BASH ${BACKUP_PRECHECK} -o
+        # Saving exit status of Backup Pre_check
+        exit_backup_precheck=$?
+    fi
+fi
+
+if [ ! "${ROLL_SNAP}" ]; then
+    if [ "${CO_SERVER}" == "YES" ]; then
+        log_msg -s "Updating OMBS shared directory" -l ${LOGFILE} ${SNAP_QUIET} -h -t
+        log_msg -q -s "Executing ${SCRIPTHOME}/create_ombs_info.bsh to refresh the content on OMBS share" -l ${LOGFILE}
+        $BASH ${SCRIPTHOME}/create_ombs_info.bsh
+            if [ $? -ne 0 ]; then
+                _err_msg_="Could not execute ${SCRIPTHOME}/create_ombs_info.bsh"
+                abort_script "${_err_msg_}"
+            fi
+                log_msg -s "Successfully updated OMBS shared directory" -l ${LOGFILE} ${SNAP_QUIET} -h -t
+    fi
+fi
+    
+if [ -s ${CLI_CONF_DIR}/niq.rc ]; then
+    . ${CLI_CONF_DIR}/niq.rc
+else
+    _err_msg_="File ${CLI_CONF_DIR}/niq.rc not found"
+    abort_script "$_err_msg_"
+fi
+
+# Check the files and scripts exist
+check_files_and_scripts
+
+# Create a temporary Directory
+TEM_DIR=/tmp/prep_eniq_backup.$$.$$
+$RM -rf ${TEM_DIR}
+$MKDIR -p ${TEM_DIR}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not create directory ${TEM_DIR}"
+    abort_script "$_err_msg_"
+fi	
+
+$CHOWN ${SYSUSER}:${SYSGRP} ${TEM_DIR}
+$CHMOD 750 ${TEM_DIR}
+
+TEMP_DIR=/var/prepare_eniq_backup.$$.$$
+$RM -rf ${TEMP_DIR}
+$MKDIR -p ${TEMP_DIR}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not create directory ${TEMP_DIR}"
+    abort_script "$_err_msg_"
+fi
+
+$CHOWN ${SYSUSER}:${SYSGRP} ${TEMP_DIR}
+$CHMOD 750 ${TEMP_DIR}
+
+
+# Get the snapshot name
+get_snapshot_name
+
+#Delete /var/tmp/bmr so that it's not backed up in next schedule backup
+if [ ! "$ROLL_SNAP" ]; then
+    if [ -d ${VAR_TMP_DIR}/bmr ]; then
+        log_msg -s "Deleting ${VAR_TMP_DIR}/bmr as it should not be backed up." -l ${LOGFILE}
+        _date_=`$DATE '+%d_%m_%Y'`
+        $TAR -czf ${VAR_TMP_DIR}/bmr_${_date_}.tar.gz ${VAR_TMP_DIR}/bmr
+        $RM -rf ${VAR_TMP_DIR}/bmr
+    fi
+fi
+#Get the Boot environment name
+_failure_=0
+#if [ "${Roll_snap_ROR}" == "YES" -a "${INSTALL_TYPE}" == "stats" ]; then
+    # The below needs to be modified/checked once Root Only is developed
+	#get_be_name
+#fi
+
+#Display the backup type NODATA /FULL
+if [ ! "$ROLL_SNAP" -a "${INSTALL_TYPE}" == "stats" ]; then
+ BKUP_OPTION_STR=`$CAT ${BKUP_CONF_FILE} | $EGREP '^[[:blank:]]*BKUP_OPTION_STR=' | $AWK -F"=" '{print $2}' 2>/dev/null`
+ if [ $BKUP_OPTION_STR ]; then
+  log_msg -s "`$DATE +%d.%m.%y_%H:%M:%S` - The backup type is ${BKUP_OPTION_STR} for server  `$HOSTNAME` \n" -l ${LOGFILE}
+else
+  log_msg -s "`$DATE +%d.%m.%y_%H:%M:%S` - The backup type paramater is not set for the server  `$HOSTNAME` \n" -l ${LOGFILE}
+ fi
+fi
+
+
+if [ "${INSTALL_TYPE}" != "es" ]; then
+	if [ -s ${IQ_DIR}/IQ-*/IQ-*.sh ]; then
+	    . ${IQ_DIR}/IQ-*/IQ-*.sh
+	else
+	    _err_msg_="File ${IQ_DIR}/IQ-*/IQ-*.sh not found"
+	    abort_script "$_err_msg_"
+	fi 
+	
+	if [ -s ${ASA_DIR}/bin64/sa_config.sh ]; then
+	    . ${ASA_DIR}/bin64/sa_config.sh >> /dev/null 2>&1
+	else
+	    _err_msg_="File ${ASA_DIR}/bin64/sa_config.sh not found"
+	    abort_script "$_err_msg_"
+	fi
+	
+	# Setup sybase env
+	$SU - ${SYSUSER} >> /dev/null -c "$ENV | $EGREP -v PS1 > $TEM_DIR/sybase_det.$$" >> /dev/null 2>&1
+	if [ ! -s $TEM_DIR/sybase_det.$$ ]; then
+		_err_msg_="Could not create a file with environment for ${SYSUSER}"
+		abort_script "$_err_msg_"
+	fi
+
+	$CAT $TEM_DIR/sybase_det.$$ | $EGREP -v "PS1" > $TEM_DIR/sybase_det_updated
+	if [ ! -s $TEM_DIR/sybase_det_updated ]; then
+		_err_msg_="Could not filter information from environment file for ${SYSUSER}"
+		abort_script "$_err_msg_"
+	fi
+	
+	# Source the environment  
+	set -a
+	. $TEM_DIR/sybase_det_updated >> /dev/null 2>&1
+	set +a
+fi
+
+# Flag indicating that this is a rolling snapshot or not
+_roll_snap_flag_=0
+
+# Flag indicating that this is a rolling snapshot or not
+_bkup_snap_flag_=0
+
+ROLL_SNAP_FILE_INDICATOR="/eniq/bkup_sw/etc/.create_rolling_snapshot"
+ROLL_SNAP_PROGRESS_INDICATOR="/eniq/bkup_sw/etc/.rolling_snapshot_in_progress"
+BKUP_SNAP_FILE_INDICATOR="/eniq/bkup_sw/etc/.create_backup_snapshot"
+BKUP_SNAP_PROGRESS_INDICATOR="/eniq/bkup_sw/etc/.rolling_backup_in_progress"
+BKUP_SNAP_CORRUPTION_INDICATOR="${ADMIN_ETC}/ombs_backup_alarm"
+ROLL_SNAP_CORRUPTION_INDICATOR="${ADMIN_ETC}/roll_snap_alarm"
+
+# I need to flag that the rolling snapshot is in progress
+if [ "${ROLL_SNAP}" ]; then
+    # Flag indicating that this is a rolling snapshot or not
+    _roll_snap_flag_=1
+else
+    # Flag indicating that this is a Backup snapshot or not
+    _bkup_snap_flag_=1
+fi
+
+if [ -f ${ROLL_SNAP_PROGRESS_INDICATOR} ]; then
+    _err_msg_="Rolling snapshot already appears to be in progress. File ${ROLL_SNAP_PROGRESS_INDICATOR} exists"
+    abort_script "$_err_msg_"
+fi
+
+if [ -f ${BKUP_SNAP_PROGRESS_INDICATOR} ]; then
+    _err_msg_="Backup snapshot already appears to be in progress. File ${BKUP_SNAP_PROGRESS_INDICATOR} exists"
+    abort_script "$_err_msg_"
+fi
+
+if [ ! "${ROLL_SNAP}" ]; then
+    if [ -f ${BKUP_SNAP_FILE_INDICATOR} ];then
+        _err_msg_="Backup already appears to be in progress. File ${BKUP_SNAP_FILE_INDICATOR} exists"
+        abort_script "$_err_msg_"
+    fi
+fi
+
+if [ "${ROLL_SNAP}" ]; then
+    $LVS -o lv_name,lv_attr --noheadings -S "lv_attr=~[^s.*]" | $AWK '{print $1}' | $SORT -u | $GREP -w "${BKUP_ID_STR}" >> /dev/null 2>&1
+    if [ $? -eq 0 ]; then
+       $ECHO "\n`$DATE +%d.%m.%y_%H:%M:%S` - Backup already in progress. omss snapshot exists. Rolling snapshot created in next schedule." >> ${LOGFILE}
+       exit 0
+    fi
+fi
+
+if [ ! "$NO_CONFIRM" ]; then
+    user_confirm 
+    if [ "$USER_CONF" == No ]; then
+		$RM -rf ${TEM_DIR}
+		if [ "${ROLL_SNAP}" ]; then
+		    $RM -f ${ROLL_SNAP_FILE_INDICATOR} ${ROLL_SNAP_PROGRESS_INDICATOR}
+		fi
+		
+		$RM -rf ${TEM_DIR}
+		exit 0
+    fi
+fi
+
+# This flag will ensure I roll back any snapshots in the case of failure 
+SNAP_TAKEN=YES
+
+# Catch any interrupts at this stage
+trap "abort_script" 1 2 3 14 15
+
+# Set flag that 
+if [ "${ROLL_SNAP}" ]; then
+    $TOUCH ${ROLL_SNAP_PROGRESS_INDICATOR}
+else
+    $TOUCH ${BKUP_SNAP_PROGRESS_INDICATOR}
+    $TOUCH ${BKUP_SNAP_FILE_INDICATOR}
+fi
+
+# Make necessary directories
+make_dirs 
+
+# if we're raw, generate the nas shares
+if [ "${STORAGE_TYPE}" != "fs" ]; then
+     if [ "${SAN_DEVICE}" != "unityXT" ]; then
+	get_nas_shares
+     fi
+fi
+
+# Okay do the snapshots
+if [ "${CO_SERVER}" == "YES" ]; then
+
+    log_msg -s "`$DATE +%d.%m.%y_%H:%M:%S` - Preparing ENIQ ${CURR_SERVER_TYPE} server for backup\n" -l ${LOGFILE} ${SNAP_QUIET}
+
+    if [ "${INSTALL_TYPE}" != "stats" ]; then
+        create_archive_delete_list
+    fi
+	
+    if [ "${INSTALL_TYPE}" != "es" ]; then
+	    # Test that I can log into sybase IQ and ASA
+	    test_iq_login "${BACKUP_IQ_DB_LIST}" ${_roll_snap_flag_} ${SNAP_QUIET}
+	    if [ $? -ne 0 ]; then
+	        _err_msg_="Could not Log into Sybase IQ Database"
+	        abort_script "$_err_msg_"
+	    fi
+	
+	    test_asa_login "${BACKUP_ASA_DB_LIST}" ${_roll_snap_flag_} ${SNAP_QUIET}
+	    if [ $? -ne 0 ]; then
+	        _err_msg_="Could not Log into Sybase ASA Database"
+	        abort_script "$_err_msg_"
+	    fi
+	fi
+
+	if [ "${INSTALL_TYPE}" == "stats" ]; then
+		if [ -f ${ADMIN_BIN}/called_through_upgrade ]; then
+			upgrade_find_time=`$FIND ${ADMIN_ETC}/dbcheck.env -mmin +660 | $WC -l`
+			if [ ${upgrade_find_time} -eq 1 ]; then
+				log_msg -s "`$DATE +%d.%m.%y_%H:%M:%S` - DBCC has not been run in the last eleven hours...\n" -l ${LOGFILE} ${SNAP_QUIET}
+				if [ "${ROLL_SNAP}" ]; then
+					 log_msg -s "`$DATE +%d.%m.%y_%H:%M:%S` - Running DBCC script for checking database corruption before rolling snapshot\n" -l ${LOGFILE} ${SNAP_QUIET}
+					 $BASH ${ENIQ_BKUPSW_DIR}/bin/trigger_dbcheck.bsh
+					if [ $? -ne 0 ]; then
+						_err_msg_="Error while running DBCC script, Please check the logs in the path /eniq/log/sw_log/iq/DbCheckLogs... Exiting!"
+					
+						$RM -rf  ${ROLL_SNAP_PROGRESS_INDICATOR} ${ROLL_SNAP_FILE_INDICATOR}
+						abort_script "$_err_msg_"
+					else
+							log_msg -s "`$DATE +%d.%m.%y_%H:%M:%S` - DBCC has been run Successfully\n" -l ${LOGFILE} ${SNAP_QUIET}
+					fi
+				fi
+			else
+				log_msg -s "`$DATE +%d.%m.%y_%H:%M:%S` - DBCC has been run recently, skipping DBCC run...\n" -l ${LOGFILE} ${SNAP_QUIET}
+			fi
+		else 
+			# When roll snap is not triggered through upgrade.
+			_find_mtime_=`$FIND ${ADMIN_ETC}/dbcheck.env -mmin +120 | $WC -l`
+			if [ ${_find_mtime_} -eq 1 ]; then
+				log_msg -s "`$DATE +%d.%m.%y_%H:%M:%S` - DBCC has not been run in the last two hours...\n" -l ${LOGFILE} ${SNAP_QUIET}
+				if [ "${ROLL_SNAP}" ]; then
+					 log_msg -s "`$DATE +%d.%m.%y_%H:%M:%S` - Running DBCC script for checking database corruption before rolling snapshot\n" -l ${LOGFILE} ${SNAP_QUIET}
+					 $BASH ${ENIQ_BKUPSW_DIR}/bin/trigger_dbcheck.bsh
+					if [ $? -ne 0 ]; then
+						_err_msg_="Error while running DBCC script, Please check the logs in the path /eniq/log/sw_log/iq/DbCheckLogs... Exiting!"
+					
+						$RM -rf  ${ROLL_SNAP_PROGRESS_INDICATOR} ${ROLL_SNAP_FILE_INDICATOR}
+						abort_script "$_err_msg_"
+					else
+							log_msg -s "`$DATE +%d.%m.%y_%H:%M:%S` - DBCC has been run Successfully\n" -l ${LOGFILE} ${SNAP_QUIET}
+					fi
+				else
+					log_msg -s "`$DATE +%d.%m.%y_%H:%M:%S` - Running DBCC script for checking database corruption before backup\n" -l ${LOGFILE} ${SNAP_QUIET}
+					if [ ! -f ${ADMIN_BIN}/.dbcc_progress_indicator ]; then
+						$BASH ${ENIQ_BKUPSW_DIR}/bin/trigger_dbcheck.bsh >>/dev/null 2>&1 &
+						counter_break=0
+						time_interval=1m
+						for _cnt_ in {1..140}
+						do
+							$SLEEP ${time_interval}
+							if [ ! -f ${ADMIN_BIN}/.dbcc_progress_indicator ]; then
+								counter_break=1
+								break
+							fi
+						done
+				
+						if [ ${counter_break} -eq 0 ]; then
+							log_msg -s "`$DATE +%d.%m.%y_%H:%M:%S` - Backup timed out as DBCC is still checking for corruption due to high number of tables. Backup will be triggered during next scheduled backup...\n" -l ${LOGFILE} ${SNAP_QUIET}
+
+							$RM -rf  ${BKUP_SNAP_PROGRESS_INDICATOR} ${BKUP_SNAP_FILE_INDICATOR}
+					
+							_err_msg_="Backup timed out as DBCC is still checking for corruption due to high number of tables. Backup will be triggered during next scheduled backup"
+
+							abort_script "$_err_msg_"
+						else
+							log_msg -s "`$DATE +%d.%m.%y_%H:%M:%S` - DBCC has been run Successfully\n" -l ${LOGFILE} ${SNAP_QUIET}
+						fi
+					else
+						_err_msg_="DBCC is ongoing. Backup will be triggered during next scheduled backup.. Exiting!"
+						$RM -rf  ${BKUP_SNAP_PROGRESS_INDICATOR} ${BKUP_SNAP_FILE_INDICATOR}
+						abort_script "$_err_msg_"
+					fi
+				fi
+			else
+				log_msg -s "`$DATE +%d.%m.%y_%H:%M:%S` - DBCC has been run recently, skipping DBCC run...\n" -l ${LOGFILE} ${SNAP_QUIET}
+			fi
+		fi
+							
+		 
+	fi
+
+if [ -f ${ADMIN_ETC}/dbcheck.env ]; then
+
+# Checking if Database Consistency Check script reported any errors
+log_msg -l ${LOGFILE} -s "Checking if DataBase Consistency Check script reported any errors"
+
+_alloc_status_=`$GREP -w db_allocation_LASTRUN_STATE ${ADMIN_ETC}/dbcheck.env | $AWK -F\= '{print $2}'`
+_verifytables_status_=`$GREP -w verify_tables_LASTRUN_STATE ${ADMIN_ETC}/dbcheck.env | $AWK -F\= '{print $2}'`
+_iqmsgchk_status_=`$GREP -w iqmsg_check_LASTRUN_STATE ${ADMIN_ETC}/dbcheck.env | $AWK -F\= '{print $2}'`
+if [ "$_alloc_status_" == "" -o "$_verifytables_status_" == "" -o "$_iqmsgchk_status_" == "" ]; then
+	log_msg -l ${LOGFILE} -t -s "\nERROR: Could not read last run status pass or fail from ${ADMIN_ETC}/dbcheck.env"
+fi
+
+# Throw error if any errors or inconsistency reported by DbCheck.bsh
+if [ "${_alloc_status_}" == "FAIL" ] || [ "${_verifytables_status_}" == "FAIL" ] || [ "${_iqmsgchk_status_}" == "FAIL" ]; then
+	 log_msg -l ${LOGFILE} -t -s "\nINFO: Error reported by DbCheck.bsh script. Cannot proceed further.\nKindly contact Ericsson Support"
+
+	  # Setting the generic message for touch file.  
+	  error="failed due to database corruption, kindly contact Ericsson support to correct the database and re run the DBCC check."
+	  
+	    if [ "${exit_backup_precheck}" -ne 0 ];then
+            _err_msg_="Backup Precheck is not Successful. Check logfile ${PRECHECK_LOGFILE}."
+            abort_script "$_err_msg_"
+        fi
+
+          if [ "${ROLL_SNAP}" ]; then
+                $ECHO "Message=Rolling snapshot $error" > ${ROLL_SNAP_CORRUPTION_INDICATOR} 
+          else
+                 $ECHO "Message=OMBS backup $error" > ${BKUP_SNAP_CORRUPTION_INDICATOR}
+          fi
+	  	
+
+	log_msg -l ${LOGFILE} -t -s "Below are the last run status for all three actions\nAlloction status : $_alloc_status_\nVerify tables : $_verifytables_status_\nIqmsg check state : $_iqmsgchk_status_\n"
+	_err_msg_="Database might be corrupted. Exiting...$0"
+	abort_script "$_err_msg_"
+
+else 
+	log_msg -l ${LOGFILE} -t -s "There are no database corruption. Proceeding further"
+	
+	    if [ "${exit_backup_precheck}" -ne 0 ];then
+            _err_msg_="Backup Precheck is not Successful. Check logfile ${PRECHECK_LOGFILE}."
+            abort_script "$_err_msg_"
+        fi
+        if [ "${ROLL_SNAP}" ]; then  
+             $RM -rf ${ROLL_SNAP_CORRUPTION_INDICATOR}
+        else
+             $RM -rf ${BKUP_SNAP_CORRUPTION_INDICATOR}
+        fi
+fi
+else
+       if [ "${ROLL_SNAP}" ]; then
+  	   $RM -rf ${ROLL_SNAP_CORRUPTION_INDICATOR} ${ROLL_SNAP_PROGRESS_INDICATOR} ${ROLL_SNAP_FILE_INDICATOR}
+       else
+   	   $RM -rf ${BKUP_SNAP_CORRUPTION_INDICATOR} ${BKUP_SNAP_PROGRESS_INDICATOR} ${BKUP_SNAP_FILE_INDICATOR}
+       fi
+       _err_msg_="Could not find file ${ADMIN_ETC}/dbcheck.env"
+       abort_script "$_err_msg_"
+fi
+	_user_input_=`$CAT ${ENIQ_BKUPSW_DIR}/etc/eniq_backup.conf |$GREP -w BKUP_OPTION_STR |$AWK -F= '{print $2}' 2>/dev/null`
+    if [ "${STORAGE_TYPE}" != "fs" ]; then
+	    if [ "${_user_input_}" == "NoData" ]; then
+           NAS_EXCLUDED_LIST="${NAS_EXCLUDED_LIST}|archive"
+        fi
+        get_nas_snap_list "${NAS_EXCLUDED_LIST}"
+        if [ ! ${_nfs_snap_list_} ]; then
+            _err_msg_="Could not get list of nas filesystems to snap"
+            abort_script "$_err_msg_"
+        fi
+
+        # Snapshot the NAS server
+        log_msg -s "\n`$DATE +%d.%m.%y_%H:%M:%S` - Creating the NAS snapshots" -l ${LOGFILE} ${SNAP_QUIET} 
+        $ECHO "with the following command: \"${SCRIPTHOME}/manage_nas_snapshots.bsh -a create -f ${_nfs_snap_list_} -l ${LOGFILE} -n ${SNAP_NAME} -N ${_roll_snap_} ${SNAP_QUIET}\"\n" >> ${LOGFILE}
+        ${SCRIPTHOME}/manage_nas_snapshots.bsh -a create -f ${_nfs_snap_list_} -l ${LOGFILE} -n ${SNAP_NAME} -N ${_roll_snap_} ${SNAP_QUIET}
+        if [ $? -ne 0 ]; then
+            _err_msg_="Could not create NFS snapshots for backup"
+            abort_script "$_err_msg_"
+        fi
+    fi
+    
+    get_fs_snap_list "${FS_EXCLUDED_LIST}"
+    if [ ! ${_fs_snap_list_} ]; then
+        _err_msg_="Could not get list of FS filesystems to snap"
+        abort_script "$_err_msg_"
+    fi
+
+    # Snapshot fs filesystems
+    log_msg -s "\n`$DATE +%d.%m.%y_%H:%M:%S` - Creating the FS snapshots" -l ${LOGFILE} ${SNAP_QUIET}
+    $ECHO "with the following command: \"${SCRIPTHOME}/manage_fs_snapshots.bsh -a create -f ${_fs_snap_list_} -l ${LOGFILE} -n ${SNAP_NAME} -N ${SNAP_QUIET}\"\n" >> ${LOGFILE}
+    ${SCRIPTHOME}/manage_fs_snapshots.bsh -a create -f ${_fs_snap_list_} -l ${LOGFILE} -n ${SNAP_NAME} -N ${SNAP_QUIET}
+    if [ $? -ne 0 ]; then
+        _err_msg_="Failed to create FS Snapshots"
+        abort_script "$_err_msg_"
+    fi
+
+    if [ "${INSTALL_TYPE}" != "es" ]; then
+	    # Backup the Repository Database
+	    log_msg -s "\n`$DATE +%d.%m.%y_%H:%M:%S` - Backing up the repository database" -l ${LOGFILE} ${SNAP_QUIET}  
+	    $ECHO "using command:" >> ${LOGFILE} 
+	    $ECHO "$SU - ${SYSUSER} -c \"$BASH ${SCRIPTHOME}/repdb_backup.bsh -c ${CLI_CONF_DIR}\"" >> ${LOGFILE} 
+	    $SU - ${SYSUSER} -c "$BASH ${SCRIPTHOME}/repdb_backup.bsh -c ${CLI_CONF_DIR}" >> ${LOGFILE}
+	    if [ $? -ne 0 ]; then
+	        _err_msg_="Could not backup repository database"
+	        abort_script "$_err_msg_"
+	    fi
+	fi
+	
+    if [ "${INSTALL_TYPE}" == "events" -a "${CO_SERVER}" == "YES"  ]; then
+        # Backup the LDAP database
+        log_msg -s "`$DATE +%d.%m.%y_%H:%M:%S` - Backing up the LDAP database" -l ${LOGFILE} ${SNAP_QUIET}
+    	$ECHO "using command:" >> ${LOGFILE} 
+    	$ECHO "$BASH ${SCRIPTHOME}/ldap_backup.bsh backup ${ENIQ_BASE_DIR}/backup/ldap.bkp" >> ${LOGFILE}
+    	$BASH ${SCRIPTHOME}/ldap_backup.bsh backup ${ENIQ_BASE_DIR}/backup/ldap.bkp >> ${LOGFILE}
+    	_res_code_=$?
+        if [ "${_res_code_}" -ne 0 ]; then
+            _err_msg_="Could not backup the LDAP database"
+	        abort_script "$_err_msg_"
+        fi
+    fi
+	
+    if [ "${INSTALL_TYPE}" != "es" ]; then
+	if [ "${ROLL_SNAP}" -o "${_user_input_}" != "NoData" ]; then
+	    # lets quiese the database
+	    _db_=`$CAT ${BKUP_IQ_DB_FILESYS_LIST} | $EGREP -v '^[[:blank:]]*#' | $AWK -F"::" '{print $1}'`
+	                        
+	    # Set name for the temporary dump file
+	    _dump_file_=${TEM_IQ_VIRT_BKUP_DIR}/${_db_}_FULL_ENCAP_DUMP
+	
+	    # Test that I can log into sybase IQ. It may be down.
+	    test_iq_login "${_db_}" ${_roll_snap_flag_} -q
+	    if [ $? -eq 0 ]; then
+	        virtual_db_bkup_snapshot "${_db_}" "${_dump_file_}"
+	    fi
+	     
+	    # Remove the old dump files
+	    log_msg -s "\n`$DATE +%d.%m.%y_%H:%M:%S` - Removing the old db dump files if they exist.\n" -l ${LOGFILE} ${SNAP_QUIET}
+	    $RM -f ${IQ_VIRT_BKUP_DIR}/${_db_}_FULL_ENCAP_DUMP.*
+	
+	    # Move the dump file to permanent place
+	    _chk_dump_file_=`$LS ${_dump_file_}.* 2>/dev/null`
+	    if [ "${_chk_dump_file_}" ]; then
+	        log_msg -s "Moving the new db dump files to a new location.\n" -l ${LOGFILE} ${SNAP_QUIET}
+	        $MV ${_dump_file_}.* ${IQ_VIRT_BKUP_DIR}
+	        if [ $? -ne 0 ]; then
+	            _err_msg_="Could not move ${_dump_file_} file(s) to ${IQ_VIRT_BKUP_DIR}"
+	            abort_script "$_err_msg_"
+	        fi
+	        fi
+	    fi
+	fi
+	
+	if [ "${INSTALL_TYPE}" != "stats" ]; then
+		# Backup the Mediation database
+		backup_mediation_db
+	fi
+	
+    if [ "${STORAGE_TYPE}" != "fs" ]; then
+        $ECHO "\n`$DATE +%d.%m.%y_%H:%M:%S` - Snapping the NFS backup directory" >> ${LOGFILE}
+        $ECHO "using command:" >> ${LOGFILE} 
+    	$ECHO "${SCRIPTHOME}/manage_nas_snapshots.bsh -a create -f backup -l ${LOGFILE} -n ${SNAP_NAME} -N ${_roll_snap_} ${SNAP_QUIET}" >> ${LOGFILE}
+        ${SCRIPTHOME}/manage_nas_snapshots.bsh -a create -f backup -l ${LOGFILE} -n ${SNAP_NAME} -N ${_roll_snap_} ${SNAP_QUIET} 
+        if [ $? -ne 0 ]; then
+            _err_msg_="Could not Snap the NAS backup directory for backup"
+            abort_script "$_err_msg_"
+        fi
+    else
+        $ECHO "\n`$DATE +%d.%m.%y_%H:%M:%S` - Snapping the FS backup directory" >> ${LOGFILE}
+        $ECHO "using command:" >> ${LOGFILE} 
+    	$ECHO "${SCRIPTHOME}/manage_fs_snapshots.bsh -a create -f backup -l ${LOGFILE} -S -n ${SNAP_NAME} -N -F ${SNAP_QUIET}" >> ${LOGFILE}
+        ${SCRIPTHOME}/manage_fs_snapshots.bsh -a create -f backup -l ${LOGFILE} -S -n ${SNAP_NAME} -N -F ${SNAP_QUIET}
+        if [ $? -ne 0 ]; then
+            _err_msg_="Could not Snap the FS backup directory for backup"
+            abort_script "$_err_msg_"
+        fi
+    fi
+    
+	if [ ! "${ROLL_SNAP}" ]; then 
+        $ECHO "\n`$DATE +%d.%m.%y_%H:%M:%S` - Snapping the FS ${LOG_FS_LIST} directory" >> ${LOGFILE}
+        $ECHO "using command:" >> ${LOGFILE}
+        $ECHO "${SCRIPTHOME}/manage_fs_snapshots.bsh -a create -f ${LOG_FS_LIST} -l ${LOGFILE} -S -n ${SNAP_NAME} -N -F ${SNAP_QUIET}" >> ${LOGFILE}
+        ${SCRIPTHOME}/manage_fs_snapshots.bsh -a create -f ${LOG_FS_LIST} -l ${LOGFILE} -S -n ${SNAP_NAME} -N -F ${SNAP_QUIET}
+        if [ $? -ne 0 ]; then
+            _err_msg_="Could not Snap the FS local_logs directory for local_logs"
+            abort_script "$_err_msg_"
+        fi
+    fi
+	
+    if [ "${INSTALL_TYPE}" != "stats" ]; then
+        # Need to cleanout the archive directory
+        log_msg -s "\n`$DATE +%d.%m.%y_%H:%M:%S` - Cleaning out the data archive" -l ${LOGFILE} ${SNAP_QUIET}
+        $ECHO "using command:" >> ${LOGFILE} 
+    	$ECHO "${SCRIPTHOME}/clean_archive_data.bsh -N -f ${TEM_DIR}/archive_list.txt ${SNAP_QUIET} -l ${LOGFILE}" >> ${LOGFILE}
+        ${SCRIPTHOME}/clean_archive_data.bsh -N -f ${TEM_DIR}/archive_list.txt ${SNAP_QUIET} -l ${LOGFILE}
+    fi
+
+    if [ ! "${ROLL_SNAP}" ]; then
+        if [ "${STORAGE_TYPE}" != "fs" ]; then
+            log_msg -s "\n`$DATE +%d.%m.%y_%H:%M:%S` - Mounting the NAS snapshots for backup" -l ${LOGFILE} ${SNAP_QUIET}
+            $ECHO "using command:" >> ${LOGFILE} 
+	    	$ECHO "${SCRIPTHOME}/manage_nas_snapshots.bsh -a mount -f ALL -n ${SNAP_NAME} -N -l ${LOGFILE} ${SNAP_QUIET}" >> ${LOGFILE}
+            ${SCRIPTHOME}/manage_nas_snapshots.bsh -a mount -f ALL -n ${SNAP_NAME} -N -l ${LOGFILE} ${SNAP_QUIET}
+            if [ $? -ne 0 ]; then
+                _err_msg_="Could not mount NAS snapshots for backup"
+                abort_script "$_err_msg_"
+            fi
+        fi
+        
+        # Mount the fs snapshots
+        log_msg -s "\n`$DATE +%d.%m.%y_%H:%M:%S` - Mounting the FS snapshots for backup" -l ${LOGFILE} ${SNAP_QUIET}
+        $ECHO "using command:" >> ${LOGFILE} 
+    	$ECHO "${SCRIPTHOME}/manage_fs_snapshots.bsh -a mount -f ALL=${SNAP_NAME} -N -l ${LOGFILE} ${SNAP_QUIET}" >> ${LOGFILE}
+        ${SCRIPTHOME}/manage_fs_snapshots.bsh -a mount -f ALL=${SNAP_NAME} -N -l ${LOGFILE} ${SNAP_QUIET}
+        if [ $? -ne 0 ]; then
+            _err_msg_="Could not mount FS snapshots for backup"
+            abort_script "$_err_msg_"
+        fi
+    fi
+else
+    log_msg -s "`$DATE +%d.%m.%y_%H:%M:%S` - Preparing ENIQ Non-Coordinator for backup" -l ${LOGFILE} ${SNAP_QUIET}
+    $ECHO "Snapping fs filesystems using command:" >> ${LOGFILE} 
+    $ECHO "${SCRIPTHOME}/manage_fs_snapshots.bsh -a create -f \'ALL\' -S -l ${LOGFILE} -n ${SNAP_NAME} -N ${SNAP_QUIET}" >> ${LOGFILE}
+    # Only snap the local fs filesystems
+    ${SCRIPTHOME}/manage_fs_snapshots.bsh -a create -f 'ALL' -S -l ${LOGFILE} -n ${SNAP_NAME} -N ${SNAP_QUIET}
+    if [ $? -ne 0 ]; then
+        _err_msg_="Failed to Create FS Snapshots"
+        abort_script "$_err_msg_"
+    fi
+	
+    if [ ! "${ROLL_SNAP}" ]; then
+        $ECHO "\n`$DATE +%d.%m.%y_%H:%M:%S` - Snapping the FS ${LOG_FS_LIST} directory" >> ${LOGFILE}
+        $ECHO "using command:" >> ${LOGFILE}
+        $ECHO "${SCRIPTHOME}/manage_fs_snapshots.bsh -a create -f ${LOG_FS_LIST} -l ${LOGFILE} -S -n ${SNAP_NAME} -N -F ${SNAP_QUIET}" >> ${LOGFILE}
+        ${SCRIPTHOME}/manage_fs_snapshots.bsh -a create -f ${LOG_FS_LIST} -l ${LOGFILE} -S -n ${SNAP_NAME} -N -F ${SNAP_QUIET}
+        if [ $? -ne 0 ]; then
+            _err_msg_="Could not Snap the FS ${LOG_FS_LIST} directory for local_logs"
+            abort_script "$_err_msg_"
+        fi
+		
+        # Mount the fs snapshots
+        log_msg -s "\n`$DATE +%d.%m.%y_%H:%M:%S` - Mounting the FS snapshots for backup" -l ${LOGFILE} ${SNAP_QUIET}
+        $ECHO "using command:" >> ${LOGFILE} 
+    	$ECHO "${SCRIPTHOME}/manage_fs_snapshots.bsh -a mount -f ALL=${SNAP_NAME} -N -l ${LOGFILE} ${SNAP_QUIET}" >> ${LOGFILE}
+        ${SCRIPTHOME}/manage_fs_snapshots.bsh -a mount -f ALL=${SNAP_NAME} -N -l ${LOGFILE} ${SNAP_QUIET}
+        if [ $? -ne 0 ]; then
+            _err_msg_="Could not mount FS snapshots for backup"
+            abort_script "$_err_msg_"
+        fi
+    fi
+fi
+
+
+# Aborting script when if precheck is failed
+if [ "${exit_backup_precheck}" -ne 0 ];then
+     _err_msg_="Backup Precheck is not Successful. Check logfile ${PRECHECK_LOGFILE}."
+    abort_script "$_err_msg_"
+fi
+
+if [ ! "${ROLL_SNAP}" ]; then
+    if [ "${STORAGE_TYPE}" != "fs" ] && [ "${CO_SERVER}" == "YES" ] && [ "${_user_input_}" != "NoData" ]; then
+        log_msg -q -s "Executing ${SCRIPTHOME}/manage_san_snapshots.bsh -a list -f ALL to get snap list" -l ${LOGFILE}
+        $BASH ${SCRIPTHOME}/manage_san_snapshots.bsh -a list -f ALL 2>/dev/null | $EGREP -v '^[[:blank:]]*(------|LUN|$)'| $EGREP -w "${SAN_SNAP_NAME}"  > ${ENIQ_BKUP_SW_OMBS_CFG}/raw_bkup_snap_details
+            if [ $? -ne 0 ]; then
+                _err_msg_="Could not list SAN snapshots for storing it in ${ENIQ_BKUP_SW_OMBS_CFG}/raw_bkup_snap_details"
+                abort_script "${_err_msg_}"
+            fi
+
+        $CHOWN -R ${SYSUSER}:${SYSGRP} ${ENIQ_BKUP_SW_OMBS_CFG}/raw_bkup_snap_details >> /dev/null 2>&1
+            if [ $? -ne 0 ]; then
+               _err_msg_="Could not set ownership of files to ${SCRIPT_USER} on ${ENIQ_BKUP_SW_OMBS_CFG}/raw_bkup_snap_details"
+               abort_script "${_err_msg_}"
+        fi
+    fi
+fi
+
+# Cleanup old Snapshots if they exist
+# if [ "${CURR_SERVER_TYPE}" == "eniq_stats"  ]; then
+
+# Get FS pool name
+_pool_name_=$(vgs --no-heading -o vg_name | grep -iw "${CURR_SERVER_TYPE}_pool")
+if [ ! "${_pool_name_}" ]; then
+    _err_msg_="Failed to get FS pool name"
+    abort_script "${_err_msg_}" 
+fi
+
+unset _ext_fs_list_ _nas_fs_list_ _final_fs_list_
+
+if [ "${STORAGE_TYPE}" != "fs" ]; then
+    _ext_fs_list_=`$CAT ${FSTAB} | $GREP -w ${_pool_name_} | $GREP -v "swap" | $AWK '{print $2}'`
+    _nas_fs_list_=`$CAT ${NASD_CONFIG} |  $AWK -F "::" '{print $3}'`
+    
+    # List of total FS
+    _final_fs_list_="${_ext_fs_list_} ${_nas_fs_list_}"
+else
+    _ext_fs_list_=`$CAT ${FSTAB} | $GREP -w ${_pool_name_} | $GREP -v "swap" | $AWK '{print $2}'`
+    
+    # List of total FS
+    _final_fs_list_="${_ext_fs_list_}"
+fi
+
+
+
+if [ "${SNAP_DELETE}" ]; then
+    log_msg -q -s "\nFile System utilization...\n\n$(df -hk ${_final_fs_list_})" -l ${LOGFILE}
+
+    log_msg -q -s "\nSnapshot utilization for Ext4 FS...\n\n$(lvs)" -l ${LOGFILE}
+
+    # Check NAS snapshot cache utilization for blade
+    if [ "${STORAGE_TYPE}" != "fs" ]; then
+        _nas_pri_pool_=$(iniget Storage_NAS_GENERAL -f ${ENIQ_CONF_DIR}/storage.ini -v POOL_PRI)
+        if [ "${SAN_DEVICE}" != "unityXT" ]; then
+           if [ ${_SFS_version_} == 7.4 ]; then
+                $SU - storadm -c "$SSH support@nasconsole '/opt/VRTSnas/clish/bin/clish -u master -c \"storage rollback cache list \"'" | $GREP -w ${_nas_pri_pool_}|  $AWK '{print $4}'  | $TR -d '()' > ${TEM_DIR}/perc_used.txt
+           else
+                $SU - storadm -c "$SSH master@nasconsole storage rollback cache list" | $GREP -w ${_nas_pri_pool_} |  $AWK '{print $4}'  | $TR -d '()' > ${TEM_DIR}/perc_used.txt
+           fi
+           log_msg -q -s "\nNAS Snapshot cache utilization is : $(cat ${TEM_DIR}/perc_used.txt)%" -l ${LOGFILE}
+        fi
+    fi
+
+    log_msg -s "\n`$DATE +%d.%m.%y_%H:%M:%S` - Cleaning up old snapshots with label \"${SNAP_DELETE}\"" -l ${LOGFILE} ${SNAP_QUIET}
+    $BASH ${SCRIPTHOME}/cleanup_eniq_backup.bsh -N ${_roll_snap_} -S "${SNAP_DELETE}" ${SNAP_QUIET}
+fi
+# fi
+
+
+if [ "${ROLL_SNAP}" ]; then
+    $RM -rf ${ROLL_SNAP_PROGRESS_INDICATOR}
+
+    # To check the existence of ${ROLL_SNAP_PROGRESS_INDICATOR}
+    if [ -f ${ROLL_SNAP_PROGRESS_INDICATOR} ]; then
+        log_msg -s "\nWARNING: ${ROLL_SNAP_PROGRESS_INDICATOR} file not removed. This file must be deleted manually before proceeding further" -l ${LOGFILE} 
+    fi
+     
+    $RM -rf ${ROLL_SNAP_FILE_INDICATOR}
+
+    # To check the existence of ${ROLL_SNAP_FILE_INDICATOR} 
+    if [ -f ${ROLL_SNAP_FILE_INDICATOR} ]; then
+        log_msg -s "\nWARNING: ${ROLL_SNAP_FILE_INDICATOR} file not removed. This file must be deleted manually before proceeding further." -l ${LOGFILE}
+    fi
+
+		
+	log_msg -s "\n`$DATE +%d.%m.%y_%H:%M:%S` - Rolling Snapshot successfully created on ENIQ Server" -l ${LOGFILE} 
+else
+    $RM -rf ${BKUP_SNAP_PROGRESS_INDICATOR}
+
+    #To check the existence of ${BKUP_SNAP_PROGRESS_INDICATOR}
+    if [ -f ${BKUP_SNAP_PROGRESS_INDICATOR} ]; then       
+        log_msg -s "\nWARNING: ${BKUP_SNAP_PROGRESS_INDICATOR} file not removed. This file must be deleted manually before proceeding further." -l ${LOGFILE} 
+    fi
+
+    $RM -rf ${BKUP_SNAP_FILE_INDICATOR}
+
+    # To check the existence of ${BKUP_SNAP_FILE_INDICATOR}
+    if [ -f ${BKUP_SNAP_FILE_INDICATOR} ]; then
+        log_msg -s "\nWARNING: ${BKUP_SNAP_FILE_INDICATOR} file not removed. This file must be deleted manually before proceeding further." -l ${LOGFILE} 
+    fi
+    log_msg -s "\n`$DATE +%d.%m.%y_%H:%M:%S` - ENIQ Server successfully prepared for Backup" -l ${LOGFILE}
+
+fi
+
+log_msg -h -s "=======================" -l ${LOGFILE}
+
+# Rotate and compress the logs if necessary
+rotate_compress_logs ${LOGFILE} ${NUM_LOGS} ${SIZE_LOGS} ${COMPRESS_LOG}
+
+$RM -rf ${TEM_DIR} ${TEM_IQ_VIRT_BKUP_DIR}
+$RM -rf ${Rep_conn_str_enc}
+$RM -rf ${DWH_CONN_STRING_enc}
+$RM -rf ${dbpng_en}
+$RM -rf ${enc_dbp}
+exit 0

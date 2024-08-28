@@ -1,0 +1,4 @@
+
+Please ensure the above filesystems are shared by the 
+master server before continuing. 
+Use the '/ericsson/storage/bin/nascli list_shares -' command on the master server to check.

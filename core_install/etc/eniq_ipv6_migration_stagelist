@@ -1,0 +1,8 @@
+update_service_VLAN_network_bond 
+update_configuration_files
+verify_passwordless_interblade_connectivity
+verify_NAS_connectivity
+update_sentinel_file
+migrate_IQ
+start_all_services
+cleanup

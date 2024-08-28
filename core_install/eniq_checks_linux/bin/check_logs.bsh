@@ -1,0 +1,406 @@
+#!/bin/bash
+# ********************************************************************
+# Ericsson Radio Systems AB                                     SCRIPT
+# ********************************************************************
+# (c) Ericsson Radio Systems AB 2018 - All rights reserved.
+#
+# The copyright to the computer program(s) herein is the property
+# of Ericsson Radio Systems AB, Sweden. The programs may be used
+# and/or copied only with the written permission from Ericsson Radio
+# Systems AB or in accordance with the terms and conditions stipulated
+# in the agreement/contract under which the program(s) have been
+# supplied.
+#
+# ********************************************************************
+# Name    : check_logs.bsh
+# Date    : 18/08/2023
+# Revision: D
+# Purpose : Script to check if any errors/warnings/exceptions are present in log files
+# Usage   : ./check_logs.bsh -e ./check_logs.bsh -m
+# Exit Values:
+#     0   : Success
+#     3   : Failure Script Aborted
+#   210   : Errors/Warnings/Exceptions found
+#   227   : Directory path for Engine Logs not found
+#   226   : Directory path for messages logs not found
+#   228   : Engine Logs of last 48 hours not found
+#
+# ********************************************************************
+#
+#   Command Section
+#
+# ********************************************************************
+AWK=/usr/bin/awk
+CAT=/usr/bin/cat
+DATE=/usr/bin/date
+CUT=/usr/bin/cut
+ECHO='/usr/bin/echo -e'
+EGREP=/usr/bin/egrep
+GREP=/usr/bin/grep
+ID=/usr/bin/id
+LS=/usr/bin/ls
+MKDIR=/usr/bin/mkdir
+RM=/usr/bin/rm
+SED=/usr/bin/sed
+TEE=/usr/bin/tee
+TOUCH=/usr/bin/touch
+# ********************************************************************
+#                                                                    *
+#                     Functions                                      *
+#                                                                    *
+# ********************************************************************
+### Function: abort_script
+#
+#   This will be called if the script is aborted through an error
+#   encountered during runtime
+#
+# Arguments:
+#       $1 - Error message from part of program
+# Return Values:
+#       none
+#
+abort_script()
+{
+_err_time_=`$DATE '+%Y-%b-%d_%H.%M.%S'`
+
+if [ "$1" ]; then
+    _err_msg_="${_err_time_} - $1"
+else
+    _err_msg_="${_err_time_} - ERROR : Script aborted.......\n"
+fi
+if [ "${LOGFILE}" ]; then
+    $ECHO "\nERROR : ${_err_msg_}\n" | $TEE -a ${LOGFILE}
+else
+    $ECHO "\nERROR : ${_err_msg_}\n"
+fi
+exit 3
+}
+### Function: check_id ###
+#
+#   Check that the effective id of the user is correct
+#   If not print error msg and exit.
+#
+# Arguments:
+#       $1 : User ID name
+# Return Values:
+#       none
+#
+check_id()
+{
+local _check_id_=`$ID  | $AWK -F\( '{print $2}' | $AWK -F\) '{print $1}'`
+
+if [ "$_check_id_" != "$1" ]; then
+    _err_msg_="You must be $1 to execute this script."
+    abort_script "$_err_msg_"
+fi
+}
+### Function: check_create_logfile ###
+#
+# Checks presence/creation of Logfile
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+#
+check_create_logfile()
+{
+if [ ! -d  ${ENIQ_PRECHECK_LOG_DIR} ]; then
+    ${MKDIR} -p ${ENIQ_PRECHECK_LOG_DIR}
+    if [ $? -ne 0 ]; then
+        _err_msg_="Could not create ${ENIQ_PRECHECK_LOG_DIR}"
+        abort_script "$_err_msg_"
+    fi
+fi
+
+if [ -s $LOGFILE ]; then
+    $RM -rf $LOGFILE
+    if [ -f $LOGFILE ]; then
+        _err_msg_="Warning : Could not remove older ${LOGFILE}"
+        abort_script "$_err_msg_"
+    fi
+fi
+
+$TOUCH -a ${LOGFILE}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not create file ${LOGFILE}"
+    abort_script "$_err_msg_"
+fi
+
+$CHMOD 640 ${LOGFILE}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not change the permissions of the ${LOGFILE}"
+    abort_script "$_err_msg_"
+fi
+}
+### Function: check_engine_log ###
+#
+# Checks if any error is present in the engine logs within last 48 hrs
+#
+# Arguments:
+#       None
+#Return codes:
+#    0     : No Errors/Warnings/Exceptions found in Engine Logs
+#    210   : Errors/Warnings/Exceptions detected in Engine Logs
+#    227   : Directory path for Engine Logs not found
+#    228   : Engine Logs of last 48 hours not found
+#
+check_engine_log()
+{
+_precheck_="Engine"
+_previous_date_=`TZ=MYT+24 $DATE +%Y_%m_%d`
+_current_date_=`$DATE +%Y_%m_%d`
+_previous_time_=0
+_current_time_=0
+_engine_error_=0
+_flag_prev_=0
+_flag_now_=0
+_file_now_=""
+_file_prev_=""
+
+if [ -d ${ENGINE_LOG_DIR} ]; then
+        log_msg -q -s "\n======================================== ENGINE LOG CHECK ============================================" -l ${LOGFILE}
+    if [ -s ${ENGINE_LOG_DIR}/engine-$_current_date_.log ]; then
+        engine_error ${ENGINE_LOG_DIR}/engine-$_current_date_.log
+        _flag_now_=$?
+    else
+        _file_now_="INFO: engine-$_current_date_.log file not found at ${ENGINE_LOG_DIR}"
+    fi
+    if [ -s ${ENGINE_LOG_DIR}/engine-$_previous_date_.log ]; then
+        engine_error ${ENGINE_LOG_DIR}/engine-$_previous_date_.log
+        _flag_prev_=$?
+    else
+        _file_prev_="INFO: engine-$_previous_date_.log file not found at ${ENGINE_LOG_DIR}"
+    fi
+        log_msg -q -s "===================================ENGINE LOG CHECK COMPLETED========================================\n" -l ${LOGFILE}
+        log_msg -q -s "\n==================================== SUMMARY FOR ENGINE LOG CHECK ===================================================\n" -l ${LOGFILE}
+        if [[ ! -z "$_file_now_" &&  ! -z "$_file_prev_" ]]; then
+            log_msg -q -s "WARNING: Engine Log files for last 48 hours not found" -l ${LOGFILE}
+            RET_CODE=228
+        else
+            if [ ! -z "$_file_now_" ];then
+               log_msg -q -s "$_file_now_" -l ${LOGFILE}
+            fi
+            if [ ! -z "$_file_prev_" ];then
+               log_msg -q -s "$_file_prev_" -l ${LOGFILE}
+            fi
+
+            if [[ "$_flag_now_" -eq 0 && "$_flag_prev_" -eq 0 ]]; then
+                log_msg -q -s "INFO: No Errors/Exceptions/Warnings found in Engine Logs in last 48 hours" -l ${LOGFILE}
+                RET_CODE=0
+            else
+                log_msg -q -s "$_engine_string_" -l ${LOGFILE}
+                RET_CODE=210
+            fi
+        fi
+        log_msg -q -s "========================================================================================================================\n" -l ${LOGFILE}
+else
+    log_msg -q -s "WARNING: Directory path ${ENGINE_LOG_DIR} not present" -l ${LOGFILE}
+    RET_CODE=227
+fi
+}
+### Function: engine_error ###
+#
+# Checks if any error is present in the given file
+#
+# Arguments:
+#        None
+# Return Values:
+#        _engine_error_
+#
+engine_error()
+{
+$EGREP -in 'error|exception|warning' $1 > /tmp/engine.txt
+if [ -s /tmp/engine.txt ]; then
+    _engine_error_=1
+    $SED "s~^~"$1":LINE# ~g" /tmp/engine.txt >> ${LOGFILE}
+    _warning_="WARNING: Errors/Exceptions/Warnings found in Engine Logs in the last 48 hours. Check $1"
+    if [ -z "$_engine_string_" ];then
+        _engine_string_="$_warning_"
+    else
+        _engine_string_="$_engine_string_"$'\n'"$_warning_"
+    fi
+    return $_engine_error_
+else
+    _info_="INFO: No Errors/Exceptions/Warnings found in Engine Logs at $1 in the last 48 hours"
+    if [ -z "$_engine_string_" ];then
+        _engine_string_="$_info_"
+    else
+        _engine_string_="$_engine_string_"$'\n'"$_info_"
+    fi
+    return $_engine_error_
+fi
+$RM -rf /tmp/engine.txt
+}
+
+### Function: check_messages_log ###
+#
+# Checks if any error is present in the engine logs within last 24 hrs
+#
+# Arguments:
+#       None
+# Return Codes:
+#    0     : No Errors/Warnings/Exceptions found in  Messages Logs
+#    210   : Errors/Warnings/Exceptions detected in Messages Logs
+#    226   : Directory path for messages logs not found
+#
+check_messages_log()
+{
+_precheck_="Messages"
+_error_message_=0
+_current_time_=0
+_previous_time_=0
+_msg_previous_date_=""
+_msg_current_date_=""
+_str_concat_=""
+_str_two_=""
+_str_one_=""
+if [ -d ${MESSAGES_LOG_DIR} ]; then
+        log_msg -q -s "\n======================================== MESSAGES LOG CHECK ============================================" -l ${LOGFILE}
+        _msg_current_date_=`$DATE +%b\ %e`
+        $EGREP -in 'error|exception|warning' ${MESSAGES_LOG_DIR}/message* | $GREP -w "$_msg_current_date_" > /tmp/messages.txt
+        if [ -s /tmp/messages.txt ]; then
+            while read line
+            do
+               _str_two_=`$ECHO $line | $CUT -d":" -f2-`
+               _str_one_=`$ECHO $line | $CUT -d":" -f1`
+               _str_concat_=`$ECHO $_str_one_:LINE# $_str_two_`
+               log_msg -q -s "$_str_concat_" -l ${LOGFILE}
+               _error_message_=1
+            done < /tmp/messages.txt
+        fi
+        $RM -r /tmp/messages.txt
+
+        _msg_previous_date_=`TZ=GMT+23 $DATE +%b\ %e`
+        $EGREP -in 'error|exception|warning' ${MESSAGES_LOG_DIR}/message* | $GREP -w "$_msg_previous_date_" > /tmp/messages.txt
+        if [ -s /tmp/messages.txt ]; then
+            while read line
+            do
+            _current_time_=`$ECHO ${line} | $CUT -d" " -f3 | $CUT -d":" -f1`
+            _previous_time_=`$DATE +%H`
+            if [ "$_current_time_" -gt "$_previous_time_" ]; then
+               _str_two_=`$ECHO $line | $CUT -d":" -f2-`
+               _str_one_=`$ECHO $line | $CUT -d":" -f1`
+               _str_concat_=`$ECHO $_str_one_:LINE# $_str_two_`
+               log_msg -q -s "$_str_concat_" -l ${LOGFILE}
+               _error_message_=1
+            fi
+            done < /tmp/messages.txt
+        fi
+        $RM -r /tmp/messages.txt
+        log_msg -q -s "===================================MESSAGES LOG CHECK COMPLETED========================================\n" -l ${LOGFILE}
+        log_msg -q -s "\n==================================== SUMMARY FOR MESSAGES LOG CHECK ===================================================\n" -l ${LOGFILE}
+        if [ "$_error_message_" -ne 0 ]; then
+            log_msg -q -s "WARNING: Errors/Warnings/Exceptions found in the ${MESSAGES_LOG_DIR}/message* files in last 24 hours" -l ${LOGFILE}
+            RET_CODE=210
+        else
+            log_msg -q -s "INFO: No Errors/Warnings/Exceptions found in the ${MESSAGES_LOG_DIR}/message* files in last 24 hours" -l ${LOGFILE}
+            RET_CODE=0
+        fi
+        log_msg -q -s "================================================================================================================================\n" -l ${LOGFILE}
+else
+    log_msg -q -s "WARNING: Directory path ${MESSAGES_LOG_DIR} not found" -l ${LOGFILE}
+    RET_CODE=226
+fi
+}
+
+
+### Function: setup_env ###
+#
+# Setup path environment
+# Imports the common lib files which imports common functions
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+#
+setup_env()
+{
+if [ ! "${ENIQ_BASE_DIR}" ]; then
+   ENIQ_BASE_DIR=/eniq
+fi
+
+# Main Directory for the Core Installation SW
+ENIQ_INST_DIR=${ENIQ_BASE_DIR}/installation
+
+# Path for Engine Logs Directory
+ENGINE_LOG_DIR=${ENIQ_BASE_DIR}/log/sw_log/engine
+
+
+# Path for Logs Directory
+MESSAGES_LOG_DIR=/var/log
+
+#Installation lib directory
+ENIQ_LIB_DIR=${ENIQ_INST_DIR}/core_install/lib
+
+#Precheck type
+_precheck_=""
+
+#Engine Error string
+_engine_string_=""
+
+#Date for Mediation Gateway Logs
+_mg_Current_date_pattern_one_=" "
+_mg_Current_date_pattern_two_=" "
+_mg_Previous_date_pattern_one_=" "
+_mg_Previous_date_pattern_two_=" "
+
+#Precheck logs directory
+ENIQ_PRECHECK_LOG_DIR=${ENIQ_BASE_DIR}/local_logs/precheck_logs
+
+#Return code declaration
+RET_CODE=0
+
+#Common function directory
+COMMON_FUNCS_LIB=${ENIQ_LIB_DIR}/common_functions.lib
+
+#Imports the common library functions
+if [ ! -f "${COMMON_FUNCS_LIB}" ]; then
+    _err_msg_="${COMMON_FUNCS_LIB} missing, this is required for this script, exiting!!!!"
+    abort_script "${_err_msg_}"
+fi
+
+. ${COMMON_FUNCS_LIB}
+
+if [ $? -ne 0 ]; then
+    _err_msg_="Importing functions of ${COMMON_FUNCS_LIB} failed, exiting!!!!"
+    abort_script "${_err_msg_}"
+fi
+}
+
+# ********************************************************************
+#
+#       Main body of program
+#
+# ********************************************************************
+# Default user
+DEFAULT_USER=root
+
+# Check that the effective id of the user is root
+check_id $DEFAULT_USER
+
+# Set up environment variables for script.
+setup_env
+
+# Logfile path
+LOGFILE=${ENIQ_PRECHECK_LOG_DIR}/log_logfile.log
+
+# Check/Create Logfile
+check_create_logfile
+
+#Check for the log files
+case $1 in
+-e)check_engine_log
+;;
+-m)check_messages_log
+;;
+*)check_engine_log
+  check_messages_log
+;;
+esac
+
+log_msg -t -s "ENIQ check for $_precheck_ logs completed" -l ${LOGFILE}
+log_msg -t -s "Check log $LOGFILE\n"
+
+exit $RET_CODE

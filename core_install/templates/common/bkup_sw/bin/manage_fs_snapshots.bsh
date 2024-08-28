@@ -1,0 +1,2250 @@
+#!/bin/bash
+# ********************************************************************
+# Ericsson Radio Systems AB                                     SCRIPT
+# ********************************************************************
+#
+#
+# (c) Ericsson Radio Systems AB 2022 - All rights reserved.
+#
+# The copyright to the computer program(s) herein is the property
+# of Ericsson Radio Systems AB, Sweden. The programs may be used
+# and/or copied only with the written permission from Ericsson Radio
+# Systems AB or in accordance with the terms and conditions stipulated
+# in the agreement/contract under which the program(s) have been
+# supplied.
+#
+# ********************************************************************
+# Name    : manage_fs_snapshot.bsh
+# Date    : 25/07/2023
+# Revision: \main\65
+# Purpose : Main ENIQ script to that handles FS snapshots.
+#
+# Usage   : manage_fs_snapshots.bsh -a <snap_action> -f <fs_name>
+#                               -n <snap_name>
+#                                                               [ -N ] [ -l <logfile> ]
+#
+# ********************************************************************
+#
+#   Command Section
+#
+# ********************************************************************
+AWK=/usr/bin/awk
+BASENAME=/usr/bin/basename
+BC=/usr/bin/bc
+BLKID=/sbin/blkid
+CAT=/usr/bin/cat
+CHMOD=/usr/bin/chmod
+CLEAR=/usr/bin/clear
+CP=/usr/bin/cp
+CPIO=/usr/bin/cpio
+CUT=/usr/bin/cut
+DATE=/usr/bin/date
+DF=/usr/bin/df
+DIRNAME=/usr/bin/dirname
+DMIDECODE=/usr/sbin/dmidecode
+DMSETUP=/usr/sbin/dmsetup
+ECHO='/usr/bin/echo -e'
+EGREP=/usr/bin/egrep
+ENV=/usr/bin/env
+EXPR=/usr/bin/expr
+FIND=/usr/bin/find
+FORMAT=/usr/sbin/format
+GREP=/usr/bin/grep
+HEAD=/usr/bin/head
+HOSTID=/usr/bin/hostid
+HOSTNAME=/usr/bin/hostname
+ID=/usr/bin/id
+INIT=/usr/sbin/init
+KILL=/usr/bin/kill
+LS=/usr/bin/ls
+LSOF=/usr/sbin/lsof
+LVCHANGE=/usr/sbin/lvchange
+LVS=/usr/sbin/lvs
+LVCREATE=/usr/sbin/lvcreate
+LVCONVERT=/usr/sbin/lvconvert
+LVREMOVE=/usr/sbin/lvremove
+MKDIR=/usr/bin/mkdir
+MOUNT=/usr/bin/mount
+MV=/usr/bin/mv
+PING=/usr/sbin/ping
+PS=/usr/bin/ps
+PWD=/usr/bin/pwd
+RAW=/usr/bin/raw
+RM=/usr/bin/rm
+RCP=/usr/bin/rcp
+SED=/usr/bin/sed
+SLEEP=/usr/bin/sleep
+SORT=/usr/bin/sort
+SU=/usr/bin/su
+SYSTEMCTL=/usr/bin/systemctl
+SYSTEMD_ANALYZE=/usr/bin/systemd-analyze
+SYNC=/usr/sbin/sync
+TAIL=/usr/bin/tail
+TEE=/usr/bin/tee
+TOUCH=/usr/bin/touch
+UNLINK=/usr/bin/unlink
+UMOUNT=/usr/bin/umount
+UNIQ=/usr/bin/uniq
+VGS=/usr/sbin/vgs
+VGDISPLAY=/usr/sbin/vgdisplay
+VGRENAME=/usr/sbin/vgrename
+WC=/usr/bin/wc
+XARGS=/usr/bin/xargs
+
+
+# ********************************************************************
+#
+#       Configuration Section
+#
+# ********************************************************************
+ENIQ_ENV=niq.rc
+ENIQ_INI=niq.ini
+SUNOS_INI=SunOS.ini
+
+# Directory on the root filesystem
+ENIQ_ROOT_DIR=/eniq
+
+DEFAULT_USER=root
+
+ENIQ_SVC_MANIFEST_LOC="/etc/systemd/system"
+
+SENTINEL_DIR="/etc/systemd/system"
+
+# Max size for FS swap partition in Mbytes
+MAX_16G_SWAP=16
+MAX_8G_SWAP=8
+
+
+# ********************************************************************
+#
+#       Configuration Section
+#
+# ********************************************************************
+# LG exclude list
+LG_EXCLUDED_LIST=""
+
+# LVM exclude list
+LVM_EXCLUDED_LIST=""
+
+# mount for backup exclude list
+MOUNT_EXCLUDE_LIST=""
+
+ROOT_LVM_MT_PT=root_lvm
+
+SNAP_DELIM="-"
+
+
+
+# ********************************************************************
+#
+#       Pre-execution Operations
+#
+# ********************************************************************
+
+
+# ********************************************************************
+#
+#   Functions
+#
+# ********************************************************************
+### Function: abort_script ###
+#
+#   This is called if the script is aborted through an error
+#   error signal sent by the kernel such as CTRL-C or if a serious
+#   error is encountered during runtime
+#
+# Arguments:
+#       $1 - Error message from part of program (Not always used)
+# Return Values:
+#       none
+abort_script()
+{
+_err_time_=`$DATE '+%Y-%b-%d_%H.%M.%S'`
+
+if [ "$1" ]; then
+    _err_msg_="${_err_time_} - ERROR : $1"
+else
+    _err_msg_="${_err_time_} - ERROR : Script aborted.......\n"
+fi
+
+$RM -rf ${VAR_TMP_DIR}/fs_rollback_indicator
+
+# Check if log_msg() is defined
+type log_msg > /dev/null 2>&1
+if [ $? -gt 0 ]; then
+    if [ "${LOGFILE}" ]; then
+        if [ ! "${SNAP_QUIET}" ]; then
+            $ECHO "\n${_err_msg_}\n" |$TEE -a ${LOGFILE}
+        else
+            $ECHO "\n${_err_msg_}\n" >> ${LOGFILE}
+        fi
+    else
+        $ECHO "\n${_err_msg_}\n"
+    fi
+else
+    if [ "${LOGFILE}" ]; then
+            log_msg -s "\n${_err_msg_}\n" -l ${LOGFILE} ${SNAP_QUIET}
+    else
+            log_msg -s "\n${_err_msg_}\n" ${SNAP_QUIET}
+    fi
+fi
+
+cd $SCRIPTHOME
+
+$RM -rf ${TEM_DIR}
+
+if [ "$2" ]; then
+        ${2}
+else
+        exit 1
+fi
+}
+### Function: backup_sentinel_service ###
+#
+# Create required Snapshots
+#
+# Arguments:
+#   ${SNAP_NAME}
+# Return Values:
+#   none
+backup_sentinel_service()
+{
+log_msg -s "\nBacking up sentinel to $ENIQ_CONF_DIR/sentinel_service.${SNAP_NAME} for inclusion in snapshot" ${_log_id_str} ${SNAP_QUIET}
+$CP $SENTINEL_DIR/licensing-sentinel.service $ENIQ_CONF_DIR/licensing-sentinel.service.${SNAP_NAME}
+if [ $? -ne 0 ]; then
+    _err_msg_="Failed to backup licensing-sentinel.service to $ENIQ_CONF_DIR/sentinel_service.${SNAP_NAME}\n"
+    abort_script "${_err_msg_}"
+fi
+}
+### Function: backup_hosts_file ###
+#
+# Create required Snapshots
+#
+# Arguments:
+#   ${SNAP_NAME}
+# Return Values:
+#   none
+backup_hosts_file()
+{
+log_msg -s "\nBacking up /etc/hosts to $ENIQ_CONF_DIR/hosts.${SNAP_NAME} for inclusion in snapshot" ${_log_id_str} ${SNAP_QUIET}
+$CP /etc/hosts $ENIQ_CONF_DIR/hosts.${SNAP_NAME}
+if [ $? -ne 0 ]; then
+    _err_msg_="Failed to backup /etc/hosts to $ENIQ_CONF_DIR/hosts.${SNAP_NAME}\n"
+    abort_script "${_err_msg_}"
+fi
+}
+
+### Function: chk_create_logfile ###
+#
+# Check/Create Logfile
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+chk_create_logfile()
+{
+$MKDIR -p `$DIRNAME ${LOGFILE}`
+if [ $? -ne 0 ]; then
+        _err_msg_="Could not create directory `$DIRNAME ${LOGFILE}`"
+        abort_script "${_err_msg_}"
+fi
+
+$TOUCH -a ${LOGFILE}
+if [ $? -ne 0 ]; then
+        _err_msg_="Could not write to file ${LOGFILE}"
+        abort_script "${_err_msg_}"
+fi
+
+_log_id_str="-l ${LOGFILE}"
+}
+
+### Function: check_id ###
+#
+#   Check that the effective id of the user is correct
+#   If not print error msg and exit.
+#
+# Arguments:
+#       $1 : User ID name
+# Return Values:
+#       none
+check_id()
+{
+_check_id_=`$ID  | $AWK -F\( '{print $2}' | $AWK -F\) '{print $1}'`
+if [ "$_check_id_" != "$1" ]; then
+    _err_msg_="You must be $1 or have equal permissions to execute this script."
+    abort_script "${_err_msg_}"
+fi
+}
+
+### Function: check_params ###
+#
+# Check Input Params
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+check_params()
+{
+# Must have SNAP_ACTION, & SNAP_FS
+if [ ! "${SNAP_ACTION}" -o ! "${LVM_NAME}" ]; then
+    usage_msg
+    exit 1
+fi
+
+if [ "${SNAP_ACTION}" == "create" ]; then
+    if [ ! "${SNAP_NAME}" ]; then
+        usage_msg
+        exit 1
+    fi
+else 
+      if [ "${SNAP_NAME}" ]; then
+        usage_msg
+        exit 1
+    fi
+fi
+
+# if [ "${SNAP_ACTION}" == "mount" -o "${SNAP_ACTION}" == "rollback" ]; then
+    # if [[ "${LVM_NAME}" != "ALL="* ]]; then
+        # usage_msg
+        # $ECHO "Please provide only one snapshot label\n\n"
+        # exit 1
+    # fi
+# fi
+
+
+case "${SNAP_ACTION}" in
+    create)     SNAP_OPT=snapshot
+                ;;
+    delete)     SNAP_OPT=destroy
+                ;;
+    list)       SNAP_OPT=list
+                ;;
+    mount)      SNAP_OPT=mount
+                ;;
+    rollback)   SNAP_OPT=rollback
+                ;;
+    *)          usage_msg
+                exit 1
+                ;;
+esac
+}
+
+### Function: check_required_files_scripts ###
+#
+# Check we have the right files
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+check_required_files_scripts()
+{
+if [ ! -s ${TEMPLATES_DIR}/${INSTALL_TYPE}/admin/bin/manage_eniq_services.bsh ]; then
+    _err_msg_="${TEMPLATES_DIR}/${INSTALL_TYPE}/admin/bin/manage_eniq_services.bsh"
+    abort_script "${_err_msg_}"
+fi
+}
+
+### Function: check_services ###
+#
+# Services are offline
+#
+# Arguments:
+#   $1 : create/rollback
+# Return Values:
+#   none
+check_services()
+{
+$RM -rf ${TEM_DIR}/eniq_service_list
+
+_server_list_=""
+
+$CAT ${TEMPLATES_DIR}/${INSTALL_TYPE}/admin/etc/smf_contract_config | $EGREP "${CURR_SERVER_TYPE}" | $EGREP "ENIQ" > $TEM_DIR/service_list.$$.$$
+if [ ! -s $TEM_DIR/service_list.$$.$$ ]; then
+    _err_msg_="Could not get a list of services for this server"
+    abort_script "${_err_msg_}"
+fi
+
+while read _line_; do
+    _service_name_=`$ECHO ${_line_} | $AWK -F"::" '{print $3}'`
+    _use_service_=`$ECHO ${_line_} | $AWK -F"::" '{print $4}'`
+    if [ "${_use_service_}" == "Y" ]; then
+                if [ "${_server_list_}" == "" ]; then
+            _server_list_=${_service_name_}
+                else
+            _server_list_="${_server_list_} ${_service_name_}"
+                fi
+    fi
+done < $TEM_DIR/service_list.$$.$$
+
+for _eniq_service_ in ${_server_list_}; do
+    _service_=`$SYSTEMCTL show ${_eniq_service_} -p ActiveState | $AWK -F= '{print $2}'| $GREP -w active`
+    if [ "${_service_}" ]; then
+        $ECHO ${_service_} >> ${TEM_DIR}/eniq_service_list
+    fi
+done
+
+if [ -s ${TEM_DIR}/eniq_service_list ]; then
+    $CAT ${TEM_DIR}/eniq_service_list
+    _err_msg_="ENIQ services are online\nCannot $1 snapshot"
+    abort_script "${_err_msg_}"
+fi
+}
+
+### Function: create_snapshots ###
+#
+# Create required Snapshots
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+create_snapshots()
+{
+if [ "${STORAGE_TYPE}" == "raw" ]; then
+     if [  "${CURR_SERVER_TYPE}" == "stats_coordinator" -o "${CURR_SERVER_TYPE}" == "stats_iqr" -o "${CURR_SERVER_TYPE}" == "eniq_stats" ]; then
+           log_msg -s "Backing up 99-iq-raw-devs.rules file to ${ENIQ_CONF_DIR}\n" -l ${LOGFILE}
+           $CP -pf /etc/udev/rules.d/99-iq-raw-devs.rules ${ENIQ_CONF_DIR}/99-iq-raw-devs.rules
+           if [ $? -ne 0 ]; then
+                _err_msg_="Failed to backup 99-iq-raw-devs.rules to ${ENIQ_CONF_DIR}"
+                abort_script "${_err_msg_}"
+           fi
+     fi
+fi
+
+if [ ! "${SKIP_SERVICE_CHECK}" ]; then
+    check_services create
+fi
+
+if [ ! "${SNAP_FORCE}" ]; then
+    # Check that there are no snapshots already created
+    $LVS -o lv_name,lv_attr --noheadings -S "lv_attr=~[^s.*]" | $AWK '{print $1}' | $AWK -F_ '{ print $3}' | $SORT -u | $GREP -w "${SNAP_NAME}" >> /dev/null 2>&1
+    if [ $? -eq 0 ]; then
+        _err_msg_="Snapshots already exist using string \"${SNAP_NAME}\""
+        abort_script "${_err_msg_}"
+    fi
+fi
+
+# Get a list of the file-systems
+$RM -rf ${TEM_DIR}/fs_list_file
+
+$CAT ${FS_SNAP_DET} | $EGREP -v '^[[:blank:]]*#' > ${TEM_DIR}/fs_list_file
+if [ ! -s ${TEM_DIR}/fs_list_file ]; then
+        _err_msg_="${TEM_DIR}/fs_list_file does not exist, or is empty"
+    abort_script "${_err_msg_}"
+fi
+
+# Build a list of file-systems that are NOT to be snapped
+if [ "${LVM_NAME}" == "ALL" ]; then
+    _exclude_list_="local_logs log"
+    for _fs_ in `$CAT ${TEM_DIR}/fs_list_file`; do
+        _fs_name_=`$ECHO ${_fs_} | $AWK -F\:: '{print $1}'`
+        _snap_opt_=`$ECHO ${_fs_} | $AWK -F\:: '{print $2}'`
+        if [ "${_snap_opt_}" == "N" ]; then
+            if [ "${_exclude_list_}" == "" ]; then
+                _exclude_list_="${_fs_name_}"
+            else
+                _exclude_list_="${_exclude_list_} ${_fs_name_}"
+            fi
+        fi
+    done
+    
+    _exclude_fs_=0
+    if [ "${_exclude_list_}" != "" ]; then
+            _exclude_list_=`$ECHO ${_exclude_list_} | $SED -e 's/ /|/g'`
+            if [ $? -ne 0 ]; then
+                _err_msg_="Could not re-format exclude list"
+                abort_script "${_err_msg_}"
+            fi
+            _exclude_fs_=1
+            LVM_EXCLUDED_LIST="${_exclude_list_}"
+    fi
+fi
+
+# Create list of file-systems to be created.
+
+local  _lvlist_  _lv_  _lv_path_ _swap_chk_ _vg_ _vg1_
+
+# Get a list of ALL LVG(s)
+_vglist_=`iniget SunOS_FS_POOL_1 -f ${ENIQ_CONF_DIR}/${SUNOS_INI} -v name` 
+if [ ! {_vglist_} ]; then
+    _err_msg_="Could not get the list of all VGs"
+    abort_script "${_err_msg_}"
+fi
+
+#Get disk layout for pool
+_pool_disk_layout_=`iniget SunOS_FS_POOL_1 -f ${ENIQ_CONF_DIR}/${SUNOS_INI} -v disk_layout`
+if [ ! "${_pool_disk_layout_}" ]; then
+     _err_msg_="Could not get the list of all VGs"
+      abort_script "${_err_msg_}"
+fi
+
+#Initialize number of stripes
+_NO_OF_STRIPES_=0
+
+for _disk_ in ${_pool_disk_layout_}; do
+    #Update number of stripes in snapshot creation
+    _NO_OF_STRIPES_=`$ECHO "${_NO_OF_STRIPES_} + 1" | $BC`
+done
+
+# Get a list of LVM(s) that need to be snapped.
+get_lvm_list "${LVM_NAME}" "${_vglist_}" "${LVM_EXCLUDED_LIST}" > ${TEM_DIR}/lvm_list_file_1
+
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not get the list of all LVMs"
+    abort_script "${_err_msg_}"
+fi
+
+if [ ! -s ${TEM_DIR}/lvm_list_file_1 ]; then
+    _err_msg_="No Logical Volumes were found for specified Volume\nGroups ${_vglist_}"
+    abort_script "${_err_msg_}"
+fi
+
+# Get the fields I am interested in
+$CAT ${TEM_DIR}/lvm_list_file_1 | $AWK '{if ( $3 ~ /^[^sS]/ ) print $1,$2}' >> ${TEM_DIR}/lvm_list_file_2
+
+if [ ! -s ${TEM_DIR}/lvm_list_file_2 ]; then
+    _err_msg_="Could not format ${TEM_DIR}/lvm_list_file_1"
+    abort_script "${_err_msg_}"
+fi
+
+# Get a list of ALL LVM(s) except swap
+while read _lv_ _vg1_;do
+    _swap_chk_=`$BLKID /dev/mapper/${_vg1_}-${_lv_} -o value -s TYPE`
+    if [ "${_swap_chk_}" != "swap" ]; then
+        $ECHO "${_lv_} ${_vg1_}" >>  ${TEM_DIR}/lvm_list_file
+    fi
+done < ${TEM_DIR}/lvm_list_file_2
+
+if [ ! -s ${TEM_DIR}/lvm_list_file ]; then
+    _err_msg_="No Logical Volumes other than swap were found for specified Volume\nGroups ${_vglist_}"
+    abort_script "${_err_msg_}"
+fi
+
+let _field1_=_field1_+40
+let _field2_=_field2_+40
+
+_line1_str_="\n%-${_field1_}s%-${_field2_}s\n\n"
+_line2_str_="%-${_field1_}s%-${_field2_}s\n"
+
+printf "${_line1_str_}"  "FS Name" >> ${TEM_DIR}/lvm_outfile 
+
+while read _lv_ _vg_;do
+    printf "${_line2_str_}" "${_lv_}" >> ${TEM_DIR}/lvm_outfile
+done < ${TEM_DIR}/lvm_list_file
+
+if [ ! "${NO_CONFIRM}" ]; then
+    user_confirm "snapshot the file-systems" "${TEM_DIR}/lvm_outfile"
+    if [ "$USER_CONF" == "No" ]; then
+        $RM -rf ${TEM_DIR}
+        exit 0
+    fi
+fi
+
+_snap_time_=`$DATE '+%Y-%b-%d_%H.%M.%S'`
+if [ ! "${NO_HEADER}" ]; then
+    log_msg -s "\n${_snap_time_} - Creating snapshots with label \"${SNAP_NAME}\"" ${_log_id_str} ${SNAP_QUIET}
+fi
+
+# Backup /etc/hosts file before snapping file-systems
+backup_hosts_file
+
+# Backup licensing-sentinel.service file before snapping file-systems
+backup_sentinel_service
+
+# Getting the volume group size
+_vg_size_=`$VGS ${_vglist_} -o vgsize --noheading`
+if [ ! "${_vg_size_}" ]; then
+    _err_msg_="Could not determine size of ${_vglist_}"
+    abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+fi
+
+# Getting only numerical value of volume group size
+_vg_size_num_=`$VGS ${_vglist_} -o vgsize --noheading | $SED -e 's/[^0-9.]//g'`
+if [ ! "${_vg_size_num_}" ]; then
+    _err_msg_="Could not determine numerical value of volume group size"
+    abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+fi
+
+# Converting VG size in GB if it is in TB
+_size_tag_=`$ECHO "${_vg_size_: -1}"`
+if [ ! "${_size_tag_}" ]; then
+    _err_msg_="Could not determine if volume group size is in TB or GB"
+    abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+fi
+
+# Converting VG size in GB
+if [ "${_size_tag_}" == "t" ]; then
+    _disk_size_=`$AWK -v _vol_size_=${_vg_size_num_} 'BEGIN {print _vol_size_ * 1024}'`
+else
+    _disk_size_="${_vg_size_num_}"
+fi
+
+if [ ! "${_disk_size_}" ]; then
+    _err_msg_="Could not determine the size of volume group in GB"
+    abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+fi
+
+# Getting available VG size excluding SWAP space
+if [  "${CURR_SERVER_TYPE}" == "stats_coordinator" -o "${CURR_SERVER_TYPE}" == "eniq_stats" ]; then
+   _avail_disk_size_=`$ECHO "{scale=3; ${_disk_size_} - ${MAX_16G_SWAP}}" | $BC`
+    if [ ! "${_avail_disk_size_}"  ]; then
+          _err_msg_="Could not determine available disk size ${_pool_disk_layout_}"
+          abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+    fi
+else
+    _avail_disk_size_=`$ECHO "{scale=3; ${_disk_size_} - ${MAX_8G_SWAP}}" | $BC`
+    if [ ! "${_avail_disk_size_}"  ]; then
+          _err_msg_="Could not determine disk size available space of ${_pool_disk_layout_}"
+          abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+    fi
+fi
+
+#get the fs tag
+get_fs_size_tag
+
+# Getting FS size tag based on hardware generation in Rack server
+if [ "${STORAGE_TYPE}" == "fs" ]; then
+    # Getting current hardware generation
+    _hard_gen_=`$DMIDECODE -s system-product-name | $AWK -F " " '{print $3}'`
+    if [ ! "${_hard_gen_}" ]; then
+        _err_msg_="Could not determine current hardware generation"
+        abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+    fi
+fi
+
+log_msg -s "\n`$DATE +%d.%m.%y_%H:%M:%S` - Creating FS snapshot(s) with label \"${SNAP_NAME}\"" -l ${LOGFILE} ${SNAP_QUIET}
+
+for _fs_ in `$CAT ${TEM_DIR}/lvm_list_file | $EGREP "[[:blank:]]+${_vglist_}[[:blank:]]*$" | $AWK '{print $1}'`; do
+
+    # Construct the Logical Volume Path
+    _lv_path_="/dev/${_vglist_}/${_fs_}"
+
+	
+    # Test that path is sane
+     $LVDISPLAY ${_lv_path_} >> /dev/null 2>&1
+    if [ $? -ne 0 ]; then
+        _err_msg_="Invalid LV Path Name '${_lv_path_}' constructed"
+        abort_script "${_err_msg_}"
+    fi
+    
+	unset _fs_size_tag_name_
+
+    # Getting SNAP size tag name 
+    if [ "${STORAGE_TYPE}" == "fs" ]; then
+        
+        $ECHO "${_fs_}" | $GREP "eniq_oss" >> /dev/null 2>&1
+        if [ $? -ne 0 ]; then
+            _fs_size_tag_name_="${_hard_gen_}_${_fs_size_tag_}"
+        else
+            _fs_size_tag_name_="eniq_stats_fls_fs_size"
+        fi
+    else
+        _fs_size_tag_name_="${_fs_size_tag_}"
+    fi
+
+    # Getting SNAP size percentage from SunOS.ini
+    $ECHO "${_fs_}" | $GREP "eniq_oss" >> /dev/null 2>&1
+    if [ $? -ne 0 ]; then 
+        _snap_size_=`iniget ${_fs_size_tag_name_} -f ${ENIQ_CONF_DIR}/${SUNOS_INI} -v "${_fs_}" | $AWK -F ":" '{print $2}'`
+    else
+        _snap_size_=`iniget ${_fs_size_tag_name_} -f ${ENIQ_CONF_DIR}/${SUNOS_INI} -v "${_hard_gen_}_eniq_oss" | $AWK -F ":" '{print $2}'`
+    fi
+   
+    if [ ! "${_snap_size_}" ]; then
+        _err_msg_="Could not read _snap_size_ parameter from ${ENIQ_CONF_DIR}/${SUNOS_INI}"
+        abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+    fi
+
+    _final_snap_size_=`$ECHO "scale=3; ${_snap_size_}/100" | $BC`
+    if [ ! "${_final_snap_size_}"  ]; then
+        _err_msg_="Could not determine value of _final_snap_size_"
+        abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+    fi
+    
+    # Getting FS size
+    _size_fs_=`$LVS ${_lv_path_} -o lvsize --noheading`
+    if [ ! "${_size_fs_}"  ]; then
+        _err_msg_="Could not determine value of _size_fs_"
+        abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+    fi
+    
+    # Checking if LVM size is in TB/GB/MB
+    _lv_size_tag_=`$ECHO "${_size_fs_: -1}"`
+    if [ ! "${_lv_size_tag_}" ]; then
+        _err_msg_="Could not determine if LVM size is in TB/GB/MB"
+        abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+    fi
+
+    # Getting only numerical value of LVM size
+    _size_fs_num_=`$LVS ${_lv_path_} -o lvsize --noheading | $SED -e 's/[^0-9.]//g'`
+    if [ ! "${_size_fs_num_}"  ]; then
+        _err_msg_="Could not determine value of _size_fs_num_"
+        abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+    fi
+
+    # Converting LVM size in GB
+    if [ "${_lv_size_tag_}" == "t" ]; then
+        _lv_space_=`$ECHO "scale=3; ${_size_fs_num_} * 1024" | $BC`
+    elif [ "${_lv_size_tag_}" == "m" ]; then
+        _lv_space_=`$ECHO "scale=3; ${_size_fs_num_} / 1024" | $BC`
+    else
+        _lv_space_="${_size_fs_num_}"
+    fi
+
+    
+    # Getting snapshot size for FS based on FS size
+    _size_snap_=`$ECHO "scale=3; ${_final_snap_size_} * ${_lv_space_}" | $BC` 
+    if [ ! "${_size_snap_}"  ]; then
+        _err_msg_="Could not determine size of _size_snap_"
+        abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+    fi
+    
+	# Getting free size of volume group
+    _free_size_=`$VGS ${_vglist_} -o vg_free --noheading`
+    if [ ! "${_free_size_}"  ]; then
+        _err_msg_="Could not determine free size in volume group ${_vglist_}"
+        abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+    fi
+	
+    # Getting only numerical value of free size of volume group
+    _free_size_num_=`$VGS ${_vglist_} -o vg_free --noheading | $SED -e 's/[^0-9.]//g'`
+	if [ ! "${_free_size_num_}"  ]; then
+        _err_msg_="Could not determine free size in volume group ${_vglist_}"
+        abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+    fi
+	
+    # Checking if VG free size is in TB/GB/MB
+    _free_size_tag_=`$ECHO "${_free_size_: -1}"`
+    if [ ! "${_free_size_tag_}" ]; then
+        _err_msg_="Could not determine if volume group size is in TB or GB"
+        abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+    fi
+
+    # Converting VG size in GB
+    if [ "${_free_size_tag_}" == "t" ]; then
+        _free_vg_space_=`$ECHO "scale=3; ${_free_size_num_} * 1024" | $BC`
+    elif [ "${_free_size_tag_}" == "m" ]; then
+	    _free_vg_space_=`$ECHO "scale=3; ${_free_size_num_} / 1024" | $BC`
+	else
+        _free_vg_space_="${_free_size_num_}"
+    fi
+	
+    if [ ! "${_free_vg_space_}" ]; then
+        _err_msg_="Could not determine final free size of volume group ${_vglist_}"
+        abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+    fi
+    
+    # BC checks if conditions is true then it returns 1 else 0
+    if [[ $($BC <<<"${_free_vg_space_}  < ${_size_snap_}") -eq 1 ]]; then
+        _err_msg_="Sufficient size is not available in volume group to create the snapshot"
+        abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+    fi
+
+    if [ "${STORAGE_TYPE}" == "fs" ]; then
+         $ECHO "$LVCREATE -L ${_size_snap_}g --snapshot --stripes ${_NO_OF_STRIPES_} --name ${_fs_}${SNAP_DELIM}${SNAP_NAME} ${_lv_path_}" >> ${LOGFILE}
+         $LVCREATE -L ${_size_snap_}g --snapshot --stripes ${_NO_OF_STRIPES_} --name ${_fs_}${SNAP_DELIM}${SNAP_NAME} ${_lv_path_}  >> ${LOGFILE} 2>&1
+         if [ $? -ne 0 ]; then
+              _err_msg_="Failed to Create snapshot of ${_fs_} with label ${SNAP_NAME}"
+              abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+         fi
+    else
+    
+         $ECHO "$LVCREATE -L ${_size_snap_}g --snapshot --name ${_fs_}${SNAP_DELIM}${SNAP_NAME} ${_lv_path_}" >> ${LOGFILE}
+         $LVCREATE -L ${_size_snap_}g --snapshot --name ${_fs_}${SNAP_DELIM}${SNAP_NAME} ${_lv_path_}  >> ${LOGFILE} 2>&1
+
+         if [ $? -ne 0 ]; then
+              _err_msg_="Failed to Create snapshot of ${_fs_} with label ${SNAP_NAME}"
+              abort_script "${_err_msg_}"
+         fi
+    fi
+done
+log_msg -s "\n--------------------------------------------------------" -l ${LOGFILE} ${SNAP_QUIET}
+log_msg -s "`$DATE +%d.%m.%y_%H:%M:%S` - FS Snapshots with label ${SNAP_NAME} created successfully" -l ${LOGFILE} ${SNAP_QUIET}
+log_msg -s "---------------------------------------------------------" -l ${LOGFILE} ${SNAP_QUIET}
+
+if [ ! "${NO_HEADER}" ]; then
+    log_msg -s "Snapshot ${SNAP_NAME} created successfully\n" ${_log_id_str} ${SNAP_QUIET} -t
+fi
+
+
+#Remove the copy of /etc/hosts file from /eniq/installation/config directory after it's been snapped
+$RM -rf $ENIQ_CONF_DIR/hosts.${SNAP_NAME}
+if [ $? -ne 0 ]; then
+    _err_msg_="Failed to delete $ENIQ_CONF_DIR/hosts.${SNAP_NAME}\n"
+    abort_script "${_err_msg_}"
+fi
+
+}
+
+### Function: destroy_snapshots ###
+#
+# Destroy required Snapshots
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+destroy_snapshots()
+{
+# Get a list of LVG(s)
+
+_vglist_=`$VGS --noheadings 2>/dev/null|$AWK '{print $1}'`
+if [ ! {_vglist_} ]; then
+    _err_msg_="Could not get the list of all VGs"
+    abort_script "${_err_msg_}"
+fi
+
+# Get a list of ALL LVM(s) into lvm_list_file_1
+#----------------------------------------------
+get_lvm_list "${LVM_NAME}" "${_vglist_}" "${LVM_EXCLUDED_LIST}" > ${TEM_DIR}/lvm_list_file_1
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not get the list of lvm"
+    abort_script "${_err_msg_}"
+fi
+
+if [ ! -s ${TEM_DIR}/lvm_list_file_1 ]; then
+    _err_msg_="No Logical Volumes were found for specified Volume\nGroups ${_vglist_}"
+    abort_script "${_err_msg_}"
+fi
+if [[ "${LVM_NAME}" == ALL* ]]; then
+    $ECHO "${LVM_NAME}" | $EGREP '^[[:blank:]]*ALL' >> /dev/null 2>&1
+    if [ $? -eq 0 ]; then
+        _id_str_=`$ECHO "${LVM_NAME}" | $AWK -F\= '{print $2}' | $HEAD -1`
+        $CAT ${TEM_DIR}/lvm_list_file_1 | $AWK '{print $1}' | $EGREP "${_id_str_}$" > ${TEM_DIR}/lvm_list_file_2
+    else
+        $CAT ${TEM_DIR}/lvm_list_file_1 > lvm_list_file_2
+    fi
+    
+    if [ ! -s ${TEM_DIR}/lvm_list_file_2 ]; then
+        _err_msg_="No snapshots found to delete"
+        abort_script "${_err_msg_}"
+    fi
+    
+    _snap_name_=`$CAT ${TEM_DIR}/lvm_list_file_2 | $AWK '{print $1}' | $AWK -F"-" '{print $2}' | $GREP -v '^$' `
+    
+    # Get the fields I am interested in from lvm_list_file_1
+    # - only from rows where first attribute in 's' or 'S'
+    #   and name contains ${SNAP_DELIM}${SNAP_NAME}
+    # 1=LV_NAME, 2=VG_NAME, 3=LV_ATTR, 4=LV_SIZE, 5=ORIGIN, 6=LV_TIME
+    #
+    # Store into lvm_list_file in this order separated with space
+    # ORIGIN, VG_NAME and LV_NAME
+    #----------------------------------------------------------------
+    $CAT ${TEM_DIR}/lvm_list_file_1|$AWK '{if ( $3 ~ /^[sS]/ ) print $5,$2,$1}'|$EGREP -w "${_snap_name_}" >> ${TEM_DIR}/lvm_list_file
+else
+    $CAT ${TEM_DIR}/lvm_list_file_1|$AWK '{if ( $3 ~ /^[sS]/ ) print $5,$2,$1}' >> ${TEM_DIR}/lvm_list_file
+fi
+if [ ! -s ${TEM_DIR}/lvm_list_file ]; then
+    _err_msg_="No Snapshot LVM(s) were found for specified Volume Groups\n${_vglist_}"
+    abort_script "${_err_msg_}"
+fi
+
+let _field1_=_field1_+40
+let _field2_=_field2_+40
+_line1_str_="\n%-${_field1_}s%-${_field2_}s\n\n"
+_line2_str_="%-${_field1_}s%-${_field2_}s\n"
+printf "${_line1_str_}" "FS Snapshot Name" >> ${TEM_DIR}/lvm_outfile
+
+
+# In lvm_list_file
+# 1=ORIGIN, 2=VG_NAME, 3=LV_NAME
+#-------------------------------
+while read _origin_ _vgsnap_ _lvsnap_ _rest_;do
+    printf "${_line2_str_}" "${_lvsnap_}" >> ${TEM_DIR}/lvm_outfile
+done < ${TEM_DIR}/lvm_list_file
+
+_snap_label_=`$CAT ${TEM_DIR}/lvm_list_file | $AWK -F"-" '{print $2}' | $HEAD -1`
+
+if [ ! "${NO_CONFIRM}" ]; then
+    user_confirm "delete the snapshots" "${TEM_DIR}/lvm_outfile"
+    if [ "$USER_CONF" == "No" ]; then
+        $RM -rf ${TEM_DIR}
+        exit 0
+    fi
+fi
+
+if [ "${SNAP_FORCE}" ]; then
+    _force_opt_="-r"
+else
+    _force_opt_=""
+fi
+
+_snap_time_=`$DATE '+%Y-%b-%d_%H.%M.%S'`
+log_msg -s "\n${_snap_time_} - Deleting FS snapshots with label \"${_snap_label_}\"\n" ${_log_id_str} ${SNAP_QUIET}
+
+ # In lvm_list_file
+# 1=ORIGIN, 2=VG_NAME, 3=LV_NAME
+#-------------------------------
+while read _origin_ _vgsnap_ _lvsnap_ _rest_;do
+        # Construct the LV Snap path and ensure that the same LV Snap path exists
+        _lv_snap_path_="/dev/${_vgsnap_}/${_lvsnap_}"
+        $LVDISPLAY ${_lv_snap_path_} >> /dev/null 2>&1 || abort_script "Invalid LV SNAP Path Name '${_lv_snap_path_}' constructed"
+        $SLEEP 5
+        # Remove the LVM snapshot
+        log_msg -s "\n`$DATE +%d.%m.%y_%H:%M:%S` - Deleting FS snapshot ${_lvsnap_}\n" -l ${LOGFILE} ${SNAP_QUIET}
+        $LVREMOVE -f ${_lv_snap_path_} >> ${LOGFILE} 2>&1 || abort_script "Failed to remove FS snapshot ${_lvsnap_}"
+    
+done < ${TEM_DIR}/lvm_list_file
+
+log_msg -s "Snapshot \"${_snap_label_}\" successfully deleted\n" ${_log_id_str} ${SNAP_QUIET} -t
+}
+
+### Function: get_absolute_path ###
+#
+# Determine absolute path to software
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+get_absolute_path()
+{
+_dir_=`$DIRNAME $0`
+SCRIPTHOME=`cd $_dir_ 2>/dev/null && pwd || $ECHO $_dir_`
+}
+
+### Function: list_snapshots ###
+#
+# List required Snapshots
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+list_snapshots()
+{
+$ECHO "${LVM_NAME}" | $EGREP '^[[:blank:]]*ALL' >> /dev/null 2>&1 
+ 
+if [ $? -ne 0 ]; then
+    usage_msg
+    exit 1
+fi
+
+# Get the VG name
+_vglist_=`iniget SunOS_FS_POOL_1 -f ${ENIQ_CONF_DIR}/${SUNOS_INI} -v name`
+if [ ! {_vglist_} ]; then
+    _err_msg_="Could not fetch the VGs"
+    abort_script "${_err_msg_}"
+fi
+
+# Get a list of ALL LVM(s) into lvm_list_file_1
+#----------------------------------------------
+get_lvm_list "${LVM_NAME}" "${_vglist_}" "${LVM_EXCLUDED_LIST}" > ${TEM_DIR}/lvm_list_file_1
+
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not get the list of file-systems"
+    abort_script "${_err_msg_}"
+fi
+
+if [ ! -s ${TEM_DIR}/lvm_list_file_1 ]; then
+    _err_msg_="No Logical Volumes were found for specified Volume\nGroups ${_vglist_}"
+    abort_script "${_err_msg_}"
+fi
+
+$ECHO "${LVM_NAME}" | $EGREP '^[[:blank:]]*ALL' >> /dev/null 2>&1
+if [ $? -eq 0 ]; then
+    _id_str_=`$ECHO "${LVM_NAME}" | $AWK -F\= '{print $2}' | $HEAD -1`
+    $CAT ${TEM_DIR}/lvm_list_file_1 | $AWK '{print $1}' | $EGREP "${_id_str_}$" > ${TEM_DIR}/lvm_list_file_2
+else
+    $CAT ${TEM_DIR}/lvm_list_file_1 > lvm_list_file_2
+fi
+
+if [ ! -s ${TEM_DIR}/lvm_list_file_2 ]; then
+    _err_msg_="No snapshots found to list"
+    abort_script "${_err_msg_}"
+fi
+
+_snap_name_=`$CAT ${TEM_DIR}/lvm_list_file_2 | $AWK '{print $1}' | $AWK -F"-" '{print $2}' | $GREP -v '^$' | $SORT -u`
+
+
+# Get the fields I am interested in from lvm_list_file_1
+# - only from rows where first attribute in 's' or 'S'
+#   and name contains ${SNAP_DELIM}${_SNAP_NAME_}
+# 1=LV_NAME, 2=VG_NAME, 3=LV_ATTR, 4=LV_SIZE, 5=ORIGIN, 6=LV_TIME
+#
+# Store into lvm_list_file in this order separated with space
+# ORIGIN, VG_NAME and LV_NAME
+#----------------------------------------------------------------
+
+$CAT ${TEM_DIR}/lvm_list_file_1|$AWK '{if ( $3 ~ /^[sS]/ ) print $5,$1,$6,$7}'|$EGREP -w "${_snap_name_}" >> ${TEM_DIR}/lvm_list_file
+
+if [ ! -s ${TEM_DIR}/lvm_list_file ]; then
+    log_msg -s "No Snapshot LVM(s) were found for specified Volume Groups\n${_vglist_}" ${_log_id_str} ${SNAP_QUIET} -t
+    $RM -rf ${TEM_DIR}
+    exit 1
+fi
+
+let _field1_=_field1_+40
+let _field2_=_field2_+40
+let _field3_=_field3_+40
+let _field4_=_field4_+40
+_line1_str_="\n%-${_field1_}s%-${_field2_}s%-${_field3_}s%-${_field4_}s\n\n"
+_line2_str_="%-${_field1_}s%-${_field2_}s%-${_field3_}s%-${_field4_}s\n"
+printf "${_line1_str_}" "FS Name" "Snapshot Name" "DATE" "TIME" >> ${TEM_DIR}/lvm_outfile
+
+while read _lv_ _lvsnap_ _snapdate_ _snaptime_ ;do
+    printf "${_line2_str_}" "${_lv_}" "${_lvsnap_}" "${_snapdate_}" "${_snaptime_}" >> ${TEM_DIR}/lvm_outfile
+done < ${TEM_DIR}/lvm_list_file
+
+$CAT ${TEM_DIR}/lvm_outfile
+
+$RM -rf ${TEM_DIR}
+}
+
+### Function: mount_snapshots ###
+#
+# Mount required Snapshots
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+mount_snapshots()
+{
+$ECHO "Creating ${SNAP_MOUNT_DIR}" >> ${LOGFILE}
+$MKDIR -p ${SNAP_MOUNT_DIR}
+if [ $? -ne 0 ]; then
+    _err_msg_="Error creating directory ${SNAP_MOUNT_DIR}"
+    abort_script "${_err_msg_}"
+fi
+
+_vglist_=`iniget SunOS_FS_POOL_1 -f ${ENIQ_CONF_DIR}/${SUNOS_INI} -v name` 
+if [ ! {_vglist_} ]; then
+    _err_msg_="Could not get the list of all VGs"
+    abort_script "${_err_msg_}"
+fi
+
+# Get a list of ALL LVM(s) into lvm_list_file_1
+#----------------------------------------------
+get_lvm_list "${LVM_NAME}" "${_vglist_}" "${LVM_EXCLUDED_LIST}" > ${TEM_DIR}/lvm_list_file_1
+
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not get the list of file-systems"
+    abort_script "${_err_msg_}"
+fi
+
+if [ ! -s ${TEM_DIR}/lvm_list_file_1 ]; then
+    _err_msg_="No Logical Volumes were found for specified Volume\nGroups ${_vglist_}"
+    abort_script "${_err_msg_}"
+fi
+
+
+$ECHO "${LVM_NAME}" | $EGREP '^[[:blank:]]*ALL=' >> /dev/null 2>&1
+if [ $? -eq 0 ]; then
+    _id_str_=`$ECHO "${LVM_NAME}" | $AWK -F\= '{print $2}' | $HEAD -1`
+    $CAT ${TEM_DIR}/lvm_list_file_1 | $AWK '{print $1}' | $EGREP "${_id_str_}$" > ${TEM_DIR}/lvm_list_file_2
+else
+    $CAT ${TEM_DIR}/lvm_list_file_1 > lvm_list_file_2
+fi
+
+if [ ! -s ${TEM_DIR}/lvm_list_file_2 ]; then
+    _err_msg_="No snapshots found to mount"
+    abort_script "${_err_msg_}"
+fi
+
+_snap_name_=`$CAT ${TEM_DIR}/lvm_list_file_2 | $AWK '{print $1}' | $AWK -F"-" '{print $2}' | $GREP -v '^$' | $SORT -u`
+
+# Get the fields I am interested in from lvm_list_file_1
+# - only from rows where first attribute in 's' or 'S'
+#   and name contains ${SNAP_DELIM}${SNAP_NAME}
+# 1=LV_NAME, 2=VG_NAME, 3=LV_ATTR, 4=LV_SIZE, 5=ORIGIN, 6=LV_TIME
+#
+# Store into lvm_list_file in this order separated with space
+# ORIGIN, VG_NAME and LV_NAME
+#----------------------------------------------------------------
+
+$CAT ${TEM_DIR}/lvm_list_file_1|$AWK '{if ( $3 ~ /^[sS]/ ) print $5,$2,$1}'|$EGREP -w "${_snap_name_}" >> ${TEM_DIR}/lvm_list_file
+
+if [ ! -s ${TEM_DIR}/lvm_list_file ]; then
+    _err_msg_="No Snapshot LVM(s) were found for specified Volume Groups\n${_vglist_}"
+    abort_script "${_err_msg_}"
+fi
+
+let _field1_=_field1_+40
+let _field2_=_field2_+40
+_line1_str_="\n%-${_field1_}s%-${_field2_}s\n\n"
+_line2_str_="%-${_field1_}s%-${_field2_}s\n"
+printf "${_line1_str_}" "FS Snapshot Name" >> ${TEM_DIR}/lvm_outfile
+
+
+# In lvm_list_file
+# 1=ORIGIN, 2=VG_NAME, 3=LV_NAME
+#-------------------------------
+while read _origin_ _vgsnap_ _lvsnap_ _rest_;do
+    printf "${_line2_str_}" "${_lvsnap_}" >> ${TEM_DIR}/lvm_outfile
+done < ${TEM_DIR}/lvm_list_file
+
+if [ ! "${NO_CONFIRM}" ]; then
+    user_confirm "mount the snapshots" "${TEM_DIR}/lvm_outfile"
+    if [ "$USER_CONF" == "No" ]; then
+        $RM -rf ${TEM_DIR}
+        exit 0
+    fi
+fi
+
+#In lvm_list_file separator inside a row is space
+# 1=ORIGIN, 2=VG_NAME, 3=LV_NAME
+#-------------------------------------------------
+while read _lv_ _vgname_ _lv_snap_name_ _rest_; do
+# Get a mountpoint  of origin LVM
+#--------------------------------
+_lvm_mount_dir_=`$MOUNT | $EGREP "\/dev\/mapper\/${_vgname_}-${_lv_}[[:blank:]]"|$EGREP -v "${SNAP_MOUNT_DIR}" |$EGREP -v "ombs_cfg"| $AWK '{print $3}'`
+
+if [ ! "${_lvm_mount_dir_}" ]; then
+    
+    _err_msg_="Failed to get the mount directory from eniq_backup.conf"
+    abort_script "${_err_msg_}"
+
+fi
+$ECHO  "${_lvm_mount_dir_}@${_lv_}@${_lv_snap_name_}" >> ${TEM_DIR}/${_vgname_}_lvm_list_file
+    
+done < ${TEM_DIR}/lvm_list_file
+
+
+_vgname_=`$CAT ${TEM_DIR}/lvm_list_file | $AWK '{print $2}' | $SORT -u` 
+
+for _lv_det_ in `$CAT ${TEM_DIR}/${_vgname_}_lvm_list_file|$SORT -t"@" -k 1,1`; do
+    _lvm_mount_dir_=`$ECHO ${_lv_det_}|$AWK -F"@" '{print $1}'`
+    _lv_=`$ECHO ${_lv_det_}|$AWK -F"@" '{print $2}'`
+    _lv_snap_name_=`$ECHO ${_lv_det_}|$AWK -F"@" '{print $3}'`
+
+    # Construct the Logical Volume Snapshot Path
+    #-------------------------------------------
+    _lv_snap_path_="/dev/${_vgname_}/${_lv_snap_name_}"
+
+    # Test that path is sane
+    #-----------------------
+    $LVDISPLAY ${_lv_snap_path_} >> /dev/null 2>&1
+
+    if [ $? -ne 0 ]; then
+        _err_msg_="Invalid LV SNAP Path Name '${_lv_snap_path_}' constructed"
+        abort_script "${_err_msg_}"
+    fi
+
+    if [ ! -d ${SNAP_MOUNT_DIR}${_lvm_mount_dir_} ]; then
+        log_msg -s "`$DATE +%d.%m.%y_%H:%M:%S` - Creating mount point ${SNAP_MOUNT_DIR}/${_lvm_snap_mount_dir_} for snapshot ${_lv_snap_path_}" -l ${LOGFILE} ${SNAP_QUIET}
+        $MKDIR -p ${SNAP_MOUNT_DIR}${_lvm_mount_dir_} >> /dev/null 2>&1
+
+        if [ $? -ne 0 ]; then
+            _err_msg_="Could not create directory ${SNAP_MOUNT_DIR}/${_lvm_snap_mount_dir_}"
+            abort_script "${_err_msg_}"
+        fi
+
+    fi
+
+
+    log_msg -s "`$DATE +%d.%m.%y_%H:%M:%S` - Mounting the snapshot ${_lv_snap_path_} on ${SNAP_MOUNT_DIR}${_lvm_snap_mount_dir_}\n" -l ${LOGFILE} ${SNAP_QUIET}
+
+    $MOUNT  ${_lv_snap_path_} ${SNAP_MOUNT_DIR}${_lvm_mount_dir_} >> ${LOGFILE}
+
+    if [ $? -ne 0 ]; then
+        _err_msg_="Could not mount  ${_lv_snap_path_} on directory ${SNAP_MOUNT_DIR}${_lvm_mount_dir_}"
+        abort_script "${_err_msg_}"
+    fi
+done
+
+}
+### Function: restore_sentinel_service ###
+#
+# Create required Snapshots
+#
+# Arguments:
+#   ${SNAP_NAME}
+# Return Values:
+#   none
+restore_sentinel_service()
+{
+if [ -s $ENIQ_CONF_DIR/licensing-sentinel.service.${_snap_label_} ]; then
+    log_msg -s "Restoring $ENIQ_CONF_DIR/licensing-sentinel.service.${_snap_label_} to $SENTINEL_DIR/licensing-sentinel.service \n" ${_log_id_str} ${SNAP_QUIET}
+    $CP $ENIQ_CONF_DIR/licensing-sentinel.service.${_snap_label_} $SENTINEL_DIR/licensing-sentinel.service
+    if [ $? -ne 0 ]; then
+        _err_msg_="Failed to restore $ENIQ_BASE_DIR/installation/.fs/snapshot/${_snap_label_}/licensing-sentinel.service.${_snap_label_} to $SENTINEL_DIR/licensing-sentinel.service \n"
+        abort_script "${_err_msg_}"
+    fi
+
+
+    log_msg -s "Importing sentinel service file into systemd" ${_log_id_str} ${SNAP_QUIET}
+    $SYSTEMCTL daemon-reload
+    if [ $? -ne 0 ]; then
+        _err_msg_="Error importing sentinel service files."
+        abort_script "${_err_msg_}"
+    fi
+
+
+    $RM -rf $ENIQ_CONF_DIR/licensing-sentinel.service.${_snap_label_}
+    if [ $? -ne 0 ]; then
+        _err_msg_="Failed to remove $ENIQ_CONF_DIR/sentinel.service.${_snap_label_}\n"
+        abort_script "${_err_msg_}"
+    fi
+fi
+}
+### Function: restore_hosts_file ###
+#
+# Create required Snapshots
+#
+# Arguments:
+#   ${SNAP_NAME}
+# Return Values:
+#   none
+restore_hosts_file()
+{
+if [ -s $ENIQ_CONF_DIR/hosts.${_snap_label_} ]; then
+        log_msg -s "Restoring $ENIQ_CONF_DIR/hosts.${_snap_label_} to /etc/hosts \n" ${_log_id_str} ${SNAP_QUIET}
+        $CP -p $ENIQ_CONF_DIR/hosts.${_snap_label_} /etc/hosts
+        if [ $? -ne 0 ]; then
+        _err_msg_="Failed to restore $ENIQ_BASE_DIR/installation/.fs/snapshot/${_snap_label_}/config/hosts.${_snap_label_} to /etc/hosts\n"
+        abort_script "${_err_msg_}"
+    fi
+
+    $RM -rf $ENIQ_CONF_DIR/hosts.${_snap_label_}
+    if [ $? -ne 0 ]; then
+        _err_msg_="Failed to remove $ENIQ_CONF_DIR/hosts.${_snap_label_}\n"
+        abort_script "${_err_msg_}"
+    fi
+else
+        log_msg -s "\nBackup of hosts file $ENIQ_CONF_DIR/hosts.${_snap_label_} not found to restore\n" ${_log_id_str} ${SNAP_QUIET}
+fi
+}
+
+### Function: rollback_systemd ###
+#
+# Rollback to the original service files
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+rollback_systemd()
+{
+$ECHO "Removing existing services files in ${ENIQ_SVC_MANIFEST_LOC}" | $TEE -a ${LOGFILE}
+$LS ${ENIQ_SVC_MANIFEST_LOC} | $GREP "^eniq-" | $XARGS $RM -f >> /dev/null 2>&1
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not remove eniq services files with .service extension from ${ENIQ_SVC_MANIFEST_LOC}"
+    abort_script "${_err_msg_}"
+fi
+
+$SYSTEMCTL daemon-reload
+$SLEEP 5
+
+
+if [ -d ${TEMPLATES_DIR}/${INSTALL_TYPE}/admin/${STORAGE_TYPE} ]; then
+        _old_var_loc_=${TEMPLATES_DIR}/${INSTALL_TYPE}/admin/${STORAGE_TYPE}
+else
+        _old_var_loc_=${TEMPLATES_DIR}/${INSTALL_TYPE}/admin
+fi
+
+if [ ! -d ${_old_var_loc_} ]; then
+    _err_msg_="Could not find directory ${_old_var_loc_}"
+    abort_script "${_err_msg_}"
+fi
+
+$ECHO "\nImporting new /etc directory from ${_old_var_loc_}" | $TEE -a ${LOGFILE}
+_tem_file_=${TEM_DIR}/tem_file
+for _file_ in `$FIND ${_old_var_loc_} -type f | $GREP -v var`; do
+    $CP ${_file_} ${ENIQ_SVC_MANIFEST_LOC}
+done
+
+cd ${_old_var_loc_}
+$FIND etc -depth -print | $CPIO -pdmu /   
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not import new /etc dir from ${_old_var_loc_}"
+    abort_script "${_err_msg_}"
+fi
+cd $SCRIPTHOME
+
+# Validate the service files
+for _svc_file_ in `$LS ${ENIQ_SVC_MANIFEST_LOC}/eniq-*.service`; do
+    $ECHO "Validating ${_svc_file_}" | $TEE -a ${LOGFILE}
+    $SYSTEMD_ANALYZE verify  ${_svc_file_} >> /dev/null 2>&1
+    if [ $? -ne 0 ]; then
+        _err_msg_="Error validating service file ${_svc_file_}"
+        abort_script "${_err_msg_}"
+    fi
+done
+
+# Import the service files into systemd
+$ECHO "\nImporting the service files into systemd" | $TEE -a ${LOGFILE}
+_manifest_import_=0
+for _svc_file_ in `$LS ${ENIQ_SVC_MANIFEST_LOC}/eniq-*.service`; do
+     _service_name_=`$ECHO ${_svc_file_} | $AWK -F"/" '{print $NF}' | $CUT -d '.' -f 1`
+    if [ $_manifest_import_ -eq 0 ];then
+       
+       $SYSTEMCTL daemon-reload
+       if [ $? -ne 0 ]; then
+          _err_msg_="Error importing new services  files."
+          abort_script "${_err_msg_}"
+       fi
+       # Import should be instant. Wait for a second
+       $SLEEP 5 
+       _manifest_import_=1
+    fi
+ 
+
+    $ECHO "Stopping Service for ${_service_name_} \n" >> ${LOGFILE}
+    $SYSTEMCTL disable ${_service_name_} >> /dev/null 2>&1
+    $SYSTEMCTL reset-failed ${_service_name_} >> /dev/null 2>&1
+    
+done
+
+#copy smf_contract_config
+if [ -f ${TEMPLATES_DIR}/${INSTALL_TYPE}/admin/etc/smf_contract_config ] ; then
+        $ECHO "Copying ${TEMPLATES_DIR}/${INSTALL_TYPE}/admin/etc/smf_contract_config to ${ENIQ_ADMIN_DIR}/etc" | $TEE -a $LOGFILE
+        $CP ${TEMPLATES_DIR}/${INSTALL_TYPE}/admin/etc/smf_contract_config ${ENIQ_ADMIN_DIR}/etc
+        if [ $? -ne 0 ]; then
+                _err_msg_="Error copying smf_contract_config"
+                abort_script "${_err_msg_}"
+        fi
+fi
+
+# Shut down the services
+$BASH ${ENIQ_ADMIN_DIR}/bin/manage_eniq_services.bsh -a stop -s ALL -N -l ${LOGFILE}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not stop services following FS rollback"
+    abort_script "${_err_msg_}"
+fi
+}
+
+### Function: rollback_co_expansion ###
+#
+# Rollback to CO expansion
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+rollback_co_expansion()
+{
+log_msg -t -s "Checking the Volume Group to rename stats_coordinator_pool to eniq_stats_pool\n" -l ${LOGFILE}
+_health_status_="r/w"
+_vg_name_=`$VGS -o name --noheading | $EGREP -w "stats_coordinator_pool|eniq_stats_pool" | $SED 's/ //g'`
+
+if [ ! -z "${_vg_name_}" ]; then
+    _stats_coordinator_pool=stats_coordinator_pool
+    _stats_coordinator_=stats_coordinator
+    if [ "${_vg_name_}" == "eniq_stats_pool" ]; then
+        log_msg -t -s "VG is already renamed.\n" -l ${LOGFILE}
+    else
+        # Get the list of all available VG on the server 
+        _vg_list_=`$VGS -o name --noheading | $EGREP -w "$_vg_name_"`
+        if [ ! -z "${_vg_list_}" ]; then
+            log_msg -q -s "\nChecking the health of following Volume Group: ${_vg_list_}" -l ${LOGFILE}
+            # Check the health status of all fetched VG's
+            _vg_health_status_=`${VGDISPLAY} ${_vg_list_} -c  | $AWK -F":" '{print $2}'`
+            if [ "${_vg_health_status_}" != "r/w" ];then
+                _err_msg_="VGs are not in proper state. Please check."
+                abort_script "${_err_msg_}"
+            else
+                log_msg -q -s "${_vg_list_} VG is online." -l ${LOGFILE}
+            fi
+        else 
+            _err_msg_="VGs are not in proper state. Please check."
+            abort_script "${_err_msg_}"
+        fi
+
+        ${ECHO} "NOTE : Stoping ENIQ services." | $TEE -a  ${LOGFILE}
+        ${BASH} ${ENIQ_ADMIN_DIR}/bin/manage_eniq_services.bsh -a stop -s ALL -N > /dev/null 2>&1
+
+        log_msg -t -s "Renaming ${_vg_list_} to eniq_stats_pool" -l ${LOGFILE}
+        ${VGRENAME} ${_vg_list_} eniq_stats_pool 
+        _vg_rename_=$?
+        if [ "${_vg_rename_}" -ne 0 ];then
+            _err_msg_="VGRENAME of ${_vg_list_} is not done Properly."
+            abort_script "$_err_msg_"
+        else
+            log_msg -t -q -s "VG was renamed successfully.\n" -l ${LOGFILE}
+        fi
+
+        $ECHO "eniq_stats_pool" > /var/tmp/mb_expansion_flag
+    fi
+
+    $EGREP ${_stats_coordinator_pool} /etc/fstab >> /dev/null 2>&1
+    _fstab_fetch_=$?
+    if [ "${_fstab_fetch_}" -eq 0 ] ; then
+        log_msg -s "Updating the entries in fstab file" -l ${LOGFILE} 
+        if [ -s /etc/fstab_bk ]; then 
+            $MV /etc/fstab_bk /etc/fstab
+            _fstab_mv_=$?
+            if [ "${_fstab_mv_}" -ne 0 ]; then
+                _err_msg_="Could not update fstab file entries with name=eniq_stats_pool"
+                abort_script "$_err_msg_"
+            fi
+        else
+            $SED -i 's/stats_coordinator_pool/eniq_stats_pool/g' /etc/fstab
+            _fstab_sed_=$?
+            if [ "${_fstab_sed_}" -ne 0 ]; then
+                _err_msg_="Could not update entries in fstab file with name=eniq_stats_pool"
+                abort_script "$_err_msg_"
+            fi
+        fi
+    fi
+
+
+    $EGREP ${_stats_coordinator_} /root/.bash_profile >> /dev/null 2>&1
+    _profile_fetch_=$?
+    if [ "${_profile_fetch_}" -eq 0 ] ; then 
+        if [ -s /root/.bash_profile_bk ]; then
+            $MV /root/.bash_profile_bk /root/.bash_profile 
+            _profile_mv_=$?
+            if [ "${_profile_mv_}" -ne 0 ]; then
+                _err_msg_="Could not update bash_profile with name=eniq_stats_pool"
+                abort_script "${_err_msg_}" 
+            fi
+        else
+            $SED -i 's/stats_coordinator/eniq_stats/g' /root/.bash_profile
+            _profile_sed_=$?
+            if [ "${_profile_sed_}" -ne 0 ]; then
+                abort_script "Could not update bash_profile file with name=eniq_stats_pool"
+            fi
+        fi
+    fi
+
+    log_msg -s "\nUpdating SunOS.ini file" -l ${LOGFILE}
+    iniset SunOS_FS_POOL_1 -f ${ENIQ_CONF_DIR}/${SUNOS_INI} name=eniq_stats_pool
+    _sunos_pool=$?
+    if [ "${_sunos_pool}" -ne 0 ]; then
+        abort_script "Could not update SunOS_FS_POOL_1 in ${ENIQ_CONF_DIR}/${SUNOS_INI} with name=eniq_stats_pool"
+    fi
+    iniset SunOS_FS_SWAP_VOL -f ${ENIQ_CONF_DIR}/${SUNOS_INI} name=eniq_stats_pool-swapvol
+    _sunos_swap_=$?
+    if [ "${_sunos_swap_}" -ne 0 ]; then
+        abort_script "Could not update SunOS_FS_SWAP_VOL in ${ENIQ_CONF_DIR}/${SUNOS_INI} with name=eniq_stats_pool-swapvol"
+    fi
+else 
+    _err_msg_="VGs are not in proper state. Please check."
+    abort_script "${_err_msg_}"
+fi
+}
+
+### Function: rollback_snapshots ###
+#
+# Rollback required Snapshots
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+rollback_snapshots()
+{
+if [[ "${LVM_NAME}" == ALL* ]]; then
+    _lvm_current_label_=`$ECHO ${LVM_NAME} | $AWK -F"=" '{print $2}'`
+else
+    _lvm_current_label_=`$ECHO ${LVM_NAME} | $AWK -F"," '{print $1}' | $AWK -F"-" '{print $2}'`
+fi
+
+_rollback_manifest_=1
+if [ ! "${SKIP_SERVICE_CHECK}" ]; then 
+    check_services rollback
+    _rollback_manifest_=0
+fi
+#If SB to CO conversion fails, stats_coordinator should change into eniq_stats during rollback
+log_msg -t -s "Checking if SB to CO conversion failed \n" -l ${LOGFILE}
+if [ -f ${VAR_TMP_DIR}/mb_expansion_flag ]; then
+    rollback_co_expansion
+fi
+
+# Get a list of ALL VGS(s)
+#----------------------------------------------
+_vglist_=`iniget SunOS_FS_POOL_1 -f ${ENIQ_CONF_DIR}/${SUNOS_INI} -v name`
+if [ ! {_vglist_} ]; then
+    _err_msg_="Could not get the list of all VGs"
+    abort_script "${_err_msg_}"
+fi
+
+if [ ! -f "${VAR_TMP_DIR}/lvm_rollback_${_lvm_current_label_}_completed" ];then
+    # Flag to restart specified services
+    $TOUCH ${VAR_TMP_DIR}/fs_rollback_indicator
+    if [ $? -ne 0 ]; then
+        _err_msg_="Could not create ${VAR_TMP_DIR}/fs_rollback_indicator." 
+        abort_script "${_err_msg_}"
+    fi
+       
+    $CAT ${FS_SNAP_DET} | $EGREP -v '^[[:blank:]]*#' > ${TEM_DIR}/snap_opt_file
+    if [ ! -s ${TEM_DIR}/snap_opt_file ]; then
+        _err_msg_="No info to be found in ${FS_SNAP_DET}"
+        abort_script "${_err_msg_}"
+    fi
+    
+    # Build a list of file-systems to exclude in rollback
+    _rollback_exclude_list_=""
+    while read _line_; do
+        _fs_name_=`$ECHO ${_line_} | $AWK -F"::" '{print $1}'`
+        _rollback_opt_=`$ECHO ${_line_} | $AWK -F"::" '{print $3}'`
+        if [ ! "${_fs_name_}" -o ! "${_rollback_opt_}" ]; then
+                    _err_msg_="Could not read values from ${FS_SNAP_DET}"
+            abort_script "${_err_msg_}"
+        fi
+    
+        if [ "${_rollback_opt_}" == "N" ]; then
+            if [ "${_rollback_exclude_list_}" == "" ]; then
+                    _rollback_exclude_list_=${_fs_name_}
+            else
+                    _rollback_exclude_list_="${_rollback_exclude_list_}|${_fs_name_}"
+            fi
+        fi
+    done < ${TEM_DIR}/snap_opt_file
+    
+    LVM_EXCLUDED_LIST="${_rollback_exclude_list_}"  
+    
+    # Get a list of ALL LVM(s) into lvm_list_file_1
+    #----------------------------------------------
+    get_lvm_list "${LVM_NAME}" "${_vglist_}" "${LVM_EXCLUDED_LIST}" > ${TEM_DIR}/lvm_list_file_1
+    
+    if [ $? -ne 0 ]; then
+        _err_msg_="Could not get the list of file-systems"
+        abort_script "${_err_msg_}"
+    fi
+    
+    if [ ! -s ${TEM_DIR}/lvm_list_file_1 ]; then
+        _err_msg_="No Logical Volumes were found for specified Volume\nGroups ${_vglist_}"
+        abort_script "${_err_msg_}"
+    fi
+    if [[ "${LVM_NAME}" == ALL* ]]; then
+        $ECHO "${LVM_NAME}" | $EGREP '^[[:blank:]]*ALL' >> /dev/null 2>&1
+        if [ $? -eq 0 ]; then
+            _id_str_=`$ECHO "${LVM_NAME}" | $AWK -F\= '{print $2}' | $HEAD -1`
+            $CAT ${TEM_DIR}/lvm_list_file_1 | $AWK '{print $1}' | $EGREP "${_id_str_}$" > ${TEM_DIR}/lvm_list_file_2
+        else
+            $CAT ${TEM_DIR}/lvm_list_file_1 > ${TEM_DIR}/lvm_list_file_2
+        fi
+        
+        if [ ! -s ${TEM_DIR}/lvm_list_file_2 ]; then
+            _err_msg_="No snapshots found to roll back to"
+            abort_script "${_err_msg_}"
+        fi
+        
+        _snap_name_=`$CAT ${TEM_DIR}/lvm_list_file_2 | $AWK '{print $1}' | $AWK -F"-" '{print $2}' | $GREP -v '^$' | $SORT -u`
+        
+        $CAT ${TEM_DIR}/lvm_list_file_1|$AWK '{if ( $3 ~ /^[sS]/ ) print $5,$2,$1}'|$EGREP -w "${_snap_name_}" >> ${TEM_DIR}/lvm_list_file
+    else
+        $CAT ${TEM_DIR}/lvm_list_file_1|$AWK '{if ( $3 ~ /^[sS]/ ) print $5,$2,$1}'>> ${TEM_DIR}/lvm_list_file
+    fi
+    if [ ! -s ${TEM_DIR}/lvm_list_file ]; then
+        _err_msg_="No Snapshot LVM(s) were found for specified Volume Groups\n${_vglist_}"
+        abort_script "${_err_msg_}"
+    fi
+    
+    let _field1_=_field1_+60
+    let _field2_=_field2_+60
+    
+    _line1_str_="\n%-${_field1_}s%-${_field2_}s\n\n"
+    _line2_str_="%-${_field1_}s%-${_field2_}s\n"
+    
+    if [ -s ${TEM_DIR}/lvm_list_file ]; then
+            printf "${_line1_str_}" "FS Snapshot" "FS File-system" >> ${TEM_DIR}/lvm_outfile
+    
+        # In lvm_list_file
+        # 1=ORIGIN, 2=VG_NAME, 3=LV_NAME
+        #-------------------------------
+        while read _origin_ _vgsnap_ _lvsnap_ _rest_;do
+            printf "${_line2_str_}" "${_lvsnap_}" "${_origin_}" >> ${TEM_DIR}/lvm_outfile
+        done < ${TEM_DIR}/lvm_list_file
+    else
+            _err_msg_="No snapshots found to roll back to after removing excluded file-systems"
+            abort_script "${_err_msg_}"
+    fi
+    
+    _snap_label_=`$CAT ${TEM_DIR}/lvm_list_file | $AWK -F"-" '{print $2}' | $HEAD -1`
+    
+    if [ ! "${NO_CONFIRM}" ]; then
+        user_confirm "rollback to the snapshots" "${TEM_DIR}/lvm_outfile"
+        if [ "$USER_CONF" == "No" ]; then
+            $RM -rf ${TEM_DIR}
+            exit 0
+        fi
+    fi
+
+    # Stopping NASd service
+    if [ "${STORAGE_TYPE}" == "raw" ]; then
+        log_msg -s "Stopping NASd service \n" -l ${LOGFILE}
+        $SYSTEMCTL stop NASd.service
+        _service_state=`$SYSTEMCTL show NASd.service -p ActiveState | $AWK -F"=" '{print $2}'`
+        if [ "${_service_state}" == "active" ] ; then
+            _err_msg_="Could not disable NAd.service"
+            abort_script "${_err_msg_}"
+        fi
+    fi
+	
+    log_msg -s "Stopping hostsync service \n" -l ${LOGFILE}
+    $SYSTEMCTL stop hostsync.service
+    _service_state=`$SYSTEMCTL show hostsync.service -p ActiveState | $AWK -F"=" '{print $2}'`
+    if [ "${_service_state}" == "active" ] ; then
+        _err_msg_="Could not disable hostsync.service"
+        abort_script "${_err_msg_}"
+    fi
+    
+    if [ "${SNAP_FORCE}" ]; then
+        _force_opt_="-fr"
+    else
+        _force_opt_=""
+    fi
+    
+    _snap_time_=`$DATE '+%Y-%b-%d_%H.%M.%S'`
+    
+    # Check if any of the file-systems is in use
+    for _entry_ in `$CAT ${TEM_DIR}/lvm_outfile| $TAIL -n+4 | $AWK '{print $2}'`;do
+        _range_=`$DMSETUP info | $GREP -wA 7 "${_entry_}$" | $GREP -w "Major, minor:" |  $AWK -F":" '{print $2}' | $SED -e 's/ //g'`
+        $LSOF | $GREP -w "${_range_}" >> ${LOGFILE}
+                pid_list=`$LSOF | $GREP -w "${_range_}"| $AWK '{print $2}'| $UNIQ `
+                if [ "${pid_list}" ]; then
+                   for _pid_ in ${pid_list};do
+                     $PS -eaf | $GREP -w ${_pid_} >> ${LOGFILE}
+                     $KILL -9 ${_pid_} >> /dev/null 2>&1
+		     $SLEEP 2
+                     $PS -eaf | $AWK '{print $2}'| $GREP -w ${_pid_} >> ${LOGFILE}
+                     if [ $? -eq 0 ]; then
+			$KILL -9 ${_pid_} >> /dev/null 2>&1
+                        $SLEEP 2
+                        $PS -eaf | $AWK '{print $2}'| $GREP -w ${_pid_} >> ${LOGFILE}
+                        if [ $? -eq 0 ]; then
+                        	_err_msg_=" ${_entry_} - Could not release the process ${_pid_} for ${_entry_}"
+                        	abort_script "${_err_msg_}"
+			fi
+                     fi
+                   done
+                fi
+    done
+	
+	$SLEEP 15
+    
+    log_msg -s "\n${_snap_time_} - Rolling back to snapshots with label \"${_snap_label_}\"\n" ${_log_id_str} ${SNAP_QUIET}
+    
+    _lines_count_=`$CAT ${TEM_DIR}/lvm_list_file | $WC -l`
+    _index_=1
+   
+    # In lvm_list_file fields are separated with space
+    # 1=ORIGIN, 2=VG_NAME, 3=LV_NAME
+    #-------------------------------------------------
+    while read _lv_ _vgname_ _lv_name_ _rest_; do
+        
+            # Construct the Logical Volume Path
+            #-------------------------------------------
+            _lv_path_="/dev/${_vgname_}/${_lv_}"
+            
+            log_msg -s "Un-mounting the file-system ${_lv_path_}" -l ${LOGFILE}
+		    $ECHO ${_lv_} | $GREP "eniq_oss" >> /dev/null 2>&1
+            if [ $? -ne 0 ]; then
+                $UMOUNT -l ${_lv_path_}
+                if [ $? -ne 0 ]; then
+                    _err_msg_="Could not unmount ${_lv_path_}"
+                    abort_script "${_err_msg_}" 
+                fi 
+            fi
+			 
+            # Construct the Logical Volume Snapshot Path
+            _lv_snap_path_="/dev/${_vgname_}/${_lv_}-${_snap_name_}"
+    
+            # Test that path is sane
+            #-----------------------
+            $LVDISPLAY ${_lv_snap_path_} >> /dev/null 2>&1
+    
+            if [ $? -ne 0 ]; then
+                _err_msg_="Invalid LV SNAP Path Name '${_lv_snap_path_}' constructed"
+                abort_script "${_err_msg_}"
+            fi
+           
+           
+	     _process_range_=`$DMSETUP info | $GREP -wA 7 "${_lv_}$" | $GREP -w "Major, minor:" |  $AWK -F":" '{print $2}' | $SED -e 's/ //g'`
+             $LSOF | $GREP -w "${_process_range_}" >> ${LOGFILE}
+             pid_list=`$LSOF | $GREP -w "${_process_range_}"| $AWK '{print $2}'| $UNIQ `
+                if [ "${pid_list}" ]; then
+                for _pid_ in ${pid_list};do
+                $PS -eaf | $GREP  -w ${_pid_} >> ${LOGFILE}
+                $KILL -9 ${_pid_} >> /dev/null 2>&1
+		$SLEEP 2
+                $PS -eaf | $AWK '{print $2}'| $GREP -w ${_pid_} >> ${LOGFILE}
+                if [ $? -eq 0 ]; then
+		     $KILL -9 ${_pid_} >> /dev/null 2>&1
+                     $SLEEP 2
+                     $PS -eaf | $AWK '{print $2}'| $GREP -w ${_pid_} >> ${LOGFILE}
+                     if [ $? -eq 0 ]; then
+                    	_err_msg_=" ${_lv_} - Could not release the process ${_pid_} before rolling back"
+                    	abort_script "${_err_msg_}"
+		     fi
+                fi
+                done
+                fi
+            
+            $SLEEP 1
+    
+            # Rollback the LVM snapshot
+            #--------------------------
+            log_msg -s "\n`$DATE +%d.%m.%y_%H:%M:%S` - Rolling back LVM snapshot ${_lv_snap_path_}\n" -l ${LOGFILE} ${SNAP_QUIET}
+    
+            $LVCONVERT --merge ${_lv_snap_path_} >> ${LOGFILE} 2>&1
+    
+            if [ $? -ne 0 ]; then
+                _err_msg_="Failed to roll back snapshot ${_lv_snap_path_}"
+                abort_script "${_err_msg_}"
+            fi
+            
+            log_msg -s "Reactivating ${_lv_}\n" -l ${LOGFILE}
+            $LVCHANGE -an /dev/mapper/${_vglist_}-${_lv_}
+            if [ $? -ne 0 ]; then
+                if [ "${_index_}" -eq "${_lines_count_}" ]; then
+                    $TOUCH ${VAR_TMP_DIR}/lvm_rollback_${_lvm_current_label_}_completed
+                    if [ $? -ne 0 ]; then
+                        _err_msg_="Could not create ${VAR_TMP_DIR}/lvm_rollback_${_lvm_current_label_}_completed flag." 
+                        abort_script "${_err_msg_}"
+                    fi
+                fi 
+                log_msg -s -q "Mounting the file-systems\n" -l ${LOGFILE}
+                sleep 30
+                $MOUNT -a
+                if [ $? -ne 0 ]; then
+                    _err_msg_="Could not mount the file-systems \n"
+                    abort_script "${_err_msg_}" 
+                fi
+                
+                # Stopping NASd service
+                if [ "${STORAGE_TYPE}" == "raw" ]; then
+                    log_msg -s "Enabling NASd service \n" -l ${LOGFILE}
+                    $SYSTEMCTL start NASd.service
+                    $SLEEP 15
+                    while true;
+                    do
+                        _service_status_=`$SYSTEMCTL show -p ActiveState NAS-online | $AWK -F= '{print $2}'`
+                        if [ "${_service_status_}" != "active" ];then
+                            $SLEEP 15
+                            continue
+                        else    
+                            break
+                        fi
+                    done
+                fi
+				
+                _err_msg_="Error running the command "$LVCHANGE -an /dev/mapper/${_vglist_}-${_lv_}" \n"
+                abort_script "${_err_msg_}" 
+            fi
+            $LVCHANGE -ay /dev/mapper/${_vglist_}-${_lv_}
+            if [ $? -ne 0 ]; then
+                if [ "${_index_}" -eq "${_lines_count_}" ]; then
+                    $TOUCH ${VAR_TMP_DIR}/lvm_rollback_${_lvm_current_label_}_completed
+                    if [ $? -ne 0 ]; then
+                        _err_msg_="Could not create${VAR_TMP_DIR}/lvm_rollback_${_lvm_current_label_}_completed flag." 
+                        abort_script "${_err_msg_}"
+                    fi
+                fi
+                _err_msg_="Error running the command "$LVCHANGE -ay /dev/mapper/${_vglist_}-${_lv_}" \n"
+                abort_script "${_err_msg_}" 
+            fi
+            
+            _index_=`$EXPR "${_index_}" + 1` 
+                            
+    done < ${TEM_DIR}/lvm_list_file
+    
+    $TOUCH ${VAR_TMP_DIR}/lvm_rollback_${_lvm_current_label_}_completed
+    if [ $? -ne 0 ]; then
+        _err_msg_="Could not create ${VAR_TMP_DIR}/lvm_rollback_${_lvm_current_label_}_completed flag." 
+        abort_script "${_err_msg_}"
+    fi
+    log_msg -s "Rolled back to snapshot \"${_snap_label_}\" successfully\n" ${_log_id_str} ${SNAP_QUIET} -t
+fi
+
+# Check if any of the FS is in merging state and clear it
+if [ "${STORAGE_TYPE}" == "raw" ]; then 
+    _current_service_state_=`$SYSTEMCTL show NASd.service -p ActiveState | $AWK -F"=" '{print $2}'`
+	
+    if [ "${_current_service_state_}" == "active" ] ; then
+        log_msg -s "Stopping NASd service \n" -l ${LOGFILE}
+        $SYSTEMCTL stop NASd.service
+		
+        _service_state=`$SYSTEMCTL show NASd.service -p ActiveState | $AWK -F"=" '{print $2}'`
+        if [ "${_service_state}" == "active" ] ; then
+            _err_msg_="Could not disable NAd.service in order to check for merging state"
+            abort_script "${_err_msg_}"
+        fi
+    fi
+fi
+
+# Stopping hostsync service
+_current_service_state_=`$SYSTEMCTL show hostsync.service -p ActiveState | $AWK -F"=" '{print $2}'`
+if [ "${_current_service_state_}" == "active" ] ; then
+    log_msg -s "Stopping hostsync service \n" -l ${LOGFILE}
+    $SYSTEMCTL stop hostsync.service
+    _service_state=`$SYSTEMCTL show hostsync.service -p ActiveState | $AWK -F"=" '{print $2}'`
+    if [ "${_service_state}" == "active" ] ; then
+        _err_msg_="Could not disable hostsync.service in order to check for merging state"
+        abort_script "${_err_msg_}"
+    fi
+fi 
+
+for _fs_ in `$LVS --noheadings | $GREP -w "${_vglist_}"  | $AWK '{print $1}' | $EGREP -v "\-|swapvol"`;do
+    # _return_value_ will be 1 if we get the merging state for fs i.e. O"
+    _return_value_=`$LVS | $AWK '{if ( $1 ~ /^'${_fs_}'$/ ) print $3}'|$AWK '{if ( $1 ~ /^O/ ) print "1";else print "0"}'`
+    if [ "${_return_value_}" -eq 1 ]; then
+        _mount_dir_=`$MOUNT | $EGREP -w "\/dev\/mapper\/${_vglist_}-${_fs_}"|$EGREP -v "${SNAP_MOUNT_DIR}"| $AWK '{print $3}'`
+        if [ ! ${_mount_dir_} ]; then
+            _err_msg_="Could not get the mount point for ${_fs_} while trying to clear merging state"
+            abort_script "${_err_msg_}"
+        fi
+        
+        log_msg -s "Un-mounting the file-system ${_mount_dir_}\n" -l ${LOGFILE}
+        $UMOUNT -l ${_mount_dir_}
+        if [ $? -ne 0 ]; then
+            _err_msg_="Could not unmount ${_mount_dir_} while trying to clear merging state"
+            abort_script "${_err_msg_}" 
+        fi 
+       
+        _check_range_=`$DMSETUP info | $GREP -wA 7 "${_fs_}$" | $GREP "Major, minor:" |  $AWK -F":" '{print $2}' | $SED -e 's/ //g'`
+        $LSOF | $GREP -w "${_check_range_}" >> ${LOGFILE}
+        for _pid_ in `$LSOF | $GREP -w "${_check_range_}"| $AWK '{print $2}' | $UNIQ`;do
+            ps -eaf | $GREP -w ${_pid_} >> ${LOGFILE}
+            $KILL -9 ${_pid_}  >> /dev/null 2>&1
+	    $SLEEP 2
+            $PS -eaf | $AWK '{print $2}'| $GREP -w ${_pid_} >> ${LOGFILE}
+            if [ $? -eq 0 ]; then
+		$KILL -9 ${_pid_} >> /dev/null 2>&1
+                $SLEEP 2
+                $PS -eaf | $AWK '{print $2}'| $GREP -w ${_pid_} >> ${LOGFILE}
+                if [ $? -eq 0 ]; then
+                	_err_msg_="Could not release the process ${_pid_} held by merging snapshot while trying to clear merging state"
+                	abort_script "${_err_msg_}"
+		fi
+            fi
+        done    
+        $SLEEP 2
+        
+        log_msg -s "Reactivating ${_fs_}\n" -l ${LOGFILE}
+        $LVCHANGE -an /dev/mapper/${_vglist_}-${_fs_}
+        if [ $? -ne 0 ]; then
+            _err_msg_="Error running the command "$LVCHANGE -an /dev/mapper/${_vglist_}-${_fs_}" while trying to clear merging state\n"
+            abort_script "${_err_msg_}"
+        fi
+        
+        $LVCHANGE -ay /dev/mapper/${_vglist_}-${_fs_}
+        if [ $? -ne 0 ]; then
+            _err_msg_="Error running the command "$LVCHANGE -ay /dev/mapper/${_vglist_}-${_fs_}"while trying to clear merging state \n"
+            abort_script "${_err_msg_}"
+        fi 
+    fi
+done
+
+    
+log_msg -s "Mounting the file-systems\n" -l ${LOGFILE}
+sleep 30
+$MOUNT -a
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not mount the file-systems \n"
+    abort_script "${_err_msg_}" 
+fi
+    
+# Remove the ROLL_SNAP_PROGRESS_INDICATOR flag from system
+$RM -rf ${ROLL_SNAP_PROGRESS_INDICATOR}
+# To check the existence of ${ROLL_SNAP_PROGRESS_INDICATOR}
+if [ -f ${ROLL_SNAP_PROGRESS_INDICATOR} ]; then
+    _err_msg_="${ROLL_SNAP_PROGRESS_INDICATOR} file not removed. This file must be deleted manually, before proceeding further."
+    abort_script "${_err_msg_}"
+fi
+
+if [ "${STORAGE_TYPE}" == "raw" ]; then
+    log_msg -s "Starting NASd service \n" -l ${LOGFILE}
+    $SYSTEMCTL start NASd.service
+    $SLEEP 15
+    while true;
+    do
+        _service_status_=`$SYSTEMCTL show -p ActiveState NAS-online | $AWK -F= '{print $2}'`
+        if [ "${_service_status_}" != "active" ];then
+            $SLEEP 15
+            continue
+        else    
+            break
+        fi
+    done 
+fi
+
+log_msg -s "Starting hostsync service \n" -l ${LOGFILE}
+$SYSTEMCTL start hostsync.service
+_service_status_=`$SYSTEMCTL show -p ActiveState hostsync | $AWK -F= '{print $2}'`
+if [ "${_service_status_}" != "active" ];then
+    _err_msg_="Could not start hostsync service \n"
+    abort_script "${_err_msg_}" 
+fi
+
+# Snapshot successfully rolled back so now rollback sentinel_service file
+restore_sentinel_service
+# Snapshot successfully rolled back so now rollback /etc/hosts file
+restore_hosts_file
+
+if [ ${_rollback_manifest_} -eq 0 ]; then
+    rollback_systemd
+fi
+
+if [ "${STORAGE_TYPE}" == "raw" ]; then
+     if [  "${CURR_SERVER_TYPE}" == "stats_coordinator" -o "${CURR_SERVER_TYPE}" == "stats_iqr" -o "${CURR_SERVER_TYPE}" == "eniq_stats" ]; then
+           if [ -f "${ENIQ_CONF_DIR}/99-iq-raw-devs.rules" ]; then
+               log_msg -t -s "Restoring 99-iq-raw-devs.rules file to /etc/udev/rule.d/\n" -l ${LOGFILE}
+               $CP -pf ${ENIQ_CONF_DIR}/99-iq-raw-devs.rules /etc/udev/rules.d/99-iq-raw-devs.rules
+               if [ $? -ne 0 ]; then
+                   _err_msg_="Could not restore the 99-iq-raw-devs.rules to /etc/udev/rules.d/\n"
+                   abort_script "${_err_msg_}" 
+               fi
+            fi
+
+           for _raw_device_ in `$RAW -qa|$AWK '{print $1}'|$CUT -d: -f1`;
+           do 
+               log_msg -t -s "Unregistering raw device ${_raw_device_}" -l ${LOGFILE}
+               $RAW "${_raw_device_}" 0 0
+               if [ $? -ne 0 ]; then
+                    _err_msg_="Could not unregister raw device ${_raw_device_}\n"
+                    abort_script "${_err_msg_}"
+               fi
+           done
+
+           log_msg -t -s "Getting list of existing DB symbolic links\n" -l ${LOGFILE}
+           $FIND /eniq/database/dwh_main_dbspace/ -name "*.iq" > ${TEM_DIR}/db_sym_links.txt
+           $FIND /eniq/database/dwh_temp_dbspace/ -name "*.iqtmp" >> ${TEM_DIR}/db_sym_links.txt
+           if [ -s ${TEM_DIR}/db_sym_links.txt ];then 
+                for _db_sym_link_ in `$CAT ${TEM_DIR}/db_sym_links.txt`;
+                do 
+                    log_msg -t -s "Unlinking existing DB symbolic link ${_db_sym_link_}\n" -l ${LOGFILE}
+                    $UNLINK ${_db_sym_link_}
+                    if [ $? -ne 0 ]; then
+                         _err_msg_="Could not unlink existing DB symbolic link ${_db_sym_link_}\n"
+                         abort_script "${_err_msg_}"
+                    fi
+                done
+           else
+                _err_msg_="Could not get list of existing DB symbolic links"
+                abort_script "${_err_msg_}"
+           fi
+
+           log_msg -t -s "Executing ${ENIQ_CORE_DIR}/bin/get_cell_count.bsh\n" -l ${LOGFILE}
+           $BASH ${ENIQ_CORE_DIR}/bin/get_cell_count.bsh -d ${ENIQ_CONF_DIR}/ -g /var/tmp/ -t raw -e stats -l ${LOGFILE}
+           if [ $? -ne 0 ]; then
+               _err_msg_="Could not get_cell_count \n"
+               abort_script "${_err_msg_}" 
+           fi
+
+           log_msg -t -s "Recreating DB symbolic links\n" -l ${LOGFILE}
+           $BASH ${ENIQ_CORE_DIR}/bin/eniq_core_install.bsh -M -s create_db_sym_links -n -R -l ${LOGFILE}
+           if [ $? -ne 0 ]; then
+               _err_msg_="Could not recreate the DB symbolic links\n"
+               abort_script "${_err_msg_}" 
+           fi
+
+           $RM -f ${ENIQ_CONF_DIR}/99-iq-raw-devs.rules
+		   
+    fi
+fi
+
+log_msg -t -s "Recreating directories\n" -l ${LOGFILE}
+$BASH ${ENIQ_CORE_DIR}/bin/eniq_core_install.bsh -M -s create_directories -n -R -l ${LOGFILE}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not recreate directories\n"
+    abort_script "${_err_msg_}" 
+fi
+
+# Change the permission of some directories as per the pre-check
+log_msg -t -s "Changing ownership of ${ENIQ_BASE_DIR}/data/rejected to 770\n" -l ${LOGFILE}
+$CHMOD 770 ${ENIQ_BASE_DIR}/data/rejected
+
+$RM -rf ${VAR_TMP_DIR}/fs_rollback_indicator
+
+#Logging Eniq Activity
+SNAP_DATE=`$DATE '+%Y-%m-%d %H:%M:%S'`
+$ECHO "ENIQ ACTIVITY INFO=Snapshot_Rollback;${SNAP_DATE};FS Snapshot Rollback" | $TEE -a /eniq/local_logs/eniq_activity_history.log >> ${LOGFILE}
+_hist_status_=$?
+if [ "${_hist_status_}" -ne 0 ]; then
+	_err_msg_="Failed to update Eniq Activity log file\n"
+	abort_script "$_err_msg_"
+else
+   $ECHO "Successfully logged Eniq Activity"
+fi
+}
+
+### Function: setup_env ###
+#
+# Setup up path environment etc
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+setup_env()
+{
+ENIQ_BASE_DIR=${ENIQ_ROOT_DIR}
+
+ENIQ_ADMIN_DIR=${ENIQ_BASE_DIR}/admin
+
+ENIQ_CONF_DIR=${ENIQ_BASE_DIR}/installation/config
+
+ENIQ_CORE_DIR=${ENIQ_BASE_DIR}/installation/core_install
+
+TEMPLATES_DIR=${ENIQ_CORE_DIR}/templates
+
+ENIQ_BKUPSW_DIR=${ENIQ_BASE_DIR}/bkup_sw
+
+# Set temporary upgrade directory
+VAR_TMP_DIR=/var/tmp
+
+CURR_SERVER_TYPE=`$CAT $ENIQ_CONF_DIR/installed_server_type | $EGREP -v '^[[:blank:]]*#' | $SED -e 's/ //g'`
+if [ ! "${CURR_SERVER_TYPE}" ]; then
+    _err_msg_="Could not determine which server type this is"
+    abort_script "${_err_msg_}"
+fi
+
+BKUP_CONF_FILE="${ENIQ_BKUPSW_DIR}/etc/eniq_backup.conf"
+if [ ! -s ${BKUP_CONF_FILE} ]; then
+    _err_msg_="Could not locate file ${BKUP_CONF_FILE}"
+    abort_script "${_err_msg_}"
+fi
+
+# Rolling snapshot flags
+ROLL_SNAP_PROGRESS_INDICATOR="${ENIQ_BKUPSW_DIR}/etc/.rolling_snapshot_in_progress"
+
+# File containing the type of OSS installation. Eg. events or statistics
+INST_TYPE_FILE=${ENIQ_CONF_DIR}/ericsson_use_config
+if [ ! -s "${INST_TYPE_FILE}" ]; then
+    _err_msg_="ENIQ install type not defined in ${INST_TYPE_FILE}"
+    abort_script "${_err_msg_}"
+fi
+
+# Read the installation type - should be "events" or "stats"
+INSTALL_TYPE=`$CAT ${INST_TYPE_FILE} | $AWK -F\= '{print $2}'`
+if [ ! "${INSTALL_TYPE}" ]; then
+    _err_msg_="Could not read INSTALL_TYPE param "
+    abort_script "${_err_msg_}"
+fi
+
+STORAGE_TYPE=`iniget STOR_TYPE -f ${ENIQ_CONF_DIR}/${SUNOS_INI} -v STORAGE_TYPE`
+if [ ! "${STORAGE_TYPE}" ]; then
+    _err_msg_="Could not read STORAGE_TYPE param"
+    abort_script "${_err_msg_}"
+fi
+
+# File containing details per FS for snapshots
+if [ "${STORAGE_TYPE}" == "fs" ]; then
+    FS_SNAP_DET="${ENIQ_BKUPSW_DIR}/etc/${INSTALL_TYPE}_rack_fs_filesys_snap_det"
+else
+    FS_SNAP_DET="${ENIQ_BKUPSW_DIR}/etc/${INSTALL_TYPE}_blade_fs_filesys_snap_det"
+fi
+
+if [ ! -s ${FS_SNAP_DET} ]; then
+    _err_msg_="Could not find ${FS_SNAP_DET} file"
+    abort_script "${_err_msg_}"
+fi
+
+SNAP_MOUNT_DIR=`$CAT ${BKUP_CONF_FILE} | $EGREP '^[[:blank:]]*BKUP_MOUNT_DIR=' | $AWK -F"=" '{print $2}'`
+if [ ! "${SNAP_MOUNT_DIR}" ]; then
+    _err_msg_="Could not read BKUP_MOUNT_DIR param from ${BKUP_CONF_FILE}"
+    abort_script "${_err_msg_}"
+fi
+
+}
+
+### Function: usage_msg ###
+#
+#   Print out the usage message
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+usage_msg()
+{
+$ECHO "
+Usage: `$BASENAME $0` -a <snap_action> -f <snap_fs,snap_fs,...snap_fs> [ -n <SNAP_NAME> ] [ -l <logfile> ]
+
+options:
+
+-a  : Snapshot Action. Must be either
+              create   --> Create a snapshot of list/ALL LVM filesystems
+              delete   --> Delete specified snapshot(s).
+              list     --> List of ALL/matching snapshot(s)
+              rollback --> Roll back to specified snapshot(s).
+
+-f  : In the case of create
+          Filesystem(s) to be Snapshot. Must be specified in the following format
+          '<fs_name>' e.g. admin. Multiple filesystems can be
+          specified if seperated by ','.
+
+          'ALL' can be specified to snapshot all filesystems
+
+          NOTE: None of the ENIQ services can be online from systemd point of view
+
+      In the case of delete
+          Snapshots(s) to be deleted. Must be specified in the following format
+          '<fs_name>-<snapshot_id_str>' e.g.dwh-ENIQ_UPGRADE.2007-Apr-02_12.24.08
+          Multiple snapshots can be specified if seperated by ','.
+
+          'ALL=<snapshot_id_str>' can be specified to delete all snapshots which contain
+           the specified snapshot id string e.g. ALL=ENIQ_UPGRADE.2007-Apr-02_12.24.08
+
+      In the case of list
+          List Snapshots. 'ALL' can be specified to list all snapshot
+
+          'ALL=<snapshot_id_str>' can be specified to list all snapshots which contain
+           the specified snapshot id string e.g. ALL=ENIQ_UPGRADE.2007-Apr-02_12.24.08
+
+      In the case of rollback
+          Snapshots(s) to roll back to. Must be specified in the following format
+          '<fs_name>-<snapshot_id_str>' e.g.dwh-ENIQ_UPGRADE.2007-Apr-02_12.24.08
+          Multiple snapshots can be specified if seperated by ','.
+
+          'ALL=<snapshot_id_str>' can be specified to roll back to all snapshots which contain
+           the specified snapshot id string e.g. ALL=ENIQ_UPGRADE.2007-Apr-02_12.24.08
+
+           NOTE: None of the ENIQ services can be online from systemd point of view
+
+-n  : In the case of snapshot creation, specify a name or label that each
+      snapshot will use. e.g. -n upg_snap would create dwh-upg_snap.
+
+      
+-l  : Optional parameter specifying the full path to logfile. If not specified, a
+      logfile will be created in ${ENIQ_ROOT_DIR}/local_logs/snapshot_logs/manage_fs_snapshot.log
+       
+-t  : In the case of snapshot listing,optional parameter specifying the the time of the snapshots created
+
+"
+}
+
+### Function: user_confirm ###
+#
+# Get confirmation from user to proceed with snapshot action
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+user_confirm()
+{
+while :; do
+    unset USER_CONF
+
+    $CLEAR
+
+    $CAT ${2}
+    $ECHO "\nAre you sure you wish to ${1} above"
+    $ECHO "Enter [Yes | No] (case sensitive) : \c"
+    read USER_CONF
+
+    if [ "$USER_CONF" == "Yes" -o "$USER_CONF" == "No" ]; then
+        break
+    fi
+done
+}
+
+# ********************************************************************
+#
+#   Main body of program
+#
+# ********************************************************************
+#
+RUN_TIME=`$DATE '+%Y-%b-%d_%H.%M.%S'`
+
+# Determine absolute path to software
+get_absolute_path
+
+# Check that the effective id of the user is root
+#check_id $DEFAULT_USER
+
+while getopts ":a:f:FHSl:n:Nq:t" arg; do
+  case $arg in
+    a) SNAP_ACTION="$OPTARG"
+       ;;
+    f) LVM_NAME="$OPTARG"
+       ;;
+    F) SNAP_FORCE="YES"
+       ;;
+    H) NO_HEADER="YES"
+       ;;
+    l) LOGFILE="$OPTARG"
+       ;;
+    n) SNAP_NAME="$OPTARG"
+       ;;
+    N) NO_CONFIRM="YES"
+       ;;
+    q) SNAP_QUIET="-q"
+       ;;
+    S) SKIP_SERVICE_CHECK="YES"
+       ;;
+    t) TIME="YES"
+       ;;
+   \?) usage_msg
+       exit 1
+       ;;
+  esac
+done
+shift `expr $OPTIND - 1`
+
+#Check current path
+$ECHO "Checking current path. Please wait"
+sleep 2
+
+_curr_dir_=$(pwd)
+
+if [ "${SNAP_ACTION}" == "rollback" ]; then
+       if [[ "${_curr_dir_}" =~ ^/eniq.* ]]; then
+        $ECHO -e "\nYour current directory is $_curr_dir_. Please change to /. \n"
+         exit 0
+      fi
+fi
+
+$ECHO -e "\nScript has been started.\n"
+
+# Source the common functions
+if [ -s ${ENIQ_ROOT_DIR}/installation/core_install/lib/common_functions.lib ]; then
+    . ${ENIQ_ROOT_DIR}/installation/core_install/lib/common_functions.lib
+else
+    _err_msg_="File ${ENIQ_ROOT_DIR}/installation/core_install/lib/common_functions.lib not found"
+    abort_script "${_err_msg_}"
+fi
+
+# Setup up path environment etc
+setup_env
+
+# Check Input Params
+check_params
+
+if [ ! "${LOGFILE}" ]; then
+    LOGFILE="${ENIQ_ROOT_DIR}/local_logs/snapshot_logs/manage_fs_snapshot.log"
+fi
+
+# Check/Create Logfile
+chk_create_logfile
+
+if [ ! "${NO_HEADER}" ]; then
+        log_msg -s "\n-------------------------------------------------------" ${_log_id_str} ${SNAP_QUIET}
+        log_msg -s "${RUN_TIME} - Starting to ${SNAP_ACTION} FS snapshots" ${_log_id_str} ${SNAP_QUIET}
+        log_msg -s "-------------------------------------------------------" ${_log_id_str} ${SNAP_QUIET}
+fi
+
+# Check we have all required files and scripts
+check_required_files_scripts
+
+# Create a temporary Directory
+TEM_DIR=/tmp/manage_snapshot.$$.$$
+$RM -rf ${TEM_DIR}
+$MKDIR -p ${TEM_DIR}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not create directory ${TEM_DIR}"
+    abort_script "${_err_msg_}"
+fi
+
+case "${SNAP_OPT}" in
+    snapshot)   create_snapshots
+                        ;;
+     destroy)   destroy_snapshots
+                        ;;
+        list)   list_snapshots
+                        ;;
+       mount)   mount_snapshots
+                        ;;
+    rollback)   rollback_snapshots
+                        ;;
+           *)   : # SHOULD NOT GET HERE
+                        ;;
+esac
+
+if [ "${SNAP_OPT}" == "rollback" ]; then
+    $RM -rf ${VAR_TMP_DIR}/lvm_rollback_*_completed
+fi
+
+$RM -rf ${TEM_DIR}
+
+
+exit 0
+

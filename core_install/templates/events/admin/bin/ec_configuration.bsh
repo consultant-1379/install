@@ -1,0 +1,527 @@
+#!/bin/bash
+# ********************************************************************
+# Ericsson Radio Systems AB                                     SCRIPT
+# ********************************************************************
+#
+#
+# (c) Ericsson Radio Systems AB 2012 - All rights reserved.
+#
+# The copyright to the computer program(s) herein is the property
+# of Ericsson Radio Systems AB, Sweden. The programs may be used
+# and/or copied only with the written permission from Ericsson Radio
+# Systems AB or in accordance with the terms and conditions stipulated
+# in the agreement/contract under which the program(s) have been
+# supplied.
+#
+# ********************************************************************
+# Name    : ec_configuration.bsh
+# Date    : 11/06/2012
+# Revision: B.2
+# Purpose : Script to configure files for the dynamic allocation of ECs
+#
+# Usage   : ec_configuration.bsh
+#
+# ********************************************************************
+#
+#   Command Section
+#
+# ********************************************************************
+AWK=/usr/bin/awk
+BASENAME=/usr/bin/basename
+BASH=/usr/bin/bash
+BC=/usr/bin/bc
+BOOTADM=/usr/sbin/bootadm
+CAT=/usr/bin/cat
+CHMOD=/usr/bin/chmod
+CHOWN=/usr/bin/chown
+CLEAR=/usr/bin/clear
+CMP=/usr/bin/cmp
+CP=/usr/bin/cp
+CPIO=/usr/bin/cpio
+DATE=/usr/bin/date
+DIRNAME=/usr/bin/dirname
+DOMAINNAME=/usr/bin/domainname
+DTCONFIG=/usr/dt/bin/dtconfig
+DUMPADM=/usr/sbin/dumpadm
+ECHO=/usr/bin/echo
+EGREP=/usr/bin/egrep
+EJECT=/usr/bin/eject
+ENV=/usr/bin/env
+EXPR=/usr/bin/expr
+FIND=/usr/bin/find
+FLARCREATE=/usr/sbin/flarcreate
+FORMAT=/usr/sbin/format
+FUSER=/usr/sbin/fuser
+GETENT=/usr/bin/getent
+GETTEXT=/usr/bin/gettext
+GREP=/usr/bin/grep
+GROUPADD=/usr/sbin/groupadd
+GTAR=/usr/sfw/bin/gtar
+GZCAT=/usr/bin/gzcat
+GZIP=/usr/bin/gzip
+HEAD=/usr/bin/head
+MYHOSTNAME=/usr/bin/hostname
+ID=/usr/bin/id
+IFCONFIG=/usr/sbin/ifconfig
+INIT=/usr/sbin/init
+LS=/usr/bin/ls
+MKDIR=/usr/bin/mkdir
+MORE=/usr/bin/more
+MOUNT=/usr/sbin/mount
+MV=/usr/bin/mv
+NAWK=/usr/bin/nawk
+NSLOOKUP=/usr/sbin/nslookup
+PGREP=/usr/bin/pgrep
+PING=/usr/sbin/ping
+PKGADD=/usr/sbin/pkgadd
+PKGINFO=/usr/bin/pkginfo
+PKGRM=/usr/sbin/pkgrm
+PRTCONF=/usr/sbin/prtconf
+PSRINFO=/usr/sbin/psrinfo
+PWD=/usr/bin/pwd
+REBOOT=/usr/sbin/reboot
+RM=/usr/bin/rm
+RCP=/usr/bin/rcp
+RSH=/usr/bin/rsh
+SED=/usr/bin/sed
+SEVEN_Z=/usr/bin/7z
+SLEEP=/usr/bin/sleep
+SORT=/usr/bin/sort
+STMSBOOT=/usr/sbin/stmsboot
+SU=/usr/bin/su
+SVCADM=/usr/sbin/svcadm
+SVCCFG=/usr/sbin/svccfg
+SVCS=/usr/bin/svcs
+SWAP=/usr/sbin/swap
+SYNC=/usr/sbin/sync
+TAIL=/usr/bin/tail
+TAR=/usr/sbin/tar
+TEE=/usr/bin/tee
+TOUCH=/usr/bin/touch
+TPUT=/usr/bin/tput
+TR=/usr/bin/tr
+UADMIN=/usr/sbin/uadmin
+UMOUNT=/usr/sbin/umount
+UNAME=/usr/bin/uname
+USERADD=/usr/sbin/useradd
+VOLD=/usr/sbin/vold
+WC=/usr/bin/wc
+YES=/usr/bin/yes
+ZFS=/usr/sbin/zfs
+ZPOOL=/usr/sbin/zpool
+
+# ********************************************************************
+#
+#       Configuration Section
+#
+# ********************************************************************
+
+# Default user
+DEFAULT_USER=root
+
+# DVD LABEL or Jumpstart Directory where all ENIQ SW will reside
+ENIQ_BASE_SW=eniq_base_sw
+
+# Name of SunOS & ENIQ ini Files
+ECS_INI=ecs.ini
+
+# Reserved memory for OS in MBs
+OS_MEM_RES=5120
+
+# ********************************************************************
+#
+#       Pre-execution Operations
+#
+# ********************************************************************
+I386=`$UNAME -p|grep -w i386`
+
+# ********************************************************************
+#
+#   Functions
+#
+# ********************************************************************
+### Function: abort_script ###
+#
+#   This will is called if the script is aborted thru an error
+#   signal sent by the kernel such as CTRL-C or if a serious
+#   error is encountered during runtime
+#
+# Arguments:
+#       $1 - Error message from part of program (Not always used)
+# Return Values:
+#       none
+abort_script()
+{
+_err_time_=`$DATE '+%Y-%b-%d_%H.%M.%S'`
+
+if [ "$1" ]; then
+    _err_msg_="${_err_time_} - $1"
+else
+    _err_msg_="${_err_time_} - ERROR : Script aborted.......\n"
+fi
+
+$ECHO "\nERROR : $_err_msg_\n" | $TEE -a ${LOGFILE}
+
+cd $SCRIPTHOME
+$RM -rf ${TEM_DIR}
+
+exit 1
+}
+
+### Function: chk_create_logfile ###
+#
+# Check/Create Logfile
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+chk_create_logfile()
+{
+$MKDIR -p `$DIRNAME ${LOGFILE}`
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not create directory `$DIRNAME ${LOGFILE}`"
+     abort_script "$_err_msg_"
+fi
+
+$TOUCH -a ${LOGFILE}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not write to file ${LOGFILE}"
+    abort_script "$_err_msg_"
+fi
+}
+
+### Function: check_id ###
+#
+#   Check that the effective id of the user is correct
+#   If not print error msg and exit.
+#
+# Arguments:
+#       $1 : User ID name
+# Return Values:
+#       none
+check_id()
+{
+_check_id_=`$ID  | $AWK -F\( '{print $2}' | $AWK -F\) '{print $1}'`
+if [ "$_check_id_" != "$1" ]; then
+    _err_msg_="You must be $1 to execute this script."
+    abort_script "$_err_msg_"
+fi
+}
+
+### Function: check_files_and_scripts ###
+#
+#   Checks required files/scripts are present
+#
+# Arguments:
+#       $1 : User ID name
+# Return Values:
+#       none
+check_files_and_scripts()
+{
+$ECHO "\nChecking for required files and scripts" | $TEE -a ${LOGFILE}
+	
+if [ ! -s ${CLI_CONF_DIR}/${ECS_INI} ]; then
+    _err_msg_="Cannot locate ${CLI_CONF_DIR}/${ECS_INI}"
+    abort_script "$_err_msg_"
+fi
+
+if [ ! -s ${SERVICE_NAME_FILE} ]; then
+    _err_msg_="Cannot locate ${SERVICE_NAME_FILE}"
+    abort_script "$_err_msg_"
+fi
+}
+
+### Function: get_absolute_path ###
+#
+# Determine absolute path to software
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+get_absolute_path()
+{
+_dir_=`$DIRNAME $0`
+SCRIPTHOME=`cd $_dir_ 2>/dev/null && pwd || $ECHO $_dir_`
+}
+
+### Function: get_num_ecs ###
+#
+# Determine number of CPUs and memory
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+get_num_ecs()
+{
+if [ ! "${NUM_CORES}" -o ! "${TOTAL_MEM}" ]; then
+	_err_msg_="Required parameters not set"
+    abort_script "$_err_msg_" 
+fi
+
+# Get the configuration parameters from ecs.ini
+$ECHO "\nGathering EC configuration parameters from ${CLI_CONF_DIR}/${ECS_INI}" | $TEE -a ${LOGFILE}
+
+_mem_per_ec_=`iniget EC_GLOBAL_INFO -f ${CLI_CONF_DIR}/${ECS_INI} -v Memory_MB_per_EC`
+if [ ! "${_mem_per_ec_}" ]; then
+	_err_msg_="Could not read Memory_MB_per_EC parameter from ${CLI_CONF_DIR}/${ECS_INI}"
+    abort_script "$_err_msg_" 
+fi
+
+_cpu_per_ec_=`iniget EC_GLOBAL_INFO -f ${CLI_CONF_DIR}/${ECS_INI} -v CPU_cores_per_EC`
+if [ ! "${_mem_per_ec_}" ]; then
+	_err_msg_="Could not read CPU_cores_per_EC parameter from ${CLI_CONF_DIR}/${ECS_INI}"
+    abort_script "$_err_msg_" 
+fi
+
+# Check if we have resources for at least 1 EC
+$ECHO "Checking if HW requirements are met" | $TEE -a ${LOGFILE}
+if [ ${NUM_CORES} -lt ${_cpu_per_ec_} ]; then
+	_err_msg_="Not enough CPU cores exists (${NUM_CORES}) for any ECs"
+    abort_script "$_err_msg_" 
+fi
+
+if [ ${TOTAL_MEM} -lt ${_mem_per_ec_} ]; then
+	_err_msg_="Not enough memory exists (${TOTAL_MEM}MB) for any ECs"
+    abort_script "$_err_msg_" 
+fi
+
+# Calculate how many ECs we can have
+_ecs_on_mem_=`$EXPR ${TOTAL_MEM} / ${_mem_per_ec_}`
+if [ ! "${_ecs_on_mem_}" ]; then
+	_err_msg_="Could not set number of ECs based on available memory"
+    abort_script "$_err_msg_" 
+fi
+
+_ecs_on_cpu_=`$EXPR ${NUM_CORES} / ${_cpu_per_ec_}`
+if [ ! "${_ecs_on_cpu_}" ]; then
+	_err_msg_="Could not set number of ECs based on available CPU resources"
+    abort_script "$_err_msg_" 
+fi
+
+unset NUM_ECS
+if [ ${_ecs_on_mem_} -ge ${_ecs_on_cpu_} ]; then
+	NUM_ECS=${_ecs_on_cpu_}
+else
+	NUM_ECS=${_ecs_on_mem_}
+fi
+$ECHO "\nNumber of ECs that can be run on this machine set to ${NUM_ECS}" | $TEE -a ${LOGFILE}
+}
+
+### Function: get_hw_info ###
+#
+# Determine number of CPUs and memory
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+get_hw_info()
+{
+unset NUM_CORES TOTAL_MEM
+
+# Get the details per physical processor
+$ECHO "\nCalculating the number of physical processors in $HNAME" | $TEE -a ${LOGFILE}
+
+NUM_CORES=`$PSRINFO -p`
+
+$ECHO "Number of physical processors found is ${NUM_CORES}" | $TEE -a ${LOGFILE}
+
+# Get the total memory of server in MBytes
+$ECHO "\nCalculating total memory in $HNAME" | $TEE -a ${LOGFILE}
+
+_total_mem_=`$PRTCONF | $EGREP '^Memory size' | $NAWK '{print $3}'`
+if [ ! "${_total_mem_}" ]; then
+    _err_msg_="Could not read total memory value from $PRTCONF"
+    abort_script "$_err_msg_" 
+fi
+
+$ECHO "Total memory in system is ${_total_mem_}" | $TEE -a ${LOGFILE}
+
+# Calculate how much memory can be set aside for the ECs
+if [ ${_total_mem_} -le ${OS_MEM_RES} ]; then
+	_err_msg_="OS memory reserve greater than total available memory"
+    abort_script "$_err_msg_" 
+else
+	TOTAL_MEM=`$EXPR ${_total_mem_} - ${OS_MEM_RES}`
+	$ECHO "Total memory available for ECs is ${TOTAL_MEM}" | $TEE -a ${LOGFILE}
+fi
+}
+
+### Function: setup_env ###
+#
+# Set up environment variables for script.
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+setup_env()
+{
+if [ ! "${ENIQ_BASE_DIR}" ]; then
+    # Directory on the root filesystem
+    ENIQ_BASE_DIR=/eniq
+fi
+
+# ENIQ Admin Directory
+ENIQ_ADMIN_DIR=${ENIQ_BASE_DIR}/admin
+
+# ENIQ Log Directory
+ENIQ_LOG_DIR=${ENIQ_BASE_DIR}/log
+
+# ENIQ Admin Bin Directory
+ENIQ_ADMIN_BIN_DIR=${ENIQ_ADMIN_DIR}/bin
+
+# Main Directory for the Core Installation SW
+ENIQ_INST_DIR=${ENIQ_BASE_DIR}/installation
+
+# Main Directory for the Core Installation SW
+ENIQ_CORE_INST_DIR=${ENIQ_INST_DIR}/core_install
+
+# ENIQ Config Directory
+ENIQ_CONF_DIR=${ENIQ_INST_DIR}/config
+
+# SW conf dir
+CLI_CONF_DIR=${ENIQ_BASE_DIR}/sw/conf
+
+HNAME=`${MYHOSTNAME}`
+HOST_IP=`$GETENT hosts ${HNAME} | $NAWK '{print $1}' | $HEAD -1`
+
+# Has the installation to stop at any specific stage?
+if [ -s ${ENIQ_CONF_DIR}/extra_params/debug ]; then
+    set -xv
+    BASH="/usr/bin/bash -xv"
+fi
+
+SERVICE_NAME_FILE=${CLI_CONF_DIR}/service_names
+}
+
+### Function: update_service_name_file ###
+#
+# Update the service names file.
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+update_service_name_file()
+{
+# Get the System User/Group. All directories are owned by this
+_sysuser_=`iniget ENIQ_INSTALL_CONFIG -f ${ENIQ_CONF_DIR}/${SUNOS_INI} -v ENIQ_SYSUSER`
+if [ ! "${_sysuser_}" ]; then
+    _err_msg_="Could not read parameter ENIQ_SYSUSER from file ${ENIQ_CONF_DIR}/${SUNOS_INI}"
+    abort_script "$_err_msg_" "${EXEC_SHELL_CMD}"
+fi
+
+_sysgrp_=`$ID ${_sysuser_} | $NAWK '{print $2}' | $NAWK -F\( '{print $2}' | $NAWK -F\) '{print $1}'`
+if [ ! "${_sysgrp_}" ]; then
+    _err_msg_="Could not determine group ID of ${_sysgrp_}"
+    abort_script "$_err_msg_" "${EXEC_SHELL_CMD}"
+fi
+	
+_curr_num_=`$CAT ${SERVICE_NAME_FILE} | $EGREP "ec_[0-9]" | $NAWK -F"::" '{print $NF}' | $NAWK -F\_ '{print $NF}' | $SORT -un | $TAIL -1`
+if [ ! "${_curr_num_}" ]; then
+	_curr_num_=0
+fi
+
+_nxt_num_=`$EXPR ${_curr_num_} + 1`
+if [ ! "${_nxt_num_}" ]; then
+    _err_msg_="Failed to calculate the next available EC number"
+    abort_script "$_err_msg_"
+fi
+
+$ECHO "\nAdding EC information to ${SERVICE_NAME_FILE}" | $TEE -a ${LOGFILE}
+for (( i=1; i<=${NUM_ECS}; i++ )); do
+	update_service_file ${SERVICE_NAME_FILE} ${HOST_IP} ${HNAME} ec_${_nxt_num_} "NULL_GRP"
+	if [ $? -ne 0 ]; then
+	    _err_msg_="Failed to update ${SERVICE_NAME_FILE} with ec_${_nxt_num_}"
+	    abort_script "$_err_msg_"
+	fi
+
+	_nxt_num_=`$EXPR ${_nxt_num_} + 1`
+done
+
+$ECHO "Changing ownership of ${SERVICE_NAME_FILE} to ${_sysuser_}:${_sysgrp_} after updates" >> ${LOGFILE}
+$CHOWN ${_sysuser_}:${_sysgrp_} ${SERVICE_NAME_FILE}
+if [ $? -ne 0 ]; then
+    _err_msg_="Failed to change ownership of ${SERVICE_NAME_FILE} to ${_sysuser_}:${_sysgrp_}"
+    abort_script "$_err_msg_"
+fi
+}
+
+# ********************************************************************
+#
+#   Main body of program
+#
+# ********************************************************************
+#
+RUN_TIME=`$DATE '+%Y-%b-%d_%H.%M.%S'`
+
+# Determine absolute path to software
+get_absolute_path
+
+# Check that the effective id of the user is root
+check_id $DEFAULT_USER
+
+while getopts ":b:l:" arg; do
+  case $arg in
+    b) ENIQ_BASE_DIR="$OPTARG"
+       ;;
+    l) LOGFILE="$OPTARG"
+       ;;
+   \?) _err_msg_="`$BASENAME $0` [-l <logfile>]"
+       abort_script "$_err_msg_"
+       ;;
+  esac
+done
+shift `expr $OPTIND - 1`
+
+# Set up environment variables for script.
+setup_env
+
+# Log file
+if [ ! "${LOGFILE}" ]; then
+	LOGFILE=${ENIQ_LOG_DIR}/ec_configuration/ec_configuration.log
+fi	
+  
+# Check/Create Logfile
+chk_create_logfile
+
+$ECHO "\n=======================================================" >> ${LOGFILE}
+$ECHO "${RUN_TIME} - Starting EC configuration" >> ${LOGFILE}
+$ECHO "=======================================================\n" >> ${LOGFILE}
+
+# Source the common functions
+if [ -s $ENIQ_CORE_INST_DIR/lib/common_functions.lib ]; then
+    . $ENIQ_CORE_INST_DIR/lib/common_functions.lib
+else
+    _err_msg_="File $ENIQ_CORE_INST_DIR/lib/common_functions.lib not found"
+    abort_script "$_err_msg_"
+fi
+
+# Check all required files/scripts exist on the server
+check_files_and_scripts
+
+# Create a temporary Directory
+TEM_DIR=/tmp/ec_configuration.$$.$$
+$RM -rf ${TEM_DIR}
+$MKDIR -p ${TEM_DIR}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not create directory $TEM_DIR"
+    abort_script "$_err_msg_"
+fi
+
+# Calculate number of CPUs and Memory
+get_hw_info
+
+# Determine how many ECs we can start
+get_num_ecs
+
+# Update service_names file with the new ECs
+update_service_name_file
+
+$RM -rf ${TEM_DIR}
+
+exit 0

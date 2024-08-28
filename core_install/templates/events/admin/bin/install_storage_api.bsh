@@ -1,0 +1,652 @@
+#!/bin/bash
+# ********************************************************************
+# Ericsson Radio Systems AB                                     SCRIPT
+# ********************************************************************
+#
+#
+# (c) Ericsson Radio Systems AB 2011 - All rights reserved.
+#
+# The copyright to the computer program(s) herein is the property
+# of Ericsson Radio Systems AB, Sweden. The programs may be used
+# and/or copied only with the written permission from Ericsson Radio
+# Systems AB or in accordance with the terms and conditions stipulated
+# in the agreement/contract under which the program(s) have been
+# supplied.
+#
+# ********************************************************************
+# Name    : install_storage_api.bsh
+# Date    : 26/07/2012
+# Revision: B.2
+# Purpose : Main script for upgrade of ENIQ Events to add the storage api.
+#
+# Usage   : install_storage_api.bsh
+#
+# ********************************************************************
+#
+#   Command Section
+#
+# ********************************************************************
+AWK=/usr/bin/awk
+BASENAME=/usr/bin/basename
+BASH=/usr/bin/bash
+BC=/usr/bin/bc
+BOOTADM=/usr/sbin/bootadm
+CAT=/usr/bin/cat
+CHMOD=/usr/bin/chmod
+CHOWN=/usr/bin/chown
+CLEAR=/usr/bin/clear
+CMP=/usr/bin/cmp
+CP=/usr/bin/cp
+CPIO=/usr/bin/cpio
+DATE=/usr/bin/date
+DIRNAME=/usr/bin/dirname
+DOMAINNAME=/usr/bin/domainname
+DTCONFIG=/usr/dt/bin/dtconfig
+DUMPADM=/usr/sbin/dumpadm
+ECHO=/usr/bin/echo
+EGREP=/usr/bin/egrep
+EJECT=/usr/bin/eject
+ENV=/usr/bin/env
+EXPR=/usr/bin/expr
+FIND=/usr/bin/find
+FLARCREATE=/usr/sbin/flarcreate
+FORMAT=/usr/sbin/format
+FUSER=/usr/sbin/fuser
+GETENT=/usr/bin/getent
+GETTEXT=/usr/bin/gettext
+GREP=/usr/bin/grep
+GROUPADD=/usr/sbin/groupadd
+GTAR=/usr/sfw/bin/gtar
+GZCAT=/usr/bin/gzcat
+GZIP=/usr/bin/gzip
+HEAD=/usr/bin/head
+MYHOSTNAME=/usr/bin/hostname
+ID=/usr/bin/id
+IFCONFIG=/usr/sbin/ifconfig
+INIT=/usr/sbin/init
+LS=/usr/bin/ls
+MKDIR=/usr/bin/mkdir
+MORE=/usr/bin/more
+MOUNT=/usr/sbin/mount
+MV=/usr/bin/mv
+NAWK=/usr/bin/nawk
+NSLOOKUP=/usr/sbin/nslookup
+PGREP=/usr/bin/pgrep
+PING=/usr/sbin/ping
+PKGADD=/usr/sbin/pkgadd
+PKGINFO=/usr/bin/pkginfo
+PKGRM=/usr/sbin/pkgrm
+PRTCONF=/usr/sbin/prtconf
+PSRINFO=/usr/sbin/psrinfo
+PWD=/usr/bin/pwd
+REBOOT=/usr/sbin/reboot
+RM=/usr/bin/rm
+RCP=/usr/bin/rcp
+RSH=/usr/bin/rsh
+SED=/usr/bin/sed
+SEVEN_Z=/usr/bin/7z
+SLEEP=/usr/bin/sleep
+SORT=/usr/bin/sort
+STMSBOOT=/usr/sbin/stmsboot
+SU=/usr/bin/su
+SVCADM=/usr/sbin/svcadm
+SVCCFG=/usr/sbin/svccfg
+SVCS=/usr/bin/svcs
+SWAP=/usr/sbin/swap
+SYNC=/usr/sbin/sync
+TAIL=/usr/bin/tail
+TAR=/usr/sbin/tar
+TEE=/usr/bin/tee
+TOUCH=/usr/bin/touch
+TPUT=/usr/bin/tput
+TR=/usr/bin/tr
+UADMIN=/usr/sbin/uadmin
+UMOUNT=/usr/sbin/umount
+UNAME=/usr/bin/uname
+USERADD=/usr/sbin/useradd
+USERMOD=/usr/sbin/usermod
+VOLD=/usr/sbin/vold
+WC=/usr/bin/wc
+YES=/usr/bin/yes
+ZFS=/usr/sbin/zfs
+ZPOOL=/usr/sbin/zpool
+
+# ********************************************************************
+#
+#       Configuration Section
+#
+# ********************************************************************
+# Default user
+DEFAULT_USER=root
+
+# Jumpstart Directory where all ENIQ SW will reside
+ENIQ_BASE_SW=eniq_base_sw
+
+# Name of SunOS & ENIQ ini Files
+ENIQ_ENV=niq.rc
+ENIQ_INI=niq.ini
+RBAC_INI=RBAC.ini
+SUNOS_INI=SunOS.ini
+SENTINEL_INI=sentinel.ini
+STORAGE_INI=storage.ini
+
+# Initialise reboot flag
+REBOOT_FLAG=0
+
+# List of core stages to run through during upgrade
+INSTALL_API_STAGES="install_san_sw
+install_storage_api
+configure_storage_api
+create_lun_map"
+
+# List of stages to run if introducing NAS pkgs
+NAS_USER_STAGES="install_storage_files
+create_nas_users
+setup_nas_filestore"
+
+ZFS_FS_LIST="bkup_sw smf connectd"
+
+NIQ_RC_VARS="EVENTDATA_DIR|DWH_READER_DIR"
+
+# ********************************************************************
+#
+#       Pre-execution Operations
+#
+# ********************************************************************
+
+# ********************************************************************
+#
+#   Functions
+#
+# ********************************************************************
+### Function: abort_script ###
+#
+#   This will is called if the script is aborted thru an error
+#   signal sent by the kernel such as CTRL-C or if a serious
+#   error is encountered during runtime
+#
+# Arguments:
+#       $1 - Error message from part of program (Not always used)
+# Return Values:
+#       none
+abort_script()
+{
+_err_time_=`$DATE '+%Y-%b-%d_%H.%M.%S'`
+
+if [ "$1" ]; then
+    _err_msg_="${_err_time_} - $1"
+else
+    _err_msg_="${_err_time_} - ERROR : Script aborted.......\n"
+fi
+
+if [ "${LOGFILE}" ]; then
+    $ECHO "\nERROR : $_err_msg_\n" | $TEE -a ${LOGFILE}
+else
+    $ECHO "\nERROR : $_err_msg_\n"
+fi
+
+cd $SCRIPTHOME
+$RM -rf ${TEM_DIR}
+
+if [ "$2" ]; then
+    ${2}
+    exit 1
+else
+   exit 1
+fi
+}
+
+### Function: chk_create_logfile ###
+#
+# Check/Create Logfile
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+chk_create_logfile()
+{
+$MKDIR -p `$DIRNAME ${LOGFILE}`
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not create directory `$DIRNAME ${LOGFILE}`"
+     abort_script "$_err_msg_"
+fi
+
+$TOUCH -a ${LOGFILE}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not write to file ${LOGFILE}"
+    abort_script "$_err_msg_"
+fi
+}
+
+### Function: check_files_and_scripts ###
+#
+#   Checks required files/scripts are present
+#
+# Arguments:
+#       $1 : User ID name
+# Return Values:
+#       none
+check_files_and_scripts()
+{
+$ECHO "\nChecking for required files and scripts" | $TEE -a ${LOGFILE}
+	
+if [ ! -s ${ENIQ_CORE_DIR}/bin/eniq_core_install.bsh ]; then
+    _err_msg_="Cannot locate ${ENIQ_CORE_DIR}/bin/eniq_core_install.bsh"
+    abort_script "$_err_msg_"
+fi
+
+if [ ! -s ${CLI_CONF_DIR}/${ENIQ_ENV} ]; then
+    _err_msg_="Cannot locate ${CLI_CONF_DIR}/${ENIQ_ENV}"
+    abort_script "$_err_msg_"
+fi
+
+if [ ! -s ${ENIQ_CONF_DIR}/${ENIQ_INI} ]; then
+    _err_msg_="Cannot locate ${ENIQ_CONF_DIR}/${ENIQ_INI}"
+    abort_script "$_err_msg_"
+fi
+
+if [ ! -s ${ENIQ_CONF_DIR}/${SUNOS_INI} ]; then
+    _err_msg_="Cannot locate ${ENIQ_CONF_DIR}/${SUNOS_INI}"
+    abort_script "$_err_msg_"
+fi
+
+if [ ! -s ${ENIQ_CONF_DIR}/${STORAGE_INI} ]; then
+    _err_msg_="Cannot locate ${ENIQ_CONF_DIR}/${STORAGE_INI}"
+    abort_script "$_err_msg_"
+fi
+
+if [ ! -s ${ENIQ_BASE_DIR}/admin/lib/inidel.pl ]; then
+    _err_msg_="Cannot locate ${NEW_TEMPL_DIR}/admin/lib/inidel.pl"
+    abort_script "$_err_msg_"
+fi
+
+if [ ! -s ${ENIQ_BASE_DIR}/admin/bin/manage_eniq_services.bsh ]; then
+    _err_msg_="Cannot locate ${NEW_TEMPL_DIR}/admin/bin/manage_eniq_services.bsh"
+    abort_script "$_err_msg_"
+fi
+
+}
+
+### Function: check_id ###
+#
+#   Check that the effective id of the user is correct
+#   If not print error msg and exit.
+#
+# Arguments:
+#       $1 : User ID name
+# Return Values:
+#       none
+check_id()
+{
+_check_id_=`$ID  | $AWK -F\( '{print $2}' | $AWK -F\) '{print $1}'`
+if [ "$_check_id_" != "$1" ]; then
+    _err_msg_="You must be $1 to execute this script."
+    abort_script "$_err_msg_"
+fi
+}
+
+### Function: check_update_boot_archive ###
+#
+# Check that the vold daemon is running
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+check_update_boot_archive()
+{
+if [ -x $BOOTADM ]; then
+    $BOOTADM update-archive >> /dev/null 2>&1
+    if [ $? -ne 0 ]; then
+       _err_msg_="Could not update boot kernel archive.....Exiting"
+       abort_script "$_err_msg"
+    fi
+fi
+}
+
+### Function: get_absolute_path ###
+#
+# Determine absolute path to software
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+get_absolute_path()
+{
+_dir_=`$DIRNAME $0`
+SCRIPTHOME=`cd $_dir_ 2>/dev/null && pwd || $ECHO $_dir_`
+}
+
+### Function: setup_env ###
+#
+# Setup up path environment etc
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+setup_env()
+{
+if [ ! "${ENIQ_BASE_DIR}" ]; then
+    ENIQ_BASE_DIR=/eniq
+fi
+
+# Main Directory for the Core Installation SW
+ENIQ_INST_DIR=${ENIQ_BASE_DIR}/installation
+
+# Installation config directory
+ENIQ_CONF_DIR=${ENIQ_INST_DIR}/config
+
+# File containing the type of installation
+INST_TYPE_FILE=${ENIQ_CONF_DIR}/ericsson_use_config
+if [ ! -s ${INST_TYPE_FILE} ]; then
+    _err_msg_="Could not locate file ${INST_TYPE_FILE}"
+    abort_script "$_err_msg_"
+fi
+
+CLI_CONF_DIR=${ENIQ_BASE_DIR}/sw/conf
+if [ ! -s ${CLI_CONF_DIR}/niq.ini ]; then
+    _err_msg_="Could not locate file ${CLI_CONF_DIR}/niq.ini"
+    abort_script "$_err_msg_"
+fi
+
+# Core install directory that contains scripts
+ENIQ_CORE_DIR=${ENIQ_INST_DIR}/core_install
+
+# Read the installation type
+INSTALL_TYPE=`$CAT ${INST_TYPE_FILE} | $NAWK -F\= '{print $2}'`
+
+# Templates Directory
+ENIQ_TEMPL_DIR="${ENIQ_CORE_DIR}/templates/${INSTALL_TYPE}"
+NEW_TEMPL_DIR="${UPGRADE_SW}/core_install/templates/${INSTALL_TYPE}"
+NEW_ENIQ_CORE_DIR="${UPGRADE_SW}/core_install"
+
+HNAME=`${MYHOSTNAME}`
+HOST_IP=`$GETENT hosts ${HNAME} | $NAWK '{print $1}' | $HEAD -1`
+
+# Core install log file
+ENIQ_CORE_LOG=${ENIQ_BASE_DIR}/local_logs/${HNAME}_install.log
+
+# Admin directory
+ENIQ_ADMIN_DIR=${ENIQ_BASE_DIR}/admin
+
+if [ ! -s ${ENIQ_BASE_DIR}/admin/lib/common_functions.lib ]; then
+    _err_msg_="Cannot locate ${ENIQ_BASE_DIR}/admin/lib/common_functions.lib"
+    abort_script "$_err_msg_"
+else
+   . ${ENIQ_BASE_DIR}/admin/lib/common_functions.lib
+fi
+
+CURR_SERVER_TYPE=`$CAT $ENIQ_CONF_DIR/installed_server_type | $EGREP -v '^[ 	]*#' | $SED -e 's/ //g'`
+if [ ! "${CURR_SERVER_TYPE}" ]; then
+	_err_msg_="Could not determine which server type this is"
+    abort_script "$_err_msg_"
+fi
+
+# Set up ini manipulation scripts
+if [ ! -s $SCRIPTHOME/../lib/iniadd.pl ]; then
+    _err_msg_="Cannot locate $SCRIPTHOME/../lib/iniadd"
+    abort_script "$_err_msg_"
+else
+    INIADD=$SCRIPTHOME/../lib/iniadd.pl
+fi
+
+if [ ! -s $SCRIPTHOME/../lib/inidel.pl ]; then
+    _err_msg_="Cannot locate $SCRIPTHOME/../lib/inidel"
+    abort_script "$_err_msg_"
+else
+    INIDEL=$SCRIPTHOME/../lib/inidel.pl
+fi
+}
+
+### Function: update_sunos_ini ###
+#
+#   Update niq.ini
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+update_sunos_ini()
+{
+$RM -rf ${TEM_DIR}/${SUNOS_INI}
+	
+# Make a copy of SunOS.ini
+$CP ${ENIQ_CONF_DIR}/${SUNOS_INI} ${TEM_DIR}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not copy ${ENIQ_CONF_DIR}/${SUNOS_INI} to ${TEM_DIR}"
+    abort_script "$_err_msg_"
+fi
+		
+# Is there any need to update the SunOS.ini??	
+$CAT ${ENIQ_CONF_DIR}/${SUNOS_INI} | $EGREP "SAN_DEV" >> /dev/null 2>&1
+if [ $? -ne 0 ]; then
+    # Add in the SAN block
+    $ECHO "
+;--------------------------------------------------------------------------
+; SAN Device information
+;--------------------------------------------------------------------------
+[SAN_DEV]
+SAN_DEVICE=
+    ">> ${TEM_DIR}/${SUNOS_INI}
+    if [ $? -ne 0 ]; then
+        _err_msg_="Could not update ${TEM_DIR}/${SUNOS_INI}"
+        abort_script "$_err_msg_"
+    fi
+
+	#Get type of SAN device (e.g. clariion, vnx)
+	if [ -s ${ENIQ_CONF_DIR}/san_details ]; then
+		_san_type_=`$CAT ${ENIQ_CONF_DIR}/san_details|$GEGREP "^SAN_DEVICE="|$NAWK -F\= '{print $2}'`
+	fi
+
+	if [ ! "${_san_type_}" ]; then
+		_err_msg_="Could not read SAN_DEVICE param from ${ENIQ_CONF_DIR}/san_details while updating SUNOS.ini"
+		abort_script "$_err_msg_" "${EXEC_SHELL_CMD}"
+	fi
+
+    # Update the ini file with SAN passwords
+    iniset SAN_DEV -f ${TEM_DIR}/${SUNOS_INI} SAN_DEVICE=${_san_type_}
+    if [ $? -ne 0 ]; then
+        _err_msg_="Could not set SAN_Username to admin ${TEM_DIR}/${SUNOS_INI}"
+        abort_script "$_err_msg_"
+    fi
+fi
+
+$CP ${TEM_DIR}/${SUNOS_INI} ${ENIQ_CONF_DIR}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not copy ${TEM_DIR}/${SUNOS_INI} to ${ENIQ_CONF_DIR}"
+    abort_script "$_err_msg_"
+fi
+
+$RM -rf ${TEM_DIR}/${SUNOS_INI}
+
+# Make a copy of SunOS.ini
+$CP ${ENIQ_CONF_DIR}/${SUNOS_INI} ${TEM_DIR}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not copy ${ENIQ_CONF_DIR}/${SUNOS_INI} to ${TEM_DIR}"
+    abort_script "$_err_msg_"
+fi
+
+$CAT ${ENIQ_CONF_DIR}/${SUNOS_INI} | $EGREP "SAN_SW" >> /dev/null 2>&1
+if [ $? -ne 0 ]; then
+    # Add in the San block
+    $ECHO "
+[SAN_SW]
+SAN_SW_SOURCE_DIR=EMC
+SAN_SW_INST_PROG=install_emc_sw.bsh
+SAN_SW_PKGS_TO_INST=NAVISCLI,HOSTAGENT
+    " >> ${TEM_DIR}/${SUNOS_INI}
+    if [ $? -ne 0 ]; then
+        _err_msg_="Could not update ${TEM_DIR}/${SUNOS_INI}"
+        abort_script "$_err_msg_"
+    fi
+fi
+
+$CP ${TEM_DIR}/${SUNOS_INI} ${ENIQ_CONF_DIR}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not copy ${TEM_DIR}/${SUNOS_INI} to ${ENIQ_CONF_DIR}"
+    abort_script "$_err_msg_"
+fi
+
+$RM -rf ${TEM_DIR}/${SUNOS_INI}
+
+# Make a copy of SunOS.ini
+$CP ${ENIQ_CONF_DIR}/${SUNOS_INI} ${TEM_DIR}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not copy ${ENIQ_CONF_DIR}/${SUNOS_INI} to ${TEM_DIR}"
+    abort_script "$_err_msg_"
+fi
+
+$CAT ${ENIQ_CONF_DIR}/${SUNOS_INI} | $EGREP "STOR_API" >> /dev/null 2>&1
+if [ $? -ne 0 ]; then
+    # Add in the Storage block
+    $ECHO "
+[STOR_API]
+STOR_API_SOURCE_DIR=storage
+STOR_API_PKG=ERICstorapi.pkg
+STOR_API_CMD=/ericsson/storage/san/bin/blkcli
+    " >> ${TEM_DIR}/${SUNOS_INI}
+    if [ $? -ne 0 ]; then
+        _err_msg_="Could not update ${TEM_DIR}/${SUNOS_INI}"
+        abort_script "$_err_msg_"
+    fi
+fi
+
+$CP ${TEM_DIR}/${SUNOS_INI} ${ENIQ_CONF_DIR}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not copy ${TEM_DIR}/${SUNOS_INI} to ${ENIQ_CONF_DIR}"
+    abort_script "$_err_msg_"
+fi
+
+$RM -rf ${TEM_DIR}/${SUNOS_INI}
+
+}
+
+### Function: usage_msg ###
+#
+#   Print out the usage message
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+usage_msg()
+{
+$CLEAR
+$ECHO "
+Usage: `$BASENAME $0` -d <eniq_sw_dir> -p <new_sw_extraction_loc> -o <om_sw_dir>/om
+						[ -b <eniq_base_dir> ] [ -l <path_to_logfile> ]
+
+options:
+
+-b  : Optional parameter specifying the full path to where the ENIQ
+      BASEDIR directory is (eg. /eniq). If not specified, then the
+      script will assume the the base directory is /eniq
+
+-d  : Parameter specifying the full path to the directory
+      containing the ENIQ BASE SW directory structure.
+
+-l  : Optional parameter specifying the full path to logfile. If not specified, a 
+      logfile will be created in <ENIQ BASEDIR>/local_logs/upgrade
+      
+-p  : Parameter specifying where the new core SW is extracted.
+	  e.g. <path_to_core_sw>/core_install  
+	  
+-o	: Parameter specifying the full path to the directory
+      containing the O&M SW directory structure.
+"
+}
+# ********************************************************************
+#
+#   Main body of program
+#
+# ********************************************************************
+#
+RUN_TIME=`$DATE '+%Y-%b-%d_%H.%M.%S'`
+
+# Determine absolute path to software
+get_absolute_path
+
+# Check that the effective id of the user is root
+check_id $DEFAULT_USER
+
+while getopts ":b:d:l:p:o:" arg; do
+  case $arg in
+    b) ENIQ_BASE_DIR="$OPTARG"
+       ;;
+    d) BASE_SW_DIR="$OPTARG"
+       ;;
+    l) LOGFILE="$OPTARG"
+       ;;
+    p) UPGRADE_SW="$OPTARG"
+       ;;
+    o) OM_SW_DIR="$OPTARG"
+       ;;
+   \?) usage_msg
+       exit 1
+       ;;
+  esac
+done
+shift `expr $OPTIND - 1`
+
+# Check that we got the required params
+if [ ! "${BASE_SW_DIR}" -o ! "${OM_SW_DIR}" -o ! "${UPGRADE_SW}" ]; then
+    usage_msg
+    exit 1
+fi 
+
+# Setup up path environment etc
+setup_env
+
+if [ ! "${LOGFILE}" ]; then
+    LOGFILE=${ENIQ_BASE_DIR}/local_logs/upgrade/install_storage_api_${RUN_TIME}.log
+fi	
+  
+# Check/Create Logfile
+chk_create_logfile
+
+$ECHO "\n-------------------------------------------------------" >> ${LOGFILE}
+$ECHO "${RUN_TIME} - Starting Storage API Installation" >> ${LOGFILE}
+$ECHO "-------------------------------------------------------\n" >> ${LOGFILE}
+
+# Check all required files/scripts exist on the server
+check_files_and_scripts
+
+# Create a temporary Directory
+TEM_DIR=/tmp/install_storage_api.$$.$$
+$RM -rf ${TEM_DIR}
+$MKDIR -p ${TEM_DIR}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not create directory ${TEM_DIR}"
+    abort_script "$_err_msg_"
+fi
+$CHMOD 777 ${TEM_DIR}
+
+# Update SunOS.ini
+update_sunos_ini
+
+
+# Run required stages
+for _stage_ in ${INSTALL_API_STAGES}; do
+    ${NEW_ENIQ_CORE_DIR}/bin/eniq_core_install.bsh -d ${BASE_SW_DIR} -n -o ${OM_SW_DIR} -s ${_stage_} -u -l ${LOGFILE}
+    if [ $? -ne 0 ]; then
+        _err_msg_="Failed in stage ${_stage_}"
+        abort_script "$_err_msg_"
+    fi
+done
+
+if [ ${REBOOT_FLAG} -eq 1 ]; then
+    $ECHO "\nA reboot is required at some stage to bring /etc/system changes into effect\n" | $TEE -a ${LOGFILE}
+fi
+
+# Update the boot-archive
+check_update_boot_archive
+
+# Remove traps on interrupts
+trap 1 2 3 14 15
+
+$RM -rf ${TEM_DIR}
+
+exit 0

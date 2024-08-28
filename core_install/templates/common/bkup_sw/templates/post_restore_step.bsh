@@ -1,0 +1,492 @@
+#!/bin/bash
+# ********************************************************************
+# Ericsson Radio Systems AB                                     SCRIPT
+# ********************************************************************
+#
+#
+# (c) Ericsson Radio Systems AB 2018 - All rights reserved.
+#
+# The copyright to the computer program(s) herein is the property
+# of Ericsson Radio Systems AB, Sweden. The programs may be used
+# and/or copied only with the written permission from Ericsson Radio
+# Systems AB or in accordance with the terms and conditions stipulated
+# in the agreement/contract under which the program(s) have been
+# supplied.
+#
+# ********************************************************************
+# Name    : post_restore_step.bsh
+# Date    : 23/10/2023
+# Revision: \main\16
+# Purpose : Wrapper ENIQ script to that handles post restores.
+#
+# Usage   : post_restore_step.bsh [ -l <logfile> ]
+#
+# ********************************************************************
+#
+#   Command Section
+#
+# ********************************************************************
+AWK=/usr/bin/awk
+BASH=/usr/bin/bash
+CHMOD=/usr/bin/chmod
+CRONTAB=/usr/bin/crontab
+DATE=/usr/bin/date
+DIRNAME=/usr/bin/dirname
+ECHO=/usr/bin/echo
+EGREP=/usr/bin/egrep
+GETENT=/usr/bin/getent
+GREP=/usr/bin/grep
+HEAD=/usr/bin/head
+ID=/usr/bin/id
+MYHOSTNAME=/usr/bin/hostname
+MKDIR=/usr/bin/mkdir
+PERL=/usr/bin/perl
+PYTHON=/usr/bin/python
+RM=/usr/bin/rm
+SU=/usr/bin/su
+TEE=/usr/bin/tee
+TOUCH=/usr/bin/touch
+WC=/usr/bin/wc
+
+
+# ********************************************************************
+#
+#   Functions
+#
+# ********************************************************************
+### Function: abort_script ###
+#
+#   This will is called if the script is aborted thru an error
+#   error signal sent by the kernel such as CTRL-C or if a serious
+#   error is encountered during runtime
+#
+# Arguments:
+#       $1 - Error message from part of program (Not always used)
+# Return Values:
+#       none
+abort_script()
+{
+if [ "$1" ]; then
+    _err_msg_="`$DATE '+%Y-%m-%d_%H.%M.%S'` - $1"
+else
+    _err_msg_="`$DATE '+%Y-%m-%d_%H.%M.%S'` - Script aborted.......\n"
+fi
+
+if [ "${LOGFILE}" ]; then
+    $ECHO "\nERROR : ${_err_msg_}\n"|$TEE -a ${LOGFILE}
+else
+    $ECHO "\nERROR : ${_err_msg_}\n"
+fi
+exit 1
+}
+
+### Function: check_id ###
+#
+#   Check that the effective id of the user is correct
+#   If not print error msg and exit.
+#
+# Arguments:
+#       $1 : User ID name
+# Return Values:
+#       none
+check_id()
+{
+_check_id_=`$ID  | $AWK -F\( '{print $2}' | $AWK -F\) '{print $1}'`
+if [ "$_check_id_" != "$1" ]; then
+    _err_msg_="You must be $1 or have equal permissions to execute this script."
+    abort_script "${_err_msg_}"
+fi
+}
+
+### Function: chk_create_logfile ###
+#
+# Check/Create Logfile
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+chk_create_logfile()
+{
+$MKDIR -p `$DIRNAME ${LOGFILE}`
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not create directory `$DIRNAME ${LOGFILE}`"
+     abort_script "${_err_msg_}"
+fi
+
+$CHMOD 777 `$DIRNAME ${LOGFILE}`
+
+$TOUCH -a ${LOGFILE}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not write to file ${LOGFILE}"
+    abort_script "${_err_msg_}"
+fi
+
+if [ -s ${LOGFILE} ]; then
+    $ECHO "\n\n" >> ${LOGFILE}
+fi
+log_msg -l ${LOGFILE} -h -t -s "Post Restore stage started "
+}
+
+### Function: setup_env ###
+#
+# Setup up path environment etc
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+setup_env()
+{
+
+if [ ! "${ENIQ_BASE_DIR}" ]; then
+    # Directory on the root filesystem
+    ENIQ_BASE_DIR=/eniq
+fi
+
+# Admin directory in the ENIQ filesystem
+ENIQ_ADMIN_DIR=${ENIQ_BASE_DIR}/admin
+
+# Admin dir
+ENIQ_ADMIN_BIN_DIR=${ENIQ_ADMIN_DIR}/bin
+ENIQ_ADMIN_ETC_DIR=${ENIQ_ADMIN_DIR}/etc
+
+# ENIQ Installer Directory
+ENIQ_INSTALLER_DIR=${ENIQ_BASE_DIR}/sw/installer
+
+# ENIQ SW BIN Directory
+ENIQ_SW_BIN_DIR=${ENIQ_BASE_DIR}/sw/bin
+
+# ENIQ Backup Sw Directory
+ENIQ_BKUPSW_DIR=${ENIQ_BASE_DIR}/bkup_sw
+
+# Main Directory for the Core Installation SW
+ENIQ_INST_DIR=${ENIQ_BASE_DIR}/installation
+
+# Main Directory for the Core Installation LIB
+ENIQ_LIB_DIR=${ENIQ_INST_DIR}/core_install/lib
+
+# ENIQ Config Directory
+ENIQ_CONF_DIR=${ENIQ_INST_DIR}/config
+
+# ENIQ install core_install Directory
+ENIQ_CORE_DIR=${ENIQ_BASE_DIR}/installation/core_install
+
+# ENIQ connectd Directory
+ENIQ_CONNECTD_DIR=${ENIQ_BASE_DIR}/connectd
+
+#hostname of local host
+HNAME=`${MYHOSTNAME}`
+
+# SunOS.ini File
+SUNOS_INI=SunOS.ini
+IPMP_INI=ipmp.ini
+
+#Temp Directory
+VAR_DIR=/var/tmp
+
+#Path for installed server type
+INSTALLED_SERVER_TYPE=${ENIQ_INST_DIR}/config/installed_server_type
+
+# Source the common functions
+if [ -s /eniq/installation/core_install/lib/common_functions.lib ]; then
+    . /eniq/installation/core_install/lib/common_functions.lib
+fi
+
+GET_IP_ORDER_SCRIPT=${ENIQ_CORE_DIR}/lib/get_ip_order.pl
+if [ ! -s "${GET_IP_ORDER_SCRIPT}" ]; then
+	_err_msg_="Could not find script: ${GET_IP_ORDER_SCRIPT}"
+	abort_script "$_err_msg_"
+fi
+
+# Get the System User.
+_sysuser_=`iniget ENIQ_INSTALL_CONFIG -f ${ENIQ_CONF_DIR}/${SUNOS_INI} -v ENIQ_SYSUSER`
+if [ ! "${_sysuser_}" ]; then
+    _err_msg_="Could not read parameter ENIQ_SYSUSER from ${ENIQ_CONF_DIR}/${SUNOS_INI} file"
+    abort_script "${_err_msg_}"
+fi
+
+# File containing the type of OSS installation. Eg. oss or single
+INST_TYPE_FILE=${ENIQ_CONF_DIR}/ericsson_use_config
+if [ ! -s "${INST_TYPE_FILE}" ]; then
+    _err_msg_="ENIQ install type not defined in ${INST_TYPE_FILE}"
+    abort_script "${_err_msg_}"
+fi
+# Read the installation type
+INSTALL_TYPE=`$CAT ${INST_TYPE_FILE} | $AWK -F\= '{print $2}'`
+
+# Read the storage type
+STORAGE_TYPE=`iniget STOR_TYPE -f ${ENIQ_CONF_DIR}/${SUNOS_INI} -v STORAGE_TYPE`
+if [ ! "${STORAGE_TYPE}" ]; then
+    _err_msg_="Failed to get Storage type from ${ENIQ_CONF_DIR}/${SUNOS_INI}"
+    abort_script "${_err_msg_}"
+fi
+
+#Check IP Type
+check_ip_type
+if [ ! "${_ip_type_}" ]; then
+    _err_msg_="Could not read parameter _ip_type_ from file ${ENIQ_CONF_DIR}/${IPMP_INI}"
+    abort_script "$_err_msg_"
+fi
+
+#Check Ping type
+ping_command=$( check_ping )
+
+}
+
+# ********************************************************************
+#
+#   Main body of program
+#
+# ********************************************************************
+#
+RUN_TIME=`$DATE '+%Y-%b-%d_%H.%M.%S'`
+
+# Check that the effective id of the user is root
+check_id root
+
+while getopts ":l:" arg; do
+  case $arg in
+    l) LOGFILE="$OPTARG"
+       ;;	
+   \?) usage_msg
+       exit 1
+       ;;
+  esac
+done
+shift `expr $OPTIND - 1`
+
+# Setup up path environment etc
+setup_env
+
+# Create a temporary Directory
+TEM_DIR=/tmp/post_restore.$$.$$
+if [ -d ${TEM_DIR} ]; then
+    $RM -rf ${TEM_DIR}
+    if [ $? -ne 0 ]; then
+        _err_msg_="Could not delete directory $TEM_DIR. Please delete it manually."
+        abort_script "${_err_msg_}" 
+    fi
+fi
+
+$MKDIR -p ${TEM_DIR}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not create directory $TEM_DIR"
+    abort_script "${_err_msg_}" 
+fi
+
+# Default Logfile location
+DEF_LOGFILE="/eniq/log/sw_log/post_restore/post_restore_step.log"
+
+# Set up default logfile if required
+if [ ! "${LOGFILE}" ]; then
+    LOGFILE="${DEF_LOGFILE}"
+fi
+
+chk_create_logfile
+
+_user_input_=`$CAT ${ENIQ_BKUPSW_DIR}/etc/eniq_backup.conf |$GREP BKUP_OPTION_STR |$AWK -F= '{print $2}' 2>/dev/null`
+if [ "${_user_input_}" == "NoData" -a ! -f ${VAR_DIR}/database_restore_complete ]; then
+
+	POST_RESTORE_PROGRESS=${VAR_DIR}/post_restore_in_progress
+	$TOUCH ${POST_RESTORE_PROGRESS}
+
+	log_msg -l ${LOGFILE} -s "Increasing catalog cache."
+    $SU - ${_sysuser_} -c "${ENIQ_INSTALLER_DIR}/change_catalog_cache.bsh -a" | $EGREP -v "Oracle|mail"		
+        if [ $? -ne 0 ]; then
+                 _err_msg_="Could not increase catalog cache"
+                abort_script "${_err_msg_}"
+        fi
+
+    if [ ! -f ${VAR_DIR}/active_restore_complete ]; then
+    log_msg -h -t -l ${LOGFILE} -s "Executing active run."
+        $SU - ${_sysuser_} -c "${ENIQ_INSTALLER_DIR}/restore_dwhdb_database -a active"  |  $TEE -a ${LOGFILE}
+       _rc_restore_=`$ECHO ${PIPESTATUS[0]}`
+	if [ ${_rc_restore_} -ne 0 ]; then
+   		 _err_msg_="Failed to execute active run"
+    		abort_script "${_err_msg_}"
+        else
+               log_msg -l ${LOGFILE} -s "Successfully completed active run.\n" 
+            $TOUCH ${VAR_DIR}/active_restore_complete
+        fi
+    fi
+
+    # We want to enable mounts before starting historic data restore
+    log_msg -t -l ${LOGFILE} -s "Re-enabling OSS mounts"
+
+    # Get an ordered list of servers based on the server_list file:
+    _deployed_servers_="${TEM_DIR}/deployed_servers.$$.tmp"
+    $PERL ${GET_IP_ORDER_SCRIPT} -f ${_deployed_servers_} 
+    for _line_ in `$EGREP -i 'engine|coordinator|eniq_stats' ${_deployed_servers_}`; do
+         local _count_=`$ECHO "${_line_}" | $GREP -o "::" | $WC -l`
+        if [ "${_ip_type_}" == "IPv6" -a "${_count_}" == 3 ]; then
+                local _ip_address_=`$ECHO ${_line_} | $GREP -oE '([a-fA-F0-9]{1,4}::?){1,7}[a-fA-F0-9]{1,4}' | $HEAD -n 1 | $AWK -F "::" '{ print $1 "::" $2}'`
+                local _serv_hostname_=`$ECHO ${_line_} | $AWK -F"::" '{print $3}'`
+                local _serv_type_=`$ECHO ${_line_} | $AWK -F"::" '{print $4}'`
+        else
+                local _ip_address_=`$ECHO ${_line_} | $AWK -F"::" '{print $1}'`
+                local _serv_hostname_=`$ECHO ${_line_} | $AWK -F"::" '{print $2}'`
+                local _serv_type_=`$ECHO ${_line_} | $AWK -F"::" '{print $3}'`
+        fi
+        if [ ! "${_ip_address_}" -o ! "${_serv_hostname_}" -o ! "${_serv_type_}" ]; then
+            _err_msg_="Failed to enable mounts. Could not read required info from ${_deployed_servers_}."
+            abort_script "${_err_msg_}"
+        fi 
+
+        # Stats coordinator should not run the script
+
+        if [ "${_serv_type_}" != "stats_coordinator" ]; then
+            #If the IP found in the order file matches my IP,
+            # then I better run the command locally - no need to ssh
+            if [ "${_serv_hostname_}" == "${HNAME}" ]; then
+                log_msg -t -l ${LOGFILE} -s "Re-enabling mounts on ${HNAME}"
+                ${ENIQ_ADMIN_BIN_DIR}/enable_mounts.bsh
+                if [ $? -ne 0 ]; then
+                    abort_script "Failed to enable mounts on ${HNAME}"
+                else
+                    log_msg -t -l ${LOGFILE} -s "Enabled mounts on ${HNAME}"
+                fi
+            else
+                log_msg -t -l ${LOGFILE} -s "Re-enabling mounts on ${_serv_hostname_}"
+                run_remote_cmd "${_serv_hostname_}" "$BASH ${ENIQ_ADMIN_BIN_DIR}/enable_mounts.bsh"
+                if [ $? -ne 0 ]; then
+                    abort_script "Failed to enable mounts on ${_serv_hostname_}"
+                else
+                    log_msg -t -l ${LOGFILE} -s "Enabled mounts on ${_serv_hostname_}"
+                fi
+            fi
+        fi
+    done	  
+
+    if [ ! -f ${VAR_DIR}/historical_restore_complete ]; then 
+        log_msg -h -t -l ${LOGFILE} -s "Executing historical run."
+        $SU - ${_sysuser_} -c "${ENIQ_INSTALLER_DIR}/restore_dwhdb_database -a historical" |  $TEE -a ${LOGFILE}
+        _rc_restore_his_=`$ECHO ${PIPESTATUS[0]}`
+	    if [ ${_rc_restore_his_} -ne 0 ]; then
+   		 _err_msg_="Failed to execute historical run "
+			abort_script "${_err_msg_}"
+        else
+               log_msg -l ${LOGFILE} -s "Successfully completed historical run.\n" 
+            $TOUCH ${VAR_DIR}/historical_restore_complete
+        fi
+	fi
+        log_msg -l ${LOGFILE} -s "Restoring catalog cache."
+    $SU - ${_sysuser_} -c "${ENIQ_INSTALLER_DIR}/change_catalog_cache.bsh -r" | $EGREP -v "Oracle|mail"
+        if [ $? -ne 0 ]; then
+                 _err_msg_="Could not decrease catalog cache"
+                abort_script "${_err_msg_}"
+    else
+        $TOUCH ${VAR_DIR}/database_restore_complete
+        fi
+fi
+ 
+if [ "${_user_input_}" != "NoData" ]; then
+    if [ "${STORAGE_TYPE}" != "fs" ]; then
+        log_msg -l ${LOGFILE} -s "Executing generate_dirchecker_sch_commands.bsh command."
+	$SU - ${_sysuser_} -c "$BASH ${ENIQ_SW_BIN_DIR}/generate_dirchecker_sch_commands.bsh -f" | $EGREP -v "Oracle|mail"
+	if [ $? -ne 0 ]; then
+    	   _err_msg_="Failed to run the generate_dirchecker_sch_commands.bsh"
+           abort_script "${_err_msg_}"
+	fi
+    else
+        log_msg -l ${LOGFILE} -s "Skipping execution of generate_dirchecker_sch_commands.bsh for Rack servers".
+    fi
+fi
+
+#Enable cron entries for dcuser
+if [ "${INSTALL_TYPE}" == "stats"  -a "${_user_input_}" == "NoData" ]; then
+    log_msg -l ${LOGFILE} -s "\n Enabling database monitoring cron jobs for dcuser"
+	if [ ! -f /var/tmp/bmr/dcuser_cron_file.txt ];then
+        	_err_msg_="Could not get cron file created at the time of restore for dcuser"
+       		 abort_script "${_err_msg_}"
+	else
+        $SU - ${_sysuser_} -c "$CRONTAB /var/tmp/bmr/dcuser_cron_file.txt" | $EGREP -v "Oracle|mail"
+    fi 
+else
+    log_msg -l ${LOGFILE} -s "\nSkipping enabling of database monitoring cron jobs"
+fi
+
+#Code Changes for Eniq Privilege Feature Restore
+$CAT /etc/group | $GREP -w ENIQ_ADMIN_ROLE > /dev/null 2>&1
+  if [ $? -eq 0 ]; then
+     feature_check=1
+  else
+     feature_check=0
+	 log_msg -s "Skipping disable root ssh as Eniq Privilege User Support is not enabled" -l ${LOGFILE}
+  fi
+
+  if [ ${feature_check} == 1 ]; then  
+      $PERL ${ENIQ_LIB_DIR}/get_ip_order.pl -f /tmp/perl.txt
+      for line in `$CAT /tmp/perl.txt`;do
+        local _count_=`$ECHO "${line}" | $GREP -o "::" | $WC -l`
+        if [ "${_ip_type_}" == "IPv6" -a "${_count_}" == 3 ]; then
+                local _ip_address_=`$ECHO ${line} | $GREP -oE '([a-fA-F0-9]{1,4}::?){1,7}[a-fA-F0-9]{1,4}' | $HEAD -n 1 | $AWK -F "::" '{ print $1 "::" $2}'`
+                local _server_name_=`$ECHO ${line} | $AWK -F"::" '{print $3}'`
+                local _server_type_=`$ECHO ${line} | $AWK -F"::" '{print $4}'`
+		_blade_type_server_=`$CAT ${INSTALLED_SERVER_TYPE}`
+        else
+                local _ip_address_=`$ECHO ${line} | $AWK -F"::" '{print $1}'`
+                local _server_name_=`$ECHO ${line} | $AWK -F"::" '{print $2}'`
+                local _server_type_=`$ECHO ${line} | $AWK -F"::" '{print $3}'`
+		_blade_type_server_=`$CAT ${INSTALLED_SERVER_TYPE}`
+        fi
+    log_msg -s "\n=========================================== Disable Root SSH on  $_server_name_ =======================================================\n" -l ${LOGFILE}
+
+         $ping_command -c1 ${_ip_address_} > /dev/null 2>&1
+         if [ $? -eq 0 ];then
+             run_remote_cmd "${_server_name_}" "$PYTHON /eniq/installation/core_install/bin/eniq_inter_blade_ssh.py"
+             if [ $? -ne 0 ];then
+	         _err_msg_="Could not disable root ssh on ${_server_name_}"	
+		 abort_script "${_err_msg_}"			
+             fi   
+	run_remote_cmd "${_server_name_}" "$PYTHON /eniq/installation/core_install/bin/eniq_disable_ssh_login.py"
+        if [ $? -ne 0 ];then
+	    _err_msg_="Could not disable root ssh on ${_server_name_}"
+	    abort_script "${_err_msg_}"	
+        fi 
+	run_remote_cmd "${_server_name_}" "$PYTHON /ericsson/security/bin/sshd_service_restart.py"		
+	if [ $? -ne 0 ];then
+	    _err_msg_="Could not restart ssh service on ${_server_name_}"
+	    abort_script "${_err_msg_}"
+	fi	
+      else
+         log_msg -s "Ping failed to ${_server_name_}" -l ${LOGFILE}
+      fi
+   log_msg -s "\n=========================================== Exit from Server $_server_name_ =======================================================\n" -l ${LOGFILE}
+
+done
+
+else 
+
+	log_msg -q -s "Skipping disable root ssh as Eniq Privilege User Support feature is not enabled" -l ${LOGFILE}
+	
+fi	
+
+
+$RM -rf ${POST_RESTORE_PROGRESS}
+$RM -rf ${VAR_DIR}/active_restore_complete 
+$RM -rf ${VAR_DIR}/historical_restore_complete
+$RM -rf ${VAR_DIR}/database_restore_complete
+
+log_msg -l ${LOGFILE} -h -t -s "Successfully completed Post Restore steps"
+
+$ECHO "Changing permission of the ${LOGFILE} to 644" | $TEE -a ${LOGFILE}
+$CHMOD 644 `$DIRNAME ${LOGFILE}`
+if [ $? -ne 0 ]; then
+        _err_msg_="Could not change ${LOGFILE} file permission to 644"
+	abort_script "${_err_msg_}"
+fi
+
+#Logging Eniq Activity
+REST_DATE=`$DATE '+%Y-%m-%d %H:%M:%S'`
+$ECHO "ENIQ ACTIVITY INFO=OMBS_Restore;${REST_DATE};Restore done with ${_user_input_} backup" | $TEE -a /eniq/local_logs/eniq_activity_history.log >> ${LOGFILE}
+_rest_status_=$?
+if [ "${_rest_status_}" -ne 0 ]; then
+	_err_msg_="Failed to update Eniq Activity log file\n"
+	abort_script "$_err_msg_"
+else
+   $ECHO "Successfully logged Eniq Activity"
+fi
+
+exit 0
+

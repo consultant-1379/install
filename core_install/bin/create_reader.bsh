@@ -1,0 +1,476 @@
+#!/bin/bash
+# ********************************************************************
+# Ericsson Radio Systems AB                                     SCRIPT
+# ********************************************************************
+#
+#
+# (c) Ericsson Radio Systems AB 2021 - All rights reserved.
+#
+# The copyright to the computer program(s) herein is the property
+# of Ericsson Radio Systems AB, Sweden. The programs may be used
+# and/or copied only with the written permission from Ericsson Radio
+# Systems AB or in accordance with the terms and conditions stipulated
+# in the agreement/contract under which the program(s) have been
+# supplied.
+#
+# ********************************************************************
+# Name    : create_reader.bsh
+# Date    : 06/10/2023
+# Revision: main\20
+# Purpose : Create the dwhdb reader
+#
+# Usage   : create_reader.bsh -c <path_to_cli_conf> -d <niq.ini_file_location>
+#                               [-l <logfile>] -s <sym_ini_file_location>
+#
+# ********************************************************************
+#
+#   Command Section
+#
+# *******************************k*************************************
+
+AWK=/usr/bin/awk
+BASENAME=/usr/bin/basename
+BASH=/usr/bin/bash
+CAT=/usr/bin/cat
+DATE=/usr/bin/date
+DIRNAME=/usr/bin/dirname
+ECHO='/usr/bin/echo -e'
+EXPR=/usr/bin/expr
+GETENT=/usr/bin/getent
+GREP=/usr/bin/grep
+HOSTNAME=/usr/bin/hostname
+HEAD=/usr/bin/head
+PING=/usr/bin/ping
+PS=/usr/bin/ps
+PWD=/usr/bin/pwd
+SLEEP=/usr/bin/sleep
+SORT=/usr/bin/sort
+TEE=/usr/bin/tee
+WC=/usr/bin/wc
+
+# ********************************************************************
+#
+#   Functions
+#
+# ********************************************************************
+### Function: abort_script ###
+#
+#   This will is called if the script is aborted thru an error
+#   signal sent by the kernel such as CTRL-C or if a serious
+#   error is encountered during runtime
+#
+# Arguments:
+#       $1 - Error message from part of program (Not always used)
+# Return Values:
+#       none
+abort_script()
+{
+if [ "$1" ]; then
+    _err_msg_=$1
+else
+    _err_msg_="`$DATE +%d.%m.%y_%H:%M:%S` - ERROR : Script aborted.......\n"
+fi
+
+if [ "${LOGFILE}" ]; then
+    $ECHO "\n`$DATE +%d.%m.%y_%H:%M:%S` - ERROR : $_err_msg_\n" | $TEE -a ${LOGFILE}
+else
+    $ECHO "\n`$DATE +%d.%m.%y_%H:%M:%S` - ERROR : $_err_msg_\n"
+fi
+$RM -rf ${CONN_STR_USER_DBA_ENC}
+$RM -rf ${READER_CONN_STR_USER_DBA_ENC}
+exit 55
+}
+
+### Function: check_alias ###
+#
+# Verify alias name can be resolved
+# Arguments:
+#   none
+# Return Values:
+#   none
+check_alias()
+{
+# Verify that the alias name can be resolved
+log_msg -t -l ${LOGFILE} -s "Doing $PING test. Pinging ${READER_NAME} ..."
+PING=$( check_ping)
+$PING -c 1 ${READER_NAME} >> /dev/null 2>&1
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not ping ${READER_NAME}"
+    abort_script "$_err_msg_"
+else
+    log_msg -t -l ${LOGFILE} -s "Alias name successfully resolved."
+fi
+}
+
+### Function: create_sql_file  ###
+#
+# Determine absolute path to software
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+create_sql_file()
+{
+$ECHO "CREATE MULTIPLEX SERVER ${READER_NAME}" > ${ENIQ_ADMIN_DIR}/sql/create_mpx_${READER_NAME}.sql
+$ECHO "DATABASE '${READER_DIR}/${DWH_ENG}.db' HOST '${READER_NAME}' PORT 2642" >> ${ENIQ_ADMIN_DIR}/sql/create_mpx_${READER_NAME}.sql
+$ECHO "ROLE WRITER STATUS INCLUDED" >> ${ENIQ_ADMIN_DIR}/sql/create_mpx_${READER_NAME}.sql
+$ECHO "ALTER DBSPACE IQ_SYSTEM_MSG RENAME '${ENIQ_LOG_DIR}/iq/${READER_NAME}.iqmsg'" > ${ENIQ_ADMIN_DIR}/sql/alter_mpx_${READER_NAME}.sql
+}
+
+### Function: get_absolute_path ###
+#
+# Determine absolute path to software
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+get_absolute_path()
+{
+_dir_=`$DIRNAME $0`
+SCRIPTHOME=`cd $_dir_ 2>/dev/null && pwd || $ECHO $_dir_`
+}
+
+### Function: setup_variables ###
+#
+# Set up some script variables
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+setup_variables()
+{
+if [ ! "${ENIQ_BASE_DIR}" ]; then
+    # Directory on the root filesystem
+    ENIQ_BASE_DIR=/eniq
+fi
+
+
+
+
+# ENIQ Admin Directory
+ENIQ_ADMIN_DIR=${ENIQ_BASE_DIR}/admin
+
+# ENIQ Software Directory
+ENIQ_SW_DIR=${ENIQ_BASE_DIR}/sw
+
+# Main Directory for the Core Installation SW
+ENIQ_INST_DIR=${ENIQ_BASE_DIR}/installation
+
+# ENIQ Config Directory
+ENIQ_CONF_DIR=${ENIQ_INST_DIR}/config
+
+# ENIQ Log Directory
+ENIQ_LOG_DIR=${ENIQ_BASE_DIR}/local_logs
+
+# File containing the type of OSS installation. Eg. events or statistics
+INST_TYPE_FILE=${ENIQ_CONF_DIR}/ericsson_use_config
+
+# Read the installation type - should be "events" or "statistics"
+INSTALL_TYPE=`$CAT ${INST_TYPE_FILE} | $AWK -F\= '{print $2}'`
+
+# Determine the current server type
+CURR_SERVER_TYPE=`$CAT $ENIQ_CONF_DIR/installed_server_type`
+
+DWH_PORT=`iniget DWH -v PortNumber -f ${ENIQ_INI}`
+DWH_ENG=`iniget DWH -v ServerName -f ${ENIQ_INI}`
+if [ ! "${DWH_PORT}" -o ! "${DWH_ENG}" ]; then
+    _err_msg_="Could not read DB parameters values from ${ENIQ_INI}"
+    abort_script "$_err_msg_"
+fi
+
+READER_PORT=`iniget DWH_READER_SETTINGS -v PortNumber -f ${ENIQ_INI}`
+if [ ! "${READER_NAME}" -o ! "${READER_PORT}" ] ; then
+    _err_msg_="Could not read reader parameters values from ${ENIQ_INI}"
+    abort_script "$_err_msg_"
+fi
+
+DBA_PASSWORD=`inigetpassword DB -f ${ENIQ_INI} -v DBAPassword`
+if [ ! ${DBA_PASSWORD} ]; then
+    if [ -f ${ENIQ_BASE_DIR}/sw/installer/dbusers ]; then
+        DBA_PASSWORD=`${ENIQ_BASE_DIR}/sw/installer/dbusers dba dwh`
+        if [ ! "${DBA_PASSWORD}" ] ; then
+            _err_msg_="Could not get dwhdb DBA Password"
+            abort_script "$_err_msg_"
+        fi
+    else
+        err_msg_="`$DATE +%d.%m.%y_%H:%M:%S` - Could not get dwhdb DBA Password"
+        abort_script "$_err_msg_"
+    fi
+fi
+
+INITIAL_SYS_MAIN=`iniget DWH_SYSTEM_MAIN -f ${SYM_INI} | $HEAD -1`
+if [ ! "${INITIAL_SYS_MAIN}" ]; then
+                _err_msg_="Could not read initial sys_main name from ${SYM_INI}"
+        abort_script "$_err_msg_"
+fi
+
+MSTOREDB=`iniget ${INITIAL_SYS_MAIN} -v Path -f ${SYM_INI}`
+MSTOREPATH=`iniget ${INITIAL_SYS_MAIN} -v Link -f ${SYM_INI}`
+if [ ! "${MSTOREDB}" -o ! "${MSTOREPATH}" ]; then
+        _err_msg_="Could not read main dbspaces values from ${SYM_INI}"
+        abort_script "$_err_msg_"
+fi
+
+#Temp directory
+TEM=/tmp
+
+CONN_STR_USER_DBA="-c \"uid=dba;pwd=${DBA_PASSWORD};eng=${DWH_ENG};links=tcpip{host=${DWH_ENG};port=${DWH_PORT};dobroadcast=no;verify=no}\""
+CONN_STR_USER_DBA_ENC=${TEM}/conn_str_dba_create_rd.`uuidgen`
+
+# encrypt the connection string.
+get_encrypt_file "${CONN_STR_USER_DBA}" "${CONN_STR_USER_DBA_ENC}"
+
+READER_CONN_STR_USER_DBA="-c \"uid=dba;pwd=${DBA_PASSWORD};eng=${READER_NAME};links=tcpip{host=${READER_NAME};port=${READER_PORT};dobroadcast=no;verify=no}\""
+READER_CONN_STR_USER_DBA_ENC=${TEM}/conn_str_reader_create_rd.`uuidgen`
+
+# encrypt the connection string.
+get_encrypt_file "${READER_CONN_STR_USER_DBA}" "${READER_CONN_STR_USER_DBA_ENC}"
+
+# Reader params
+Server_Name=`$GREP -i dwhdb /etc/hosts | $AWK '{print $2}'`
+CO_IP_ADDRESS=`$GREP -w dwhdb /etc/hosts | $AWK '{print $1}'| $SORT -u`
+IP_ADDRESS=`${HOSTNAME} -i| $AWK '{print $1}'`
+READER_NUM=`$ECHO $READER_NAME | $AWK -F\_ '{print $NF}'`
+#eval READER_DIR=$(echo \${DWH_DIR_R${READER_NUM}})
+READER_DIR=${DWH_READER_DIR}
+
+# Determine the deployment type
+_deployment_=`$CAT ${ENIQ_CONF_DIR}/extra_params/deployment`
+
+}
+
+### Function: usage_msg ###
+#
+# Usage
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+usage_msg()
+{
+$ECHO "
+Usage: `$BASENAME $0` -l <logfile> -c <conf dir> -d <niq.ini file>
+                               -r <reader name> -s <sym_ini_file_location>
+
+options:
+
+-l : Logfile to be used.
+
+-c : Conf dir where niq.rc resides
+
+-d : Path to the niq.ini file.
+
+-r : Reader to be used.
+
+-s : Path to the sym_link.ini file.
+"
+}
+
+# ********************************************************************
+#
+#   Main body of program
+#
+# ********************************************************************
+#
+TIMESTAMP=`$DATE +%d.%m.%y_%H:%M:%S`
+
+# Determine absolute path to software
+get_absolute_path
+
+while getopts ":l:c:d:s:r:" arg; do
+        case $arg in
+                l)  LOGFILE="$OPTARG"
+                        ;;
+                c)  CONF_DIR="$OPTARG"
+                        ;;
+                d)  ENIQ_INI="$OPTARG"
+                        ;;
+                s)  SYM_INI="$OPTARG"
+                        ;;
+                r)  READER_NAME="$OPTARG"
+                        ;;
+                \?)     usage_msg
+                        exit 1
+                        ;;
+        esac
+done
+shift `$EXPR $OPTIND - 1`
+
+# Source the common functions
+if [ -s $SCRIPTHOME/../lib/common_functions.lib ]; then
+    . $SCRIPTHOME/../lib/common_functions.lib
+else
+    _err_msg_="File $SCRIPTHOME/../lib/common_functions.lib not found"
+    abort_script "$_err_msg_"
+fi
+
+# Check required files and scripts exist
+if [ ! -s ${CONF_DIR}/niq.rc ]; then
+        _err_msg_="File ${CONF_DIR}/niq.rc not found, or is empty"
+        abort_script "$_err_msg_"
+else
+        log_msg -t -l ${LOGFILE} -q -s "Sourcing ${CONF_DIR}/niq.rc"
+        . ${CONF_DIR}/niq.rc
+fi
+
+if [ ! "$LOGFILE" ]; then
+        LOGFILE=${IQLOGDIR}/create_reader_${TIMESTAMP}.log
+fi
+
+if [ -z "$CONF_DIR" ]; then
+    _err_msg_="CONF_DIR is not set"
+    abort_script "$_err_msg_"
+fi
+
+if [ ! -f ${ENIQ_INI} ]; then
+    _err_msg_="${ENIQ_INI} does not exists"
+    abort_script "$_err_msg_"
+fi
+
+# Set up variables
+setup_variables
+
+# check alias
+check_alias
+# check alias on Coordinator
+_count_=1
+while [ ${_count_} -lt 60 ]; do
+
+log_msg -t -l ${LOGFILE} -s "checking alias on Coordinator"
+
+        run_remote_cmd "${Server_Name}" "$GREP ${IP_ADDRESS} /etc/hosts" "$LOGFILE" "dcuser" >> /dev/null
+        if [ $? -eq 0 ]; then
+
+                  log_msg -t -l ${LOGFILE} -s "Alias successfully resolved on Coordinator"
+                          break
+        fi
+        $SLEEP 2
+                _count_=`$EXPR ${_count_} + 1`
+                if [ ${_count_} -eq 60 ]; then
+                    _err_msg_="Reader_2 Entry not found on Coordinator"
+            abort_script "$_err_msg_"
+                fi
+done
+
+# create the sql file
+create_sql_file
+
+# Workaround for EQEV-56663
+_retry_attempt_=1
+while [ ${_retry_attempt_} -lt 3 ]
+do
+        ${IQDIR}/bin64/dbping -q @${CONN_STR_USER_DBA_ENC}
+        if [ $? -eq 0 ]; then
+                log_msg -t -l ${LOGFILE} -s "Database $DWH_ENG is running, we can create the reader"
+                break
+        else
+                log_msg -t -l ${LOGFILE} -s "Database $DWH_ENG is not running, cant connect to create ${READER_NAME}. Restarting the $DWH_ENG before proceeding."
+                run_remote_cmd "${Server_Name}" "$BASH ${ENIQ_SW_DIR}/bin/$DWH_ENG restart" "LOGFILE" "dcuser"
+                if [ $? -eq 0 ]; then
+                       log_msg -t -l ${LOGFILE} -s "$DWH_ENG successfully restarted"
+                       ${IQDIR}/bin64/dbisql -nogui @${CONN_STR_USER_DBA_ENC} "sp_iqmpxinfo" | $GREP -w "${READER_NAME}" >> /dev/null 2>&1
+                       if [ $? -eq 0 ]; then  
+                           log_msg -t -l ${LOGFILE} -s "Login to $DWH_ENG is successful"
+                       fi
+                else
+                        log_msg -t -l ${LOGFILE} -s "Failed to restart $DWH_ENG"
+                fi
+                _retry_attempt_=`$EXPR ${_retry_attempt_} + 1`
+        fi
+done
+
+if [ ${_retry_attempt_} -eq 3 ]; then
+        _err_msg_="Database $DWH_ENG is not running, cant connect to create ${READER_NAME}"
+        abort_script "$_err_msg_"
+fi
+
+
+${IQDIR}/bin64/dbisql -nogui @${CONN_STR_USER_DBA_ENC} "sp_iqmpxinfo" | $GREP -w "${READER_NAME}" >> /dev/null 2>&1
+if [ $? -ne 0 ]; then
+    ${IQDIR}/bin64/dbisql -nogui @${CONN_STR_USER_DBA_ENC} -q ${ENIQ_ADMIN_DIR}/sql/create_mpx_${READER_NAME}.sql >> /dev/null 2>&1
+    if [ $? -ne 0 ]; then
+        ${IQDIR}/bin64/dbping -q @${CONN_STR_USER_DBA_ENC} >> ${LOGFILE} 2>&1
+        if [ $? -eq 0 ] ; then
+            log_msg -t -l ${LOGFILE} -q -s "Database $DWH_ENG is online"
+        else
+            _pid_exists_="true"
+            while [ "${_pid_exists_}" == "true" ]; do
+             _dwhdb_pid_=`$PS -eaf|$GREP iqsrv|$GREP -v grep|$AWK '{print $2}'|$WC -l`
+              if [ ${_dwhdb_pid_} -eq 0 ]; then
+                _pid_exists_="false"
+              fi
+                          $SLEEP 2
+            done
+            log_msg -t -l ${LOGFILE} -s "DWHDB appears to be offline or unreachable."
+            log_msg -t -l ${LOGFILE} -s "Trying to start DWHDB..."
+            ${ADMIN_BIN}/dwhdb start
+            if [ $? -ne 0 ] ; then
+                _err_msg_="DWHDB failed to start"
+                abort_script "$_err_msg_"
+            fi
+        fi
+
+        log_msg -t -l ${LOGFILE} -s "Checking if MULTIPLEX SERVER ${READER_NAME} has been created successfully"
+       ${IQDIR}/bin64/dbisql -nogui @${CONN_STR_USER_DBA_ENC} "sp_iqmpxinfo" | $GREP -w "${READER_NAME}" >> /dev/null 2>&1
+        if [ $? -ne 0 ]; then
+            _err_msg_="CREATE MULTIPLEX SERVER ${READER_NAME} Failed"
+            abort_script "$_err_msg_"
+        else
+            log_msg -t -l ${LOGFILE} -s "MULTIPLEX SERVER ${READER_NAME}, created successfully."
+             ${IQDIR}/bin64/dbping -q @${CONN_STR_USER_DBA_ENC} >> ${LOGFILE} 2>&1
+            if [ $? -eq 0 ] ; then
+                log_msg -t -l ${LOGFILE} -s "Trying to stop DWHDB..."
+                ${ADMIN_BIN}/dwhdb stop
+                if [ $? -ne 0 ]; then
+                    _err_msg_="DWHDB failed to stop"
+                    abort_script "$_err_msg_"
+                fi
+            fi
+        fi
+    else
+        log_msg -t -l ${LOGFILE} -s "MULTIPLEX SERVER ${READER_NAME}, created successfully."
+    fi
+else
+    log_msg -t -l ${LOGFILE} -s "${READER_NAME} already exists"
+fi
+
+if [ "${CURR_SERVER_TYPE}" == "stats_coordinator" ]; then
+    # Nothing to do
+    log_msg -t -l ${LOGFILE} -s "This is the coordinator. No Need to start the reader."
+else
+    # Make sure the dwhdb is online
+    ${IQDIR}/bin64/dbping -q @${CONN_STR_USER_DBA_ENC} >> ${LOGFILE} 2>&1
+    if [ $? -eq 0 ] ; then
+        log_msg -t -l ${LOGFILE} -q -s "Database $DWH_ENG is Online"
+    else
+        log_msg -t -l ${LOGFILE} -s "DWHDB appears to be offline or unreachable."
+        _err_msg_="Failed to ping the DWHDB database."
+        abort_script "$_err_msg_"
+    fi
+    log_msg -t -l ${LOGFILE} -s "Trying to start DWH Reader..."
+    ${ADMIN_BIN}/dwh_reader start
+    if [ $? -ne 0 ] ; then
+        _err_msg_="DWH reader failed to start"
+        abort_script "$_err_msg_"
+    fi
+    log_msg -t -l ${LOGFILE} -s "Relocating the IQMSG logfile..."
+    ${IQDIR}/bin64/dbisql -nogui @${READER_CONN_STR_USER_DBA_ENC} -q ${ENIQ_ADMIN_DIR}/sql/alter_mpx_${READER_NAME}.sql
+	
+	
+    log_msg -t -l ${LOGFILE} -s "Trying to stop DWH Reader..."
+    ${ADMIN_BIN}/dwh_reader stop
+    if [ $? -ne 0 ] ; then
+        _err_msg_="DWH reader failed to stop"
+        abort_script "$_err_msg_"
+    fi
+fi
+
+$RM -rf ${CONN_STR_USER_DBA_ENC}
+$RM -rf ${READER_CONN_STR_USER_DBA_ENC}
+
+
+exit 0

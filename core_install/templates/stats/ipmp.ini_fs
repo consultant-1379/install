@@ -1,0 +1,6 @@
+[Backup_Group]
+ENABLE=
+Backup_Group_Intf=
+Backup_Group_IP=
+Backup_Group_Netmask=
+Backup_Group_Gateway=

@@ -1,0 +1,520 @@
+#!/bin/bash
+# ********************************************************************
+# Ericsson Radio Systems AB                                     SCRIPT
+# ********************************************************************
+# Ericsson Radio Systems AB 2019 - All rights reserved.
+#
+# The copyright to the computer program(s) herein is the property
+# of Ericsson Radio Systems AB, Sweden. The programs may be used
+# and/or copied only with the written permission from Ericsson Radio
+# Systems AB or in accordance with the terms and conditions stipulated
+# in the agreement/contract under which the program(s) have been
+# supplied.
+#
+# ********************************************************************
+#
+# Name    : check_symlink.bsh
+# Date    : 19/12/2019
+# Revision: \main\Statistics_18.2_18.2.8_EU16\1
+#
+# Purpose : This script will check consistency of symlink File.
+#
+# Usage   : check_symlink.bsh
+# Exit Values:
+#     SUCCESS=0
+#     FAILED=1
+#     WARNING=2
+#     ROOT_USER_FAILED=71
+#     ENGINE_NOT_APPLICABLE=54
+#     VALUE_MISSING=133
+#
+# ********************************************************************
+#
+#   Command Section
+#
+# ********************************************************************
+
+NAWK=/usr/bin/nawk
+BASH=/usr/bin/bash
+BC=/usr/bin/bc
+CAT=/usr/bin/cat
+CUT=/usr/bin/cut
+CP=/usr/bin/cp
+DATE=/usr/bin/date
+DIRNAME=/usr/bin/dirname
+ECHO=/usr/bin/echo
+GEGREP=/usr/bin/gegrep
+EXPR=/usr/bin/expr
+FIND=/usr/bin/find
+GETENT=/usr/bin/getent
+GREP=/usr/bin/grep
+HEAD=/usr/bin/head
+HOSTNAME=/usr/bin/hostname
+SED=/usr/bin/sed
+TOUCH=/usr/bin/touch
+TEE=/usr/bin/tee
+WC=/usr/bin/wc
+
+
+#### RETURN CODE ENUM's ####
+SUCCESS=0
+FAILED=1
+WARNING=2
+ROOT_USER_FAILED=71
+ENGINE_NOT_APPLICABLE=54
+VALUE_MISSING=133
+
+
+### Function: abort_script
+#
+#   This will be called if the script is aborted through an error
+#   encountered during runtime
+#
+# Arguments: $1 - Error message from part of program (Not always used)
+# Return Values: none
+#
+#
+abort_script()
+{
+_err_time_=`$DATE '+%Y-%b-%d_%H.%M.%S'`
+
+if [ "$1" ]; then
+    _err_msg_="${_err_time_} - $1"
+else
+    _err_msg_="${_err_time_} - ERROR : Script aborted.......\n"
+fi
+if [ "${LOGFILE}" ]; then
+    $ECHO "\nERROR: ${_err_msg_}\n" | $TEE -a ${LOGFILE}
+else
+    $ECHO "\nERROR: ${_err_msg_}\n"
+fi
+exit 3
+}
+
+    
+### Function: check_user ###
+#
+#   Check that the effective id of the user is correct
+#   If not print error msg and exit.
+#
+# Arguments:
+#       $1 : User ID name
+# Return Values:
+#       none
+#
+check_user()
+{
+   local _check_id_=`$ID  | $NAWK -F\( '{print $2}' | $NAWK -F\) '{print $1}'`
+
+   if [ "$_check_id_" != "$1" ]; then
+      _err_msg_="You must be $1 to execute this script."
+      abort_script "$_err_msg_"
+   fi
+}
+    
+
+### Function: check_user ###
+#
+#   Check that the effective id of the user is correct
+#   If not print error msg and exit.
+#
+# Arguments:
+#       $1 : User ID name
+# Return Values:
+#       none
+#
+check_symlink()
+{
+
+_fail_path_cnt_=0
+_fail_link_cnt_=0
+_fail_lunid_cnt_=0
+
+
+_par_tag_list_="DWH_DBSPACES_MAIN DWH_SYSTEM_MAIN DWH_DBSPACES_TEMP"
+if [ "${CO_SERVER}" == "YES" ]; then
+    _ini_file_list_="${ENIQ_SW_CONF}/${COORD_SYM_LINKS_INI} ${ENIQ_CONF_DIR}/${SYM_LINKS_INI}"
+else
+    _ini_file_list_="${ENIQ_CONF_DIR}/${SYM_LINKS_INI}"
+fi
+
+
+
+for _ini_file_ in `$ECHO ${_ini_file_list_}`; do
+
+    for _parent_block_ in `$ECHO ${_par_tag_list_}`; do
+        _block_list_=`iniget ${_parent_block_} -f ${_ini_file_}`
+        if [ ! "${_block_list_}" ]; then
+             log_msg -l ${LOGFILE} -q -t -s "$_path_file_ value not present."
+             exit $VALUE_MISSING
+        fi
+    
+        for _block_ in $_block_list_; do
+            _path_file_=`iniget ${_block_} -f ${_ini_file_} -v Path`
+            if [ -z "$_path_file_" ]; then
+                 log_msg -l ${LOGFILE} -q -s "\n$RUN_TIME : IQ Lun details are inconsistent for ${_block_} in ${_ini_file_}."
+                 exit $VALUE_MISSING
+             fi
+            _lun_id_file_=`iniget ${_block_} -f ${_ini_file_} -v Lun_ID`
+            if [ -z "$_lun_id_file_" ]; then
+                 log_msg -l ${LOGFILE} -q -s "\n$RUN_TIME : IQ Lun details are inconsistent for ${_block_} in  ${_ini_file_}."
+                  exit $VALUE_MISSING
+             fi
+            _link_file_=`iniget ${_block_} -f ${_ini_file_} -v Link`
+            if [ -z "$_link_file_" ]; then
+                 log_msg -l ${LOGFILE} -q -s "\nI$RUN_TIME : IQ Lun details are inconsistent for ${_block_} in ${_ini_file_}."
+                  exit $VALUE_MISSING
+             fi
+    
+            _path_cnt_=`$GREP ${_path_file_} ${_ini_file_} | $WC -l`
+            _lun_id_cnt_=`$GREP -w ${_lun_id_file_} ${_ini_file_} | $WC -l`
+            _link_cnt_=`$GREP ${_link_file_} ${_ini_file_} | $WC -l`
+             
+            log_msg -l ${LOGFILE} -q -s "\n$RUN_TIME-------------------------Checking values in $_block_ of $_ini_file_---------------------------"             
+            $ECHO "\nINFO : $_path_file_ = $_path_cnt_" >> $LOGFILE
+            if [ ! -z ${_path_cnt_} ];then
+                if [ $_path_cnt_ -ne 1 ];then
+                    _fail_path_cnt_=`expr $_fail_path_cnt_ + 1`
+                    log_msg -l ${LOGFILE} -q -t -s "Multiple IQ File Information ${_path_file_} present for ${_block_} in ${_ini_file_}"
+                    $GREP ${_path_file_} ${_ini_file_} >> $LOGFILE
+                fi
+            else
+                 log_msg -l ${LOGFILE} -q -s "\n$RUN_TIME : IQ Lun details are inconsistent for ${_block_} in ${_ini_file_}."
+                 exit $VALUE_MISSING
+            fi
+            $ECHO "\nINFO : $_lun_id_file_ = $_lun_id_cnt_" >> $LOGFILE
+            if [ ! -z ${_lun_id_cnt_} ];then
+                if [ $_lun_id_cnt_ -ne 1 ];then
+                    _fail_lunid_cnt_=`expr $_fail_lunid_cnt_ + 1`
+                    log_msg -l ${LOGFILE} -q -t -s "Multiple LUNs $_lun_id_file_ present for ${_block_} in ${_ini_file_}"
+                    $GREP -w ${_lun_id_file_} ${_ini_file_} >> $LOGFILE
+                fi
+            else
+                 log_msg -l ${LOGFILE} -q -s "\n$RUN_TIME : IQ Lun details are inconsistent for ${_block_} in  ${_ini_file_}."
+                 exit $VALUE_MISSING
+            fi
+                $ECHO "\nINFO : $_link_file_ = $_link_cnt_" >> $LOGFILE
+            if [ ! -z ${_link_cnt_} ];then
+                if [ $_link_cnt_ -ne 1 ];then
+                    _fail_link_cnt_=`expr $_fail_link_cnt_ + 1`
+                    log_msg -l ${LOGFILE} -q  -s "Multiple physical Linking present $_link_file_ for ${_block_} in ${_ini_file_}"
+                    $GREP ${_link_file_} ${_ini_file_} >> $LOGFILE
+                fi
+            else
+                 log_msg -l ${LOGFILE} -q -s "\n$RUN_TIME : IQ Lun details are inconsistent for ${_block_} in ${_ini_file_}."
+                 exit $VALUE_MISSING
+            fi
+        done
+    done
+
+done
+
+if [ $_fail_path_cnt_ -ne 0 -o $_fail_lunid_cnt_ -ne 0 -o $_fail_link_cnt_ -ne 0 ];then
+    RET_CODE=$FAILED
+    log_msg -l ${LOGFILE} -q -t -s "Symlink File is inconsistent."
+else
+    RET_CODE=$SUCCESS
+    log_msg -l ${LOGFILE} -q -t -s "Symlink File is consistent."
+fi
+
+return $RET_CODE
+
+}
+
+
+
+
+
+#### Function: create_log_file ######
+#
+#   Check that the effective id of the user is correct
+#   If not print error msg and exit.
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+#
+
+create_log_file()
+{
+   $ECHO "" > ${LOGFILE}  
+}
+
+
+
+### Function: insert_header_footer ###
+#
+#   Insert a stage header/footer message
+#
+# Arguments:
+#   $1 : head/foot
+#   $2 : Message
+#   $3 : Logfile
+# Return Values:
+#   none
+insert_header_footer()
+{
+if [ $# -ne 3 ]; then
+    _err_msg_="3 Parameters(Head/Foot,Message,Logfile) must be passed to header/footer function."
+    abort_script "${_err_msg_}"
+fi
+
+if [ "$1" != "head" -a "$1" != "foot" ]; then
+    _err_msg_="Only Param of head/foot is allowed...exiting!"
+    abort_script "${_err_msg_}"
+fi
+_type_=$1
+
+_msg_=$2
+
+_logfile_=$3
+$MKDIR -p `$DIRNAME ${_logfile_}`
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not create directory `$DIRNAME ${_logfile_}`"
+    abort_script "${_err_msg_}"
+fi
+
+$TOUCH -a ${_logfile_}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not write to file ${_logfile_}"
+    abort_script "${_err_msg_}"
+fi
+
+_time_=`$DATE '+%Y-%b-%d_%H.%M.%S'`
+
+if [ "$_type_" == "head" ]; then
+    log_msg -s "\n----------------------------------------------------------------------------" -l ${_logfile_}
+    log_msg -s "$_time_ : $_msg_" -l ${_logfile_}
+    log_msg -s "----------------------------------------------------------------------------" -l ${_logfile_}
+fi
+
+if [ "$_type_" == "foot" ]; then
+    log_msg -s "\n----------------------------------------------------------------------------" -l ${_logfile_}
+    log_msg -s "$_time_ : $_msg_" -l ${_logfile_}
+    log_msg -s "----------------------------------------------------------------------------\n" -l ${_logfile_}
+fi
+}
+
+### Function: get_absolute_path ###
+#
+# Determine absolute path to software
+#
+# Arguments:
+#    none
+# Return Values:
+#    none
+get_absolute_path()
+{
+_dir_=`$DIRNAME $0`
+SCRIPTHOME=`cd $_dir_ 2>/dev/null && pwd || $ECHO $_dir_`
+}
+
+
+### Function: setup_env
+#
+#   This will be called if the script is aborted through an error
+#   encountered during runtime
+#
+# Arguments: $1 - Error message from part of program (Not always used)
+# Return Values: none
+#
+#
+setup_env()
+{
+
+if [ ! "${ENIQ_BASE_DIR}" ]; then
+    # Directory on the root filesystem
+    ENIQ_BASE_DIR=/eniq
+fi
+
+
+SYM_LINKS_INI=sym_links.ini
+COORD_SYM_LINKS_INI=coordinator_sym_links.ini
+SUNOS_INI=SunOS.ini
+BLK_STOR_INI=block_storage.ini
+BACKUP_DATA_INI=backup_migration_data.ini
+ENIQ_INI=niq.ini
+TEM_DIR=/var/tmp
+
+# Main Directory for the Core Installation SW
+ENIQ_INST_DIR=${ENIQ_BASE_DIR}/installation
+
+
+# Main Directory for the Core Installation SW
+ENIQ_CORE_INST_DIR=${ENIQ_INST_DIR}/core_install
+
+# ENIQ Config Directory
+ENIQ_CONF_DIR=${ENIQ_INST_DIR}/config
+
+# Precheck logs directory
+ENIQ_PRECHECK_LOG_DIR=${ENIQ_BASE_DIR}/local_logs/precheck_logs/
+
+#Installation lib directory
+ENIQ_LIB_DIR=${ENIQ_INST_DIR}/core_install/lib/
+
+#Configuration directory
+ENIQ_SW_CONF=${ENIQ_BASE_DIR}/sw/conf
+
+# Logfile path
+LOGFILE=${ENIQ_PRECHECK_LOG_DIR}check_symlink.log
+
+
+if [ -s ${ENIQ_CORE_INST_DIR}/lib/common_functions.lib ]; then
+    . ${ENIQ_CORE_INST_DIR}/lib/common_functions.lib
+else
+    _err_msg_="File ${ENIQ_CORE_INST_DIR}/lib/common_functions.lib not found"
+    abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+fi
+
+
+
+
+# Read location of storage API command
+_stor_api_cmd_=`iniget STOR_API -f ${ENIQ_CONF_DIR}/${SUNOS_INI} -v STOR_API_CMD`
+if [ ! "${_stor_api_cmd_}" ]; then
+    _err_msg_="Could not read STOR_API_CMD param from ${ENIQ_CONF_DIR}/${SUNOS_INI}"
+    abort_script "${_err_msg_}"
+fi
+
+# Get current server type
+CURR_SERVER_TYPE=`$CAT ${ENIQ_CONF_DIR}/installed_server_type | $GEGREP -v  '^[[:blank:]]*#' | $SED -e 's/ //g'`
+if [ ! "${CURR_SERVER_TYPE}" ]; then
+    _err_msg_="Could not determine which server type this is"
+    abort_script "${_err_msg_}"
+fi
+
+# Check if server is Coordinator or Reader type
+CO_SERVER=""
+RD_SERVER=""
+if [ "${CURR_SERVER_TYPE}" == "stats_coordinator" -o "${CURR_SERVER_TYPE}" == "eniq_stats" ]; then
+    CO_SERVER="YES"
+elif [ "${CURR_SERVER_TYPE}" == "stats_iqr" ]; then
+    RD_SERVER="YES"
+fi
+
+
+STORAGE_TYPE=`iniget STOR_TYPE -f ${ENIQ_BASE_DIR}/installation/config/${SUNOS_INI} -v STORAGE_TYPE`
+if [ ! "${STORAGE_TYPE}" ]; then
+    _err_msg_="Could not read STORAGE_TYPE param "
+    abort_script "${_err_msg_}"
+fi
+
+
+
+SYSUSER=`iniget ENIQ_INSTALL_CONFIG -f ${ENIQ_CONF_DIR}/${SUNOS_INI} -v ENIQ_SYSUSER`
+if [ ! "${SYSUSER}" ]; then
+    _err_msg_="Could not read System User from ${ENIQ_CONF_DIR}/${SUNOS_INI}"
+    abort_script "${_err_msg_}"
+fi
+
+
+
+
+DWH_PORT=`iniget DWH -v PortNumber -f ${ENIQ_CONF_DIR}/${ENIQ_INI}`
+DWH_NAME=`iniget DWH -v ServerName -f ${ENIQ_CONF_DIR}/${ENIQ_INI}`
+if [ ! "${DWH_PORT}" -o ! "${DWH_NAME}" ]; then
+    _err_msg_="Could not read DB values from ${ENIQ_INI}"
+    abort_script "$_err_msg_"
+fi
+
+if [ "${CURR_SERVER_TYPE}" == "stats_coordinator" ]; then
+     _reader_list_=`iniget DWH_READER -f ${ENIQ_SW_CONF}/niq.ini`
+     if [ ! "${_reader_list_}" ]; then
+         _err_msg_="Could not find values for DWH_READER in ${ENIQ_SW_CONF}/niq.ini"
+         abort_script "${_err_msg_}"
+     fi
+
+     DWH_READER_PORT=`iniget DWH_READER_SETTINGS -v PortNumber -f ${ENIQ_SW_CONF}/${ENIQ_INI}`
+     for _reader_ in ${_reader_list_}; do
+         eval "${_reader_}"_ENG=`iniget ${_reader_} -v Service_Name -f ${ENIQ_SW_CONF}/${ENIQ_INI}`
+         if [ ! "${DWH_READER_PORT}" -o ! "${_reader_}_ENG" ]; then
+                _err_msg_="Could not read IQ values from ${ENIQ_SW_CONF}/${ENIQ_INI}"
+                abort_script "${_err_msg_}"
+         fi
+         done
+fi
+
+
+DBA_PASSWORD=`inigetpassword DB -f ${ENIQ_CONF_DIR}/${ENIQ_INI} -v DBAPassword`
+if [ ! ${DBA_PASSWORD} ]; then
+    if [ -f ${ENIQ_BASE_DIR}/sw/installer/dbusers ]; then
+        DBA_PASSWORD=`${ENIQ_BASE_DIR}/sw/installer/dbusers dba dwh`
+        if [ ! "${DBA_PASSWORD}" ] ; then
+            _err_msg_="`$DATE +%d.%m.%y_%H:%M:%S` - Could not get dwhdb DBA Password"
+            abort_script "$_err_msg_"
+        fi
+    else
+        _err_msg_="`$DATE +%d.%m.%y_%H:%M:%S` - Could not get dwhdb DBA Password"
+        abort_script "$_err_msg_"
+    fi
+fi
+
+CONN_STR_USER_DBA="uid=dba;pwd=${DBA_PASSWORD};eng=${DWH_NAME};links=tcpip{host=${DWH_NAME};port=${DWH_PORT};dobroadcast=no;verify=no}"                 
+
+
+
+# Get the required environment variables for Sybase
+$SU - ${SYSUSER} -c "$ENV |$EGREP '^(SYBASE|ASDIR|IQDIR|ASALOGDIR|SQLANY)'" > $TEM_DIR/sybase_det.$$
+$CAT $TEM_DIR/sybase_det.$$ |$EGREP '^(SYBASE|ASDIR|IQDIR|ASALOGDIR|SQLANY)' > $TEM_DIR/sybase_det_var.$$
+. $TEM_DIR/sybase_det_var.$$ >> /dev/null 2>&1
+
+if [ -z "$IQDIR" ] ; then
+    _err_msg_="ERROR: IQDIR is not set"
+    abort_script "${_err_msg_}"
+fi
+
+
+
+
+
+HNAME=`${HOSTNAME}`
+HOST_IP=`$GETENT hosts ${HNAME} | $NAWK '{print $1}' | $HEAD -1`
+
+}
+
+
+# ********************************************************************
+#
+#   Main body of program
+#
+# ********************************************************************
+
+RUN_TIME=`$DATE '+%Y-%b-%d_%H:%M:%S'`
+
+
+# Default return code
+RET_CODE=0
+
+# Set up environment variables for script.
+setup_env
+
+#Check and create the log file
+create_log_file
+
+get_absolute_path
+
+# Check the current user as root
+check_user "root"; RET_CODE=$?
+if [ "$RET_CODE" -ne ${SUCCESS} ]
+then
+   log_msg -t -s "FAILED : You need to be a root user to execute this script" -l ${LOGFILE}
+   RET_CODE=${ROOT_USER_FAILED}
+   exit ${RET_CODE}
+fi
+
+
+
+#Check symlink File
+if [ "${CO_SERVER}" == "YES" -o "${RD_SERVER}" == "YES" ]; then
+    check_symlink;rCode=$?
+    log_msg -t -s "INFO :Symlink File check completed for ${HNAME}: END, RC:$rCode" -l ${LOGFILE}
+    log_msg -t -s "Check log $LOGFILE\n"
+    exit ${rCode}
+else
+    log_msg -t -s "INFO :Symlink File check not applicable for Engine Blade : ${HNAME}: END" -l ${LOGFILE}
+    exit $ENGINE_NOT_APPLICABLE
+fi
+
+
+

@@ -1,0 +1,578 @@
+#!/bin/bash
+# ********************************************************************
+# Ericsson Radio Systems AB SCRIPT
+# ********************************************************************
+#
+#
+# (c) Ericsson Radio Systems AB 2019 - All rights reserved.
+#
+# The copyright to the computer program(s) herein is the property
+# of Ericsson Radio Systems AB, Sweden. The programs may be used
+# and/or copied only with the written permission from Ericsson Radio
+# Systems AB or in accordance with the terms and conditions stipulated
+# in the agreement/contract under which the program(s) have been
+# supplied.
+#
+# ********************************************************************
+# Name    : change_nas_vips.bsh
+# Date    : 27/03/2019
+# Revision: main\7
+# Purpose : This script will ask the same NAS VIP questions as the inirator
+# so that the user can change the SFS VIPs easily. 
+#
+# Usage   : change_nas_vips.bsh
+#
+# ********************************************************************
+#
+#   Command Section
+#
+# ********************************************************************
+AWK=/usr/bin/awk
+BASENAME=/usr/bin/basename
+BC=/usr/bin/bc
+CAT=/usr/bin/cat
+CHMOD=/usr/bin/chmod
+CHOWN=/usr/bin/chown
+CLEAR=/usr/bin/clear
+CMP=/usr/bin/cmp
+CP=/usr/bin/cp
+CUT=/usr/bin/cut
+DATE=/usr/bin/date
+DF=/usr/bin/df
+DIRNAME=/usr/bin/dirname
+DOMAINNAME=/usr/bin/domainname
+ECHO=/usr/bin/echo
+EGREP=/usr/bin/egrep
+EJECT=/usr/bin/eject
+ENV=/usr/bin/env
+EXPR=/usr/bin/expr
+GETENT=/usr/bin/getent
+GREP=/usr/bin/grep
+HEAD=/usr/bin/head
+HOSTID=/usr/bin/hostid
+HOSTNAME=/usr/bin/hostname
+ID=/usr/bin/id
+INIT=/usr/sbin/init
+LS=/usr/bin/ls
+MKDIR=/usr/bin/mkdir
+MORE=/usr/bin/more
+MV=/usr/bin/mv
+MYHOSTNAME=/usr/bin/hostname
+AWK=/usr/bin/awk
+PWD=/usr/bin/pwd
+RM=/usr/bin/rm
+SED=/usr/bin/sed
+SORT=/usr/bin/sort
+SU=/usr/bin/su
+SYSTEMCTL=/usr/bin/systemctl
+TAIL=/usr/bin/tail
+TEE=/usr/bin/tee
+TOUCH=/usr/bin/touch
+WC=/usr/bin/wc
+
+# ********************************************************************
+#
+#       Configuration Section
+#
+# ********************************************************************
+
+# ********************************************************************
+#
+#       Pre-execution Operations
+#
+# ********************************************************************
+# Number of log files to keep
+NUM_LOGS=10
+
+# Size in kbytes that the log file is allowed to grow to
+SIZE_LOGS=2048000
+
+# Flag to determine whether to compress log or not (Must be y/n)
+COMPRESS_LOG=n
+
+
+
+# ********************************************************************
+#
+#   functions
+#
+# ********************************************************************
+### Function: abort_script ###
+#
+#   This will is called if the script is aborted thru an error
+#   error signal sent by the kernel such as CTRL-C or if a serious
+#   error is encountered during runtime
+#
+# Arguments:
+#       $1 - Error message from part of program (Not always used)
+# Return Values:
+#       none
+abort_script()
+{
+_err_time_=`$DATE '+%Y-%b-%d_%H.%M.%S'`
+
+if [ "$1" ]; then
+	_err_msg_="${_err_time_} - $1"
+else
+	_err_msg_="${_err_time_} - Script aborted.......\n"
+fi
+if [ "${LOGFILE}" ]; then
+	$ECHO "\nERROR : $_err_msg_\n" | $TEE -a ${LOGFILE}
+else
+	$ECHO "\nERROR : $_err_msg_\n"
+fi
+
+cd $SCRIPTHOME
+$RM -rf ${TEM_DIR}
+
+if [ "$2" ]; then
+	${2}
+else
+	exit 1
+fi
+}
+
+# Check/Create Logfile
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+chk_create_logfile()
+{
+$MKDIR -p `$DIRNAME ${LOGFILE}`
+if [ $? -ne 0 ]; then
+	_err_msg_="Could not create directory `$DIRNAME ${LOGFILE}`"
+	abort_script "$_err_msg_"
+fi
+
+$TOUCH -a ${LOGFILE}
+if [ $? -ne 0 ]; then
+	_err_msg_="Could not write to file ${LOGFILE}"
+	abort_script "$_err_msg_"
+fi
+}
+
+### Function: check_id ###
+#
+#   Check that the effective id of the user is correct
+#   If not print error msg and exit.
+#
+# Arguments:
+#       $1 : User ID name
+# Return Values:
+#       none
+check_id()
+{
+_check_id_=`$ID  | $AWK -F\( '{print $2}' | $AWK -F\) '{print $1}'`
+if [ "$_check_id_" != "$1" ]; then
+	_err_msg_="You must be $1 or have equal permissions to execute this script."
+	abort_script "$_err_msg_"
+fi
+}
+
+
+### Function: get_absolute_path ###
+#
+# Determine absolute path to software
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+get_absolute_path() 
+{
+_dir_=`$DIRNAME $0`
+SCRIPTHOME=`cd $_dir_ 2>/dev/null && pwd || $ECHO $_dir_`
+}
+
+### Function: get_virt_nas_ips ###
+#
+# Get the logical NAS IPs
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+get_virt_nas_ips()
+{
+# Copy the ini template files. I will work on these until it is
+# time to move them to the main ini directory.    
+$CP ${ENIQ_CONF_DIR}/${SUNOS_INI}  ${TEM_DIR}/${SUNOS_INI}
+if [ $? -ne 0 ]; then
+	    _err_msg_="Could not copy ${ENIQ_CONF_DIR}/${SUNOS_INI} to ${TEM_DIR}/${SUNOS_INI}"
+	    abort_script "$_err_msg_"
+fi
+
+#logging current values in logfile
+_number_virt_nas_ips_curr_=`iniget NAS_DETAILS -f ${TEM_DIR}/${SUNOS_INI} -v Number_Virt_NAS_IPs`
+if [ $? -ne 0 ]; then
+	_err_msg_="Could not get Number_Virt_NAS_IPs from ${TEM_DIR}/${SUNOS_INI} "
+	abort_script "$_err_msg_"
+fi
+
+_virtual_nas_ip_list_curr_=`iniget NAS_DETAILS -f ${TEM_DIR}/${SUNOS_INI} -v Virtual_NAS_IP_List`
+if [ $? -ne 0 ]; then
+	_err_msg_="Could not get Virtual_NAS_IP_List from ${TEM_DIR}/${SUNOS_INI} "
+	abort_script "$_err_msg_"
+fi
+
+log_msg -s "\nCurrently  Number_Virt_NAS_IPs = ${_number_virt_nas_ips_curr_} and Virtual_NAS_IP_List = ${_virtual_nas_ip_list_curr_} " -l ${LOGFILE} -q
+
+# Get the number of NAS IPs for this system 	
+log_msg -s "Getting the number of NAS VIPs  " -l ${LOGFILE}
+
+common_get_num_vips ${TEM_DIR}/${SUNOS_INI}  ${TEM_DIR}/display_file
+if [ "${Number_Virt_NAS_IPs}" ]; then
+	log_msg -s "\nSetting Number_Virt_NAS_IPs to ${Number_Virt_NAS_IPs} in ${TEM_DIR}/${SUNOS_INI}  " -l ${LOGFILE}
+	iniset NAS_DETAILS -f ${TEM_DIR}/${SUNOS_INI} Number_Virt_NAS_IPs="${Number_Virt_NAS_IPs}"
+	if [ $? -ne 0 ]; then
+		_err_msg_="Could not update ${TEM_DIR}/${SUNOS_INI} with Number_Virt_NAS_IPs=${Number_Virt_NAS_IPs}"
+		abort_script "$_err_msg_"
+	fi
+else
+	_err_msg_="Could not get ${Number_Virt_NAS_IPs} "
+	abort_script "$_err_msg_"
+fi
+# Call the common function to get the IPs
+common_get_nas_virtual_ip ${Number_Virt_NAS_IPs}
+
+if [ "${VIRTUAL_NAS_IP_LIST}" ]; then
+	log_msg -s "\nSetting VIRTUAL_NAS_IP_LIST to ${VIRTUAL_NAS_IP_LIST} in ${TEM_DIR}/${SUNOS_INI}  " -l ${LOGFILE}
+	iniset NAS_DETAILS -f ${TEM_DIR}/${SUNOS_INI} Virtual_NAS_IP_List="${VIRTUAL_NAS_IP_LIST}"
+	if [ $? -ne 0 ]; then
+		_err_msg_="Could not update ${TEM_DIR}/${SUNOS_INI} with Virtual_NAS_IP_List=${VIRTUAL_NAS_IP_LIST}"
+		abort_script "$_err_msg_"
+	fi
+else
+	_err_msg_="Could not get VIRTUAL_NAS_IP_LIST "
+	abort_script "$_err_msg_"
+fi
+
+$ECHO "Number of Virtual NAS IPs = $Number_Virt_NAS_IPs" > ${TEM_DIR}/disp_file
+$ECHO "Virtual NAS IPs List =${VIRTUAL_NAS_IP_LIST}">> ${TEM_DIR}/disp_file
+user_confirm ${TEM_DIR}/disp_file
+if [ "${USER_CONF}" == "Yes" ]; then
+	$CLEAR
+	log_msg -s "\nSaving updated ${SUNOS_INI} file in ${ENIQ_CONF_DIR}" -l ${LOGFILE}
+	$CP ${TEM_DIR}/${SUNOS_INI} ${ENIQ_CONF_DIR}/${SUNOS_INI}
+    if [ $? -ne 0 ]; then
+       _err_msg_="Could not copy ${TEM_DIR}/${SUNOS_INI} to ${ENIQ_CONF_DIR}/${SUNOS_INI}"
+	    abort_script "$_err_msg_"
+    fi
+    $CHMOD 644 ${ENIQ_CONF_DIR}/${SUNOS_INI}
+    if [ $? -ne 0 ]; then
+        _err_msg_="Could not change permissions of ${ENIQ_CONF_DIR}/${SUNOS_INI} to -rw-r--r--"
+	    abort_script "$_err_msg_"
+    fi
+else 
+    $RM -rf ${TEM_DIR} 
+    exit 0
+fi 
+
+}
+
+### Function: setup_env ###
+#
+# Setup up path environment etc
+#
+# Arguments:
+#	none
+# Return Values:
+#	none
+setup_env()
+{
+if [ ! "${ENIQ_BASE_DIR}" ]; then
+	# Directory on the root filesystem
+	ENIQ_BASE_DIR=/eniq
+fi
+
+# Main Directory for the Core Installation SW
+ENIQ_INST_DIR=${ENIQ_BASE_DIR}/installation
+
+# Main Directory for the Core Installation SW
+ENIQ_CORE_INST_DIR=${ENIQ_INST_DIR}/core_install
+
+# ENIQ Config Directory
+ENIQ_CONF_DIR=${ENIQ_INST_DIR}/config
+
+# ENIQ SW conf
+CLI_CONF_DIR=${ENIQ_BASE_DIR}/sw/conf
+
+# Coordinator server list
+CO_SERVER_TYPE="eniq_coordinator|stats_coordinator|eniq_events|eniq_stats|eniq_iqw|son_coordinator|eniq_es"
+
+# Set up default logfile 
+LOGDIR="${ENIQ_BASE_DIR}/local_logs"
+#set nasd smf id
+NASd_SMF_ID="NASd.service"
+#set hostsync SMF ID
+HOSTSYNC_SMF_ID="hostsync.service"
+
+# Source the common functions
+if [ -s ${SCRIPTHOME}/../lib/common_functions.lib ]; then
+	. ${SCRIPTHOME}/../lib/common_functions.lib
+else
+	_err_msg_="File ${SCRIPTHOME}/../lib/common_functions.lib not found"
+	abort_script "$_err_msg_"
+fi
+# Source the common inirator functions
+if [ -s ${SCRIPTHOME}/../lib/common_inirator_functions.lib ]; then
+	. ${SCRIPTHOME}/../lib/common_inirator_functions.lib
+else
+	_err_msg_="File ${SCRIPTHOME}/../lib/common_inirator_functions.lib not found"
+	abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+fi
+
+# Determine the current server type
+CURR_SERVER_TYPE=`$CAT $ENIQ_CONF_DIR/installed_server_type | $GREP -v '^[[:blank:]]*#' | $SED -e 's/ //g'`
+if [ ! "${CURR_SERVER_TYPE}" ]; then
+	_err_msg_="Could not determine which server type this is"
+	abort_script "$_err_msg_"
+fi
+
+$ECHO "${CURR_SERVER_TYPE}" | $EGREP "${CO_SERVER_TYPE}" >> /dev/null 2>&1
+if [ $? -eq 0 ]; then
+	SERVER_TYPE="CO"
+else
+	SERVER_TYPE="${CURR_SERVER_TYPE}"
+fi
+#set SunOS.ini file
+SUNOS_INI=SunOS.ini
+#set host name and host ip
+HNAME=`${MYHOSTNAME}`
+HOST_IP=`$GETENT hosts ${HNAME} | $AWK '{print $1}' | $HEAD -1`
+
+#set sysuser and sysgrp
+SYSUSER=`iniget ENIQ_INSTALL_CONFIG -f ${ENIQ_CONF_DIR}/${SUNOS_INI} -v ENIQ_SYSUSER`
+if [ ! "${SYSUSER}" ]; then
+	_err_msg_="Could not read parameter ENIQ_SYSUSER from file - ${ENIQ_CONF_DIR}/${SUNOS_INI}"
+	abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+fi
+
+SYSGRP=`$ID ${SYSUSER} | $AWK '{print $2}' | $AWK -F\( '{print $2}' | $AWK -F\) '{print $1}'`
+if [ ! "${SYSGRP}" ]; then
+	_err_msg_="Could not determine group ID of ${SYSUSER}"
+	abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+fi
+
+STORAGE_TYPE=`iniget STOR_TYPE -f  ${ENIQ_CONF_DIR}/${SUNOS_INI} -v STORAGE_TYPE`
+if [ ! "${STORAGE_TYPE}" ]; then
+    _err_msg_="Could not read STORAGE_TYPE param "
+    abort_script "${_err_msg_}"
+fi
+
+}
+
+### Function: update_host_sync ###
+#
+# Update host sync to sync Sunos.ini file across teh deployment
+#
+# Arguments:
+#	none
+# Return Values:
+#	none
+update_host_sync()
+{
+log_msg -s "\nUpdating ${CLI_CONF_DIR}/ini_data_sync.cfg with new NAS IPs  " -l ${LOGFILE}
+_number_virt_nas_ips_update_=`iniget NAS_DETAILS -f ${TEM_DIR}/${SUNOS_INI} -v Number_Virt_NAS_IPs`
+if [ $? -ne 0 ]; then
+	_err_msg_="Could not get Number_Virt_NAS_IPs from ${TEM_DIR}/${SUNOS_INI} "
+	abort_script "$_err_msg_"
+fi
+
+_virtual_nas_ip_list_update_=`iniget NAS_DETAILS -f ${TEM_DIR}/${SUNOS_INI} -v Virtual_NAS_IP_List`
+if [ $? -ne 0 ]; then
+	_err_msg_="Could not get Virtual_NAS_IP_List from ${TEM_DIR}/${SUNOS_INI} "
+	abort_script "$_err_msg_"
+fi
+if [ -s ${CLI_CONF_DIR}/ini_data_sync.cfg ]; then
+    $CAT ${CLI_CONF_DIR}/ini_data_sync.cfg  | $GREP -v "${ENIQ_CONF_DIR}/${SUNOS_INI}::NAS_DETAILS::Number_Virt_NAS_IPs=" > ${TEM_DIR}/ini_data_sync.cfg
+	$CAT ${TEM_DIR}/ini_data_sync.cfg  | $GREP -v "${ENIQ_CONF_DIR}/${SUNOS_INI}::NAS_DETAILS::Virtual_NAS_IP_List=" > ${CLI_CONF_DIR}/ini_data_sync.cfg
+fi
+$ECHO "${ENIQ_CONF_DIR}/${SUNOS_INI}::NAS_DETAILS::Number_Virt_NAS_IPs="${_number_virt_nas_ips_update_}"" >> ${CLI_CONF_DIR}/ini_data_sync.cfg
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not update  ${CLI_CONF_DIR}/ini_data_sync.cfg"
+     abort_script "$_err_msg_"
+fi
+$ECHO "${ENIQ_CONF_DIR}/${SUNOS_INI}::NAS_DETAILS::Virtual_NAS_IP_List="${_virtual_nas_ip_list_update_}"" >> ${CLI_CONF_DIR}/ini_data_sync.cfg
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not update  ${CLI_CONF_DIR}/ini_data_sync.cfg"
+     abort_script "$_err_msg_"
+fi
+}
+
+### Function: update_service_name ###
+#
+#  update service name with nas informataion
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+update_service_name()
+{
+log_msg -s "Updating service name file with NAS VIPs and alias  " -l ${LOGFILE}
+# Get the number of NAS IPs for this system
+_num_ips_=`iniget NAS_DETAILS -f ${ENIQ_CONF_DIR}/${SUNOS_INI} -v Number_Virt_NAS_IPs`	
+if [ ! "${_num_ips_}" ]; then
+	_err_msg_="Could not read Number_Virt_NAS_IPs in ${ENIQ_CONF_DIR}/${SUNOS_INI}"
+	abort_script "$_err_msg_"
+fi
+#Get the NAS IPs for this system
+_ip_list_=`iniget NAS_DETAILS -f ${ENIQ_CONF_DIR}/${SUNOS_INI} -v Virtual_NAS_IP_List`	
+if [ ! "${_ip_list_}" ]; then
+	_err_msg_="Could not read Virtual_NAS_IP_List in ${ENIQ_CONF_DIR}/${SUNOS_INI}"
+	abort_script "$_err_msg_"
+fi
+#Get the NAS IPs for this system
+_total_supported_nas_ips_=`iniget NAS_DETAILS -f ${ENIQ_CONF_DIR}/${SUNOS_INI} -v Total_Supported_Virt_NAS_IPs`	
+if [ ! "${_total_supported_nas_ips_}" ]; then
+	_err_msg_="Could not read Total_Supported_Virt_NAS_IPs in ${ENIQ_CONF_DIR}/${SUNOS_INI}"
+	abort_script "$_err_msg_"
+fi
+_cnt_=1
+#assigning nas alias (nas[_nas_alias_num_]) in round robin for the available _num_ips_
+for _ip_ in  ${_ip_list_}; do
+	_nas_alias_num_=$_cnt_
+	while :; do
+		_nas_alias_name_=nas${_nas_alias_num_}
+		update_service_file ${CLI_CONF_DIR}/service_names ${_ip_} ${_nas_alias_name_} ${_nas_alias_name_} "NULL_GRP" "NO_RESTART"
+		if [ $? -ne 0 ]; then
+			_err_msg_="Failed to update ${CLI_CONF_DIR}/service_names with ${_nas_alias_name_} details"
+			abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+		fi
+		_nas_alias_num_=`$EXPR ${_nas_alias_num_} + ${_num_ips_}`	
+		if [ ${_nas_alias_num_} -gt ${_total_supported_nas_ips_} ]; then
+			break
+		fi	
+	done
+	let _cnt_=_cnt_+1
+done
+
+log_msg -s "Changing ownership of ${CLI_CONF_DIR}/service_names to ${SYSUSER}:${SYSGRP} after NAS alias changes" -l ${LOGFILE}
+$CHOWN ${SYSUSER}:${SYSGRP} ${CLI_CONF_DIR}/service_names
+if [ $? -ne 0 ]; then
+	_err_msg_="Failed to change ownership of ${CLI_CONF_DIR}/service_names to ${SYSUSER}:${SYSGRP}"
+	abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+fi
+
+log_msg -s "Restarting ${HOSTSYNC_SMF_ID}" -l ${LOGFILE}
+$SYSTEMCTL restart ${HOSTSYNC_SMF_ID}
+if [ $? -ne 0 ]; then
+	_err_msg_="Could not restart ${HOSTSYNC_SMF_ID}"
+	abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+fi
+
+
+
+}
+
+
+### Function: user_confirm ###
+#
+# Get confirmation from user to proceed with snapshot action
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+user_confirm()
+{
+local _disp_file_=$1
+while :; do
+	unset USER_CONF
+	$CLEAR
+	$CAT ${_disp_file_} 
+	$ECHO "\nAre you sure you wish to change NAS VIPs with the value above ?\n"	
+	$ECHO "Enter [Yes | No] (case sensitive) : \c"
+
+	read USER_CONF
+	if [ "$USER_CONF" == "Yes" -o "$USER_CONF" == "No" ]; then
+		break
+	fi
+done
+}
+
+# ********************************************************************
+#
+#   Main body of program
+#
+# ********************************************************************
+#
+# Determine absolute path to software
+get_absolute_path
+
+# Check that the effective id of the user is root
+check_id root
+
+while getopts ":l:" arg; do
+  case $arg in
+  
+    l) LOGFILE="$OPTARG" 
+       ;;
+   
+   \?) _err_msg_="`$BASENAME $0` [ -l <path_to_logfile> ]"
+       abort_script "$_err_msg_"
+       ;;
+  esac
+done
+shift `expr $OPTIND - 1`
+
+#setup env
+setup_env
+
+# Check Input Params
+#check_params 
+
+DEF_LOGFILE="${LOGDIR}/change_nas_vips/change_nas_vips.log"
+
+# Set up default logfile if required
+if [ ! "${LOGFILE}" ]; then
+    LOGFILE="${DEF_LOGFILE}"
+fi
+
+# Check/Create Logfile
+chk_create_logfile
+
+# Create a temporary Directory
+TEM_DIR=/tmp/change_nas_vips.$$.$$
+$RM -rf ${TEM_DIR}
+$MKDIR -p ${TEM_DIR}
+if [ $? -ne 0 ]; then
+	_err_msg_="Could not create directory ${TEM_DIR}"
+	abort_script "$_err_msg_"
+fi
+$CHMOD 777 ${TEM_DIR}
+
+# Only run on the coordinator
+if [ "${SERVER_TYPE}" != "CO" ]; then
+	_err_msg_="$0 can not be executed on ${SERVER_TYPE} server type"
+	abort_script "$_err_msg_"
+elif [ "${STORAGE_TYPE}" == "fs" ]; then
+	_err_msg_="$0 can not be executed on Storage Type ${STORAGE_TYPE} "
+	abort_script "$_err_msg_"
+fi	
+
+#checking if NASd is up and service_names file is there
+if [ ! -s ${CLI_CONF_DIR}/service_names ]; then
+    _err_msg_="${CLI_CONF_DIR}/service_names is not found, or is empty"
+    abort_script "$_err_msg_"
+fi
+log_msg -s "Starting `$BASENAME $0` " -l ${LOGFILE} -t -h
+# Get number of virt NAS IPs and logical NAS IP addresses
+get_virt_nas_ips
+
+#update hostsync file /eniq/sw/conf/ini_data_sync.cfg to sync SunOS.ini update across the deployment
+update_host_sync
+
+#update the service_names files with NAS IP and alias
+update_service_name
+# Rotate and compress the logs if necessary
+rotate_compress_logs ${LOGFILE} ${NUM_LOGS} ${SIZE_LOGS} ${COMPRESS_LOG}
+
+$RM -rf ${TEM_DIR}
+
+log_msg -s "Successfully finished `$BASENAME $0` " -l ${LOGFILE} 
+
+exit 0

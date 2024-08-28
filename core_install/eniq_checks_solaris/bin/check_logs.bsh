@@ -1,0 +1,695 @@
+#!/bin/bash
+# ********************************************************************
+# Ericsson Radio Systems AB                                     SCRIPT
+# ********************************************************************
+# (c) Ericsson Radio Systems AB 2016 - All rights reserved.
+#
+# The copyright to the computer program(s) herein is the property
+# of Ericsson Radio Systems AB, Sweden. The programs may be used
+# and/or copied only with the written permission from Ericsson Radio
+# Systems AB or in accordance with the terms and conditions stipulated
+# in the agreement/contract under which the program(s) have been
+# supplied.
+#
+# ********************************************************************
+# Name    : check_logs.bsh
+# Date    : 08/31/2016 
+# Revision: B 
+# Purpose : Script to check if any errors/warnings/exceptions are present in log files
+# Usage   : ./check_logs.bsh -e ./check_logs.bsh -m ./check_logs.bsh -mz ./check_logs.bsh -g ./check_logs.bsh -mg
+# Exit Values: 
+#     0   : Success
+#     3   : Failure Script Aborted
+#   112   : Directory path not found
+#   216   : Glassfish log file server.log not found
+#   217   : Directory path for glassfish logs not found
+#   210   : Errors/Warnings/Exceptions found 
+#   227   : Directory path for Engine Logs not found
+#   225   : Message log file not found
+#   226   : Directory path for messages logs not found
+#   228   : Engine Logs of last 48 hours not found
+#   247   : Mediation log directory not found
+#   111   : MZSH Directory path not found
+#   108   : MZSH Password not retrieved
+#   113   : Database script not found
+#    
+# ********************************************************************
+#
+#   Command Section
+#
+# ********************************************************************
+AWK=/usr/bin/awk
+CAT=/usr/bin/cat
+DATE=/usr/bin/date
+CUT=/usr/bin/cut
+ECHO=/usr/bin/echo
+EGREP=/usr/bin/egrep
+FIND=/usr/bin/find
+GREP=/usr/bin/grep
+ID=/usr/bin/id
+LS=/usr/bin/ls
+MKDIR=/usr/bin/mkdir
+RM=/usr/bin/rm
+SED=/usr/bin/sed
+TAIL=/usr/bin/tail
+TEE=/usr/bin/tee
+TOUCH=/usr/bin/touch
+# ********************************************************************
+#                                                                    *
+#                     Functions                                      *
+#                                                                    *
+# ********************************************************************
+### Function: abort_script 
+#                                                                     
+#   This will be called if the script is aborted through an error        
+#   encountered during runtime                               
+#                                                                     
+# Arguments:                                                          
+#       $1 - Error message from part of program     
+# Return Values:                                                      
+#       none                                                          
+#
+abort_script()
+{
+_err_time_=`$DATE '+%Y-%b-%d_%H.%M.%S'`
+
+if [ "$1" ]; then
+    _err_msg_="${_err_time_} - $1"
+else
+    _err_msg_="${_err_time_} - ERROR : Script aborted.......\n"
+fi
+if [ "${LOGFILE}" ]; then
+    $ECHO "\nERROR : ${_err_msg_}\n" | $TEE -a ${LOGFILE}
+else
+    $ECHO "\nERROR : ${_err_msg_}\n"
+fi
+exit 3 
+}
+### Function: check_id ###
+#
+#   Check that the effective id of the user is correct
+#   If not print error msg and exit.
+#
+# Arguments:
+#       $1 : User ID name
+# Return Values:
+#       none
+#
+check_id()
+{
+local _check_id_=`$ID  | $AWK -F\( '{print $2}' | $AWK -F\) '{print $1}'`
+
+if [ "$_check_id_" != "$1" ]; then
+    _err_msg_="You must be $1 to execute this script."
+    abort_script "$_err_msg_"
+fi
+}
+### Function: check_create_logfile ###
+#
+# Checks presence/creation of Logfile
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+#
+check_create_logfile()
+{
+if [ ! -d  ${ENIQ_PRECHECK_LOG_DIR} ]; then
+    ${MKDIR} -p ${ENIQ_PRECHECK_LOG_DIR}
+    if [ $? -ne 0 ]; then
+        _err_msg_="Could not create ${ENIQ_PRECHECK_LOG_DIR}"
+        abort_script "$_err_msg_"
+    fi
+fi
+
+if [ -s $LOGFILE ]; then
+    $RM -rf $LOGFILE
+    if [ -f $LOGFILE ]; then
+        _err_msg_="Warning : Could not remove older ${LOGFILE}"
+        abort_script "$_err_msg_"
+    fi
+fi
+
+$TOUCH -a ${LOGFILE}
+if [ $? -ne 0 ]; then 
+    _err_msg_="Could not create file ${LOGFILE}"
+    abort_script "$_err_msg_"
+fi
+
+$CHMOD 640 ${LOGFILE}
+if [ $? -ne 0 ]; then 
+    _err_msg_="Could not change the permissions of the ${LOGFILE}"
+    abort_script "$_err_msg_"
+fi
+}
+### Function: check_engine_log ###
+#
+# Checks if any error is present in the engine logs within last 48 hrs
+#
+# Arguments:
+#       None
+#Return codes:
+#    0     : No Errors/Warnings/Exceptions found in Engine Logs
+#    210   : Errors/Warnings/Exceptions detected in Engine Logs
+#    227   : Directory path for Engine Logs not found
+#    228   : Engine Logs of last 48 hours not found
+#
+check_engine_log()
+{ 
+_precheck_="Engine"
+_previous_date_=`TZ=MYT+24 $DATE +%Y_%m_%d`
+_current_date_=`$DATE +%Y_%m_%d`
+_previous_time_=0
+_current_time_=0
+_engine_error_=0
+_flag_prev_=0
+_flag_now_=0
+_file_now_=""
+_file_prev_=""
+
+if [ -d ${ENGINE_LOG_DIR} ]; then
+        log_msg -q -s "\n======================================== ENGINE LOG CHECK ============================================" -l ${LOGFILE}
+    if [ -s ${ENGINE_LOG_DIR}/engine-$_current_date_.log ]; then
+        engine_error ${ENGINE_LOG_DIR}/engine-$_current_date_.log
+        _flag_now_=$?
+    else
+        _file_now_="INFO: engine-$_current_date_.log file not found at ${ENGINE_LOG_DIR}" 
+    fi
+    if [ -s ${ENGINE_LOG_DIR}/engine-$_previous_date_.log ]; then
+        engine_error ${ENGINE_LOG_DIR}/engine-$_previous_date_.log
+	_flag_prev_=$?
+    else
+        _file_prev_="INFO: engine-$_previous_date_.log file not found at ${ENGINE_LOG_DIR}" 
+    fi
+        log_msg -q -s "===================================ENGINE LOG CHECK COMPLETED========================================\n" -l ${LOGFILE}
+        log_msg -q -s "\n==================================== SUMMARY FOR ENGINE LOG CHECK ===================================================\n" -l ${LOGFILE}
+        if [[ ! -z "$_file_now_" &&  ! -z "$_file_prev_" ]]; then
+            log_msg -q -s "WARNING: Engine Log files for last 48 hours not found" -l ${LOGFILE}
+            RET_CODE=228
+        else
+            if [ ! -z "$_file_now_" ];then
+               log_msg -q -s "$_file_now_" -l ${LOGFILE}
+            fi
+            if [ ! -z "$_file_prev_" ];then
+               log_msg -q -s "$_file_prev_" -l ${LOGFILE}
+            fi
+
+            if [[ "$_flag_now_" -eq 0 && "$_flag_prev_" -eq 0 ]]; then
+                log_msg -q -s "INFO: No Errors/Exceptions/Warnings found in Engine Logs in last 48 hours" -l ${LOGFILE}
+                RET_CODE=0
+            else
+                log_msg -q -s "$_engine_string_" -l ${LOGFILE}
+                RET_CODE=210
+            fi
+        fi
+        log_msg -q -s "========================================================================================================================\n" -l ${LOGFILE}
+else
+    log_msg -q -s "WARNING: Directory path ${ENGINE_LOG_DIR} not present" -l ${LOGFILE}
+    RET_CODE=227
+fi
+}
+### Function: engine_error ###
+#
+# Checks if any error is present in the given file  
+#
+# Arguments:
+#        None 
+# Return Values:
+#        _engine_error_ 
+#
+engine_error()
+{
+$EGREP -in 'error|exception|warning' $1 > /tmp/engine.txt
+if [ -s /tmp/engine.txt ]; then
+    _engine_error_=1
+    $SED "s~^~"$1":LINE# ~g" /tmp/engine.txt >> ${LOGFILE}
+    _warning_="WARNING: Errors/Exceptions/Warnings found in Engine Logs in the last 48 hours. Check $1"
+    if [ -z "$_engine_string_" ];then 
+        _engine_string_="$_warning_"
+    else
+        _engine_string_="$_engine_string_"$'\n'"$_warning_"
+    fi
+    return $_engine_error_
+else
+    _info_="INFO: No Errors/Exceptions/Warnings found in Engine Logs at $1 in the last 48 hours"
+    if [ -z "$_engine_string_" ];then
+        _engine_string_="$_info_"
+    else
+        _engine_string_="$_engine_string_"$'\n'"$_info_"
+    fi
+    return $_engine_error_
+fi
+$RM -rf /tmp/engine.txt
+}
+
+### Function: check_messages_log ###
+#
+# Checks if any error is present in the engine logs within last 24 hrs
+#
+# Arguments:
+#       None
+# Return Codes:
+#    0     : No Errors/Warnings/Exceptions found in  Messages Logs
+#    210   : Errors/Warnings/Exceptions detected in Messages Logs
+#    225   : Message log file not found
+#    226   : Directory path for messages logs not found
+#
+check_messages_log()
+{
+_precheck_="Messages" 
+_error_message_=0
+_current_time_=0
+_previous_time_=0
+_msg_previous_date_=""
+_msg_current_date_=""
+_str_concat_=""
+_str_two_=""
+_str_one_=""
+if [ -d ${MESSAGES_LOG_DIR} ]; then
+        log_msg -q -s "\n======================================== MESSAGES LOG CHECK ============================================" -l ${LOGFILE}
+        _msg_current_date_=`$DATE +%b\ %e`
+        $EGREP -in 'error|exception|warning' ${MESSAGES_LOG_DIR}/messages* | $GREP "$_msg_current_date_" > /tmp/messages.txt 
+        if [ -s /tmp/messages.txt ]; then
+            while read line
+            do
+               _str_two_=`$ECHO $line | $CUT -d":" -f2-`
+               _str_one_=`$ECHO $line | $CUT -d":" -f1`
+               _str_concat_=`$ECHO $_str_one_:LINE# $_str_two_`
+               log_msg -q -s "$_str_concat_" -l ${LOGFILE}
+               _error_message_=1
+            done < /tmp/messages.txt
+        fi
+        $RM -r /tmp/messages.txt
+        
+        _msg_previous_date_=`TZ=GMT+23 $DATE +%b\ %e`
+        $EGREP -in 'error|exception|warning' ${MESSAGES_LOG_DIR}/messages* | $GREP "$_msg_previous_date_" > /tmp/messages.txt 
+        if [ -s /tmp/messages.txt ]; then
+            while read line
+            do
+            _current_time_=`$ECHO ${line} | $CUT -d" " -f3 | $CUT -d":" -f1`
+            _previous_time_=`$DATE +%H`
+            if [ "$_current_time_" -gt "$_previous_time_" ]; then
+               _str_two_=`$ECHO $line | $CUT -d":" -f2-` 
+               _str_one_=`$ECHO $line | $CUT -d":" -f1`
+               _str_concat_=`$ECHO $_str_one_:LINE# $_str_two_`
+               log_msg -q -s "$_str_concat_" -l ${LOGFILE}
+               _error_message_=1
+            fi
+            done < /tmp/messages.txt
+        fi
+        $RM -r /tmp/messages.txt
+        log_msg -q -s "===================================MESSAGES LOG CHECK COMPLETED========================================\n" -l ${LOGFILE}
+        log_msg -q -s "\n==================================== SUMMARY FOR MESSAGES LOG CHECK ===================================================\n" -l ${LOGFILE} 
+        if [ "$_error_message_" -ne 0 ]; then 
+            log_msg -q -s "WARNING: Errors/Warnings/Exceptions found in the ${MESSAGES_LOG_DIR}/messages* files in last 24 hours" -l ${LOGFILE} 
+            RET_CODE=210
+        else
+            log_msg -q -s "INFO: No Errors/Warnings/Exceptions found in the ${MESSAGES_LOG_DIR}/messages* files in last 24 hours" -l ${LOGFILE}
+            RET_CODE=0
+        fi
+        log_msg -q -s "================================================================================================================================\n" -l ${LOGFILE}
+else
+    log_msg -q -s "WARNING: Directory path ${MESSAGES_LOG_DIR} not found" -l ${LOGFILE}
+    RET_CODE=226
+fi
+}
+### Function: check_mediation_log ###
+#
+# Checks if any error is present in the mediation gateway logs within last 48 hrs
+#
+# Arguments:
+#       None
+#Return code:
+#    0     : No Errors/Warnings/Exceptions found in mediation gateway logs
+#    210   : Errors/Warnings/Exceptions detected in mediation gateway logs
+#    247   : Directory path for mediation gateway log not found 
+#
+check_mediation_log()
+{
+_precheck_="Mediation gateway" 
+_dir_flag_=0
+_error_flag_=0
+_mediation_log_dir_=""
+if [ -f ${EVENTS_CHECK_CONFIG} ]; then
+    $CAT $EVENTS_CHECK_CONFIG | $GREP -v "#"| $GREP CHECK_MEDIATION_LOG >/tmp/config_mediation_log
+    log_msg -q -s "\n======================================== MEDIATION GATEWAY LOG CHECK ============================================" -l ${LOGFILE}
+    while read line
+    do
+       _mediation_log_dir_=`$ECHO ${line} | $NAWK -F":" '{print $2}'`
+       if [ -d ${_mediation_log_dir_} ]; then
+           cd ${_mediation_log_dir_} 
+           check_date_format $_mediation_log_dir_ 
+           $FIND . \( ! -name . -prune \) \( -type f -o -type l \) -mtime -1 | $CUT -c3- | $EGREP -v 'M_E_LTEES|M_E_CTRS|MULTI_EC'> /tmp/medgate.txt 
+           while read file 
+	   do  
+           $EGREP -in 'ERROR|WARNING|EXCEPTION|WARN' "$file"| $EGREP -v 'error_tiny|warning_tiny|HTTP-Error|-Exceptions_|errors.json|error.vm'| $EGREP "$_mg_Current_date_pattern_one_|$_mg_Previous_date_pattern_one_|$_mg_Current_date_pattern_two_|$_mg_Previous_date_pattern_two_" >  /tmp/mediation_log.txt  
+           if [ -s /tmp/mediation_log.txt ]; then
+               _error_flag_=1	
+               $SED "s~^~"${_mediation_log_dir_}/$file":LINE# ~g" /tmp/mediation_log.txt >> ${LOGFILE}
+           fi
+           $RM -r /tmp/mediation_log.txt
+	   done < /tmp/medgate.txt
+           $RM -r /tmp/medgate.txt
+       else
+           log_msg -q -s "WARNING: Directory path ${_mediation_log_dir_} not found" -l ${LOGFILE}
+           _dir_flag_=1
+       fi
+    done < /tmp/config_mediation_log 
+    $RM -rf /tmp/config_mediation_log
+
+   log_msg -q -s "\n======================================== MEDIATION GATEWAY LOG CHECK COMPLETED ============================================" -l ${LOGFILE}
+   log_msg -q -s "\n=================================== SUMMARY FOR MEDIATION GATEWAY LOG CHECK ===============================================\n" -l ${LOGFILE}
+
+   if [ "$_error_flag_" -ne 0 ]; then 
+       log_msg -q -s "WARNING: Errors/Warnings/Exceptions found in mediation gateway logs in last 48 hours" -l ${LOGFILE}
+       RET_CODE=210
+   elif [ "$_dir_flag_" -ne 0 ]; then         
+       log_msg -q -s "WARNING: Directory path for mediation gateway log not found" -l ${LOGFILE}
+       RET_CODE=247
+   else
+       log_msg -q -s "INFO: No Errors/Warnings/Exceptions found in mediation gateway logs in last 48 hours" -l ${LOGFILE}
+       RET_CODE=0
+   fi
+   log_msg -q -s "======================================================================================================================\n" -l ${LOGFILE}
+else
+  log_msg -s "WARNING: ${EVENTS_CHECK_CONFIG} file missing, this is required for this script, exiting!!!!" -l ${LOGFILE}
+  RET_CODE=15
+fi
+}
+### Function: check_date_format ###
+#
+# Assigns specific date format according to various Mediation logs
+#
+# Arguments:
+#       None
+#Return Codes:
+#       None 
+#
+check_date_format()
+{
+_path_=`$ECHO ${_mediation_log_dir_} | $CUT -d"/" -f6`
+case $_path_ in
+MULTI_EC)_mg_Current_date_pattern_one_=`$DATE +%Y.%m.%d`
+         _mg_Current_date_pattern_two_=`$DATE +%Y-%m-%d`
+         _mg_Previous_date_pattern_one_=`TZ=GMT+23 $DATE +%Y.%m.%d`
+         _mg_Previous_date_pattern_two_=`TZ=GMT+23 $DATE +%Y-%m-%d`
+;;
+M_E_CTRS)_mg_Current_date_pattern_one_=`$DATE +%Y-%m-%d`
+         _mg_Current_date_pattern_two_=`$DATE +%Y-%m-%d`
+         _mg_Previous_date_pattern_one_=`TZ=GMT+23 $DATE +%Y-%m-%d`
+         _mg_Previous_date_pattern_two_=`TZ=GMT+23 $DATE +%Y-%m-%d`
+
+;;
+M_E_LTEES)_mg_Current_date_pattern_one_=`$DATE +%Y-%m-%d`
+          _mg_Current_date_pattern_two_=`$DATE +%Y-%m-%d`
+          _mg_Previous_date_pattern_one_=`TZ=GMT+23 $DATE +%Y-%m-%d`
+          _mg_Previous_date_pattern_two_=`TZ=GMT+23 $DATE +%Y-%m-%d`
+;;
+*)_path_=`$ECHO $_mediation_log_dir_ | $CUT -d"/" -f3` 
+if [ "$_path_" == "mediation_sw" ]; then 
+    _mg_Current_date_pattern_one_=`$DATE +%b\%e`
+    _mg_Current_date_pattern_two_=`$DATE +%b\ %d`
+    _mg_Previous_date_pattern_two_=`TZ=GMT+23 $DATE +%b\%e`
+    _mg_Previous_date_pattern_one_=`TZ=GMT+23 $DATE +%b\ %d`
+else
+    _mg_Current_date_pattern_one_=" "
+    _mg_Current_date_pattern_two_=" "
+    _mg_Previous_date_pattern_one_=" "
+    _mg_Previous_date_pattern_two_=" "
+fi
+;;
+esac
+}
+
+### Function: check_MZSystem_log ###
+#
+# Checks if any error is present in the Dumpsys logs within last 48 hrs
+#
+# Arguments:
+#       None
+#Return Codes:
+#    0     : No Errors/Warnings/Exceptions found in MZ System Logs
+#    210   : Errors/Warnings/Exceptions detected in MZ System  Logs
+#    111   : MZSH Directory path not found 
+#    108   : MZSH Password not retrieved
+#    113   : Database script not found
+#
+check_MZSystem_log()
+{
+_precheck_="MZSystem"
+_error_dumpsys_=0
+_mz_current_date_=`date +%Y-%m-%d`
+_mz_previous_date_=`TZ=MYT+23 $DATE +%Y-%m-%d`
+
+if [ -d ${MZ_PATH} ]; then
+    if [ -f ${INSTALLER_DIR}/dbusers ]; then
+        MZ_PASSWORD=`${INSTALLER_DIR}/dbusers admin MG`
+        if [ ! -z "$MZ_PASSWORD" ]; then 
+            log_msg -q -s "\n======================================== MZ SYSTEM LOG CHECK ============================================" -l ${LOGFILE}
+            ${MZ_PATH}/mzsh mzadmin/${MZ_PASSWORD} dumpsyslog -d "$_mz_previous_date_ $_mz_current_date_" -t |$EGREP -i 'invalid|abort' > /tmp/dump.txt  
+            if [ -s /tmp/dump.txt ]; then
+               _error_dumpsys_=1
+               $SED "s~^~MZ System Logs:~g" /tmp/dump.txt >> ${LOGFILE}
+            fi
+            $RM -r /tmp/dump.txt
+            log_msg -q -s "=================================== MZ SYSTEM LOG CHECK COMPLETED ========================================\n" -l ${LOGFILE}
+            log_msg -q -s "\n====================================SUMMARY FOR MZ SYSTEM LOG CHECK===================================================\n" -l ${LOGFILE}
+            if [ "$_error_dumpsys_" -ne 0 ]; then
+                log_msg -q -s "WARNING: Errors/Warnings/Exceptions found in MZ System logs in last 48 hours" -l ${LOGFILE}
+                $ECHO "Please run the following command as dcuser for detailed logs : ${MZ_PATH}/mzsh <username>/<password> dumpsyslog -d "\"$_mz_previous_date_ $_mz_current_date_\""" >> ${LOGFILE} 
+                RET_CODE=210
+            else
+                log_msg -q -s "INFO: No Errors/Warnings/Exceptions found in MZ System logs in last 48 hours" -l ${LOGFILE}
+                $ECHO "Please run the following command as dcuser for detailed logs : ${MZ_PATH}/mzsh <username>/<password> dumpsyslog -d "\"$_mz_previous_date_ $_mz_current_date_\""" >> ${LOGFILE}
+                RET_CODE=0
+            fi
+            log_msg -q -s "============================================================================================================================\n" -l ${LOGFILE}
+        else
+            log_msg -q -s "ERROR: Unable to receive MZSH Password" -l ${LOGFILE} 
+            RET_CODE=108
+        fi
+    else
+        log_msg -q -s "ERROR: Database script not found" -l ${LOGFILE}
+        RET_CODE=113
+   fi
+else
+    log_msg -q -s "ERROR: Directory path ${MZ_PATH} not found" -l ${LOGFILE}
+    RET_CODE=111 
+fi
+}
+### Function: check_glassfish_log ###
+#
+#
+# Checks if any error is present in the glassfish logs within last 24 hrs
+#
+# Arguments:
+#       None
+#Return code:
+#    0     : No Errors/Warnings/Exceptions found in glassfish Logs
+#    210   : Errors/Warnings/Exceptions detected in glassfish Logs
+#    216   : Glassfish log file server.log not found
+#    217   : Directory path for glassfish logs not found 
+#
+check_glassfish_log()
+{
+_precheck_="Glassfish"
+_error_glassfish_=0
+_gf_current_date_=`$DATE +%Y-%m-%d`
+_gf_previous_date_=`TZ=GMT+23 $DATE +%Y-%m-%d`
+_glassfish_time_=0
+
+if [ -d ${GLASSFISH_LOG_DIR} ]; then
+    if [ -f ${GLASSFISH_LOG_DIR}/server.log ]; then
+        _error_glassfish_=0
+        _gf_current_date_=`$DATE +%Y-%m-%d`
+        _gf_previous_date_=`TZ=GMT+23 $DATE +%Y-%m-%d`
+        log_msg -q -s "\n========================================GLASSFISH LOG CHECK ============================================" -l ${LOGFILE}
+        $EGREP -in 'ERROR|WARNING|EXCEPTION' ${GLASSFISH_LOG_DIR}/server.log | $GREP $_gf_current_date_>> /tmp/glassfish.txt 
+        if [ -s /tmp/glassfish.txt ]; then
+            $SED "s~^~"${GLASSFISH_LOG_DIR}/server.log":LINE# ~g" /tmp/glassfish.txt >> ${LOGFILE}
+            _error_glassfish_=1
+        fi
+        $RM -r /tmp/glassfish.txt
+        $EGREP -in 'ERROR|WARNING|EXCEPTION' ${GLASSFISH_LOG_DIR}/server.log | $GREP $_gf_previous_date_>> /tmp/glassfish.txt
+        if [ -s /tmp/glassfish.txt ]; then
+            while read line
+            do
+                _glassfish_time_=`$ECHO $line | cut -d":" -f2 | cut -d"T" -f2`
+	        if [ "$_glassfish_time_" -gt "$($DATE +"%H")" ]; then
+                    log_msg -q -s "${GLASSFISH_LOG_DIR}/server.log:LINE# $line" -l ${LOGFILE}
+                    _error_glassfish_=1
+	        fi
+            done < /tmp/glassfish.txt
+        fi
+        $RM -r /tmp/glassfish.txt 
+        log_msg -q -s "===================================GLASSFISH LOG CHECK COMPLETED========================================\n" -l ${LOGFILE}
+        log_msg -q -s "\n==================================== SUMMARY FOR GLASSFISH LOG CHECK ===================================================\n" -l ${LOGFILE}
+        if [ "${_error_glassfish_}" -eq 0 ]; then 
+            log_msg -q -s "INFO: No Errors/Warnings/Exceptions found in Glassfish logs at ${GLASSFISH_LOG_DIR}/server.log in last 24 hours" -l ${LOGFILE}
+            RET_CODE=0
+        else
+            log_msg -q -s "WARNING: Errors/Warnings/Exceptions found in Glassfish logs in last 24 hours. Check ${GLASSFISH_LOG_DIR}/server.log" -l ${LOGFILE}
+            RET_CODE=210
+        fi
+        log_msg -q -s "================================================================================================================================\n" -l ${LOGFILE}
+    else
+        log_msg -q -s "WARNING: Glassfish log file server.log not found" -l ${LOGFILE}
+        RET_CODE=216
+    fi
+else
+    log_msg -q -s "WARNING: Directory path ${GLASSFISH_LOG_DIR} not found" -l ${LOGFILE}
+    RET_CODE=217
+fi
+}
+### Function: setup_env ###
+#
+# Setup path environment
+# Imports the common lib files which imports common functions 
+# 
+# Arguments:
+#   none
+# Return Values:
+#   none
+#
+setup_env()
+{
+if [ ! "${ENIQ_BASE_DIR}" ]; then 
+   ENIQ_BASE_DIR=/eniq
+fi
+
+# Main Directory for the Core Installation SW
+ENIQ_INST_DIR=${ENIQ_BASE_DIR}/installation
+
+# Path for Installer Directory
+INSTALLER_DIR=${ENIQ_BASE_DIR}/sw/installer
+
+# Path for Engine Logs Directory 
+ENGINE_LOG_DIR=${ENIQ_BASE_DIR}/log/sw_log/engine
+
+# Path for Glassfish Logs Directory
+GLASSFISH_LOG_DIR=${ENIQ_BASE_DIR}/log/sw_log/glassfish
+
+# Path for Glassfish Logs Directory
+MESSAGES_LOG_DIR=/var/adm
+
+# Path for MZ Directory
+MZ_PATH=${ENIQ_BASE_DIR}/mediation_sw/mediation_gw/bin
+
+#Installation lib directory
+ENIQ_LIB_DIR=${ENIQ_INST_DIR}/core_install/lib
+
+#Environment Setup File 
+ENV_SET_UP_FILE=${ENIQ_BASE_DIR}/sw/conf/niq.rc
+
+# Events_checks config file
+EVENTS_CHECK_CONFIG=${ENIQ_INST_DIR}/core_install/eniq_checks/config/precheck_events.cfg
+
+#Precheck type
+_precheck_=""
+
+#Engine Error string 
+_engine_string_=""
+
+#Date for Mediation Gateway Logs
+_mg_Current_date_pattern_one_=" "
+_mg_Current_date_pattern_two_=" "
+_mg_Previous_date_pattern_one_=" "
+_mg_Previous_date_pattern_two_=" "
+
+#Precheck logs directory
+ENIQ_PRECHECK_LOG_DIR=${ENIQ_BASE_DIR}/local_logs/precheck_logs
+
+#Return code declaration
+RET_CODE=0
+
+#Common function directory
+COMMON_FUNCS_LIB=${ENIQ_LIB_DIR}/common_functions.lib
+
+#Imports the common library functions
+if [ ! -f "${COMMON_FUNCS_LIB}" ]; then
+    _err_msg_="${COMMON_FUNCS_LIB} missing, this is required for this script, exiting!!!!"
+    abort_script "${_err_msg_}"
+fi
+
+. ${COMMON_FUNCS_LIB}
+
+if [ $? -ne 0 ]; then
+    _err_msg_="Importing functions of ${COMMON_FUNCS_LIB} failed, exiting!!!!"
+    abort_script "${_err_msg_}"
+fi
+}
+
+### Function: env_setup ###
+#
+# Environment path setup
+# Imports the Environment Setup File required for MZ_System_log check
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+#
+
+env_setup()
+{
+if [ ! -f "${ENV_SET_UP_FILE}" ]; then
+    _err_msg_="${ENV_SET_UP_FILE} missing, this is required for this script, exiting!!!!"
+    abort_script "${_err_msg_}"
+fi
+
+. ${ENV_SET_UP_FILE}
+
+if [ $? -ne 0 ]; then
+    _err_msg_="Importing functions of ${ENV_SET_UP_FILE} failed, exiting!!!!"
+    abort_script "${_err_msg_}"
+fi
+}
+
+# ********************************************************************
+#
+#       Main body of program
+#
+# ********************************************************************
+# Default user
+DEFAULT_USER=root
+
+# Check that the effective id of the user is root
+check_id $DEFAULT_USER
+
+# Set up environment variables for script.
+setup_env
+
+# Logfile path
+LOGFILE=${ENIQ_PRECHECK_LOG_DIR}/log_logfile.log
+ 
+# Check/Create Logfile
+check_create_logfile
+
+#Check for the log files 
+case $1 in
+-e)check_engine_log
+;;
+-m)check_messages_log
+;;
+-mz)env_setup
+    check_MZSystem_log
+;;
+-g)check_glassfish_log
+;;
+-mg)check_mediation_log
+;;
+*)check_engine_log
+  check_messages_log
+  env_setup
+  check_MZSystem_log
+  check_glassfish_log
+  check_mediation_log
+;;
+esac
+
+log_msg -t -s "ENIQ check for $_precheck_ logs completed" -l ${LOGFILE}
+log_msg -t -s "Check log $LOGFILE\n"
+
+exit $RET_CODE
+

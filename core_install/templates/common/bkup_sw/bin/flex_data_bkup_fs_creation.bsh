@@ -1,0 +1,1192 @@
+#!/bin/bash
+# ********************************************************************
+# Ericsson Radio Systems AB                                     SCRIPT
+# ********************************************************************
+#
+# (c) Ericsson Radio Systems AB 2017 - All rights reserved.
+#
+# The copyright to the computer program(s) herein is the property
+# of Ericsson Radio Systems AB, Sweden. The programs may be used
+# and/or copied only with the written permission from Ericsson Radio
+# Systems AB or in accordance with the terms and conditions stipulated
+# in the agreement/contract under which the program(s) have been
+# supplied.
+#
+# ********************************************************************
+# Name    : flex_data_bkup_fs_creation.bsh 
+# Date    : 21/08/2019
+# Revision: \main\9
+# Purpose : Create a new file-system for storing 2-Week data as a backup.
+#
+#
+# Usage   : flex_data_bkup_fs_creation.bsh -o create
+#           flex_data_bkup_fs_creation.bsh -o destroy
+#
+# ********************************************************************
+#
+#   Command Section
+#
+# ********************************************************************
+AWK=/usr/bin/awk
+BASENAME=/usr/bin/basename
+BASH=/usr/bin/bash
+BC=/usr/bin/bc
+CAT=/usr/bin/cat
+CP=/usr/bin/cp
+DATE=/usr/bin/date
+DIRNAME=/usr/bin/dirname
+ECHO=/usr/bin/echo
+EGREP=/usr/bin/egrep
+EXPR=/usr/bin/expr
+FIND=/usr/bin/find
+GEGREP=/usr/sfw/bin/gegrep
+GREP=/usr/bin/grep
+HEAD=/usr/bin/head
+ID=/usr/bin/id
+MKDIR=/usr/bin/mkdir
+MOUNT=/usr/sbin/mount
+MV=/usr/bin/mv
+NAWK=/usr/bin/nawk
+PERL=/usr/bin/perl
+PWD=/usr/bin/pwd
+RM=/usr/bin/rm
+SCP=/usr/bin/scp
+SED=/usr/bin/sed
+SLEEP=/usr/bin/sleep
+SORT=/usr/bin/sort
+SSH=/usr/bin/ssh
+SU=/usr/bin/su
+SVCADM=/usr/sbin/svcadm
+SVCS=/usr/bin/svcs
+TAIL=/usr/bin/tail
+TEE=/usr/bin/tee
+TOUCH=/usr/bin/touch
+TR=/usr/bin/tr
+UMOUNT=/usr/sbin/umount
+WC=/usr/bin/wc
+DF=/usr/sbin/df
+
+#### GLOBAL VARIABLES ###
+RECOVERY_FLAG=0
+
+### Function: abort_script ###
+#
+#   This will is called if the script is aborted if an error
+#   is encountered during runtime
+#
+# Arguments:
+#       $1 - Error message from part of program (Not always used)
+# Return Values:
+#       none
+abort_script()
+{
+    _err_time_=`$DATE '+%Y-%b-%d_%H.%M.%S'`
+
+    if [ "$1" ]; then
+        _err_msg_=$1
+    else
+        _err_msg_="${_err_time_} - ERROR : Script aborted.......\n"
+    fi
+ 
+    if [ "$2" ]; then
+        _func_name_=$2
+    else
+        _func_name_=""
+    fi 
+   
+    if [ "${LOGFILE}" ]; then
+        #$ECHO "\n${_err_time_} - ERROR : $_err_msg_\n" | $TEE -a ${LOGFILE}
+        $ECHO "\n${_err_time_} - ERROR : $_err_msg_\n" 
+        $ECHO "\n${_err_time_} - ERROR : $_err_msg_ , _func_=${_func_name_}" >> ${LOGFILE}
+    else
+        $ECHO "\n${_err_time_} - ERROR : $_err_msg_\n"
+    fi
+
+    $RM -rf ${TEM_DIR}
+
+    exit 1
+}
+
+### Function: check_id ###
+#
+#   Check that the effective id of the user is correct
+#   If not print error msg and exit.
+#
+# Arguments:
+#       $1 : User ID name
+# Return Values:
+#       0 for success; 1 for failure;
+check_id()
+{
+    _func_name_="check_id"
+    _check_id_=`$ID  | $AWK -F\( '{print $2}' | $AWK -F\) '{print $1}'`
+    if [ "${_check_id_}" != "$1" ]; then
+         _err_msg_="ERROR:: You must be ROOT to execute Script $0 - exiting"
+         abort_script "$_err_msg_" "$_func_name_"
+    fi
+}
+
+### Function: check_mount_point_status ###
+#
+# Checks the status of mount-point
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+check_mount_point_status()
+{
+    _mountpoint_=${ENIQ_BASE_DIR}/${_filesystem_name_}
+    $MOUNT -p | $GEGREP -w $_mountpoint_ >/dev/null 2>&1
+    if [ $? -eq 0 ]; then
+        log_msg -q -t -s "$_mountpoint_ is mounted"  -l ${LOGFILE}
+        _mp_status_=0
+    else
+        log_msg -q -t -s "$_mountpoint_ is not mounted"  -l ${LOGFILE}
+        _mp_status_=1
+    fi
+}
+
+### Function: check_nas_svcs_status ###
+#
+# Checks the status of NASd and nas-milestone services
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+check_nas_svcs_status()
+{
+    _is_svcs_down_=0
+    _nas_smf_str_=`iniget NAS_DAEMON -f ${ENIQ_CONF_DIR}/${SUNOS_INI} -v NAS_SERVICE_STR`
+    _nas_ms_str_=`iniget NAS_DAEMON -f ${ENIQ_CONF_DIR}/${SUNOS_INI} -v NAS_MILESTONE_FMRI`
+    _nas_state_=`$SVCS -H -o sta ${_nas_smf_str_}`
+    _nas_ms_state_=`$SVCS -H -o sta ${_nas_ms_str_}`
+
+    if [ ${_nas_state_} != "ON" -o ${_nas_ms_state_} != "ON" ]; then
+        _is_svcs_down_=1 
+    fi
+}
+
+### Function: check_space_availiblity ###
+#
+# Checks if the required space is available for new FS creation
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+check_space_availiblity()
+{
+    _func_name_="check_space_availiblity"
+    _new_fs_size_="$NEW_FS_SIZE"
+    get_kilo_size "$NEW_FS_SIZE"
+    _new_fs_size_k_="$SIZE_KILO"
+
+    display_and_logging "Space required for FS creation is ${_new_fs_size_} " "L"
+    if [[ $_new_fs_size_k_ -gt $MAX_SIZE ]]; then
+        insert_header "Deleting the configuration for data loading."
+
+        display_and_logging "Executing command : ${TP_DATA_BACKUP} -d" "L"
+        $BASH ${TP_DATA_BACKUP} -d
+        _ret_code_=$?
+        if [ ${_ret_code_} -ne 0 ]; then
+            RECOVERY_FLAG=1
+            remove_file_system
+            _err_msg_="Script ${TP_DATA_BACKUP} failed with error code - ${_ret_code_}"
+            abort_script "$_err_msg_"
+        fi
+        display_and_logging "Successfully executed the command" "L"
+
+        _err_msg_="New nas filesystem cannot be created , required size $_new_fs_size_k_ is greater than available size $MAX_SIZE"
+        abort_script "${_err_msg_}" "${_func_name_}"
+    fi
+    display_and_logging "Required space is available for FS creation" "L"
+}
+
+### Function: check_variable ###
+#
+# Checks if the requested variable value is non-zero
+#
+# Arguments:
+#   variable
+# Return Values:
+#   none
+check_variable()
+{
+    _func_name_="check_variable"
+    _val_=$1
+    eval _value_='$'$_val_
+    if [ -z $_value_ ];then
+        _err_msg_="Could not get value for $1"
+        abort_script "$_err_msg_" "${_func_name_}"
+    fi
+}
+
+### Function: cleanup ###
+#
+# Cleanup of temporary directory
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+cleanup()
+{
+    log_msg -q -t -s "Cleaning up the temporary directory" -l ${LOGFILE}
+    $RM -rf ${TEM_DIR}
+    log_msg  -q -t -s "Successfully completed the cleanup" -l ${LOGFILE}
+}
+
+### Function: create_new_ini_block_storage_ini ###
+#
+# Creates a new ini-block for 2-week data backup FS
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+create_new_ini_block_storage_ini()
+{
+    _mount_point_name_="/${_filesystem_name_}"
+
+    $ECHO "[${_parent_tag_}]"                                                              >${TEM_DIR}/new_ini_block
+    $ECHO "FS_NAME=$_filesystem_name_"                                                    >>${TEM_DIR}/new_ini_block
+    $ECHO "FS_SIZE=$_new_fs_size_"                                                        >>${TEM_DIR}/new_ini_block
+    $ECHO "NFS_HOST=$_nas_host_"                                                          >>${TEM_DIR}/new_ini_block
+    $ECHO "SHARE_PATH=/vx/<CHANGE><ENIQ_POOL_ID>-${_filesystem_name_}"                    >>${TEM_DIR}/new_ini_block
+    $ECHO "MOUNT_PATH=<CHANGE><ENIQ_BASE_DIR>${_mount_point_name_}"                       >>${TEM_DIR}/new_ini_block
+    $ECHO 'NFS_SHARE_OPTIONS="rw,no_root_squash"'                                         >>${TEM_DIR}/new_ini_block
+    $ECHO "SNAP_TYPE=optim"                                                               >>${TEM_DIR}/new_ini_block
+    $ECHO "STAGE=ALL"                                                                     >>${TEM_DIR}/new_ini_block
+    $ECHO "OWNER=dcuser"                                                                  >>${TEM_DIR}/new_ini_block
+    $ECHO "GROUP=dc5000"                                                                  >>${TEM_DIR}/new_ini_block
+}
+
+### Function: create_new_ini_block_sunos_ini ###
+#
+# Creates a new ini-block for 2-week data backup FS
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+create_new_ini_block_sunos_ini()
+{
+
+    $CP "${SUNOS_INI_TEMPLATE}" ${TEM_DIR}/SunOS_ini_template 
+    _last_used_=`$CAT ${TEM_DIR}/SunOS_ini_template  | $GREP SunOS_DIRECTORY_DIR_* | $GREP -v "\[*\]" | $TAIL -1 | $SED 's/[^0-9]*//g'`
+    ((_last_used_++))
+ 
+    _mount_point_name_="/${_filesystem_name_}"
+    _parent_tag_sunos_="SunOS_DIRECTORY_DIR_${_last_used_}"
+
+    $ECHO "[${_parent_tag_sunos_}]"                                >${TEM_DIR}/new_ini_block_sunos
+    $ECHO "path=<CHANGE><ENIQ_BASE_DIR>${_mount_point_name_}"     >>${TEM_DIR}/new_ini_block_sunos
+    $ECHO "perms=0755"                                            >>${TEM_DIR}/new_ini_block_sunos
+    $ECHO "user=dcuser"                                           >>${TEM_DIR}/new_ini_block_sunos
+    $ECHO "group=dc5000"                                          >>${TEM_DIR}/new_ini_block_sunos
+}
+
+### Function: display_and_logging ###
+#
+# Display the msg on console and log it 
+# in log file as well
+#
+# Arguments:
+#   $1 : Message which needs to display
+#   $2 : "Y/N"
+#        Y : Display msg as a header
+#        N : Display msg as a sub-header
+#   $3 : "Optional", display Success or Failure msg
+# Return Values:
+#   none
+display_and_logging()
+{
+    _message_=$1
+    _header_=$2
+    _result_=$3
+    _logged_=0
+
+    if [ "${_header_}" == "L" ]; then
+        log_msg -t -q -s "$1" -l ${LOGFILE} 
+        _logged_=1
+    elif [ "${_header_}" == "Y" ]; then
+        printf '\n%s\n' "$1"
+    else
+        printf '\n%s\n' "$1"
+    fi
+  
+    if [ ${_logged_} -eq 0 ]; then
+        log_msg -t -q -s "$1" -l ${LOGFILE}
+    fi
+}
+
+### Function: fs_size_configuration ###
+#
+# Gets the size of file-system which 
+# needs to be created
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+fs_size_configuration()
+{
+    _func_name_="fs_size_configuration"
+    _dep_type_=$1
+    _list_count_=1
+    NEW_FS_SIZE=""
+
+    _bkup_type_="flexible_backup"
+
+    _sel_bkup_data_=`$CAT ${FLEX_DATA_BKUP_CONF_FILE} | $GREP  -v ^# | $GREP -w "${_bkup_type_}"`
+    _flex_fs_name_=`$ECHO ${_sel_bkup_data_} | $AWK -F: '{print $6}'`
+    _flex_fs_path_=`$ECHO ${_sel_bkup_data_} | $AWK -F: '{print $7}'`
+
+    if [ ! -z ${_sel_bkup_data_} ]; then 
+        case "${_dep_type_}" in
+                ft)    NEW_FS_SIZE=`$ECHO ${_sel_bkup_data_} | $AWK -F: '{print $2}'`
+                       ;;
+             small)    NEW_FS_SIZE=`$ECHO ${_sel_bkup_data_} | $AWK -F: '{print $3}'`
+                       ;;
+            medium)    NEW_FS_SIZE=`$ECHO ${_sel_bkup_data_} | $AWK -F: '{print $4}'`
+                       ;;
+             large)    NEW_FS_SIZE=`$ECHO ${_sel_bkup_data_} | $AWK -F: '{print $5}'`
+                       ;;
+                 *)    _err_msg_="Invalid deployment type : ${_deployment_}"
+                       abort_script "${_err_msg_}" "${_func_name_}"
+                       ;;
+        esac
+    fi 
+
+}
+
+### Function: get_absolute_path ###
+#
+# Gets the path of execution directory
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+get_absolute_path()
+{
+    _dir_=`$DIRNAME $0`
+    SCRIPTHOME=`cd $_dir_ 2>/dev/null && pwd || $ECHO $_dir_`
+}
+
+### Function: get_filesystem_data ###
+#
+# Gets the data of new file-system    
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+get_filesystem_data()
+{
+    # NAS details
+    _nas_host_=nas3
+    display_and_logging "NAS host name          : ${_nas_host_}" "L"
+
+    # Storage Pool Name
+    _storage_pool_name_=`iniget NAS_DETAILS -f ${ENIQ_CONF_DIR}/${SUNOS_INI} -v NAS_Primary_Storage_Pool`
+    check_variable _storage_pool_name_
+    display_and_logging "Storage pool name      : ${_storage_pool_name_}" "L"
+
+    # Get the maximum available size 
+    get_max_size_available
+
+    # Get the storage template as per the deployment type
+    get_storage_template
+  
+    # Get the file-system details
+    get_new_fs_name
+    if [ ${_fs_exists_} -eq 1 ]; then
+        display_and_logging "File System '${_filesystem_name_}' already present on NAS" "Y"
+    fi 
+    # Get the parent tag for creattin an ini block
+    _parent_tag_=Storage_NAS_`$ECHO $_filesystem_name_ |$TR "[:lower:]" "[:upper:]" `
+    log_msg -q -t -s "Parent tag\t\t\t : ${_parent_tag_}" -l ${LOGFILE}
+    check_variable _parent_tag_
+    # Create a new ini block for adding FS details in storage_ini template 
+    create_new_ini_block_storage_ini
+    create_new_ini_block_sunos_ini
+
+    $ECHO "BKUP_TYPE=${_bkup_type_}" > ${SYS_FLEX_BKUP_CONF} 
+    $ECHO "FS_SIZE=${NEW_FS_SIZE}" >> ${SYS_FLEX_BKUP_CONF}
+    $ECHO "FS_NAME=${_filesystem_name_}" >> ${SYS_FLEX_BKUP_CONF}
+    $ECHO "FS_PATH=${_filesystem_path_}" >> ${SYS_FLEX_BKUP_CONF}
+}
+
+### Function: get_kilo_size ###
+#
+# Gets the size in kilobytes
+# Uses GLOBAL variable SIZE_KILO
+#
+# Arguments:
+#   string with digits and unit
+# Return Values:
+#   none
+get_kilo_size()
+{
+    _func_name_="get_kilo_size"
+    unset SIZE_KILO
+    local _convert_no_=$1
+    if  [ "${_convert_no_}" == "" ]; then
+        _err_msg_="Must provide a String"
+        abort_script "$_err_msg_" "${_func_name_}"
+    fi
+
+
+    get_unit_size "${_convert_no_}"
+    local _units_=${UNIT}
+    local _size_=${SIZE}
+
+    case "${_units_}" in
+        T|t)    _size_=$($ECHO "${_size_} * 1073741824" | $BC | $NAWK -F\. '{print $1}')
+                ;;
+        g|G)    _size_=$($ECHO "${_size_} * 1048576" | $BC | $NAWK -F\. '{print $1}')
+                ;;
+        m|M)    _size_=$($ECHO "${_size_} * 1024" | $BC | $NAWK -F\. '{print $1}')
+                ;;
+        k|K)    let _size_=${_size_}
+                ;;
+        *)      abort_script "Unit not supported '${_units_}'."
+                ;;
+    esac
+    if [ -z "${_size_}" ]; then
+        _err_msg_="Unable to convert ${_convert_no_} to kilo"
+        abort_script "$_err_msg_" "${_func_name_}" 
+    fi
+    SIZE_KILO=${_size_}
+}
+
+### Function: get_max_size_available ###
+#
+# Gets total size available on the nas
+#
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+get_max_size_available()
+{
+    _func_name_="get_max_size_available"
+    MAX_SIZE_NAS=$($NASCLI filestore_cmd storage pool free | $GEGREP -w "^${_storage_pool_name_}" | $NAWK '{print $2}')
+    if [ ! "$MAX_SIZE_NAS" ]; then
+        _err_msg_="Unable to get maximun size form NAS"
+        abort_script "$_err_msg_" "${_func_name_}"
+    fi
+    get_kilo_size "${MAX_SIZE_NAS}"
+    MAX_SIZE=${SIZE_KILO}
+    display_and_logging "Maximum size Available : '${MAX_SIZE_NAS}'" "L"
+}
+
+### Function: get_new_fs_name ###
+#
+# Gets the new file-system details
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+get_new_fs_name()
+{
+    _func_name_="get_new_fs_name"
+    _filesystem_name_="${_flex_fs_name_}"
+    _filesystem_path_="${_flex_fs_path_}"
+    _fs_exists_=0
+
+    check_variable _filesystem_name_
+    check_variable _filesystem_path_
+
+    display_and_logging "File System name" "L"
+    display_and_logging "${_filesystem_name_}" "L"
+    display_and_logging "Checking FS existence" "L"
+
+    $NASCLI list_shares - | $GREP -w "${_filesystem_name_}" > ${TEM_DIR}/fs_check_on_nas
+    _ret_code_=$?
+    if [ ${RECOVERY_FLAG} -ne 1 ]; then
+        if [ ${_ret_code_} -eq 0 ];then
+            #$CAT ${TEM_DIR}/fs_check_on_nas | $SED -e 's/^/         /g'
+            if [ ${ACTION} == "create" ]; then
+                check_mount_point_status
+                if [ $_mp_status_ -eq 0 ];then
+                    _fs_exists_=1
+                fi
+            else
+                _fs_exists_=1
+            fi
+        else
+            display_and_logging "No FS with name $_filesystem_name_ exists" "L" 
+        fi
+    else
+        _fs_exists_=1
+    fi
+    
+    if [ ${_fs_exists_} -eq 1 ]; then
+        display_and_logging "NAS Filesystem with name $_filesystem_name_ already exists" "L"
+        $CAT ${TEM_DIR}/fs_check_on_nas | $SED -e 's/^/             /g' >> ${LOGFILE}
+    fi
+}
+
+### Function: get_storage_template ###
+#
+# Get the storage template as per the deployment type
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+get_storage_template()
+{
+    _func_name_="get_storage_template"
+    # Get starage template file as per specified deployment
+    if [ -s ${ENIQ_CONF_DIR}/extra_params/deployment ]; then
+        _deployment_=`$CAT ${ENIQ_CONF_DIR}/extra_params/deployment | $TR '[:upper:]' '[:lower:]'`
+
+        case ${_deployment_} in
+               ft) _ini_file_name_="${NEW_TEMPL_DIR}/storage_ini.ft"
+                   ;;
+            small) _ini_file_name_="${NEW_TEMPL_DIR}/storage_ini.sml"
+                   ;;
+           medium) _ini_file_name_="${NEW_TEMPL_DIR}/storage_ini.med"
+                   ;;
+            large) _ini_file_name_="${NEW_TEMPL_DIR}/storage_ini.lrg"
+                   ;;
+			extralarge) _ini_file_name_="${NEW_TEMPL_DIR}/storage_ini.extralrg"
+                   ;;
+                *) _err_msg_="Invalid deployment type : ${_deployment_}"
+                   abort_script "${_err_msg_}" "${_func_name_}"
+                   ;;
+        esac
+
+        if [ ${ACTION} == "create" ];then
+            fs_size_configuration ${_deployment_} 
+            check_variable NEW_FS_SIZE
+        fi
+
+        if [ ${RECOVERY_FLAG} -eq 0 ]; then
+            log_msg -q -t -s "Using values in ${_ini_file_name_} for nas fs" -l ${LOGFILE}
+            $CP ${_ini_file_name_}  ${TEM_DIR}/storage_ini_template
+            $CP "${SUNOS_INI_TEMPLATE}" ${TEM_DIR}/SunOS_ini_template
+
+            if [ ! -s ${TEM_DIR}/storage_ini_template ]; then
+                _err_msg_="Could not copy information from ${_ini_file_name_}"
+                abort_script "$_err_msg_" "${_func_name_}"
+            fi
+            log_msg -q -t -s "INI Deployment file\t\t : ${_ini_file_name_}" -l ${LOGFILE}
+ 
+            if [ ${ACTION} == "create" ];then
+                log_msg -q -t -s "NEW FS size\t\t : ${NEW_FS_SIZE}" -l ${LOGFILE}
+                check_space_availiblity
+            fi
+        else
+            log_msg -q -t -s "INI Deployment file\t\t : ${_ini_file_name_}" -l ${LOGFILE}
+        fi
+    else
+        _err_msg_="Could not locate ${ENIQ_CONF_DIR}/extra_params/deployment"
+        abort_script "$_err_msg_" "${_func_name_}"
+    fi
+}
+
+### Function: get_unit_size ###
+#
+# Gets the size
+#
+# Arguments:
+#   string with digits and unit
+# Return Values:
+#   none
+get_unit_size()
+{
+    _func_name_="get_unit_size"
+    unset UNIT
+    unset SIZE
+    local _convert_no_="${1}"
+    if  [ "${_convert_no_}" == "" ]; then
+        _err_msg_="Must provide String"
+        abort_script "$_err_msg_" "${_func_name_}"
+    fi
+
+    local _units_=$($ECHO "${_convert_no_}" | $SED 's/[0-9\.]*//g')
+    if [ -z "${_units_}" ]; then
+        _err_msg_="Unable to get unit from ${_convert_no_}"
+        abort_script "$_err_msg_" "${_func_name_}"
+    fi
+    UNIT=${_units_}
+    local _size_=${_convert_no_%[A-Z,a-z]}
+    $NAWK 'BEGIN{if ('$_size_'>0) ;else exit 1}'
+    SIZE=${_size_}
+}
+
+insert_header()
+{
+   disp_msg=$1
+
+   log_msg -s "\n---------------------------------------------------------------------------------------------"  -l ${LOGFILE}
+   log_msg -t -s "${disp_msg}" -l ${LOGFILE}
+   log_msg -s "-----------------------------------------------------------------------------------------------"  -l ${LOGFILE}
+
+}
+### Function: remove_file_system ###
+#
+# Removes the files-system created for 2-Week data backup
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+remove_file_system()
+{
+    insert_header "Deleting the configuration for data loading."
+
+    display_and_logging "Executing command : ${TP_DATA_BACKUP} -d" "L"
+    $BASH ${TP_DATA_BACKUP} -d 
+    _ret_code_=$?
+    if [ ${_ret_code_} -ne 0 ]; then
+        RECOVERY_FLAG=1
+        remove_file_system
+        _err_msg_="Script ${TP_DATA_BACKUP} with option -d failed with error code - ${_ret_code_}"
+        abort_script "$_err_msg_"
+    fi
+    display_and_logging "Successfully executed the command" "L" 
+
+    if [ ${RECOVERY_FLAG} -eq 1 ]; then
+        # We are here b'coz some failure occured and recovery was triggered as a part of recovery action
+        display_and_logging "Error detected during FS creation, recovering the system" "Y" 
+        insert_header "Failure detected while FS creation, recovering the system back to its orignal state"
+    else
+        # We are here b'coz graceful removal of FS is triggered
+        insert_header "Deleting Flexible Backup Data NAS filesytsem"
+    fi
+    display_and_logging "Getting FS detail" "L"
+    get_new_fs_name
+
+    if [ $_fs_exists_ -eq 0 ]; then
+        for i in `$CAT ${TEM_DIR}/server_order_list |$GREP -v stats_coordinator | $AWK -F:: '{print $1}'`
+        do
+            $CAT ${TEM_DIR}/fs_check_on_nas | $GREP -w "${i}"
+            if [ $? -eq 0 ]; then
+                _fs_exists_=1
+                break
+            fi
+        done
+    fi
+
+    if [ $_fs_exists_ -eq 1 ]; then
+
+        # Reverting the NAS entries from the storage_ini template for removing the FS from the NAS
+        revert_nas_entry_storage_template
+
+        # Calling manage_storage_fs for FS removal
+        log_msg -q -t -s "Executing $BASH ${NEW_TEMPL_DIR}/admin/bin/manage_storage_fs.bsh -r ${ENIQ_INST_DIR} -l ${LOGFILE}"  -l ${LOGFILE}
+        display_and_logging "Removing and unmounting NAS FS on all the server, it will take upto 15 mins :" "Y"
+        $BASH ${NEW_TEMPL_DIR}/admin/bin/manage_storage_fs.bsh -r ${ENIQ_INST_DIR} -l ${LOGFILE} -f >/dev/null
+        if [ $? -ne 0 ];then
+            if [ ${RECOVERY_FLAG} -eq 1 ]; then
+                _err_msg_="Failed to recover the system to its orignal state" 
+            else
+                _err_msg_="Error in removing NAS filesytsem"
+            fi
+            $CP -rp ${TEM_DIR}/storage_ini_template ${_ini_file_name_}
+            $CP -rp ${TEM_DIR}/SunOS_ini_template ${SUNOS_INI_TEMPLATE} 
+            abort_script "$_err_msg_" "${_func_name_}"
+        else
+            check_mount_point_status
+            ${DF} -hk | $GREP -w ${_filesystem_name_} >/dev/null 2>&1
+            if [ $_mp_status_ -eq 0 -a $? -ne 0 ]; then
+                $UMOUNT -f ${_filesystem_path_}    
+                $RM -rf ${_filesystem_path_}
+            fi 
+
+            display_and_logging "Successfully removed NAS filesystem" "N" 
+            if [ "${CURR_SERVER_TYPE}" == "stats_coordinator" ]; then
+                for _server_ip_  in `$CAT ${TEM_DIR}/server_order_list |grep -v stats_coordinator | $AWK -F:: '{print $1}'`
+                do
+                    $SSH -o StrictHostKeyChecking=no -n ${_server_ip_} $RM -rf ${_filesystem_path_} 
+                    if [ $? -ne 0 ];then
+                        _err_msg_=" -> Failed to remove FS:${_filesystem_path_} on server:${_server_ip_}"
+                        abort_script "$_err_msg_" "${_func_name_}"
+                    else
+                        display_and_logging "Successfully removed FS:${_filesystem_path_} on server:${_server_ip_}" "N"
+                    fi
+                done
+            fi
+            if [ ${RECOVERY_FLAG} -eq 1 ]; then
+                display_and_logging "Recovery Completed" "Y"
+                display_and_logging "Successfully recovered the system to its orignal state, removed and unmounted NAS FS: $_filesystem_name_" "N"
+            else
+                display_and_logging "Successfully removed and unmounted NAS FS: $_filesystem_name_" "Y"
+            fi
+        fi
+    else
+        display_and_logging "NAS Filesystem:${_filesystem_path_} is already deleted" "Y"
+    fi
+
+    if [ -f "${SYS_FLEX_BKUP_CONF}" ]; then
+        # After successful removal of FS, removing the flag file which indicates the existing of FS
+        $RM -rf "${SYS_FLEX_BKUP_CONF}"
+    fi
+}
+
+### Function: revert_nas_entry_storage_template ###
+#
+# Revert the NAS entry from the storage template
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+revert_nas_entry_storage_template()
+{
+    _func_name_="revert_nas_entry_storage_template"
+
+    _nas_fs_name_uc_=`echo ${_filesystem_name_} |$TR "[:lower:]" "[:upper:]" `
+
+    _primary_tag_=Storage_NAS_FS_LIST
+    _secondary_tag_=Storage_NAS_${_nas_fs_name_uc_}
+
+    # Get the Storage_ini template details
+    log_msg -q -t -s " Fetching the storage ini template for updation as per the deployment type : " -l ${LOGFILE}
+    get_storage_template
+
+    # Getting the details of FS tag from the SunOs.ini tempalte which needs to be removed
+    for _sunos_list_ in `iniget SunOS_DIRECTORY -f ${TEM_DIR}/SunOS_ini_template`; do
+        iniget ${_sunos_list_} -f ${TEM_DIR}/SunOS_ini_template -v path | $GEGREP ${_filesystem_name_} >/dev/null 2>&1
+        if [  $? -eq 0 ]; then
+            _parent_tag_sunos_=${_sunos_list_}
+            break
+        fi
+    done
+
+    display_and_logging "Updating storage_ini_template and SunOs.ini template." "L"
+    if [ ${RECOVERY_FLAG} -eq 1 ]; then
+        _output_storage_file_path_="${TEM_DIR}/storage_ini_template"
+        _output_storage_file_path_sun_="${TEM_DIR}/SunOS_ini_template"
+    else
+        # Removing the FS entry from the SunOs.ini and storage_ini template
+        _output_storage_file_path_="${TEM_DIR}/storage_ini_template_new"
+        _output_storage_file_path_sun_="${TEM_DIR}/sunos_ini_template"
+
+        $INIDEL -g ${_primary_tag_} -p  ${_secondary_tag_} -i ${TEM_DIR}/storage_ini_template -o ${_output_storage_file_path_} 
+        if [ $? -ne 0 ];then
+            _err_msg_="Failed to update ${_output_storage_file_path_}"
+            abort_script "$_err_msg_" "${_func_name_}"
+        else
+            log_msg -q -t -s "${_output_storage_file_path_} successfully updated " -l ${LOGFILE}
+        fi
+
+        $INIDEL -g SunOS_DIRECTORY -p ${_parent_tag_sunos_} -i ${TEM_DIR}/SunOS_ini_template -o ${_output_storage_file_path_sun_}
+        if [ $? -ne 0 ];then
+            _err_msg_="Failed to update ${_output_storage_file_path_sun_}"
+            abort_script "$_err_msg_" "${_func_name_}"
+        else
+            log_msg -q -t -s "${_output_storage_file_path_sun_} successfully updated " -l ${LOGFILE}
+        fi
+
+    fi
+
+    $CP -rp ${_output_storage_file_path_} ${_ini_file_name_}
+    _rcode_str_=$?
+    $CP -rp ${_output_storage_file_path_sun_} ${SUNOS_INI_TEMPLATE}
+    _rcode_sun_=$?
+    if [ ${_rcode_str_} -ne 0 -o ${_rcode_sun_} -ne 0 ];then
+        _err_msg_="Could not update template file-[${_rcode_str_},${_rcode_sun_}]"
+        abort_script "$_err_msg_" "${_func_name_}"
+    else
+        display_and_logging "${_ini_file_name_} successfully updated" "L" 
+    fi
+
+    log_msg -q -t -s "CURR_SERVER_TYPE = ${CURR_SERVER_TYPE}" -l ${LOGFILE}
+    if [ "${CURR_SERVER_TYPE}" == "stats_coordinator" ]; then
+        # Copying the storage.ini and SunOs.ini template on other servers
+        for i in `$CAT ${TEM_DIR}/server_order_list |grep -v stats_coordinator | $AWK -F:: '{print $1}'`
+        do
+            display_and_logging "Copying updated storage_ini_template on server:${i}" "L"
+            scp -rp -o StrictHostKeyChecking=no ${_ini_file_name_} ${i}:${_ini_file_name_} >/dev/null 2>&1 
+            _rcode_str_=$?
+            scp -rp -o StrictHostKeyChecking=no ${SUNOS_INI_TEMPLATE} ${i}:${SUNOS_INI_TEMPLATE} >/dev/null 2>&1
+            _rcode_sun_=$?
+            if [ ${_rcode_str_} -ne 0 -o ${_rcode_sun_} -ne 0 ];then
+                log_msg -q -t -s "Ret_Code_Str=${_rcode_str_}, Ret_Code_Sun=${_rcode_sun_}\n" -l ${LOGFILE}
+                _err_msg_="Error in SCP of storage_ini_template : ${_ini_file_name_}"
+                abort_script "$_err_msg_" "${_func_name_}"
+            fi
+            display_and_logging "Copied Successfully" "L" 
+        done
+    fi
+}
+
+### Function: setup_env ###
+#
+# Setup the environment variables
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+setup_env()
+{
+    _func_name_="setup_env"
+    SUNOS_INI=SunOS.ini
+
+    #Eniq base directory
+    ENIQ_BASE_DIR=/eniq
+
+    ENIQ_LOG_DIR=${ENIQ_BASE_DIR}/local_logs
+
+    # Main Directory for the Core Installation SW
+    ENIQ_INST_DIR=${ENIQ_BASE_DIR}/installation
+
+    # Main Directory for the Core Installation SW
+    ENIQ_CORE_INST_DIR=${ENIQ_INST_DIR}/core_install
+
+    # ENIQ Config Directory
+    ENIQ_CONF_DIR=${ENIQ_INST_DIR}/config
+
+    # ENIQ Backup Directory
+    ENIQ_BKUP_DIR=${ENIQ_BASE_DIR}/bkup_sw
+
+    # Backup FS configuration file
+    FLEX_DATA_BKUP_CONF_FILE="${ENIQ_BKUP_DIR}/etc/flex_data_bkup.conf"
+ 
+    # Script for data loading
+    TP_DATA_BACKUP="/eniq/admin/bin/manage_eniq_backup.bsh"
+    if [ ! -f ${TP_DATA_BACKUP} ]; then
+        _err_msg_="Failed to get the script ${TP_DATA_BACKUP} for data loading"
+        abort_script "$_err_msg_"
+    fi
+ 
+    # System conf file for backup fs
+    SYS_FLEX_BKUP_CONF=${ENIQ_BKUP_DIR}/etc/.flex_data_bkup_conf
+
+    # Source the common functions
+    if [ -s $ENIQ_CORE_INST_DIR/lib/common_functions.lib ]; then
+        . $ENIQ_CORE_INST_DIR/lib/common_functions.lib
+    else
+        _err_msg_="File $ENIQ_CORE_INST_DIR/lib/common_functions.lib not found"
+        abort_script "$_err_msg_" "${_func_name_}"
+    fi
+
+    # Set up Variable to hold path for iniadd
+    if [ ! -s ${ENIQ_CORE_INST_DIR}/lib/iniadd.pl ]; then
+        _err_msg_="Cannot locate ${ENIQ_CORE_INST_DIR}/lib/iniadd.pl"
+        abort_script "$_err_msg_" "${_func_name_}"
+    else
+        INIADD=${ENIQ_CORE_INST_DIR}/lib/iniadd.pl
+    fi
+
+    # Set up Variable to hold path for inidel
+    if [ ! -s ${ENIQ_CORE_INST_DIR}/lib/inidel.pl ]; then
+        _err_msg_="Cannot locate ${ENIQ_CORE_INST_DIR}/lib/inidel.pl"
+        abort_script "$_err_msg_" "${_func_name_}"
+    else
+        INIDEL=${ENIQ_CORE_INST_DIR}/lib/inidel.pl
+    fi
+
+    # File containing the type of installation
+    INST_TYPE_FILE=${ENIQ_CONF_DIR}/ericsson_use_config
+    if [ ! -s ${INST_TYPE_FILE} ]; then
+        _err_msg_="Could not locate file ${INST_TYPE_FILE}"
+        abort_script "$_err_msg_" "${_func_name_}"
+    fi
+
+    # Read the installation type
+    INSTALL_TYPE=`$CAT ${INST_TYPE_FILE} | $NAWK -F\= '{print $2}'`
+
+    NASCLI=/ericsson/storage/bin/nascli
+
+    NEW_TEMPL_DIR="${ENIQ_INST_DIR}/core_install/templates/${INSTALL_TYPE}"
+
+    BLADE_TYPE=`$GREP STORAGE_TYPE $ENIQ_CONF_DIR/san_details | $AWK -F"=" '{print $2}'`
+    if [ ${BLADE_TYPE} == "zfs" ]; then
+        _err_msg_="Flexible data backup functionality is not supported for RACK server"
+        abort_script "$_err_msg_"
+    elif [ -z ${BLADE_TYPE} ]; then
+        _err_msg_="Unable to read blade type"
+        abort_script "$_err_msg_"
+    fi
+
+    SUNOS_INI_TEMPLATE="${NEW_TEMPL_DIR}/SunOS.ini_${BLADE_TYPE}" 
+    if [ ! -f "${SUNOS_INI_TEMPLATE}" ]; then
+        _err_msg_="Failed to get the SunOs.ini template"
+        abort_script "$_err_msg_"
+    fi
+
+    CURR_SERVER_TYPE=`$CAT ${ENIQ_CONF_DIR}/installed_server_type`
+    if [ "$CURR_SERVER_TYPE" == "eniq_events" -o "${CURR_SERVER_TYPE}" == "eniq_coordinator" ]; then
+        _err_msg_="Flexible data backup functionality is not supported for events"
+        abort_script "$_err_msg_"
+    fi  
+
+    STORAGE_TYPE=`iniget STOR_TYPE -f ${ENIQ_CONF_DIR}/${SUNOS_INI} -v STORAGE_TYPE`
+    if [ -z "${STORAGE_TYPE}" ]; then
+        STORAGE_TYPE=${BLADE_TYPE} 
+    fi
+
+    GET_IP_ORDER=${ENIQ_CORE_INST_DIR}/lib/get_ip_order.pl
+    if [ -f ${GET_IP_ORDER} ]; then
+        $PERL ${GET_IP_ORDER} -f ${TEM_DIR}/server_order_list
+    fi
+}
+
+### Function: update_storage_template ###
+#
+# Update storage template
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+update_storage_template()
+{
+    _func_name_="update_storage_template"
+    $CP -rp ${TEM_DIR}/storage_ini_template_new ${_ini_file_name_}
+    _rcode_str_=$? 
+    $CP -rp ${TEM_DIR}/sunos_ini_template ${SUNOS_INI_TEMPLATE} 
+    _rcode_sun_=$?
+    if [ ${_rcode_str_} -ne 0 -o ${_rcode_sun_} -ne 0 ];then
+        _err_msg_="Could not update template file-[${_rcode_str_},${_rcode_sun_}]"
+        $CP -rp ${TEM_DIR}/storage_ini_template ${_ini_file_name_}
+        $CP -rp ${TEM_DIR}/SunOS_ini_template ${SUNOS_INI_TEMPLATE}
+        abort_script "$_err_msg_" "${_func_name_}"
+    else
+        log_msg -q -t -s "${_ini_file_name_} successfully updated " -l ${LOGFILE}
+    fi
+}
+
+### Function: usage_msg ###
+#
+#   Print out the usage message
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+usage_msg()
+{
+    $ECHO "
+    Usage : `$BASENAME $0` -a {create|destroy} [-l]
+
+    options:
+
+    -a  : Action. Must be either
+             create   --> Create a new file-system on NAS
+             destroy  --> Destroy the file-sysyem from NAS 
+    -l  : To generate logfile other than default path
+    "
+}
+
+# **********************************************************************
+#
+# ********************** Main body of program  *************************
+#
+# **********************************************************************
+#
+
+# Check that the effective id of the user is root
+check_id root
+
+TIMESTAMP=`$DATE '+%d-%m-%y_%H.%M.%S'`
+
+# Get  values on runtime
+while getopts "a:l:" arg;
+do
+    case $arg in
+        a)     ACTION="$OPTARG"
+               ;;
+        l)     LOGFILE="$OPTARG"
+               $TOUCH $LOGFILE
+               ;;
+       \?)     echo  "Invalid option(s) passed"
+               usage_msg
+               exit 1
+               ;;
+    esac
+done
+
+if [ "${ACTION}" != "create" -a "${ACTION}" != "destroy" ]; then
+    usage_msg
+    exit 1
+fi
+
+
+# Create a temporary Directory
+TEM_DIR=/tmp/flex_data_bkup.$$.$$
+$RM -rf ${TEM_DIR}
+$MKDIR -p ${TEM_DIR}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not create directory $TEM_DIR"
+    abort_script "$_err_msg_"
+fi
+
+# Determine absolute path to software
+get_absolute_path
+
+setup_env
+
+if [ ! "${LOGFILE}" ]; then
+    LOGFILE=${ENIQ_LOG_DIR}/flex_data_bkup_${ACTION}_$TIMESTAMP.log
+    $TOUCH $LOGFILE
+fi
+
+if [ "${ACTION}" == "create" ];then
+
+     if [ -f "${SYS_FLEX_BKUP_CONF}" ]; then
+         _err_msg_="File System flex_data_bkup already exists"
+         abort_script "$_err_msg_"
+     fi
+
+     insert_header "Enabling the configuration for data loading."
+
+     display_and_logging "Executing command : ${TP_DATA_BACKUP} -c holdCacheReload" "L"
+     $BASH ${TP_DATA_BACKUP} -c holdCacheReload
+     _ret_code_=$?
+     if [ ${_ret_code_} -ne 0 ]; then
+         RECOVERY_FLAG=1
+         remove_file_system
+         _err_msg_="Script ${TP_DATA_BACKUP} with option holdCacheReload failed with error code - ${_ret_code_}"
+         abort_script "$_err_msg_"
+     fi
+     display_and_logging "Successfully executed the command" "L"
+
+     insert_header "Creating new NAS filesytsem"     
+
+    # Check NAS services before procedding further
+    check_nas_svcs_status
+
+    display_and_logging "Checking NAS services status" "Y"
+    if [ ${_is_svcs_down_} -eq 1 ]; then
+        _err_msg_="NAS services are down, failed to proceed further"
+        abort_script "$_err_msg_"
+    fi
+    display_and_logging "NAS services are UP and Running" "N" "Success"
+
+    display_and_logging "Getting new FS information" "L"
+
+    # Fetch the file-system data which needs to be created
+    get_filesystem_data
+
+    if [ ${_fs_exists_} -eq 0 ]; then
+
+        display_and_logging "Adding FS entry block " "L"
+
+        # Adding block for storage ini
+        $INIADD -g Storage_NAS_FS_LIST -p ${_parent_tag_} -i ${TEM_DIR}/storage_ini_template -d ${TEM_DIR}/new_ini_block -o ${TEM_DIR}/storage_ini_template_new
+        if [ $? -ne 0 ];then
+            display_and_logging "FAILED" "L"   
+            _err_msg_="Failed to add FS block in ${TEM_DIR}/storage_ini_template_new"
+            abort_script "$_err_msg_"
+        else
+            log_msg -q -t -s "${TEM_DIR}/storage_ini_template_new successfully updated " -l ${LOGFILE}
+        fi
+
+        # Adding block for SunOS ini
+        $INIADD -g SunOS_DIRECTORY -p ${_parent_tag_sunos_} -i ${TEM_DIR}/SunOS_ini_template -d ${TEM_DIR}/new_ini_block_sunos -o ${TEM_DIR}/sunos_ini_template 
+
+        if [ $? -ne 0 ];then
+            display_and_logging "FAILED" "L" 
+            _err_msg_="Failed to add FS block in ${TEM_DIR}/sunos_ini_template"
+            abort_script "$_err_msg_"
+        else
+            log_msg -q -t -s "${TEM_DIR}/sunos_ini_template successfully updated " -l ${LOGFILE}
+
+        fi
+
+        display_and_logging "Successfully added" "L"
+        display_and_logging "Updating storage_ini template " "L"
+  
+        # Updating storage and sunos template 
+        update_storage_template
+        display_and_logging "Successfully updated" "L"
+
+       	log_msg -q -t -s " Using below parameters for NAS filesystem creation : \n" -l ${LOGFILE}
+        $CAT ${TEM_DIR}/new_ini_block |$EGREP -e "FS_NAME|FS_SIZE|NFS_HOST|NFS_SHARE_OPTIONS|OWNER|GROUP"  >> ${LOGFILE}
+
+        display_and_logging "Creating and mounting new FS on server, it will take upto 15 mins :" "Y"
+
+        #  Calling manage_storage_fs for FS creation, sharing and mounting
+        $BASH ${NEW_TEMPL_DIR}/admin/bin/manage_storage_fs.bsh -p ${ENIQ_INST_DIR} -l ${LOGFILE} -f >/dev/null
+        if [ $? -ne 0 ];then
+                # Get the list of existing FS on NAS
+                $NASCLI list_shares - | $GREP -w "${_filesystem_name_}" >/dev/null 2>&1
+                if [ $? -eq 0 ]; then
+                    # Since manage_storage_fs failed to execute successfully and FS mounted so recovering the system and bringing it back to orignal state.
+                    RECOVERY_FLAG=1
+                    remove_file_system
+                fi
+                $CP -rp ${TEM_DIR}/storage_ini_template ${_ini_file_name_}
+                _err_msg_="Failed to create NAS filesystem"
+                abort_script "$_err_msg_"
+        else
+                display_and_logging "Successfully created and mounted FS on coordinator" "N"
+        fi
+    fi
+
+    log_msg -q -t -s "CURR_SERVER_TYPE = ${CURR_SERVER_TYPE}" -l ${LOGFILE}
+    if [ "${CURR_SERVER_TYPE}" == "stats_coordinator" ]; then
+        for i in `$CAT ${TEM_DIR}/server_order_list |grep -v stats_coordinator | $AWK -F:: '{print $1}'`
+        do
+            # Checking if FS is mounted on other servers one-by-one if present then move to next if not proceed with sharing and mounting  
+            display_and_logging "Checking if FS is mounted on server:${i}" "Y"
+            $CAT ${TEM_DIR}/fs_check_on_nas | $GREP -w "${i}" > /dev/null
+            if [ $? -ne 0 ]; then
+                _fs_exists_=0
+                # Coptying storage and sunos.ini template on respective server
+                display_and_logging "Copying updated storage_ini_template and SunOs.ini tempalte on server:${i}" "L" 
+                scp -rp -o StrictHostKeyChecking=no ${_ini_file_name_} ${i}:${_ini_file_name_} >/dev/null 2>&1
+                _rcode_str_=$?
+                scp -rp -o StrictHostKeyChecking=no ${SUNOS_INI_TEMPLATE} ${i}:${SUNOS_INI_TEMPLATE} >/dev/null 2>&1
+                _rcode_sun_=$?
+                if [ ${_rcode_str_} -ne 0 -o ${_rcode_sun_} -ne 0 ];then
+                    log_msg -q -t -s "Ret_Code_Str=${_rcode_str_}, Ret_Code_Sun=${_rcode_sun_}\n" -l ${LOGFILE}
+                    RECOVERY_FLAG=1
+                    remove_file_system 
+                    _err_msg_="Error in SCP of deployment file : ${_ini_file_name_}"
+                    abort_script "$_err_msg_"
+                fi
+                display_and_logging "Copied successfully" "L" 
+                display_and_logging "Mounting FS on server-$i , it will take up to 10 mins :" "Y"
+  
+                # Executing manage_storage_fs on other server for FS sharing and mounting
+                run_remote_cmd "$i"  "$BASH ${NEW_TEMPL_DIR}/admin/bin/manage_storage_fs.bsh -p ${ENIQ_INST_DIR} -l ${LOGFILE} -f " > /dev/null
+                if [ $?  -ne 0 ];then
+                    # Since manage_storage_fs failed to execute successfully and FS mounted on CO so recovering the system and bringing it back to orignal state.
+                    RECOVERY_FLAG=1
+                    remove_file_system
+                    _err_msg_="Failure in mounting new file system on server '$i'"
+                    abort_script "$_err_msg_"
+                fi
+                display_and_logging "Mounted successfully on server-$i" "N"
+            else
+                display_and_logging "FS is already mounted" "N"
+            fi        
+        done        
+    fi
+
+    if [ ${_fs_exists_} -eq 0 ]; then
+        display_and_logging "File System '${_filesystem_name_}' succesfully configured on NAS" "Y"
+    else
+        display_and_logging "File System '${_filesystem_name_}' already configured on NAS" "Y"
+    fi
+  
+elif [ "${ACTION}" == "destroy" ];then
+    # We are here to destroy the FS
+    _flex_fs_name_=""
+    _flex_fs_path_=""
+    # Get the FS name and path 
+    if [ -f "${SYS_FLEX_BKUP_CONF}" ]; then
+        _flex_fs_name_=`$CAT $SYS_FLEX_BKUP_CONF | $GREP "FS_NAME=" | $AWK -F= '{print $2}'`
+        _flex_fs_path_=`$CAT $SYS_FLEX_BKUP_CONF | $GREP "FS_PATH=" | $AWK -F= '{print $2}'` 
+    else
+        _err_msg_="File System flex_data_bkup is already deleted"
+        abort_script "$_err_msg_"
+    fi
+    remove_file_system
+fi
+
+cleanup

@@ -1,0 +1,2592 @@
+#!/bin/bash
+# ********************************************************************
+# Ericsson Radio Systems AB                                     SCRIPT
+# ********************************************************************
+#
+# (c) Ericsson Radio Systems AB 2022 - All rights reserved.
+#
+# The copyright to the computer program(s) herein is the property
+# of Ericsson Radio Systems AB, Sweden. The programs may be used
+# and/or copied only with the written permission from Ericsson Radio
+# Systems AB or in accordance with the terms and conditions stipulated
+# in the agreement/contract under which the program(s) have been
+# supplied.
+#
+# ********************************************************************
+# Name    : configure_enm_mode.bsh
+# Date    : 12/10/2023
+# Revision: \main\29
+# Purpose : Convert ENM from Symlink to fls and from fls to symlink mode
+#
+#
+# Usage   : configure_enm_mode.bsh -a <fls|symlink> -n <OSS alias name> [ -l <logfile> ]
+#
+# ********************************************************************
+#
+#   Command Section
+#
+# ********************************************************************
+AWK=/usr/bin/awk
+BASH=/usr/bin/bash
+BC=/usr/bin/bc
+CAT=/usr/bin/cat
+CP=/usr/bin/cp
+DATE=/usr/bin/date
+DIRNAME=/usr/bin/dirname
+DMIDECODE=/usr/sbin/dmidecode
+ECHO='/usr/bin/echo -e'
+EGREP=/usr/bin/egrep
+GREP=/usr/bin/grep
+HEAD=/usr/bin/head
+ID=/usr/bin/id
+LVCREATE=/usr/sbin/lvcreate
+LVREMOVE=/usr/sbin/lvremove
+LVS=/usr/sbin/lvs
+MKDIR=/usr/bin/mkdir
+MKFS_EXT4=/usr/sbin/mkfs.ext4
+MOUNT=/usr/bin/mount
+MV=/usr/bin/mv
+PERL=/usr/bin/perl
+PWD=/usr/bin/pwd
+RM=/usr/bin/rm
+SCP=/usr/bin/scp
+SED=/usr/bin/sed
+SLEEP=/usr/bin/sleep
+SORT=/usr/bin/sort
+TAIL=/usr/bin/tail
+TEE=/usr/bin/tee
+TOUCH=/usr/bin/touch
+TR=/usr/bin/tr
+UMOUNT=/usr/bin/umount
+VGS=/usr/sbin/vgs
+WC=/usr/bin/wc
+UEMCLI=/usr/bin/uemcli
+
+### Function: abort_script ###
+#
+#   This will is called 
+#   if a serious error is encountered during runtime
+#   
+#
+# Arguments:
+#       $1 - Error message from part of program (Not always used)
+# Return Values:
+#       none
+abort_script()
+{
+_err_time_=`$DATE '+%Y-%b-%d_%H.%M.%S'`
+
+if [ "$1" ]; then
+    _err_msg_=$1
+else
+    _err_msg_="${_err_time_} - ERROR : Script aborted.......\n"
+fi
+
+if [ "${LOGFILE}" ]; then
+    $ECHO "\n${_err_time_} - ERROR : $_err_msg_\n" | $TEE -a ${LOGFILE}
+else
+    $ECHO "\n${_err_time_} - ERROR : $_err_msg_\n"
+fi
+
+$RM -rf ${TEM_DIR}
+
+exit 1
+}
+
+### Function: chk_create_logfile ###
+#
+# Check/Create Logfile
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+chk_create_logfile()
+{
+$MKDIR -p `$DIRNAME ${LOGFILE}`
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not create directory `$DIRNAME ${LOGFILE}`"
+    abort_script "$_err_msg_"
+fi
+
+$TOUCH -a ${LOGFILE}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not write to file ${LOGFILE}"
+    abort_script "$_err_msg_"
+fi
+}
+
+### Function: check_id ###
+#
+#   Check that the effective id of the user is correct
+#   If not print error msg and exit.
+#
+# Arguments:
+#       $1 : User ID name
+# Return Values:
+#       0 for success; 1 for failure;
+check_id()
+{
+    _check_id_=`$ID  | $AWK -F\( '{print $2}' | $AWK -F\) '{print $1}'`
+    if [ "${_check_id_}" != "$1" ]; then
+        _err_msg_="ERROR:: You must be ROOT to execute Script $0 - exiting."
+        abort_script "$_err_msg_"
+    fi
+}
+
+### Function: check_mount_point_status ###
+#
+# Checks if ENM mount_point is mounted 
+#
+# Arguments:
+#   none
+# Return Values:
+#   _mp_status_
+check_mount_point_status()
+{
+run_remote_engine "$MOUNT -l "| $EGREP -w $_mp_ >/dev/null 2>&1
+if [ $? -eq 0 ]; then
+    log_msg -q -s "${PM_SYM_LINKS_DIR}${OSS_ALIAS}${PMDATA_MOUNT_POINT} is mounted"  -l ${LOGFILE}
+    _mp_status_=0
+else
+    log_msg -q -s "${PM_SYM_LINKS_DIR}${OSS_ALIAS}${PMDATA_MOUNT_POINT} is not mounted"  -l ${LOGFILE}
+    _mp_status_=1
+fi
+}
+
+### Function: check_variable ###
+#
+#Check if variable does not have null value
+#
+# Arguments:
+#   variable
+# Return Values:
+#   none
+check_variable()
+{
+_val_=$1
+eval _value_='$'$_val_
+if [ -z $_value_ ];then
+    _err_msg_="Could not get value for $1"
+    abort_script "$_err_msg_"
+fi
+}
+
+### Function: check_fls ###
+#
+#Check if fls mode has been already configured on ENIQ
+#
+# Arguments:
+#   variable
+# Return Values:
+#   none
+check_fls()
+{
+run_remote_engine "$CAT $FLS_CONFIG_FILE" 2>/dev/null |$GREP $OSS_ALIAS_NAME >/dev/null
+if [ $? -eq 0 ]; then
+    _err_msg_="FLS has been already configured for $OSS_ALIAS_NAME"
+    abort_script "$_err_msg_"
+else
+    log_msg  -s "ENM is configured as symlink"
+fi
+
+}
+
+### Function: check_symlink ###
+#
+#Check if symlink mode has been already configured on ENIQ
+#
+# Arguments:
+#   variable
+# Return Values:
+#   none
+check_symlink()
+{
+run_remote_engine "$CAT $FLS_CONFIG_FILE" 2>/dev/null |$GREP $OSS_ALIAS_NAME >/dev/null
+if [ $? -ne 0 ]; then
+    _err_msg_="Symlink has been already configured for $OSS_ALIAS_NAME"
+    abort_script "$_err_msg_"
+else
+    log_msg  -s "ENM is configured as FLS" -l ${LOGFILE}
+fi
+
+}
+
+### Function: create_new_ini_block ###
+#
+#Create new ini block of new file system to be be created to add in Storage.ini file
+#
+# Arguments:
+#   variable
+# Return Values:
+#   none
+create_new_ini_block()
+{
+_mount_point_name_=${PM_DIR}${OSS_ALIAS}${PMDATA_MOUNT_POINT}
+_mp_end_=`$ECHO ${_mount_point_name_: -1}`
+if [ ${_mp_end_} == "/" ]; then
+_mount_point_name_=`$ECHO ${_mount_point_name_%?}`
+fi
+
+if [ "${SAN_DEVICE}" != "unityXT" ]; then
+$ECHO "[${_parent_tag_}]
+FS_NAME=$_filesystem_name_
+FS_SIZE=$_new_fs_size_
+NFS_HOST=$_nas_host_
+SHARE_PATH=/vx/<CHANGE><ENIQ_POOL_ID>-${_filesystem_name_}
+MOUNT_PATH=<CHANGE><ENIQ_BASE_DIR>${_mount_point_name_}
+NFS_SHARE_OPTIONS=\"rw,no_root_squash\"
+SNAP_TYPE=optim
+STAGE=ALL
+OWNER=$_owner_
+GROUP=$_group_">${TEM_DIR}/new_ini_block
+else
+
+$ECHO "[${_parent_tag_}]
+FS_NAME=$_filesystem_name_
+ID=
+FS_SIZE=$_new_fs_size_
+NFS_HOST=$_nas_host_
+SHARE_PATH=/<CHANGE><ENIQ_POOL_ID>-${_filesystem_name_}
+MOUNT_PATH=<CHANGE><ENIQ_BASE_DIR>${_mount_point_name_}
+NFS_SHARE_OPTIONS=\"rw,no_root_squash\"
+SNAP_TYPE=optim
+STAGE=ALL
+OWNER=$_owner_
+GROUP=$_group_">${TEM_DIR}/new_ini_block
+
+fi
+}
+
+### Function: create_new_sunos_ini_block ###
+#
+#Create new ini block of new file system to be be created to add in Sunos.ini template file
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+create_new_sunos_ini_block()
+{
+_mount_point_name_=${PM_DIR}${OSS_ALIAS}${PMDATA_MOUNT_POINT}
+_mp_end_=`$ECHO ${_mount_point_name_: -1}`
+if [ ${_mp_end_} == "/" ]; then
+_mount_point_name_=`$ECHO ${_mount_point_name_%?}`
+fi
+
+if [ "${STORAGE_TYPE}" == "raw" ];then
+    $CP "${SUNOS_INI_TEMPLATE}" ${TEM_DIR}/SunOS_ini_template
+    #_last_used_=`$CAT ${TEM_DIR}/SunOS_ini_template  | $GREP SunOS_DIRECTORY_DIR_* | $GREP -v "\[*\]" | $TAIL -1 | $SED 's/[^0-9]*//g'`
+    _last_used_=`iniget SunOS_DIRECTORY -f ${TEM_DIR}/SunOS_ini_template  | $TAIL -1 | $SED 's/[^0-9]*//g'`
+    ((_last_used_++))
+
+
+_parent_tag_sunos_="SunOS_DIRECTORY_DIR_${_last_used_}"
+$ECHO "[${_parent_tag_sunos_}]
+path=<CHANGE><ENIQ_BASE_DIR>${_mount_point_name_}
+perms=0755
+user=dcuser
+group=dc5000" >${TEM_DIR}/new_ini_block_sunos
+
+elif [ "${STORAGE_TYPE}" == "fs" ];then
+    $CP "${SUNOS_INI_TEMPLATE}" ${TEM_DIR}/SunOS_ini_template
+
+    _last_used_=`iniget SunOS_ZFS_FS -f ${TEM_DIR}/SunOS_ini_template | $TAIL -1 | $SED 's/[^0-9]*//g'`
+    ((_last_used_++))
+
+     _parent_tag_sunos_="SunOS_ZFS_FS_${_last_used_}"
+$ECHO "[${_parent_tag_sunos_}]
+name=${_fls_fs_}
+mountpoint=<CHANGE><ENIQ_BASE_DIR>${_mount_point_name_}
+perms=0755" >${TEM_DIR}/new_ini_block_sunos
+
+    _last_used_=`iniget SunOS_DIRECTORY -f ${TEM_DIR}/SunOS_ini_template  | $TAIL -1 | $SED 's/[^0-9]*//g'`
+    ((_last_used_++))
+    _parent_tag_sunos_2_="SunOS_DIRECTORY_DIR_${_last_used_}"
+$ECHO "[${_parent_tag_sunos_2_}]
+path=<CHANGE><ENIQ_BASE_DIR>${_mount_point_name_}
+perms=0755
+user=dcuser
+group=dc5000">${TEM_DIR}/new_ini_block_sunos_zfs2
+fi
+}
+
+### Function: get_absolute_path ###
+#
+# Get absolute path of the script
+#
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+get_absolute_path()
+{
+_dir_=`$DIRNAME $0`
+SCRIPTHOME=`cd $_dir_ 2>/dev/null && pwd || $ECHO $_dir_`
+}
+
+### Function: get_available_space ###
+#
+# Get the available pool space for creating FLS File system
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+get_available_space()
+{
+_fls_fs_size_tag_="eniq_stats_fls_fs_size"
+_fls_fs_aval_size_tag_="eniq_stats_fls_available_size"
+_gen_detail_=`$DMIDECODE | $GREP -iw "Product Name" | $AWK -F ":" '{print $2}' | $AWK -F " " '{print $3}' | $HEAD -1`
+_fs_size_=`iniget ${_fls_fs_size_tag_} -f ${ENIQ_CONF_DIR}/${SUNOS_INI} -v ${_gen_detail_}_eniq_oss | $AWK -F ":" '{print $1}'`
+    if [ ! "${_fs_size_}" ]; then
+        _err_msg_="Could not read FLS FS parameter from ${ENIQ_CONF_DIR}/${SUNOS_INI}"
+        abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+    fi
+
+_final_fs_size_=`$ECHO "scale=5; ${_fs_size_}/100" | $BC`
+
+_avail_disk_size_=`iniget ${_fls_fs_aval_size_tag_} -f ${ENIQ_CONF_DIR}/${SUNOS_INI} | $AWK -F "=" '{print $2}'`
+    if [ ! "${_avail_disk_size_}" ]; then
+        _err_msg_="Could not read FLS FS parameter from ${ENIQ_CONF_DIR}/${SUNOS_INI}"
+        abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+    fi
+
+_size_of_fls_fs_=`$AWK -v _disk_size_=${_avail_disk_size_} -v _final_size_=${_final_fs_size_} 'BEGIN {print _disk_size_ * _final_size_}'`
+    if [ ! "${_size_of_fls_fs_}"  ]; then
+        _err_msg_="Could not determine fs size of ${_fs_name_}"
+        abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+    fi
+
+}
+
+### Function: get_enm_type ###
+#
+#
+# get the type of ENM (Physical or Virtual or Cloud)
+# Arguments:
+#   string with digits and unit
+# Return Values:
+#   none
+get_enm_type()
+{
+run_remote_engine "$LS ${MOUNT_INFO_DIR}/${OSS_ALIAS_NAME}/enm_type">>/dev/null 2>&1
+if [ $? -ne 0 ]; then
+    while :; do
+        unset _enm_type_
+        $ECHO "\nPlease select the type of ENM used for integration"
+        $ECHO "[1] Physical ENM on LITP Platform\n[2] ENM on Cloud\n[3] Cloud Native ENM\n" 
+        read _user_value_
+        if [ ! ${_user_value_} ]; then
+            continue
+        fi
+        if [ ${_user_value_} -eq 1 ]; then
+            _enm_type_="pENM"
+
+        elif [ ${_user_value_} -eq 2 ]; then
+            _enm_type_="vENM"
+        
+        elif [ "${_user_value_}" -eq "3" ]; then
+           _enm_type_="cENM"
+
+        else
+            continue
+        fi
+        break
+    done
+    $ECHO ${_enm_type_} > ${TEM_DIR}/enm_type
+    ENM_TYPE=${_enm_type_}
+    
+    # Copying enm_type file to original location
+    if [ "${CURR_SERVER_TYPE}" = "stats_coordinator" ]; then
+        if [ "${_ip_type_}" == "IPv6" ]; then
+		    $SCP -6 -rp ${TEM_DIR}/enm_type [${ENGINE_IP}]:${MOUNT_INFO_DIR}/${OSS_ALIAS_NAME}
+		else
+            $SCP -rp ${TEM_DIR}/enm_type ${ENGINE_IP}:${MOUNT_INFO_DIR}/${OSS_ALIAS_NAME}
+		fi
+        if [ $? -ne 0 ];then
+            _err_msg_="Failed to copy enm_type on Engine server."
+            abort_script "${_err_msg_}"
+        else
+            log_msg -s "Successfully copied enm_type on Engine server."  -l ${LOGFILE}
+        fi
+    else
+        $CP -rp ${TEM_DIR}/enm_type ${MOUNT_INFO_DIR}/${OSS_ALIAS_NAME}
+        if [ $? -ne 0 ];then
+            _err_msg_="Failed to copy enm_type."
+            abort_script "${_err_msg_}"
+        else
+            log_msg -s "Successfully copied enm_type."  -l ${LOGFILE}
+        fi
+    fi
+else
+    ENM_TYPE=`run_remote_engine "$CAT ${MOUNT_INFO_DIR}/${OSS_ALIAS_NAME}/enm_type" | $TR -d "\r"`
+    if [ $? -ne 0 ]; then
+        _err_msg_="Could not get the type of ENM"
+        abort_script "${_err_msg_}"
+    fi
+
+fi
+
+check_variable ENM_TYPE
+}
+
+### Function: check_alias ###
+#
+#Check if alias name has been already configured on ENIQ
+#
+# Arguments:
+#   variable
+# Return Values:
+#   none
+check_alias()
+{
+if [ -s ${PMDATA_FILE_SYSTEM_FILE} ]; then
+    _err_msg_="symlink has been already configured for $OSS_ALIAS_NAME"
+    abort_script "$_err_msg_"
+else
+    log_msg  -s "ENM is not configured in FLS mode for $OSS_ALIAS_NAME.Configuring $OSS_ALIAS_NAME as FLS"
+fi
+
+}
+
+### Function: get_kilo_size ###
+#
+# Gets the size in kilobytes
+#Uses GLOBAL variable SIZE_KILO
+#
+# Arguments:
+#   string with digits and unit
+# Return Values:
+#   none
+get_kilo_size()
+{
+unset SIZE_KILO
+local _convert_no_=$1
+if  [ "${_convert_no_}" == "" ]; then
+    _err_msg_="Must provide String"
+    abort_script "$_err_msg_"
+fi
+
+get_unit_size "${_convert_no_}"
+local _units_=${UNIT}
+local _size_=${SIZE}
+
+case "${_units_}" in
+        T|t)    _size_=$($ECHO "${_size_} * 1073741824" | $BC | $AWK -F\. '{print $1}')
+                ;;
+        g|G)    _size_=$($ECHO "${_size_} * 1048576" | $BC | $AWK -F\. '{print $1}')
+                ;;
+        m|M)    _size_=$($ECHO "${_size_} * 1024" | $BC | $AWK -F\. '{print $1}')
+                ;;
+        k|K)    let _size_=${_size_}
+                ;;
+        *)      abort_script "Unit not supported '${_units_}'."
+                ;;
+esac
+if [ -z "${_size_}" ]; then
+    _err_msg_="Unable to convert ${_convert_no_} to kilo"
+    abort_script "$_err_msg_"
+fi
+SIZE_KILO=${_size_}
+}
+
+
+### Function: get_max_size_available ###
+#
+# Gets total size available on the NAS
+#
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+get_max_size_available()
+{
+MAX_SIZE_NAS=$($NASCLI filestore_cmd storage pool free | $EGREP -w "^${_storage_pool_name_}" | $AWK '{print $2}')
+if [ ! "$MAX_SIZE_NAS" ]; then
+    _err_msg_="Unable to get maximum size from NAS"
+    abort_script "$_err_msg_"
+fi
+get_kilo_size "${MAX_SIZE_NAS}"
+MAX_SIZE=${SIZE_KILO}
+log_msg -q -s "Maximum size Available := '${MAX_SIZE_NAS}'" -l ${LOGFILE}
+}
+
+### Function: get_mount_point ###
+#
+# Get name of ENM symlink directory mountpoint
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+get_mount_point()
+{
+_mp_=${PM_SYM_LINKS_DIR}${OSS_ALIAS}${PMDATA_MOUNT_POINT}
+_mp_end_=`$ECHO ${_mp_: -1}`
+if [ ${_mp_end_} == "/" ]; then
+_mp_=`$ECHO ${_mp_%?}`
+fi
+}
+
+### Function: get_nas_host ###
+#
+# Decide the nas host as per availability
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+get_nas_host()
+{
+run_remote_engine "$LS ${FLS_CONFIG_FILE}" > /dev/null 2>&1 
+if [ $? -eq 0 ];then
+    _enm_count_=`run_remote_engine "$CAT ${FLS_CONFIG_FILE}" |$WC -l |$TR -d " " `>/dev/null
+else
+    _enm_count_=0
+fi
+
+case ${_enm_count_} in
+0|3|6|9) _nas_host_=nas3
+;;
+1|4|7|10) _nas_host_=nas4
+;;
+2|5|8|11) _nas_host_=nas8
+;;
+esac
+
+check_variable _nas_host_
+}
+
+### Function: get_new_fs_name ###
+#
+# Get new fs name
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+get_new_fs_name()
+{
+_filesystem_name_=${OSS_ALIAS_NAME}
+
+# Get the pool name
+_nas_pool_=`iniget NAS_DETAILS -f ${ENIQ_CONF_DIR}/${SUNOS_INI} -v NAS_Primary_Storage_Pool`
+if [ "${SAN_DEVICE}" == "unityXT" ]; then
+	$UEMCLI -d ${_spa_ip_} -noHeader /stor/prov/fs/nfs show | $GREP -w "${_nas_pool_}/${_filesystem_name_}" >/dev/null
+else
+	$NASCLI list_shares | $GREP -w "${_nas_pool_}/${_filesystem_name_}" >/dev/null
+fi
+if [ $? -eq 0 ];then
+    _err_msg_="NAS Filesystem with name ${_nas_pool_}/${_filesystem_name_} already exists on NAS "
+    abort_script "$_err_msg_" 
+fi
+
+check_variable _filesystem_name_
+}
+
+### Function: get_new_fs_size ###
+#
+# Get new fs size
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+get_new_fs_size()
+{
+NEW_FS_SIZE=45g
+_new_fs_size_="$NEW_FS_SIZE"
+get_kilo_size "$NEW_FS_SIZE"
+_new_fs_size_k_="$SIZE_KILO"
+if [ "${SAN_DEVICE}" != "unityXT" ]; then
+if [[ $_new_fs_size_k_ -gt $MAX_SIZE ]]; then
+    _err_msg_="New nas filesystem cannot be created , required size $_new_fs_size_k_ is greater than available size $MAX_SIZE "
+    abort_script
+fi
+fi
+}
+
+### Function: get_pmlinks_info ###
+#
+# Get PMlinks information 
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+get_pmlinks_info()
+{
+# get pmlinks dir name from engine
+pmlinks_dir=`run_remote_engine "$CAT ${MOUNT_INFO_DIR}/${OSS_ALIAS}/pmlinks_file" | $AWK -F " " '{print $NF}' | $TR -d '\r'`
+if [ $? -ne 0 ];then
+    _err_msg_="Could not get pmlinks dir name "
+    abort_script "$_err_msg_"
+fi
+
+# get pmlinks ip from engine
+pmlinks_ip=`run_remote_engine "$CAT ${MOUNT_INFO_DIR}/${OSS_ALIAS}/pmlinks_file" | $AWK -F " " '{print $1}' | $TR -d '\r'`
+if [ $? -ne 0 ];then
+    err_msg_="Could not get pmlinks ip"
+    abort_script "$_err_msg_"
+fi
+
+}
+
+
+### Function: get_oss_sys_id ###
+#
+# Get OSS system id
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+get_oss_sys_id()
+{
+recheck_count=0
+while [ $recheck_count -lt 10 ]
+do
+    $MOUNT -l |$EGREP ${OSS_ALIAS_NAME} >/dev/null 2>&1
+    if [ $? -ne 0 ];then
+        log_msg -s "Waiting for ENM FS to mount" -l ${LOGFILE}
+        $SLEEP 5
+    else
+        break
+    fi
+    (( recheck_count = recheck_count + 1 ))
+done
+
+OSS_SYS_ID=`run_remote_engine "$CAT ${MOUNT_INFO_DIR}/${OSS_ALIAS}/fs_mount_list "| $EGREP -v "#" | $AWK '{print $2}' | $AWK -F "/" '{print $3}' | $AWK -F "-" '{print $1}' | $HEAD -1`
+check_variable OSS_SYS_ID
+}
+
+### Function: get_owner_group ###
+#
+# Get owner & group info for new FS to be created
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+get_owner_group()
+{
+if [ "${ENM_NEW}" == "YES" ];then
+    _owner_=dcuser
+    _group_=dc5000
+else
+    _owner_=`run_remote_engine "$LS -ld ${PM_SYM_LINKS_DIR}${OSS_ALIAS}${PMDATA_MOUNT_POINT}" |$AWK '{print $3}'`
+    check_variable _owner_
+    _group_=`run_remote_engine "$LS -ld ${PM_SYM_LINKS_DIR}${OSS_ALIAS}${PMDATA_MOUNT_POINT}" |$AWK '{print $4}'`
+    check_variable _group_
+fi
+}
+
+### Function: get_parent_tag ###
+#
+# Get parent tag to add in storage ini template
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+get_parent_tag()
+{
+_parent_tag_=Storage_NAS_`$ECHO $_filesystem_name_ |$TR "[:lower:]" "[:upper:]" `
+check_variable _parent_tag_
+}
+
+### Function: get_storage_pool_name ###
+#
+# Get storage pool name from sunos ini file
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+get_storage_pool_name()
+{
+_storage_pool_name_=`iniget NAS_DETAILS -f ${ENIQ_CONF_DIR}/${SUNOS_INI} -v NAS_Primary_Storage_Pool`
+check_variable _storage_pool_name_
+}
+
+### Function: get_storage_template ###
+#
+# Decide the storage_template as per deployment type
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+get_storage_template()
+{
+# Get starage template file as per specified deployment
+if [ -s ${ENIQ_CONF_DIR}/extra_params/deployment ]; then
+    _deployment_=`$CAT ${ENIQ_CONF_DIR}/extra_params/deployment | $TR '[:upper:]' '[:lower:]'`
+
+if [ "${SAN_DEVICE}" != "unityXT" ]; then
+case ${_deployment_} in
+    ft) _ini_file_name_="${NEW_TEMPL_DIR}/storage_ini.ft"
+            ;;
+    small) _ini_file_name_="${NEW_TEMPL_DIR}/storage_ini.sml"
+            ;;
+    medium) _ini_file_name_="${NEW_TEMPL_DIR}/storage_ini.med"
+            ;;
+    large) _ini_file_name_="${NEW_TEMPL_DIR}/storage_ini.lrg"
+            ;;
+    extralarge) _ini_file_name_="${NEW_TEMPL_DIR}/storage_ini.extralrg"
+            ;;
+esac
+else
+
+case ${_deployment_} in
+    large) _ini_file_name_="${NEW_TEMPL_DIR}/storage_ini.lrg_unityXT"
+            ;;
+    extralarge) _ini_file_name_="${NEW_TEMPL_DIR}/storage_ini.extralrg_unityXT"
+            ;;
+esac
+
+fi
+
+    log_msg  -s -q "Using values in ${_ini_file_name_} for nas fs creation" -l ${LOGFILE}
+    $CP -rp ${_ini_file_name_}  ${TEM_DIR}/storage_ini_template
+
+    if [ ! -s ${TEM_DIR}/storage_ini_template ]; then
+        _err_msg_="Could not copy information from ${_ini_file_name_}"
+        abort_script "$_err_msg_"
+    fi
+else
+    _err_msg_="Could not locate ${ENIQ_CONF_DIR}/extra_params/deployment"
+    abort_script "$_err_msg_"
+fi
+}
+
+### Function: get_unit_size ###
+#
+# get unit size
+#
+# Arguments:
+#   variable
+# Return Values:
+#   none
+get_unit_size()
+{
+unset UNIT
+unset SIZE
+local _convert_no_="${1}"
+if  [ "${_convert_no_}" == "" ]; then
+    _err_msg_="Must provide String"
+    abort_script "$_err_msg_"
+fi
+
+local _units_=$($ECHO "${_convert_no_}" | $SED 's/[0-9\.]*//g')
+if [ -z "${_units_}" ]; then
+    _err_msg_="Unable to get unit from ${_convert_no_}"
+    abort_script "$_err_msg_"
+fi
+UNIT=${_units_}
+local _size_=${_convert_no_%[A-Z,a-z]}
+$AWK 'BEGIN{if ('$_size_'>0) ;else exit 1}'
+SIZE=${_size_}
+}
+
+### Function: populate_pmlink_file ###
+#
+#
+# Populate below two files
+# pmlinks_file and ip_list_enm
+# Arguments:
+#   none
+# Return Values:
+#   none
+populate_pmlink_file()
+{
+$RM -rf ${TEM_DIR}/pmlinks_file ${TEM_DIR}/ip_list_enm
+
+run_remote_engine "$CAT ${PMDATA_FILE_SYSTEM_FILE}" | $GREP -v '#' | $AWK '{print $1 " " $2}' > ${TEM_DIR}/pmlinks_file
+
+# Copying pmlinks_file file to original location
+if [ "${CURR_SERVER_TYPE}" = "stats_coordinator" ]; then
+    if [ "${_ip_type_}" == "IPv6" ]; then
+	    $SCP -6 -rp ${TEM_DIR}/pmlinks_file [${ENGINE_IP}]:${MOUNT_INFO_DIR}/${OSS_ALIAS_NAME}
+	else
+        $SCP -rp ${TEM_DIR}/pmlinks_file ${ENGINE_IP}:${MOUNT_INFO_DIR}/${OSS_ALIAS_NAME}
+	fi
+    if [ $? -ne 0 ];then
+        _err_msg_="Failed to copy pmlinks_file on Engine server."
+        abort_script "${_err_msg_}"
+    else
+        log_msg -s "Successfully copied pmlinks_file on Engine server."  -l ${LOGFILE}
+    fi
+else
+    $CP -p ${TEM_DIR}/pmlinks_file ${MOUNT_INFO_DIR}/${OSS_ALIAS_NAME}
+    if [ $? -ne 0 ];then
+        _err_msg_="Failed to copy pmlinks_file."
+        abort_script "${_err_msg_}"
+    else
+        log_msg -s "Successfully copied pmlinks_file."  -l ${LOGFILE}
+    fi
+fi
+
+run_remote_engine "$CAT ${PMDATA_FILE_SYSTEM_FILE}" | $GREP -v '#' | $AWK '{print $1}' > ${TEM_DIR}/ip_list_enm_1
+run_remote_engine "$CAT ${MOUNT_INFO_DIR}/${OSS_ALIAS_NAME}/fs_mount_list" | $GREP -v '#' | $AWK '{print $1}' >> ${TEM_DIR}/ip_list_enm_1
+
+$CAT ${TEM_DIR}/ip_list_enm_1 | $SORT -u > ${TEM_DIR}/ip_list_enm
+
+# Copying ip_list_enm file to original location
+if [ "${CURR_SERVER_TYPE}" = "stats_coordinator" ]; then
+    if [ "${_ip_type_}" == "IPv6" ]; then
+	    $SCP -6 -rp ${TEM_DIR}/ip_list_enm [${ENGINE_IP}]:${MOUNT_INFO_DIR}/${OSS_ALIAS_NAME}
+	else
+        $SCP -rp ${TEM_DIR}/ip_list_enm ${ENGINE_IP}:${MOUNT_INFO_DIR}/${OSS_ALIAS_NAME}
+	fi
+    if [ $? -ne 0 ];then
+        _err_msg_="Failed to copy ip_list_enm on Engine server."
+        abort_script "${_err_msg_}"
+    else
+        log_msg -s "Successfully copied ip_list_enm on Engine server."  -l ${LOGFILE}
+    fi
+else
+    $CP -rp ${TEM_DIR}/ip_list_enm ${MOUNT_INFO_DIR}/${OSS_ALIAS_NAME}
+    if [ $? -ne 0 ];then
+        _err_msg_="Failed to copy ip_list_enm."
+        abort_script "${_err_msg_}"
+    else
+        log_msg -s "Successfully copied ip_list_enm."  -l ${LOGFILE}
+    fi
+fi
+}
+
+
+### Function: print_header ###
+#
+# Print the header for stages
+#
+# Arguments:
+#   message
+# Return Values:
+#   none
+print_header()
+{
+log_msg -s "\n-----------------------------------------------------------------------------------------------"  -l ${LOGFILE}
+log_msg -s "$1 " -l ${LOGFILE}
+log_msg -s "-----------------------------------------------------------------------------------------------\n"  -l ${LOGFILE}
+}
+
+### Function: remove_disable_oss ###
+#
+# Removes disable_OSS file and remount the ENM nfs filesystem
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+remove_disable_oss()
+{
+log_msg -q -s "Removing disable OSS file $DISABLE_OSS "  -l ${LOGFILE}
+run_remote_engine  "$LS $DISABLE_OSS" > /dev/null 2>&1
+if [ $? -eq 0 ];then
+    run_remote_engine  "$RM $DISABLE_OSS" > /dev/null 2>&1
+    if [ $? -ne 0 ];then
+        _err_msg_="Could not remove $DISABLE_OSS"
+        abort_script "$_err_msg_"
+    else
+        log_msg -q -s "Successfully removed $DISABLE_OSS"  -l ${LOGFILE}
+    fi
+fi
+}
+
+### Function: remove_fstab_entries ###
+#
+# Removes FSTAB Entries 
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+remove_fstab_entries()
+{
+log_msg -q -s "Removing FLS entry of ${_mp_} from ${FSTAB} file "  -l ${LOGFILE}
+# Removing the entry in /etc/fstab file if exists
+$CAT ${FSTAB} | $EGREP -v ${_mp_} >> ${TEM_DIR}/fstab
+if [ $? -eq 0 ]; then
+    log_msg -s "Moving the ${TEM_DIR}/fstab to ${FSTAB}" -l ${LOGFILE}
+    $MV ${TEM_DIR}/fstab ${FSTAB}
+    if [ $? -eq 0 ]; then
+        log_msg -s "Successfully moved ${TEM_DIR}/fstab to ${FSTAB}" -l ${LOGFILE}
+    else
+        _err_msg_="Could not move ${TEM_DIR}/fstab to ${FSTAB}"
+    fi
+fi
+
+}
+
+### Function: remove_file_system ###
+#
+# In case of failure,Remove the nas file system that was created during fls configuration
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+remove_file_system()
+{
+print_header "Failure detected while FS creation, recovering the system back to its original state" 
+
+
+$CP -rp ${TEM_DIR}/storage_ini_template ${_ini_file_name_}
+$CP -rp ${TEM_DIR}/SunOS_ini_template ${SUNOS_INI_TEMPLATE}
+run_remote_engine "$CP -rp ${PMDATA_FILE_SYSTEM_FILE}_orig ${PMDATA_FILE_SYSTEM_FILE}"
+log_msg -q -t -s "Executing $BASH ${NEW_TEMPL_DIR}/admin/bin/manage_storage_fs.bsh -r ${ENIQ_INST_DIR} -f -l ${LOGFILE}"  -l ${LOGFILE}
+
+if [ "${CURR_SERVER_TYPE}" == "stats_coordinator" ]; then
+    for _line_ in `$CAT ${TEM_DIR}/server_order_list |grep -v stats_coordinator`
+    do
+	    unset _server_ip_ _count_
+		local _server_ip_ _count_
+	    _count_=`$ECHO "${_line_}" | grep -o "::" | wc -l`
+
+	    if [ "${_ip_type_}" == "IPv6" ] && [ "${_count_}" == 3 ]; then
+		    _server_ip_=`$ECHO ${_line_} | grep -oE '([a-fA-F0-9]{1,4}::?){1,7}[a-fA-F0-9]{1,4}' | head -n 1 | awk -F "::" '{ print $1 "::" $2}'`
+	    else
+		    _server_ip_=`$ECHO ${_line_} | $AWK -F"::" '{print $1}'`
+	    fi
+
+ 
+        if [ "${_ip_type_}" == "IPv6" ]; then
+		    $SCP -6 -rp ${_ini_file_name_} [${_server_ip_}]:${_ini_file_name_}
+			if [ $? -ne 0 ];then
+                log_msg -s "ERROR : Failed to revert Storage.ini template"  -l ${LOGFILE}
+            fi
+            $SCP -6 -rp ${SUNOS_INI_TEMPLATE} [${_server_ip_}]:${SUNOS_INI_TEMPLATE}
+		else
+		    $SCP -rp ${_ini_file_name_} ${_server_ip_}:${_ini_file_name_}
+			if [ $? -ne 0 ];then
+                log_msg -s "ERROR : Failed to revert Storage.ini template"  -l ${LOGFILE}
+            fi
+            $SCP -rp ${SUNOS_INI_TEMPLATE} ${_server_ip_}:${SUNOS_INI_TEMPLATE}            
+		fi
+		    if [ $? -ne 0 ];then
+                log_msg -s "ERROR : Failed to revert SunOS.ini template" -l ${LOGFILE}
+            fi
+    done
+fi
+
+$BASH ${NEW_TEMPL_DIR}/admin/bin/manage_storage_fs.bsh -r ${ENIQ_INST_DIR} -f -l ${LOGFILE} >/dev/null
+if [ $? -ne 0 ];then
+    _err_msg_=" -> Error in recovering the system back to its orignal state"
+fi
+
+remove_disable_oss
+abort_script "$_err_msg_"
+}
+
+### Function: remove_symlink_entry ###
+#
+# Remove the entry of symlink directory in connectd configuration file
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+remove_symlink_entry()
+{
+print_header "De-registering $_mp_ from connectd" 
+
+run_remote_engine "$CAT ${PMDATA_FILE_SYSTEM_FILE}" |$GREP ${pmlinks_ip} >/dev/null 2>&1
+
+if [ $? -eq 0 ]; then
+    run_remote_engine "$CP -rp ${PMDATA_FILE_SYSTEM_FILE} ${PMDATA_FILE_SYSTEM_FILE}_orig"
+    run_remote_engine "$CAT ${PMDATA_FILE_SYSTEM_FILE}" |$TR -d "\r">${TEM_DIR}/PMDATA_FILE_SYSTEM_FILE_temp
+    $SED "/${pmlinks_ip}/d" ${TEM_DIR}/PMDATA_FILE_SYSTEM_FILE_temp |$GREP -v ^# >${TEM_DIR}/PMDATA_FILE_SYSTEM_FILE_temp_1
+    if [ "${CURR_SERVER_TYPE}" = "stats_coordinator" ]; then
+        if [ "${_ip_type_}" == "IPv6" ]; then
+		    $SCP -6 -rp ${TEM_DIR}/PMDATA_FILE_SYSTEM_FILE_temp_1 [${ENGINE_IP}]:${PMDATA_FILE_SYSTEM_FILE}
+		else
+		    $SCP -rp ${TEM_DIR}/PMDATA_FILE_SYSTEM_FILE_temp_1 ${ENGINE_IP}:${PMDATA_FILE_SYSTEM_FILE}
+		fi
+    else
+        $CP -rp ${TEM_DIR}/PMDATA_FILE_SYSTEM_FILE_temp_1 ${PMDATA_FILE_SYSTEM_FILE}
+    fi
+    if [ $? -ne 0 ]; then
+        _err_msg_="Could not de-register $_mp_ from connectd "
+        run_remote_engine "$CP -rp ${PMDATA_FILE_SYSTEM_FILE}_orig ${PMDATA_FILE_SYSTEM_FILE}"
+        remove_disable_oss
+        abort_script "$_err_msg_"
+    else
+        log_msg -s "Successfully de-registered $_mp_ from connectd " -l ${LOGFILE}
+    fi
+else
+    log_msg -s "No entry for ${pmlinks_ip} found in ${PMDATA_FILE_SYSTEM_FILE}" -l ${LOGFILE}
+fi
+}
+
+### Function: revert_nas_entry_storage_template ###
+#
+# Remove the entry of FLS FS from storage ini template
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+revert_nas_entry_storage_template()
+{
+print_header "Updating storage_ini_template " 
+
+get_mount_point
+
+_nas_fs_name_=`run_remote_engine "$MOUNT -l" | $EGREP -w $_mp_  |$AWK '{print $1}' |$CUT -d "-" -f2 `>/dev/null 2>&1
+_nas_fs_name_uc_=`$ECHO ${_nas_fs_name_} |$TR "[:lower:]" "[:upper:]" `
+
+_primary_tag_=Storage_NAS_FS_LIST
+_secondary_tag_=Storage_NAS_${_nas_fs_name_uc_}
+
+get_storage_template
+
+$INIDEL -g ${_primary_tag_} -p  ${_secondary_tag_} -i ${TEM_DIR}/storage_ini_template -o ${TEM_DIR}/storage_ini_template_new
+
+if [ $? -ne 0 ];then
+    _err_msg_="Could not update ${TEM_DIR}/storage_ini_template_new"
+    remove_disable_oss
+    abort_script "$_err_msg_"
+else
+    log_msg -q -s "${TEM_DIR}/storage_ini_template_new successfully updated " -l ${LOGFILE}
+fi
+
+$CP -rp ${TEM_DIR}/storage_ini_template_new ${_ini_file_name_}
+if [ $? -ne 0 ];then
+    _err_msg_="Could not update ${_ini_file_name_}"
+    remove_disable_oss
+    abort_script "$_err_msg_"
+else
+    log_msg -s "${_ini_file_name_} successfully updated " -l ${LOGFILE}
+fi
+
+}
+
+### Function: revert_sunos_template ###
+#
+# Remove the entry of FLS FS from sunos ini template
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+revert_sunos_template()
+{
+$CP "${SUNOS_INI_TEMPLATE}" ${TEM_DIR}/SunOS_ini_template
+_new_fs_name_=`run_remote_engine "$MOUNT -l" | $EGREP -w $_mp_  |$AWK '{print $1}' |$CUT -d "-" -f2 `>/dev/null 2>&1
+_parent_tag_sunos_=`$CAT ${TEM_DIR}/SunOS_ini_template | $EGREP -B1 ${_new_fs_name_} |$HEAD -1 |$TR -d "[" |$TR -d "]"`
+
+$INIDEL -g SunOS_DIRECTORY -p ${_parent_tag_sunos_} -i ${TEM_DIR}/SunOS_ini_template -o ${TEM_DIR}/sunos_ini_template_op
+if [ $? -ne 0 ];then
+    _err_msg_="Failed to update ${TEM_DIR}/sunos_ini_template_op"
+    $CP -rp ${TEM_DIR}/storage_ini_template ${_ini_file_name_}
+    remove_disable_oss
+    abort_script "$_err_msg_"
+else
+    log_msg -q -t -s "${TEM_DIR}/sunos_ini_template_op successfully updated " -l ${LOGFILE}
+fi
+
+$CP -rp ${TEM_DIR}/sunos_ini_template_op ${SUNOS_INI_TEMPLATE}
+if [ $? -ne 0 ];then
+    _err_msg_="Could not update ${SUNOS_INI_TEMPLATE}"
+    $CP -rp ${TEM_DIR}/storage_ini_template ${_ini_file_name_}
+    remove_disable_oss
+    abort_script "$_err_msg_"
+else
+    log_msg -s "${SUNOS_INI_TEMPLATE} successfully updated " -l ${LOGFILE}
+fi
+}
+
+### Function: revert_symlink_entry_connectd_config ###
+#
+# Add the entry of symlink directory in connectd configuration file
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+revert_symlink_entry_connectd_config()
+{
+print_header "Registering $OSS_ALIAS_NAME in connectd" 
+
+# Copy the pmdata_fs_mount_template template to /tmp
+run_remote_engine "$CAT ${CONNECTD_BASE_DIR}/etc/pmdata_fs_mount_template" | $EGREP -v '^[[:blank:]]*#'|$TR -d "\r"> ${TEM_DIR}/uptd_mount_list
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not create ${TEM_DIR}/uptd_mount_list"
+    rollback_stage
+    abort_script "${_err_msg_}"
+fi
+
+# Create a header for the pmdata_fs_mount file
+$ECHO "#" > ${TEM_DIR}/pm_mount_list_file
+$ECHO "# Mount_IP       NFS_share     Mount_Point_relative_to_PM_SYM_LINKS_DIR" >> ${TEM_DIR}/pm_mount_list_file
+$ECHO "#" >> ${TEM_DIR}/pm_mount_list_file
+
+if [ "${ENM_TYPE}" != "vENM" ]; then
+    $CAT ${TEM_DIR}/uptd_mount_list | $SED '/^vENM/ d' | $SED '/^$/d' > ${TEM_DIR}/uptd_mount_list_temp
+    $MV ${TEM_DIR}/uptd_mount_list_temp ${TEM_DIR}/uptd_mount_list
+    $CAT ${TEM_DIR}/uptd_mount_list |$EGREP -w ENM | $SED -e "s|<OSS_POOL_ID>|${OSS_SYS_ID}|g" -e "s|<IP>|${pmlinks_ip}|g" |$AWK '{print $2,$3,$4}'>${TEM_DIR}/upd_fs_list
+    if [ $? -ne 0 ]; then
+        _err_msg_="Could not update ${TEM_DIR}/upd_fs_list with OSS System ID and PMLINKS IP"
+        rollback_stage
+        abort_script "${_err_msg_}"
+    fi
+else
+    $CAT ${TEM_DIR}/uptd_mount_list | $SED '/^ENM/ d' | $SED '/^$/d' > ${TEM_DIR}/uptd_mount_list_temp
+    $MV ${TEM_DIR}/uptd_mount_list_temp ${TEM_DIR}/uptd_mount_list
+    $CAT ${TEM_DIR}/uptd_mount_list |$EGREP -w vENM | $SED -e "s|<PMLINKS_DIR>|${pmlinks_dir}|g" -e "s|<IP>|${pmlinks_ip}|g" |$AWK '{print $2,$3,$4}'>${TEM_DIR}/upd_fs_list
+    if [ $? -ne 0 ]; then
+        _err_msg_="Could not update ${TEM_DIR}/upd_fs_list with pmlinks info"
+        rollback_stage
+        abort_script "${_err_msg_}"
+    fi
+fi
+
+
+$CAT ${TEM_DIR}/upd_fs_list >>${TEM_DIR}/pm_mount_list_file
+if [ $? -eq 0 ]; then
+    if [ "${CURR_SERVER_TYPE}" = "stats_coordinator" ]; then
+        if [ "${_ip_type_}" == "IPv6" ]; then
+            $SCP -6 -rp ${TEM_DIR}/pm_mount_list_file [${ENGINE_IP}]:${PMDATA_FILE_SYSTEM_FILE}
+		else
+		    $SCP -rp ${TEM_DIR}/pm_mount_list_file ${ENGINE_IP}:${PMDATA_FILE_SYSTEM_FILE}
+		fi
+    else
+        $CP -rp ${TEM_DIR}/pm_mount_list_file ${PMDATA_FILE_SYSTEM_FILE}
+    fi
+    if [ $? -ne 0 ]; then
+        _err_msg_="Could not update ${PMDATA_FILE_SYSTEM_FILE} with pmlinks info"
+        rollback_stage
+        abort_script "${_err_msg_}"
+    else
+        log_msg -s "Successfully registered $OSS_ALIAS_NAME in connectd" -l ${LOGFILE}
+    fi
+else
+    _err_msg_="Could not update ${TEM_DIR}/pm_mount_list_file with pmlinks info"
+    rollback_stage
+    abort_script "${_err_msg_}"
+fi
+}
+
+### Function: rollback_stage ###
+#
+# Rollback the server to its original state in case of failure
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+rollback_stage()
+{
+if [ "${STORAGE_TYPE}" == "raw" ];then
+    $CP -rp ${TEM_DIR}/storage_ini_template ${_ini_file_name_}
+    $CP -rp ${TEM_DIR}/SunOS_ini_template "${SUNOS_INI_TEMPLATE}"
+    # Update pmdate_fs_mount file for fls 
+    remove_symlink_entry
+    $BASH ${NEW_TEMPL_DIR}/admin/bin/manage_storage_fs.bsh -p ${ENIQ_INST_DIR} -f -l ${LOGFILE}
+    if [ $? -ne 0 ];then
+        _err_msg_="Error in reverting NAS file system"
+        remove_disable_oss
+        abort_script "$_err_msg_"
+    fi
+    if [ "${CURR_SERVER_TYPE}" = "stats_coordinator" ]; then
+        for _line_ in `$CAT ${TEM_DIR}/server_order_list |grep -v stats_coordinator`
+        do
+		    unset i _count_ _serv_hostname_
+			local i _count_ _serv_hostname_
+	        _count_=`$ECHO "${_line_}" | grep -o "::" | wc -l`
+
+	        if [ "${_ip_type_}" == "IPv6" ] && [ "${_count_}" == 3 ]; then
+		        i=`$ECHO ${_line_} | grep -oE '([a-fA-F0-9]{1,4}::?){1,7}[a-fA-F0-9]{1,4}' | head -n 1 | awk -F "::" '{ print $1 "::" $2}'`
+				_serv_hostname_=`$ECHO ${_line_} | $AWK -F"::" '{print $3}'`
+	        else
+		        i=`$ECHO ${_line_} | $AWK -F"::" '{print $1}'`
+				_serv_hostname_=`$ECHO ${_line_} | $AWK -F"::" '{print $2}'`
+	        fi
+
+		    if [ "${_ip_type_}" == "IPv6" ]; then
+			    $SCP -6 -rp -o StrictHostKeyChecking=no  ${TEM_DIR}/storage_ini_template [${i}]:${_ini_file_name_}
+			    $SCP -6 -rp -o StrictHostKeyChecking=no  ${TEM_DIR}/SunOS_ini_template [${i}]:${SUNOS_INI_TEMPLATE}
+			else
+			    $SCP -rp -o StrictHostKeyChecking=no  ${TEM_DIR}/storage_ini_template ${i}:${_ini_file_name_}
+			    $SCP -rp -o StrictHostKeyChecking=no  ${TEM_DIR}/SunOS_ini_template ${i}:${SUNOS_INI_TEMPLATE}
+			fi
+            run_remote_cmd "${_serv_hostname_}"  "$BASH ${NEW_TEMPL_DIR}/admin/bin/manage_storage_fs.bsh -p ${ENIQ_INST_DIR} -f -l ${LOGFILE} }"
+            if [ $? -ne 0 ];then
+                _err_msg_="Error in reverting NAS file system"
+                remove_disable_oss
+                abort_script "$_err_msg_"
+            fi
+        done
+        log_msg -s "Successfully reverted NAS file system" -l ${LOGFILE}
+    fi
+elif [ "${STORAGE_TYPE}" == "fs" ];then
+    $CP ${TEM_DIR}/SunOS.ini.tmp ${ENIQ_CONF_DIR}/${SUNOS_INI}
+    $CP -rp ${TEM_DIR}/SunOS_ini_template ${SUNOS_INI_TEMPLATE}
+    # Emptying pmdate_fs_mount file for fls
+    remove_symlink_entry
+    
+	
+	# Creating LVM File system
+    $LVCREATE -y --stripes ${_NO_OF_STRIPES_} -L ${_size_of_fls_fs_}G  -n ${_filesystem_name_} ${_vg_} >> /dev/null 2>&1
+    if [ $? -ne 0 ]; then
+        _err_msg_="Could not create LV ${_filesystem_name_}"
+        abort_script "${_err_msg_}"
+    fi
+    # Creating EXT4 File system
+    $MKFS_EXT4 /dev/mapper/${_fls_fs_} >> /dev/null 2>&1
+    if [ $? -ne 0 ]; then
+        _err_msg_="Could not create EXT4 file system on ${_fls_fs_}"
+        abort_script "${_err_msg_}"
+    fi
+
+    remove_disable_oss
+fi
+}
+
+### Function: run_remote_engine ###
+#
+# Runs a command remotely on engine blade if it is a multiblade server
+#
+# Arguments:
+#   Command
+# Return Values:
+#   none
+run_remote_engine()
+{
+if [ "${CURR_SERVER_TYPE}" = "stats_coordinator" ]; then
+    run_remote_cmd "${ENGINE_HOST_NAME}" "$1" "$LOGFILE"
+else
+    $1
+fi
+}
+
+### Function: restore_techpack_directory ###
+#
+# Revert back the techpack related files/directory
+#
+# Arguments:
+#   Command
+# Return Values:
+#   none
+restore_techpack_directory()
+{
+# Restoring files/directory in case of failure 
+if [ -d "/eniq/backup/techpack_dir_bkup_${OSS_ALIAS_NAME}" ] ; then
+    ls -A /eniq/backup/techpack_dir_bkup_${OSS_ALIAS_NAME} >> ${TEM_DIR}/techpack_file   
+    for file in `$CAT ${TEM_DIR}/techpack_file` ; do
+    if [ ! -e "${_mp_}/$file" ] ; then
+        $MV /eniq/backup/techpack_dir_bkup_${OSS_ALIAS_NAME}/$file ${_mp_}
+        if [ $? -eq 0 ]; then
+            log_msg -s -q "Successfully moved the contents of /eniq/backup/techpack_dir_bkup_${OSS_ALIAS_NAME} diretory to  ${_mp_}  directory" -l ${LOGFILE}
+        else
+            _err_msg_="Failed to move the contents of /eniq/backup/techpack_dir_bkup_${OSS_ALIAS_NAME} diretory to  ${_mp_}  directory"
+            abort_script "${_err_msg_}"
+        fi
+    fi
+    done
+
+$RM -rf /eniq/backup/techpack_dir_bkup_${OSS_ALIAS_NAME}
+$RM -rf ${TEM_DIR}/techpack_file
+fi 
+}
+
+
+### Function: setup_env ###
+#
+# Setup environment variables
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+setup_env()
+{
+SUNOS_INI=SunOS.ini
+
+#Eniq base directory
+ENIQ_BASE_DIR=/eniq
+
+ENIQ_LOG_DIR=${ENIQ_BASE_DIR}/local_logs
+ENIQ_LOGFILE_DIR="${ENIQ_LOG_DIR}/configure_enm_log"
+# Main Directory for the Core Installation SW
+ENIQ_INST_DIR=${ENIQ_BASE_DIR}/installation
+
+# Main Directory for the Core Installation SW
+ENIQ_CORE_INST_DIR=${ENIQ_INST_DIR}/core_install
+
+# ENIQ Config Directory
+ENIQ_CONF_DIR=${ENIQ_INST_DIR}/config
+
+FLS_CONFIG_FILE=${ENIQ_CONF_DIR}/fls_conf
+
+# Source the common functions
+if [ -s $ENIQ_CORE_INST_DIR/lib/common_functions.lib ]; then
+    . $ENIQ_CORE_INST_DIR/lib/common_functions.lib
+else
+    _err_msg_="File $ENIQ_CORE_INST_DIR/lib/common_functions.lib not found"
+    abort_script "$_err_msg_"
+fi
+
+#Fetching IP Type from IPMP_INI file.
+check_ip_type
+
+if [ ! "${_ip_type_}" ]; then
+    _err_msg_="Could not read parameter _IP_TYPE_ from file ${ENIQ_CONF_DIR}/${IPMP_INI}"
+    abort_script "$_err_msg_"
+fi
+
+PM_DIR=/data/pmdata
+PM_SYM_LINKS_DIR=${ENIQ_BASE_DIR}${PM_DIR}
+
+OSS_ALIAS=/$OSS_ALIAS_NAME
+
+# ConnectD Software Directory
+CONNECTD_BASE_DIR="/eniq/connectd"
+
+# Location of ConnectD Mount Info Directory
+MOUNT_INFO_DIR="${CONNECTD_BASE_DIR}/mount_info"
+
+#OSS reference file
+OSS_REF_FILE=${MOUNT_INFO_DIR}/.oss_ref_name_file
+
+# Location of file containing PM DATA symbolic links filesystem to mount.
+PMDATA_FILE_SYSTEM_FILE="${MOUNT_INFO_DIR}${OSS_ALIAS}/pmdata_fs_mount"
+
+# File containing the list of mount points
+FSTAB=/etc/fstab
+
+#String denoting the filesystem type
+FS_TYPE=ext4
+
+#Engine IP adress
+ENGINE_IP=`$CAT /etc/hosts |$EGREP -w engine |$AWK '{print $1}'`
+
+#Engine Host name
+ENGINE_HOST_NAME=`$CAT /etc/hosts |$EGREP -w engine |$AWK '{print $2}'`
+
+#PMDATA symbolic links directory
+run_remote_engine "$CAT ${CONNECTD_BASE_DIR}/etc/pmdata_fs_mount_template" >${TEM_DIR}/pmdata_file_system_file_tmp
+PMDATA_MOUNT_POINT=(`$CAT ${TEM_DIR}/pmdata_file_system_file_tmp | $EGREP -v '^[[:blank:]]*#' | $EGREP -w ENM |$AWK '{print $NF}' |$TR -d "\r"`)
+
+DISABLE_OSS="${MOUNT_INFO_DIR}${OSS_ALIAS}/disable_OSS"
+
+# Set up Variable to hold path for iniadd
+if [ ! -s ${ENIQ_CORE_INST_DIR}/lib/iniadd.pl ]; then
+    _err_msg_="Cannot locate ${ENIQ_CORE_INST_DIR}/lib/iniadd.pl "
+    abort_script "$_err_msg_"
+else
+    INIADD=${ENIQ_CORE_INST_DIR}/lib/iniadd.pl
+fi
+
+# Set up Variable to hold path for inidel
+if [ ! -s ${ENIQ_CORE_INST_DIR}/lib/inidel.pl ]; then
+    _err_msg_="Cannot locate ${ENIQ_CORE_INST_DIR}/lib/inidel.pl "
+    abort_script "$_err_msg_"
+else
+    INIDEL=${ENIQ_CORE_INST_DIR}/lib/inidel.pl
+fi
+
+# File containing the type of installation
+INST_TYPE_FILE=${ENIQ_CONF_DIR}/ericsson_use_config
+if [ ! -s ${INST_TYPE_FILE} ]; then
+    _err_msg_="Could not locate file ${INST_TYPE_FILE}"
+    abort_script "$_err_msg_"
+fi
+
+# Read the installation type
+INSTALL_TYPE=`$CAT ${INST_TYPE_FILE} | $AWK -F\= '{print $2}'`
+
+NASCLI=/ericsson/storage/bin/nascli
+
+NEW_TEMPL_DIR="${ENIQ_INST_DIR}/core_install/templates/${INSTALL_TYPE}"
+
+CURR_SERVER_TYPE=`$CAT ${ENIQ_CONF_DIR}/installed_server_type`
+
+if [ -s ${ENIQ_CONF_DIR}/${SUNOS_INI} ]; then
+    STORAGE_TYPE=`iniget STOR_TYPE -f ${ENIQ_CONF_DIR}/${SUNOS_INI} -v STORAGE_TYPE`
+else
+    if [ -s ${ENIQ_CONF_DIR}/san_details ]; then
+        STORAGE_TYPE=`$CAT ${ENIQ_CONF_DIR}/san_details | $EGREP "^STORAGE_TYPE=" | $AWK -F\= '{print $2}'`
+    fi
+fi
+
+# Read the SAN device type
+if [ "${STORAGE_TYPE}" = "raw" ]; then
+    if [ -s ${ENIQ_CONF_DIR}/${SUNOS_INI} ]; then
+        SAN_DEVICE=`iniget SAN_DEV -f ${ENIQ_CONF_DIR}/${SUNOS_INI} -v SAN_DEVICE`
+    else
+        if [ -s ${ENIQ_CONF_DIR}/san_details ]; then
+            SAN_DEVICE=`$CAT ${ENIQ_CONF_DIR}/san_details | $EGREP "^SAN_DEVICE=" | $AWK -F\= '{print $2}'`
+        fi
+    fi
+
+    if [ "${SAN_DEVICE}" == "local" ]; then
+        SAN_DEVICE="vnx"
+    fi
+else
+    get_storage_template
+    if [ ${_deployment_} == "small" -o ${_deployment_} == "ft" ]; then
+        SAN_DEVICE="${STORAGE_TYPE}_compact"
+        _mirroring_="-m1"
+    else
+        SAN_DEVICE="${STORAGE_TYPE}"
+        _mirroring_=""
+    fi
+fi
+
+if [ "${STORAGE_TYPE}" = "raw" ]; then
+     if [ "${SAN_DEVICE}" == "unityXT" ]; then
+          _spa_ip_=`$CAT ${ENIQ_CONF_DIR}/block_storage.ini | $GREP -w "BLK_STORAGE_IP_SPA" | $CUT -d "=" -f 2`
+          if [ ! "${_spa_ip_}" ]; then
+               _err_msg_="Could not get the value of san spa ip"
+               abort_script "$_err_msg_"
+          fi
+     fi
+fi
+
+SUNOS_INI_TEMPLATE="${NEW_TEMPL_DIR}/SunOS.ini_${SAN_DEVICE}"
+if [ ! -f "${SUNOS_INI_TEMPLATE}" ]; then
+    _err_msg_="Failed to get the SunOs.ini template"
+    abort_script "$_err_msg_"
+fi
+
+_pool_list_=`iniget SunOS_FS_POOL -f ${ENIQ_CONF_DIR}/${SUNOS_INI}`
+		
+#Initialize no of stripes
+_NO_OF_STRIPES_=0
+
+_pool_disk_layout_=`iniget ${_pool_list_} -f ${ENIQ_CONF_DIR}/${SUNOS_INI} -v disk_layout`
+if [ ! "${_pool_disk_layout_}" ]; then
+	_err_msg_="Could not get FS pool disk layout"
+	abort_script "${_err_msg_}"
+fi
+	
+#Update no of stripes used in filesystem creation
+for _disk_ in ${_pool_disk_layout_}; do
+	_NO_OF_STRIPES_=`$ECHO " ${_NO_OF_STRIPES_} + 1 " | $BC`
+done
+
+GET_IP_ORDER=${ENIQ_CORE_INST_DIR}/lib/get_ip_order.pl
+}
+
+### Function: touch_disable_oss ###
+#
+# Touch disable_OSS file to unmount the ENM NFS mounted filesystem
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+touch_disable_oss()
+{
+log_msg -q -s "Creating disable OSS file $DISABLE_OSS "  -l ${LOGFILE}
+run_remote_engine "$TOUCH $DISABLE_OSS"
+if [ $? -ne 0 ];then
+    _err_msg_="Could not create $DISABLE_OSS"
+    abort_script "$_err_msg_"
+else
+    log_msg -q -s "Successfully created $DISABLE_OSS"  -l ${LOGFILE}
+fi
+}
+
+### Function: unmount_symlink_dir ###
+#
+# Unmount the ENM symlink directory 
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+unmount_symlink_dir()
+{
+print_header "Unmounting ENM file system" 
+
+log_msg -q -s "Checking status of symlink NFS directory ${PM_SYM_LINKS_DIR}${OSS_ALIAS}${PMDATA_MOUNT_POINT}" -l ${LOGFILE}
+get_mount_point
+check_mount_point_status
+if [ $_mp_status_ -eq 0 ]; then
+    touch_disable_oss
+    recheck_count=0
+    while [ $recheck_count -lt 20 ]
+    do
+        log_msg -q -s "Checking if NFS  ${PM_SYM_LINKS_DIR}${OSS_ALIAS}${PMDATA_MOUNT_POINT} unmounted" -l ${LOGFILE}
+        check_mount_point_status
+        if [ $_mp_status_ -eq 0 ]; then
+            (( recheck_count = recheck_count + 1 ))
+            log_msg -s "Waiting for ${PM_SYM_LINKS_DIR}${OSS_ALIAS}${PMDATA_MOUNT_POINT}  to get unmounted " -l ${LOGFILE}
+        else
+            log_msg -s "Successfully unmounted ${PM_SYM_LINKS_DIR}${OSS_ALIAS}${PMDATA_MOUNT_POINT} symlinks directory" -l ${LOGFILE}
+            break
+        fi
+        $SLEEP 5
+    done
+
+    if [ $recheck_count -eq 20 ];then
+        _err_msg_="Could not unmount ${PM_SYM_LINKS_DIR}${OSS_ALIAS}${PMDATA_MOUNT_POINT} symlinks directory"
+        abort_script "$_err_msg_"
+    fi
+else
+    log_msg -s "${PM_SYM_LINKS_DIR}${OSS_ALIAS}${PMDATA_MOUNT_POINT} already unmounted" -l ${LOGFILE}
+fi
+}
+
+### Function: update_fls_conf_file ###
+#
+# Update the fls mode configuration file that maintains the entry of 
+# ENM that has been converted to FLS mode
+# Arguments:
+#   none
+# Return Values:
+#   none
+update_fls_conf_file()
+{
+if [ "${ACTION}" == "fls" ];then
+    run_remote_engine "$LS $FLS_CONFIG_FILE" > /dev/null 2>&1
+    if [ $? -ne 0 ];then
+        if [ "${CURR_SERVER_TYPE}" = "stats_coordinator" ]; then
+			$ECHO "${OSS_ALIAS_NAME}" >${TEM_DIR}/fls_conf_file
+			run_remote_engine "$CAT $FLS_CONFIG_FILE" 2>/dev/null |$GREP -w $OSS_ALIAS_NAME >/dev/null
+			if [ $? -eq 0 ]; then
+				log_msg -s ""${OSS_ALIAS_NAME}" is already in $FLS_CONFIG_FILE."  -l ${LOGFILE}
+			else
+                if [ "${_ip_type_}" == "IPv6" ]; then
+                    $SCP -6 -rp ${TEM_DIR}/fls_conf_file [${ENGINE_IP}]:$FLS_CONFIG_FILE
+			    else
+			        $SCP -rp ${TEM_DIR}/fls_conf_file ${ENGINE_IP}:$FLS_CONFIG_FILE
+			    fi
+				if [ $? -ne 0 ];then
+					_err_msg_="Could not copy $FLS_CONFIG_FILE on Engine server."
+					abort_script "$_err_msg_"
+				else
+					log_msg -s "Successfully copied $FLS_CONFIG_FILE on Engine server."  -l ${LOGFILE}
+				fi
+            $CP ${TEM_DIR}/fls_conf_file $FLS_CONFIG_FILE
+				if [ $? -ne 0 ];then
+					_err_msg_="Could not copy ${TEM_DIR}/fls_conf_file to $FLS_CONFIG_FILE"
+					abort_script "$_err_msg_"
+				else
+					log_msg -s "Successfully copied ${TEM_DIR}/fls_conf_file to $FLS_CONFIG_FILE"  -l ${LOGFILE}
+				fi
+			fi
+        else
+			$CAT $FLS_CONFIG_FILE 2>/dev/null |$GREP -w $OSS_ALIAS_NAME >/dev/null
+			if [ $? -eq 0 ]; then
+				log_msg -s ""${OSS_ALIAS_NAME}" is already in $FLS_CONFIG_FILE."  -l ${LOGFILE}
+			else
+				$ECHO "${OSS_ALIAS_NAME}" >$FLS_CONFIG_FILE
+				if [ $? -ne 0 ];then
+					_err_msg_="Could not add ${OSS_ALIAS_NAME} entry in $FLS_CONFIG_FILE"
+					abort_script "$_err_msg_"
+				else
+					log_msg -s "Successfully added ${OSS_ALIAS_NAME} entry in $FLS_CONFIG_FILE"  -l ${LOGFILE}
+				fi
+				
+			fi
+        fi
+    else
+        if [ "${CURR_SERVER_TYPE}" = "stats_coordinator" ]; then
+            run_remote_engine "$CAT $FLS_CONFIG_FILE"|$TR -d "\r" >${TEM_DIR}/fls_conf_file
+            $ECHO "${OSS_ALIAS_NAME}" >>${TEM_DIR}/fls_conf_file
+			run_remote_engine "$CAT $FLS_CONFIG_FILE" 2>/dev/null |$GREP -w $OSS_ALIAS_NAME >/dev/null
+			if [ $? -eq 0 ]; then
+				log_msg -s ""${OSS_ALIAS_NAME}" is already in $FLS_CONFIG_FILE."  -l ${LOGFILE}
+			else
+            if [ "${_ip_type_}" == "IPv6" ]; then
+			    $SCP -6 -rp ${TEM_DIR}/fls_conf_file [${ENGINE_IP}]:$FLS_CONFIG_FILE
+			else
+			    $SCP -rp ${TEM_DIR}/fls_conf_file ${ENGINE_IP}:$FLS_CONFIG_FILE
+			fi
+            if [ $? -ne 0 ];then
+                _err_msg_="Could not copy $FLS_CONFIG_FILE on Engine server."
+                abort_script "$_err_msg_"
+            else
+                log_msg -s "Successfully copied $FLS_CONFIG_FILE on Engine server."  -l ${LOGFILE}
+            fi
+            $CP ${TEM_DIR}/fls_conf_file $FLS_CONFIG_FILE
+            if [ $? -ne 0 ];then
+                _err_msg_="Could not copy ${TEM_DIR}/fls_conf_file to $FLS_CONFIG_FILE"
+                abort_script "$_err_msg_"
+            else
+                log_msg -s "Successfully copied ${TEM_DIR}/fls_conf_file to $FLS_CONFIG_FILE"  -l ${LOGFILE}
+            fi
+			fi
+        else
+			$CAT $FLS_CONFIG_FILE 2>/dev/null |$GREP -w $OSS_ALIAS_NAME >/dev/null
+			if [ $? -eq 0 ]; then
+				log_msg -s ""${OSS_ALIAS_NAME}" is already in $FLS_CONFIG_FILE."  -l ${LOGFILE}
+			else
+            $ECHO "${OSS_ALIAS_NAME}" >>$FLS_CONFIG_FILE
+            if [ $? -ne 0 ];then
+                _err_msg_="Could not add ${OSS_ALIAS_NAME} entry in $FLS_CONFIG_FILE"
+                abort_script "$_err_msg_"
+            else
+                log_msg -s "Successfully added ${OSS_ALIAS_NAME} entry in $FLS_CONFIG_FILE"  -l ${LOGFILE}
+            fi
+			fi
+        fi
+    fi
+
+elif [ "${ACTION}" == "symlink" ];then
+    run_remote_engine "$LS $FLS_CONFIG_FILE" > /dev/null 2>&1
+    if [ $? -eq 0 ];then
+        if [ "${CURR_SERVER_TYPE}" = "stats_coordinator" ]; then
+            run_remote_engine "$CAT $FLS_CONFIG_FILE"|$TR -d "\r" >${TEM_DIR}/FLS_CONFIG_FILE_temp1
+            $SED "/${OSS_ALIAS_NAME}/d" ${TEM_DIR}/FLS_CONFIG_FILE_temp1 >${TEM_DIR}/FLS_CONFIG_FILE_temp
+			run_remote_engine "$CAT $FLS_CONFIG_FILE" 2>/dev/null |$GREP -w $OSS_ALIAS_NAME >/dev/null
+			if [ $? -eq 0 ]; then
+				log_msg -s ""${OSS_ALIAS_NAME}" is already in $FLS_CONFIG_FILE."  -l ${LOGFILE}
+			else
+            if [ "${_ip_type_}" == "IPv6" ]; then
+                $SCP -6 -rp ${TEM_DIR}/FLS_CONFIG_FILE_temp [${ENGINE_IP}]:$FLS_CONFIG_FILE
+			else	
+			    $SCP -rp ${TEM_DIR}/FLS_CONFIG_FILE_temp ${ENGINE_IP}:$FLS_CONFIG_FILE
+			fi
+            if [ $? -ne 0 ];then
+                _err_msg_="Could not copy $FLS_CONFIG_FILE on Engine server."
+                abort_script "$_err_msg_"
+            else
+                log_msg -s "Successfully copied $FLS_CONFIG_FILE on Engine server."  -l ${LOGFILE}
+            fi
+
+            $CP ${TEM_DIR}/FLS_CONFIG_FILE_temp $FLS_CONFIG_FILE
+            if [ $? -ne 0 ];then
+                _err_msg_="Could not copy ${TEM_DIR}/FLS_CONFIG_FILE_temp to $FLS_CONFIG_FILE"
+                abort_script "$_err_msg_"
+            else
+                log_msg -s "Successfully copied ${TEM_DIR}/FLS_CONFIG_FILE_temp to $FLS_CONFIG_FILE"  -l ${LOGFILE}
+            fi
+			fi
+        else
+            $SED "/${OSS_ALIAS_NAME}/d" $FLS_CONFIG_FILE >${TEM_DIR}/FLS_CONFIG_FILE_temp
+			$CAT $FLS_CONFIG_FILE 2>/dev/null |$GREP -w $OSS_ALIAS_NAME >/dev/null
+			if [ $? -eq 0 ]; then
+				log_msg -s ""${OSS_ALIAS_NAME}" is already in $FLS_CONFIG_FILE."  -l ${LOGFILE}
+			else
+            $CP -rp ${TEM_DIR}/FLS_CONFIG_FILE_temp $FLS_CONFIG_FILE
+            if [ $? -ne 0 ];then
+                _err_msg_="Could not remove ${OSS_ALIAS_NAME} entry in $FLS_CONFIG_FILE"
+                abort_script "$_err_msg_"
+            else
+                log_msg -s "Successfully removed ${OSS_ALIAS_NAME} entry from $FLS_CONFIG_FILE"  -l ${LOGFILE}
+            fi
+			fi
+        fi
+    else
+        _err_msg_="Could not locate  $FLS_CONFIG_FILE"
+        abort_script "$_err_msg_"
+    fi
+
+fi
+}
+
+### Function: update_storage_template ###
+#
+# Update the storage ini file after iniadd command is successful
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+update_storage_template()
+{
+$CP -rp ${TEM_DIR}/storage_ini_template_new ${_ini_file_name_}
+if [ $? -ne 0 ];then
+    _err_msg_="Could not update ${_ini_file_name_}"
+    run_remote_engine "$CP -rp ${PMDATA_FILE_SYSTEM_FILE}_orig ${PMDATA_FILE_SYSTEM_FILE}"
+    remove_disable_oss
+    abort_script "$_err_msg_"
+else
+    log_msg -q -s "${_ini_file_name_} successfully updated " -l ${LOGFILE}
+fi
+}
+
+### Function: update_sunos_template ###
+#
+# Update the sunos ini file after iniadd command is successful
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+update_sunos_template()
+{
+$CP -rp ${TEM_DIR}/sunos_ini_template_op ${SUNOS_INI_TEMPLATE}
+if [ $? -ne 0 ];then
+    _err_msg_="Could not update ${SUNOS_INI_TEMPLATE}"
+    run_remote_engine "$CP -rp ${PMDATA_FILE_SYSTEM_FILE}_orig ${PMDATA_FILE_SYSTEM_FILE}"
+    remove_disable_oss
+    abort_script "$_err_msg_"
+else
+    log_msg -q -s "${SUNOS_INI_TEMPLATE} successfully updated " -l ${LOGFILE}
+fi
+}
+
+### Function: usage_msg ###
+#
+# print usage message if user input is invalid
+#
+# Arguments:
+#   variable
+# Return Values:
+#   none
+usage_msg()
+{
+$ECHO "USAGE"
+$ECHO "bash configure_enm_mode.bsh -a <fls|symlink> -n <OSS alias name> [ -l <logfile> ]"
+$ECHO "eg. bash configure_enm_mode.bsh -a fls -n eniq_oss_2 -l logfile"
+exit
+}
+
+### Function: lvm_fs_create ###
+#
+# Create new LVM filesystem for FLS mode
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+lvm_fs_create()
+{
+_vg_="eniq_stats_pool"
+_filesystem_name_=${OSS_ALIAS_NAME}
+#Filesystem size is 45GB
+_tot_space_=45G
+_pool_assign_=0
+get_kilo_size "${_tot_space_}"
+_tot_space_=${SIZE_KILO}
+
+_free_space_=`$VGS ${_vg_} -o vg_free --noheading |$AWK -F" " '{print $1}' | $SED 's/<//g'`
+get_kilo_size "${_free_space_}"
+_free_space_=${SIZE_KILO}
+
+log_msg -q -s "${_vg_} has ${_free_space_}KB of free space" -l ${LOGFILE}
+_free_space_=$( printf "%.0f" $_free_space_ )
+if [ ! "${_free_space_}" ]; then
+    _err_msg_="Could not get free space for vg"
+    abort_script "${_err_msg_}"
+fi
+# Comparing free space of eniq_stats_pool with space required to create new LVM File system of 45G 
+if [ "${_free_space_}" -gt "${_tot_space_}" ]; then
+    _fls_fs_="${_vg_}-${_filesystem_name_}"
+    $LVS | $GREP ${_filesystem_name_} >/dev/null 2>&1
+    if [ $? -eq 0 ];then
+        $CP -rp ${PMDATA_FILE_SYSTEM_FILE}_orig ${PMDATA_FILE_SYSTEM_FILE}
+        remove_disable_oss
+        _err_msg_="LVM Filesystem with name ${_filesystem_name_} already exists"
+        abort_script "$_err_msg_"
+    fi
+    check_variable _filesystem_name_
+
+    # Get the available pool space for creating FLS File system	  
+    get_available_space
+
+    log_msg -q -s "\n\nCreating LVM filesystem ${_fls_fs_}" -l ${LOGFILE}
+	
+	
+    # Creating LVM File system
+    $LVCREATE -y --stripes ${_NO_OF_STRIPES_} -L ${_size_of_fls_fs_}G -n ${_filesystem_name_} ${_vg_} >> /dev/null 2>&1
+    if [ $? -ne 0 ]; then
+        $CP -rp ${PMDATA_FILE_SYSTEM_FILE}_orig ${PMDATA_FILE_SYSTEM_FILE}
+        remove_disable_oss
+        _err_msg_="Could not create LV ${_filesystem_name_}"
+        abort_script "${_err_msg_}"
+    fi
+    # Creating EXT4 File system
+    $MKFS_EXT4 /dev/mapper/${_fls_fs_} >> /dev/null 2>&1
+    if [ $? -ne 0 ]; then
+        $CP -rp ${PMDATA_FILE_SYSTEM_FILE}_orig ${PMDATA_FILE_SYSTEM_FILE}
+        log_msg -q -s "\n\nRemoving LVM filesystem ${_filesystem_name_}" -l ${LOGFILE}
+        $LVREMOVE -f ${_vg_}|${_filesystem_name_} >> /dev/null 2>&1
+        if [ $? -ne 0 ]; then
+            _err_msg_="Unable to remove LV ${_filesystem_name_}"
+            abort_script "${_err_msg_}"
+        fi
+        remove_disable_oss
+        _err_msg_="Could not create EXT4 filesytem on ${_fls_fs_}"
+        abort_script "${_err_msg_}"
+    fi
+    _pool_assign_=1
+fi
+
+
+if [ $_pool_assign_ == 1 ]; then
+    log_msg -q -s "\n\nSuccessfully created the LVM FLS" -l ${LOGFILE}
+else
+    _err_msg_="Unable to create LVM filesystem for FLS"
+    $CP -rp ${PMDATA_FILE_SYSTEM_FILE}_orig ${PMDATA_FILE_SYSTEM_FILE}
+    remove_disable_oss
+    abort_script "${_err_msg_}"
+fi
+
+get_mount_point
+
+# Handling for mounting for local filesystem 
+if [ "${STORAGE_TYPE}" == "fs" ];then
+    if [ "${ACTION}" == "fls" ];then
+        if [ ! -z "$(ls -A ${_mp_})" ]; then
+            $MKDIR -p /eniq/backup/techpack_dir_bkup_${OSS_ALIAS_NAME}
+            if [ $? -eq 0 ]; then
+                log_msg -s -q "Successfully created the /eniq/backup/techpack_dir_bkup_${OSS_ALIAS_NAME} directory" -l ${LOGFILE}
+            else
+                _err_msg_="Failed to create the /eniq/backup/techpack_dir_bkup_${OSS_ALIAS_NAME} directory"
+                abort_script "${_err_msg_}"
+            fi
+
+            $MV ${_mp_}/* /eniq/backup/techpack_dir_bkup_${OSS_ALIAS_NAME}
+            if [ $? -eq 0 ]; then
+                log_msg -s -q "Successfully moved the contents of ${_mp_} diretory to  /eniq/backup/techpack_dir_bkup_${OSS_ALIAS_NAME} directory" -l ${LOGFILE}
+            else
+                _err_msg_="Failed to move the contents of ${_mp_} directory to /eniq/backup/techpack_dir_bkup_${OSS_ALIAS_NAME} directory"
+                abort_script "${_err_msg_}"
+            fi
+        fi
+    fi
+fi
+
+$ECHO "Mounting Logical Volume ${_fls_fs_} on ${_mp_}"
+
+$MOUNT -l |$GREP ${_mp_} >> /dev/null 2>&1
+if [ $? -ne 0 ]; then
+    $MOUNT /dev/mapper/${_fls_fs_} ${_mp_} >> /dev/null 2>&1
+    if [ $? -ne 0 ]; then
+        log_msg -q -s "\n\nRemoving LVM filesystem /dev/mapper/${_fls_fs_}" -l ${LOGFILE}
+        $LVREMOVE -f /dev/mapper/${_fls_fs_} >> /dev/null 2>&1
+        if [ $? -ne 0 ]; then
+            _err_msg_="Unable to remove LV /dev/mapper/${_fls_fs_}"
+            abort_script "${_err_msg_}"
+        fi
+        $CP -rp ${PMDATA_FILE_SYSTEM_FILE}_orig ${PMDATA_FILE_SYSTEM_FILE}
+        # Restoring files/directory in case of failure 
+        restore_techpack_directory
+        remove_disable_oss
+        _err_msg_="Could not mount Logical Volume ${_fls_fs_}"
+        abort_script "${_err_msg_}"
+    fi
+fi
+
+# Restoring files/directory which we have created before LVM mounting.
+restore_techpack_directory
+
+
+$CHOWN ${_owner_}:${_group_} ${_mp_}
+if [ $? -ne 0 ]; then
+    $UMOUNT -l ${_mp_}
+    log_msg -q -s "\n\nRemoving LVM filesystem /dev/mapper/${_fls_fs_}" -l ${LOGFILE}
+    $LVREMOVE -f /dev/mapper/${_fls_fs_} >> /dev/null 2>&1
+    if [ $? -ne 0 ]; then
+        _err_msg_="Unable to remove LV /dev/mapper/${_fls_fs_}"
+        abort_script "${_err_msg_}"
+    fi
+    $CP -rp ${PMDATA_FILE_SYSTEM_FILE}_orig ${PMDATA_FILE_SYSTEM_FILE}
+    remove_disable_oss
+    _err_msg_="Could not change the owner for ${_mp_} "
+    abort_script "${_err_msg_}"
+fi
+
+$CP ${ENIQ_CONF_DIR}/${SUNOS_INI} ${TEM_DIR}/SunOS.ini.tmp
+_last_used_=`iniget SunOS_ZFS_FS -f ${TEM_DIR}/SunOS.ini.tmp  | $GREP -v "\[*\]" | $TAIL -1 | $SED 's/[^0-9]*//g' `
+((_last_used_++))
+_new_fs_="SunOS_ZFS_FS_${_last_used_}"
+
+$ECHO "[${_new_fs_}]
+name=${_fls_fs_}
+mountpoint=${_mp_}
+perms=0755">${TEM_DIR}/new_ini_block
+
+$INIADD -g SunOS_ZFS_FS -p ${_new_fs_} -i ${TEM_DIR}/SunOS.ini.tmp -d ${TEM_DIR}/new_ini_block -o ${TEM_DIR}/SunOS.ini.tmp_op
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not update ${TEM_DIR}/SunOS.ini.tmp_op"
+    lvm_fs_rollback_stage
+fi
+_last_used_=`iniget SunOS_DIRECTORY -f ${TEM_DIR}/SunOS.ini.tmp  | $GREP -v "\[*\]" | $TAIL -1  | $SED 's/[^0-9]*//g'`
+((_last_used_++))
+_parent_tag_sunos_="SunOS_DIRECTORY_DIR_${_last_used_}"
+$ECHO "[${_parent_tag_sunos_}]
+path=${_mp_}
+perms=0755
+user=dcuser
+group=dc5000" >${TEM_DIR}/new_ini_block
+
+$INIADD -g SunOS_DIRECTORY  -p ${_parent_tag_sunos_} -i ${TEM_DIR}/SunOS.ini.tmp_op -d ${TEM_DIR}/new_ini_block -o ${TEM_DIR}/SunOS.ini.tmp_op_new
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not update ${TEM_DIR}/SunOS.ini.tmp_op"
+    lvm_fs_rollback_stage
+fi
+$CP -rp ${TEM_DIR}/SunOS.ini.tmp_op_new ${ENIQ_CONF_DIR}/${SUNOS_INI}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not update ${ENIQ_CONF_DIR}/${SUNOS_INI}"
+    lvm_fs_rollback_stage
+fi
+
+create_new_sunos_ini_block
+# Adding block for SunOS ini
+$INIADD -g SunOS_ZFS_FS -p ${_parent_tag_sunos_} -i ${TEM_DIR}/SunOS_ini_template -d ${TEM_DIR}/new_ini_block_sunos -o ${TEM_DIR}/sunos_ini_template_op
+
+if [ $? -ne 0 ];then
+    $CP -rp ${PMDATA_FILE_SYSTEM_FILE}_orig ${PMDATA_FILE_SYSTEM_FILE}
+    _err_msg_="Failed to add FS block in ${TEM_DIR}/sunos_ini_template"
+    lvm_fs_rollback_stage
+else
+    log_msg -q -s "${TEM_DIR}/sunos_ini_template successfully updated " -l ${LOGFILE}
+fi
+
+$INIADD -g SunOS_DIRECTORY -p ${_parent_tag_sunos_2_} -i ${TEM_DIR}/sunos_ini_template_op -d ${TEM_DIR}/new_ini_block_sunos_zfs2 -o ${TEM_DIR}/sunos_ini_template_op_new
+if [ $? -ne 0 ];then
+    $CP -rp ${PMDATA_FILE_SYSTEM_FILE}_orig ${PMDATA_FILE_SYSTEM_FILE}
+    _err_msg_="Failed to add FS block in ${TEM_DIR}/sunos_ini_template"
+    lvm_fs_rollback_stage
+else
+    log_msg -q -s "${TEM_DIR}/sunos_ini_template successfully updated " -l ${LOGFILE}
+fi
+
+$CP -rp ${TEM_DIR}/sunos_ini_template_op_new ${SUNOS_INI_TEMPLATE}
+if [ $? -ne 0 ];then
+    $CP -rp ${PMDATA_FILE_SYSTEM_FILE}_orig ${PMDATA_FILE_SYSTEM_FILE}
+    _err_msg_="Failed to add FS block in ${TEM_DIR}/sunos_ini_template"
+    lvm_fs_rollback_stage
+else
+    log_msg -q -s "${SUNOS_INI_TEMPLATE} successfully updated " -l ${LOGFILE}
+fi
+
+# Make a backup of fstab file
+if [ -f "${FSTAB}" ]; then
+    log_msg -s "Backing up original ${FSTAB} file to ${TEM_DIR}/fstab" -l ${LOGFILE}
+    $CP -p ${FSTAB} ${TEM_DIR}/fstab
+    if [ $? -ne 0 ]; then
+        _err_msg_="Could not copy ${FSTAB} to ${TEM_DIR}/fstab"
+        lvm_fs_rollback_stage
+    else
+        # Updating the FSTAB file with newly created FS   
+        $ECHO "/dev/mapper/${_fls_fs_} ${_mp_}                   ${FS_TYPE}    defaults,x-systemd.device-timeout=300s        0 0" >> ${TEM_DIR}/fstab
+        if [ $? -eq 0 ]; then
+            log_msg -s "Updating the ${FSTAB} file " -l ${LOGFILE}
+            $MV ${TEM_DIR}/fstab ${FSTAB}
+        else
+            _err_msg_="Could not update ${TEM_DIR}/fstab file"
+            lvm_fs_rollback_stage
+        fi
+    fi
+else
+    _err_msg_="Unable to find ${FSTAB} file"
+    lvm_fs_rollback_stage
+fi
+
+}
+
+### Function: lvm_fs_delete ###
+#
+# Delete the FLS LVM Filesystem
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+lvm_fs_delete()
+{
+get_mount_point
+
+#Updating Sunos.ini
+$CP ${ENIQ_CONF_DIR}/${SUNOS_INI} ${TEM_DIR}/SunOS.ini.tmp
+_secondary_tag_=`cat ${TEM_DIR}/SunOS.ini.tmp |$EGREP -B2 "mountpoint=$_mp_" |$HEAD -1 |$CUT -d "[" -f2 |$CUT -d "]" -f1`
+
+$INIDEL -g SunOS_ZFS_FS -p  ${_secondary_tag_} -i ${TEM_DIR}/SunOS.ini.tmp -o ${TEM_DIR}/SunOS.ini.tmp_op
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not update ${TEM_DIR}/SunOS.ini.tmp_op"
+    remove_disable_oss
+    abort_script "${_err_msg_}"
+fi
+
+_secondary_tag_=`cat ${TEM_DIR}/SunOS.ini.tmp |$EGREP -B1 "path=$_mp_" |$HEAD -1 |$CUT -d "[" -f2 |$CUT -d "]" -f1`
+$INIDEL -g SunOS_DIRECTORY -p  ${_secondary_tag_} -i ${TEM_DIR}/SunOS.ini.tmp_op -o ${TEM_DIR}/SunOS.ini.tmp_op_new
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not update ${TEM_DIR}/SunOS.ini.tmp_op"
+    remove_disable_oss
+    abort_script "${_err_msg_}"
+fi
+
+$CP -rp ${TEM_DIR}/SunOS.ini.tmp_op_new ${ENIQ_CONF_DIR}/${SUNOS_INI}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not update ${ENIQ_CONF_DIR}/${SUNOS_INI}"
+    $CP -rp ${TEM_DIR}/SunOS.ini.tmp  ${ENIQ_CONF_DIR}/${SUNOS_INI}
+    remove_disable_oss
+    abort_script "${_err_msg_}"
+fi
+
+#Updating Sunos.ini template file
+$CP -rp "${SUNOS_INI_TEMPLATE}" ${TEM_DIR}/SunOS_ini_template
+_new_fs_name_=`$MOUNT -l | $EGREP -w $_mp_  |$AWK '{print $3}' |$SED "s|${ENIQ_BASE_DIR}/||g" `>/dev/null 2>&1
+_parent_tag_sunos_=`$CAT ${TEM_DIR}/SunOS_ini_template | $EGREP -B2 "mountpoint=<CHANGE><ENIQ_BASE_DIR>/${_new_fs_name_}" |$HEAD -1 |$TR -d "[" |$TR -d "]"`
+$INIDEL -g SunOS_ZFS_FS -p ${_parent_tag_sunos_} -i ${TEM_DIR}/SunOS_ini_template -o ${TEM_DIR}/sunos_ini_template_op
+if [ $? -ne 0 ];then
+    _err_msg_="Failed to update ${TEM_DIR}/sunos_ini_template_op"
+    $CP -rp ${TEM_DIR}/SunOS.ini.tmp ${ENIQ_CONF_DIR}/${SUNOS_INI}
+    remove_disable_oss
+    abort_script "$_err_msg_"
+else
+    log_msg -q -t -s "${TEM_DIR}/sunos_ini_template_op successfully updated " -l ${LOGFILE}
+fi
+
+
+_parent_tag_sunos_=`$CAT ${TEM_DIR}/SunOS_ini_template | $EGREP -B1 "path=<CHANGE><ENIQ_BASE_DIR>/${_new_fs_name_}" |$HEAD -1 |$TR -d "[" |$TR -d "]"`
+$INIDEL -g SunOS_DIRECTORY -p ${_parent_tag_sunos_} -i ${TEM_DIR}/sunos_ini_template_op -o ${TEM_DIR}/sunos_ini_template_op_new
+if [ $? -ne 0 ];then
+    _err_msg_="Failed to update ${TEM_DIR}/sunos_ini_template_op_new"
+    $CP -rp ${TEM_DIR}/SunOS.ini.tmp ${ENIQ_CONF_DIR}/${SUNOS_INI}
+    remove_disable_oss
+    abort_script "$_err_msg_"
+else
+    log_msg -q -t -s "${TEM_DIR}/sunos_ini_template_op successfully updated " -l ${LOGFILE}
+fi
+
+$CP -rp ${TEM_DIR}/sunos_ini_template_op_new ${SUNOS_INI_TEMPLATE}
+if [ $? -ne 0 ];then
+    _err_msg_="Could not update ${SUNOS_INI_TEMPLATE}"
+    $CP -rp ${TEM_DIR}/SunOS.ini.tmp ${ENIQ_CONF_DIR}/${SUNOS_INI}
+    $CP -rp ${TEM_DIR}/SunOS_ini_template ${SUNOS_INI_TEMPLATE}
+    remove_disable_oss
+    abort_script "$_err_msg_"
+else
+    log_msg -s "${SUNOS_INI_TEMPLATE} successfully updated " -l ${LOGFILE}
+fi
+
+_fs_name_=` $MOUNT -l | $EGREP -w $_mp_  |$AWK '{print $1}' `>/dev/null 2>&1
+
+$UMOUNT -l ${_mp_}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not unmount ${_mp_}"
+    $CP -rp ${TEM_DIR}/SunOS.ini.tmp ${ENIQ_CONF_DIR}/${SUNOS_INI}
+    $CP -rp ${TEM_DIR}/SunOS_ini_template ${SUNOS_INI_TEMPLATE}
+    remove_disable_oss
+    abort_script "${_err_msg_}"
+fi
+log_msg -q -s "\n\nRemoving LVM filesystem ${_fs_name_}" -l ${LOGFILE}
+$LVREMOVE -f ${_fs_name_} >> /dev/null 2>&1
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not remove ${_fs_name_}"
+    $CP -rp ${TEM_DIR}/SunOS.ini.tmp ${ENIQ_CONF_DIR}/${SUNOS_INI}
+    $CP -rp ${TEM_DIR}/SunOS_ini_template ${SUNOS_INI_TEMPLATE}
+    remove_disable_oss
+    abort_script "${_err_msg_}"
+fi
+}
+
+### Function: lvm_fs_rollback_stage ###
+#
+# Rollback the server to its original state
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+lvm_fs_rollback_stage()
+{
+$UMOUNT -l ${_mp_}
+if [ $? -ne 0 ]; then
+    _err_msg_="Unable to unmount ${_mp_}"
+    abort_script "${_err_msg_}"
+fi
+log_msg -q -s "\n\nRemoving LVM filesystem /dev/mapper/${_fls_fs_}" -l ${LOGFILE}
+$LVREMOVE -f /dev/mapper/${_fls_fs_} >> /dev/null 2>&1
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not remove /dev/mapper/${_fls_fs_}"
+    abort_script "${_err_msg_}"
+fi
+$CP -rp ${TEM_DIR}/SunOS.ini.tmp  ${ENIQ_CONF_DIR}/${SUNOS_INI}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not copy ${TEM_DIR}/SunOS.ini.tmp to ${ENIQ_CONF_DIR}/${SUNOS_INI}"
+    abort_script "${_err_msg_}"
+fi
+$CP -rp ${TEM_DIR}/SunOS_ini_template ${SUNOS_INI_TEMPLATE}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not copy ${TEM_DIR}/SunOS_ini_template to ${SUNOS_INI_TEMPLATE}"
+    abort_script "${_err_msg_}"
+fi
+$CP -rp ${PMDATA_FILE_SYSTEM_FILE}_orig ${PMDATA_FILE_SYSTEM_FILE}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not copy ${PMDATA_FILE_SYSTEM_FILE}_orig to ${PMDATA_FILE_SYSTEM_FILE}"
+    abort_script "${_err_msg_}"
+fi
+remove_disable_oss
+abort_script "${_err_msg_}"
+}
+
+# **********************************************************************
+#
+# ********************** Main body of program  *************************
+#
+# **********************************************************************
+#
+
+# Check that the effective id of the user is root
+check_id root
+
+TIMESTAMP=`$DATE '+%d-%m-%y_%H.%M.%S'`
+
+# Create a temporary Directory
+TEM_DIR=/tmp/configure_enm.$$.$$
+$RM -rf ${TEM_DIR}
+$MKDIR -p ${TEM_DIR}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not create directory $TEM_DIR"
+    abort_script "$_err_msg_"
+fi
+
+# Determine absolute path to software
+get_absolute_path
+
+while getopts ":n:a:l:e" arg; do
+  case $arg in
+    n) OSS_ALIAS_NAME="$OPTARG"
+       ;;
+    a) ACTION="$OPTARG"
+       ;;
+    e) ENM_NEW=YES
+       ;;
+    l) LOGFILE="$OPTARG"
+       $TOUCH LOGFILE
+       ;;
+   \?) usage_msg
+       exit 1
+       ;;
+  esac
+done
+
+if [ -z $OSS_ALIAS_NAME ] || [ -z $ACTION ];then
+usage_msg
+fi
+
+if [ "$ACTION" == "fls" -o "$ACTION" == "symlink" ];then
+$ECHO >/dev/null
+else
+usage_msg
+fi
+
+$ECHO $OSS_ALIAS_NAME |$GREP eniq_oss_ >/dev/null
+if [ $? -ne 0 ];then
+usage_msg
+fi
+
+setup_env
+
+if [ ! "${LOGFILE}" ]; then
+    LOGFILE=${ENIQ_LOGFILE_DIR}/configure_enm_mode_${TIMESTAMP}.log
+fi
+
+# Check/Create Logfile
+chk_create_logfile
+
+if [ ! ${ENM_NEW} ];then
+    ENM_NEW=NO
+fi
+
+# Get the enm type (physical or  virtual or cloud)
+get_enm_type
+
+if [ "${ENM_NEW}" != "YES" -a "${ACTION}" == "fls" ];then
+    run_remote_engine "$CAT ${FLS_CONFIG_FILE}" 2>/dev/null | $GREP -w ${OSS_ALIAS_NAME} >/dev/null
+    if [ $? -ne 0 ]; then
+        run_remote_engine "$CAT ${MOUNT_INFO_DIR}/${OSS_ALIAS_NAME}/pmlinks_file" 2>/dev/null | $GREP -w pmlinks1 >/dev/null
+        if [ $? -ne 0 ]; then
+            populate_pmlink_file
+        fi
+    fi
+fi
+
+if [ "${STORAGE_TYPE}" == "raw" ];then
+    $PERL ${GET_IP_ORDER} -f ${TEM_DIR}/server_order_list
+    if [ ${ACTION} == "fls" ];then
+        if [ "${ENM_NEW}" != "YES" ];then
+            print_header "Checking configuration for ENM $OSS_ALIAS_NAME " 
+            check_fls
+        else
+            check_alias
+        fi
+        #Getting all the nas parameters to configure new nas filesystem for fls mode
+        get_owner_group
+
+        print_header "Configuring ENM $OSS_ALIAS_NAME as FLS" 
+        log_msg -s "Getting NAS parameters for filesystem creation" -l ${LOGFILE}
+
+        get_nas_host
+
+        get_storage_pool_name
+
+        get_new_fs_name
+
+	if [ "${SAN_DEVICE}" != "unityXT" ]; then
+		get_max_size_available
+	fi	
+
+     	get_new_fs_size
+
+        get_parent_tag
+
+        get_storage_template
+
+        create_new_ini_block
+
+        create_new_sunos_ini_block
+
+        if [ "${ENM_TYPE}" = "pENM" ] || [ "${ENM_TYPE}" = "vENM" ]; then
+            if [ "${ENM_NEW}" != "YES" ];then
+                # Get the pmlinks information taken from user.   
+                get_pmlinks_info 
+                unmount_symlink_dir
+                remove_symlink_entry
+            fi
+        fi
+
+        print_header "Creating new NAS file system" 
+        $INIADD -g Storage_NAS_FS_LIST -p ${_parent_tag_} -i ${TEM_DIR}/storage_ini_template -d ${TEM_DIR}/new_ini_block -o ${TEM_DIR}/storage_ini_template_new
+        if [ $? -ne 0 ];then
+            _err_msg_="Could not update ${TEM_DIR}/storage_ini_template_new"
+            run_remote_engine "$CP -rp ${PMDATA_FILE_SYSTEM_FILE}_orig ${PMDATA_FILE_SYSTEM_FILE}"
+            remove_disable_oss
+            abort_script "$_err_msg_"
+        else
+            log_msg -q -s "${TEM_DIR}/storage_ini_template_new successfully updated " -l ${LOGFILE}
+        fi
+
+        # Adding block for SunOS ini
+        $INIADD -g SunOS_DIRECTORY -p ${_parent_tag_sunos_} -i ${TEM_DIR}/SunOS_ini_template -d ${TEM_DIR}/new_ini_block_sunos -o ${TEM_DIR}/sunos_ini_template_op
+        if [ $? -ne 0 ];then
+            _err_msg_="Failed to add FS block in ${TEM_DIR}/sunos_ini_template"
+            run_remote_engine "$CP -rp ${PMDATA_FILE_SYSTEM_FILE}_orig ${PMDATA_FILE_SYSTEM_FILE}"
+            remove_disable_oss
+            abort_script "$_err_msg_"
+        else
+            log_msg -q -s "${TEM_DIR}/sunos_ini_template successfully updated " -l ${LOGFILE}
+        fi
+        update_storage_template
+        update_sunos_template
+
+        log_msg -s  "Using below parameters for NAS filesystem creation" -l ${LOGFILE}
+        $CAT ${TEM_DIR}/new_ini_block |$EGREP -e "FS_NAME|FS_SIZE|NFS_HOST|NFS_SHARE_OPTIONS|OWNER|GROUP"
+        log_msg -s  "\n"  -l ${LOGFILE}
+        log_msg -s  "Please wait while filesystem is being created,it may take some time ........"  -l ${LOGFILE}
+        $BASH ${NEW_TEMPL_DIR}/admin/bin/manage_storage_fs.bsh -p ${ENIQ_INST_DIR} -f -l ${LOGFILE} >/dev/null
+        if [ $? -ne 0 ];then
+            
+	    if [ "${SAN_DEVICE}" == "unityXT" ]; then
+			$UEMCLI -d ${_spa_ip_} -noHeader /stor/prov/fs/nfs show | $GREP -w "${_nas_pool_}/${_filesystem_name_}" >/dev/null 2>&1
+	    else
+			$NASCLI list_shares | $GREP -w "${_nas_pool_}/${_filesystem_name_}" >/dev/null 2>&1
+	    fi
+
+	    if [ $? -eq 0 ];then
+                log_msg -s "ERROR : Failure detected while FS operation on coordinator "  -l ${LOGFILE}
+                remove_file_system
+            else
+                $CP -rp ${TEM_DIR}/storage_ini_template ${_ini_file_name_}
+                $CP -rp ${TEM_DIR}/SunOS_ini_template ${SUNOS_INI_TEMPLATE}
+                run_remote_engine "$CP -rp ${PMDATA_FILE_SYSTEM_FILE}_orig ${PMDATA_FILE_SYSTEM_FILE}"
+                remove_disable_oss
+                _err_msg_="Failed to create new NAS file system"
+                abort_script "$_err_msg_"
+            fi
+        fi
+
+        if [ "${CURR_SERVER_TYPE}" == "stats_coordinator" ]; then
+            for _line_ in `$CAT ${TEM_DIR}/server_order_list |grep -v stats_coordinator`
+            do
+			    unset i _count_ _serv_hostname_
+	            _count_=`$ECHO "${_line_}" | grep -o "::" | wc -l`
+
+	            if [ "${_ip_type_}" == "IPv6" ] && [ "${_count_}" == 3 ]; then
+		            i=`$ECHO ${_line_} | grep -oE '([a-fA-F0-9]{1,4}::?){1,7}[a-fA-F0-9]{1,4}' | head -n 1 | awk -F "::" '{ print $1 "::" $2}'`
+			    _serv_hostname_=`$ECHO ${_line_} | $AWK -F"::" '{print $3}'`
+	            else
+		            i=`$ECHO ${_line_} | $AWK -F"::" '{print $1}'`
+			    _serv_hostname_=`$ECHO ${_line_} | $AWK -F"::" '{print $2}'`
+	            fi
+			    if [ "${_ip_type_}" == "IPv6" ]; then
+				    $SCP -6 -rp -o StrictHostKeyChecking=no ${_ini_file_name_} [${i}]:${_ini_file_name_}
+                    if [ $? -ne 0 ];then
+                        log_msg -s "ERROR : Failure detected while copying ${_ini_file_name_} on server ${i}"  -l ${LOGFILE}
+                        remove_file_system
+                    fi
+                    $SCP -6 -rp -o StrictHostKeyChecking=no ${SUNOS_INI_TEMPLATE} [${i}]:${SUNOS_INI_TEMPLATE}
+				else
+				    $SCP -rp -o StrictHostKeyChecking=no ${_ini_file_name_} ${i}:${_ini_file_name_}
+                    if [ $? -ne 0 ];then
+                        log_msg -s "ERROR : Failure detected while copying ${_ini_file_name_} on server ${i}"  -l ${LOGFILE}
+                        remove_file_system
+                    fi
+                    $SCP -rp -o StrictHostKeyChecking=no ${SUNOS_INI_TEMPLATE} ${i}:${SUNOS_INI_TEMPLATE}
+				fi
+                if [ $? -ne 0 ];then
+                    log_msg -s "ERROR : Failure detected while copying ${SUNOS_INI_TEMPLATE} on server ${i}" -l ${LOGFILE}
+                    remove_file_system
+                fi
+                run_remote_cmd "${_serv_hostname_}"  "$BASH ${NEW_TEMPL_DIR}/admin/bin/manage_storage_fs.bsh -p ${ENIQ_INST_DIR} -f -l ${LOGFILE} "
+                if [ $?  -ne 0 ];then
+                    log_msg -s "ERROR : Failure detected while FS operation on server ${i}" -l ${LOGFILE}
+                    remove_file_system
+                fi
+            done
+        fi
+
+        update_fls_conf_file
+
+        if [ "${ENM_NEW}" != "YES" ];then
+            remove_disable_oss
+        fi
+
+        log_msg -s "Successfully configured ENM $OSS_ALIAS_NAME as FLS"
+
+        if [ "${ENM_TYPE}" = "pENM" ] || [ "${ENM_TYPE}" = "vENM" ]; then
+            if [ -f ${PMDATA_FILE_SYSTEM_FILE} ]; then
+                $RM -rf  ${PMDATA_FILE_SYSTEM_FILE}
+                log_msg -s "Deleting pmdata_fs_mount as FLS is configured" -l ${LOGFILE} 
+            fi
+        fi
+
+
+
+########################################################################################
+    elif [ ${ACTION} == "symlink" ];then
+        if [ "${ENM_TYPE}" = "cENM" ] || [ "${ENM_TYPE}" = "vENM" ] || [ "${ENM_TYPE}" = "pENM" ]; then
+            $ECHO "Skipping the conversion to Symlink mode as it is not supported for ${ENM_TYPE} Integration" | $TEE -a ${LOGFILE}
+            exit 0
+        else
+            print_header  "Checking configuration for ENM $OSS_ALIAS_NAME  " 
+            check_symlink
+		    
+            # Get oss sys id and pmlinks information taken from user.   
+            if [ "${ENM_TYPE}" != "vENM" ]; then
+                get_oss_sys_id
+                get_pmlinks_info
+            else
+                get_pmlinks_info
+            fi
+		    
+            get_mount_point
+		    
+            check_mount_point_status
+		    
+            if [ $_mp_status_ -eq 0 ];then
+                revert_nas_entry_storage_template
+                revert_sunos_template
+                log_msg -s "Unmounting ENM file system\n" -l ${LOGFILE}
+                touch_disable_oss
+		    
+                print_header  "Deleting ENM NAS file system" 
+                if [ "${CURR_SERVER_TYPE}" == "stats_coordinator" ]; then
+                    SCP_FLAG=0 
+                    for _line_ in `$CAT ${TEM_DIR}/server_order_list |grep -v stats_coordinator`
+                    do
+		            unset i _count_
+	                    _count_=`$ECHO "${_line_}" | grep -o "::" | wc -l`
+
+	                    if [ "${_ip_type_}" == "IPv6" ] && [ "${_count_}" == 3 ]; then
+		                    i=`$ECHO ${_line_} | grep -oE '([a-fA-F0-9]{1,4}::?){1,7}[a-fA-F0-9]{1,4}' | head -n 1 | awk -F "::" '{ print $1 "::" $2}'`
+	                    else
+		                    i=`$ECHO ${_line_} | $AWK -F"::" '{print $1}'`
+	                    fi
+		            if [ "${_ip_type_}" == "IPv6" ]; then
+                                $SCP -6 -rp -o StrictHostKeyChecking=no ${_ini_file_name_} [${i}]:${_ini_file_name_}
+                                if [ $? -ne 0 ];then
+                                    SCP_FLAG=1
+                                fi
+                                $SCP -6 -rp -o StrictHostKeyChecking=no ${SUNOS_INI_TEMPLATE} [${i}]:${SUNOS_INI_TEMPLATE}
+	              	    else
+				$SCP -rp -o StrictHostKeyChecking=no ${_ini_file_name_} ${i}:${_ini_file_name_}
+                                if [ $? -ne 0 ];then
+                                    SCP_FLAG=1
+                                fi
+                                $SCP -rp -o StrictHostKeyChecking=no ${SUNOS_INI_TEMPLATE} ${i}:${SUNOS_INI_TEMPLATE}
+			    fi
+                        if [ $? -ne 0 ];then
+                            SCP_FLAG=1
+                        fi
+                    done
+                    if [ $SCP_FLAG -eq 1 ];then
+                        for _line_ in `$CAT ${TEM_DIR}/server_order_list |grep -v stats_coordinator`
+                        do
+			        unset i _count_
+	                        _count_=`$ECHO "${_line_}" | grep -o "::" | wc -l`
+
+	                        if [ "${_ip_type_}" == "IPv6" ] && [ "${_count_}" == 3 ]; then
+		                        i=`$ECHO ${_line_} | grep -oE '([a-fA-F0-9]{1,4}::?){1,7}[a-fA-F0-9]{1,4}' | head -n 1 | awk -F "::" '{ print $1 "::" $2}'`
+	                        else
+		                        i=`$ECHO ${_line_} | $AWK -F"::" '{print $1}'`
+	                        fi
+		                if [ "${_ip_type_}" == "IPv6" ]; then
+                                    $SCP -6 -rp -o StrictHostKeyChecking=no  ${TEM_DIR}/storage_ini_template [${i}]:${_ini_file_name_}
+                                    $SCP -6 -rp -o StrictHostKeyChecking=no  ${TEM_DIR}/SunOS_ini_template [${i}]:${SUNOS_INI_TEMPLATE}
+				else
+				    $SCP -rp -o StrictHostKeyChecking=no  ${TEM_DIR}/storage_ini_template ${i}:${_ini_file_name_}
+                                    $SCP -rp -o StrictHostKeyChecking=no  ${TEM_DIR}/SunOS_ini_template ${i}:${SUNOS_INI_TEMPLATE}
+				fi
+                        done
+                            $CP -rp ${TEM_DIR}/storage_ini_template ${_ini_file_name_}
+                            $CP -rp ${TEM_DIR}/SunOS_ini_template ${SUNOS_INI_TEMPLATE}
+                            remove_disable_oss
+                            _err_msg_="Error in SCP of deployment file : ${_ini_file_name_} or ${SUNOS_INI_TEMPLATE}"
+                            abort_script "$_err_msg_"
+                    else
+                        log_msg -s "Successfully copied ${_ini_file_name_} and ${SUNOS_INI_TEMPLATE} to all the blades"
+                    fi
+                fi
+		    
+                log_msg -q -s  "Executing $BASH ${NEW_TEMPL_DIR}/admin/bin/manage_storage_fs.bsh -r ${ENIQ_INST_DIR} -f -l ${LOGFILE}"  -l ${LOGFILE}
+                log_msg -s  "Please wait while file system is being deleted,it may take some time ........"  -l ${LOGFILE}
+                $BASH ${NEW_TEMPL_DIR}/admin/bin/manage_storage_fs.bsh -r ${ENIQ_INST_DIR} -f -l ${LOGFILE} >/dev/null
+                if [ $? -ne 0 ];then
+                    _err_msg_="Error in deleting FLS NAS file system"
+                    if [ "${CURR_SERVER_TYPE}" == "stats_coordinator" ]; then
+                        $NASCLI list_shares |$EGREP  -w ${_filesystem_name_}
+                        if [ $? -eq 0 ] ; then
+                            $MOUNT -l |$EGREP -w ${_filesystem_name_} 
+                            if [ $? -eq 0 ] ; then
+                                for _line_ in `$CAT ${TEM_DIR}/server_order_list |grep -v stats_coordinator`
+                                do
+					unset i _count_ _serv_hostname_
+	                                _count_=`$ECHO "${_line_}" | grep -o "::" | wc -l`
+
+	                                if [ "${_ip_type_}" == "IPv6" ] && [ "${_count_}" == 3 ]; then
+		                                i=`$ECHO ${_line_} | grep -oE '([a-fA-F0-9]{1,4}::?){1,7}[a-fA-F0-9]{1,4}' | head -n 1 | awk -F "::" '{ print $1 "::" $2}'`
+						_serv_hostname_=`$ECHO ${_line_} | $AWK -F"::" '{print $3}'`
+	                                else
+		                                i=`$ECHO ${_line_} | $AWK -F"::" '{print $1}'`
+						_serv_hostname_=`$ECHO ${_line_} | $AWK -F"::" '{print $2}'`
+	                                fi
+					if [ "${_ip_type_}" == "IPv6" ]; then
+                                               $SCP -6 -rp -o StrictHostKeyChecking=no  ${TEM_DIR}/storage_ini_template [${i}]:${_ini_file_name_}
+                                        else
+					       $SCP -rp -o StrictHostKeyChecking=no  ${TEM_DIR}/storage_ini_template ${i}:${_ini_file_name_}
+					fi
+					run_remote_cmd "${_serv_hostname_}"  "$BASH ${NEW_TEMPL_DIR}/admin/bin/manage_storage_fs.bsh -p ${ENIQ_INST_DIR} -f -l ${LOGFILE} "
+                                done
+                                remove_disable_oss
+                                abort_script "$_err_msg_"
+                            fi
+                        else
+                            rollback_stage
+                            remove_disable_oss
+                            abort_script "$_err_msg_"
+                        fi
+                    else
+                        rollback_stage
+                        remove_disable_oss
+                        abort_script "$_err_msg_"
+                    fi
+                else
+                    log_msg -s "Successfully deleted FLS NAS file system" -l ${LOGFILE}
+                fi
+            else
+                    log_msg -s "${PM_SYM_LINKS_DIR}${OSS_ALIAS}${PMDATA_MOUNT_POINT} NAS file system is already deleted"
+            fi
+            
+             revert_symlink_entry_connectd_config
+            
+             update_fls_conf_file
+            
+             print_header  "Mounting ENM filesystem " 
+            
+             remove_disable_oss
+             log_msg -s "Successfully configured ENM ${OSS_ALIAS_NAME} as symlink  " -l ${LOGFILE}
+        fi
+    fi
+elif [ "${STORAGE_TYPE}" == "fs" ];then
+    if [ ${ACTION} == "fls" ];then
+        if [ "${ENM_NEW}" != "YES" ];then
+            print_header "Checking configuration for ENM $OSS_ALIAS_NAME " 
+            check_fls
+        else
+            check_alias
+        fi
+        get_owner_group
+
+        print_header "Configuring ENM $OSS_ALIAS_NAME as FLS" 
+
+        if [ "${ENM_TYPE}" = "pENM" ] || [ "${ENM_TYPE}" = "vENM" ]; then
+            if [ "${ENM_NEW}" != "YES" ];then
+                # Get the pmlinks information taken from user.   
+                get_pmlinks_info 
+                unmount_symlink_dir
+                remove_symlink_entry
+            fi
+        fi
+
+        print_header "Creating new LVM file system" 
+
+        lvm_fs_create
+
+        update_fls_conf_file
+
+        if [ "${ENM_NEW}" != "YES" ];then
+            remove_disable_oss
+        fi
+
+        log_msg -s "Successfully configured ENM $OSS_ALIAS_NAME as FLS"
+
+        if [ "${ENM_TYPE}" = "pENM" ] || [ "${ENM_TYPE}" = "vENM" ]; then
+            if [ -f ${PMDATA_FILE_SYSTEM_FILE} ]; then
+                $RM -rf  ${PMDATA_FILE_SYSTEM_FILE}
+                log_msg -s "Deleting pmdata_fs_mount as FLS is configured" -l ${LOGFILE} 
+            fi
+        fi
+
+########
+    elif [ ${ACTION} == "symlink" ];then
+        if [ "${ENM_TYPE}" = "cENM" ] || [ "${ENM_TYPE}" = "vENM" ] || [ "${ENM_TYPE}" = "pENM" ]; then
+            $ECHO "Skipping the conversion to Symlink mode as it is not supported for ${ENM_TYPE} Integration" | $TEE -a ${LOGFILE}
+            exit 0
+        else
+            print_header "Checking configuration for ENM $OSS_ALIAS_NAME  " 
+            check_symlink
+            # Get the SYS Id and pmlinks information stored.
+            if [ "${ENM_TYPE}" != "vENM" ]; then
+                get_oss_sys_id
+                get_pmlinks_info
+            else
+                get_pmlinks_info
+            fi
+		    
+            get_mount_point
+		    
+            check_mount_point_status
+		    
+            if [ $_mp_status_ -eq 0 ];then
+                log_msg -s "Unmounting ENM file system\n" -l ${LOGFILE}
+                touch_disable_oss
+                while true
+                do
+                    $MOUNT -l |$EGREP -v ${_mp_}|$EGREP ${OSS_ALIAS_NAME} >/dev/null
+                    if [ $? -eq 0 ];then
+                        log_msg -s "Waiting for ENM FS to unmount" -l ${LOGFILE}
+                        $SLEEP 5
+                    else
+                        break
+                    fi
+                done
+                print_header "Deleting ENM LVM file system" 
+                lvm_fs_delete
+            else
+                log_msg -s "${PM_SYM_LINKS_DIR}${OSS_ALIAS}${PMDATA_MOUNT_POINT} LVM file system is already deleted" -l ${LOGFILE}
+            fi
+		    
+            revert_symlink_entry_connectd_config
+            update_fls_conf_file
+		    
+            print_header "Mounting ENM filesystem " 
+            remove_fstab_entries
+            remove_disable_oss
+            log_msg -s "Successfully configured ENM ${OSS_ALIAS_NAME} as symlink  " -l ${LOGFILE}
+        fi
+    fi
+
+fi
+
+if [ -f "/eniq/sw/conf/Persisted.ser" ] ; then 
+    log_msg -s "Persistent file found /eniq/sw/conf/Persisted.ser. Deleting the file....!!"  -l ${LOGFILE} 
+    $RM -rf /eniq/sw/conf/Persisted.ser 
+fi 
+
+exit 0

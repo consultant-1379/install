@@ -1,0 +1,110 @@
+#!/bin/bash
+# ********************************************************************
+# Ericsson Radio Systems AB                                     SCRIPT
+# ********************************************************************
+#
+# (c) Ericsson Radio Systems AB 2018 - All rights reserved.
+#
+# The copyright to the computer program(s) herein is the property
+# of Ericsson Radio Systems AB, Sweden. The programs may be used
+# and/or copied only with the written permission from Ericsson Radio
+# Systems AB or in accordance with the terms and conditions stipulated
+# in the agreement/contract under which the program(s) have been
+# supplied.
+#
+# ********************************************************************
+# Name    : updateVersionDB.bsh
+# Date    : 08/05/2018
+# Purpose : Script to update versiondb.properties file before platform upgrade to avoid upgrade failure.     
+# Usage   : updateVersionDB.bsh
+#
+# ********************************************************************
+#
+# Command Section
+#
+# ********************************************************************
+
+LS=/usr/bin/ls
+GREP=/usr/bin/grep
+ECHO=/usr/bin/echo
+WC=/usr/bin/wc
+CUT=/usr/bin/cut
+CAT=/usr/bin/cat
+SED=/usr/bin/sed
+DATE=/usr/bin/date
+RM=/usr/bin/rm
+
+
+HOME_DIR=/eniq/home/dcuser
+LOG_DIR=/eniq/log/sw_log
+CURR_DIR=`pwd`
+
+if [ -z "${CONF_DIR}" ] ; then
+  EchoText "ERROR: CONF_DIR is not set"
+  exit 1
+fi
+
+if [ ! -r "${CONF_DIR}/niq.rc" ] ; then
+  EchoText "ERROR: Source file is not readable at ${CONF_DIR}/niq.rc"
+  exit 2
+fi
+
+. ${CONF_DIR}/niq.rc
+
+HOSTNAME=`hostname`
+
+INSTALLED_MODULES=$HOME_DIR/installed_modules.txt
+VERSIONDBPROPERTIES=${INSTALLER_DIR}/versiondb.properties
+LOG_FILE=${LOG_DIR}/updateVersionDB`$DATE '+%Y%m%d_%H%M%S'`.log
+
+EchoText() {
+   $ECHO $*
+   $ECHO `$DATE '+%Y-%m-%d %H:%M:%S': ` $* >> ${LOG_FILE}
+}
+
+cleanup() {
+	$RM $INSTALLED_MODULES
+	if [ -f $CURR_DIR/temp_vdb_props ] ;
+	then
+		$RM $CURR_DIR/temp_vdb_props
+	fi
+}
+##take backup
+##$CAT $VERSIONDBPROPERTIES > ${INSTALLER_DIR}/versiondbproperties_backup
+
+$LS $PLATFORM_DIR > $INSTALLED_MODULES
+
+while IFS='-' read module rstate
+do
+	EchoText "$module = $rstate"
+	count=`$GREP -w $module $VERSIONDBPROPERTIES | $WC -l | xargs`
+	if [[ $count -gt 1 ]];then
+		## delete all the entries
+		EchoText "deleting duplicate entries from the versiondb.properties file"
+		$GREP -v -w $module $VERSIONDBPROPERTIES > $CURR_DIR/temp_vdb_props
+		$CAT $CURR_DIR/temp_vdb_props > $VERSIONDBPROPERTIES
+	fi
+	curr_module=`$GREP -i -w $module $VERSIONDBPROPERTIES `
+	if [[ ! -z $curr_module ]]; then
+		curr_module_name="$($ECHO $curr_module | $CUT -d'=' -f1)"
+		curr_module_rstate="$($ECHO $curr_module | $CUT -d'=' -f2)"
+		EchoText "$curr_module_name = $curr_module_rstate"
+		
+		if [[ $rstate == $curr_module_rstate ]];then
+			EchoText "entry already exists"
+		else
+			##replace the rstate with latest
+			EchoText "Replacing correct Rstate"
+			$SED "s/$curr_module_rstate/$rstate/g" $VERSIONDBPROPERTIES > $CURR_DIR/temp_vdb_props
+			$CAT $CURR_DIR/temp_vdb_props > $VERSIONDBPROPERTIES
+		fi
+	else
+		##insert the entry
+		EchoText "Inserting missing entry"
+		$ECHO "module.$module=$rstate" >> $VERSIONDBPROPERTIES
+	fi
+	EchoText "---------------------------------------------"
+	
+done < $INSTALLED_MODULES
+
+cleanup

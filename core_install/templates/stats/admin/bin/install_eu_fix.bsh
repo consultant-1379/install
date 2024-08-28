@@ -1,0 +1,665 @@
+#!/bin/bash
+# ********************************************************************
+# Ericsson Radio Systems AB                                     SCRIPT
+# ********************************************************************
+#
+#
+# (c) Ericsson Radio Systems AB 2012 - All rights reserved.
+#
+# The copyright to the computer program(s) herein is the property
+# of Ericsson Radio Systems AB, Sweden. The programs may be used
+# and/or copied only with the written permission from Ericsson Radio
+# Systems AB or in accordance with the terms and conditions stipulated
+# in the agreement/contract under which the program(s) have been
+# supplied.
+#
+# ********************************************************************
+# Name    : install_eu_fix.bsh
+# Date    : 30/01/2012
+# Revision: PA1
+# Purpose : Script to automatically copy the contents of an emergency EU
+#			and overwrite problematic LLSV content. For ENIQ Statistics
+#			on Rack mounted servers.
+#
+# Usage   : install_eu_fix.bsh
+#
+# ********************************************************************
+#
+#   Command Section
+#
+# ********************************************************************
+AWK=/usr/bin/awk
+BASENAME=/usr/bin/basename
+BASH=/usr/bin/bash
+BC=/usr/bin/bc
+BOOTADM=/usr/sbin/bootadm
+CAT=/usr/bin/cat
+CHMOD=/usr/bin/chmod
+CHOWN=/usr/bin/chown
+CLEAR=/usr/bin/clear
+CMP=/usr/bin/cmp
+CP=/usr/bin/cp
+CPIO=/usr/bin/cpio
+DATE=/usr/bin/date
+DIRNAME=/usr/bin/dirname
+DLADM=/usr/sbin/dladm
+DOMAINNAME=/usr/bin/domainname
+DTCONFIG=/usr/dt/bin/dtconfig
+DUMPADM=/usr/sbin/dumpadm
+ECHO=/usr/bin/echo
+EGREP=/usr/bin/egrep
+EJECT=/usr/bin/eject
+ENV=/usr/bin/env
+EXPR=/usr/bin/expr
+FIND=/usr/bin/find
+FLARCREATE=/usr/sbin/flarcreate
+FORMAT=/usr/sbin/format
+FUSER=/usr/sbin/fuser
+GEGREP=/usr/sfw/bin/gegrep
+GETENT=/usr/bin/getent
+GETTEXT=/usr/bin/gettext
+GREP=/usr/bin/grep
+GROUPADD=/usr/sbin/groupadd
+GTAR=/usr/sfw/bin/gtar
+GZCAT=/usr/bin/gzcat
+GZIP=/usr/bin/gzip
+HEAD=/usr/bin/head
+MYHOSTNAME=/usr/bin/hostname
+ID=/usr/bin/id
+IFCONFIG=/usr/sbin/ifconfig
+INIT=/usr/sbin/init
+LN=/usr/bin/ln
+LS=/usr/bin/ls
+MKDIR=/usr/bin/mkdir
+MORE=/usr/bin/more
+MOUNT=/usr/sbin/mount
+MV=/usr/bin/mv
+NAWK=/usr/bin/nawk
+NSLOOKUP=/usr/sbin/nslookup
+PGREP=/usr/bin/pgrep
+PING=/usr/sbin/ping
+PKGADD=/usr/sbin/pkgadd
+PKGINFO=/usr/bin/pkginfo
+PKGRM=/usr/sbin/pkgrm
+PRTCONF=/usr/sbin/prtconf
+PSRINFO=/usr/sbin/psrinfo
+PWD=/usr/bin/pwd
+REBOOT=/usr/sbin/reboot
+RM=/usr/bin/rm
+RCP=/usr/bin/rcp
+RSH=/usr/bin/rsh
+SED=/usr/bin/sed
+SEVEN_Z=/usr/bin/7z
+SLEEP=/usr/bin/sleep
+SORT=/usr/bin/sort
+STMSBOOT=/usr/sbin/stmsboot
+SU=/usr/bin/su
+SVCADM=/usr/sbin/svcadm
+SVCCFG=/usr/sbin/svccfg
+SVCS=/usr/bin/svcs
+SWAP=/usr/sbin/swap
+SYNC=/usr/sbin/sync
+TAIL=/usr/bin/tail
+TAR=/usr/sbin/tar
+TEE=/usr/bin/tee
+TOUCH=/usr/bin/touch
+TPUT=/usr/bin/tput
+TR=/usr/bin/tr
+UADMIN=/usr/sbin/uadmin
+UMOUNT=/usr/sbin/umount
+UNAME=/usr/bin/uname
+USERADD=/usr/sbin/useradd
+VOLD=/usr/sbin/vold
+WC=/usr/bin/wc
+YES=/usr/bin/yes
+ZFS=/usr/sbin/zfs
+ZPOOL=/usr/sbin/zpool
+
+# ********************************************************************
+#
+#       Configuration Section
+#
+# ********************************************************************
+
+# Default user
+DEFAULT_USER=root
+
+
+
+# ********************************************************************
+#
+#   Functions
+#
+# ********************************************************************
+### Function: abort_script ###
+#
+#   This will is called if the script is aborted thru an error
+#   signal sent by the kernel such as CTRL-C or if a serious
+#   error is encountered during runtime
+#
+# Arguments:
+#       $1 - Error message from part of program (Not always used)
+# Return Values:
+#       none
+abort_script()
+{
+_err_time_=`$DATE '+%Y-%b-%d_%H.%M.%S'`
+
+if [ "$1" ]; then
+    _err_msg_="${_err_time_} - $1"
+else
+    _err_msg_="${_err_time_} - ERROR : Script aborted.......\n"
+fi
+
+if [ "${LOGFILE}" ]; then
+    $ECHO "\nERROR : $_err_msg_\n" | $TEE -a ${LOGFILE}
+else
+    $ECHO "\nERROR : $_err_msg_\n"
+fi
+
+cd $SCRIPTHOME
+$RM -rf ${TEM_DIR}
+
+if [ "$2" ]; then
+    if [ ! "${UPGRADE}" -a ! "${RESTORE}" ]; then
+    	${2}
+    fi
+    exit 1
+else
+    exit 1
+fi
+}
+
+### Function: common_loop ###
+#
+#   Check content in eu path & locate within llsv
+#
+# Arguments:
+#       $1 : User ID name
+# Return Values:
+#       none
+
+common_loop()
+{
+while :; do
+	$ECHO "\nPlease enter the correct path where file will be stored:"
+	read _full_dir_path_
+	if [ ${_full_dir_path_} ]; then
+		_check_path_=`ls ${_full_dir_path_}`
+		if [ $? -ne 0 ]; then
+		 	_err_msg_="Invalid path."
+		else
+			_check_path_=`ls ${_full_dir_path_}`
+			if [ $? -ne 0 ]; then
+			 	_err_msg_="Invalid path."
+			else
+				break
+			fi
+		fi
+	fi
+done
+}
+
+
+### Function: check_content ###
+#
+#   Check content in eu path & locate within llsv
+#
+# Arguments:
+#       $1 : User ID name
+# Return Values:
+#       none
+check_content()
+{
+TMP=/tmp
+$ECHO "${RUN_TIME} -Checking Content" >> ${LOGFILE}
+for i in ${ENIQ_SOURCE_DIR}/*; do
+	_file_name_=`basename $i`
+	# Removes Rstate/extention (if exists)
+	_file_=`$ECHO ${_file_name_} | $SED 's/_R/ /g;s/-R/ /g' | $SED 's/_E/ /g;s/-E/ /g' | $SED s'/\./ /' | $NAWK '{print $1}'`
+	_search_=$( find ${ENIQ_DEST_DIR} -name "${_file_}*" )
+	# check to see if more than one path is returned
+	_entries_=`ls $_search_ | $NAWK '{n++} END {print n}'`
+	if [ $_entries_ -gt "1"  -a ! -d ${i} ]; then
+		# Print out two paths
+		$ECHO "Similar files were found for: ${_file_}."
+		$ECHO ${_search_} | tr ' ' '\n'
+		common_loop
+		$ECHO "${CP}_-R_${i}_${_full_dir_path_}" >> ${TMP}/eu_files.$$.txt
+		if [ $? -ne 0 ]; then
+		    _err_msg_="Unable to copy information to tmp file: ${TMP}/eu_files.$$.txt."
+		    abort_script "$_err_msg_"
+		fi
+	else
+		# Check does the file/directory exists on llsv path
+		if [[ ! ${_search_} ]]; then
+			if [ -d ${i} ]; then
+				# if its a dir & doesn't already exist on the server, ask for path location#
+				_msg_="->Directory Found: ${i}.\nDo you want to copy entire directory? [Yes | No] (Case sensitive)"
+	    		user_confirm "${_msg_}"
+				if [ ${ANS} == "Yes" ]; then
+					common_loop
+					$ECHO "${CP}_-R_${i}_${_full_dir_path_}" >> ${TMP}/eu_files.$$.txt
+					if [ $? -ne 0 ]; then
+					    _err_msg_="Unable to copy information to tmp file: ${TMP}/eu_files.$$.txt."
+					    abort_script "$_err_msg_"
+					fi
+				else
+					for j in ${i}/*; do
+						_new_file_=`basename $j`
+						# Removes Rstate/extention (if exists)
+						_file_=`$ECHO ${_new_file_} | $SED 's/_R/ /g;s/-R/ /g' | $SED 's/_E/ /g;s/-E/ /g' | $SED s'/\./ /' | $NAWK '{print $1}'`
+						_new_search_=$( find ${ENIQ_DEST_DIR} -name ${_file_}* )
+						if [[ ! ${_new_search_} ]]; then
+							_msg_="->File Found within Directory: ${j}\nFile does not exist your your server. Do you want to copy this file? [Yes | No] (Case sensitive)"
+							user_confirm "${_msg_}"
+							if [ ${ANS} == "Yes" ]; then
+								common_loop
+								$ECHO "${CP}_-R_${j}_${_full_dir_path_}" >> ${TMP}/eu_files.$$.txt
+								if [ $? -ne 0 ]; then
+								    _err_msg_="Unable to copy information to tmp file: ${TMP}/eu_files.$$.txt."
+								    abort_script "$_err_msg_"
+								fi
+							fi
+						else
+							_multiple_files_=`$ECHO ${_new_search_} | tr ' ' '\n' | wc -l`
+							if [[ ${_multiple_dirs_} -eq "1" ]]; then
+								_location_=`dirname ${_new_search_}`
+								$ECHO "${CP}_-R_${j}_${_location_}" >> ${TMP}/eu_files.$$.txt
+								if [ $? -ne 0 ]; then
+							    	_err_msg_="Unable to copy information to tmp file: ${TMP}/eu_files.$$.txt."
+							    	abort_script "$_err_msg_"
+								fi
+							else
+								# Print out two paths
+								$ECHO "\nSimilar files were found for: ${_file_}\nFull name: ${j}"
+								$ECHO ${_search_} | tr ' ' '\n'
+								common_loop
+								$ECHO "${CP}_-R_${i}_${_full_dir_path_}" >> ${TMP}/eu_files.$$.txt
+								if [ $? -ne 0 ]; then
+								    _err_msg_="Unable to copy information to tmp file: ${TMP}/eu_files.$$.txt."
+								    abort_script "$_err_msg_"
+								fi
+							fi
+
+						fi
+					done
+				fi
+			else
+				_msg_="->File Found: ${i} doesn't exist\nDo you want to copy this file? [Yes | No] (Case sensitive)"
+				user_confirm "${_msg_}"
+				if [ ${ANS} == "Yes" ]; then
+					common_loop
+					$ECHO "${CP}_-R_${i}_${_full_dir_path_}" >> ${TMP}/eu_files.$$.txt
+					if [ $? -ne 0 ]; then
+					    _err_msg_="Unable to copy information to tmp file: ${TMP}/eu_files.$$.txt."
+					    abort_script "$_err_msg_"
+					fi
+				else
+					$ECHO "Not Copying File: ${i} " >> ${LOGFILE}
+				fi
+			fi
+		else
+			# Exists in LLSV path, but a directory
+			if [ -d ${i} ]; then
+				_multiple_dirs_=`$ECHO ${_search_} | tr ' ' '\n' | wc -l`
+				if [ ${_multiple_dirs_} -eq "1" ]; then
+					_msg_="->Directory Found: ${i}\nDo you want to overwrite ${_search_} ? [Yes | No] (Case sensitive)"
+					user_confirm "${_msg_}"
+					if [ ${ANS} == "Yes" ]; then
+						# Update tmp_file with cp -R file//location
+						_location_=`dirname ${_search_}`
+						$ECHO "${CP}_-R_${i}_${_location_}" >> ${TMP}/eu_files.$$.txt
+						if [ $? -ne 0 ]; then
+						    _err_msg_="Unable to copy information to tmp file: ${TMP}/eu_files.$$.txt."
+						    abort_script "$_err_msg_"
+						fi
+					else
+						# Before Search, check if there's anything in the directory
+						if [ -s ${i}/ ]; then
+							for j in ${i}/*; do
+								_new_file_=`basename $j`
+								# Removes Rstate/extention (if exists)
+								_file_=`$ECHO ${_new_file_} | $SED 's/_R/ /g;s/-R/ /g' | $SED 's/_E/ /g;s/-E/ /g' | $SED s'/\./ /' | $NAWK '{print $1}'`
+								_new_search_=$( find ${ENIQ_DEST_DIR} -name ${_file_}* )
+								if [[ ! ${_new_search_} ]]; then
+									$ECHO "Going Through Directory's Contents..."
+									_msg_="->File Found: ${j}\nDoes not exist on ${ENIQ_DEST_DIR}\nDo you want to copy this file?? [Yes | No] (Case sensitive)"
+									user_confirm "${_msg_}"
+									if [ ${ANS} == "Yes" ]; then
+										common_loop
+										$ECHO "${CP}_-R_${j}_${_full_dir_path_}" >> ${TMP}/eu_files.$$.txt
+										if [ $? -ne 0 ]; then
+										    _err_msg_="Unable to copy information to tmp file: ${TMP}/eu_files.$$.txt."
+										    abort_script "$_err_msg_"
+										fi
+									else
+										$ECHO "Not Copying File: ${i} " >> ${LOGFILE}
+									fi
+								else
+									_multiple_dirs_=`$ECHO ${_new_search_} | tr ' ' '\n' | wc -l`
+									if [ ${_multiple_dirs_} -ne "1" ]; then
+										$ECHO "\nSimilar files were found for: ${_file_}."
+										$ECHO ${_search_} | tr ' ' '\n'
+										common_loop
+										$ECHO "${CP}_-R_${j}_${_full_dir_path_}" >> ${TMP}/eu_files.$$.txt
+										if [ $? -ne 0 ]; then
+										    _err_msg_="Unable to copy information to tmp file: ${TMP}/eu_files.$$.txt."
+										    abort_script "$_err_msg_"
+										fi
+									else
+										_location_=`dirname ${_new_search_}`
+										$ECHO "${CP}_-R_${j}_${_location_}" >> ${TMP}/eu_files.$$.txt
+										if [ $? -ne 0 ]; then
+										    _err_msg_="Unable to copy information to tmp file: ${TMP}/eu_files.$$.txt."
+										    abort_script "$_err_msg_"
+										fi
+									fi
+								fi
+							done
+						else
+							$ECHO "->Directory Empty."
+						fi
+					fi
+					else
+						# Print out two paths
+						$ECHO "\nSimilar Directories were found for: ${_file_}."
+						$ECHO ${_search_} | tr ' ' '\n'
+						common_loop
+						$ECHO "${CP}_-R_${i}_${_full_dir_path_}" >> ${TMP}/eu_files.$$.txt
+						if [ $? -ne 0 ]; then
+						    _err_msg_="Unable to copy information to tmp file: ${TMP}/eu_files.$$.txt."
+						    abort_script "$_err_msg_"
+						fi
+					fi
+			else
+				_location_=`dirname ${_search_}`
+				$ECHO "${CP}_-R_${i}_${_location_}" >> ${TMP}/eu_files.$$.txt
+				if [ $? -ne 0 ]; then
+				    _err_msg_="Unable to copy information to tmp file: ${TMP}/eu_files.$$.txt."
+				    abort_script "$_err_msg_"
+				fi
+			fi
+		fi
+	fi
+done
+}
+
+### Function: check_id ###
+#
+#   Check that the effective id of the user is correct
+#   If not print error msg and exit.
+#
+# Arguments:
+#       $1 : User ID name
+# Return Values:search
+#       none
+check_id()
+{
+_check_id_=`$ID  | $AWK -F\( '{print $2}' | $AWK -F\) '{print $1}'`
+if [ "$_check_id_" != "$1" ]; then
+    _err_msg_="You must be $1 or have equal permissions to execute this script."
+    abort_script "$_err_msg_"
+fi
+}
+
+
+
+### Function: check_params ###
+#
+# Check Input Params
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+check_params()
+{
+# Must have SNAP_ACTION, & SNAP_FS
+if [ ! "${ENIQ_SOURCE_DIR}" -o ! "${ENIQ_DEST_DIR}" ]; then
+    usage_msg
+    exit 1
+fi
+
+}
+
+
+### Function: clean_up ###
+#
+# Clean up files
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+clean_up()
+{
+$RM -rf ${TMP}/eu_files.$$.txt
+}
+
+
+### Function: confirm_copy ###
+#
+# Copy files from eu to llsv path
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+confirm_copy()
+{
+$CLEAR
+if [ -f ${TMP}/eu_files.$$.txt ]; then
+	$ECHO "--------------------------------------------------------------------------"
+	$CAT ${TMP}/eu_files.$$.txt | ${SED} 's/_\// \//g' |  ${SED} 's/_-/ /g'  | $NAWK '/./' | $NAWK '{print $3 " -->> " $4}'
+	if [ $? -ne 0 ]; then
+	    _err_msg_="nothing to be carried out"
+	    abort_script "$_err_msg_"
+	fi
+	$ECHO "--------------------------------------------------------------------------"
+	_msg_="Please confirm. Do you wish to copy over the following file(s)? [Yes | No] (Case sensitive)"
+	user_confirm "${_msg_}"
+	if [ ${ANS} == "Yes" ]; then
+		# remove old files
+		_remove_files_=`$CAT ${TMP}/eu_files.$$.txt | ${SED} 's/_\// \//g' |  ${SED} 's/_-/ /g'  | $NAWK '/./' | $NAWK '{print $4}'`
+		$CAT ${TMP}/eu_files.$$.txt | ${SED} 's/_\// \//g' |  ${SED} 's/_-/ -/g' | $NAWK '/./' >> ${TMP}/eu_files.$$.$$.txt
+		_remove_name_=$( basename `$CAT ${TMP}/eu_files.$$.$$.txt | $NAWK '{print $3}' | $SED 's/_R/ /g;s/-R/ /g' | $SED 's/_E/ /g;s/-E/ /g' | $SED s'/\./ /' | $NAWK '{print $1}' ` )
+
+		# Only removing files, not entire directories
+
+		for j in ${_remove_files_}; do
+			if [ -f ${_remove_files_}/${_remove_name_}* ]; then
+				$RM -rf ${_remove_files_}/${_remove_name_}*
+			fi
+		done
+		$CAT ${TMP}/eu_files.$$.txt | ${SED} 's/_\// \//g' |  ${SED} 's/_-/ -/g' | $NAWK '/./' >> ${TMP}/eu_files.$$.$$.txt
+		while read line; do
+			$line
+		done < ${TMP}/eu_files.$$.$$.txt
+		if [ $? -ne 0 ]; then
+		    _err_msg_="A problem occurred whilst trying to copy ${i} to ${_source_}"
+		    abort_script "$_err_msg_"
+		else
+			$ECHO "Copy successfully."
+			# copy files across
+			$ECHO "Copying the following file(s):" >> ${LOGFILE}
+			$CAT ${TMP}/eu_files.$$.txt | ${SED} 's/_\// \//g' |  ${SED} 's/_-/ /g'  | $NAWK '/./' | $NAWK '{print $3 " " $4}' >> ${LOGFILE}
+			$ECHO "=======================================================\n" >> ${LOGFILE}
+			$ECHO "${RUN_TIME} - Completed EU Update" >> ${LOGFILE}
+			$ECHO "=======================================================\n" >> ${LOGFILE}
+
+		fi
+	else
+		$ECHO "Exiting"
+		$ECHO "${RUN_TIME} - User confirmed not to copy files\n" >> ${LOGFILE}
+		clean_up
+		exit 0
+	fi
+else
+	$ECHO "Exiting..."
+	$ECHO "${RUN_TIME} - No files to be copied over\n" >> ${LOGFILE}
+	clean_up
+	exit 0
+fi
+}
+
+### Function: setup_env ###
+#
+# Setup up path environment etc
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+setup_env()
+{
+if [ ! "${ENIQ_BASE_DIR}" ]; then
+    ENIQ_BASE_DIR=/eniq
+fi
+
+# Set the log directory
+ENIQ_LOG_DIR=${ENIQ_BASE_DIR}/local_logs
+LOGFILE_DIR="${ENIQ_LOG_DIR}/upgrade"
+}
+
+### Function: usage_msg ###
+#
+#   Print out the usage message
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+usage_msg()
+{
+$ECHO "
+Usage: `$BASENAME $0` -s <eu_directory_path> -d <llsv_directory_path> [ -l <logfile> ]
+
+options:
+
+-s  : Path where emergency eu tar file has been cache to.
+	Example /tmp/eniq_base_sw
+
+-d  : Path where latest LLSV has been cached to.
+	Example /var/tmp/eniq_base_sw
+
+-l  : Optional parameter specifying the full path to logfile.
+	If not specified, a logfile will be created in ${LOGFILE_DIR}
+"
+}
+
+
+### Function: user_confirm ###
+#
+# Confirm details
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+user_confirm()
+{
+if [ "$NO_CONFIRM" ]; then
+    ANS="Yes"
+    return
+fi
+
+local _msg_=$1
+local _file_=$2
+
+while :; do
+    if [ -f "$2" ]; then
+        $CAT $2
+    fi
+    $ECHO "\n${_msg_}"
+    read _ans_
+
+    if [ ! "${_ans_}" ]; then
+        continue
+    fi
+
+    if [ "${_ans_}" == "Yes" -o "${_ans_}" == "No" ]; then
+        ANS="${_ans_}"
+        break
+    fi
+done
+}
+
+
+# ********************************************************************
+#
+#   Main body of program
+#
+# ********************************************************************
+#
+RUN_TIME=`$DATE '+%Y-%b-%d_%H.%M.%S'`
+
+
+# Check that the effective id of the user is root
+check_id $DEFAULT_USER
+
+while getopts "s:d:l:" arg; do
+
+  case $arg in
+    s) ENIQ_SOURCE_DIR="$OPTARG"
+       ;;
+    d) ENIQ_DEST_DIR="$OPTARG"
+       ;;
+    l) LOGFILE="$OPTARG"
+       ;;
+   \?) usage_msg
+   	   exit 1
+       ;;
+  esac
+done
+shift `expr $OPTIND - 1`
+
+
+# Setup up path environment etc
+setup_env
+
+# Check Input Params
+check_params
+
+# Check if the eu has been untarred/zipped
+$ECHO ${ENIQ_SOURCE_DIR}/* | ${EGREP} -v "tar.gz"  >> /dev/null 2>&1
+if [ $? -ne 0 ]; then
+    _err_msg_="The file: ${ENIQ_SOURCE_DIR} needs to be uncompressed."
+     abort_script "$_err_msg_"
+fi
+
+# Check if directory submitted is correct - should be: eniq_base_sw/
+$ECHO ${ENIQ_SOURCE_DIR} | ${EGREP} "eniq_base_sw"  >> /dev/null 2>&1
+if [ $? -ne 0 ]; then
+    _err_msg_="Incorrect EU Path.\nEnsure path: ${ENIQ_SOURCE_DIR} is referencing the eniq_base_sw path."
+     abort_script "$_err_msg_"
+fi
+
+# Check if directory submitted is correct - should be: eniq_base_sw/
+$ECHO ${ENIQ_DEST_DIR} | ${EGREP} "eniq_base_sw"  >> /dev/null 2>&1
+if [ $? -ne 0 ]; then
+    _err_msg_="Incorrect Path.\nEnsure path: ${ENIQ_DEST_DIR} is referencing the eniq_base_sw path."
+     abort_script "$_err_msg_"
+fi
+
+# Log file
+if [ ! "${LOGFILE}" ]; then
+	$MKDIR -p ${LOGFILE_DIR}
+	LOGFILE="${LOGFILE_DIR}/`${MYHOSTNAME}`_install_eu_fix.log"
+fi
+
+$CLEAR
+$ECHO "\n=======================================================" >> ${LOGFILE}
+$ECHO "${RUN_TIME} - Beginning EU Update" >> ${LOGFILE}
+$ECHO "${RUN_TIME} - Beginning EU Update"
+$ECHO "=======================================================\n" >> ${LOGFILE}
+
+# check content
+check_content
+
+confirm_copy
+
+clean_up
+
+exit 0
+

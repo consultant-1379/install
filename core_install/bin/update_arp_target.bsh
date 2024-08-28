@@ -1,0 +1,892 @@
+#!/bin/bash
+# ********************************************************************
+# Ericsson Radio Systems AB                                     SCRIPT
+# ********************************************************************
+#
+# (c) Ericsson Radio Systems AB 2020 - All rights reserved.
+#
+# The copyright to the computer program(s) herein is the property
+# of Ericsson Radio Systems AB, Sweden. The programs may be used
+# and/or copied only with the written permission from Ericsson Radio
+# Systems AB or in accordance with the terms and conditions stipulated
+# in the agreement/contract under which the program(s) have been
+# supplied.
+#
+# ********************************************************************
+# Name    : update_arp_target.bsh
+# Date    : 06/10/2023
+# Revision: \main\4
+# Purpose : Main wrapper script handling the arp ip update. It will
+#           call all necessary scripts to complete arp ip update
+#
+# Usage   : update_arp_target.bsh
+#
+# ********************************************************************
+#
+#   Command Section
+#
+# ********************************************************************
+AWK=/usr/bin/awk
+BASENAME=/usr/bin/basename
+BASH=/usr/bin/bash
+CAT=/usr/bin/cat
+CP=/usr/bin/cp
+DATE=/usr/bin/date
+DIRNAME=/usr/bin/dirname
+ECHO='/usr/bin/echo -e'
+EGREP=/usr/bin/egrep
+GREP=/usr/bin/grep
+HEAD=/usr/bin/head
+MYHOSTNAME=/usr/bin/hostname
+ID=/usr/bin/id
+KILL=/usr/bin/kill
+LS=/usr/bin/ls
+MKDIR=/usr/bin/mkdir
+MV=/usr/bin/mv
+PERL=/usr/bin/perl
+PING=/usr/bin/ping
+PRINTF=/usr/bin/printf
+PS=/usr/bin/ps
+PWD=/usr/bin/pwd
+RM=/usr/bin/rm
+SED=/usr/bin/sed
+SLEEP=/usr/bin/sleep
+SORT=/usr/bin/sort
+TAIL=/usr/bin/tailr
+TEE=/usr/bin/tee
+TOUCH=/usr/bin/touch
+TR=/usr/bin/tr
+WC=/usr/bin/wc
+XARGS=/usr/bin/xargs
+# ********************************************************************
+#
+#       Configuration Section
+#
+# ********************************************************************
+
+# Default user
+DEFAULT_USER=root
+
+# Cmd to exec a shell and drop user to it in case of an error
+EXEC_SHELL_CMD="exec /bin/bash -o emacs"
+
+# Name of SunOS & ENIQ ini Files
+IPMP_INI=ipmp.ini
+SUNOS_INI=SunOS.ini
+
+# Location of interface directory
+INTF_DIR="/etc/sysconfig/network-scripts"
+
+ENIQ_INTF_DIR="/eniq/installation/config/intf_files_org"
+
+
+# ********************************************************************
+#
+#   Functions
+#
+# ********************************************************************
+### Function: abort_script ###
+#
+#   This will is called if the script is aborted thru an error
+#   signal sent by the kernel such as CTRL-C or if a serious
+#   error is encountered during runtime
+#
+# Arguments:
+#       $1 - Error message from part of program (Not always used)
+# Return Values:
+#       none
+abort_script()
+{
+_err_time_=`$DATE '+%Y-%b-%d_%H.%M.%S'`
+
+if [ "$1" ]; then
+    _err_msg_="${_err_time_} - $1"
+else
+    _err_msg_="${_err_time_} - ERROR : Script aborted.......\n"
+fi
+
+if [ "${LOGFILE}" ]; then
+    $ECHO -e "\nERROR : ${_err_msg_}\n" | $TEE -a ${LOGFILE}
+else
+    $ECHO -e "\nERROR : ${_err_msg_}\n"
+fi
+
+cd $SCRIPTHOME
+$RM -rf ${TEM_DIR}
+
+if [ "$2" ]; then
+    exit 1
+else
+   exit 1
+fi
+}
+
+### Function: bond_file_create ###
+#
+# Create the bond file for VLAN group
+#
+# Arguments:
+#   $1 : Bond Interface Tag
+# Return Values:
+#   0 : Success
+#   1 : Fail
+bond_file_create()
+{
+local _ipmp_det_=$1
+local _dns_ip_=$2
+local _domain_name_=$3
+local _bond_tag_=$4
+
+#To get the vlan group from ipmp.ini file for each vlan
+_vlan_group_=`iniget ${_ipmp_det_} -f ${ENIQ_CONF_DIR}/${IPMP_INI} -v IPMP_VLAN_Group_Name`
+if [ ! "${_vlan_group_}" ]; then
+    _err_msg_="Failed to get vlan group name"
+    abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+fi
+
+#To get the IP from ipmp.ini file for each vlan
+_client_ip_=`iniget ${_ipmp_det_} -f ${ENIQ_CONF_DIR}/${IPMP_INI} -v IPMP_Group_IP`
+if [ ! "${_client_ip_}" ]; then
+    _err_msg_="Failed to get client ip address"
+    abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+fi
+
+#To get the netmask from ipmp.ini file for each vlan
+if [ "${_ip_type_}" == "IPv6" -a "${_vlan_group_}" == "PM Services Group" ]; then
+   echo "Skipping client netmask details for IPv6" >> /dev/null 2>&1
+else
+   _client_netmask_=`iniget ${_ipmp_det_} -f ${_ipmp_ini_file_} -v IPMP_Group_Netmask`
+    if [ ! "${_client_netmask_}" ]; then
+        log_msg -l ${_logfile_} -s "Failed to get client netmask"
+        return 1
+    fi
+fi
+
+#To get the arp-ip from ipmp.ini file for each vlan
+_client_arp_target_=`iniget ${_ipmp_det_} -f ${ENIQ_CONF_DIR}/${IPMP_INI} -v ARP_IP_TARGET`
+if [ ! "${_client_arp_target_}" ]; then
+    _err_msg_="Failed to get arp-ip-target"
+    abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+fi
+
+#To calculate the subnet from netmask
+if [ "${_ip_type_}" == "IPv6" -a "${_vlan_group_}" == "PM Services Group" ]; then
+    HNAME=`${MYHOSTNAME}`
+    _netmask_subnet_=`$CAT ${ENIQ_CONF_DIR}/${HNAME}/${HNAME}_ks_cfg.txt | $GREP CLIENT_IP_ADDR_V6 | $AWK -F"=" '{ print $2 }' | $AWK -F"/" '{print $2}'`
+    
+	if [ ! "${_netmask_subnet_}" ]; then
+      log_msg -l ${_logfile_} -s "Failed to get subnet"
+      return 1
+    fi
+else
+    _netmask_subnet_=`get_network_from_netmask ${_client_netmask_}`
+    if [ ! "${_netmask_subnet_}" ]; then
+      _err_msg_="Failed to get subnet"
+      abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+    fi
+fi
+
+#To get the mode from ipmp.ini file
+_mode_group_=`iniget BOND_PARAMETER -f ${ENIQ_CONF_DIR}/${IPMP_INI} -v MODE`
+if [ ! "${_mode_group_}" ]; then
+    _err_msg_="Failed to get mode"
+    abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+fi
+
+#To get the arp-interval from ipmp.ini file
+_arp_interval_group_=`iniget BOND_PARAMETER -f ${ENIQ_CONF_DIR}/${IPMP_INI} -v ARP_INTERVAL`
+if [ ! "${_arp_interval_group_}" ]; then
+    _err_msg_="Failed to get arp-interval"
+    abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+fi
+
+#To get the gateway ip from ipmp.ini file for each vlan
+_gateway_=`iniget ${_ipmp_det_} -f ${ENIQ_CONF_DIR}/${IPMP_INI} -v IPMP_Group_Gateway`
+if [ ! "${_gateway_}" ]; then
+    _err_msg_="Failed to get Gateway"
+    abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+fi
+
+#get the primary interface from ipmp.ini for each vlan
+_primary_intf_=`iniget ${_ipmp_det_} -f ${ENIQ_CONF_DIR}/${IPMP_INI} -v IPMP_Group_Intf | $AWK '{print $1}'`
+if [ ! "${_primary_intf_}" ]; then
+    _err_msg_="Could not read primary interface"
+    abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+fi
+
+#get the selected interfaces from ipmp.ini
+_ethernet_list_=`iniget ${_ipmp_det_} -f ${ENIQ_CONF_DIR}/${IPMP_INI} -v IPMP_Group_Intf`
+if [ ! "${_ethernet_list_}" ]; then
+    _err_msg_="Could not selected interfaces"
+    abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+fi
+
+#Move the interface configuration files
+for _ethernet_det_ in ${_ethernet_list_}; do
+    $MV ${INTF_DIR}/ifcfg-${_ethernet_det_} ${ENIQ_INTF_DIR}
+    if [ $? -ne 0 ]; then
+        _err_msg_="Could not Copy the original interface file"
+        abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+    fi
+done
+
+if [ "${_ip_type_}" == "IPv4" ]; then
+
+#configure bond file for each vlan
+if [  "${_vlan_group_}" == "PM Services Group" ]; then
+    $NMCLI con add type bond \
+    con-name ${_bond_tag_} \
+    ifname ${_bond_tag_} \
+    mode ${_mode_group_} \
+    ip4 ${_client_ip_}/${_netmask_subnet_} \
+    ipv4.dns "${_dns_ip_}" \
+    ipv4.dns-search "${_domain_name_}" \
+    gw4 ${_gateway_} \
+    arp-interval ${_arp_interval_group_} \
+    arp-ip-target ${_client_arp_target_} \
+    primary ${_primary_intf_} | $TEE -a ${LOGFILE}
+else
+    $NMCLI con add type bond \
+    con-name ${_bond_tag_} \
+    ifname ${_bond_tag_} \
+    mode ${_mode_group_} \
+    ip4 ${_client_ip_}/${_netmask_subnet_} \
+    ipv4.never-default true \
+    ipv4.dns "${_dns_ip_}" \
+    arp-interval ${_arp_interval_group_} \
+    arp-ip-target ${_client_arp_target_} \
+    primary ${_primary_intf_} | $TEE -a ${LOGFILE}
+fi
+
+elif [ "${_ip_type_}" == "IPv6" ]; then
+#configure bond file for each vlan 
+if [  "${_vlan_group_}" == "PM Services Group" ]; then
+    $NMCLI con add type bond \
+    con-name ${_bond_tag_} \
+    ifname ${_bond_tag_} \
+    mode ${_mode_group_} \
+    miimon "2000" \
+    ipv4.method disabled \
+    ipv6.method manual \
+    ipv6.addresses ${_client_ip_}/${_netmask_subnet_} \
+    ipv6.dns "${_dns_ip_}" \
+    ipv6.dns-search "${_domain_name_}" \
+    ipv6.gateway ${_gateway_} \
+    primary ${_primary_intf_} | $TEE -a ${_logfile_}
+else
+    $NMCLI con add type bond \
+    con-name ${_bond_tag_} \
+    ifname ${_bond_tag_} \
+    mode ${_mode_group_} \
+    ip4 ${_client_ip_}/${_netmask_subnet_} \
+    ipv4.never-default true \
+    arp-interval ${_arp_interval_group_} \
+    arp-ip-target ${_client_arp_target_} \
+    primary ${_primary_intf_} | $TEE -a ${_logfile_}
+fi
+else
+  _err_msg_="Unable to fetch IP type value"
+  abort_script "$_err_msg_"
+fi
+
+_check_status_=`$ECHO ${PIPESTATUS[0]}`
+if [ "${_check_status_}" -ne 0 ]; then
+    _err_msg_="Could not Create bond file for ${_vlan_group_}"
+    abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+else
+    log_msg -l ${LOGFILE} -s "Successfully created bond file ifcfg-${_bond_tag_} for ${_vlan_group_} \n"
+fi
+
+#configure bond-slave file
+for _ethernet_det_ in ${_ethernet_list_}; do
+    $NMCLI con add type bond-slave ifname ${_ethernet_det_} master ${_bond_tag_} | $TEE -a ${LOGFILE}
+    _check_status_=`$ECHO ${PIPESTATUS[0]}`
+    if [ "${_check_status_}" -ne 0 ]; then
+        _err_msg_="Could not create bond-slave file for ${_ethernet_det_}"
+        abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+    else
+        log_msg -l ${LOGFILE} -s "Successfully created bond-slave file ifcfg-bond-slave-${_ethernet_det_} for ${_ethernet_det_} \n"
+    fi
+    $NMCLI connection up bond-slave-${_ethernet_det_} | $TEE -a ${LOGFILE}
+    _check_status_=`$ECHO ${PIPESTATUS[0]}`
+    if [ "${_check_status_}" -ne 0 ]; then
+        _err_msg_="Unable to make up bond-slave for ${_ethernet_det_}"
+        abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+    else
+        log_msg -l ${LOGFILE} -s "Successfully activated ifcfg-bond-slave-${_ethernet_det_} for ${_ethernet_det_} \n"
+    fi
+done
+
+#bring the connection up
+$NMCLI connection up ${_bond_tag_} | $TEE -a ${LOGFILE}
+_check_status_=`$ECHO ${PIPESTATUS[0]}`
+if [ "${_check_status_}" -ne 0 ]; then
+    _err_msg_="Unable to make up ${_bond_tag_}"
+    abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+else
+    log_msg -l ${LOGFILE} -s "Successfully activated bond ifcfg-${_bond_tag_} for ${_vlan_group_} \n\n"
+fi
+}
+
+### Function: check_id ###
+#
+#   Check that the effective id of the user is correct
+#   If not print error msg and exit.
+#
+# Arguments:
+#       $1 : User ID name
+# Return Values:
+#       none
+check_id()
+{
+_check_id_=`$ID | $AWK -F\( '{print $2}' | $AWK -F\) '{print $1}'`
+if [ "$_check_id_" != "$1" ]; then
+    _err_msg_="You must be $1 to execute this script."
+    abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+fi
+}
+
+### Function: delete_existing_selected_vlan_bond ###
+#
+#   Deletes the existing bond for the selected Vlan
+#   
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+delete_existing_selected_vlan_bond()
+{
+# To delete existing Vlan Bond
+# To get the IP from ipmp.ini file for each vlan
+$ECHO "Deleting existing selected vlan bond.\n" | $TEE -a ${LOGFILE}
+_orig_ifs_="$IFS"
+IFS=$'\n'
+for _vlan_grp_ in `$CAT ${TEM_DIR}/Vlan_group_selection`; do
+    IFS="${_orig_ifs_}"
+    for _ipmp_det_ in ${_ipmp_config_list_}; do
+        _ipmp_group_name_=`iniget ${_ipmp_det_} -f ${ENIQ_CONF_DIR}/${IPMP_INI} -v IPMP_VLAN_Group_Name`
+        if [ ! "${_ipmp_group_name_}" ]; then
+            _err_msg_="Could not read VLAN_Group_Name in ${ENIQ_CONF_DIR}/${IPMP_INI}"
+            abort_script "${_err_msg_}"
+        fi
+        if [ "${_vlan_grp_}" == "${_ipmp_group_name_}" ]; then
+            _client_ip_=`iniget ${_ipmp_det_}  -f ${ENIQ_CONF_DIR}/${IPMP_INI} -v IPMP_Group_IP`
+            if [  "${_client_ip_}" ]; then
+                _bond_exist_=`$FIND ${INTF_DIR}/* | xargs $GREP -iw "IPADDR=${_client_ip_}" | $AWK -F: '{print $1}'`
+                if [ "${_bond_exist_}" ]; then
+                    _bond_name_=`$BASENAME ${_bond_exist_} | $AWK -F\- '{print $2}'`
+                    $ECHO "${_bond_name_}=${_ipmp_group_name_}" >> ${TEM_DIR}/bond_information
+                    log_msg -l ${LOGFILE} -s "Moving ${_ipmp_group_name_} interface configuration files to ${INTF_DIR}"
+                    #get the selected interfaces from ipmp.ini
+                    _ethernet_list_=`iniget ${_ipmp_det_} -f ${ENIQ_CONF_DIR}/${IPMP_INI} -v IPMP_Group_Intf`
+                    if [ ! "${_ethernet_list_}" ]; then
+                        _err_msg_="Could not selected interfaces"
+                        abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+                    fi
+                    #Move the interface configuration files
+                    for _ethernet_det_ in ${_ethernet_list_}; do
+                        $MV ${ENIQ_INTF_DIR}/ifcfg-${_ethernet_det_} ${INTF_DIR}/
+                        if [ $? -ne 0 ]; then
+                            _err_msg_="Could not move the interface files to ${INTF_DIR} directory"
+                            abort_script "${_err_msg_}"
+                        fi
+                    done 
+                    log_msg -l ${LOGFILE} -s "Deleting ${_ipmp_group_name_} bond configuration file(s)\n"
+                    $RM -rf ${_bond_exist_}
+                    for _ethernet_det_ in ${_ethernet_list_}; do
+                        $RM -rf ${INTF_DIR}/*bond*${_ethernet_det_} 
+                    done 
+                    $SYSTEMCTL restart ${NETWORK_SERVICE}
+                    if [ $? -ne 0 ]; then
+                        _err_msg_="Network service not restarted successfully"
+                        abort_script "${_err_msg_}"
+                    fi
+                fi
+            fi
+        fi
+    done
+    IFS=$'\n'
+done
+IFS="${_orig_ifs_}"
+}
+### Function: get_absolute_path ###
+#
+# Determine absolute path to software
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+get_absolute_path()
+{
+_dir_=`$DIRNAME $0`
+SCRIPTHOME=`cd $_dir_ 2>/dev/null && pwd || $ECHO $_dir_`
+}
+
+## Function: read_storage_type ###
+#
+# Arguments:
+#   none
+# Return Values:
+#   set varibale STORAGE_TYPE
+read_storage_type()
+{
+# Read the storage type
+if [ -s ${ENIQ_CONF_DIR}/${SUNOS_INI} ]; then
+    STORAGE_TYPE=`iniget STOR_TYPE -f ${ENIQ_CONF_DIR}/${SUNOS_INI} -v STORAGE_TYPE`
+else
+    if [ -s ${ENIQ_CONF_DIR}/san_details ]; then
+        STORAGE_TYPE=`$CAT ${ENIQ_CONF_DIR}/san_details | $EGREP "^STORAGE_TYPE=" | $AWK -F\= '{print $2}'`
+    fi
+fi
+
+if [ ! "${STORAGE_TYPE}" ]; then
+    _err_msg_="Could not read STORAGE_TYPE param "
+    abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+fi
+}
+
+### Function: setup_bond ###
+#
+# Set up BOND.
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+setup_bond()
+{
+log_msg "Commencing bond Configuration ..."  | $TEE -a ${LOGFILE}
+
+#get the dns IP
+_dns_ip_=`$GREP -w "nameserver" /etc/resolv.conf | $AWK '{print $2}' | $TR '\n' ' '`
+if [ ! "${_dns_ip_}" ]; then
+    _err_msg_="Could not read the dns ip"
+    abort_script "${_err_msg_}"
+fi
+
+# Get domain name
+if [ -s /etc/resolv.conf ]; then
+    _domain_name_=`$EGREP -w 'search|domain' /etc/resolv.conf | $AWK '{print $2}'`
+    if [ ! "${_domain_name_}" ]; then
+        log_msg -l ${LOGFILE} -s "Could not get the domain name from resolv.conf file"
+        return 1
+    fi
+else
+    log_msg -l ${LOGFILE} -s "Could not get the resolv.conf file"
+    return 1
+fi
+
+#number of vlan has to be configured
+_ipmp_config_list_=`iniget IPMP -f ${ENIQ_CONF_DIR}/${IPMP_INI}`
+    if [ ! "${_ipmp_config_list_}" ]; then
+        _err_msg_="Could not build a list of VLAN blocks from ${ENIQ_CONF_DIR}/${IPMP_INI}"
+        abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+    fi
+#create bond file as per the ipmp configuration	
+_orig_ifs_="$IFS"
+IFS=$'\n'
+for _vlan_grp_ in `$CAT ${TEM_DIR}/Vlan_group_selection`; do    
+    IFS="${_orig_ifs_}"
+    for _ipmp_det_ in ${_ipmp_config_list_}; do
+        _ipmp_group_name_=`iniget ${_ipmp_det_} -f ${ENIQ_CONF_DIR}/${IPMP_INI} -v IPMP_VLAN_Group_Name`
+        if [ ! "${_ipmp_group_name_}" ]; then
+            _err_msg_="Could not read VLAN_Group_Name in ${ENIQ_CONF_DIR}/${IPMP_INI}"
+            abort_script "${_err_msg_}"
+        fi
+        if [ "${_vlan_grp_}" == "${_ipmp_group_name_}" ]; then
+            _bond_name_=`$CAT ${TEM_DIR}/bond_information | $GREP -w "${_ipmp_group_name_}" | $AWK -F= '{print $1}'`
+            bond_file_create ${_ipmp_det_} ${_dns_ip_} ${_domain_name_} ${_bond_name_}
+        fi
+    done
+    IFS=$'\n'
+done
+IFS="${_orig_ifs_}"
+}
+
+### Function: setup_env ###
+#
+# Set up environment variables for script.
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+setup_env()
+{
+ROOT_HOME=/root
+# Setting the env HOME to /root for console run
+export HOME=/root
+
+if [ ! "${ENIQ_BASE_DIR}" ]; then
+    # Directory on the root filesystem
+    ENIQ_BASE_DIR=/eniq
+fi
+
+# ENIQ Log Directory
+ENIQ_LOG_DIR=${ENIQ_BASE_DIR}/local_logs
+
+# Main Directory for the Core Installation SW
+ENIQ_INST_DIR=${ENIQ_BASE_DIR}/installation
+
+# Main Directory for the Core Installation SW
+ENIQ_CORE_INST_DIR=${ENIQ_INST_DIR}/core_install
+
+# Core bin dir
+ENIQ_CORE_BIN_DIR=${ENIQ_CORE_INST_DIR}/bin
+
+# ENIQ Config Directory
+ENIQ_CONF_DIR=${ENIQ_INST_DIR}/config
+
+# Common SW directory
+ENIQ_COMMON_SW_DIR="`$DIRNAME ${SCRIPTHOME}`/templates/common"
+
+# Set up Variable to hold network path to SW
+if [ ! -s ${SCRIPTHOME}/../lib/iniadd.pl ]; then
+    _err_msg_="Cannot locate ${SCRIPTHOME}/../lib/iniadd"
+    abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+else
+    INIADD=${SCRIPTHOME}/../lib/iniadd.pl
+fi
+
+if [ ! -s ${SCRIPTHOME}/../lib/inidel.pl ]; then
+    _err_msg_="Cannot locate ${SCRIPTHOME}/../lib/inidel"
+    abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+else
+    INIDEL=${SCRIPTHOME}/../lib/inidel.pl
+fi
+
+# Source the common functions
+if [ -s ${SCRIPTHOME}/../lib/common_functions.lib ]; then
+    . ${SCRIPTHOME}/../lib/common_functions.lib
+else
+    _err_msg_="File ${SCRIPTHOME}/../lib/common_functions.lib not found"
+    abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+fi
+
+if [ -s ${SCRIPTHOME}/../lib/common_core_install_functions.lib ]; then
+    . ${SCRIPTHOME}/../lib/common_core_install_functions.lib
+else
+    _err_msg_="File ${SCRIPTHOME}/../lib/common_core_install_functions.lib not found"
+    abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+fi
+
+if [ -s ${SCRIPTHOME}/../lib/common_inirator_functions.lib ]; then
+    . ${SCRIPTHOME}/../lib/common_inirator_functions.lib
+else
+    _err_msg_="File ${SCRIPTHOME}/../lib/common_inirator_functions.lib not found"
+    abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+fi
+
+HNAME=`${MYHOSTNAME}`
+
+#Check IP Type
+check_ip_type
+}
+
+
+# ********************************************************************
+#
+#   Main body of program
+#
+# ********************************************************************
+#
+RUN_TIME=`$DATE '+%Y-%b-%d_%H.%M.%S'`
+
+# Determine absolute path to software
+get_absolute_path
+
+# Check that the effective id of the user is root
+check_id $DEFAULT_USER
+
+# Set up environment variables for script.
+setup_env
+
+# Log file
+if [ ! "${LOGFILE}" ]; then
+    $MKDIR -p ${ENIQ_LOG_DIR}/installation
+    LOGFILE="${ENIQ_LOG_DIR}/installation/${HNAME}_arp_update.log"
+fi
+
+# Create a temporary Directory
+TEM_DIR=/tmp/arp_update.$$.$$
+$RM -rf ${TEM_DIR}
+$MKDIR -p ${TEM_DIR}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not create directory $TEM_DIR"
+    abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+fi
+
+# Read the storage type
+read_storage_type
+
+if [ "${STORAGE_TYPE}" == "raw" ]; then
+   
+    #copy the ipmp.ini file from config directory
+    if [ -s ${ENIQ_CONF_DIR}/${IPMP_INI} ]; then
+        $CP ${ENIQ_CONF_DIR}/${IPMP_INI} ${TEM_DIR}/${IPMP_INI}
+        if [ $? -ne 0 ]; then
+            _err_msg_="Could not copy ${ENIQ_CONF_DIR}/${IPMP_INI} to ${TEM_DIR}/${IPMP_INI}"
+            abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+        fi
+    else
+        _err_msg_="${ENIQ_CONF_DIR}/${IPMP_INI} does not exist, or is empty"
+        abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+    fi
+
+    # configure services, storage and backup vlans
+    _ipmp_config_list_=`iniget IPMP -f ${TEM_DIR}/${IPMP_INI}`
+    if [ ! "${_ipmp_config_list_}" ]; then
+        _err_msg_="Could not build a list of VLAN blocks from ${TEM_DIR}/${IPMP_INI}"
+        abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+    fi
+
+    _disp_file_=${TEM_DIR}/disp_file
+    $RM -rf ${TEM_DIR}/ipmp_group_information
+    for _ipmp_det_ in ${_ipmp_config_list_}; do
+        _ipmp_group_name_=`iniget ${_ipmp_det_} -f ${TEM_DIR}/${IPMP_INI} -v IPMP_VLAN_Group_Name`
+        if [ ! "${_ipmp_group_name_}" ]; then
+            _err_msg_="Could not read VLAN_Group_Name in ${TEM_DIR}/${IPMP_INI}"
+            abort_script "${_err_msg_}"
+        fi
+        $ECHO "${_ipmp_group_name_}" >> ${TEM_DIR}/ipmp_group_information
+    done
+    # Build an array to store the names of the available Vlan Group
+    _cnt_=1
+    while read _vlan_detail_; do
+        # Store the details in the array
+        _str_array_[${_cnt_}]=${_vlan_detail_}
+        let _cnt_=_cnt_+1
+    done < ${TEM_DIR}/ipmp_group_information
+
+    _cnt_=${#_str_array_[@]}
+    _def_vlan_list_="1-${_cnt_}"
+    $ECHO -e "\n\nAvailable Vlan Group:" >> ${_disp_file_}
+    for (( i=1; i<=${_cnt_}; i++ )); do
+        $ECHO "[${i}]  ${_str_array_[${i}]}" >> ${_disp_file_}
+    done
+    while :; do
+        _numerror_=0
+        $PRINTF '\33[H\33[2J'
+        $CP /dev/null ${TEM_DIR}/Vlan_group_selection
+        $CAT ${_disp_file_}
+        $ECHO -e "\nSelect the Range of Vlan group you want to update arp ip"
+        $ECHO -e "using the format [n,n,n-n,n...n]\tE.G. 1,2,3-8,9,10"
+    
+        $ECHO "Hit enter to select default [${_def_vlan_list_}] or enter the Vlan group you wish to update"
+    
+        read _opt_
+        # If the User hit nothing and there is a default. that will do
+        if [ ! "${_opt_}" ]; then
+            _start_=`$ECHO ${_def_vlan_list_} | $AWK -F\- '{print $1}'`
+            _end_=`$ECHO ${_def_vlan_list_} | $AWK -F\- '{print $2}'`
+            for (( _sel_=${_start_}; _sel_<=${_end_}; _sel_++ )); do
+                $ECHO ${_str_array_[${_sel_}]}|$AWK  -F\@ '{print $1}' >> ${TEM_DIR}/Vlan_group_selection
+            done
+            break
+        fi
+
+        unset _num_
+        for _num_ in `$ECHO ${_opt_} | $SED -e 's| ||g' -e 's|,| |g'`; do 
+            $ECHO ${_num_} | $EGREP '-' >> /dev/null 2>&1
+            if [ $? -eq 0 ]; then            
+                _start_=`$ECHO ${_num_} | $AWK -F\- '{print $1}'`
+                if [ ! "${_start_}" ]; then
+                    continue
+                fi
+                _end_=`$ECHO ${_num_} | $AWK -F\- '{print $2}'`
+                for (( _sel_=${_start_}; _sel_<=${_end_}; _sel_++ )); do
+                    $ECHO ${_sel_} | $EGREP '^[0-9]+$' >> /dev/null 2>&1
+                    if [ $? -ne 0 ]; then
+                        _numerror_=1
+                        break
+                    fi
+                    if [ ${_sel_} -lt 1 -o ${_sel_} -gt ${_cnt_} ]; then
+                        _numerror_=1
+                        break
+                    fi
+                    _dsk_=`$ECHO ${_str_array_[${_sel_}]}|$AWK  -F\@ '{print $1}'`
+                    $GREP -w ${_dsk_} ${TEM_DIR}/Vlan_group_selection >> /dev/null 2>&1
+                    if [ $? -ne 0 ]; then
+                        $ECHO ${_dsk_} >> ${TEM_DIR}/Vlan_group_selection
+                    fi
+                done
+            else
+                $ECHO ${_num_} | $EGREP '^[0-9]+$' >> /dev/null 2>&1
+                if [ $? -ne 0 ]; then
+                    _numerror_=1
+                    break
+                fi
+                if [ ${_num_} -lt 1 -o ${_num_} -gt ${_cnt_} ]; then
+                    _numerror_=1
+                    break
+                fi
+                _dsk_=`$ECHO ${_str_array_[${_num_}]}|$AWK  -F\@ '{print $1}'`
+                $GREP -w ${_dsk_} ${TEM_DIR}/Vlan_group_selection >> /dev/null 2>&1
+                if [ $? -ne 0 ]; then
+                    $ECHO ${_dsk_} >> ${TEM_DIR}/Vlan_group_selection
+                fi
+            fi  
+        done
+
+        $RM -rf $TEM_DIR/current_arp_information
+
+        $PRINTF '\33[H\33[2J'
+        $ECHO "\nCurrent ARP IP Information" >> ${TEM_DIR}/current_arp_information
+        $ECHO "----------------" >> ${TEM_DIR}/current_arp_information
+
+        _orig_ifs_="$IFS"
+        IFS=$'\n'
+        for _vlan_grp_ in `$CAT ${TEM_DIR}/Vlan_group_selection`; do
+            IFS="${_orig_ifs_}"        
+            for _ipmp_det_ in ${_ipmp_config_list_}; do
+                $PRINTF '\33[H\33[2J'
+
+                _ipmp_group_name_=`iniget ${_ipmp_det_} -f ${TEM_DIR}/${IPMP_INI} -v IPMP_VLAN_Group_Name`
+                if [ ! "${_ipmp_group_name_}" ]; then
+                    _err_msg_="Could not read VLAN_Group_Name in ${TEM_DIR}/${IPMP_INI}"
+                    abort_script "${_err_msg_}"
+                fi
+            
+                _bond_enabled_=`iniget ${_ipmp_det_} -f ${TEM_DIR}/${IPMP_INI} -v BONDING_ENABLE`
+                if [ ! "${_bond_enabled_}" ]; then
+                    _err_msg_="Could not read ${_ipmp_det_} BONDING_ENABLE Y/N in ${TEM_DIR}/${IPMP_INI}"
+                    abort_script "${_err_msg_}"
+                fi
+
+                # calling common_get_ipmp_info function for selected Service , Storage and backup Vlan details
+                if [ "${_vlan_grp_}" == "${_ipmp_group_name_}" ]; then
+                    if [ "${_bond_enabled_}" == "Y" ]; then
+                        #to get the arp-ip-target
+                        _current_arp_target_=`iniget ${_ipmp_det_} -f ${TEM_DIR}/${IPMP_INI} -v ARP_IP_TARGET`
+                        if [ ! "${_current_arp_target_}" ]; then
+                            _err_msg_="Could not read ARP_IP_TARGET in ${TEM_DIR}/${IPMP_INI}"
+                           abort_script "${_err_msg_}"
+                        fi
+                        $ECHO "${_ipmp_group_name_} Highly available server IP:\t${_current_arp_target_}" >> ${TEM_DIR}/current_arp_information
+                    else
+                        _err_msg_="Could not update for selected Vlan ${_ipmp_group_name_} as the bond is not configured. Re-run the script with correct Vlan group to be updated"
+                        abort_script "${_err_msg_}"
+                    fi
+                fi
+               
+            done
+            IFS=$'\n'
+        done
+        IFS="${_orig_ifs_}"
+        # Final confirmation for user input
+        while :; do
+            $PRINTF '\33[H\33[2J'
+
+            $CAT $TEM_DIR/current_arp_information
+            $ECHO "\nEnter Yes if the above arp IP needs to be updated else enter No if update not required. (Yes|No)"
+            read _ans_
+
+            if [ ! "${_ans_}" ]; then
+                continue
+            fi
+
+            if [ "${_ans_}" == "Yes" -o "${_ans_}" == "No" ]; then
+                break
+            else
+                continue
+            fi
+        done
+
+        if [ "${_ans_}" == "Yes" ]; then
+            break
+        else
+            if [ "${LOGFILE}" ]; then
+                $ECHO -e "\nUser selected No. Exiting....\n" | $TEE -a ${LOGFILE}
+            else
+                $ECHO -e "\nUser selected No. Exiting....\n"
+            fi
+            cd $SCRIPTHOME
+            $RM -rf ${TEM_DIR}
+            exit 1
+        fi
+
+
+    done
+    while :; do
+        $RM -rf $TEM_DIR/ipmp_information
+
+        $PRINTF '\33[H\33[2J'
+        $ECHO "\nARP IP Information" >> ${TEM_DIR}/ipmp_information
+        $ECHO "----------------" >> ${TEM_DIR}/ipmp_information
+
+        _orig_ifs_="$IFS"
+        IFS=$'\n'
+        for _vlan_grp_ in `$CAT ${TEM_DIR}/Vlan_group_selection`; do
+            IFS="${_orig_ifs_}"        
+            for _ipmp_det_ in ${_ipmp_config_list_}; do
+                $PRINTF '\33[H\33[2J'
+
+                _ipmp_group_name_=`iniget ${_ipmp_det_} -f ${TEM_DIR}/${IPMP_INI} -v IPMP_VLAN_Group_Name`
+                if [ ! "${_ipmp_group_name_}" ]; then
+                    _err_msg_="Could not read VLAN_Group_Name in ${TEM_DIR}/${IPMP_INI}"
+                    abort_script "${_err_msg_}"
+                fi
+
+                # calling common_get_ipmp_info function for selected Service , Storage and backup Vlan details
+                if [ "${_vlan_grp_}" == "${_ipmp_group_name_}" ]; then
+                    #to get the arp-ip-target
+                    common_get_vlan_arp "${_ipmp_group_name_}"
+                    _arp_target_=${IPMP_ARP}
+                    iniset ${_ipmp_det_} -f ${TEM_DIR}/${IPMP_INI} ARP_IP_TARGET=${IPMP_ARP}
+                    if [ $? -ne 0 ]; then
+                        _err_msg_="Could not update ${TEM_DIR}/${IPMP_INI} with ARP_IP_TARGET=${IPMP_ARP} for ${_ipmp_det_}"
+                        abort_script "${_err_msg_}"
+                    fi
+                    $ECHO "${_ipmp_group_name_} Highly available server IP:\t${_arp_target_}" >> ${TEM_DIR}/ipmp_information                  
+                fi
+               
+            done
+            IFS=$'\n'
+        done
+        IFS="${_orig_ifs_}"
+        # Final confirmation for user input
+        while :; do
+            $PRINTF '\33[H\33[2J'
+
+            $CAT $TEM_DIR/ipmp_information
+            $ECHO "\nIs the information above correct (Yes|No)"
+            read _ans_
+
+            if [ ! "${_ans_}" ]; then
+                continue
+            fi
+
+            if [ "${_ans_}" == "Yes" -o "${_ans_}" == "No" ]; then
+                break
+            else
+                continue
+            fi
+        done
+
+        if [ "${_ans_}" == "Yes" ]; then
+            break
+        else
+            $RM -rf ${TEM_DIR}/ipmp_information
+            continue
+        fi
+    done
+
+    $RM -rf ${ENIQ_CONF_DIR}/${IPMP_INI}
+
+    $CP ${TEM_DIR}/${IPMP_INI} ${ENIQ_CONF_DIR}/${IPMP_INI}
+    if [ $? -ne 0 ]; then
+        _err_msg_="Could not copy ${TEM_DIR}/${IPMP_INI} to ${ENIQ_CONF_DIR}/${IPMP_INI}"
+        abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+    fi
+
+    delete_existing_selected_vlan_bond
+
+    setup_bond
+
+    $RM -rf ${TEM_DIR}
+
+    exit 0
+
+fi

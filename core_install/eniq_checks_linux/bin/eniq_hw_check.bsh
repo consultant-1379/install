@@ -1,0 +1,312 @@
+#!/usr/bin/bash
+# ********************************************************************
+# Ericsson Radio Systems AB                                     SCRIPT
+# ********************************************************************
+#
+# (c) Ericsson Radio Systems AB 2016 - All rights reserved.
+#
+# The copyright to the computer program(s) herein is the property
+# of Ericsson Radio Systems AB, Sweden. The programs may be used
+# and/or copied only with the written permission from Ericsson Radio
+# Systems AB or in accordance with the terms and conditions stipulated
+# in the agreement/contract under which the program(s) have been
+# supplied.
+#
+# ********************************************************************
+# Name    : eniq_hw_check.bsh 
+# Date    : 29/08/2016
+# Revision: B
+# Purpose : Script will check the hardware errors.
+#
+# Usage   : eniq_hw_check.bsh 
+#
+# Exit Values:
+#  0   : SUCCESS
+#  3   : NO RUN  : Healthcheck Aborted
+#  241 : WARNING : Hardware errors present.
+#
+#
+# ********************************************************************
+#
+#   Command Section
+#
+# ********************************************************************
+
+AWK="/usr/bin/awk"
+CAT="/usr/bin/cat"
+CP="/usr/bin/cp"
+SU="/usr/bin/su"
+CUT="/usr/bin/cut"
+DATE="/usr/bin/date"
+ECHO="/usr/bin/echo"
+ID="/usr/bin/id"
+TEE="/usr/bin/tee"
+GREP="/usr/bin/grep"
+DUMPADM="/usr/sbin/dumpadm"
+XARGS="/usr/bin/xargs"
+WC="/usr/bin/wc"
+CD="cd"
+IOSTAT="/usr/bin/iostat"
+LS="/usr/bin/ls"
+RM="/usr/bin/rm"
+HEAD="/usr/bin/head"
+TAIL="/usr/bin/tail"
+SED="/usr/bin/sed"
+PERL="/usr/bin/perl"
+KSTAT="/usr/bin/kstat"
+
+#### RETURN CODE ENUM's ####
+SUCCESS=0
+FAILED=1
+WARNING=2
+NORUN=3
+ROOT_USER_FAILED=71
+HW_ERROR_WARNING=241
+
+### Function: setup_env ###
+#
+# Set up environment variables for script.
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+setup_env()
+{
+   if [ ! "${ENIQ_BASE_DIR}" ]; then
+       ENIQ_BASE_DIR=/eniq
+   fi
+
+   # Main Directory for the Core Installation SW
+   ENIQ_INST_DIR=${ENIQ_BASE_DIR}/installation
+
+   # Installation config directory
+   ENIQ_CONF_DIR=${ENIQ_INST_DIR}/config
+
+   # Precheck logs directory
+   ENIQ_PRECHECK_LOG_DIR=${ENIQ_BASE_DIR}/local_logs
+
+   # Installation lib directory
+   ENIQ_LIB_DIR=${ENIQ_INST_DIR}/core_install/lib/
+
+   # Common function directory
+   COMMON_FUNCS_LIB=${ENIQ_LIB_DIR}/common_functions.lib
+
+   # Installed server type path
+   INSTALLED_SERVER_TYPE=${ENIQ_CONF_DIR}/installed_server_type
+
+   # Ericsson config file path
+   ERICSSON_USE_CONFIG=${ENIQ_CONF_DIR}/ericsson_use_config
+
+   # Events_checks config file
+   EVENTS_CHECK_CONFIG=${ENIQ_INST_DIR}/core_install/eniq_checks/config/events_config.cfg
+
+   # Stats_checks config file
+   STATS_CHECK_CONFIG=${ENIQ_INST_DIR}/core_install/eniq_checks/config/stats_config.cfg
+
+   # Logfile path
+   LOG_FILE=${ENIQ_PRECHECK_LOG_DIR}/precheck_hw_errors.log
+
+   # Return code declaration
+   RET_CODE=0
+
+   # Imports the common library functions
+   if [ ! -f "${COMMON_FUNCS_LIB}" ]; then
+      _err_msg_="${COMMON_FUNCS_LIB} missing, this is required for this script, exiting!!!!"
+      abort_script "${_err_msg_}"
+   fi
+
+   . ${COMMON_FUNCS_LIB}
+
+   if [ $? -ne 0 ]; then
+      _err_msg_="Importing functions of ${COMMON_FUNCS_LIB} failed, exiting!!!!"
+      abort_script "${_err_msg_}"
+   fi
+}
+
+### Function: abort_script
+#
+#   This will be called if the script is aborted through an error
+#   encountered during runtime
+#
+# Arguments:
+#       $1 - Error message from part of program
+# Return Values:
+#       none
+#
+
+abort_script()
+{
+   _err_time_=`$DATE '+%Y-%b-%d_%H.%M.%S'`
+
+   if [ "$1" ]; then
+      _err_msg_="${_err_time_} - $1"
+   else
+      _err_msg_="${_err_time_} - ERROR : Script aborted.......\n"
+   fi
+
+   if [ "${LOG_FILE}" ]; then
+      $ECHO "\nERROR : ${_err_msg_}\n" | $TEE -a ${LOG_FILE}
+   else
+      $ECHO "\nERROR : ${_err_msg_}\n"
+   fi
+   exit 3
+}
+
+
+#### Function: create_log_file ######
+#
+#   Check that the effective id of the user is correct
+#   If not print error msg and exit.
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+#
+
+create_log_file()
+{
+   $ECHO "" > ${LOG_FILE}  
+}
+
+### Function: check_user ###
+#
+#   Check that the effective id of the user is correct
+#   If not print error msg and exit.
+#
+# Arguments:
+#       $1 : User ID name
+# Return Values:
+#       none
+#
+check_user()
+{
+   local _check_id_=`$ID  | $AWK -F\( '{print $2}' | $AWK -F\) '{print $1}'`
+
+   if [ "$_check_id_" != "$1" ]; then
+      _err_msg_="You must be $1 to execute this script."
+      abort_script "$_err_msg_"
+   fi
+}
+
+#### Function : check_hw_sw_error ######
+#
+# Arguments:
+#           None
+# Return values:
+#  0   : SUCCESS
+#  241 : WARNING : Hardware errors present.
+##
+
+check_hw_sw_error()
+{
+   declare -a _hw_sw_err_data_;
+   declare -a _dev_err_flag_list_;
+   _is_faulty_=0;
+   _dev_num_=0;
+   _err_flag_=0;
+   _err_index_=0;
+   _err_list_index_=0;
+   _dev_count_=0;
+   _dev_name_=""
+   _err_string_=""
+   _ret_code_=${SUCCESS}
+
+   log_msg -t -s "INFO : Checking hardware errors." -l ${LOG_FILE}
+
+   # Get the count of all devices which needs to be checked
+   _dev_count_=`$IOSTAT -E | $GREP "Soft Errors" | $WC -l | $SED -e 's/ //g'`
+   log_msg -t -s "INFO : Number of device found : ${_dev_count_}" -l ${LOG_FILE}
+   log_msg -t -s "INFO : List of devices :" -l ${LOG_FILE}
+   $IOSTAT -E | $GREP "Soft Errors" | $AWK '{print $1}' >> ${LOG_FILE}
+
+   while [ ${_dev_num_} -lt ${_dev_count_} ]
+   do
+      # Check all the devices individually if any error exists or not
+      _err_index_=0;
+      _dev_name_=`$IOSTAT -E | $GREP "Soft Errors" | $HEAD -\`expr ${_dev_num_} + 1\` | $TAIL -1 | $AWK '{print $1}'`
+      log_msg -t -s "INFO : Checking the status of device : ${_dev_name_}" -l ${LOG_FILE}
+      $KSTAT -n ${_dev_name_},err >> ${LOG_FILE}
+
+      _dev_err_flag_list_[$_err_index_]=`$KSTAT -n ${_dev_name_},err | $GREP "Hard Errors" | $AWK '{print $3}'`; _err_index_=`expr $_err_index_ + 1`
+      _dev_err_flag_list_[$_err_index_]=`$KSTAT -n ${_dev_name_},err | $GREP "Soft Errors" | $AWK '{print $3}'`; _err_index_=`expr $_err_index_ + 1`
+      _dev_err_flag_list_[$_err_index_]=`$KSTAT -n ${_dev_name_},err | $GREP "Transport Errors" | $AWK '{print $3}'`; _err_index_=`expr $_err_index_ + 1`
+      _dev_err_flag_list_[$_err_index_]=`$KSTAT -n ${_dev_name_},err | $GREP "Device Not Ready" | $AWK '{print $4}'`; _err_index_=`expr $_err_index_ + 1`
+      _dev_err_flag_list_[$_err_index_]=`$KSTAT -n ${_dev_name_},err | $GREP "Media Error" | $AWK '{print $3}'`; _err_index_=`expr $_err_index_ + 1`
+      _dev_err_flag_list_[$_err_index_]=`$KSTAT -n ${_dev_name_},err | $GREP "No Device" | $AWK '{print $3}'`; _err_index_=`expr $_err_index_ + 1`
+      _dev_err_flag_list_[$_err_index_]=`$KSTAT -n ${_dev_name_},err | $GREP "Recoverable" | $AWK '{print $2}'`;
+
+      while [ $_err_index_ -ge 0 ]
+      do
+         if [ ${_dev_err_flag_list_[$_err_index_]} -ne 0 ]
+         then
+            # We are here because any device reported the error
+            _err_flag_=1;
+         fi
+         _err_index_=`expr $_err_index_ - 1`
+      done
+
+      if [ ${_err_flag_} -ne 0 ]
+      then
+         # Raise the fault flag to true
+         _is_faulty_=1
+      fi
+
+      if [ ${_err_flag_} -ne 0 ]
+      then
+         _err_string_="Hard Errors:${_dev_err_flag_list_[0]}, Soft Errors:${_dev_err_flag_list_[1]}, Transport Errors:${_dev_err_flag_list_[2]}, Device Not Ready:${_dev_err_flag_list_[3]}, Media Error:${_dev_err_flag_list_[4]}, No Device:${_dev_err_flag_list_[5]}, Recoverable:${_dev_err_flag_list_[6]}"
+         _hw_sw_err_data_[$_err_list_index_]="Device '${_dev_name_}' is faulty : ${_err_string_}"
+         _err_list_index_=`expr $_err_list_index_ + 1`
+         _err_flag_=0
+      fi
+      _dev_num_=`expr $_dev_num_ + 1`
+   done
+
+
+   # Report the result SUCCESS/WARNING as per the fault check 
+   if [ ${_is_faulty_} -eq 0 ]
+   then
+      log_msg -t -s "SUCCESS : No Fault detected for any device" -l ${LOG_FILE}
+      _ret_code_=${SUCCESS}
+   else
+      log_msg -t -s "WARNING : Fault detected for below devices : " -l ${LOG_FILE}
+      _err_list_index_=`expr $_err_list_index_ - 1`
+      while [ $_err_list_index_ -ge 0 ]
+      do
+         log_msg -s "${_hw_sw_err_data_[$_err_list_index_]}" -l ${LOG_FILE}
+         _err_list_index_=`expr $_err_list_index_ - 1`
+      done
+      _ret_code_=${HW_ERROR_WARNING}
+   fi
+
+   log_msg -t -s "INFO : Log location : ${LOG_FILE}"
+   return ${_ret_code_}
+}
+
+# ********************************************************************
+#
+#       Main body of program
+#
+# ********************************************************************
+
+# Check the current user as root
+check_user "root"; _ret_code_=$?
+if [ "$_ret_code_" -ne ${SUCCESS} ]
+then
+   log_msg -t -s "FAILED : You need to be a root user to execute this script" -l ${LOG_FILE}
+   _ret_code_=${ROOT_USER_FAILED}
+   exit ${_ret_code_}
+fi
+
+# Set up environment variables for script.
+setup_env
+
+# Create log file
+create_log_file
+
+# Check hardware errors
+log_msg -t -s "INFO : Checking hardware errors : BEGIN" -l ${LOG_FILE}
+check_hw_sw_error; rCode=$?
+log_msg -t -s "INFO : Checking hardware errors : END, RC:$rCode" -l ${LOG_FILE}
+exit ${rCode}

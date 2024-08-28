@@ -1,0 +1,797 @@
+#!/bin/bash
+# ********************************************************************
+# Ericsson Radio Systems AB SCRIPT
+# ********************************************************************
+#
+# (c) Ericsson Radio Systems AB 2023 - All rights reserved.
+#
+# The copyright to the computer program(s) herein is the property
+# of Ericsson Radio Systems AB, Sweden. The programs may be used
+# and/or copied only with the written permission from Ericsson Radio
+# Systems AB or in accordance with the terms and conditions stipulated
+# in the agreement/contract under which the program(s) have been
+# supplied.
+#
+# ********************************************************************
+# Name    : bitmapCheck
+# Date    : 15/05/2023
+# Revision: /main/2
+# Purpose : The script checks for Bitmap related errors in the engine logs, If found tableName will be parsed
+#           and a child script nbit2flat_Auto.bsh will be called to fix the problematic indexes.
+# Usage   : bash bitmapCheck.bsh
+#
+# ********************************************************************
+#
+#     Command Section
+#
+# ********************************************************************
+AWK=/usr/bin/awk
+BASENAME=/usr/bin/basename
+BASH=/usr/bin/bash
+CAT=/usr/bin/cat
+CD=/usr/bin/cd
+DATE=/usr/bin/date
+EXPECT=/usr/bin/expect
+CP=/usr/bin/cp
+CHMOD=/usr/bin/chmod
+CHOWN=/usr/bin/chown
+COLUMN=/usr/bin/column
+CUT=/bin/cut
+ECHO=/usr/bin/echo
+EGREP=/usr/bin/egrep
+GREP=/usr/bin/grep
+GTAR=/usr/bin/gtar
+HEAD=/usr/bin/head
+LN=/usr/bin/ln
+LS=/usr/bin/ls
+MKDIR=/usr/bin/mkdir
+ID=/usr/bin/id
+PASTE=/usr/bin/paste
+PS=/usr/bin/ps
+SED=/usr/bin/sed
+SU=/usr/bin/su
+RM=/usr/bin/rm
+TAIL=/usr/bin/tail
+TAR=/usr/bin/tar
+TR=/bin/tr
+TEE=/usr/bin/tee
+TOUCH=/usr/bin/touch
+SYSTEMCTL=/usr/bin/systemctl
+SLEEP=/usr/bin/sleep
+UUID=/bin/uuidgen
+ZGREP=/bin/zgrep
+wc=/bin/wc
+WC=/bin/wc
+FIND=/bin/find
+
+# ********************************************************************
+#
+#       Configuration Section
+#
+# ********************************************************************
+
+# Jumpstart Directory where all ENIQ SW will reside
+ENIQ_BASE_DIR=/eniq
+ENIQ_ADMIN_DIR=$ENIQ_BASE_DIR/admin/bin
+ENIQ_BASE_SW=eniq_base_sw
+
+# Name of SunOS & ENIQ ini Files
+
+ENIQ_ENV=niq.rc
+ENIQ_INI=niq.ini
+RBAC_INI=RBAC.ini
+SUNOS_INI=SunOS.ini
+SENTINEL_INI=sentinel.ini
+STORAGE_INI=storage.ini
+DEPLOYMENT_TYPE=`$CAT /eniq/installation/config/extra_params/deployment`
+STORAGE_INI_TEMPL="storage_ini.${DEPLOYMENT_TYPE}"
+SYM_INI=sym_links.ini
+COORD_INI=coordinator_sym_links.ini
+
+## Function: abort_script ###
+#
+#   This will is called if the script is aborted thru an error
+#   signal sent by the kernel such as CTRL-C or if a serious
+#   error is encountered during runtime
+#
+# Arguments:
+#       $1 - Error message from part of program (Not always used)
+# Return Values:
+#       none
+abort_script()
+{
+_err_time_=`$DATE '+%Y-%b-%d_%H.%M.%S'`
+if [ "$1" ]; then
+    _err_msg_="${_err_time_} - $1"
+else
+    _err_msg_="${_err_time_} - ERROR : Script aborted.......\n"
+fi
+if [ "${LOGFILE}" ]; then
+    $ECHO "\nERROR: ${_err_msg_}\n" | $TEE -a ${LOGFILE}
+else
+    $ECHO "\nERROR: ${_err_msg_}\n"
+fi
+cleanUpTempDirs
+exit 1
+}
+
+## Function: checkFailedTablesFromLastRunIfExists ###
+#
+#   Checks the ddp.report for failures from earlier or current runs.
+# If found, it will call the child script nbit2flat_Auto.bsh to fix the tables again.
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+checkFailedTablesFromLastRunIfExists(){
+if [[ -s ${DDP_Report} ]]; then
+    log_msg -t -s "Checking for failed tables in earlier & current runs..." -l ${LOGFILE}
+    local failure_count=`$GREP -iwc "Failure" $DDP_Report`
+    if [[ $failure_count -ge 1 ]]; then
+        log_msg -t -s "Found $failure_count entries failed in earlier (or) current runs" -l ${LOGFILE}
+        $GREP -iw "Failure" $DDP_Report > ${TEMP_WORK_DIR}/failed_tables.list
+        while read failedEntry; do
+            local tableName=`$ECHO $failedEntry | $CUT -d"|" -f1`
+            local UUID=`$ECHO $failedEntry | $CUT -d"|" -f8`
+            $ECHO "${tableName}|${UUID}" >> ${TEMP_WORK_DIR}/Final_failed.list
+        done < ${TEMP_WORK_DIR}/failed_tables.list
+        if [[ -s ${SCRIPT_HOME}/nbit2flat_Auto.bsh ]]; then
+            if [[ -s ${TEMP_WORK_DIR}/Final_failed.list ]]; then
+                $SORT -ru ${TEMP_WORK_DIR}/Final_failed.list > ${TEMP_WORK_DIR}/Sorted_Final_failed.list
+                log_msg -s "${single_line}\n" -l ${LOGFILE}
+                log_msg -t -s "Triggering the Automation to convert from nbit to Flat FP for failed tables" -l ${LOGFILE}
+                $CAT ${TEMP_WORK_DIR}/Sorted_Final_failed.list >> ${LOGFILE}
+                log_msg -s "\n${single_line}" -l ${LOGFILE}
+                $BASH ${SCRIPT_HOME}/nbit2flat_Auto.bsh -t ${TEMP_WORK_DIR}/Sorted_Final_failed.list -l ${LOGFILE} -f
+            else
+                log_msg -t -s "Zero entries in the failed list...." -l ${LOGFILE}
+            fi
+        else
+            log_msg -t -s "Unable to find the automation script...." -l ${LOGFILE}
+            abort_script "${SCRIPT_HOME}/nbit2flat_Auto.bsh not found....Exiting..."
+        fi
+    fi
+    log_msg -t -s "Completed Checking for failed tables in previous & current runs..." -l ${LOGFILE}
+    log_msg -s "${single_line}" -l ${LOGFILE}
+fi
+
+# Cleanup
+$RM -rf ${TEMP_WORK_DIR}/failed_tables.list ${TEMP_WORK_DIR}/Final_failed_${RUNNUMBER}.list ${TEMP_WORK_DIR}/Sorted_Final_failed.list
+}
+
+### Function: setup_env ###
+#
+# Setup path environment
+# Imports the common lib files which imports common functions
+#
+# Arguments: none
+# Return Values: none
+#
+setup_env()
+{
+if [ ! "${ENIQ_BASE_DIR}" ]; then
+    ENIQ_BASE_DIR=/eniq
+fi
+
+double_line="======================================================================="
+single_line="-----------------------------------------------------------------------"
+
+# ENIQ Log Directory
+ENIQ_LOG_DIR=${ENIQ_BASE_DIR}/local_logs
+
+# Main Directory for the Core Installation SW
+ENIQ_INST_DIR=${ENIQ_BASE_DIR}/installation
+CONF_DIR=${ENIQ_INST_DIR}/config
+ENIQ_INI=niq.ini
+
+# Core install directory that contains scripts
+ENIQ_CORE_DIR=${ENIQ_INST_DIR}/core_install
+ENIQ_DATABASE_DIR=${ENIQ_BASE_DIR}/database/
+ENIQ_ADMIN=${ENIQ_BASE_DIR}/admin
+ENIQ_SQL=${ENIQ_ADMIN}/sql
+ENIQ_BACKUP=${ENIQ_BASE_DIR}/backup
+ENIQ_BKUP_SW_BIN_DIR=${ENIQ_BASE_DIR}/bkup_sw/bin
+SLASH_TMP=/tmp
+TEMP_WORK_DIR=/var/tmp/bitmap_logs
+SCRIPT_HOME=${ENIQ_ADMIN}/bin
+ENIQ_HOME=/eniq/home/dcuser
+LOG_DIR=/eniq/log/sw_log/iq/bitmapDailyLogs
+BITMAP_ENV=${ENIQ_ADMIN}/etc/bitmapCheck.env
+TEMPLATE_BITMAP_ENV=${ENIQ_CORE_DIR}/templates/stats/admin/etc/bitmapCheck.env
+EIB=${LOG_DIR}/ENGINE_INVESTIGATOR.btmp
+FEIB=${LOG_DIR}/filteredEIB.btmp
+DDP_Report=/eniq/log/sw_log/iq/bitmapDailyLogs/ddp.report
+# CPB = convertedPartitions.btmp
+
+# ENGINE_LOGS
+ENGINE_LOG_DIR=${ENIQ_BASE_DIR}/log/sw_log/engine
+
+#Installation lib directory
+ENIQ_LIB_DIR=${ENIQ_INST_DIR}/core_install/lib/
+
+# ENIQ Config Directory
+ENIQ_CONF_DIR=${ENIQ_INST_DIR}/config
+
+# File containing the type of OSS installation. Eg. events or statistics
+INST_TYPE_FILE=${ENIQ_CONF_DIR}/ericsson_use_config
+
+# Source the common functions
+if [ -s ${COMMON_FUNCS_LIB} ]; then
+    . /eniq/installation/core_install/lib/common_functions.lib
+else
+    _err_msg_="File /eniq/installation/core_install/lib/common_functions.lib not found"
+    abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+fi
+
+if [[ ! -e $LOG_DIR ]]; then
+    $MKDIR -p $LOG_DIR
+fi
+
+if [[ ! -e $TEMP_WORK_DIR ]]; then
+    $MKDIR -p $TEMP_WORK_DIR/dbfhide_logs
+fi
+
+# Logfile Setup
+if [[ -z $LOGFILE ]]; then
+    # Default logfile
+    start_time=`date '+%m-%d-%y_%H.%M.%S'`
+    LOGFILE="${LOG_DIR}/BitmapCheck_${start_time}.log"
+    $RM -rf $LOGFILE
+    touchFileIfNotExists $LOGFILE
+fi
+
+log_msg -s "\n${double_line}" -l ${LOGFILE}
+log_msg -t -s "Started running bitmap Checker at : `date`" -l ${LOGFILE}
+
+LASTBMPCHECK=`date +%Y-%m-%d\ %H:%M:%S -d "1 day ago"`
+
+if [[ ! -s ${BITMAP_ENV} ]]; then
+    if [[ -s ${TEMPLATE_BITMAP_ENV} ]]; then
+        $ECHO "${BITMAP_ENV} file is empty. Copying it from Template path"
+        $CP -rp ${TEMPLATE_BITMAP_ENV} ${BITMAP_ENV}
+        old_LASTBMPCHECK=
+        LASTBMPCHECK=`date +%Y-%m-%d\ %H:%M:%S -d "1 day ago"`
+        $SED -e "s/LASTBMPCHECK='$old_LASTBMPCHECK'/LASTBMPCHECK='$LASTBMPCHECK'/" $BITMAP_ENV  > $TEMP_WORK_DIR/tempf
+        $CP -rp $TEMP_WORK_DIR/tempf ${BITMAP_ENV}
+        if [ $? -ne 0 ]; then
+               $ECHO "Failed to update LASTBMPCHECK in ${BITMAP_ENV}" >> ${LOGFILE}
+        fi
+    else
+        $ECHO "${TEMPLATE_BITMAP_ENV} file not found for processing"
+        abort_script "Bitmap environment file not found..."
+    fi
+else
+    $ECHO "Sourcing Bitmap env file....."
+    . "${BITMAP_ENV}"
+fi
+log_msg -t -s "Current Run number is: ${RUNNUMBER}" -l ${LOGFILE}
+$ECHO "LOGFILE: $LOGFILE"
+touchFileIfNotExists $EIB
+touchFileIfNotExists $FEIB
+
+# Get the System User and Group. All directories are owned by this
+SYSUSER=`iniget ENIQ_INSTALL_CONFIG -f ${ENIQ_CONF_DIR}/${SUNOS_INI} -v ENIQ_SYSUSER`
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not read SYSUSER param from ${ENIQ_CONF_DIR}/${SUNOS_INI}"
+    abort_script "$_err_msg_"
+fi
+
+SYSGRP=`$ID ${SYSUSER}|$AWK '{print $2}'|$AWK -F\( '{print $2}'|$AWK -F\) '{print $1}'`
+if [ ! "${SYSGRP}" ]; then
+    _err_msg_="Could not read SYSGRP param from ${ENIQ_CONF_DIR}/${SUNOS_INI}"
+    abort_script "$_err_msg_"
+fi
+
+_iqdir_=/eniq/sybase_iq
+version=`$CAT ${_iqdir_}/version/iq_version |$GREP -w VERSION`
+prt=$(iniget DWH -f /eniq/sw/conf/niq.ini -v PortNumber)
+REP_PORT=$(iniget REP -f /eniq/sw/conf/niq.ini -v PortNumber)
+dba_pass=$(inigetpassword DB -f /eniq/sw/conf/niq.ini -v DBAPassword)
+dcpublic_pass=$(inigetpassword DWH -f /eniq/sw/conf/niq.ini -v DCPUBLICPassword)
+dcbo_pass=$(inigetpassword DWH -f /eniq/sw/conf/niq.ini -v DCBOPassword)
+dc_pass=$(inigetpassword DWH -f /eniq/sw/conf/niq.ini -v DCPassword)
+dwhrep_pass=$(inigetpassword REP -f /eniq/sw/conf/niq.ini -v DWHREPPassword)
+etlrep_pass=$(inigetpassword REP -f /eniq/sw/conf/niq.ini -v ETLREPPassword)
+
+# Read the installation type - should be "events" or "stats"
+INSTALL_TYPE=`$CAT ${INST_TYPE_FILE} | $AWK -F\= '{print $2}'`
+
+CURR_SERVER_TYPE=`$CAT $ENIQ_CONF_DIR/installed_server_type | $EGREP -v  '^[[:blank:]]*#' | $SED -e 's/ //g'`
+# Read the storage type
+STORAGE_TYPE=`iniget STOR_TYPE -f ${ENIQ_BASE_DIR}/installation/config/SunOS.ini -v STORAGE_TYPE`
+if [ ! "${STORAGE_TYPE}" ]; then
+    _err_msg_="Could not obtain storage type from ${ENIQ_BASE_DIR}/installation/config/SunOS.ini"
+    abort_script "${_err_msg_}"
+fi
+SNAPSHOT_LOGFILE=/eniq/log/sw_log/rolling_snapshot_logs/prep_eniq_snapshots.log
+SERVICES='/eniq/installation/core_install/bin/list_services.bsh'
+
+# setting dbisql command for dba user
+cmd='eng=dwhdb;links=tcpip{host=localhost;port=@prt@};uid=dba;pwd=@dba_pass@';
+replaced_cmd=`echo $cmd | sed "s/@prt@/$prt/g" | sed "s/@dba_pass@/${dba_pass}/g"`
+conn_string_dba_dec='-nogui -onerror exit -c @replaced_cmd@'
+echo $conn_string_dba_dec | sed "s/@replaced_cmd@/$replaced_cmd/g" > ${TEMP_WORK_DIR}/dbfhide_logs/conn_string_dba.dec
+dbfhide ${TEMP_WORK_DIR}/dbfhide_logs/conn_string_dba.dec ${TEMP_WORK_DIR}/dbfhide_logs/conn_string_dba.enc > /dev/null
+DBISQL_DBA="dbisql @${TEMP_WORK_DIR}/dbfhide_logs/conn_string_dba.enc"
+DBPING_DBA="dbping -c ${replaced_cmd} "
+
+# Setting dbisql command for dc user
+cmd_dc='eng=dwhdb;links=tcpip{host=localhost;port=@prt@};uid=dc;pwd=@dc_pass@';
+replaced_cmd_dc=`echo $cmd_dc | sed "s/@prt@/$prt/g" | sed "s/@dc_pass@/${dc_pass}/g"`
+DBISQL_DC="dbisql -nogui -c ${replaced_cmd_dc} "
+
+#Repdb configuration
+REP_CONN_STR_USER_DBA="uid=dba;pwd=${dba_pass};eng=repdb;links=tcpip(host=localhost;port=$REP_PORT)"
+DBISQL_DBA_REP="dbisql -nogui -c ${REP_CONN_STR_USER_DBA}"
+
+REP_CONN_STR_USER_DWHREP="uid=dwhrep;pwd=${dwhrep_pass};eng=repdb;links=tcpip(host=localhost;port=$REP_PORT)"
+DBISQL_DWHREP="dbisql -nogui -c ${REP_CONN_STR_USER_DWHREP}"
+
+REP_CONN_STR_USER_ETLREP="uid=etlrep;pwd=${etlrep_pass};eng=repdb;links=tcpip(host=localhost;port=$REP_PORT)"
+DBISQL_ETLREP="dbisql -nogui -c ${REP_CONN_STR_USER_ETLREP}"
+
+DBPING_DBA_REP="/eniq/sql_anywhere/bin64/dbping -c ${REP_CONN_STR_USER_DBA}"
+}
+
+### Function: check_id ###
+#
+#   Check that the effective id of the user is correct
+#   If not print error msg and exit.
+#
+# Arguments: $1 : User ID name
+# Return Values: none
+#
+check_id()
+{
+local _check_id_=`$ID  | $AWK -F\( '{print $2}' | $AWK -F\) '{print $1}'`
+if [ "$_check_id_" != "$1" ]; then
+    _err_msg_="You must be $1 to execute this script."
+    abort_script "$_err_msg_"
+fi
+}
+
+### Function: investigateEngineErrorLogs ###
+#
+# Lists all the error files in /eniq/log/sw_log/engine for bitmap errors 
+# Input arguments: none
+# Output: ${EIB} file
+#
+investigateEngineErrorLogs(){
+log_msg -t -s "Listing the engine/error-* files which are updated after: ${LASTBMPCHECK}" -l $LOGFILE
+$TOUCH --date "${LASTBMPCHECK}" ${TEMP_WORK_DIR}/start.file
+current_TSC=`date '+%Y-%m-%d %H:%M:%S'`
+$TOUCH --date "${current_TSC}" ${TEMP_WORK_DIR}/end.file
+$FIND ${ENGINE_LOG_DIR}/error-* -type f -newer ${TEMP_WORK_DIR}/start.file -not -newer ${TEMP_WORK_DIR}/end.file > ${TEMP_WORK_DIR}/error_files.list
+if [[ $? -eq 0 ]]; then
+    fileCount=`$WC -l ${TEMP_WORK_DIR}/error_files.list| $CUT -d" " -f1`
+    log_msg -t -s "Completed listing files which are updated after: ${LASTBMPCHECK}" -l $LOGFILE
+    log_msg -t -s "No of Files found : $fileCount " -l ${LOGFILE}
+    $CAT -n ${TEMP_WORK_DIR}/error_files.list >>  ${LOGFILE}
+    updateLastBmpCheck
+else
+   abort_script "Failed to list the error_files which are updated after: ${LASTBMPCHECK}"
+fi
+# Populate the header for EIB if not there
+if [[ ! -s $EIB ]]; then
+    log_msg -t -s "Populating the header for $EIB for first time..." -l ${LOGFILE}
+    $ECHO "Filename|CheckedAt|BitmapSeen|SizeOfFile|isFresh" > $EIB
+fi
+# -----------------------------
+# Generate EIB File
+# -----------------------------
+if [[ $fileCount -gt 0 ]]; then
+    log_msg -t -s "Generating the $EIB for $fileCount error files" -l ${LOGFILE}
+    for fileItem in `$CAT ${TEMP_WORK_DIR}/error_files.list`; do
+        # file_name
+        _file_name_=`$ECHO $fileItem | $AWK -F"/" '{print $NF}' `
+         # TSC
+        TSC=`date '+%Y-%m-%d_%H:%M:%S'`
+        # BitmapSeen
+        ${ZGREP} -i "Bitmap failed internal checks" $fileItem > /dev/null
+        if [[ $? -eq 0 ]]; then
+            BitmapSeen="Yes"
+        else
+            BitmapSeen="No"
+        fi
+         # SizeOfFile
+        _size_=`$LS -ld $fileItem | $AWK '{print $5}'`
+        # Check if file_name is already present in the EIB
+        $ZGREP -i ${_file_name_} ${EIB} > /dev/null
+        if [[ $? -eq 0 ]]; then
+            # log_msg -t -s "$_file_name_ is already present in the $EIB" -l ${LOGFILE}
+            $SED -i "/${_file_name_}/d" $EIB
+            isFresh=`$ZGREP -i ${_file_name_} ${EIB} | $AWK '{print $NF}'`
+        else
+            # log_msg -t -s "$_file_name_ is not there in the $EIB" -l ${LOGFILE}
+            isFresh="True"
+        fi
+        $ECHO "${_file_name_}|${TSC}|${BitmapSeen}|${_size_}|${isFresh}" >> $EIB
+    done
+    $SORT -k1 -n $EIB > ${TEMP_WORK_DIR}/sorted_EIB.txt
+    $CP -p ${TEMP_WORK_DIR}/sorted_EIB.txt ${EIB}
+else
+    log_msg -t -s "No updated files found after: ${LASTBMPCHECK} " -l ${LOGFILE}
+fi
+log_msg -t -s "Check $EIB for more details" -l ${LOGFILE}
+log_msg -t -s "Completed the first level of investigation on Engine logs" -l ${LOGFILE}
+log_msg -s "${single_line}" -l ${LOGFILE}
+# Cleanup
+$RM -rf ${TEMP_WORK_DIR}/start.file ${TEMP_WORK_DIR}/end.file ${TEMP_WORK_DIR}/sorted_EIB.txt
+$RM -rf ${TEMP_WORK_DIR}/error_files.list
+}
+
+### Function: filterEngineInvestigationLogs ###
+#
+# Filters the EIB file which has BitmapSeen-Y && isFresh-T
+# Arguments
+#   none
+# Output
+#   ${FEIB} file
+#
+filterEngineInvestigationLogs(){
+if [[ -s ${EIB} ]]; then
+    > $FEIB # Empty the FEIB
+    > ${TEMP_WORK_DIR}/Half_FEIB.txt
+    > ${TEMP_WORK_DIR}/YT_EIB.txt
+    # Populate the header for FEIB if not there
+    if [[ ! -s $FEIB ]]; then
+        log_msg -t -s "Populating the FEIB header for first time" -l ${LOGFILE}
+        $ECHO "Filename|CheckedAt|BitmapSeen|ErrorTS|EngineID|UUID|PartitionName" > $FEIB
+    fi
+    # -----------------------------
+    # YT_EIB.txt Generation
+    # -----------------------------
+    $GREP -i "Yes" ${EIB} | $GREP -i "True" > ${TEMP_WORK_DIR}/YT_EIB.txt
+    YTCount=`wc -l  ${TEMP_WORK_DIR}/YT_EIB.txt | $CUT -d" " -f1`
+    if [[ $YTCount -gt 0 ]]; then
+        log_msg -t -s "Found some entries where Verification is required..Created YT_EIB.txt" -l ${LOGFILE}
+    else
+        log_msg -t -s "No entries found in ${TEMP_WORK_DIR}/YT_EIB.txt " -l ${LOGFILE}
+    fi
+    # Making times stamps with no spaces.
+    $SED -i "s/ /-/g" ${TEMP_WORK_DIR}/YT_EIB.txt
+    # -----------------------------
+    # Half_FEIB.txt Generation
+    # -----------------------------
+    # Loop over the YT_EIB
+    if [[ -s ${TEMP_WORK_DIR}/YT_EIB.txt ]]; then
+        while read item; do
+            _file_name_=`$ECHO $item | $CUT -d"|" -f1`
+            checkedAt=`$ECHO $item | $CUT -d"|" -f2`
+            fullFilePath="/eniq/log/sw_log/engine/${_file_name_}"
+            # BitmapSeen
+            $ZGREP -i "Bitmap failed internal checks" ${fullFilePath} > /dev/null
+            if [[ $? -eq 0 ]]; then
+                BitmapSeen="Yes"
+            else
+                BitmapSeen="No"
+            fi
+            # ErrorTS + EngineID
+            $ZGREP -i "Bitmap failed internal checks" ${fullFilePath} | $GREP -v "java.sql.SQLException" | $AWK '{print $1,$2,$3}' > ${TEMP_WORK_DIR}/${_file_name_}_Engine.ids
+            while read idLine; do
+                ErrorTS=`$ECHO $idLine | $CUT -d" " -f1,2`
+                EngineID=`$ECHO $idLine |  $CUT -d" " -f3 `
+                $ECHO "${_file_name_}|${checkedAt}|${BitmapSeen}|${ErrorTS}|${EngineID}|" >> ${TEMP_WORK_DIR}/Half_FEIB.txt
+            done < ${TEMP_WORK_DIR}/${_file_name_}_Engine.ids
+            $SED -i "s/ /-/g" ${TEMP_WORK_DIR}/Half_FEIB.txt
+        done < ${TEMP_WORK_DIR}/YT_EIB.txt
+        log_msg -t -s "Completed Generating the ${TEMP_WORK_DIR}/Half_FEIB.txt " -l ${LOGFILE}
+    else
+        log_msg -t -s "Skipped Generating the ${TEMP_WORK_DIR}/Half_FEIB.txt" -l ${LOGFILE}
+    fi
+    # -----------------------------
+    # FEIB Generation
+    # -----------------------------
+    if [[ -s  ${TEMP_WORK_DIR}/Half_FEIB.txt ]]; then
+        # Getting the Partition name for given engine ID
+        while read line ; do
+            _file_name_=`$ECHO $line | $CUT -d"|" -f1`
+            fullFilePath="/eniq/log/sw_log/engine/${_file_name_}"
+            checkedAt=`$ECHO  $line | $CUT -d"|" -f2`
+            BitmapSeen=`$ECHO  $line | $CUT -d"|" -f3`
+            ErrorTS=`$ECHO  $line | $CUT -d"|" -f4`
+            EngineID=`$ECHO  $line | $CUT -d"|" -f5`
+            # PartitionName
+            PartitionName=`$ZGREP -i -A3 $EngineID $fullFilePath | $GREP -i "and the sql clause is" | $AWK '{print $NF}'`
+            if [[ -z $PartitionName ]]; then
+                log_msg -t -s "No PartitionName found for EngineID: ${EngineID} in ${_file_name_}...Will try checking in next run" -l ${LOGFILE}
+                PartitionName="null"
+            else
+                log_msg -t -s "Partition $PartitionName Found for EngineID: ${EngineID} in ${_file_name_} " -l ${LOGFILE}
+                # Change the True to False for isFresh in EIB
+                if [[ -s $EIB ]]; then
+                    $AWK -F"|" -v FN=$_file_name_ '{if ($1 == FN) {$NF="False"} {print $0} {OFS="|"} }' $EIB > ${TEMP_WORK_DIR}/replacable_EIB.txt
+                    if [[ $? -ne 0 ]]; then
+                        log_msg -t -s "WARNING: Unable to update the EIB's isFresh value for ${PartitionName}" -l ${LOGFILE}
+                    fi
+                    $CP -p ${TEMP_WORK_DIR}/replacable_EIB.txt $EIB
+                    if [[ $? -ne 0 ]]; then
+                        log_msg -t -s "WARNING: Unable to copy the replacable_EIB.txt to EIB" -l ${LOGFILE}
+                    fi
+                    $RM -rf ${TEMP_WORK_DIR}/replacable_EIB.txt
+                fi
+            fi
+            # UUID
+            if [[ ! -z $PartitionName ]]; then
+                # Checking the FEIB for same partition is already entried.
+                $GREP -w $PartitionName $FEIB > /dev/null
+                if [[ $? -eq 0 ]]; then
+                    # Assign the same UUID for the next iteration too..
+                    UUID=`$GREP -w $PartitionName $FEIB | $CUT -d"|" -f6 | $HEAD -1`
+                    if [[ $? -ne 0 ]]; then
+                        UUID=`uuidgen -r`
+                    else
+                        # log_msg -t -s "Got the older UUID for $PartitionName " -l ${LOGFILE}
+                        :
+                    fi
+                else
+                    UUID=`uuidgen -r`
+                fi
+            fi
+            if [[ -z $UUID || "$PartitionName" == "null" ]]; then
+                # If not set via above steps, assign a new one
+                # For null always assign a new one.
+                UUID=`uuidgen -r`
+            fi
+            $ECHO "${_file_name_}|${checkedAt}|${BitmapSeen}|${ErrorTS}|${EngineID}|${UUID}|${PartitionName}" >> $FEIB
+        done < ${TEMP_WORK_DIR}/Half_FEIB.txt
+        log_msg -t -s "Completed Generating the $FEIB" -l ${LOGFILE}
+    else
+        log_msg -t -s "Skipping Generating the $FEIB" -l ${LOGFILE}
+    fi
+else
+    log_msg -t -s "No ${EIB} file Found...Skipping this run " -l ${LOGFILE}
+    doISkip="Yes"
+fi
+log_msg -t -s "Completed Second level of investigation" -l ${LOGFILE}
+log_msg -s "$single_line" -l ${LOGFILE}
+# Cleanup
+$RM -rf ${TEMP_WORK_DIR}/YT_EIB.txt ${TEMP_WORK_DIR}/*.ids ${TEMP_WORK_DIR}/Half_FEIB.txt
+}
+
+### Function: callForAnAutomatedFix ###
+#
+# Filters the FEIB file which PartitionName & calls the bitmap
+# automated script `nbit2flat_Auto.bsh`
+# arguments:
+#   none
+# return values
+#   none
+#
+callForAnAutomatedFix(){
+local FEIBCount=`$WC -l $FEIB | $CUT -d" " -f1`
+
+if [[ $FEIBCount -gt 1 ]]; then
+    paritionPossibleCount=`$EGREP -vw "null|PartitionName" $FEIB | $AWK -F"|" '{print $NF}' | $WC -l`
+    uniqParitionPossibleCount=`$EGREP -vw "null|PartitionName" $FEIB | $AWK -F"|" '{print $NF}' | $SORT -ru | $WC -l`
+
+    if [[ $paritionPossibleCount -gt 0 && uniqParitionPossibleCount -gt 0 ]]; then
+
+        log_msg -t -s "Found ${uniqParitionPossibleCount} unique entries out of total ${paritionPossibleCount} entries" -l ${LOGFILE}
+        $EGREP -vw "null|PartitionName" $FEIB | $AWK -F"|" '{print $NF}' | $SORT -ru > ${TEMP_WORK_DIR}/uniqPartitions.list
+        # $CAT ${TEMP_WORK_DIR}/uniqPartitions.list
+
+        # Get the UUID's for each table if exists
+        $RM -rf ${TEMP_WORK_DIR}/finalTablesWithUUID.list
+        while read tn;
+        do
+            $GREP -w ${tn} $FEIB > /dev/null
+            if [[ $? -eq 0 ]]; then
+                local _table_name_=${tn};
+                local _uuid_=`$GREP -w ${tn} $FEIB | $CUT -d"|" -f6 | $HEAD -1`
+                $ECHO "${_table_name_}|${_uuid_}" >> ${TEMP_WORK_DIR}/finalTablesWithUUID.list
+            fi
+
+        done < ${TEMP_WORK_DIR}/uniqPartitions.list
+
+        # TODO: Comment or remove the below line!
+        # $CAT ${TEMP_WORK_DIR}/finalTablesWithUUID.list
+
+        # Check & Call the
+        if [[ -s ${TEMP_WORK_DIR}/finalTablesWithUUID.list ]]; then
+            log_msg -s "${single_line}\n" -l ${LOGFILE}
+            log_msg -t -s "Triggering the Automation to convert from nbit to Flat FP" -l ${LOGFILE}
+            log_msg -s "\n${single_line}" -l ${LOGFILE}
+
+            if [[ -s ${SCRIPT_HOME}/nbit2flat_Auto.bsh ]]; then
+                $CAT ${TEMP_WORK_DIR}/finalTablesWithUUID.list >> ${LOGFILE}
+                $BASH ${SCRIPT_HOME}/nbit2flat_Auto.bsh -t ${TEMP_WORK_DIR}/finalTablesWithUUID.list -l ${LOGFILE}
+                log_msg -t -s "Completed Calling the Automated Fixer Script" -l ${LOGFILE}
+
+            else
+                log_msg -t -s "Unable to find the automation script...." -l ${LOGFILE}
+                abort_script "${SCRIPT_HOME}/nbit2flat_Auto.bsh not found....Exiting..."
+
+            fi
+        else
+            log_msg -t -s "No tables found with bitmap error.....!" -l ${LOGFILE}
+        fi
+    else
+        log_msg -t -s "No entries found for current run: ${RUNNUMBER}" -l ${LOGFILE}
+    fi
+
+else
+    log_msg -t -s "No entries found in $FEIB for current run!!" -l ${LOGFILE}
+fi
+
+log_msg -s "$single_line" -l ${LOGFILE}
+
+# Cleanup
+$RM -rf ${TEMP_WORK_DIR}/uniqPartitions.list ${TEMP_WORK_DIR}/finalTablesWithUUID.list
+
+}
+
+### Function: generateRandomString ###
+#
+# Generates a randomString based on length supplied. Default length is 10.
+# Args: 1 - length
+#
+generateRandomString(){
+
+    length=$1
+    if [[ -z $length ]]; then
+        length=10
+    fi
+    randomStringA=`$HEAD -3 /dev/urandom | $TR -cd '[:alnum:]' | $CUT -c -5`
+    randomStringB=`$HEAD -3 /dev/urandom | $TR -cd '[:alnum:]' | $CUT -c -5`
+    randomString="${randomStringA}-${randomStringB}"
+
+    return $randomString
+}
+
+### Function: touchFileIfNotExists ###
+#
+# Touches file if not exists.
+#
+# Input: filename to be touched
+# 
+touchFileIfNotExists(){
+
+    if [[ ! -f $1 ]]; then
+        $TOUCH $1
+    fi   
+}
+
+### Function:removeOldLogs ###
+#
+# removes old logs that exceed the max number of logs to be kept
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+#
+removeOldLogs()
+{
+if [[ -d ${LOG_DIR} ]]; then
+    _log_file_="BitmapCheck_"
+    _number_of_logs_present_=`$LS ${LOG_DIR}|$GREP ${_log_file_} |$WC -l`
+    if [ $? -ne 0 ]; then
+         log_msg -l ${LOGFILE} -t -q -s "Could not evaluate ${_number_of_logs_present_}\n"
+    fi
+
+    # Check for the old results directory.
+    if [ ${_number_of_logs_present_} -gt 0 ]; then
+        _number_of_logs_remove_=`$EXPR ${_number_of_logs_present_} - $MAXNUMLOG`
+        if [ ! ${_number_of_logs_remove_} ]; then
+            log_msg -l ${LOGFILE} -t -q -s "Could not evaluate ${_number_of_logs_remove_}\n"
+        fi
+
+        # Removing old LOG_DIR
+        if  [[ ${_number_of_logs_present_} -gt $MAXNUMLOG ]]
+        then
+            for fileTOremove in $($LS -t ${LOG_DIR}/${_log_file_}*.log | $TAIL -${_number_of_logs_remove_})
+            do
+                $RM $fileTOremove;
+                if [ $? -ne 0 ]; then
+                    log_msg -l ${LOGFILE} -t -q -s "Could not delete old logs ${LOG_DIR}/BitmapCheck_*.log\n"
+                fi
+                log_msg -l ${LOGFILE} -t -q -s "Deleted old logs ${LOG_DIR}/BitmapCheck_*.log\n"
+            done
+        else
+            log_msg -t -s "No:of Logs is below maximum value..." -l ${LOGFILE}
+        fi
+    fi
+
+fi
+
+}
+
+### Function:updateLastBmpCheck ###
+#
+# updates the LASTBMPCHECK in env file.
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+#
+updateLastBmpCheck(){
+
+    # Updating the LASTBMPCHECK in env file
+    $SED "s/LASTBMPCHECK='${LASTBMPCHECK}'/LASTBMPCHECK='${current_TSC}'/g" ${BITMAP_ENV} > ${TEMP_WORK_DIR}/temp_env.txt
+	$CP ${TEMP_WORK_DIR}/temp_env.txt ${BITMAP_ENV}
+    if [[ $? -eq 0 ]]; then
+        log_msg -t -s "Successfully updated the LASTBMPCHECK in ${BITMAP_ENV} file with: ${current_TSC}" -l $LOGFILE
+    else
+        log_msg -t -s "WARNING: Failed to update the LASTBMPCHECK" -l ${LOGFILE}
+    fi
+	$RM -rf ${TEMP_WORK_DIR}/temp_env.txt
+}
+
+### Function:updateRunNumber ###
+#
+# updates the RUNNUMBER in env file.
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+#
+updateRunNumber(){
+
+    log_msg -t -s "Updating RUNNUMBER in ${BITMAP_ENV}"  -l ${LOGFILE}
+    OLD_RUNNUMBER=${RUNNUMBER}
+    let 'OLD_RUNNUMBER = OLD_RUNNUMBER + 1'
+    $SED "s/RUNNUMBER=${RUNNUMBER}/RUNNUMBER=$OLD_RUNNUMBER/" ${BITMAP_ENV} > ${TEMP_WORK_DIR}/temp_env_2.txt
+	$CP ${TEMP_WORK_DIR}/temp_env_2.txt ${BITMAP_ENV}
+    if [[ $? -eq 0 ]]; then
+        log_msg -t -s "Successfully updated RUNNUMBER in ${BITMAP_ENV}" -l $LOGFILE
+    else
+        log_msg -t -s "WARNING: Failed to update the RUNNUMBER" -l ${LOGFILE}
+    fi
+    $RM -rf ${TEMP_WORK_DIR}/temp_env_2.txt
+}
+
+### Function:cleanUpTempDirs ###
+#
+# removes the temporary directories used in script.
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+#
+cleanUpTempDirs(){
+    $RM -rf ${TEMP_WORK_DIR}
+    if [[ $? -eq 0 ]]; then
+        log_msg -t -s "Cleaned up the temporary files...." -l ${LOGFILE}
+    fi
+
+}
+
+# ********************************************************************
+#
+#     Main body of program
+#
+# ********************************************************************
+#
+# Ctrl+C
+trap "abort_script" INT
+
+# Check that the effective id of the user is dcuser
+check_id "dcuser"
+
+# Set up environment variables for script.
+setup_env
+
+investigateEngineErrorLogs
+
+filterEngineInvestigationLogs
+
+callForAnAutomatedFix
+
+checkFailedTablesFromLastRunIfExists
+
+updateRunNumber
+
+cleanUpTempDirs
+
+removeOldLogs
+
+log_msg -s "${double_line}" -l ${LOGFILE}
+log_msg -t -s "Check $DDP_Report for status of each table" -l ${LOGFILE}
+log_msg -t -s "Check $LOGFILE for complete details..." -l ${LOGFILE}
+log_msg -t -s "Completed running bitmap Checker at: `date`" -l ${LOGFILE}
+

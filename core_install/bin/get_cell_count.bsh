@@ -1,0 +1,1442 @@
+#!/bin/bash 
+# ********************************************************************
+# Ericsson Radio Systems AB                                     SCRIPT
+# ********************************************************************
+#
+#
+# (c) Ericsson Radio Systems AB 2021 - All rights reserved.
+#
+# The copyright to the computer program(s) herein is the property
+# of Ericsson Radio Systems AB, Sweden. The programs may be used 
+# and/or copied only with the written permission from Ericsson Radio 
+# Systems AB or in accordance with the terms and conditions stipulated 
+# in the agreement/contract under which the program(s) have been 
+# supplied.
+#
+# ********************************************************************
+# Name    : get_cell_count.bsh
+# Date    : 13/06/2023
+# Revision: main\34
+# Purpose : Script to determine number of nodes to be managed,
+#           whether to mirror storage pool, and to lay out disks
+#           and node numbers in ini files
+#
+# Usage   : get_cell_count.bsh
+#
+# ********************************************************************
+#
+#     Command Section
+#
+# ********************************************************************
+
+AWK=/usr/bin/awk
+BASENAME=/usr/bin/basename
+BC=/usr/bin/bc
+CAT=/usr/bin/cat
+CHMOD=/usr/bin/chmod
+CLEAR=/usr/bin/clear
+CP=/usr/bin/cp
+CUT=/usr/bin/cut
+DATE=/usr/bin/date
+DF=/usr/bin/df
+DIRNAME=/usr/bin/dirname
+DMIDECODE=/usr/sbin/dmidecode
+ECHO='/usr/bin/echo -e'
+EGREP=/usr/bin/egrep
+ENV=/usr/bin/env
+EXPR=/usr/bin/expr
+GREP=/usr/bin/grep
+HEAD=/usr/bin/head
+HOSTNAME=/usr/bin/hostname
+ID=/usr/bin/id
+LS=/usr/bin/ls
+MKDIR=/usr/bin/mkdir
+MORE=/usr/bin/more
+MULTIPATH=/usr/sbin/multipath
+MV=/usr/bin/mv
+PWD=/usr/bin/pwd
+RAW=/usr/bin/raw
+RM=/usr/bin/rm
+SCSI_ID=/usr/lib/udev/scsi_id
+SED=/usr/bin/sed
+SLEEP=/usr/bin/sleep
+SORT=/usr/bin/sort
+SU=/usr/bin/su
+SUDO=/usr/bin/sudo
+TAIL=/usr/bin/tail
+TEE=/usr/bin/tee
+TOUCH=/usr/bin/touch
+UDEVADM=/usr/sbin/udevadm
+WC=/usr/bin/wc
+
+# ********************************************************************
+#
+#       Configuration Section
+#
+# ********************************************************************
+# Name of SunOS & ENIQ ini Files
+ENIQ_ENV=niq.rc
+ENIQ_INI=niq.ini
+LUN_MAP_INI=lun_map.ini
+SYM_INI=sym_links.ini
+SUNOS_INI=SunOS.ini
+
+# Percentage figures for the amount of available
+# disk space to give to main and temp dbspaces
+MAIN_DBSPACE_PERCENTAGE=70
+TEMP_DBSPACE_PERCENTAGE=30
+#Max Size for FS SWAP Partition in GBytes
+MAX_16G_SWAP=16
+# ********************************************************************
+#
+#       Pre-execution Operations
+#
+# ********************************************************************
+
+# ********************************************************************
+#
+#     functions
+#
+# ********************************************************************
+### Function: abort_script ###
+#
+#   This will is called if the script is aborted thru an error
+#   error signal sent by the kernel such as CTRL-C or if a serious
+#   error is encountered during runtime
+#
+# Arguments:
+#       $1 - Error message from part of program (Not always used)
+# Return Values:
+#       none
+abort_script()
+{
+if [ "$1" ]; then
+    _err_msg_=$1
+else
+    _err_msg_="Script aborted.......\n"    
+fi
+
+if [ "${LOGFILE}" ]; then
+    $ECHO "\n$_err_msg_\n"|$TEE -a ${LOGFILE}
+else
+    $ECHO "\n$_err_msg_\n"
+fi
+
+cd $SCRIPTHOME
+
+$RM -rf ${TEM_DIR}
+
+if [ "$2" ]; then
+    ${2}
+else
+   exit 1
+fi
+}
+
+
+
+### Function: calculate_main_dbspace_details ###
+#
+# Calculate number of main dbspaces required and the
+# size of each dbspace
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+calculate_main_dbspace_details()
+{
+unset NUM_MAIN_DBSPACES
+unset MAIN_SPACE_PER_DBSPACE
+unset START_MAIN_DBSPACE_NUM
+
+if [ "${STORAGE_TYPE}" != "fs" ]; then
+    _num_luns_=$(iniget DB_DISK_ALLOC -f ${INI_DIR}/${SYM_INI} -v MAINDB_DISKS)
+    DEF_NUM_MAIN_DBSPACES=$($ECHO ${_num_luns_}|$AWK '{print NF}')
+else    
+    DEF_NUM_MAIN_DBSPACES=10
+fi
+
+if [ "${MAIN_USER_NUM_SPACE}" ]; then
+    NUM_MAIN_DBSPACES=${MAIN_USER_NUM_SPACE}
+else
+    NUM_MAIN_DBSPACES=${DEF_NUM_MAIN_DBSPACES}
+fi
+
+if [ "${STORAGE_TYPE}" == "fs" ]; then
+     MAIN_SPACE_PER_DBSPACE=$($ECHO "${1}/${NUM_MAIN_DBSPACES}" | $BC)
+     if [ "${MAIN_SPACE_PER_DBSPACE}" -eq 0 ]; then
+         MAIN_SPACE_PER_DBSPACE=1
+     fi
+fi
+
+if [ "${RESTORE}" ]; then
+    if [ -s ${TEM_DIR}/dbspace_file_loc_ini ]; then 
+        START_MAIN_DBSPACE_NUM=$($CAT "${TEM_DIR}"/dbspace_file_loc_ini | $EGREP -w "^DWH_DBSPACES_MAIN_[1-9]" | $AWK  '{print $2}' | $SED -e 's|\(.*_\)\(.*\)\(\.iq\)|\2|' | $SORT -n | $TAIL -1)
+        START_MAIN_DBSPACE_NUM=$($EXPR ${START_MAIN_DBSPACE_NUM} + 1)
+    else
+        START_MAIN_DBSPACE_NUM=$($CAT $SCRIPTHOME/../../config/"${SYM_INI}" | $EGREP -w "^DWH_DBSPACES_MAIN_[1-9]" | $CUT -d "_" -f4 | $SORT -n | $HEAD -1)
+    fi    
+else    
+    if [ -s ${TEM_DIR}/dbspace_file_loc_ini ]; then 
+        START_MAIN_DBSPACE_NUM=$($CAT "${TEM_DIR}"/dbspace_file_loc_ini | $EGREP -w "^DWH_DBSPACES_MAIN_[1-9]" | $AWK  '{print $2}' | $SED -e 's|\(.*_\)\(.*\)\(\.iq\)|\2|' | $SORT -n | $TAIL -1)
+        START_MAIN_DBSPACE_NUM=$($EXPR ${START_MAIN_DBSPACE_NUM} + 1)
+    else
+        _previous_db_=$($CAT "${INI_DIR}"/"${SYM_INI}" | $EGREP -w "^DWH_DBSPACES_MAIN_[1-9]" | $CUT -d "_" -f4 | $SORT -n | $HEAD -1)
+                if [ ! ${_previous_db_} -o ${_previous_db_} == 1  ]; then
+                        START_MAIN_DBSPACE_NUM=1
+                else
+                        START_MAIN_DBSPACE_NUM=$($ECHO ${_previous_db_})
+                fi
+    fi        
+fi
+
+if [ ! "${START_MAIN_DBSPACE_NUM}" ]; then
+    _err_msg_="Could not determine next Main DBspace number"
+    abort_script "$_err_msg_" "${EXEC_SHELL_CMD}"
+fi
+}
+
+### Function: calculate_temp_dbspace_details ###
+#
+# Calculate number of temp dbspaces required and the
+# size of each dbspace
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+calculate_temp_dbspace_details()
+{
+unset NUM_TEMP_DBSPACES
+unset TEMP_SPACE_PER_DBSPACE
+unset START_TEMP_DBSPACE_NUM
+
+if [ "${STORAGE_TYPE}" != "fs" ]; then
+    _num_luns_=$(iniget DB_DISK_ALLOC -f ${INI_DIR}/${SYM_INI} -v TEMPDB_DISKS)
+    DEF_NUM_TEMP_DBSPACES=$($ECHO ${_num_luns_}|$AWK '{print NF}')
+else    
+    DEF_NUM_TEMP_DBSPACES=5
+fi
+
+if [ "${TEMP_USER_NUM_SPACE}" ]; then
+    NUM_TEMP_DBSPACES=${TEMP_USER_NUM_SPACE}
+else
+    NUM_TEMP_DBSPACES=${DEF_NUM_TEMP_DBSPACES}
+fi
+
+ if [ "${STORAGE_TYPE}" == "fs" ]; then
+     TEMP_SPACE_PER_DBSPACE=$($ECHO "${1}/${NUM_TEMP_DBSPACES}" | $BC)
+     if [ "${TEMP_SPACE_PER_DBSPACE}" -eq 0 ]; then
+         TEMP_SPACE_PER_DBSPACE=1
+     fi
+ fi
+
+if [ "${RESTORE}" ]; then
+    if [ -s ${TEM_DIR}/dbspace_file_loc_ini ]; then 
+        START_TEMP_DBSPACE_NUM=$($CAT "${TEM_DIR}"/dbspace_file_loc_ini | $EGREP -w "^DWH_DBSPACES_TEMP_[1-9]" \ | $AWK  '{print $2}' | $SED -e 's|\(.*_\)\(.*\)\(\.iq\)|\2|' | $SORT -n | $TAIL -1)
+        START_TEMP_DBSPACE_NUM=$($EXPR ${START_TEMP_DBSPACE_NUM} + 1)
+    else
+        START_TEMP_DBSPACE_NUM=$($CAT $SCRIPTHOME/../../config/"${SYM_INI}"|$EGREP -w "^DWH_DBSPACES_TEMP_[1-9]"|$CUT -d "_" -f4|$SORT -n|$HEAD -1)
+    fi    
+else    
+    if [ -s ${TEM_DIR}/dbspace_file_loc_ini ]; then 
+        START_TEMP_DBSPACE_NUM=$($CAT "${TEM_DIR}"/dbspace_file_loc_ini | $EGREP -w "^DWH_DBSPACES_TEMP_[1-9]" | $AWK  '{print $2}' | $SED -e 's|\(.*_\)\(.*\)\(\.iq\)|\2|' | $SORT -n | $TAIL -1)
+        START_TEMP_DBSPACE_NUM=$($EXPR ${START_TEMP_DBSPACE_NUM} + 1)
+    elif [ -f /var/tmp/vnx_to_unity_temp_migration_flag ]; then
+           START_TEMP_DBSPACE_NUM=$($CAT $SCRIPTHOME/../../config/"${SYM_INI}"|$EGREP -w "^DWH_DBSPACES_TEMP_[1-9]"|$CUT -d "_" -f4|$SORT -n|$HEAD -1)
+    else
+        _previous_temp_db_=$($CAT ${INI_DIR}/"${SYM_INI}" | $EGREP -w "^DWH_DBSPACES_TEMP_[1-9]" | $CUT -d "_" -f4 | $SORT -n | $HEAD -1)
+                if [ ! ${_previous_temp_db_} -o ${_previous_temp_db_} == 1  ]; then
+                        START_TEMP_DBSPACE_NUM=1
+                else
+                        START_TEMP_DBSPACE_NUM=$($ECHO ${_previous_temp_db_})
+                fi            
+    fi 
+fi
+
+if [ ! "${START_TEMP_DBSPACE_NUM}" ]; then
+    _err_msg_="Could not determine next Temp DBspace number"
+    abort_script "$_err_msg_" "${EXEC_SHELL_CMD}"
+fi
+}
+
+### Function: calculate_sys_main_dbspace_details ###
+#
+# Calculate number of sys main dbspaces required and the
+# size of each dbspace
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+calculate_sys_main_dbspace_details()
+{
+unset NUM_SYS_MAIN_DBSPACES
+unset START_SYS_MAIN_DBSPACE_NUM
+
+if [ "${STORAGE_TYPE}" == "raw" ]; then
+    _num_luns_=$(iniget DB_DISK_ALLOC -f ${INI_DIR}/${SYM_INI} -v IQ_SYS_MAIN_DISKS)
+    DEF_NUM_SYS_MAIN_DBSPACES=$($ECHO ${_num_luns_}|$AWK '{print NF}')
+fi
+
+if [ "${SYS_MAIN_USER_NUM_SPACE}" ]; then
+    NUM_SYS_MAIN_DBSPACES=${SYS_MAIN_USER_NUM_SPACE}
+else
+    NUM_SYS_MAIN_DBSPACES=${DEF_NUM_SYS_MAIN_DBSPACES}
+fi
+
+if [ "${RESTORE}" ]; then
+    if [ -s ${TEM_DIR}/dbspace_file_loc_ini ]; then 
+        START_SYS_MAIN_DBSPACE_NUM=$($CAT "${TEM_DIR}"/dbspace_file_loc_ini | $EGREP -w "^DWH_SYSTEM_MAIN_[1-9]" | $AWK  '{print $2}' | $SED -e 's|\(.*_\)\(.*\)\(\.iq\)|\2|' | $SORT -n | $TAIL -1)
+        START_SYS_MAIN_DBSPACE_NUM=$($EXPR ${START_SYS_MAIN_DBSPACE_NUM} + 1)
+    else
+        START_SYS_MAIN_DBSPACE_NUM=$($CAT $SCRIPTHOME/../../config/"${SYM_INI}" | $EGREP -w "^DWH_SYSTEM_MAIN_[1-9]" | $CUT -d "_" -f4 | $SORT -n | $HEAD -1)
+    fi    
+else    
+    if [ -s ${TEM_DIR}/dbspace_file_loc_ini ]; then 
+        START_SYS_MAIN_DBSPACE_NUM=$($CAT "${TEM_DIR}"/dbspace_file_loc_ini | $EGREP -w "^DWH_SYSTEM_MAIN_[1-9]" | $AWK  '{print $2}' | $SED -e 's|\(.*_\)\(.*\)\(\.iq\)|\2|' | $SORT -n | $TAIL -1)
+        START_SYS_MAIN_DBSPACE_NUM=$($EXPR ${START_SYS_MAIN_DBSPACE_NUM} + 1)
+    else
+        _previous_db_=$($CAT "${INI_DIR}"/"${SYM_INI}" | $EGREP -w '^DWH_SYSTEM_MAIN_[1-9]' | $CUT -d "_" -f4 | $SORT -n | $HEAD -1)
+                if [ ! ${_previous_db_} -o ${_previous_db_} == 1  ]; then
+                        START_SYS_MAIN_DBSPACE_NUM=1
+                else
+                        START_SYS_MAIN_DBSPACE_NUM=$($ECHO ${_previous_db_})
+                fi
+    fi        
+fi
+
+if [ ! "${START_SYS_MAIN_DBSPACE_NUM}" ]; then
+    _err_msg_="Could not determine next Main DBspace number"
+    abort_script "$_err_msg_" "${EXEC_SHELL_CMD}"
+fi
+}
+
+### Function: check_id ###
+#
+#   Check that the effective id of the user is correct
+#   If not print error msg and exit.
+#
+# Arguments:
+#       $1 : User ID name
+# Return Values:
+#       none
+check_id()
+{
+_get_id_=$($ENV |$GREP -w SUDO_USER | $EGREP "^[[:blank:]]*SUDO_USER="|$AWK -F\= '{print $2}'|$SED -e 's|"||g')
+
+_check_id_=$($ID | $AWK -F\( '{print $2}' | $AWK -F\) '{print $1}')
+
+_check_group_=$($ID $_get_id_ | $AWK -F\( '{print $3}' | $AWK -F\) '{print $1}')
+
+
+    if [ "${_get_id_}" == "" ]; then
+
+        if [ "${_check_id_}" == "root" ]; then
+           # Set 1 for true
+           _user_root=1
+
+        else
+           _err_msg_="You must be root or admin to execute this script."
+           abort_script "${_err_msg_}"
+        fi
+    else
+        if [ "${_check_group_}" == "ENIQ_ADMIN_ROLE" ]; then
+           # Set 0 for false
+           _user_root=0
+
+        else
+            _err_msg_="You must be root or admin to execute this script." 
+            abort_script "${_err_msg_}"
+        fi
+    fi
+
+}
+
+### Function: get_absolute_path ###
+#
+# Determine absolute path to software
+#
+# Arguments:
+#    none
+# Return Values:
+#    none
+get_absolute_path() 
+{
+_dir_=$($DIRNAME $0)
+SCRIPTHOME=$(cd $_dir_ 2>/dev/null && pwd || $ECHO $_dir_)
+}
+
+### Function: get_mpath_val ###
+#
+# Determine absolute path to software
+#
+# Arguments:
+#   $1 : file containing disk names
+#   $2 : DWH_DBSPACES_MAIN / DWH_SYSTEM_MAIN
+# Return Values:
+#    MainDB / SYS_MAIN_DB disk name as per local server
+get_mpath_val()
+{
+CO_MPATH_LIST=$1
+DBSPACE_VAL=$2
+
+# Replacing space with new line
+$SED -ie 's/ /\n/g' "${CO_MPATH_LIST}"
+if [ $? -ne 0 ]; then
+    _err_msg_="Error while re-arranging ${CO_MPATH_LIST} file"
+    abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+fi
+    
+# Getting block tags from COORD_SYM_LINK_FILE
+    if [ "${DBSPACE_VAL}" == "DWH_DBSPACES_MAIN" ]; then
+        _main_db_luns_=""
+        _co_tag_list_=$(iniget DWH_DBSPACES_MAIN -f ${ENIQ_CONF_DIR}/${COORD_SYM_LINK_FILE})
+    else
+        _sys_db_luns_=""
+        _co_tag_list_=$(iniget DWH_SYSTEM_MAIN -f ${ENIQ_CONF_DIR}/${COORD_SYM_LINK_FILE})
+    fi
+    
+    if [ ! "${_co_tag_list_}" ]; then
+       _err_msg_="Could not get the list of blocks from ${ENIQ_CONF_DIR}/${COORD_SYM_LINK_FILE}"
+       abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+    fi
+
+# Getting block tags from Lun_Map_Ini file
+    _lun_map_list_=$(iniget LUN_MAP_DETAILS -f ${ENIQ_CONF_DIR}/lun_map.ini)
+    if [ ! "${_lun_map_list_}" ]; then
+        _err_msg_="Could not get the list of blocks from ${ENIQ_CONF_DIR}/lun_map.ini"
+        abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+    fi
+
+# Getting local disk name for the MainDB / SysMain corresponding to those present on Coordinator
+    while read line; do
+        for _tag_ in ${_co_tag_list_}; do
+            _co_disk_=$(iniget ${_tag_} -f ${ENIQ_CONF_DIR}/${COORD_SYM_LINK_FILE} -v Disk)
+            if [ ! "${_co_disk_}" ]; then
+               _err_msg_="Could not get the value of DISK from ${ENIQ_CONF_DIR}/${COORD_SYM_LINK_FILE}"
+               abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+            fi
+        
+            if [ "${_co_disk_}" == "${line}1" ]; then
+
+                _co_lun_id_=$(iniget ${_tag_} -f ${ENIQ_CONF_DIR}/${COORD_SYM_LINK_FILE} -v Lun_ID) 
+                if [ ! "${_co_lun_id_}" ]; then
+                    _err_msg_="Could not determine Lun_ID for ${_tag_}"
+                    abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+                fi
+
+                # Getting the block from lun_map.ini containing disk updated in sym_link.ini
+                for _lun_tag_ in ${_lun_map_list_}; do
+                    _lun_id_=$(iniget ${_lun_tag_} -f ${ENIQ_CONF_DIR}/lun_map.ini -v LUN_ID)
+                    if [ ! "${_lun_id_}" ]; then
+                        _err_msg_="Could not determine disk id for ${_lun_tag_}"
+                        abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+                    fi
+        
+                    if [ "${_co_lun_id_}" == "${_lun_id_}" ]; then
+                        _disk_name_=$(iniget ${_lun_tag_} -f ${ENIQ_CONF_DIR}/lun_map.ini -v DISK_ID)
+                        if [ ! "${_disk_name_}" ]; then
+                            _err_msg_="Could not determine disk name for $_lun_tag_ block"
+                            abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+                        fi
+
+                        if [ "${DBSPACE_VAL}" == "DWH_DBSPACES_MAIN" ]; then
+                            if [ "${_main_db_luns_}" ]; then
+                                _main_db_luns_="${_main_db_luns_} ${_disk_name_}"
+                            else
+                                _main_db_luns_="${_disk_name_}"
+                            fi
+                        else
+                            if [ "${_sys_db_luns_}" ]; then
+                                _sys_db_luns_="${_sys_db_luns_} ${_disk_name_}"
+                            else
+                                _sys_db_luns_="${_disk_name_}"
+                            fi
+                        fi
+                        
+                        break
+                    fi    
+    
+                done
+                break
+            fi
+        done
+    done < ${CO_MPATH_LIST}
+}
+
+
+### Function: register_raw_device ###
+#
+# Register the disk with raw device
+#
+# Arguments:
+#    none
+# Return Values:
+#    none
+register_raw_device()
+{
+touch ${TEM_DIR}/symlink.txt
+
+if [ "${SERVER_TYPE}" == "CO" -o "${SERVER_TYPE}" == "eniq_stats" ]; then
+    _main_db_luns_=$(iniget DB_DISK_ALLOC -f ${INI_DIR}/${SYM_INI} -v MAINDB_DISKS)
+    if [ ! "${_main_db_luns_}" ]; then
+        _err_msg_="Could not read MAINDB_DISKS parameter from  ${INI_DIR}/${SYM_INI}"
+        abort_script "$_err_msg_" "${EXEC_SHELL_CMD}"
+    fi
+else
+    iniget DB_DISK_ALLOC -f ${ENIQ_CONF_DIR}/${COORD_SYM_LINK_FILE} -v MAINDB_DISKS > ${TEM_DIR}/co_main_db_luns
+    if [ $? -ne 0 ]; then
+        _err_msg_="Could not read MAINDB_DISKS parameter from  ${INI_DIR}/${COORD_SYM_LINK_FILE}"
+        abort_script "$_err_msg_" "${EXEC_SHELL_CMD}"
+    fi
+	
+    # Getting the list of MainDBs 
+    get_mpath_val ${TEM_DIR}/co_main_db_luns DWH_DBSPACES_MAIN
+	
+    # Updating MAIN luns in sym_link.ini file
+    iniset DB_DISK_ALLOC -f ${INI_DIR}/${SYM_INI} MAINDB_DISKS="${_main_db_luns_}"
+    if [ $? -ne 0 ]; then
+        _err_msg_="Could not set MAINDB_DISKS value in ${INI_DIR}/${SYM_INI}"
+        abort_script "$_err_msg_" "${EXEC_SHELL_CMD}"
+    fi
+	
+fi
+
+_temp_db_luns_=$(iniget DB_DISK_ALLOC -f ${INI_DIR}/${SYM_INI} -v TEMPDB_DISKS)
+if [ ! "${_temp_db_luns_}" ]; then
+    _err_msg_="Could not read MAINDB_DISKS parameter from  ${INI_DIR}/${SYM_INI}"
+    abort_script "$_err_msg_" "${EXEC_SHELL_CMD}"
+fi
+
+if [ "${SERVER_TYPE}" == "CO" -o "${SERVER_TYPE}" == "eniq_stats" ]; then
+    _sys_db_luns_=$(iniget DB_DISK_ALLOC -f ${INI_DIR}/${SYM_INI} -v IQ_SYS_MAIN_DISKS)
+    if [ ! "${_sys_db_luns_}" ]; then
+        _err_msg_="Could not read IQ_SYS_MAIN_DISKS value from ${INI_DIR}/${SYM_INI}"
+        abort_script "$_err_msg_" "${EXEC_SHELL_CMD}"
+    fi
+else
+    iniget DB_DISK_ALLOC -f ${ENIQ_CONF_DIR}/${COORD_SYM_LINK_FILE} -v IQ_SYS_MAIN_DISKS > ${TEM_DIR}/co_sys_db_luns
+    if [ $? -ne 0 ]; then
+        _err_msg_="Could not read IQ_SYS_MAIN_DISKS value from ${INI_DIR}/${COORD_SYM_LINK_FILE}"
+        abort_script "$_err_msg_" "${EXEC_SHELL_CMD}"
+    fi
+	
+    # Getting the list of MainDBs 
+    get_mpath_val ${TEM_DIR}/co_sys_db_luns DWH_SYSTEM_MAIN
+	
+    # Updating SYSTEM MAIN luns in sym_link.ini file
+    iniset DB_DISK_ALLOC -f ${INI_DIR}/${SYM_INI} IQ_SYS_MAIN_DISKS="${_sys_db_luns_}"
+    if [ $? -ne 0 ]; then
+        _err_msg_="Could not set IQ_SYS_MAIN_DISKS value in ${INI_DIR}/${SYM_INI}"
+        abort_script "$_err_msg_" "${EXEC_SHELL_CMD}"
+    fi
+fi
+
+$ECHO $_main_db_luns_ $_sys_db_luns_ $_temp_db_luns_ > ${TEM_DIR}/symlink.txt
+if [ ! -s ${TEM_DIR}/symlink.txt ]; then
+        _err_msg_="Could not write luns information to ${TEM_DIR}/symlink.txt"
+        abort_script "$_err_msg_" "${EXEC_SHELL_CMD}"
+fi
+
+$SED -i 's/ /\n/g' ${TEM_DIR}/symlink.txt
+if [ $? -ne 0 ]; then
+        _err_msg_="Could not align the content in ${TEM_DIR}/symlink.txt"
+        abort_script "$_err_msg_" "${EXEC_SHELL_CMD}"
+fi
+
+count=1
+while read line
+do
+    $SED -ie "s/^\($line\)$/\1:\/dev\/raw\/raw$count/g" ${TEM_DIR}/symlink.txt 
+    if [ $? -ne 0 ]; then
+        _err_msg_="Could not append raw device with ${line} in ${TEM_DIR}/symlink.txt"
+        abort_script "$_err_msg_" "${EXEC_SHELL_CMD}"
+    fi
+    count=$(expr $count + 1)
+done < ${TEM_DIR}/symlink.txt
+
+# Delete udev rules file if already exist
+if [ -f ${UDEV_FILE} ]; then
+    $RM -rf ${UDEV_FILE} 
+fi
+
+# Registering raw devices
+if [ ! -f ${UDEV_FILE} ]; then
+    
+    $ECHO "#BEGIN" >> ${UDEV_FILE}
+	$ECHO 'ACTION!="add|change", GOTO="raw_end"' >> ${UDEV_FILE}
+    while read line
+    do
+        if [ ${_san_device_} == "local" ]; then
+   
+            _disk_=$($ECHO $line | $AWK -F":" '{print $1}')
+            if [ ! ${_disk_} ]; then
+                _err_msg_="Could not find disk value"
+                abort_script "$_err_msg_" "${EXEC_SHELL_CMD}"
+            fi
+            _raw_disk_=$($ECHO $line | $AWK -F":" '{print $2}')
+            if [ ! ${_raw_disk_} ]; then
+                _err_msg_="Could not find _raw_disk_ value"
+                abort_script "$_err_msg_" "${EXEC_SHELL_CMD}"
+            fi
+            _uuid_=$($SCSI_ID -g -u -d /dev/${_disk_}1)
+            if [ ! ${_uuid_} ]; then
+                _err_msg_="Could not find _uuid_ value"
+                abort_script "$_err_msg_" "${EXEC_SHELL_CMD}"
+            fi
+            $ECHO "KERNEL=="\"sd*[0-9]\"", PROGRAM=="\"scsi_id -g -u -d %N\"", RESULT=="\"${_uuid_}\"", RUN+="\"/usr/bin/raw ${_raw_disk_} %N\""" >> ${UDEV_FILE}
+        else
+    
+            _disk_=$($ECHO $line | $AWK -F":" '{print $1}')
+            if [ ! ${_disk_} ]; then
+                _err_msg_="Could not find disk value"
+                abort_script "$_err_msg_" "${EXEC_SHELL_CMD}"
+            fi
+            _raw_disk_=$($ECHO $line | $AWK -F":" '{print $2}')
+            if [ ! ${_raw_disk_} ]; then
+                _err_msg_="Could not find _raw_disk_ value"
+                abort_script "$_err_msg_" "${EXEC_SHELL_CMD}"
+            fi
+			_uuid_=$($UDEVADM  info --query=all --name=/dev/mapper/${_disk_}1 | $GREP -iw DM_UUID | $AWK -F"=" '{print $2}')
+            if [ ! ${_uuid_} ]; then
+                _err_msg_="Could not find _uuid_ value"
+                abort_script "$_err_msg_" "${EXEC_SHELL_CMD}"
+            fi
+            $ECHO "ENV{DM_UUID}=="\"${_uuid_}\"", RUN+="\"/bin/raw ${_raw_disk_}  %M %m\""" >> ${UDEV_FILE}
+        fi
+
+    done < ${TEM_DIR}/symlink.txt
+    $ECHO 'KERNEL=="raw*", OWNER="dcuser", GROUP="dc5000", MODE="0660"' >> ${UDEV_FILE}
+	$ECHO 'LABEL="raw_end"' >> ${UDEV_FILE}
+	$ECHO "#END" >> ${UDEV_FILE}
+fi
+}
+    
+### Function: get_cell_count ###
+#
+# Get Cell managed count
+#
+# Arguments:
+#    none
+# Return Values:
+#    none
+get_cell_count()
+{
+unset TOTAL_NODE_MAIN_SPACE
+unset TOTAL_NODE_TEMP_SPACE
+unset _db_size_in_mbytes_
+
+if [ "${STORAGE_TYPE}" == "fs" ]; then
+      # Getting current hardware generation
+      _hard_gen_=$($DMIDECODE -s system-product-name | $AWK -F " " '{print $3}')
+      if [ ! "${_hard_gen_}" ]; then
+           _err_msg_="Could not determine current hardware generation"
+           abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+      fi
+
+      log_msg -s "Creating a list of volume groups from ${INI_DIR}/${SUNOS_INI}\n" -l ${LOGFILE}
+      _pool_list_=$(iniget SunOS_FS_POOL -f ${INI_DIR}/${SUNOS_INI})
+      for _pool_ in ${_pool_list_}; do
+          _pool_disk_layout_=$(iniget ${_pool_} -f ${INI_DIR}/${SUNOS_INI} -v disk_layout)
+          if [ ! "${_pool_disk_layout_}" ]; then
+               _err_msg_="Could not determine disk ${_pool_disk_layout_}"
+               abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+          fi
+      done
+
+      # Get the list of the disks seperated by "@" delimiter
+      ${SCRIPTHOME}/get_disk_list.sh -f -r -d "@" > ${TEM_DIR}/tem_disk_file
+      if [ ! -s ${TEM_DIR}/tem_disk_file ]; then
+            _err_msg_="No disk details returned from command\n${SCRIPTHOME}/get_disk_list.sh -f -d -r "@""
+            abort_script "$_err_msg_" "${EXEC_SHELL_CMD}"
+      fi
+
+       _tot_disk_space_=0
+       for _disk_ in ${_pool_disk_layout_}; do 
+           _indv_disk_space_=$($CAT "${TEM_DIR}"/tem_disk_file | $GREP -w "${_disk_}" | $AWK -F\@ '{print $3}'| $AWK '{print $1}')
+           _tot_disk_space_=$($EXPR ${_tot_disk_space_} + ${_indv_disk_space_})
+       done
+
+       #Getting disk size excluding swap volume
+        _avail_disk_size_=$($ECHO "${_tot_disk_space_} - ${MAX_16G_SWAP}" | $BC)
+        if [ ! "${_avail_disk_size_}"  ]; then
+            _err_msg_="Could not determine avaialable pool size in ${_pool_name_} "
+            abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+        fi
+
+    #Get Filesystem Overhead
+    _metadata_=$(iniget FS_OVERHEAD -f ${INI_DIR}/${SUNOS_INI} -v metadata)
+    if [ ! "${_metadata_}" ]; then
+         _err_msg_="Could not determine metadata overhead"
+         abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+    fi
+
+    _root_reserved_=$(iniget FS_OVERHEAD -f ${INI_DIR}/${SUNOS_INI} -v root_reserved)
+    if [ ! "${_root_reserved_}" ]; then
+         _err_msg_="Could not determine Root reserved overhead"
+         abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+    fi
+
+    #Getting actual disk space by excluding Filesystem Overheads(FS Overhead - 1.6% and Root Overhead - 5%)
+    _avail_disk_size_=$($ECHO "scale=3; ${_avail_disk_size_}*(100-${_metadata_}-${_root_reserved_})/100" | $BC)
+    if [ ! "${_avail_disk_size_}"  ]; then
+         _err_msg_="Could not exclude FS overhead from disk size"
+         abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+    fi
+
+    # Getting the MainDB size 
+      _main_db_size_=$(iniget ${_hard_gen_}_DBSPACES -f ${INI_DIR}/${SUNOS_INI} -v Main_DB)
+      if [ ! "${_main_db_size_}"  ]; then
+            _err_msg_="Could not determine Main DB size from ${INI_DIR}/${SUNOS_INI}"
+            abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+      fi
+      TOTAL_NODE_MAIN_SPACE=$($ECHO "scale=3; ${_avail_disk_size_}*${_main_db_size_}*1024/100" | $BC)
+      if [ ! "${TOTAL_NODE_MAIN_SPACE}"  ]; then
+            _err_msg_="Could not determine Main DB space size"
+            abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+      fi
+
+      # Getting the TempDB size
+      _temp_db_size_=$(iniget ${_hard_gen_}_DBSPACES -f ${INI_DIR}/${SUNOS_INI} -v Temp_DB)
+      if [ ! "${_temp_db_size_}"  ]; then
+            _err_msg_="Could not determine Temp DB size from ${INI_DIR}/${SUNOS_INI}"
+            abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+      fi
+
+      TOTAL_NODE_TEMP_SPACE=$($ECHO "scale=3; ${_avail_disk_size_}*${_temp_db_size_}*1024/100" | $BC)
+      if [ ! "${TOTAL_NODE_TEMP_SPACE}"  ]; then
+            _err_msg_="Could not determine Temp DB space size"
+            abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+      fi
+
+      #Getting the SysMainDB size
+      _sys_main_db_size_=$(iniget ${_hard_gen_}_DBSPACES -f ${INI_DIR}/${SUNOS_INI} -v SysMain_DB)
+      if [ ! "${_sys_main_db_size_}" ]; then
+           _err_msg_="Could not determine SysMain DB sizefrom ${INI_DIR}/${SUNOS_INI}"
+           abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+      fi
+      _db_size_in_mbytes_=$($ECHO "${_avail_disk_size_}*${_sys_main_db_size_}*1024/100" | $BC)
+      if [ ! "${_db_size_in_mbytes_}" ]; then
+           _err_msg_="Could not determine SysMain DB size"
+           abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+      fi
+fi
+
+# Calculate number of main dbspaces required and the
+# size of each dbspace
+calculate_main_dbspace_details ${TOTAL_NODE_MAIN_SPACE}
+
+# Calculate number of temp dbspaces required and the
+# size of each dbspace
+calculate_temp_dbspace_details ${TOTAL_NODE_TEMP_SPACE}
+
+
+# Calculate number of sysmain dbspaces required and the
+# size of each dbspace
+calculate_sys_main_dbspace_details
+
+# Update the ${SYM_INI} with the dbspaces
+update_dbspace_ini 
+}
+
+### Function: setup_env ###
+#
+# Setup up path environment etc
+#
+# Arguments:
+#	none
+# Return Values:
+#	none
+setup_env()
+{
+# ENIQ Directory
+if [ ! "${ENIQ_BASE_DIR}" ]; then
+    ENIQ_BASE_DIR=/eniq
+fi
+
+# ENIQ Config Directory
+ENIQ_CONF_DIR=${ENIQ_BASE_DIR}/installation/config
+
+# Core install bin dir
+ENIQ_CORE_BIN_DIR=${ENIQ_BASE_DIR}/installation/core_install/bin
+
+# ENIQ SW conf
+CLI_CONF_DIR=${ENIQ_BASE_DIR}/sw/conf
+
+# File containing LUN Ids for the coordinator
+COORD_SYM_LINK_FILE=coordinator_sym_links.ini
+
+# Cmd to exec a shell and drop user to it in case of an error
+EXEC_SHELL_CMD="exec /bin/bash -o emacs"
+
+#UDEV File
+UDEV_FILE=/etc/udev/rules.d/99-iq-raw-devs.rules
+
+# Determine the current server type
+CURR_SERVER_TYPE=$($CAT ${ENIQ_CONF_DIR}/installed_server_type)
+if [ "${CURR_SERVER_TYPE}" == "stats_coordinator" -o "${CURR_SERVER_TYPE}" == "eniq_coordinator" ]; then
+    SERVER_TYPE="CO"
+else
+    SERVER_TYPE="${CURR_SERVER_TYPE}"
+fi
+
+#Get deployment type
+if [ -s ${ENIQ_CONF_DIR}/extra_params/deployment ]; then
+      _deployment_=$($CAT ${ENIQ_CONF_DIR}/extra_params/deployment)
+else
+      _err_msg_="Could not get the current deployment type"
+      abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+fi
+
+if [ "${STORAGE_TYPE}" == "raw" ]; then
+    _san_device_=$($CAT ${ENIQ_CONF_DIR}/san_details | $EGREP "^SAN_DEVICE=" | $AWK -F\= '{print $2}')
+    if [ ! "${_san_device_}" ]; then
+        _err_msg_="Could not get the value of SAN device"
+        abort_script "$_err_msg_" "${EXEC_SHELL_CMD}"
+    fi
+fi
+}
+
+### Function: update_dbspace_ini ###
+#
+# Update the ${ENIQ_INI} with the dbspaces
+#
+# Arguments:
+#    none
+# Return Values:
+#    none
+update_dbspace_ini()
+{
+
+# Register SAN disks as RAW 
+if [ "${STORAGE_TYPE}" == "raw" ]; then
+    register_raw_device
+fi
+
+local _dir_num_ _sym_link_ _db_path_ _disk_id_ _ip_addr_
+local _loop_cnt_ _iq_sys_main_db_lun_ _reader_name_
+local _lun_fld_=0
+
+if [ "${SERVER_TYPE}" == "CO" -o "${SERVER_TYPE}" == "eniq_stats" ]; then
+    MAIN_DB_PATH=$(iniget DWH_DBSPACES_LOCATION -f ${INI_DIR}/${SYM_INI} -v MAIN_DB_PATH)
+    if [ ! "${MAIN_DB_PATH}" ]; then
+    _err_msg_="Could not find MAIN_DB_PATH in ${INI_DIR}/${SYM_INI}"
+    abort_script "$_err_msg_" "${EXEC_SHELL_CMD}"
+    fi
+fi
+
+TEMP_DB_PATH=$(iniget DWH_DBSPACES_LOCATION -f ${INI_DIR}/${SYM_INI} -v TEMP_DB_PATH)
+if [ ! "${TEMP_DB_PATH}" ]; then
+    _err_msg_="Could not find TEMP_DB_PATH in ${INI_DIR}/${SYM_INI}"
+    abort_script "$_err_msg_" "${EXEC_SHELL_CMD}"
+fi
+
+DB_DIR_NAME_TEMPL=$(iniget DWH_DBSPACES_LOCATION -f ${INI_DIR}/${SYM_INI} -v DB_DIR_NAME_TEMPL)
+if [ ! "${DB_DIR_NAME_TEMPL}" ]; then
+    _err_msg_="Could not find DB_DIR_NAME_TEMPL in ${INI_DIR}/${SYM_INI}"
+    abort_script "$_err_msg_" "${EXEC_SHELL_CMD}"
+fi
+
+if [ "${STORAGE_TYPE}" != "fs" ]; then
+    # Read location of storage API command
+    _stor_api_cmd_=$(iniget STOR_API -f ${INI_DIR}/${SUNOS_INI} -v STOR_API_CMD)
+    if [ ! "${_stor_api_cmd_}" ]; then
+    _err_msg_="Could not read STOR_API_CMD param from ${INI_DIR}/${SUNOS_INI}"
+    abort_script "$_err_msg_" "${EXEC_SHELL_CMD}"
+    fi
+
+    $RM -f ${TEM_DIR}/listluns.txt
+    ${_stor_api_cmd_} --action listluns >> ${TEM_DIR}/listluns.txt
+    if [ $? -ne 0 ]; then
+    _err_msg_="Error getting list of luns for Lun Map ini creation"
+    abort_script "$_err_msg_" "${EXEC_SHELL_CMD}"
+    fi
+    
+    if [ "${SERVER_TYPE}" == "CO" -o "${SERVER_TYPE}" == "eniq_stats" ]; then
+    _main_db_luns_=$(iniget DB_DISK_ALLOC -f ${INI_DIR}/${SYM_INI} -v MAINDB_DISKS)
+    if [ ! "${_main_db_luns_}" ]; then
+        _err_msg_="Could not read MAINDB_DISKS parameter from  ${INI_DIR}/${SYM_INI}"
+        abort_script "$_err_msg_" "${EXEC_SHELL_CMD}"
+    fi
+    fi
+    
+    _temp_db_luns_=$(iniget DB_DISK_ALLOC -f ${INI_DIR}/${SYM_INI} -v TEMPDB_DISKS)
+    if [ ! "${_temp_db_luns_}" ]; then
+    _err_msg_="Could not read TEMPDB_DISKS parameter from  ${INI_DIR}/${SYM_INI}"
+    abort_script "$_err_msg_" "${EXEC_SHELL_CMD}"
+    fi
+fi
+
+
+
+if [ "${SERVER_TYPE}" == "CO" -o "${SERVER_TYPE}" == "eniq_stats" ]; then
+    let _loop_cnt_=${START_MAIN_DBSPACE_NUM}+${NUM_MAIN_DBSPACES}-1
+    for (( i=${START_MAIN_DBSPACE_NUM}; i<=${_loop_cnt_}; i++)); do
+        # Get the directory number. If the last character is 1 then go to dbspace_dir_1,
+        # if the last character is 2 then go to dbspace_dir_2....
+        # if the last character is 0 then go to dbspace_dir_0....
+
+        # Get the last digit
+        _last_dig_=$($ECHO ${i: -1})
+        if [ ${_last_dig_} -eq 0 ]; then
+            _dir_num_=10
+        else
+            _dir_num_=${_last_dig_}
+        fi
+
+        let _lun_fld_=_lun_fld_+1
+        if [ "${STORAGE_TYPE}" == "fs" ]; then
+            _size_=${MAIN_SPACE_PER_DBSPACE}
+            _sym_link_=""
+            _db_path_="Path=${MAIN_DB_PATH}/${DB_DIR_NAME_TEMPL}${_dir_num_}/main_${i}.iq"
+            _lun_id_=""
+            _disk_name_=""
+        else
+            _size_=""
+            _disk_id_=$($ECHO ${_main_db_luns_}|$AWK -v fld=${_lun_fld_} '{print $fld}')
+            _sym_link_=$($CAT ${TEM_DIR}/symlink.txt | $AWK -v disk="$_disk_id_" -F":" '$1 == disk{print $2}')
+            _db_path_="Path=${MAIN_DB_PATH}/${DB_DIR_NAME_TEMPL}${_dir_num_}/main_${i}.iq"
+            _lun_id_=$($CAT ${TEM_DIR}/listluns.txt|$EGREP -i -w "${_disk_id_}"|$AWK -F\; '{print $1}')
+            if [ ! "${_lun_id_}" ]; then
+            _err_msg_="Could not read LUN ID for ${_disk_id_} from \n${TEM_DIR}/listluns.txt"
+            abort_script "$_err_msg_"  "${EXEC_SHELL_CMD}"
+            fi
+			
+            _disk_name_="${_disk_id_}1"
+        fi
+
+        $RM -f ${TEM_DIR}/ins_det
+        $ECHO "[DWH_DBSPACES_MAIN_${i}]" >> ${TEM_DIR}/ins_det
+        $ECHO "${_db_path_}" >> ${TEM_DIR}/ins_det
+        $ECHO "Lun_ID=${_lun_id_}">> ${TEM_DIR}/ins_det
+        $ECHO "Size=${_size_}" >> ${TEM_DIR}/ins_det
+        $ECHO "Type=${STORAGE_TYPE}">> ${TEM_DIR}/ins_det
+        $ECHO "Link=${_sym_link_}">> ${TEM_DIR}/ins_det
+        $ECHO "Disk=${_disk_name_}">> ${TEM_DIR}/ins_det
+        if [ "${STORAGE_TYPE}" == "raw" ]; then
+            if [ ${_san_device_} != "local" ]; then
+                _wwn_id_=$($MULTIPATH -l | $GREP -w "${_disk_id_}" | $AWK -F "(" '{print $2}' | $AWK -F ")" '{print $1}')
+                $ECHO "WWN=${_wwn_id_}">> ${TEM_DIR}/ins_det
+            fi
+        fi
+
+
+        $RM -f  ${TEM_DIR}/${SYM_INI}
+        $ECHO "Updating ${INI_DIR}/${SYM_INI} with DWH_DBSPACES_MAIN_${i}" >> ${LOGFILE}
+        ${SCRIPTHOME}/../lib/iniadd.pl -g DWH_DBSPACES_MAIN -p DWH_DBSPACES_MAIN_${i} -i ${INI_DIR}/${SYM_INI} -d ${TEM_DIR}/ins_det -o ${TEM_DIR}/${SYM_INI}
+        if [ $? -ne 0 ]; then
+            _err_msg_="Error adding DWH_DBSPACES_MAIN_${i} to ${TEM_DIR}/${SYM_INI}"
+            abort_script "$_err_msg_" "${EXEC_SHELL_CMD}"
+        fi
+
+        $CP ${TEM_DIR}/${SYM_INI} ${INI_DIR}/${SYM_INI}
+
+        # Updating the link attribute in lun_map.ini file for MAIN DBSPACE
+        update_lun_map ${_disk_id_} ${_sym_link_}
+    done
+else
+    if [ -s ${TEM_DIR}/${SYM_INI} ]; then
+        $CP ${TEM_DIR}/${SYM_INI} ${INI_DIR}/${SYM_INI}
+    fi
+fi
+
+_lun_fld_=0
+_sys_main_db_=$(iniget DWH_SYSTEM_MAIN -f ${INI_DIR}/${SYM_INI}|$HEAD -1)
+if [ "${STORAGE_TYPE}" == "fs" ]; then  
+    iniset ${_sys_main_db_} -f ${INI_DIR}/${SYM_INI} Size=${_db_size_in_mbytes_}
+    if [ $? -ne 0 ]; then
+    _err_msg_="Could not update ${INI_DIR}/${SYM_INI} with ${_sys_main_db_} Size=${_db_size_in_mbytes_}"
+    abort_script "$_err_msg_" "${EXEC_SHELL_CMD}"
+    fi
+else
+    _db_path_1_=$(iniget ${_sys_main_db_} -f ${INI_DIR}/${SYM_INI} -v Path)
+    if [ ! "${_db_path_1_}" ]; then
+    _err_msg_="Could not read Path param from ${INI_DIR}/${SYM_INI}"
+    abort_script "$_err_msg_" "${EXEC_SHELL_CMD}"
+    fi
+    if [ ! "${CURR_SERVER_TYPE}" == "stats_engine" ]; then
+    let _loop_cnt_=${START_SYS_MAIN_DBSPACE_NUM}+${NUM_SYS_MAIN_DBSPACES}-1
+    for (( i=${START_SYS_MAIN_DBSPACE_NUM}; i<=${_loop_cnt_}; i++)); do
+        # Get the directory number. If the last character is 1 then go to dbspace_dir_1,
+        # if the last character is 2 then go to dbspace_dir_2....
+        # if the last character is 0 then go to dbspace_dir_0....
+
+        # Get the last digit
+        _last_dig_=$($ECHO ${i: -1})
+        if [ ${_last_dig_} -eq 0 ]; then
+            _dir_num_=10
+        else
+            _dir_num_=${_last_dig_}
+        fi
+
+        let _lun_fld_=_lun_fld_+1
+        _size_=""
+        _disk_id_=$($ECHO ${_sys_db_luns_}|$AWK -v fld=${_lun_fld_} '{print $fld}')
+        _sym_link_=$($CAT ${TEM_DIR}/symlink.txt | $AWK -v disk="$_disk_id_" -F":" '$1 == disk{print $2}')
+        _db_path_="Path=${_db_path_1_}"
+        _lun_id_=$($CAT ${TEM_DIR}/listluns.txt|$EGREP -i -w "${_disk_id_}"|$AWK -F\; '{print $1}')
+        if [ ! "${_lun_id_}" ]; then
+            _err_msg_="Could not read LUN ID for ${_disk_id_} from \n${TEM_DIR}/listluns.txt"
+            abort_script "$_err_msg_"  "${EXEC_SHELL_CMD}"
+        fi
+        _disk_name_="${_disk_id_}1"
+
+        $RM -f ${TEM_DIR}/ins_det
+        $ECHO "[DWH_SYSTEM_MAIN_${i}]" >> ${TEM_DIR}/ins_det
+        $ECHO "${_db_path_}" >> ${TEM_DIR}/ins_det
+        $ECHO "Lun_ID=${_lun_id_}">> ${TEM_DIR}/ins_det
+        $ECHO "Size=${_size_}" >> ${TEM_DIR}/ins_det
+        $ECHO "Type=${STORAGE_TYPE}">> ${TEM_DIR}/ins_det
+        $ECHO "Link=${_sym_link_}">> ${TEM_DIR}/ins_det
+        $ECHO "Disk=${_disk_name_}">> ${TEM_DIR}/ins_det
+        if [ "${STORAGE_TYPE}" == "raw" ]; then
+            if [ ${_san_device_} != "local" ]; then
+                _wwn_id_=$($MULTIPATH -l | $GREP -w "${_disk_id_}" | $AWK -F "(" '{print $2}' | $AWK -F ")" '{print $1}')
+                $ECHO "WWN=${_wwn_id_}">> ${TEM_DIR}/ins_det
+            fi
+        fi
+
+
+        $RM -f  ${TEM_DIR}/${SYM_INI}
+        $GREP -wv "Disk=${_disk_name_}" ${INI_DIR}/${SYM_INI} > ${TEM_DIR}/SYS_test
+        $GREP -vw "WWN=${_wwn_id_}" ${TEM_DIR}/SYS_test > ${INI_DIR}/${SYM_INI}
+        
+        $ECHO "Updating ${INI_DIR}/${SYM_INI} with DWH_SYSTEM_MAIN_${i}" >> ${LOGFILE}
+        ${SCRIPTHOME}/../lib/iniadd.pl -g DWH_SYSTEM_MAIN -p DWH_SYSTEM_MAIN_${i} -i ${INI_DIR}/${SYM_INI} -d ${TEM_DIR}/ins_det -o ${TEM_DIR}/${SYM_INI}
+        if [ $? -ne 0 ]; then
+            _err_msg_="Error adding DWH_SYSTEM_MAIN_${i} to ${TEM_DIR}/${SYM_INI}"
+            abort_script "$_err_msg_" "${EXEC_SHELL_CMD}"
+        fi
+        
+        $CP ${TEM_DIR}/${SYM_INI} ${INI_DIR}/${SYM_INI}
+
+        # Updating the link attribute in lun_map.ini file for MAIN DBSPACE
+        update_lun_map ${_disk_id_} ${_sym_link_}
+    done
+    fi
+fi
+
+_lun_fld_=0
+let _loop_cnt_=${START_TEMP_DBSPACE_NUM}+${NUM_TEMP_DBSPACES}-1
+for (( i=${START_TEMP_DBSPACE_NUM}; i<=${_loop_cnt_}; i++)); do
+    # Get the directory number. If the last character is 1 then go to dbspace_dir_1,
+    # if the last character is 2 then go to dbspace_dir_2....
+    # if the last character is 0 then go to dbspace_dir_0....
+
+    # Get the last digit
+    _last_dig_=$($ECHO ${i: -1})
+    case ${_last_dig_} in
+    1|6) _dir_num_=1
+        ;;
+    2|7) _dir_num_=2
+        ;;
+    3|8) _dir_num_=3
+        ;;
+    4|9) _dir_num_=4
+        ;;
+    5|0) _dir_num_=5
+        ;;
+    esac
+
+    let _lun_fld_=_lun_fld_+1
+    if [ "${STORAGE_TYPE}" == "fs" ]; then
+    _size_=${TEMP_SPACE_PER_DBSPACE}
+    _sym_link_=""
+    _db_path_="Path=${TEMP_DB_PATH}/${DB_DIR_NAME_TEMPL}${_dir_num_}/temp_${i}.iqtmp"
+    _lun_id_=""
+    else
+    _size_=""
+    _disk_id_=$($ECHO ${_temp_db_luns_}|$AWK -v fld=${_lun_fld_} '{print $fld}')
+    _disk_name_="${_disk_id_}1"
+    _sym_link_=$($CAT ${TEM_DIR}/symlink.txt | $AWK -v disk="$_disk_id_" -F":" '$1 == disk{print $2}')
+    if [ "${CURR_SERVER_TYPE}" == "stats_iqr" ]; then
+        if [ -s ${ENIQ_CONF_DIR}/.reader_info ]; then
+        _reader_name_=$($CAT ${ENIQ_CONF_DIR}/.reader_info |$EGREP "::"  |$AWK -F"::" '{print $1}'|$HEAD -1)
+        if [ ! "${_reader_name_}" ]; then
+            _err_msg_="Could not read reader name from ${ENIQ_CONF_DIR}/.reader_info"
+            abort_script "$_err_msg_" "${EXEC_SHELL_CMD}"
+        fi
+        else
+        _hname_=$($HOSTNAME)
+        _ip_addr_=$(hostname --ip-address | $AWK '{print $1}' | $HEAD -1)
+        if [ ! "${_ip_addr_}" ]; then
+            _err_msg_="Could not determine Reader IP address"
+            abort_script "$_err_msg_" "${EXEC_SHELL_CMD}"
+        fi
+
+        _reader_name_=$($CAT ${CLI_CONF_DIR}/service_names|$EGREP "^[[:blank:]]*${_ip_addr_}::.+dwh_reader" |$AWK -F"::" '{print $NF}')
+        if [ ! "${_reader_name_}" ]; then
+            _err_msg_="Could not read reader name from ${CLI_CONF_DIR}/service_names"
+            abort_script "$_err_msg_" "${EXEC_SHELL_CMD}"
+        fi
+        fi
+        _db_path_="Path=${TEMP_DB_PATH}/${DB_DIR_NAME_TEMPL}${_dir_num_}/${_reader_name_}_temp_${i}.iqtmp"
+    else
+        _db_path_="Path=${TEMP_DB_PATH}/${DB_DIR_NAME_TEMPL}${_dir_num_}/temp_${i}.iqtmp"
+    fi
+    
+    _lun_id_=$($CAT "${TEM_DIR}"/listluns.txt| $EGREP -i -w "${_disk_id_}"|$AWK -F\; '{print $1}')
+    if [ ! "${_lun_id_}" ]; then
+        _err_msg_="Could not read LUN ID for ${_disk_id_} from \n${TEM_DIR}/listluns.txt"
+        abort_script "$_err_msg_" "${EXEC_SHELL_CMD}"
+    fi
+    fi
+
+    $RM -f ${TEM_DIR}/ins_det
+    $ECHO "[DWH_DBSPACES_TEMP_${i}]" >> ${TEM_DIR}/ins_det
+    $ECHO "${_db_path_}" >> ${TEM_DIR}/ins_det
+    $ECHO "Lun_ID=${_lun_id_}">> ${TEM_DIR}/ins_det
+    $ECHO "Size=${_size_}" >> ${TEM_DIR}/ins_det
+    $ECHO "Type=${STORAGE_TYPE}">> ${TEM_DIR}/ins_det
+    $ECHO "Link=${_sym_link_}">> ${TEM_DIR}/ins_det
+    $ECHO "Disk=${_disk_name_}">> ${TEM_DIR}/ins_det
+    if [ "${STORAGE_TYPE}" == "raw" ]; then
+        if [ ${_san_device_} != "local" ]; then
+            _wwn_id_=$($MULTIPATH -l | $GREP -w "${_disk_id_}" | $AWK -F "(" '{print $2}' | $AWK -F ")" '{print $1}')
+            $ECHO "WWN=${_wwn_id_}">> ${TEM_DIR}/ins_det
+        fi
+	fi
+
+    $RM -f  ${TEM_DIR}/${SYM_INI}
+
+    $ECHO "Updating ${INI_DIR}/${SYM_INI} with DWH_DBSPACES_TEMP_${i}" >> ${LOGFILE}
+    ${SCRIPTHOME}/../lib/iniadd.pl -g DWH_DBSPACES_TEMP -p DWH_DBSPACES_TEMP_${i} -i ${INI_DIR}/${SYM_INI} -d ${TEM_DIR}/ins_det -o ${TEM_DIR}/${SYM_INI}
+    if [ $? -ne 0 ]; then
+    _err_msg_="Error adding DWH_DBSPACES_TEMP_${i} to ${TEM_DIR}/${SYM_INI}"
+    abort_script "$_err_msg_" "${EXEC_SHELL_CMD}"
+    fi
+
+    $CP ${TEM_DIR}/${SYM_INI} ${INI_DIR}/${SYM_INI}
+	
+    # Updating the link attribute in lun_map.ini file for TEMP DBSAPCES 
+    update_lun_map ${_disk_id_} ${_sym_link_}
+done
+
+if [ "${SERVER_TYPE}" != "CO" -a "${SERVER_TYPE}" != "eniq_stats" ]; then
+    if [ ! -s ${ENIQ_CONF_DIR}/${COORD_SYM_LINK_FILE} ]; then
+        _err_msg_="Could not locate file containing LUN IDs - ${ENIQ_CONF_DIR}/${COORD_SYM_LINK_FILE}"
+        abort_script "$_err_msg_" "${EXEC_SHELL_CMD}"
+    fi
+    
+    _dwh_main_list_=$(iniget DWH_DBSPACES_MAIN -f ${ENIQ_CONF_DIR}/${COORD_SYM_LINK_FILE})
+    if [ ! "${_dwh_main_list_}" ]; then
+        _err_msg_="Could not read any MAIN LUN details from ${ENIQ_CONF_DIR}/${COORD_SYM_LINK_FILE}"
+        abort_script "$_err_msg_" "${EXEC_SHELL_CMD}"
+    fi
+
+    # Store CO-ORD sysmain details in local ${SYM_INI}
+    _sys_main_db_list_=$(iniget DWH_SYSTEM_MAIN -f ${ENIQ_CONF_DIR}/${COORD_SYM_LINK_FILE})
+
+    for _sys_main_db_ in ${_sys_main_db_list_}; do    
+        _sys_main_path_=$(iniget ${_sys_main_db_} -f ${ENIQ_CONF_DIR}/${COORD_SYM_LINK_FILE} -v Path)
+        _sys_main_lun_id_=$(iniget ${_sys_main_db_} -f ${ENIQ_CONF_DIR}/${COORD_SYM_LINK_FILE} -v Lun_ID)
+        _sys_main_type_=$(iniget ${_sys_main_db_} -f ${ENIQ_CONF_DIR}/${COORD_SYM_LINK_FILE} -v Type)
+        _sys_main_size_=$(iniget ${_sys_main_db_} -f ${ENIQ_CONF_DIR}/${COORD_SYM_LINK_FILE} -v Size)
+        _sys_main_link_=$(iniget ${_sys_main_db_} -f ${ENIQ_CONF_DIR}/${COORD_SYM_LINK_FILE} -v Link)
+
+        # update the link for sym_link.ini from lun_map.ini
+        _lun_map_details_list_=$(iniget LUN_MAP_DETAILS -f ${ENIQ_CONF_DIR}/${LUN_MAP_INI})
+        for _lun_map_details_ in ${_lun_map_details_list_}; do
+            _lun_id_in_lun_map_=$(iniget ${_lun_map_details_} -f ${ENIQ_CONF_DIR}/${LUN_MAP_INI} -v LUN_ID)
+            if [ "${_lun_id_in_lun_map_}" == "${_sys_main_lun_id_}" ]; then
+                _sys_main_link_temp_=$(iniget ${_lun_map_details_} -f ${ENIQ_CONF_DIR}/${LUN_MAP_INI} -v DISK_ID)
+                _sym_link_=$($CAT ${TEM_DIR}/symlink.txt | $AWK -v disk="$_sys_main_link_temp_" -F":" '$1 == disk{print $2}')
+                if [ "${_sys_main_link_}" !=  "${_sym_link_}"  ]; then
+                    _sys_main_link_="${_sym_link_}"
+                fi
+
+                # Setting LINK attribute in lun_map.ini
+                iniset ${_lun_map_details_} -f ${ENIQ_CONF_DIR}/${LUN_MAP_INI} LINK=${_sys_main_link_}
+                if [ $? -ne 0 ]; then
+                    _err_msg_="Error adding LINK value for ${_lun_map_details_}"
+                    abort_script "$_err_msg_" "${EXEC_SHELL_CMD}"
+                fi
+            fi
+        done
+
+        iniset ${_sys_main_db_} -f ${INI_DIR}/${SYM_INI} Path=${_sys_main_path_}
+        iniset ${_sys_main_db_} -f ${INI_DIR}/${SYM_INI} Lun_ID=${_sys_main_lun_id_}
+        iniset ${_sys_main_db_} -f ${INI_DIR}/${SYM_INI} Type=${_sys_main_type_}
+        iniset ${_sys_main_db_} -f ${INI_DIR}/${SYM_INI} Size=${_sys_main_size_}
+        iniset ${_sys_main_db_} -f ${INI_DIR}/${SYM_INI} Link=${_sys_main_link_}
+        iniset ${_sys_main_db_} -f ${INI_DIR}/${SYM_INI} Disk=${_sys_main_link_temp_}1
+		
+        if [ ${_san_device_} != "local" ]; then
+            _sys_main_wwn_id_=$($MULTIPATH -l | $GREP -w "${_sys_main_link_temp_}" | $AWK -F "(" '{print $2}' | $AWK -F ")" '{print $1}')
+	        iniset ${_sys_main_db_} -f ${INI_DIR}/${SYM_INI} WWN=${_sys_main_wwn_id_}
+        fi
+    
+    done
+
+    # Store CO-ORD Main Lun details in local ${SYM_INI}
+    for _dwh_main_ in ${_dwh_main_list_}; do
+        _db_path_=$(iniget ${_dwh_main_} -f ${ENIQ_CONF_DIR}/${COORD_SYM_LINK_FILE} -v Path)
+        _lun_id_=$(iniget ${_dwh_main_} -f ${ENIQ_CONF_DIR}/${COORD_SYM_LINK_FILE} -v Lun_ID)
+        _type_=$(iniget ${_dwh_main_} -f ${ENIQ_CONF_DIR}/${COORD_SYM_LINK_FILE} -v Type)
+        _size_=$(iniget ${_dwh_main_} -f ${ENIQ_CONF_DIR}/${COORD_SYM_LINK_FILE} -v Size)
+        _sym_link_=$(iniget ${_dwh_main_} -f ${ENIQ_CONF_DIR}/${COORD_SYM_LINK_FILE} -v Link)
+    
+        # update the link for sym_link.ini from lun_map.ini
+        for _lun_map_details_ in ${_lun_map_details_list_}; do
+            _lun_id_in_lun_map_=$(iniget ${_lun_map_details_} -f ${ENIQ_CONF_DIR}/${LUN_MAP_INI} -v LUN_ID)
+            if [ "${_lun_id_in_lun_map_}" == "${_lun_id_}" ]; then
+                _sym_link_temp_=$(iniget ${_lun_map_details_} -f ${ENIQ_CONF_DIR}/${LUN_MAP_INI} -v DISK_ID)
+                _sym_link_1_=$($CAT ${TEM_DIR}/symlink.txt | $AWK -v disk="$_sym_link_temp_" -F":" '$1 == disk{print $2}')
+
+                if [ "${_sym_link_}" !=  "${_sym_link_1_}" ]; then
+                    _sym_link_="${_sym_link_1_}"
+
+                fi
+
+                # Setting LINK attribute in lun_map.ini
+                iniset ${_lun_map_details_} -f ${ENIQ_CONF_DIR}/${LUN_MAP_INI} LINK=${_sym_link_}
+                if [ $? -ne 0 ]; then
+                    _err_msg_="Error adding LINK value for ${_lun_map_details_}"
+                    abort_script "$_err_msg_" "${EXEC_SHELL_CMD}"
+                fi
+            fi
+        done
+		
+        $RM -f ${TEM_DIR}/ins_det
+        $ECHO "[${_dwh_main_}]" >> ${TEM_DIR}/ins_det
+        $ECHO "Path=${_db_path_}" >> ${TEM_DIR}/ins_det
+        $ECHO "Lun_ID=${_lun_id_}">> ${TEM_DIR}/ins_det
+        $ECHO "Size=${_size_}" >> ${TEM_DIR}/ins_det
+        $ECHO "Type=${_type_}">> ${TEM_DIR}/ins_det
+        $ECHO "Link=${_sym_link_}">> ${TEM_DIR}/ins_det
+        $ECHO "Disk=${_sym_link_temp_}1">> ${TEM_DIR}/ins_det
+		
+        if [ ${_san_device_} != "local" ]; then
+            _main_wwn_id_=$($MULTIPATH -l | $GREP -w "${_sym_link_temp_}" | $AWK -F "(" '{print $2}' | $AWK -F ")" '{print $1}')
+	        $ECHO "WWN=${_main_wwn_id_}">> ${TEM_DIR}/ins_det
+        fi
+
+        $RM -f  ${TEM_DIR}/${SYM_INI}
+        $ECHO "Updating ${INI_DIR}/${SYM_INI} with ${_dwh_main_}" >> ${LOGFILE}
+        ${SCRIPTHOME}/../lib/iniadd.pl -g DWH_DBSPACES_MAIN -p ${_dwh_main_} -i ${INI_DIR}/${SYM_INI} -d ${TEM_DIR}/ins_det -o ${TEM_DIR}/${SYM_INI}
+        if [ $? -ne 0 ]; then
+            _err_msg_="Error adding ${_dwh_main_} to ${TEM_DIR}/${SYM_INI}"
+            abort_script "$_err_msg_" "${EXEC_SHELL_CMD}"
+        fi
+
+        $CP ${TEM_DIR}/${SYM_INI} ${INI_DIR}/${SYM_INI}
+
+    done
+fi
+}
+
+### Function: update_lun_map ###
+#
+#   Print out the usage message
+#
+# Arguments:
+#   $1 : disk id for which link needs to be updated in lun_map.ini file
+#   $2 : raw device value to be updated in lun_map.ini file
+# Return Values:
+#    none
+update_lun_map()
+{
+if [ "${STORAGE_TYPE}" == "raw" ]; then
+    _sym_disk_id_=$1
+
+    _raw_device_link_=$2
+
+    if [ -f ${ENIQ_CONF_DIR}/lun_map.ini ]; then
+        _lun_map_list_=$(iniget LUN_MAP_DETAILS -f ${ENIQ_CONF_DIR}/lun_map.ini)
+        if [ ! "${_lun_map_list_}" ]; then
+           _err_msg_="Could not get the list of blocks from ${ENIQ_CONF_DIR}/lun_map.ini"
+           abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+        fi
+
+        # Getting the block from lun_map.ini containing disk updated in sym_link.ini
+        for _tag_ in ${_lun_map_list_}; do
+            _lun_disk_id_=$(iniget ${_tag_} -f ${ENIQ_CONF_DIR}/lun_map.ini -v DISK_ID)
+            if [ ! "${_lun_disk_id_}" ]; then
+                _err_msg_="Could not determine disk id for ${_tag_}"
+                abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+            fi
+        
+            if [ "${_sym_disk_id_}" == "${_lun_disk_id_}" ]; then
+                _disk_tag_=${_tag_}
+                break
+            fi    
+    
+        done
+    
+        # Updating the Link value in lun_map.ini for the respective disk
+        iniset ${_disk_tag_} -f ${ENIQ_CONF_DIR}/lun_map.ini LINK=${_raw_device_link_}
+        if [ $? -ne 0 ]; then
+            _err_msg_="Could not set LINK value for ${_disk_tag_}"
+            abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+        fi
+    else
+        _err_msg_="Could not find ${ENIQ_CONF_DIR}/lun_map.ini file"
+        abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+    fi
+fi
+}
+
+### Function: usage_msg ###
+#
+#   Print out the usage message
+#
+# Arguments:
+#    none
+# Return Values:
+#    none
+usage_msg() 
+{
+$CLEAR
+$ECHO "
+Usage: )$BASENAME $0) -d <path_to_niq_ini_dir> -g <path_to_store_file> 
+                      [ -l <path_to_logfile> ][-r] -t  [ raw | zfs ] -e [ stats | events ] -s [ total_disk_size ]
+                      
+options:
+
+-d  : Parameter specifying the full path to the directory containing
+      the niq.ini file to be updated. 
+
+-g  : Parameter specifying the full path to the file that will store the values 
+      required by the calling script
+
+-l  : Optional parameter specifying the full path to logfile.
+
+-r  : Optional parameter to specify that the script is used as part of a restore
+
+-t  : Flag to specify which stoage type for databases [ raw | zfs ]
+
+-e  : Flag tp specify which install type it is [ stats | events ]
+
+-s  : Optional parameter to identify the disk space on an Events zfs server
+"
+}
+
+# ********************************************************************
+#
+#     Main body of program
+#
+# ********************************************************************
+#
+
+RUN_TIME=$($DATE '+%Y-%b-%d_%H.%M.%S')
+
+# Determine absolute path to software
+get_absolute_path
+
+# Check that the effective id of the user is root
+check_id
+
+while getopts ":b:d:g:l:rs:t:e:u" arg; do
+  case $arg in
+    b) ENIQ_BASE_DIR="$OPTARG"
+       ;;
+    d) INI_DIR="$OPTARG" 
+       ;;
+    l) LOGFILE="$OPTARG"
+       ;;
+    r) RESTORE="YES" 
+       ;;
+    s) DISK_SIZE="$OPTARG"
+       ;;
+    t) STORAGE_TYPE="$OPTARG"
+       ;;
+    e) INSTALL_TYPE="$OPTARG"
+       ;;
+  esac
+done
+shift "$(expr $OPTIND - 1)"
+
+if [ ! "${INI_DIR}" -o ! "${STORAGE_TYPE}" -o ! "${INSTALL_TYPE}" ]; then
+    usage_msg
+    exit 1
+fi
+
+$ECHO "\n=======================================================" >> ${LOGFILE}
+$ECHO "${RUN_TIME} - Starting $0 script" >> ${LOGFILE}
+$ECHO "=======================================================\n" >> ${LOGFILE}
+
+if [ ! -s ${INI_DIR}/${ENIQ_INI} ]; then
+    _err_msg_="File ${INI_DIR}/${ENIQ_INI} not found or empty"
+    abort_script "$_err_msg_" "${EXEC_SHELL_CMD}"
+fi
+
+if [ ! -s ${INI_DIR}/${SYM_INI} ]; then
+    _err_msg_="File ${INI_DIR}/${SYM_INI} not found or empty"
+    abort_script "$_err_msg_" "${EXEC_SHELL_CMD}"
+fi
+
+if [ ! -s $SCRIPTHOME/../lib/common_functions.lib ]; then
+    _err_msg_="Cannot locate $SCRIPTHOME/../lib/common_functions.lib"
+    abort_script "$_err_msg_" "${EXEC_SHELL_CMD}"
+else
+   . $SCRIPTHOME/../lib/common_functions.lib
+fi
+
+# Create a temporary Directory
+TEM_DIR=/tmp/get_cell_count.$$
+$RM -rf ${TEM_DIR}
+$MKDIR -p ${TEM_DIR}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not create directory ${TEM_DIR}"
+    abort_script "$_err_msg_" "${EXEC_SHELL_CMD}"
+fi    
+
+if [ "${RESTORE}" ]; then
+    if [ ! -s "$SCRIPTHOME/../../config/${SYM_INI}" ]; then
+        _err_msg_="File $SCRIPTHOME/../../config/${SYM_INI} not found or empty"
+        abort_script "$_err_msg_" "${EXEC_SHELL_CMD}"
+    fi
+fi
+
+# Setup up path environment
+setup_env
+
+# Get the number of nodes/cells to be managed if I'm a Stats machine
+if [ "${CURR_SERVER_TYPE}" == "stats_coordinator" -o "${CURR_SERVER_TYPE}" == "eniq_stats" ]; then
+    get_cell_count
+else
+    if [ "${SERVER_TYPE}" == "CO" ]; then
+        if [ "${STORAGE_TYPE}" == "raw" ]; then
+        # Calculate number of main dbspaces required
+        TOTAL_NODE_MAIN_SPACE=100
+        else
+        # Total main dbspace is 70% of total disk space available
+        _tot_main_db_space_calc_=0
+        let _tot_main_db_space_calc_=${TOT_DISK_SPACE}/100*${MAIN_DBSPACE_PERCENTAGE}
+        TOTAL_NODE_MAIN_SPACE=${_tot_main_db_space_calc_}
+        fi
+        calculate_main_dbspace_details ${TOTAL_NODE_MAIN_SPACE}
+    fi
+
+    # Calculate number of temp dbspaces required
+    if [ "${STORAGE_TYPE}" == "raw" ]; then
+        TOTAL_NODE_TEMP_SPACE=50
+    else
+        # Total temp dbspace is 30% of total disk space available
+        _tot_temp_db_space_calc_=0
+        let _tot_temp_db_space_calc_=${TOT_DISK_SPACE}/100*${TEMP_DBSPACE_PERCENTAGE}
+        TOTAL_NODE_TEMP_SPACE=${_tot_temp_db_space_calc_}
+    fi
+    calculate_temp_dbspace_details ${TOTAL_NODE_TEMP_SPACE}
+
+    # Calculate number of sysmain dbspaces required and the
+    # size of each dbspace
+    calculate_sys_main_dbspace_details
+
+    # Update the ${SYM_INI} with the dbspaces
+    update_dbspace_ini
+fi
+if [ "${CURR_SERVER_TYPE}" == "stats_coordinator" -o "${CURR_SERVER_TYPE}" == "eniq_stats" ]; then
+    if [ -f ${CLI_CONF_DIR}/${COORD_SYM_LINK_FILE} ]; then
+        $CP ${INI_DIR}/${SYM_INI} ${CLI_CONF_DIR}/${COORD_SYM_LINK_FILE}
+    fi
+fi
+
+# Clean up
+$RM -rf ${TEM_DIR} /var/tmp/vnx_to_unity_temp_migration_flag
+
+exit 0
+
+

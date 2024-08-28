@@ -1,0 +1,12 @@
+get_expansion_details
+prerequisite_validation
+stop_rollsnap_services
+disabling_OMBS_policies
+snapshot_creation
+niqini_backup
+memory_expansion
+add_mainDb
+add_tempdb
+add_sysmainDb
+post_expansion_configuration
+cleanup

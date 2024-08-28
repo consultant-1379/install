@@ -1,0 +1,16 @@
+######################################################
+# This file Contains certain any files and directories 
+# that are deemed necessary to be available at the time 
+# of an ENIQ BMR. 
+#
+# This tar file will be copied to the BMR root and 
+# untarred there. 
+#
+# Lead '/' should not be used. All paths should be given 
+# relative to but not including '/' 
+#
+# Comments are preceded by '#' 
+######################################################
+etc/hosts
+etc/inet/netmasks
+etc/nsswitch.conf

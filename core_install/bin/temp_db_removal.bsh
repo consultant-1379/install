@@ -1,0 +1,1371 @@
+#!/bin/bash
+# ********************************************************************
+# Ericsson Radio Systems AB                                     SCRIPT
+# ********************************************************************
+# Ericsson Radio Systems AB 2021 - All rights reserved.
+#
+# The copyright to the computer program(s) herein is the property
+# of Ericsson Radio Systems AB, Sweden. The programs may be used
+# and/or copied only with the written permission from Ericsson Radio
+# Systems AB or in accordance with the terms and conditions stipulated
+# in the agreement/contract under which the program(s) have been
+# supplied.
+#
+# ********************************************************************
+#
+# Name    : temp_db_removal.bsh
+# Date    : 20/10/2023
+# Revision: \main\11
+#
+# Purpose : This script will support the removal of Temp DBs from the database 
+#           on RHEL
+#
+#
+# Usage   : temp_db_removal.bsh
+#
+# ********************************************************************
+#
+#   Command Section
+#
+# ********************************************************************
+AWK=/usr/bin/awk
+BASENAME=/usr/bin/basename
+BASH=/usr/bin/bash
+CAT=/usr/bin/cat
+CHOWN=/usr/bin/chown
+CUT=/usr/bin/cut
+CP=/usr/bin/cp
+DATE=/usr/bin/date
+DIRNAME=/usr/bin/dirname
+ECHO='/usr/bin/echo -e'
+EGREP=/usr/bin/egrep
+EXPR=/usr/bin/expr
+FIND=/usr/bin/find
+GETENT=/usr/bin/getent
+GREP=/usr/bin/grep
+HEAD=/usr/bin/head
+HOST=/usr/sbin/host
+ID=/usr/bin/id
+MD5SUM=/usr/bin/md5sum
+MYHOSTNAME=/usr/bin/hostname
+MKDIR=/usr/bin/mkdir
+MULTIPATH=/usr/sbin/multipath
+PASTE=/usr/bin/paste
+PERL=/usr/bin/perl
+PRINTF=/usr/bin/printf
+PS=/usr/bin/ps
+RAW=/usr/bin/raw
+RM=/usr/bin/rm
+SED=/usr/bin/sed
+SORT=/usr/bin/sort
+SLEEP=/usr/bin/sleep
+SYSTEMCTL=/usr/bin/systemctl
+TAC=/usr/bin/tac
+TAIL=/usr/bin/tail
+TEE=/usr/bin/tee
+TOUCH=/usr/bin/touch
+TR=/usr/bin/tr
+UDEVADM=/usr/sbin/udevadm
+UNIQ=/usr/bin/uniq
+UNLINK=/usr/bin/unlink
+WC=/usr/bin/wc
+YES=/usr/bin/yes
+
+# ********************************************************************
+#
+#       Configuration Section
+#
+# ********************************************************************
+
+# Default user
+DEFAULT_USER=root
+
+SUNOS_INI=SunOS.ini
+ENIQ_INI=niq.ini
+IPMP_INI=ipmp.ini
+
+# Hostname Information
+HNAME=`${MYHOSTNAME}`
+HOST_IP=`${MYHOSTNAME} -i | $AWK '{print $1}' | $HEAD -1`
+CO_IP_ADDRESS=`$GREP -w dwhdb /etc/hosts | $AWK '{print $1}'| $SORT -u`
+
+
+# ********************************************************************
+#
+#   Functions
+#
+# ********************************************************************
+### Function: abort_script ###
+#
+#   This will be called if the script is aborted by an error
+#   which is encountered during runtime
+#
+# Arguments:
+#       $1 - Error message from part of program (Not always used)
+# Return Values:
+#       none
+abort_script()
+{
+_err_time_=`$DATE '+%Y-%b-%d_%H.%M.%S'`
+
+if [ "$1" ]; then
+    _err_msg_="${_err_time_} - $1"
+else
+    _err_msg_="${_err_time_} - ERROR : Script aborted.......\n"
+fi
+
+if [ "${LOGFILE}" ]; then
+    $ECHO "\nERROR : ${_err_msg_}\n" | $TEE -a ${LOGFILE}
+else
+    $ECHO "\nERROR : ${_err_msg_}\n"
+fi
+
+$RM -rf ${TEM_DIR}
+$RM -rf ${Conn_STR_USER_DBA_enc}
+$RM -rf ${Conn_STR_USER_DWH_enc}
+exit 1
+}
+
+### Function: check_absolute_path ###
+#
+# Determine absolute path to software
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+check_absolute_path()
+{
+_dir_=`$DIRNAME $0`
+SCRIPTHOME=`cd ${_dir_} 2>/dev/null && pwd || $ECHO ${_dir_}`
+}
+
+
+### Function: check_id ###
+#
+#   Check that the effective id of the user is correct
+#   If not print error msg and exit.
+#
+# Arguments:
+#       $1 : User ID name
+# Return Values:
+#       none
+check_id()
+{
+_check_id_=`$ID | $AWK -F\( '{print $2}' | $AWK -F\) '{print $1}'`
+if [ "$_check_id_" != "$1" ]; then
+    _err_msg_="You must be $1 to execute this script."
+    abort_script "${_err_msg_}"
+fi
+}
+
+cleanup()
+{
+insert_header_footer head "Entering stage - ${NEXT_STAGE}" ${LOGFILE}
+
+$RM -rf ${TEM_DIR}
+
+insert_header_footer foot "Successfully completed - ${NEXT_STAGE}" ${LOGFILE}
+}
+
+### Function: change_perm_to_readonly ###
+#
+#   changes tempdbs to read only
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+change_perm_to_readonly()
+{
+insert_header_footer head "Entering stage - ${NEXT_STAGE}" ${LOGFILE}
+
+if [ "${CO_SERVER}" == "YES" ]; then
+     start_stop_eniq_services "start" "standalone" "dwhdb"
+elif [ "${RD_SERVER}" == "YES" ]; then
+     start_stop_eniq_services "start" "standalone" "dwh_reader"
+fi
+
+  $RM -rf ${TEM_DIR}/change_perm_to_readonly.sql
+  for _temp_db_ in `$CAT ${EXISTING_TEMP_DB_INFO}/vnx_temp_dbs.txt|$TR -d \'`
+  do
+      $GREP -w "${_temp_db_}" ${EXISTING_TEMP_DB_INFO}/readonly_dbs >> /dev/null 2>&1
+      if [ $? -ne 0 ]; then
+           log_msg -t -s "Creating SQL file to change permission of ${_temp_db_} to READONLY" -l ${LOGFILE}
+           $ECHO "alter dbspace IQ_SYSTEM_TEMP" > ${TEM_DIR}/change_perm_to_readonly.sql;
+           $ECHO "alter file ${_temp_db_} READONLY;" >> ${TEM_DIR}/change_perm_to_readonly.sql
+           log_msg -t -s "Changing permission of ${_temp_db_} to READONLY" -l ${LOGFILE}
+           $SU - $SYSUSER -c "${IQDIR}/bin64/dbisql -nogui -onerror exit @${Conn_STR_USER_DBA_enc} \"${TEM_DIR}/change_perm_to_readonly.sql\""
+           if [ $? -ne 0 ];then
+                _err_msg_="Could not change permission of ${_temp_db_} to READONLY"
+                abort_script "${_err_msg_}"
+           else
+                $ECHO "${_temp_db_}" >> ${EXISTING_TEMP_DB_INFO}/readonly_dbs
+           fi
+      else
+           log_msg -t -s "${_temp_db_} is already set to READONLY" -l ${LOGFILE}
+      fi
+  done
+
+insert_header_footer foot "Successfully completed - ${NEXT_STAGE}" ${LOGFILE}
+
+set_next_stage `$EXPR ${ARRAY_ELEM}+1`
+}
+
+### Function: drop_temp_db ###
+#
+#   checks if the temps are good to drop and drops them
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+drop_temp_db()
+{
+insert_header_footer head "Entering stage - ${NEXT_STAGE}" ${LOGFILE}
+
+start_iq_without_temps
+
+$RM -rf ${TEM_DIR}/check_ok_to_drop.sql
+for _temp_db_ in `$CAT ${EXISTING_TEMP_DB_INFO}/vnx_temp_dbs.txt| $TR -d \'`
+ do
+    $GREP -w ${_temp_db_} ${EXISTING_TEMP_DB_INFO}/dropped_dbs >> /dev/null 2>&1
+    if [ $? -ne 0 ]; then
+         log_msg -t -s "Creating SQL file to check if ${_temp_db_} can be dropped" -l ${LOGFILE}
+         $ECHO "select DBFileName, OkToDrop from sp_iqfile() where DBFileName like '${_temp_db_}';OUTPUT TO ${TEM_DIR}/ok_to_drop" > ${TEM_DIR}/check_ok_to_drop.sql;
+         log_msg -t -s "Checking if ${_temp_db_} can be dropped" -l ${LOGFILE}
+         $SU - $SYSUSER -c "${IQDIR}/bin64/dbisql -nogui -onerror exit @${Conn_STR_USER_DBA_enc} \"${TEM_DIR}/check_ok_to_drop.sql\""
+         if [ $? -ne 0 ];then
+              _err_msg_="Could not check if ${_temp_db_} can be dropped"
+              abort_script "${_err_msg_}"
+         else
+              _ok_to_drop_status_=`$CAT ${TEM_DIR}/ok_to_drop|$TR -d \'|$AWK -F, '{print $2}'`
+              if [ "${_ok_to_drop_status_}" == "Y" -o "${_ok_to_drop_status_}" == "NA" ]; then
+                   log_msg -t -s "${_temp_db_} is OK to be dropped" -l ${LOGFILE}
+                   log_msg -t -s "Creating SQL file to drop ${_temp_db_}" -l ${LOGFILE}
+                   $ECHO "alter dbspace IQ_SYSTEM_TEMP" > ${TEM_DIR}/drop_temp_db.sql
+                   $ECHO "drop file ${_temp_db_};" >> ${TEM_DIR}/drop_temp_db.sql
+                   $SU - $SYSUSER -c "${IQDIR}/bin64/dbisql -nogui -onerror exit @${Conn_STR_USER_DBA_enc} \"${TEM_DIR}/drop_temp_db.sql\""
+                   if [ $? -ne 0 ];then
+                        _err_msg_="Could not drop ${_temp_db_}"
+                        abort_script "${_err_msg_}"
+                   else
+                        log_msg -t -s "Checking if ${_temp_db_} has been dropped" -l ${LOGFILE}
+                        $SU - $SYSUSER -c "${IQDIR}/bin64/dbisql -nogui -onerror exit @${Conn_STR_USER_DBA_enc} \"select * from sp_iqfile() where DBFileName like '${_temp_db_}';OUTPUT TO ${TEM_DIR}/dropped_db\""
+                        if [ ! -s ${TEM_DIR}/dropped_db ]; then
+                              log_msg -t -s "${_temp_db_} has been dropped successfully" -l ${LOGFILE}
+                              $ECHO "${_temp_db_}" >> ${EXISTING_TEMP_DB_INFO}/dropped_dbs
+                        else
+                             _err_msg_="Could not drop ${_temp_db_}"
+                             abort_script "${_err_msg_}"
+                        fi
+                   fi
+             fi
+         fi
+    else
+          log_msg -t -s "${_temp_db_} has already been dropped" -l ${LOGFILE}
+    fi
+done
+
+if [ "${CO_SERVER}" == "YES" ]; then
+     start_stop_eniq_services "stop" "standalone" "dwhdb" "YES"
+elif [ "${RD_SERVER}" == "YES" ]; then
+     start_stop_eniq_services "stop" "standalone" "dwh_reader" "YES"
+fi
+
+insert_header_footer foot "Successfully completed - ${NEXT_STAGE}" ${LOGFILE}
+
+set_next_stage `$EXPR ${ARRAY_ELEM}+1`
+}
+
+
+
+### Function: execute_temp_db_removal_stages ###
+#
+#   Execute stages for Temp DB Removal
+#
+# Arguments: none
+#
+# Return Values: none
+execute_temp_db_removal_stages()
+{
+# Create a stage array
+core_install_build_stage_array ${LOGFILE} ${TEM_DIR} eniq_linux temp_db_removal ${ENIQ_CORE_INST_DIR}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not build a stage array for ${ACTION_TYPE}"
+    abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+fi
+
+# If stage specified, make sure it is in the stage list for this server type
+if [ "$USER_STAGE" ]; then
+    core_install_check_user_stage ${LOGFILE} ${TEM_DIR} ${USER_STAGE}
+    if [ $? -ne 0 ]; then
+       _err_msg_="The specified stage ${USER_STAGE} is not in the stage list for ${ACTION_TYPE}"
+       abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+    fi
+fi
+
+if [ "$USER_STAGE" ]; then
+    NEXT_STAGE="${USER_STAGE}"
+    # Get the element number so we can move along the array
+    get_array_element
+else
+    get_next_stage
+fi
+
+STOP_STAGE="cleanup"
+
+# Loop through the stages from stage list
+while :; do
+    _nxt_stage_="${NEXT_STAGE}"
+    $_nxt_stage_
+    if [ $? -ne 0 ]; then
+        _err_msg_="Error in Stage ${NEXT_STAGE}"
+        abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+    fi
+
+    # Exit if the user specified to run a specific stage only
+    if [ "$USER_STAGE" ]; then
+        break
+    fi
+
+    # If we read ${STOP_STAGE} from the stagefile
+    if [ "$NEXT_STAGE" == "${STOP_STAGE}" ]; then
+        break
+    fi
+
+    get_next_stage
+done
+}
+
+### Function: get_array_element ###
+#
+# Get the current array element number
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+get_array_element()
+{
+_num_elements_=${#ENIQ_CORE_STAGES[*]}
+_array_length_=`${EXPR} ${_num_elements_} - 1`
+
+for (( _elem_=0; _elem_<=${_array_length_}; _elem_++ )); do
+    $ECHO ${ENIQ_CORE_STAGES[${_elem_}]} | $GREP -w ${NEXT_STAGE} >> /dev/null 2>&1
+    if [ $? -eq 0 ]; then
+        ARRAY_ELEM=${_elem_}
+        break
+    fi
+done
+}
+
+### Function: get_deployment_order ###
+#
+# Get the order of the deployment
+# for performing required functionality based on action type
+#
+# Arguments: none
+#
+# Return Values: none
+get_deployment_order()
+{
+$RM -rf ${TEM_DIR}/temp_db_removal_order
+
+# Get an ordered list of servers based on the server_list file
+$PERL ${ENIQ_CORE_INST_DIR}/lib/get_ip_order.pl -f ${TEM_DIR}/temp_db_removal_order
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not get an ordered list of servers"
+    abort_script "${_err_msg_}"
+fi
+}
+
+
+### Function: get_next_stage ###
+#
+# Get the stage to be run
+#
+# Arguments:
+#   $1 : Stage to be set to. Either numeric value or 'done'
+# Return Values:
+#   none
+get_next_stage()
+{
+ARRAY_ELEM=0
+
+if [ -s $STAGEFILE ]; then
+
+    NEXT_STAGE=`$CAT $STAGEFILE | $EGREP -v '^[[:blank:]]*#' | $SED -e 's| ||g'`
+
+    if [ ! "${NEXT_STAGE}" ]; then
+        _err_msg_="Failed to read stage from ${STAGEFILE}, exiting."
+        abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+    fi
+
+    if [ "${NEXT_STAGE}" == "${STOP_STAGE}" ]; then
+        return 0
+    else
+        $ECHO ${ENIQ_CORE_STAGES[*]} | $GREP -w ${NEXT_STAGE} >> /dev/null 2>&1
+        if [ $? -ne 0 ]; then
+            _err_msg_="Specified stage ${NEXT_STAGE} is not a valid stage"
+            abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+        fi
+    fi
+
+    # Get the element number so we can move along the array
+    get_array_element
+else
+    $MKDIR -p `$DIRNAME $STAGEFILE`
+    if [ $? -ne 0 ]; then
+        _err_msg_="Failed to create directory `$DIRNAME ${STAGEFILE}`, exiting."
+        abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+    fi
+
+    NEXT_STAGE=${ENIQ_CORE_STAGES[${ARRAY_ELEM}]}
+fi
+}
+
+### Function: insert_header_footer ###
+#
+#   Insert a stage header/footer message
+#
+# Arguments:
+#   $1 : head/foot
+#   $2 : Message
+#   $3 : Logfile
+# Return Values:
+#   none
+insert_header_footer()
+{
+if [ $# -ne 3 ]; then
+    _err_msg_="3 Parameters must be passed to header/footer function"
+    abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+fi
+
+if [ "$1" != "head" -a "$1" != "foot" ]; then
+    _err_msg_="Only Param of head/foot is allowed...exiting!"
+    abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+fi
+_type_=$1
+
+_msg_=$2
+
+_logfile_=$3
+$MKDIR -p `$DIRNAME ${_logfile_}`
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not create directory `$DIRNAME ${_logfile_}`"
+    abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+fi
+
+$TOUCH -a ${_logfile_}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not write to file ${_logfile_}"
+    abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+fi
+
+_time_=`$DATE '+%Y-%b-%d_%H.%M.%S'`
+if [ "$_type_" == "head" ]; then
+    $ECHO "\n=====================================================" | $TEE -a ${_logfile_}
+    $ECHO "-----------------------------------------------------" | $TEE -a ${_logfile_}
+    $ECHO "$_time_ : $_msg_" | $TEE -a ${_logfile_}
+    $ECHO "-----------------------------------------------------" | $TEE -a ${_logfile_}
+fi
+
+if [ "$_type_" == "foot" ]; then
+    $ECHO "\n-----------------------------------------------------" | $TEE -a ${_logfile_}
+    $ECHO "$_time_ : $_msg_" | $TEE -a ${_logfile_}
+    $ECHO "-----------------------------------------------------" | $TEE -a ${_logfile_}
+    $ECHO "=====================================================\n" | $TEE -a ${_logfile_}
+fi
+}
+
+### Function: reregister_raw_device ###
+#
+#   re-registers the temps dbs
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+reregister_raw_device()
+{
+insert_header_footer head "Entering stage - ${NEXT_STAGE}" ${LOGFILE}
+
+for _raw_device_ in `$RAW -qa|$AWK '{print $1}'|$CUT -d: -f1`;
+do
+    log_msg -t -s "Unregistering raw device ${_raw_device_}" -l ${LOGFILE}
+    $RAW "${_raw_device_}" 0 0
+    if [ $? -ne 0 ]; then
+         _err_msg_="Could not unregister raw device ${_raw_device_}\n"
+         abort_script "${_err_msg_}"
+    fi
+done
+
+$TOUCH /var/tmp/vnx_to_unity_temp_migration_flag
+if [ $? -ne 0 ]; then
+     _err_msg_="Failed to create flag file /var/tmp/vnx_to_unity_temp_migration_flag"
+      abort_script "${_err_msg_}"
+fi
+
+$BASH ${ENIQ_CORE_INST_DIR}/bin/get_cell_count.bsh -d ${ENIQ_CONF_DIR} -g /var/tmp/ -t raw -e stats -l ${LOGFILE}
+if [ $? -ne 0 ]; then
+     _err_msg_="Failed to execute ${ENIQ_CORE_INST_DIR}/bin/get_cell_count.bsh"
+      abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+fi
+
+$BASH ${ENIQ_CORE_INST_SCRIPT} -M -s create_db_sym_links -n -R -l ${LOGFILE}
+if [ $? -ne 0 ]; then
+     _err_msg_="Failed to execute ${ENIQ_CORE_INST_SCRIPT}"
+      abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+fi
+
+# Verify sym links are correctly configured
+_sym_links_check_="${ENIQ_CORE_INST_DIR}/bin/check_sym_links.pl"
+log_msg -t -s "Verifying if database symbolic links are correctly assigned" -l ${LOGFILE}
+$PERL ${_sym_links_check_} ${ENIQ_CONF_DIR}/sym_links.ini >> /dev/null
+_return_code_=$?
+if [ ${_return_code_} -eq 0 ]; then
+    log_msg -t -s "DB sym_links are correctly assigned.\n" -l ${LOGFILE}
+elif [ ${_return_code_} -eq 22 -o ${_return_code_} -eq 32 ]; then
+    _err_msg_="DB sym_links are still incorrect. Please fix the sym_links manually."
+    abort_script "${_err_msg_}"
+else
+    _err_msg_="Failed to execute ${_sym_links_} script to verify the sym_links."
+    abort_script "${_err_msg_}"
+fi
+
+if [ "${CO_SERVER}" == "YES" ]; then
+     start_stop_eniq_services "start" "standalone" "dwhdb"
+fi
+
+insert_header_footer foot "Successfully completed - ${NEXT_STAGE}" ${LOGFILE}
+
+set_next_stage `$EXPR ${ARRAY_ELEM}+1`
+}
+
+### Function: setup_env ###
+#
+# Set up environment variables for script.
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+setup_env()
+{
+# ENIQ Directories
+if [ ! "${ENIQ_BASE_DIR}" ]; then
+    # Directory on the root filesystem
+    ENIQ_BASE_DIR=/eniq
+fi
+
+ENIQ_ADMIN_DIR=${ENIQ_BASE_DIR}/admin
+ENIQ_INST_DIR=${ENIQ_BASE_DIR}/installation
+ENIQ_CORE_INST_DIR=${ENIQ_INST_DIR}/core_install
+ENIQ_LOG_DIR=${ENIQ_BASE_DIR}/local_logs
+ENIQ_CONF_DIR=${ENIQ_INST_DIR}/config
+DEPLOYMENT=/extra_params/deployment
+
+# File to hold stage information
+STAGEFILE=${ENIQ_CORE_INST_DIR}/etc/eniq_linux_temp_db_removal_stage
+
+# Admin bin dir
+ENIQ_ADMIN_BIN_DIR=${ENIQ_ADMIN_DIR}/bin
+
+# ENIQ Core install script
+ENIQ_CORE_INST_SCRIPT=${ENIQ_CORE_INST_DIR}/bin/eniq_core_install.bsh
+
+# ENIQ SW conf directory
+CLI_CONF_DIR=${ENIQ_BASE_DIR}/sw/conf
+CONF_DIR=${ENIQ_BASE_DIR}/sw/conf
+
+#Temp directory.
+VAR_TMP_DIR=/var/tmp
+
+# Hostname Information
+HNAME=`${MYHOSTNAME}`
+HOST_IP=`${MYHOSTNAME} -i | $AWK '{print $1}' | $HEAD -1`
+CO_IP_ADDRESS=`$GREP -w dwhdb /etc/hosts | $AWK '{print $1}'| $SORT -u`
+
+if [ ! -s ${CLI_CONF_DIR}/${COORD_SYM_LINKS_INI} ]; then
+    _err_msg_="${CLI_CONF_DIR}/${COORD_SYM_LINKS_INI} not found or is empty"
+    abort_script "${_err_msg_}"
+fi
+
+if [ ! -s ${ENIQ_CONF_DIR}/${SYM_LINKS_INI} ]; then
+    _err_msg_="${ENIQ_CONF_DIR}/${SYM_LINKS_INI} not found or is empty"
+    abort_script "${_err_msg_}"
+fi
+
+# Source the common functions
+_common_functions_list_="common_functions.lib common_core_install_functions.lib common_migration_functions.lib"
+for lib_file in ${_common_functions_list_}; do
+    if [ -s ${ENIQ_CORE_INST_DIR}/lib/${lib_file} ]; then
+        . ${ENIQ_CORE_INST_DIR}/lib/${lib_file}
+    else
+        _err_msg_="File ${ENIQ_CORE_INST_DIR}/lib/${lib_file} not found"
+        abort_script "${_err_msg_}"
+    fi
+done
+
+
+#Fetch ip_type from ipmp.ini
+check_ip_type
+if [ ! "${_ip_type_}" ]; then
+    _err_msg_="Could not read parameter _ip_type_ from file ${ENIQ_CONF_DIR}/${IPMP_INI}"
+    abort_script "$_err_msg_"
+fi
+
+DWH_DIR="/eniq/database/dwh_main"
+DWH_TEMP_DIR="/eniq/database/dwh_temp_dbspace"
+
+UNIQUE_CORES=`$CAT /proc/cpuinfo |$GREP -w "core id"|$SORT -u|$WC -l`
+NUMBEROFCORES=`$EXPR ${UNIQUE_CORES} \* 2`
+if [ ! ${NUMBEROFCORES} ]; then
+     _err_msg_="Could not get the number of cores"
+     abort_script "$_err_msg_"
+fi
+
+# Check hardware
+if [ -f ${ENIQ_CONF_DIR}/san_details ];then
+    STORAGE_TYPE=`$CAT ${ENIQ_CONF_DIR}/san_details | $GREP -w STORAGE_TYPE | $CUT -f 2 -d =`
+    if [ "${STORAGE_TYPE}" != "raw" ];then
+        _err_msg_="\nHardware type is not supported for Migration."
+        abort_script "${_err_msg_}"
+    fi
+else
+    _err_msg_="Could not find the file to get hardware type."
+    abort_script "${_err_msg_}"
+fi
+
+# Determine SAN Device type if raw
+if [ "${STORAGE_TYPE}" == "raw" ];then
+    SAN_DEVICE=`$CAT ${ENIQ_CONF_DIR}/san_details | $EGREP "^SAN_DEVICE=" | $AWK -F\= '{print $2}'`
+    if [ ! "${SAN_DEVICE}" ]; then
+        _err_msg_="Could not read SAN_DEVICE type from ${ENIQ_CONF_DIR}/san_details."
+        abort_script "${_err_msg_}"
+    fi
+fi
+
+SAN_DEVICE_UNITY=unity
+
+# File containing the type of installation. Eg. events or statistics
+INST_TYPE_FILE=${ENIQ_CONF_DIR}/ericsson_use_config
+if [ ! -s "${INST_TYPE_FILE}" ]; then
+    _err_msg_="ENIQ install type not defined in ${INST_TYPE_FILE}"
+    abort_script "${_err_msg_}"
+fi
+
+if [ -x ${ENIQ_CORE_INST_DIR}/lib/iniadd.pl ]; then
+    INIADD=${ENIQ_CORE_INST_DIR}/lib/iniadd.pl
+else
+    _err_msg_="${ENIQ_CORE_INST_DIR}/lib/iniadd.pl is not found, or is not executable"
+    abort_script "$_err_msg_" "${EXEC_SHELL_CMD}"
+fi
+
+#UDEV File
+UDEV_FILE=/etc/udev/rules.d/99-iq-raw-devs.rules
+
+# Get current server type
+CURR_SERVER_TYPE=`$CAT ${ENIQ_CONF_DIR}/installed_server_type | $EGREP -v  '^[[:blank:]]*#' | $SED -e 's/ //g'`
+if [ ! "${CURR_SERVER_TYPE}" ]; then
+    _err_msg_="Could not determine which server type this is"
+    abort_script "${_err_msg_}"
+fi
+
+
+EXISTING_TEMP_DB_INFO=${VAR_TMP_DIR}/temp_db_binaries
+
+if [ "${CURR_SERVER_TYPE}" == "stats_coordinator" -o "${CURR_SERVER_TYPE}" == "eniq_stats" -o "${CURR_SERVER_TYPE}" == "stats_iqr" ]; then
+     if [ ! -s ${EXISTING_TEMP_DB_INFO}/vnx_temp_dbs.txt ]; then
+         _err_msg_="${EXISTING_TEMP_DB_INFO}/vnx_temp_dbs.txt not found or is empty"
+         abort_script "${_err_msg_}"
+     fi
+     
+     if [ ! -s ${EXISTING_TEMP_DB_INFO}/temp_dbs_to_delete.txt ]; then
+         _err_msg_="${EXISTING_TEMP_DB_INFO}/temp_dbs_to_delete.txt  not found or is empty"
+         abort_script "${_err_msg_}"
+     fi
+     
+     if [ ! -s ${EXISTING_TEMP_DB_INFO}/temp_db_files_to_delete.txt ]; then
+         _err_msg_="${EXISTING_TEMP_DB_INFO}/temp_db_files_to_delete.txt not found or is empty"
+         abort_script "${_err_msg_}"
+     fi
+     
+     if [ ! -s ${EXISTING_TEMP_DB_INFO}/temp_db_mpaths_to_delete.txt ]; then
+         _err_msg_="${EXISTING_TEMP_DB_INFO}/temp_db_mpaths_to_delete.txt not found or is empty"
+         abort_script "${_err_msg_}"
+     fi
+fi
+
+# Check if server is Coordinator or Reader type
+CO_SERVER=""
+RD_SERVER=""
+if [ "${CURR_SERVER_TYPE}" == "stats_coordinator" -o "${CURR_SERVER_TYPE}" == "eniq_stats" ]; then
+    CO_SERVER="YES"
+
+    # Set the Connect DB parameters
+    DWH_PORT=`iniget DWH -v PortNumber -f ${CLI_CONF_DIR}/${ENIQ_INI}`
+    DWH_ENG=`iniget DWH -v ServerName -f ${CLI_CONF_DIR}/${ENIQ_INI}`
+    if [ ! "${DWH_PORT}" -o ! "${DWH_ENG}" ]; then
+            _err_msg_="Could not read IQ values from ${CLI_CONF_DIR}/${ENIQ_INI}"
+            abort_script "${_err_msg_}"
+    fi
+
+    MAINCACHE=`iniget DWH -v MainCache -f ${CONF_DIR}/${ENIQ_INI}`
+    if [ ! ${MAINCACHE} ]; then
+        _err_msg_="Could not read MainCache param from ${CONF_DIR}/${ENIQ_INI}"
+        abort_script "$_err_msg_"
+    fi
+
+    TEMPCACHE=`iniget DWH -v TempCache -f ${CONF_DIR}/${ENIQ_INI}`
+    if [ ! ${TEMPCACHE} ]; then
+        _err_msg_="Could not read TempCache param from ${CONF_DIR}/${ENIQ_INI}"
+        abort_script "$_err_msg_"
+    fi
+
+    LARGEMEMORY=`iniget DWH -v LargeMemory -f ${CONF_DIR}/${ENIQ_INI}`
+    if [ ! ${LARGEMEMORY} ]; then
+        _err_msg_="Could not read LargeMemory param from ${CONF_DIR}/${ENIQ_INI}"
+        abort_script "$_err_msg_"
+    fi
+
+    CATALOGCACHE=`iniget DWH -v CatalogCache -f ${CONF_DIR}/${ENIQ_INI}`
+    if [ ${CATALOGCACHE} ]; then
+            CC="-c ${CATALOGCACHE}m"
+    fi
+
+    CATALOG_CACHE_UPPER_MEM_LIMIT_RESERVE=`iniget DWH -v CatalogCacheUpperMemLimitReserve -f ${CONF_DIR}/${ENIQ_INI}`
+    if [ ! ${CATALOG_CACHE_UPPER_MEM_LIMIT_RESERVE} ]; then
+        _err_msg_="Could not read CatalogCacheUpperLimitReserve param from ${CONF_DIR}/${ENIQ_INI}"
+        abort_script "$_err_msg_"
+    else
+        _dwh_catalog_cache_upper_limit_=`$EXPR ${CATALOGCACHE} + ${CATALOG_CACHE_UPPER_MEM_LIMIT_RESERVE}`
+        CH="-ch ${_dwh_catalog_cache_upper_limit_}m"
+    fi
+elif [ "${CURR_SERVER_TYPE}" == "stats_iqr" ]; then
+    RD_SERVER="YES"
+
+    DWH_DIR="/eniq/database/dwh_reader"
+    
+	local _count_=`$CAT ${CONF_DIR}/service_names | $GREP -w "${HOST_IP}" | $GREP "dwh_" | $GREP -o "::" | $WC -l`
+if [ "${_ip_type_}" == "IPv6" -a "${_count_}" == 3 ]; then
+	READER_NUM=`$CAT ${CONF_DIR}/service_names | $GREP -w "${HOST_IP}" | $GREP "dwh_" | $AWK -F"::" '{print $4}' | $AWK -F\_ '{print $NF}'`
+else
+	READER_NUM=`$CAT ${CONF_DIR}/service_names | $GREP -w "${HOST_IP}" | $GREP "dwh_" | $AWK -F"::" '{print $3}' | $AWK -F\_ '{print $NF}'`
+fi
+    _reader_="DWH_READER_${READER_NUM}"
+
+    # Set the Connect DB parameters
+	local _count_=`$CAT ${CONF_DIR}/service_names | $GREP -w "${HOST_IP}" | $GREP "dwh_" | $GREP -o "::" | $WC -l`
+if [ "${_ip_type_}" == "IPv6" -a "${_count_}" == 3 ]; then	
+	DWH_ENG=`$CAT ${CONF_DIR}/service_names | $GREP -w "${HOST_IP}" | $GREP "dwh_" | $AWK -F"::" '{print $4}'`
+else	
+	DWH_ENG=`$CAT ${CONF_DIR}/service_names | $GREP -w "${HOST_IP}" | $GREP "dwh_" | $AWK -F"::" '{print $3}'`
+fi   
+    DWH_PORT=`iniget DWH_READER_SETTINGS -v PortNumber -f ${CONF_DIR}/${ENIQ_INI}`
+    if [ ! "${DWH_ENG}" -o ! "${DWH_PORT}" ] ; then
+        _err_msg_="Could not get database connection details"
+        abort_script "$_err_msg_"
+    fi
+
+
+    MAINCACHE=`iniget ${_reader_} -v MainCache -f ${CONF_DIR}/${ENIQ_INI}`
+    if [ ! ${MAINCACHE} ]; then
+        _err_msg_="Could not read MainCache param from ${CONF_DIR}/${ENIQ_INI}"
+        abort_script "$_err_msg_"
+    fi
+
+    TEMPCACHE=`iniget ${_reader_} -v TempCache -f ${CONF_DIR}/${ENIQ_INI}`
+    if [ ! ${TEMPCACHE} ]; then
+        _err_msg_="Could not read TempCache param from ${CONF_DIR}/${ENIQ_INI}"
+        abort_script "$_err_msg_"
+    fi
+
+    LARGEMEMORY=`iniget ${_reader_} -v LargeMemory -f ${CONF_DIR}/${ENIQ_INI}`
+    if [ ! ${LARGEMEMORY} ]; then
+        _err_msg_="Could not read LargeMemory param from ${CONF_DIR}/${ENIQ_INI}"
+        abort_script "$_err_msg_"
+    fi
+
+    CATALOGCACHE=`iniget ${_reader_} -v CatalogCache -f ${CONF_DIR}/${ENIQ_INI}`
+    if [ ${CATALOGCACHE} ]; then
+            CC="-c ${CATALOGCACHE}m"
+    fi
+
+    CATALOG_CACHE_UPPER_MEM_LIMIT_RESERVE=`iniget DWH -v CatalogCacheUpperMemLimitReserve -f ${CONF_DIR}/${ENIQ_INI}`
+    if [ ! ${CATALOG_CACHE_UPPER_MEM_LIMIT_RESERVE} ]; then
+        _err_msg_="Could not read CatalogCacheUpperLimitReserve param from ${CONF_DIR}/${ENIQ_INI}"
+        abort_script "$_err_msg_"
+    else
+        _dwh_catalog_cache_upper_limit_=`$EXPR ${CATALOGCACHE} + ${CATALOG_CACHE_UPPER_MEM_LIMIT_RESERVE}`
+        CH="-ch ${_dwh_catalog_cache_upper_limit_}m"
+    fi
+fi
+
+SYSUSER=`iniget ENIQ_INSTALL_CONFIG -f ${ENIQ_CONF_DIR}/${SUNOS_INI} -v ENIQ_SYSUSER`
+if [ ! "${SYSUSER}" ]; then
+    _err_msg_="Could not read System User from  ${ENIQ_CONF_DIR}/${SUNOS_INI}"
+    abort_script "${_err_msg_}"
+fi
+
+SYSGROUP=`iniget SunOS_GROUP_1 -f ${ENIQ_CONF_DIR}/${SUNOS_INI} -v name`
+if [ ! "${SYSGROUP}" ]; then
+    _err_msg_="Could not read SYSGROUP param from ${ENIQ_CONF_DIR}/${SUNOS_INI}"
+    abort_script "$_err_msg_"
+fi
+
+DBA_PASSWORD=`inigetpassword DB -f ${CLI_CONF_DIR}/${ENIQ_INI} -v DBAPassword`
+if [ ! "${DBA_PASSWORD}" ]; then
+    if [ -f ${ENIQ_BASE_DIR}/sw/installer/dbusers ]; then
+        DBA_PASSWORD=`${ENIQ_BASE_DIR}/sw/installer/dbusers dba dwhrep`
+        if [ ! "${DBA_PASSWORD}" ] ; then
+            _err_msg_="Could not get dwhdb DBA Password"
+            abort_script "${_err_msg_}"
+        fi
+    else
+        err_msg_="Could not get dwhdb DBA Password"
+        abort_script "${_err_msg_}"
+    fi
+fi
+
+# Read location of storage API command
+_stor_api_cmd_=`iniget STOR_API -f ${ENIQ_CONF_DIR}/${SUNOS_INI} -v STOR_API_CMD`
+if [ ! "${_stor_api_cmd_}" ]; then
+    _err_msg_="Could not read STOR_API_CMD param from ${ENIQ_CONF_DIR}/${SUNOS_INI}"
+    abort_script "${_err_msg_}"
+fi
+
+# Log file
+$MKDIR -p ${ENIQ_LOG_DIR}/migration
+LOGFILE="${ENIQ_LOG_DIR}/migration/eniq_vnx_unity.log"
+
+$TOUCH $LOGFILE
+if [ ! -f $LOGFILE ]; then
+     _err_msg_="Failed to create $LOGFILE"
+     abort_script "${_err_msg_}"
+fi
+
+$CHMOD 777 $LOGFILE
+if [ $? -ne 0 ]; then
+     _err_msg_="Could not change the permission of $LOGFILE"
+     abort_script "${_err_msg_}"
+fi
+
+# Create a temporary Directory
+TEM_DIR=/tmp/vnx_unity_migration.$$.$$
+$RM -rf ${TEM_DIR}
+$MKDIR -p ${TEM_DIR}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not create directory ${TEM_DIR}"
+    abort_script "${_err_msg_}"
+fi
+
+$CHMOD 777 ${TEM_DIR}
+if [ $? -ne 0 ]; then
+     _err_msg_="Could not change the permission of ${TEM_DIR}"
+     abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+fi
+
+# Removing old connection string
+$RM -rf ${Conn_STR_USER_DBA_enc}
+$RM -rf ${Conn_STR_USER_DWH_enc}
+
+Conn_STR_USER_DBA="-c \"uid=dba;pwd=${DBA_PASSWORD};eng=${DWH_ENG};links=tcpip{host=${DWH_ENG};port=${DWH_PORT};dobroadcast=no;verify=no}\""
+Conn_STR_USER_DBA_enc=${TEM_DIR}/Con_str_db_rem_encrypt.`uuidgen`
+
+Conn_STR_USER_DWH="-c \"con=$DWH_ENG;eng=${DWH_ENG};links=tcpip{host=${DWH_ENG};port=${DWH_PORT};dobroadcast=none;verify=no};uid=dba;pwd=${DBA_PASSWORD}\""
+Conn_STR_USER_DWH_enc=${TEM_DIR}/Con_str_db_rem_encrypt_dbping.`uuidgen`
+
+# encrypt the connection string.
+get_encrypt_file "${Conn_STR_USER_DBA}" "${Conn_STR_USER_DBA_enc}"
+get_encrypt_file "${Conn_STR_USER_DWH}" "${Conn_STR_USER_DWH_enc}"
+
+# Get the required environment variables for Sybase
+$SU - ${SYSUSER} -c "$ENV |$EGREP '^(SYBASE|ASDIR|IQDIR|ASALOGDIR|SQLANY)'" > $TEM_DIR/sybase_det.$$
+$CAT $TEM_DIR/sybase_det.$$ |$EGREP '^(SYBASE|ASDIR|IQDIR|ASALOGDIR|SQLANY)' > $TEM_DIR/sybase_det_var.$$
+. $TEM_DIR/sybase_det_var.$$ >> /dev/null 2>&1
+
+if [ -z "$IQDIR" ] ; then
+    _err_msg_="ERROR: IQDIR is not set"
+    abort_script "${_err_msg_}"
+fi
+
+# Get iqheader binary
+_iqheader_=`$FIND ${ENIQ_BASE_DIR}/sybase_iq/IQ*|$EGREP "\/IQ-.*\/bin.*\/iqheader[[:blank:]]*$"|$HEAD -1`
+if [ ! -x ${_iqheader_} ]; then
+    _err_msg_="Could not locate the iqheader binary"
+    abort_script "${_err_msg_}"
+fi
+}
+
+### Function: set_next_stage ###
+#
+# Set up the stage to be run
+#
+# Arguments:
+#   $1 : Stage to be set to. Either numeric value or last stage of stagefile
+# Return Values:
+#   none
+set_next_stage()
+{
+# Do I have to reset stage
+if [ "${USER_STAGE}" -a "${NO_RESET_STAGE}" ]; then
+    return 0
+fi
+
+_stage_time_=`$DATE '+%Y-%b-%d_%H.%M.%S'`
+$ECHO "# Setting new stage at $_stage_time_" > ${STAGEFILE} | $TEE -a ${LOGFILE}
+$ECHO "${ENIQ_CORE_STAGES[$1]} " >> ${STAGEFILE} | $TEE -a ${LOGFILE}
+
+}
+
+
+### Function: start_stop_eniq_services ###
+#
+# Starts / Stops all ENIQ services
+#
+# Arguments: $1 = start / stop
+#
+# Return Values: none
+start_stop_eniq_services()
+{
+_action_=$1
+_deployment_=$2
+_server_=$3
+_without_temps_=$4
+
+if [ "${_deployment_}" == "deployment" ]; then
+      $BASH ${ENIQ_ADMIN_DIR}/bin/manage_deployment_services.bsh -a ${_action_} -s ALL -N | $TEE -a ${LOGFILE}
+      _rc_service_action_=`$ECHO ${PIPESTATUS[0]}`
+      if [ ${_rc_service_action_} -ne 0 ]; then
+          _err_msg_="Failed to ${_action_} ENIQ services."
+          abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+      fi
+elif [ "${_deployment_}" == "standalone" ]; then
+      if [ "${_without_temps_}" == "YES" ] ; then
+           if [ "${CO_SERVER}" == "YES" -o "${RD_SERVER}" == "YES" ]; then
+                 if [ "${_action_}" == "start" ]; then
+                      log_msg -t -s "Starting ${_server_} without Temp DBs" -l ${LOGFILE}
+
+                      # Start the IQ server
+                      $SU - ${SYSUSER} -c "${IQDIR}/bin64/start_iq -STARTDIR ${DWH_DIR} @${DWH_DIR}/dwhdb.cfg ${CC} ${CH} -n ${DWH_ENG} -iqmc ${MAINCACHE} -iqtc ${TEMPCACHE} -iqlm ${LARGEMEMORY} -x tcpip{port=${DWH_PORT}} -dt ${DWH_TEMP_DIR} -iqnumbercpus ${NUMBEROFCORES} ${DWH_DIR}/dwhdb.db -iqnotemp 100" >> ${LOGFILE} 2>&1
+
+                      # Check if server is up
+                      $SU - ${SYSUSER} -c "${IQDIR}/bin64/dbping @${Conn_STR_USER_DWH_enc}" >> ${LOGFILE} 2>&1
+                      _start_res_=$?
+                      if [ ${_start_res_} -eq 0 ] ; then
+                           log_msg -l ${LOGFILE} -s "Database dwhdb successfully started"
+                      else
+                           _err_msg_="IQ server $DWH_ENG start failed"
+                           abort_script "$_err_msg_"
+                     fi
+                elif [ "${_action_}" == "stop" ]; then
+                      log_msg -t -s "Stopping ${_server_} that has been started without Temp DBs" -l ${LOGFILE}
+                      PID=`$PS -ef | $EGREP "iqsrv" | $EGREP -wv grep | $EGREP -w ${DWH_ENG} | $AWK '{print $2}'`
+                      if [ -z "${PID}" ] ; then
+                           log_msg -t -l ${LOGFILE} -s "Can't find dwhdb process. Database not running." 
+                           return 0
+                      else
+                           log_msg -t -l ${LOGFILE} -s "Database is running with PID ${PID}"
+                      fi
+
+                      $SU - ${SYSUSER} -c "${IQDIR}/bin64/dbstop -y @${Conn_STR_USER_DWH_enc} &"
+                     log_msg -t -s "dbstop forked" -l ${LOGFILE}
+
+                     cnt=0
+                     while [ ${cnt} -lt 30 ] ; do
+                             $SLEEP 5
+
+                              PID=`$PS -ef | $EGREP "(iqsrv)" | $EGREP -wv grep | $EGREP -w ${DWH_ENG} | $AWK '{print $2}'`
+
+                              if [ -z "${PID}" ] ; then
+                                   break
+                              else
+                                   log_msg -t -s "DB process ${DWH_ENG} is still running on pid ${PID}" -l ${LOGFILE}
+                                   let cnt=cnt+1
+
+                                   $SLEEP 5
+                              fi
+                     done
+
+                     PID=`$PS -ef | $EGREP "(iqsrv)" | $EGREP -wv grep| $EGREP -w ${DWH_ENG} | $AWK '{print $2}'`
+                     if [ -z "${PID}" ] ; then
+                          log_msg -t -s "Database is down" -l ${LOGFILE}
+                     else
+                          log_msg -t -s "Database $DWH_ENG refused to stop. Attempting to force kill it." -l ${LOGFILE}
+                          $KILL -9 ${PID} >> ${LOGFILE} 2>&1
+                          if [ $? -ne 0 ]; then
+                               _err_msg_="Could not kill IQ SERVER PID ${PID}"
+                               abort_script "$_err_msg_"
+                          fi
+                          log_msg -t -s "Database killed." -l ${LOGFILE}
+                     fi
+                fi
+           elif [ "${RD_SERVER}" == "YES" ]; then
+                  log_msg -t -s "Starting ${_server_} without Temp DBs" -l ${LOGFILE}
+           fi
+      else
+           $BASH ${ENIQ_ADMIN_DIR}/bin/manage_eniq_services.bsh -a ${_action_} -s ${_server_} -N | $TEE -a ${LOGFILE}
+           _rc_service_action_=`$ECHO ${PIPESTATUS[0]}`
+           if [ ${_rc_service_action_} -ne 0 ]; then
+                _err_msg_="Failed to ${_action_} ENIQ services."
+                abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+           fi
+      fi
+fi
+}
+
+### Function: start_iq_without_temps ###
+#
+#   starts the iq service without the temp dbs
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+start_iq_without_temps()
+{
+if [ "${CO_SERVER}" == "YES" ]; then
+     start_stop_eniq_services "restart" "standalone" "dwhdb"
+     start_stop_eniq_services "stop" "standalone" "dwhdb"
+     start_stop_eniq_services "start" "standalone" "dwhdb" "YES"
+elif [ "${RD_SERVER}" == "YES" ]; then
+     start_stop_eniq_services "restart" "standalone" "dwh_reader"
+     start_stop_eniq_services "stop" "standalone" "dwh_reader"
+     start_stop_eniq_services "start" "standalone" "dwh_reader" "YES"
+fi
+}
+
+### Function: update_config_files ###
+#
+#   updates the necessery config files
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+update_config_files()
+{
+insert_header_footer head "Entering stage - ${NEXT_STAGE}" ${LOGFILE}
+
+log_msg -t -s "Creating a backup of ${ENIQ_CONF_DIR}/sym_links.ini" -l ${LOGFILE}
+$CP -pf ${ENIQ_CONF_DIR}/sym_links.ini ${ENIQ_CONF_DIR}/sym_links.ini.sanmigorig
+if [ $? -ne 0 ]; then
+     _err_msg_="Could not backup ${ENIQ_CONF_DIR}/sym_links.ini as ${ENIQ_CONF_DIR}/sym_links.ini.sanmigorig"
+     abort_script "${_err_msg_}"
+fi
+
+log_msg -t -s "Creating a backup of ${ENIQ_CONF_DIR}/coordinator_sym_links.ini" -l ${LOGFILE}
+$CP -pf ${ENIQ_CONF_DIR}/coordinator_sym_links.ini ${ENIQ_CONF_DIR}/coordinator_sym_links.ini.sanmigorig
+if [ $? -ne 0 ]; then
+     _err_msg_="Could not backup ${ENIQ_CONF_DIR}/coordinator_sym_links.ini as ${ENIQ_CONF_DIR}/coordinator_sym_links.ini.sanmigorig"
+     abort_script "${_err_msg_}"
+fi
+
+if [ "${CO_SERVER}" == "YES" ]; then
+      log_msg -t -s "Creating a backup of ${CLI_CONF_DIR}/coordinator_sym_links.ini" -l ${LOGFILE}
+      $CP -pf ${CLI_CONF_DIR}/coordinator_sym_links.ini ${CLI_CONF_DIR}/coordinator_sym_links.ini.sanmigorig
+      if [ $? -ne 0 ]; then
+           _err_msg_="Could not backup ${CLI_CONF_DIR}/coordinator_sym_links.ini as ${CLI_CONF_DIR}/coordinator_sym_links.ini.sanmigorig"
+           abort_script "${_err_msg_}"
+      fi
+fi
+
+log_msg -t -s "Copying ${ENIQ_CONF_DIR}/sym_links.ini to ${TEM_DIR}" -l ${LOGFILE}
+$CP -pf ${ENIQ_CONF_DIR}/sym_links.ini ${TEM_DIR}/sym_links.ini
+if [ $? -ne 0 ]; then
+     _err_msg_="Could not copy ${ENIQ_CONF_DIR}/sym_links.ini to ${TEM_DIR}/sym_links.ini"
+     abort_script "${_err_msg_}"
+fi
+
+for _temp_db_ in `$CAT ${EXISTING_TEMP_DB_INFO}/temp_dbs_to_delete.txt`
+do 
+    $GREP -w "${_temp_db_}" ${EXISTING_TEMP_DB_INFO}/updated_sym_links_ini >> /dev/null 2>&1
+    if [ $? -ne 0 ]; then
+        $RM -rf ${TEM_DIR}/sym_links.ini.new
+        log_msg -t -s "Deleting ${_temp_db_} from ${TEM_DIR}/sym_links.ini" -l ${LOGFILE}
+        ${ENIQ_CORE_INST_DIR}/lib/inidel.pl -g DWH_DBSPACES_TEMP -p ${_temp_db_} -i ${TEM_DIR}/sym_links.ini -o ${TEM_DIR}/sym_links.ini.new;
+        if [ $? -ne 0 ]; then
+             _err_msg_="Could not delete ${_temp_db_} from ${TEM_DIR}/sym_links.ini"
+             abort_script "${_err_msg_}"
+        fi
+ 
+        log_msg -t -q -s "Copying ${TEM_DIR}/sym_links.ini.new to ${TEM_DIR}/sym_links.ini" -l ${LOGFILE}
+        $CP -pf ${TEM_DIR}/sym_links.ini.new ${TEM_DIR}/sym_links.ini
+        if [ $? -ne 0 ]; then
+          _err_msg_="Could not copy ${TEM_DIR}/sym_links.ini.new to ${TEM_DIR}/sym_links.ini"
+          abort_script "${_err_msg_}"
+        fi
+   
+        $ECHO ${_temp_db_} >> ${EXISTING_TEMP_DB_INFO}/updated_sym_links_ini
+    else
+        log_msg -t -s "${_temp_db_} already deleted from ${ENIQ_CONF_DIR}/sym_links.ini" -l ${LOGFILE}
+    fi
+done
+
+log_msg -t -s "Creating a backup of ${ENIQ_CONF_DIR}/disks_partitioned" -l ${LOGFILE}
+$CP -pf ${ENIQ_CONF_DIR}/disks_partitioned ${ENIQ_CONF_DIR}/disks_partitioned.sanmigorig
+if [ $? -ne 0 ]; then
+     _err_msg_="Could not backup ${ENIQ_CONF_DIR}/disks_partitioned as ${ENIQ_CONF_DIR}/disks_partitioned.sanmigorig"
+     abort_script "${_err_msg_}"
+fi
+
+log_msg -t -s "Copying ${ENIQ_CONF_DIR}/disks_partitioned to ${TEM_DIR}" -l ${LOGFILE}
+$CP -pf ${ENIQ_CONF_DIR}/disks_partitioned ${TEM_DIR}/disks_partitioned
+if [ $? -ne 0 ]; then
+     _err_msg_="Could not copy ${ENIQ_CONF_DIR}/disks_partitioned to ${TEM_DIR}/disks_partitioned"
+     abort_script "${_err_msg_}"
+fi
+
+for _mpath_ in `$CAT ${EXISTING_TEMP_DB_INFO}/temp_db_mpaths_to_delete.txt`
+do 
+   $GREP -w "${_mpath_}" ${EXISTING_TEMP_DB_INFO}/deleted_mpaths >> /dev/null 2>&1
+   if [ $? -ne 0 ]; then
+        log_msg -t -s "Deleting ${_mpath_} from ${TEM_DIR}/disks_partitioned" -l ${LOGFILE}
+        $SED -i "/^${_mpath_}$/d" ${TEM_DIR}/disks_partitioned
+        if [ $? -ne 0 ]; then
+             _err_msg_="Could not delete ${_mpath_} from ${TEM_DIR}/disks_partitioned"
+             abort_script "${_err_msg_}"
+        fi
+
+        log_msg -t -s "Deleting ${_mpath_} from ${TEM_DIR}/sym_links.ini" -l ${LOGFILE}
+        $SED -i "s/\<${_mpath_}\>//g" ${TEM_DIR}/sym_links.ini
+        if [ $? -ne 0 ]; then
+             _err_msg_="Could not delete ${_mpath_} from ${TEM_DIR}/sym_links.ini"
+             abort_script "${_err_msg_}"
+        fi
+        
+        log_msg -t -q -s "Removing blank spaces after TEMPDB_DISKS= from ${TEM_DIR}/sym_links.ini" -l ${LOGFILE}
+        $SED -i "s/TEMPDB_DISKS=[[:blank:]]*/TEMPDB_DISKS=/g" ${TEM_DIR}/sym_links.ini
+        if [ $? -ne 0 ]; then
+             _err_msg_="Could not remove blank spaces after TEMPDB_DISKS= from ${TEM_DIR}/sym_links.ini"
+             abort_script "${_err_msg_}"
+        fi
+
+        $ECHO ${_mpath_} >> ${EXISTING_TEMP_DB_INFO}/deleted_mpaths
+
+    else
+        log_msg -t -s "${_mpath_} already deleted from ${ENIQ_CONF_DIR}/sym_links.ini and ${ENIQ_CONF_DIR}/disks_partitioned files" -l ${LOGFILE}
+    fi
+done
+
+log_msg -t -s "Creating a backup of ${ENIQ_CONF_DIR}/lun_map.ini" -l ${LOGFILE}
+$CP -pf ${ENIQ_CONF_DIR}/lun_map.ini ${ENIQ_CONF_DIR}/lun_map.ini.sanmigorig
+if [ $? -ne 0 ]; then
+     _err_msg_="Could not backup ${ENIQ_CONF_DIR}/lun_map.ini as ${ENIQ_CONF_DIR}/lun_map.ini.sanmigorig"
+     abort_script "${_err_msg_}"
+fi
+
+log_msg -t -s "Copying ${ENIQ_CONF_DIR}/lun_map.ini to ${TEM_DIR}" -l ${LOGFILE}
+$CP -pf ${ENIQ_CONF_DIR}/lun_map.ini ${TEM_DIR}/lun_map.ini
+if [ $? -ne 0 ]; then
+     _err_msg_="Could not copy ${ENIQ_CONF_DIR}/lun_map.ini to ${TEM_DIR}/lun_map.ini"
+     abort_script "${_err_msg_}"
+fi
+
+for _lun_detail_ in `iniget LUN_MAP_DETAILS -f ${ENIQ_CONF_DIR}/lun_map.ini`
+do 
+   $RM -rf ${TEM_DIR}/lun_map.ini.new
+   _lun_id_=`iniget ${_lun_detail_} -f ${ENIQ_CONF_DIR}/lun_map.ini -v LUN_ID`;
+   if [ "${_lun_id_}" == "local" ]; then
+         log_msg -t -s "Deleting ${_lun_detail_} from ${TEM_DIR}/lun_map.ini"
+         ${ENIQ_CORE_INST_DIR}/lib/inidel.pl -g LUN_MAP_DETAILS -p ${_lun_detail_} -i ${TEM_DIR}/lun_map.ini -o ${TEM_DIR}/lun_map.ini.new;
+         if [ $? -ne 0 ]; then
+              _err_msg_="Could not delete ${_lun_detail_} from ${TEM_DIR}/lun_map.ini"
+              abort_script "${_err_msg_}"
+         fi
+
+         log_msg -t -q -s "Copying ${TEM_DIR}/lun_map.ini.new to ${TEM_DIR}/lun_map.ini"
+         $CP -pf ${TEM_DIR}/lun_map.ini.new ${TEM_DIR}/lun_map.ini
+         if [ $? -ne 0 ]; then
+           _err_msg_="Could not copy ${TEM_DIR}/lun_map.ini.new to ${TEM_DIR}/lun_map.ini"
+           abort_script "${_err_msg_}"
+         fi
+    fi
+done
+
+log_msg -t -s "Copying ${TEM_DIR}/sym_links.ini to ${ENIQ_CONF_DIR}" -l ${LOGFILE}
+$CP -pf ${TEM_DIR}/sym_links.ini ${ENIQ_CONF_DIR}/sym_links.ini 
+if [ $? -ne 0 ]; then
+     _err_msg_="Could not copy ${TEM_DIR}/sym_links.ini to ${ENIQ_CONF_DIR}/sym_links.ini"
+     abort_script "${_err_msg_}"
+fi
+
+log_msg -t -s "Copying ${TEM_DIR}/disks_partitioned to ${ENIQ_CONF_DIR}" -l ${LOGFILE}
+$CP -pf ${TEM_DIR}/disks_partitioned ${ENIQ_CONF_DIR}/disks_partitioned 
+if [ $? -ne 0 ]; then
+     _err_msg_="Could not copy ${TEM_DIR}/disks_partitioned to ${ENIQ_CONF_DIR}/disks_partitioned"
+     abort_script "${_err_msg_}"
+fi
+
+log_msg -t -s "Copying ${TEM_DIR}/lun_map.ini to ${ENIQ_CONF_DIR}" -l ${LOGFILE}
+$CP -pf ${TEM_DIR}/lun_map.ini ${ENIQ_CONF_DIR}/lun_map.ini 
+if [ $? -ne 0 ]; then
+     _err_msg_="Could not copy ${TEM_DIR}/lun_map.ini to ${ENIQ_CONF_DIR}/lun_map.ini"
+     abort_script "${_err_msg_}"
+fi
+
+log_msg -t -s "Copying ${ENIQ_CONF_DIR}/sym_links.ini to ${ENIQ_CONF_DIR}/coordinator_sym_links.ini" -l ${LOGFILE}
+$CP -pf ${ENIQ_CONF_DIR}/sym_links.ini ${ENIQ_CONF_DIR}/coordinator_sym_links.ini 
+if [ $? -ne 0 ]; then
+     _err_msg_="Could not copy ${ENIQ_CONF_DIR}/sym_links.ini to ${ENIQ_CONF_DIR}/coordinator_sym_links.ini"
+     abort_script "${_err_msg_}"
+fi
+
+if [ "${CO_SERVER}" == "YES" ]; then
+     log_msg -t -s "Copying ${ENIQ_CONF_DIR}/sym_links.ini to ${CLI_CONF_DIR}/coordinator_sym_links.ini" -l ${LOGFILE}
+     $CP -pf ${ENIQ_CONF_DIR}/sym_links.ini ${CLI_CONF_DIR}/coordinator_sym_links.ini 
+     if [ $? -ne 0 ]; then
+          _err_msg_="Could not copy ${ENIQ_CONF_DIR}/sym_links.ini to ${CLI_CONF_DIR}/coordinator_sym_links.ini"
+          abort_script "${_err_msg_}"
+     fi
+elif [ "${RD_SERVER}" == "YES" ]; then
+     log_msg -t -s "Copying ${ENIQ_CONF_DIR}/sym_links.ini to ${CLI_CONF_DIR}/coordinator_sym_links.ini" -l ${LOGFILE}
+     $CP -pf ${CLI_CONF_DIR}/coordinator_sym_links.ini ${ENIQ_CONF_DIR}/coordinator_sym_links.ini  
+     if [ $? -ne 0 ]; then
+          _err_msg_="Could not copy ${CLI_CONF_DIR}/coordinator_sym_links.ini to ${ENIQ_CONF_DIR}/coordinator_sym_links.ini"
+          abort_script "${_err_msg_}"
+     fi
+fi
+
+insert_header_footer foot "Successfully completed - ${NEXT_STAGE}" ${LOGFILE}
+
+set_next_stage `$EXPR ${ARRAY_ELEM}+1`
+}
+
+### Function: unlink_db_sym_links ###
+#
+#   unlinks the temps dbs
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+unlink_db_sym_links()
+{
+insert_header_footer head "Entering stage - ${NEXT_STAGE}" ${LOGFILE}
+
+for _db_sym_link_ in `$CAT ${EXISTING_TEMP_DB_INFO}/temp_db_files_to_delete.txt`
+do
+    $GREP -w "${_db_sym_link_}" ${EXISTING_TEMP_DB_INFO}/unlinked_dbs >> /dev/null 2>&1
+    if [ $? -ne 0 ]; then
+          log_msg -t -s "Unlinking ${_db_sym_link_}" -l ${LOGFILE}
+          $UNLINK ${_db_sym_link_}
+          if [ $? -ne 0 ]; then
+               _err_msg_="Could not unlink ${_db_sym_link_}"
+               abort_script "${_err_msg_}"
+          else
+               $ECHO ${_db_sym_link_} >> ${EXISTING_TEMP_DB_INFO}/unlinked_dbs
+          fi
+    else
+         log_msg -t -s "${_db_sym_link_} already unlinked" -l ${LOGFILE}
+    fi
+done
+
+insert_header_footer foot "Successfully completed - ${NEXT_STAGE}" ${LOGFILE}
+
+set_next_stage `$EXPR ${ARRAY_ELEM}+1`
+}
+
+# ********************************************************************
+#
+#   Main body of program
+#
+# ********************************************************************
+
+RUN_TIME=`$DATE '+%Y-%b-%d_%H:%M:%S'`
+
+# Check that the effective id of the user is root
+check_id ${DEFAULT_USER}
+
+# Determine absolute path to software
+check_absolute_path
+
+# Set up environment variables for script.
+setup_env
+
+if [ "${CO_SERVER}" == "YES" ]; then
+
+     start_stop_eniq_services "stop" "deployment"
+
+     get_deployment_order
+
+     _order_file_="${TEM_DIR}/temp_db_removal_order"
+
+     if [ "${CO_SERVER}" == "YES" ]; then
+        for _line_ in `$CAT ${_order_file_}`; do                	
+		    local _count_=`$ECHO "${_line_}" | $GREP -o "::" | $WC -l`
+        if [ "${_ip_type_}" == "IPv6" -a "${_count_}" == 3 ]; then
+                local _ip_address_=`$ECHO ${_line_} | $GREP -oE '([a-fA-F0-9]{1,4}::?){1,7}[a-fA-F0-9]{1,4}' | $HEAD -n 1 | $AWK -F "::" '{ print $1 "::" $2}'`
+                local _serv_hostname_=`$ECHO ${_line_} | $AWK -F"::" '{print $3}'`                
+        else
+                local _ip_address_=`$ECHO ${_line_} | $AWK -F"::" '{print $1}'`
+                local _serv_hostname_=`$ECHO ${_line_} | $AWK -F"::" '{print $2}'`                
+
+        fi			   
+              if [ ! "${_ip_address_}" -o ! "${_serv_hostname_}" ]; then
+                      _err_msg_="Could not read required info from ${_order_file_}"
+                      abort_script "${_err_msg_}"
+              fi
+
+              if [ "${_ip_address_}" == "${HOST_IP}" ]; then
+                    log_msg -h -l ${LOGFILE} -t -s "Starting Temp DB Removal on ${_serv_hostname_}"
+                    if [ -s $STAGEFILE ]; then
+                          NEXT_STAGE=`$CAT $STAGEFILE | $EGREP -v '^[[:blank:]]*#' | $SED -e 's| ||g'`
+                          if [ ! "${NEXT_STAGE}" ]; then
+                               _err_msg_="Failed to read stage from ${STAGEFILE}, exiting."
+                               abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+                          elif [ "${NEXT_STAGE}" == "cleanup" ]; then
+                                start_stop_eniq_services "start" "standalone" "dwhdb"
+                                log_msg -t -s "All stages are completed on ${HNAME}" -l ${LOGFILE}
+                                continue
+                          fi
+                    fi
+                    
+                    execute_temp_db_removal_stages
+              else
+                    log_msg -l ${LOGFILE} -t -s "Remotely executing ${SCRIPTHOME}/temp_db_removal.bsh on ${_serv_hostname_}"
+                    run_remote_cmd "${_serv_hostname_}" "$BASH ${SCRIPTHOME}/temp_db_removal.bsh" "$LOGFILE"
+                    if [ $? -ne 0 ]; then
+                          _err_msg_="Failed to execute temp_db_removal.bsh on ${_serv_hostname_}"
+                          abort_script "${_err_msg_}"
+                    fi
+              fi
+           done
+       fi
+elif [ "${RD_SERVER}" == "YES" ]; then
+        log_msg -h -l ${LOGFILE} -t -s "Starting Temp DB Removal on ${HNAME}"
+        if [ -s $STAGEFILE ]; then
+              NEXT_STAGE=`$CAT $STAGEFILE | $EGREP -v '^[[:blank:]]*#' | $SED -e 's| ||g'`
+              if [ ! "${NEXT_STAGE}" ]; then
+                   _err_msg_="Failed to read stage from ${STAGEFILE}, exiting."
+                   abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+              elif [ "${NEXT_STAGE}" == "cleanup" ]; then
+                     log_msg -t -s "All stages are completed on ${HNAME}" -l ${LOGFILE}
+                     exit 0
+              fi
+        fi
+
+        execute_temp_db_removal_stages
+else
+    log_msg -h -t -s "Skipping Temp DB Removal on ${HNAME}" -l ${LOGFILE}
+    exit 0
+fi
+
+if [ "${CO_SERVER}" == "YES" ]; then
+      start_stop_eniq_services "restart" "deployment"
+fi
+
+$RM -rf ${Conn_STR_USER_DBA_enc}
+$RM -rf ${Conn_STR_USER_DWH_enc}
+
+$ECHO "Changing permission of the ${LOGFILE} to 644" | $TEE -a ${LOGFILE}
+$CHMOD 644 ${LOGFILE}
+    if [ $? -ne 0 ]; then
+        _err_msg_="Could not change ${LOGFILE} file permission to 644"
+	abort_script "${_err_msg_}"
+    fi
+
+exit 0
+

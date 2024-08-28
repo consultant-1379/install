@@ -1,0 +1,825 @@
+#!/bin/bash
+# ********************************************************************
+# Ericsson Radio Systems AB                                     SCRIPT
+# ********************************************************************
+#
+#
+# (c) Ericsson Radio Systems AB 2022 - All rights reserved.
+#
+# The copyright to the computer program(s) herein is the property
+# of Ericsson Radio Systems AB, Sweden. The programs may be used 
+# and/or copied only with the written permission from Ericsson Radio 
+# Systems AB or in accordance with the terms and conditions stipulated 
+# in the agreement/contract under which the program(s) have been 
+# supplied.
+#
+# ********************************************************************
+# Name    : mount_server.bsh
+# Date    : 13/02/2023
+# Revision: \main\25
+# Purpose : This script will mount the PMS directory structure on the
+#           ENIQ server so that the ENIQ server will be be able to 
+#           access the OM raw data files.
+#
+# Usage   : mount_server.bsh
+#
+# ********************************************************************
+#
+#   Command Section
+#
+# ********************************************************************
+AWK=/usr/bin/awk
+BASENAME=/usr/bin/basename
+CAT=/usr/bin/cat
+CHOWN=/usr/bin/chown
+CP=/usr/bin/cp
+MV=/usr/bin/mv
+DATE=/usr/bin/date
+DIRNAME=/usr/bin/dirname
+ECHO='/usr/bin/echo -e'
+EGREP=/usr/bin/egrep
+EXPR=/usr/bin/expr
+GREP=/usr/bin/grep
+MYHOSTNAME=/usr/bin/hostname
+ID=/usr/bin/id
+MKDIR=/usr/bin/mkdir
+PRINTF=/usr/bin/printf
+PWD=/usr/bin/pwd
+RM=/usr/bin/rm
+SED=/usr/bin/sed
+SLEEP=/usr/bin/sleep
+SORT=/usr/bin/sort
+SYSTEMCTL=/usr/bin/systemctl
+TEE=/usr/bin/tee
+TOUCH=/usr/bin/touch
+UNIQ=/usr/bin/uniq
+
+# ********************************************************************
+#
+#       Configuration Section
+#
+# ********************************************************************
+# This is the where the ENIQ PM DATA Volume will be mounted. It is under this
+# mount point that all the symbolic links amd topology data required by ENIQ
+# will be created. ENIQ server will mount this directory. 
+ENIQ_VOLUME_MT_POINT=/ossrc/data/pmMediation/pmData
+
+# This is the where the ENIQ SOEM PM DATA Volume will be mounted. It is under this
+# mount point that all the symbolic links amd topology data required by ENIQ
+# will be created. ENIQ server will mount this directory. 
+ENIQ_SOEM_VOLUME_MT_POINT=/opt/data/soemdata
+
+# Name of the service for automounter
+AUTOFS_SERVICE="autofs.service"
+
+# Name of the parameter for automounter
+AUTOFS_PARAM="auto.master"
+
+# Name of the Configuration File for automounter
+AUTOFS_CONF="/etc/${AUTOFS_PARAM}"
+
+# Name of SunOS & ENIQ ini Files
+ENIQ_ENV=niq.rc
+ENIQ_INI=niq.ini
+SUNOS_INI=SunOS.ini
+
+ENIQ_SERVICES="connectd dwhdb repdb licmgr engine scheduler webserver"
+
+# Default user
+DEFAULT_USER=root
+
+# Strig to be used to determine the type
+# of connection being set up
+OSS_REF_STR=_oss_
+
+# Strig to be used to determine the type
+# of connection being set up
+SOEM_REF_STR=_soem_
+
+# ********************************************************************
+#
+#       Pre-execution Operations
+#
+# ********************************************************************
+
+
+# ********************************************************************
+#
+#   Functions
+#
+# ********************************************************************
+### Function: abort_script ###
+#
+#   This will is called if the script is aborted thru an error
+#   error signal sent by the kernel such as CTRL-C or if a serious
+#   error is encountered during runtime
+#
+# Arguments:
+#       $1 - Error message from part of program (Not always used)
+# Return Values:
+#       none
+abort_script()
+{
+_err_time_=`$DATE '+%Y-%b-%d_%H.%M.%S'`
+
+if [ "$1" ]; then
+    _err_msg_="${_err_time_} - $1"
+else
+    _err_msg_="${_err_time_} - ERROR : Script aborted.......\n"
+fi
+
+if [ "${LOGFILE}" ]; then
+    $ECHO "\nERROR : ${_err_msg_}\n" | $TEE -a ${LOGFILE}
+else
+    $ECHO "\nERROR : ${_err_msg_}\n"
+fi
+
+cd $SCRIPTHOME
+$RM -rf ${TEM_DIR}
+$RM -rf /tmp/enm_mode_fls >> /dev/null 2>&1
+
+if [ "$2" ]; then
+    ${2}
+else
+   exit 1
+fi
+}
+
+### Function: chk_create_logfile ###
+#
+# Check/Create Logfile
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+chk_create_logfile()
+{
+$MKDIR -p `$DIRNAME ${LOGFILE}`
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not create directory `$DIRNAME ${LOGFILE}`"
+    abort_script "${_err_msg_}"
+fi
+
+$TOUCH -a ${LOGFILE}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not write to file ${LOGFILE}"
+    abort_script "${_err_msg_}"
+fi
+}
+
+### Function: check_id ###
+#
+#   Check that the effective id of the user is correct
+#   If not print error msg and exit.
+#
+# Arguments:
+#       $1 : User ID name
+# Return Values:
+#       none
+check_id()
+{
+_check_id_=`$ID  | $AWK -F\( '{print $2}' | $AWK -F\) '{print $1}'`
+if [ "$_check_id_" != "$1" ]; then
+    _err_msg_="You must be $1 to execute this script."
+    abort_script "${_err_msg_}"
+fi
+}
+
+### Function: check_services ### 
+#
+# Ensure ENIQ Services are inactive
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+check_services()
+{
+for _eniq_service_ in ${ENIQ_SERVICES}; do 
+    _service_=`$SYSTEMCTL show "eniq-${_eniq_service_}." -p ActiveState | $EGREP -w "active"`
+    if [ "${_service_}" ]; then 
+        $ECHO ${_service_} >> ${TEM_DIR}/eniq_service_list
+    fi
+done    
+
+if [ -s ${TEM_DIR}/eniq_service_list ]; then
+    $CAT ${TEM_DIR}/eniq_service_list | $TEE -a ${LOGFILE}
+    _err_msg_="Cannot remove obsolete automounter entries while services are active"
+    abort_script "${_err_msg_}" 
+fi
+}
+
+
+### Function: clear ### 
+#
+# To clear the screen
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+clear()
+{
+
+# Clearing the screen without removing scrollback buffer
+$PRINTF '\33[H\33[2J'
+
+}
+
+### Function: get_absolute_path ###
+#
+# Determine absolute path to software
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+get_absolute_path() 
+{
+_dir_=`$DIRNAME $0`
+SCRIPTHOME=`cd $_dir_ 2>/dev/null && pwd || $ECHO $_dir_`
+}
+
+### Function: get_connection ###
+#
+# Get the connection name. 
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+get_connection()
+{
+MOUNT_CHOICE_ARRAY=`$CAT ${ENIQ_CONNECTD_DIR}/etc/${INSTALL_TYPE}_fs_mount_list_template | $EGREP -v '^[[:blank:]]*#' | $AWK '{print $1}'| $SORT -rn | $UNIQ | $GREP -wv "vENM"`
+
+# Get the location of where we're mounting
+_num_=1
+
+for _opt_ in ${MOUNT_CHOICE_ARRAY}; do
+    # Store the details in the array
+    _mount_array_[${_num_}]=${_opt_}
+    let _num_=_num_+1
+done
+
+_cnt_=${#_mount_array_[@]}
+
+# Create the Display file
+_disp_file_=${TEM_DIR}/disp_file
+$RM -f ${_disp_file_}
+
+$ECHO "\n\nAvailable mount locations:" >> ${_disp_file_}
+for (( i=1; i<=${_cnt_}; i++ )); do
+    $ECHO "[${i}]  ${_mount_array_[${i}]}" >> ${_disp_file_}
+done
+$ECHO "\nSelect where the filesystems will be mounted from" >> ${_disp_file_}
+
+while :; do
+    unset CONN_TYPE
+    
+    clear
+    $CAT ${_disp_file_}
+    read _num_
+    
+    if [ ! "${_num_}" ]; then
+        continue
+    fi
+    
+    _numerror_=0
+    
+    $ECHO ${_num_} | $EGREP '[^0-9]' >> /dev/null 2>&1
+    if [ $? -eq 0 ]; then
+        _numerror_=1
+    fi
+    if [ ${_num_} -lt 1 -o ${_num_} -gt ${_cnt_} ]; then
+        _numerror_=1
+    fi
+    
+    if [ ${_numerror_} -eq 0 ]; then
+        CONN_TYPE="${_mount_array_[${_num_}]}"
+        break
+    fi
+done
+}
+
+
+### Function: get_eniq_node_name ###
+#
+# Get the ENIQ OSS reference name. 
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+get_eniq_node_name()
+{
+while :; do
+    unset SRV_IP REF_NAME
+    
+    clear    
+    
+    $ECHO "\nPlease enter the hostname alias of the server being connected"
+    $ECHO "This must be defined in /etc/hosts and $REF_NAME_FILE"
+    read REF_NAME
+
+    # If the User hit nothing...Loop
+    if [ ! "${REF_NAME}" ]; then
+        continue
+    fi
+
+    REF_NAME=`$ECHO ${REF_NAME} | $AWK -F\. '{print $1}'`
+    
+    if [ "${CONN_TYPE}" == "SOEM" ]; then
+        $ECHO ${REF_NAME} | $EGREP "${SOEM_REF_STR}" >> /dev/null 2>&1
+        if [ $? -ne 0 ]; then
+            continue
+        fi
+    else
+        $ECHO ${REF_NAME} | $EGREP "${OSS_REF_STR}" >> /dev/null 2>&1
+        if [ $? -ne 0 ]; then
+            $ECHO ${OSS_ALIAS} | $EGREP "_events_[1-9][0-9]*"  >> /dev/null 2>&1
+            OSS_REF_STR="eniq_events_"
+        fi
+    fi
+    # Is the HNAME already listed
+    $CAT $REF_NAME_FILE | $GREP -w ${REF_NAME} >> /dev/null 2>&1
+    if [ $? -ne 0 ]; then
+        continue
+    fi
+
+    $CAT /etc/hosts | $EGREP -v '^[[:blank:]]*#' | $GREP -w ${REF_NAME} >> /dev/null 2>&1
+    if [ $? -ne 0 ]; then
+        continue
+    fi
+    break
+done
+
+# See if I can detect IP address
+if [ "${CONN_TYPE}" != "ENM" ]; then
+    SRV_IP=`$CAT $REF_NAME_FILE | $GREP -w ${REF_NAME} | $AWK '{print $NF}'`
+    if [ ! "$SRV_IP" ]; then
+        _err_msg_="Could not get IP address for ${REF_NAME} from $REF_NAME_FILE"
+        abort_script "${_err_msg_}"
+    fi
+else
+   $CAT $REF_NAME_FILE | $GREP -w ${REF_NAME} | $AWK '{$1=""; print}' | $SED 's/^[ ]*//' >> ${TEM_DIR}/ip_list
+   $CAT ${TEM_DIR}/ip_list | tr ' ' '\n' >> ${TEM_DIR}/ip_list1
+   if [ ! -s ${TEM_DIR}/ip_list1 ]; then
+        _err_msg_="Could not get IP address for ${REF_NAME} from $REF_NAME_FILE"
+        abort_script "${_err_msg_}"
+   fi
+fi
+
+if [ "${CONN_TYPE}" == "ENM" -o "${CONN_TYPE}" == "NAS" -o "${CONN_TYPE}" == "OSS" ]; then
+   if [ -f ${ENIQ_CONNECTD_DIR}/mount_info/${REF_NAME}/fs_mount_list ]; then
+       $ECHO "Creating file ${ENIQ_CONNECTD_DIR}/mount_info/${REF_NAME}/disable_OSS" >> ${LOGFILE}
+       $TOUCH ${ENIQ_CONNECTD_DIR}/mount_info/${REF_NAME}/disable_OSS
+   fi
+fi
+
+# Make the directory
+$MKDIR -p ${CONNECTD_INFO}/${REF_NAME}
+if [ $? -ne 0 ]; then
+        _err_msg_="Could not create ${CONNECTD_INFO}/${REF_NAME}"
+         abort_script "${_err_msg_}"
+fi
+
+if [ ${CONN_TYPE} == "ENM" ]; then
+    # Copying enm_type file to original location
+    $CP -p ${TEM_DIR}/enm_type ${CONNECTD_INFO}/${REF_NAME}/enm_type
+    if [ $_enm_type_ == "cENM" ]; then
+	$CP -rp ${TEM_DIR}/enm_type ${CLI_CONF_DIR}/enm_type
+        if [ $? -ne 0 ]; then
+		$ECHO "enm_type file doesn't copied to ${CLI_CONF_DIR}"
+            	$ECHO " --------. Creating enm_type file with proper content in ${CLI_CONF_DIR}"
+            	$TOUCH ${CLI_CONF_DIR}/.enm_type
+            	$ECHO "cENM" >> ${CLI_CONF_DIR}/.enm_type
+	else
+		$MV ${CLI_CONF_DIR}/enm_type ${CLI_CONF_DIR}/.enm_type
+        fi
+    fi
+    IP_LIST_FILE=${CONNECTD_INFO}/${REF_NAME}/ip_list_enm
+    # Copying ip_list file to original location
+    $CP ${TEM_DIR}/ip_list1 ${IP_LIST_FILE}
+fi
+}
+
+### Function: get_enm_type ###
+#
+# Get the ENM type here it is Physical or Virtual or Cloud
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+get_enm_type()
+{
+while :; do
+    unset _enm_type_
+    $ECHO "\nPlease select the type of ENM used for integration"
+    $ECHO "[1] Physical ENM on LITP Platform\n[2] ENM on Cloud\n[3] Cloud Native ENM\n" 
+    read _user_value_
+    if [ ! $_user_value_ ]; then
+        continue
+    fi
+    if [ $_user_value_ -eq 1 ]; then
+        _enm_type_="pENM"
+
+    elif [ $_user_value_ -eq 2 ]; then
+        _enm_type_="vENM"
+
+    elif [ "$_user_value_" -eq "3" ]; then
+        _enm_type_="cENM"
+
+    else
+        continue
+    fi
+    break
+done
+$ECHO $_enm_type_ > ${TEM_DIR}/enm_type
+
+if [ $_enm_type_ == "cENM" ]; then
+	get_ingress_for_cENM
+fi
+}
+
+### Function: get_ingress_for_cENM ###
+#
+# Get the ingress IP for cENM
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+get_ingress_for_cENM()
+{
+while :; do
+
+   unset _ingress_ip_
+   $ECHO "\nPlease enter the Ingress LoadBalancer IP for cENM integration."
+
+   read _ingress_ip_
+
+    # If the User hit nothing...Loop
+    if [ ! "${_ingress_ip_}" ]; then
+        continue
+    fi
+    break
+
+done
+
+$ECHO $_ingress_ip_ >> ${TEM_DIR}/ingress
+}
+
+
+### Function: set_connection_config ###
+#
+# Setup up configuration parameter related to 
+# connection
+# Arguments:
+#   none
+# Return Values:
+#   none
+set_connection_config()
+{
+if [ "${CONN_TYPE}" == "SOEM" ]; then
+    # Name of file containing List of used SOEM reference names
+    REF_NAME_FILE=${CLI_CONF_DIR}/.soem_ref_name_file
+    ENIQ_VOLUME_MT_POINT=${ENIQ_SOEM_VOLUME_MT_POINT}
+    _PMDATA_DIR_=`$CAT ${CLI_CONF_DIR}/${ENIQ_ENV} | $EGREP "^[[:blank:]]*PMDATA_SOEM_DIR=" | $AWK -F\= '{print $2}' | $SED -e 's|"||g'`
+    if [ ! "${_PMDATA_DIR_}" ]; then
+        _err_msg_="Could not read PMDATA_SOEM_DIR parameter from ${CLI_CONF_DIR}/${ENIQ_ENV}"
+        abort_script "${_err_msg_}" 
+    fi
+else
+    # Name of file containing List of used OSS reference names
+    REF_NAME_FILE=${CLI_CONF_DIR}/.oss_ref_name_file
+    _PMDATA_DIR_=`$CAT ${CLI_CONF_DIR}/${ENIQ_ENV} | $EGREP "^[[:blank:]]*PMDATA_DIR=" | $AWK -F\= '{print $2}' | $SED -e 's|"||g'`
+    if [ ! "${_PMDATA_DIR_}" ]; then
+        _err_msg_="Could not read PMDATA_DIR parameter from ${CLI_CONF_DIR}/${ENIQ_ENV}"
+        abort_script "${_err_msg_}" 
+    fi
+fi
+}
+
+### Function: setup_env ###
+#
+# Setup up path environment etc
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+setup_env()
+{
+if [ ! "${ENIQ_BASE_DIR}" ]; then
+    ENIQ_BASE_DIR=/eniq
+fi
+
+ENIQ_CONF_DIR=${ENIQ_BASE_DIR}/installation/config
+if [ ! -s ${ENIQ_CONF_DIR}/SunOS.ini ]; then
+    _err_msg_="Could not locate file ${ENIQ_CONF_DIR}/SunOS.ini"
+    abort_script "${_err_msg_}"
+fi
+
+# Create new directory structure for tunnels/interfaces
+ENIQ_ADMIN_DIR=${ENIQ_BASE_DIR}/admin
+ENIQ_INST_DIR=${ENIQ_BASE_DIR}/installation
+
+CLI_CONF_DIR=${ENIQ_BASE_DIR}/sw/conf
+if [ ! -s ${CLI_CONF_DIR}/${ENIQ_INI} ]; then
+    _err_msg_="Could not locate file ${CLI_CONF_DIR}/${ENIQ_INI}"
+    abort_script "${_err_msg_}"
+fi
+
+HNAME=`${MYHOSTNAME}`
+
+# ENIQ admin bin directory
+ENIQ_CONNECTD_DIR=${ENIQ_BASE_DIR}/connectd
+
+# Connectd info
+CONNECTD_INFO=${ENIQ_CONNECTD_DIR}/mount_info
+CONNECTD_SW=${ENIQ_CONNECTD_DIR}/bin
+
+# File containing the type of OSS installation. Eg. oss or single
+INST_TYPE_FILE=${ENIQ_CONF_DIR}/ericsson_use_config
+
+# Read the installation type
+INSTALL_TYPE=`$CAT ${INST_TYPE_FILE} | $AWK -F\= '{print $2}'`
+
+# Source the common functions
+if [ -s ${ENIQ_INST_DIR}/core_install/lib/common_functions.lib ]; then
+    . ${ENIQ_INST_DIR}/core_install/lib/common_functions.lib
+else
+    _err_msg_="File ${ENIQ_INST_DIR}/core_install/lib/common_functions.lib not found"
+    abort_script "${_err_msg_}"
+fi
+
+# Do we have a templates dir for the install type
+if [ ! -s ${ENIQ_CONNECTD_DIR}/etc/${INSTALL_TYPE}_fs_mount_list_template ]; then
+    _err_msg_="File ${ENIQ_CONNECTD_DIR}/etc/${INSTALL_TYPE}_fs_mount_list_template not found or is empty"
+    abort_script "${_err_msg_}"
+fi
+
+}
+
+### Function: update_auto_mounter ###
+#
+# Update the Automounter files
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+update_auto_mounter()
+{
+_sysuser_=`$CAT ${CLI_CONF_DIR}/${ENIQ_ENV} | $EGREP "^[[:blank:]]*SYS_USER=" | $AWK -F\= '{print $2}' | $SED -e 's|"||g'`
+if [ ! "${_sysuser_}" ]; then
+    _err_msg_="Could not read SYS_USER parameter from ${CLI_CONF_DIR}/${ENIQ_ENV}"
+    abort_script "${_err_msg_}" 
+fi
+
+_sysgrp_=`$ID ${_sysuser_} | $AWK '{print $2}' | $AWK -F\( '{print $2}' | $AWK -F\) '{print $1}'`
+if [ ! "${_sysgrp_}" ]; then
+    _err_msg_="Could not determine Group ID of ${_sysuser_} "
+    abort_script "${_err_msg_}" 
+fi
+
+if [ ! -d "${_PMDATA_DIR_}/${REF_NAME}" ]; then
+    $ECHO "Creating directory ${_PMDATA_DIR_}/${REF_NAME}" >> ${LOGFILE}
+    $MKDIR -p ${_PMDATA_DIR_}/${REF_NAME}
+    if [ $? -ne 0 ]; then
+        _err_msg_="Could not create directory ${_PMDATA_DIR_}/${REF_NAME}"
+        abort_script "${_err_msg_}" 
+    fi
+
+    $ECHO "Changing ownership of directory ${_PMDATA_DIR_}/${REF_NAME} ${_sysuser_}:${_sysgrp_}" >> ${LOGFILE}
+    $CHOWN -R ${_sysuser_}:${_sysgrp_} ${_PMDATA_DIR_}/${REF_NAME} >> /dev/null 2>&1
+    if [ $? -ne 0 ]; then 
+        _err_msg_="Could not change ${_PMDATA_DIR_}/${REF_NAME} ownership to ${_sysuser_}:${_sysgrp_}"
+        abort_script "${_err_msg_}" 
+    fi
+else
+    $ECHO "Directory ${_PMDATA_DIR_}/${REF_NAME} already exists"  >> ${LOGFILE}
+fi
+
+# Do I need to have any entry in the /etc/auto.master 
+#If not then just return
+$CAT ${AUTOFS_CONF} | $EGREP "^[     ]*/-[     ]+auto_eniq" >> /dev/null 2>&1
+if [ $? -ne 0 ]; then
+    return 0
+fi
+
+if [ -s /etc/auto_eniq ]; then
+    # Is this oss referenced in the /etc/auto_eniq. If not just return 
+    $CAT /etc/auto_eniq | $EGREP -v '^[[:blank:]]#' | $GREP -w "${REF_NAME}:$ENIQ_VOLUME_MT_POINT" >> /dev/null 2>&1
+    if [ $? -ne 0 ]; then
+        return 0
+    fi
+fi
+
+# Okay, I have to update automounter. Ensure ENIQ Services are inactive
+check_services
+
+if [ -s /etc/auto_eniq ]; then
+    # Remove the entry, comment lines and any blank lines from the /etc/auto_eniq file
+    $CAT /etc/auto_eniq | $EGREP -v '^[[:blank:]]#' | $GREP -vw "${REF_NAME}:$ENIQ_VOLUME_MT_POINT" \
+                        | $EGREP -v '^[[:blank:]]*$' > ${TEM_DIR}/auto_eniq
+
+    
+
+    # Is the file empty? If so, remove the /etc/auto_eniq file and the entry from
+    # the /etc/auto.master
+    if [ ! -s ${TEM_DIR}/auto_eniq ]; then
+        $ECHO "Removing auto_eniq entry from ${AUTOFS_CONF}" >> ${LOGFILE}
+        $CAT ${AUTOFS_CONF} | $EGREP -v "^[     ]*/-[     ]+auto_eniq" > ${TEM_DIR}/${AUTOFS_PARAM}
+        $CP ${TEM_DIR}/${AUTOFS_PARAM} ${AUTOFS_CONF}
+        if [ $? -ne 0 ]; then 
+            _err_msg_="Could not copy ${TEM_DIR}/${AUTOFS_PARAM} to ${AUTOFS_CONF}"
+            abort_script "${_err_msg_}" 
+        fi
+        
+        $ECHO "Removing /etc/auto_eniq file" >> ${LOGFILE}
+        $RM -f /etc/auto_eniq
+    else
+        # Copy the new auto_eniq file in.
+        $ECHO "Removing ${REF_NAME} entry from /etc/auto_eniq" >> ${LOGFILE}
+        $CP ${TEM_DIR}/auto_eniq /etc/auto_eniq
+        if [ $? -ne 0 ]; then 
+            _err_msg_="Could not copy ${TEM_DIR}/auto_eniq to /etc/auto_eniq"
+            abort_script "${_err_msg_}" 
+        fi
+    fi
+else
+    $ECHO "Removing auto_eniq entry from ${AUTOFS_CONF}" >> ${LOGFILE}
+    $CAT ${AUTOFS_CONF} | $EGREP -v "^[     ]*/-[     ]+auto_eniq" > ${TEM_DIR}/auto.master
+    $CP ${TEM_DIR}/${AUTOFS_PARAM} ${AUTOFS_CONF}
+    if [ $? -ne 0 ]; then 
+        _err_msg_="Could not copy ${TEM_DIR}/${AUTOFS_PARAM} to ${AUTOFS_CONF}"
+        abort_script "${_err_msg_}" 
+    fi
+fi
+
+$ECHO "Restarting automounter" >> ${LOGFILE}
+$SYSTEMCTL restart ${AUTOFS_SERVICE}
+    if [ $? -ne 0 ]; then 
+        _err_msg_="Could not restart ${AUTOFS_SERVICE}"
+    fi
+$SLEEP 5
+}
+
+### Function: usage_msg ###
+#
+#   Print out the usage message
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+usage_msg() 
+{
+clear
+$ECHO "
+Usage: `$BASENAME $0` [ -b <eniq_base_dir> ] [ -t <connection type > ]
+                      [ -l <path_to_logfile> ]
+options:
+
+-b  : Optional parameter specifying the full path to where the ENIQ
+      BASEDIR directory is (eg. /eniq). If not specified, then the 
+      script will assume the the base directory is 
+      ../../<directory_that_this_script_is_in>
+
+-t  : Optional parameter to specify connection type from which file
+      system is mounted.
+     
+-l  : Optional parameter specifying the full path to a logfile.
+      If not specified, then the script will create its own logfile
+      in ${ENIQ_BASE_DIR}/local_logs/connectd/mount_server.log
+
+"
+}
+
+# ********************************************************************
+#
+#   Main body of program
+#
+# ********************************************************************
+#
+# Determine absolute path to software
+get_absolute_path
+
+# Check that the effective id of the user is root
+check_id $DEFAULT_USER
+
+while getopts ":b:lNt:" arg; do
+  case $arg in
+    b) ENIQ_BASE_DIR="$OPTARG" 
+       ;;
+    l) LOGFILE="$OPTARG" 
+       ;;
+    N) NO_CONFIRM="YES" 
+       ;;
+    t) CONN_TYPE="$OPTARG"
+       ;;
+   \?) usage_msg
+       exit 1
+       ;;
+  esac
+done
+shift `expr $OPTIND - 1`
+
+# Setup up path environment etc
+setup_env
+
+if [ ! "${LOGFILE}" ]; then
+    LOGFILE=${ENIQ_BASE_DIR}/local_logs/connectd/mount_server.log
+fi    
+  
+# Check/Create Logfile
+chk_create_logfile
+
+$ECHO "\n=====================================================" >> ${LOGFILE}
+$ECHO "`$DATE '+%Y-%b-%d_%H.%M.%S'` - Beginning to run $0 " >> ${LOGFILE}
+$ECHO "=====================================================" >> ${LOGFILE}
+
+if [ ! -s ${CONNECTD_SW}/manage_mountpoints.bsh ]; then
+    _err_msg_="Could not find ${CONNECTD_SW}/manage_mountpoints.bsh script"
+    abort_script "${_err_msg_}"
+fi
+
+# Create a temporary Directory
+TEM_DIR=/tmp/mount_server.$$.$$
+$RM -rf ${TEM_DIR}
+$MKDIR -p ${TEM_DIR}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not create directory ${TEM_DIR}"
+    abort_script "${_err_msg_}"
+fi  
+
+if [ -z "${CONN_TYPE}" ]; then
+    get_connection
+fi
+
+set_connection_config
+
+# Have we previous OSS defined
+if [ ! -s $REF_NAME_FILE ]; then
+    _err_msg_="No ${CONN_TYPE} defined in $REF_NAME_FILE"
+    abort_script "${_err_msg_}"
+fi
+
+# Get the type of ENM (Physical or Virtual or Cloud) 
+if [ "${CONN_TYPE}" == "ENM" ]; then
+   get_enm_type
+fi
+
+# Get the ENIQ NODE reference name. 
+get_eniq_node_name
+
+# Get the mode of ENM for Cloud ENM 
+if [ "${_enm_type_}" == "cENM" ]; then
+    $ECHO "\nSetting ENM Mode to FLS as default for Cloud ENM Integration" | $TEE -a ${LOGFILE}
+    ENM_MODE="FLS"
+    $ECHO ${REF_NAME} >/tmp/enm_mode_fls
+fi
+
+if [ "${NO_CONFIRM}" ]; then
+    _no_cofirm_str_="-N"
+fi
+
+# Okay I need to trap interrupts at this stage
+trap "abort_script" 1 2 3 14 15
+
+# Update the Automounter files
+update_auto_mounter
+
+# Add the new fs_mount_list file
+$ECHO "Generating connect mount files" >> ${LOGFILE}
+$ECHO "using command" >> ${LOGFILE}
+if [ "${CONN_TYPE}" != "ENM" ]; then
+        $ECHO "/usr/bin/bash ${CONNECTD_SW}/manage_mountpoints.bsh -a add -i ${SRV_IP} -o ${REF_NAME} -t ${CONN_TYPE} -l ${LOGFILE} ${_no_cofirm_str_}" >> ${LOGFILE}
+        /usr/bin/bash ${CONNECTD_SW}/manage_mountpoints.bsh -a add -i ${SRV_IP} -o ${REF_NAME} -t ${CONN_TYPE} -l ${LOGFILE} ${_no_cofirm_str_}
+else
+       $ECHO "/usr/bin/bash ${CONNECTD_SW}/manage_mountpoints.bsh -a add -i ${IP_LIST_FILE} -o ${REF_NAME} -t ${CONN_TYPE} -l ${LOGFILE} ${_no_cofirm_str_}" >> ${LOGFILE}
+        /usr/bin/bash ${CONNECTD_SW}/manage_mountpoints.bsh -a add -i ${IP_LIST_FILE} -o ${REF_NAME} -t ${CONN_TYPE} -l ${LOGFILE} ${_no_cofirm_str_}
+fi
+
+
+if [ $? -ne 0 ]; then
+    _err_msg_="Fault running ${CONNECTD_SW}/manage_mountpoints.bsh"
+    abort_script "${_err_msg_}"
+fi
+
+#In case of ENM and NAS also the filename is disable_OSS,so changing CONN_TYPE to OSS
+if [ "${CONN_TYPE}" == "ENM" -o "${CONN_TYPE}" == "NAS" ]; then
+    CONN_TYPE=OSS
+fi
+
+if [ -f ${ENIQ_CONNECTD_DIR}/mount_info/${REF_NAME}/disable_${CONN_TYPE} ]; then
+    $ECHO "Removing file ${ENIQ_CONNECTD_DIR}/mount_info/${REF_NAME}/disable_${CONN_TYPE}" | $TEE -a ${LOGFILE}
+    $RM -f ${ENIQ_CONNECTD_DIR}/mount_info/${REF_NAME}/disable_${CONN_TYPE}
+fi
+
+$RM -rf ${TEM_DIR}
+
+exit 0

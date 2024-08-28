@@ -1,0 +1,833 @@
+###################################e
+
+## 			PERMS FILE			  ##
+## element user group permissions ##
+
+####################################
+
+core_install root root 755
+
+core_install/bin root root 755
+
+core_install/bin/active_loaddb.bsh root root 755
+core_install/bin/add_eniq_role.bsh root root 755
+core_install/bin/add_iq_sys_main_dbspaces.bsh root root 644
+core_install/bin/add_main_dbspaces.bsh root root 644
+core_install/bin/add_reader_temp_dbspace.bsh root root 755
+core_install/bin/add_temp_dbspaces.bsh root root 644
+core_install/bin/backup_bond_configuration.bsh root root 644
+core_install/bin/change_nas_vips.bsh root root 644
+core_install/bin/check_sym_links.pl root root 644
+core_install/bin/configure_platform.sh root root 644
+core_install/bin/configure_enm_mode.bsh root root 644
+core_install/bin/configure_fls_post_migration.bsh root root 755
+core_install/bin/create_dwhdb.bsh root root 644
+core_install/bin/create_eniq_rbac.bsh root root 755
+core_install/bin/eniq_linux_migration_restore.bsh root root 755
+core_install/bin/create_events_ini.bsh root root 644
+core_install/bin/create_reader.bsh root root 644
+core_install/bin/create_repdb.bsh root root 644
+core_install/bin/reconfigure_oss.bsh root root 755
+core_install/bin/create_stats_ini.bsh root root 644
+core_install/bin/continue_eniq_recovery.bsh root root 644
+core_install/bin/dboptions_dwhdb.bsh root root 644
+core_install/bin/dboptions_repdb.bsh root root 755
+core_install/bin/eniq_NASd_install.bsh root root 755
+core_install/bin/hardware_replacement_backup.bsh root root 755
+core_install/bin/eniq_core_install.bsh root root 755
+core_install/bin/data_migration_status.bsh root root 755
+core_install/bin/eniq_core_upgrade.bsh root root 644
+core_install/bin/eniq_data_migration.bsh root root 755
+core_install/bin/eniq_vnx_unity_migration.bsh root root 755
+core_install/bin/eniq_fs_expansion.bsh root root 755
+core_install/bin/eu_upgrade.bsh root root 755
+core_install/bin/fix_sym_links.bsh root root 755
+core_install/bin/get_cell_count.bsh root root 644
+core_install/bin/get_disk_info.bsh root root 755
+core_install/bin/get_disk_list.sh root root 755
+core_install/bin/historic_loaddb.bsh root root 755
+core_install/bin/extractdb.bsh root root 755
+core_install/bin/extracttable.bsh root root 755
+core_install/bin/install_hostsync.bsh root root 755
+core_install/bin/install_ldap_sw.bsh root root 755
+core_install/bin/ipv6_ipmp_upgrade.bsh root root 755
+core_install/bin/label_disk_template.sh root root 555
+core_install/bin/label_disks.sh root root 555
+core_install/bin/list_services.bsh root root 755 
+core_install/bin/manage_cep_mediation.bsh root root 755
+core_install/bin/manage_eniq_sentinel.bsh root root 755
+core_install/bin/integrate_enm.bsh root root 755
+core_install/bin/openldap_server_install.bsh root root 644
+core_install/bin/set_core_memcache.bsh root root 644
+core_install/bin/set_ipmp_enm.bsh root root 755
+core_install/bin/unpack_core_sw.bsh root root 644
+core_install/bin/update_hosts_file.bsh root root 644
+core_install/bin/update_passwords.bsh root root 755
+core_install/bin/update_ini.bsh root root 644
+core_install/bin/update_ipmp_ini.bsh root root 755
+core_install/bin/update_iq_mem_settings.bsh root root 755
+core_install/bin/update_sunos_ini.bsh root root 644
+core_install/bin/update_sybase_iq_timestamp.bsh root root 755
+core_install/bin/update_sym_links_ini.bsh root root 755
+core_install/bin/update_zfs_ini.bsh root root 644
+core_install/bin/upgrade_core_sw.bsh root root 755
+core_install/bin/upgrade_eniq_sw.bsh root root 644
+core_install/bin/upgrade_linux_os.bsh root root 644
+core_install/bin/upgrade_sybase_iq.bsh root root 755
+core_install/bin/upgrade_sybase_sql_anywhere.bsh root root 755
+core_install/bin/eniq_linux_migration.bsh root root 644
+core_install/bin/eniq_solaris_linux_migration.bsh root root 644
+core_install/bin/tablelist_perfeature.bsh root root 755
+core_install/bin/updateVersionDB.bsh root root 755
+core_install/bin/eniq_linux_replacement.bsh root root 755
+core_install/bin/eniq_linux_rack_replacement.bsh root root 755
+core_install/bin/eniq_linux_rack_replacement_restore.bsh root root 755
+core_install/eniq_checks_linux root root 755
+core_install/eniq_checks_solaris root root 755
+core_install/bin/eniq_linux_rack_migration.bsh root root 644
+core_install/bin/eniq_solaris_linux_rack_migration.bsh root root 644
+core_install/bin/manage_windows_server.bsh root root 644
+core_install/bin/manage_ilo_nodes.bsh root root 644
+core_install/bin/create_eniq_data_structure.bsh root root 755
+core_install/bin/update_arp_target.bsh root root 755
+core_install/bin/temp_db_expansion.bsh root root 755
+core_install/bin/temp_db_removal.bsh root root 755
+core_install/bin/configure_NAS_vips.bsh root root 755
+core_install/bin/eniq_db_expansion.bsh root root 755
+core_install/bin/upgrade_params.bsh root root 755
+core_install/bin/upgrade_feature_selection.bsh root root 755
+core_install/bin/eniq_pre_upgrade.bsh root root 755
+core_install/bin/manage_ombs_policies.bsh root root 755
+core_install/bin/eniq_dcuser_enable_ssh.py root root 755
+core_install/bin/eniq_disable_ssh_login.py root root 755
+core_install/bin/eniq_enable_admin_ssh.py root root 755
+core_install/bin/eniq_inter_blade_ssh.py root root 755
+core_install/bin/eniq_nh_verify.py root root 755
+core_install/bin/eniq_reenable_ssh.py root root 755
+core_install/bin/eniq_rollback_admin_ssh.py root root 755
+core_install/bin/manage_privileged_users.bsh root root 750
+core_install/bin/remote_privileged_users.bsh root root 755
+core_install/bin/eniq_disable_admin_ssh.py root root 755
+core_install/bin/ipv6_premigration.bsh root root 755
+core_install/bin/ipv6_migration.bsh root root 755
+
+core_install/eniq_checks_linux/config root root 755
+core_install/eniq_checks_solaris/config root root 755
+core_install/eniq_checks_linux/bin root root 755
+core_install/eniq_checks_solaris/bin root root 755
+core_install/eniq_checks_solaris/bin/check_iq_file_read_write.bsh root root 755
+core_install/eniq_checks_solaris/bin/check_iq_lun_mapping.bsh root root 755
+core_install/eniq_checks_solaris/bin/check_iq_header.bsh root root 755
+core_install/eniq_checks_solaris/bin/check_symlink.bsh root root 755
+core_install/eniq_checks_solaris/bin/check_snap_luns.bsh root root 755
+core_install/eniq_checks_solaris/bin/eniq_zpool_check.bsh root root 755
+core_install/eniq_checks_solaris/bin/storage_name_check.bsh root root 755
+core_install/eniq_checks_solaris/bin/storage_name_validate.bsh root root 755
+core_install/eniq_checks_solaris/config/script_registry_events.cfg root root 755
+
+
+core_install/eniq_checks_linux/bin/check_ssh.bsh root root 755 
+core_install/eniq_checks_linux/bin/check_dir_perms.bsh root root 755
+core_install/eniq_checks_linux/bin/check_logs.bsh root root 755
+core_install/eniq_checks_linux/bin/check_port.bsh root root 755
+core_install/eniq_checks_linux/bin/chk_smf_services.bsh root root 755
+core_install/eniq_checks_linux/bin/chk_partition_size.bsh root root 755
+core_install/eniq_checks_linux/bin/check_lockfile.bsh root root 755
+core_install/eniq_checks_linux/bin/check_core_dump.bsh root root 755
+core_install/eniq_checks_linux/bin/check_engine_profile.bsh root root 755
+core_install/eniq_checks_linux/bin/check_DNS.bsh root root 755
+core_install/eniq_checks_linux/bin/check_dir_perms.bsh root root 755
+core_install/eniq_checks_linux/bin/disk_partition_check.bsh root root 755
+core_install/eniq_checks_linux/bin/eniq_checks.bsh root root 755
+core_install/eniq_checks_linux/bin/eniq_crashdump_check.bsh root root 755
+core_install/eniq_checks_linux/bin/eniq_db_hung_connection_check.bsh root root 755
+core_install/eniq_checks_linux/bin/eniq_db_iq_utilization_check.bsh root root 755
+core_install/eniq_checks_linux/bin/eniq_db_multiplex_mode_check.bsh root root 755
+core_install/eniq_checks_linux/bin/eniq_dropleak_check.bsh root root 755
+core_install/eniq_checks_linux/bin/eniq_hw_check.bsh root root 755
+core_install/eniq_checks_linux/bin/eniq_vg_check.bsh root root 755
+core_install/eniq_checks_linux/bin/feature_lic.bsh root root 755
+core_install/eniq_checks_linux/bin/inode.bsh root root 755
+core_install/eniq_checks_linux/bin/license.bsh root root 755
+core_install/eniq_checks_linux/bin/nas_online.bsh root root 755
+core_install/eniq_checks_linux/bin/snapshot_cache_nas.bsh root root 755
+core_install/eniq_checks_linux/bin/snapshot_cache_fs.bsh root root 755
+core_install/eniq_checks_linux/bin/hw_migration_precheck.bsh root root 755
+core_install/eniq_checks_linux/bin/oss_mount.bsh root root 755
+core_install/eniq_checks_linux/bin/check_capacity_license.bsh root root 755
+core_install/eniq_checks_linux/bin/check_storage_ip.bsh root root 755
+core_install/eniq_checks_linux/bin/mws_hardware_check.py root root 755
+core_install/eniq_checks_linux/bin/mws_upgrade_check.py root root 755
+core_install/eniq_checks_linux/bin/nas_hardware_check.py root root 755
+core_install/eniq_checks_linux/bin/nas_media_check.py root root 755
+core_install/eniq_checks_linux/bin/nas_rhel_check.py root root 755
+
+core_install/eniq_checks_linux/config/return_code.cfg root root 755
+core_install/eniq_checks_linux/config/script_registry_stats.cfg root root 755
+core_install/eniq_checks_linux/config/precheck_stats.cfg root root 755
+core_install/eniq_checks_linux/config/script_registry_feature_upgrade.cfg root root 755
+core_install/eniq_checks_linux/config/script_registry_stats_MWS.cfg root root 755
+
+core_install/eniq_checks_solaris/bin/check_ssh.bsh root root 755 
+core_install/eniq_checks_solaris/bin/check_dir_perms.bsh root root 755
+core_install/eniq_checks_solaris/bin/check_logs.bsh root root 755
+core_install/eniq_checks_solaris/bin/check_port.bsh root root 755
+core_install/eniq_checks_solaris/bin/chk_smf_services.bsh root root 755
+core_install/eniq_checks_solaris/bin/chk_partition_size.bsh root root 755
+core_install/eniq_checks_solaris/bin/check_lockfile.bsh root root 755
+core_install/eniq_checks_solaris/bin/check_core_dump.bsh root root 755
+core_install/eniq_checks_solaris/bin/check_engine_profile.bsh root root 755
+core_install/eniq_checks_solaris/bin/check_DNS.bsh root root 755
+core_install/eniq_checks_solaris/bin/check_dir_perms.bsh root root 755
+core_install/eniq_checks_solaris/bin/eniq_checks.bsh root root 755
+core_install/eniq_checks_solaris/bin/eniq_crashdump_check.bsh root root 755
+core_install/eniq_checks_solaris/bin/eniq_db_hung_connection_check.bsh root root 755
+core_install/eniq_checks_solaris/bin/eniq_db_iq_utilization_check.bsh root root 755
+core_install/eniq_checks_solaris/bin/eniq_db_multiplex_mode_check.bsh root root 755
+core_install/eniq_checks_solaris/bin/eniq_dropleak_check.bsh root root 755
+core_install/eniq_checks_solaris/bin/eniq_hw_check.bsh root root 755
+core_install/eniq_checks_solaris/bin/feature_lic.bsh root root 755
+core_install/eniq_checks_solaris/bin/inode.bsh root root 755
+core_install/eniq_checks_solaris/bin/license.bsh root root 755
+core_install/eniq_checks_solaris/bin/nas_online.bsh root root 755
+core_install/eniq_checks_solaris/bin/snapshot_cache_nas.bsh root root 755
+core_install/eniq_checks_solaris/bin/oss_mount.bsh root root 755
+core_install/eniq_checks_solaris/bin/check_capacity_license.bsh root root 755
+core_install/eniq_checks_solaris/bin/check_storage_ip.bsh root root 755
+core_install/eniq_checks_solaris/bin/check_nas_ssh.bsh root root 755
+core_install/eniq_checks_solaris/config/return_code.cfg root root 755
+core_install/eniq_checks_solaris/config/script_registry_stats.cfg root root 755
+core_install/eniq_checks_solaris/config/precheck_stats.cfg root root 755
+core_install/eniq_checks_solaris/config/script_registry_feature_upgrade.cfg root root 755
+
+core_install/eniq_log_collector root root 755
+
+core_install/eniq_log_collector/bin root root 755
+core_install/eniq_log_collector/bin/log_collector.bsh root root 755
+core_install/eniq_log_collector/bin/log_transfer.bsh root root 755
+
+core_install/eniq_log_collector/config root root 755
+core_install/eniq_log_collector/config/log_collector.cfg root root 755
+core_install/eniq_log_collector/config/registry_log_collector.cfg root root 755
+core_install/eniq_log_collector/config/deployment_type.cfg root root 755
+
+core_install/etc root root 755
+
+core_install/etc/es_eniq_es_stagelist root root 644
+core_install/etc/es_eniq_mz_stagelist root root 644
+core_install/etc/es_server_list root root 644
+core_install/etc/eu_upgrade.cfg root root 644
+core_install/etc/eniq_linux_migration_restore_files root root 644
+core_install/etc/eniq_premigrate_stagelist root root 644
+core_install/etc/eniq_postmigrate_stagelist root root 644
+core_install/etc/eniq_prerecover_stagelist root root 644
+core_install/etc/eniq_postrecover_stagelist root root 644
+core_install/etc/eniq_upgrade_stagelist root root 644
+core_install/etc/eniq_upgrade_platform_only_stagelist root root 644
+core_install/etc/events_eniq_coordinator_stagelist root root 644
+core_install/etc/events_eniq_events_stagelist root root 644
+core_install/etc/events_eniq_iqr_stagelist root root 644
+core_install/etc/events_eniq_iqw_stagelist root root 644
+core_install/etc/events_eniq_mz_stagelist root root 644
+core_install/etc/events_eniq_ui_stagelist root root 644
+core_install/etc/eniq_upgrade_platform_only_stagelist root root 644
+core_install/etc/events_server_list root root 644
+core_install/etc/events_son_coordinator_stagelist root root 644
+core_install/etc/nas_plugin_perms.cfg root root 644
+core_install/etc/partition_plan_events root root 644
+core_install/etc/partition_plan_stats root root 644
+core_install/etc/solaris_11_cron_list root root 644
+core_install/etc/stats_clariion.cfg root root 644
+core_install/etc/stats_eniq_stats_stagelist root root 644
+core_install/etc/stats_server_list root root 644
+core_install/etc/stats_stats_coordinator_stagelist root root 644
+core_install/etc/stats_stats_engine_stagelist root root 644
+core_install/etc/stats_stats_iqr_stagelist root root 644
+core_install/etc/storage_options root root 644
+core_install/etc/eniq_solaris_migration_stagelist root root 644
+core_install/etc/eniq_solaris_premigration_stagelist root root 644
+core_install/etc/eniq_solaris_recovery_stagelist root root 644
+core_install/etc/eniq_linux_migration_stagelist root root 644
+core_install/etc/eniq_linux_premigration_stagelist root root 644
+core_install/etc/eniq_linux_recovery_stagelist root root 644
+core_install/etc/eniq_solaris_10_cronlist root root 644
+core_install/etc/eniq_rollback_stagelist root root 644
+core_install/etc/eniq_post_upgrade_stagelist root root 644
+core_install/etc/eniq_upgrade_feature_only_stagelist root root 644
+core_install/etc/eniq_add_features_admin_ui_stagelist root root 644 
+core_install/etc/eniq_feature_upgrade_admin_ui_stagelist root root 644  
+core_install/etc/eniq_post_upgrade_admin_ui_stagelist root root 644 
+core_install/etc/eniq_rollback_admin_ui_stagelist root root 644
+core_install/etc/eniq_linux_fs_migration_stagelist root root 644
+core_install/etc/eniq_linux_prereplacement_stagelist root root 644
+core_install/etc/eniq_linux_rep-recovery_stagelist root root 644
+core_install/etc/eniq_linux_replacement_stagelist root root 644
+core_install/etc/eniq_linux_fs_recovery_stagelist root root 644
+core_install/etc/eniq_migration_recovery_files root root 644
+core_install/etc/eniq_linux_fs_premigration_stagelist root root 644
+core_install/etc/eniq_linux_fs_prereplacement_stagelist root root 644
+core_install/etc/eniq_linux_fs_replacement_stagelist root root 644
+core_install/etc/eniq_linux_replacement_restore_files root root 644
+core_install/etc/eniq_linux_temp_db_expansion_stagelist root root 644
+core_install/etc/eniq_linux_temp_db_removal_stagelist root root 644
+core_install/etc/eniq_db_expansion_stagelist root root 644
+core_install/etc/eniq_ipv6_premigration_stagelist root root 644
+core_install/etc/eniq_ipv6_migration_stagelist root root 644
+
+
+
+core_install/lib root root 755
+
+core_install/lib/common_core_install_functions.lib root root 644
+core_install/lib/common_functions.lib root root 644
+core_install/lib/common_inirator_functions.lib root root 644
+core_install/lib/common_migration_functions.lib root root 644
+core_install/lib/iniadd.pl root root 755
+core_install/lib/inidel.pl root root 755
+core_install/lib/port_ping.pl root root 755
+core_install/lib/get_ip_order.pl root root 755
+
+core_install/templates root root 755
+
+core_install/templates/common root root 755
+
+core_install/templates/common/bkup_sw root root 755
+
+core_install/templates/common/bkup_sw/bin root root 755
+core_install/templates/common/bkup_sw/bin/backup_precheck.bsh root root 755
+core_install/templates/common/bkup_sw/bin/clean_archive_data.bsh root root 755
+core_install/templates/common/bkup_sw/bin/cleanup_eniq_backup.bsh root root 755
+core_install/templates/common/bkup_sw/bin/collect_root_disk_conf.bsh root root 755
+core_install/templates/common/bkup_sw/bin/config_ACL.bsh root root 755
+core_install/templates/common/bkup_sw/bin/prep_eniq_snapshots.bsh root root 755
+core_install/templates/common/bkup_sw/bin/create_snapshot_luns.bsh root root 755
+core_install/templates/common/bkup_sw/bin/create_snapshots.bsh root root 755
+core_install/templates/common/bkup_sw/bin/eniq_rollsnapd.bsh root root 755
+core_install/templates/common/bkup_sw/bin/eniq_smf_roll_snap.sh root root 755
+core_install/templates/common/bkup_sw/bin/get_backup_option.bsh root root 755
+core_install/templates/common/bkup_sw/bin/get_fs_backup_list.bsh root root 755
+core_install/templates/common/bkup_sw/bin/manage_nas_snapshots.bsh root root 755
+core_install/templates/common/bkup_sw/bin/manage_san_snapshots.bsh root root 755
+core_install/templates/common/bkup_sw/bin/manage_fs_snapshots.bsh root root 755
+core_install/templates/common/bkup_sw/bin/post_rollback.bsh root root 644
+core_install/templates/common/bkup_sw/bin/prepare_eniq_bkup.bsh root root 755
+core_install/templates/common/bkup_sw/bin/raw_backup_supervisor.bsh root root 755
+core_install/templates/common/bkup_sw/bin/recover_iq.bsh root root 755
+core_install/templates/common/bkup_sw/bin/repdb_backup.bsh root root 755
+core_install/templates/common/bkup_sw/bin/repdb_restore.bsh root root 755
+core_install/templates/common/bkup_sw/bin/rollback_archive_data.bsh root root 644
+core_install/templates/common/bkup_sw/bin/save_conf_data.bsh root root 755
+core_install/templates/common/bkup_sw/bin/trigger_roll_snap.bsh root root 755
+core_install/templates/common/bkup_sw/bin/trigger_dbcheck.bsh root root 755
+core_install/templates/common/bkup_sw/bin/flex_data_bkup_fs_creation.bsh root root 755
+core_install/templates/common/bkup_sw/bin/flexible_data_bkup.bsh root root 755
+core_install/templates/common/bkup_sw/bin/reconfigure_flex_fs.bsh root root 755
+core_install/templates/common/bkup_sw/bin/get_ombs_info.bsh root root 755
+core_install/templates/common/bkup_sw/bin/create_ombs_info.bsh root root 755
+
+core_install/templates/common/bkup_sw/etc root root 755
+core_install/templates/common/bkup_sw/etc/asa_filesystem_list root root 644
+core_install/templates/common/bkup_sw/etc/eniq_backup.conf root root 644
+core_install/templates/common/bkup_sw/etc/change_owner_dir_list root root 644
+core_install/templates/common/bkup_sw/etc/es_blade_nfs_filesys_snap_det root root 644
+core_install/templates/common/bkup_sw/etc/es_blade_zfs_filesys_snap_det root root 644
+core_install/templates/common/bkup_sw/etc/events_blade_nfs_filesys_snap_det root root 644
+core_install/templates/common/bkup_sw/etc/events_blade_zfs_filesys_snap_det root root 644
+core_install/templates/common/bkup_sw/etc/events_rack_zfs_filesys_snap_det root root 644
+core_install/templates/common/bkup_sw/etc/iq_filesystem_list root root 644
+core_install/templates/common/bkup_sw/etc/save_conf_data_files root root 644
+core_install/templates/common/bkup_sw/etc/stats_blade_nfs_filesys_snap_det root root 644
+core_install/templates/common/bkup_sw/etc/stats_blade_fs_filesys_snap_det root root 644
+core_install/templates/common/bkup_sw/etc/stats_rack_fs_filesys_snap_det root root 644
+core_install/templates/common/bkup_sw/etc/stats_rolling_snap_crontab_template root root 644
+
+core_install/templates/common/bkup_sw/templates root root 755
+
+core_install/templates/common/bkup_sw/templates/eniq_ombs_restore.bsh root root 644
+core_install/templates/common/bkup_sw/templates/create_disk_restore_list.bsh root root 644
+core_install/templates/common/bkup_sw/templates/recreate_root_disk_layout.bsh root root 644
+core_install/templates/common/bkup_sw/templates/restore_eniq.bsh root root 644
+core_install/templates/common/bkup_sw/templates/post_restore_step.bsh root root 644
+core_install/templates/common/bkup_sw/templates/etc root root 755
+core_install/templates/common/bkup_sw/templates/eniq_selective_restore.bsh root root 644
+core_install/templates/common/bkup_sw/templates/ini_file root root 644
+core_install/templates/common/bkup_sw/templates/eniq_selective_restore_rack_replacment.bsh root root 644
+core_install/templates/common/bkup_sw/templates/ini_file_rack_replacement root root 644
+core_install/templates/common/bkup_sw/templates/etc/eniq_restore.conf root root 644
+core_install/templates/common/bkup_sw/templates/etc/menu.lst.template root root 644
+
+core_install/templates/common/connectd root root 755
+
+core_install/templates/common/connectd/bin root root 755
+core_install/templates/common/connectd/bin/connectd.bsh root root 744
+core_install/templates/common/connectd/bin/connectd_monitor_template.bsh root root 744
+core_install/templates/common/connectd/bin/generate_ssh_key.bsh root root 644
+core_install/templates/common/connectd/bin/manage_connections.bsh root root 644
+core_install/templates/common/connectd/bin/manage_mountpoints.bsh root root 644
+core_install/templates/common/connectd/bin/mount_server.bsh root root 644
+
+core_install/templates/common/connectd/etc root root 755
+
+core_install/templates/common/connectd/etc/config root root 644
+core_install/templates/common/connectd/etc/connectd_config_template root root 644
+core_install/templates/common/connectd/etc/eniqstats_template.env root root 644
+core_install/templates/common/connectd/etc/es_fs_mount_list_template root root 644
+core_install/templates/common/connectd/etc/eventdata_fs_mount_template root root 644
+core_install/templates/common/connectd/etc/events_connection_template root root 644
+core_install/templates/common/connectd/etc/events_fs_mount_list_template root root 644
+core_install/templates/common/connectd/etc/manage_connection.cfg root root 644
+core_install/templates/common/connectd/etc/mount_warning.txt root root 644
+core_install/templates/common/connectd/etc/mount_warning_nas.txt root root 644
+core_install/templates/common/connectd/etc/pmdata_fs_mount_template root root 644
+core_install/templates/common/connectd/etc/stats_fs_mount_list_template root root 644
+core_install/templates/common/connectd/etc/update_config_file_template root root 644
+core_install/templates/common/connectd/etc/wifi_template.env root root 644
+
+core_install/templates/common/connectd/mount_info root root 755
+
+core_install/templates/common/host_sync root root 755
+
+core_install/templates/common/host_sync/hostsync.sh root root 755
+core_install/templates/common/host_sync/hostsync_monitor.bsh root root 755
+core_install/templates/common/host_sync/hostsync.service root root 755
+
+core_install/templates/common/niq.rc root root 555
+
+core_install/templates/common/smf root root 755
+
+
+core_install/templates/common/smf/bin root root 755
+
+core_install/templates/common/smf/bin/NASd.sh root root 755
+core_install/templates/common/smf/bin/eniq_service_start_stop.bsh root root 755
+core_install/templates/common/smf/bin/eniq_services_monitor.bsh root root 755
+
+core_install/templates/common/smf/bin/eniq_smf_start_stop.sh root root 755
+
+core_install/templates/common/smf/connectd root root 755
+
+core_install/templates/common/smf/connectd/eniq_smf_connectd.sh root root 744
+
+core_install/templates/common/smf/etc root root 755
+
+core_install/templates/es root root 755
+
+core_install/templates/es/RBAC.ini root root 644
+core_install/templates/es/SunOS.ini_raw root root 644
+core_install/templates/es/admin root root 755
+core_install/templates/es/cep_mediation.ini root root 644
+core_install/templates/es/ini_config_file.cfg root root 644
+core_install/templates/es/ipmp.ini root root 644
+core_install/templates/es/niq.ini root root 644
+core_install/templates/es/niq.rc root root 644
+core_install/templates/es/sentinel.ini root root 644
+core_install/templates/es/storage_ini.ft root root 644
+core_install/templates/es/storage_ini.sml root root 644
+core_install/templates/es/sym_links.ini root root 644
+
+core_install/templates/es/admin/bin root root 755
+
+core_install/templates/es/admin/bin/clean_archives.bsh root root 755
+core_install/templates/es/admin/bin/create_async_share_cmds.bsh root root 644
+core_install/templates/es/admin/bin/esm root root 755
+core_install/templates/es/admin/bin/manage_deployment_services.bsh root root 644
+core_install/templates/es/admin/bin/manage_eniq_oss.bsh root root 644
+core_install/templates/es/admin/bin/manage_eniq_services.bsh root root 644
+core_install/templates/es/admin/bin/manage_eniq_status.bsh root root 644
+core_install/templates/es/admin/bin/manage_features.bsh root root 644
+core_install/templates/es/admin/bin/manage_oss_ip.bsh root root 644
+core_install/templates/es/admin/bin/manage_storage_fs.bsh root root 644
+core_install/templates/es/admin/bin/post_upgrade.bsh root root 644
+core_install/templates/es/admin/bin/post_upgrade_configuration.bsh root root 644
+core_install/templates/es/admin/bin/enable_mounts.bsh root root 755
+core_install/templates/es/admin/bin/manage_dtrace.bsh root root 755
+core_install/templates/es/admin/bin/call_dtrace.bsh root root 755
+core_install/templates/es/admin/bin/start_dtrace.d root root 755
+core_install/templates/es/admin/bin/regenerate_symlinks.bsh root root 755
+core_install/templates/es/admin/bin/upgrade_platform_modules.bsh root root 644
+
+core_install/templates/es/admin/etc root root 755
+core_install/templates/es/admin/etc/clean_archives.cfg root root 640
+core_install/templates/es/admin/etc/smf_contract_config root root 644
+
+core_install/templates/es/admin/lib root root 755
+core_install/templates/es/admin/lib/common_functions.lib root root 555
+core_install/templates/es/admin/lib/get_ip_order.pl root root 755
+core_install/templates/es/admin/lib/iniadd.pl root root 755
+core_install/templates/es/admin/lib/inidel.pl root root 755
+core_install/templates/es/admin/lib/port_ping.pl root root 755
+
+core_install/templates/es/i386 root root 755
+
+core_install/templates/es/i386/skel_dir root root 755
+
+core_install/templates/es/i386/skel_dir/.profile root root 555
+core_install/templates/es/i386/skel_dir/.ssh root root 700
+core_install/templates/es/i386/skel_dir/.ssh/config root root 544
+
+core_install/templates/events root root 755
+
+core_install/templates/events/RBAC.ini root root 644
+core_install/templates/events/SunOS.ini_raw root root 644
+core_install/templates/events/SunOS.ini_zfs root root 644
+core_install/templates/events/cep_mediation.ini root root 644
+core_install/templates/events/ecs.ini root root 644
+core_install/templates/events/ini_config_file.cfg root root 644
+core_install/templates/events/interfaces root root 444
+core_install/templates/events/ipmp.ini root root 644
+core_install/templates/events/niq.ini root root 644
+core_install/templates/events/niq.rc root root 644
+core_install/templates/events/sentinel.ini root root 644
+core_install/templates/events/storage_ini.ft root root 644
+core_install/templates/events/storage_ini.lrg root root 644
+core_install/templates/events/storage_ini.med root root 644
+core_install/templates/events/storage_ini.sml root root 644
+core_install/templates/events/storage_ini.vm root root 644
+core_install/templates/events/sym_links.ini root root 644
+
+core_install/templates/events/admin root root 755
+
+core_install/templates/events/admin/bin root root 755
+
+core_install/templates/events/admin/bin/catalog_cache_tuning.bsh root root 755 
+core_install/templates/events/admin/bin/clean_archives.bsh root root 755
+core_install/templates/events/admin/bin/cleanup_log_files.bsh root root 755
+core_install/templates/events/admin/bin/change_db_password.bsh root root 640
+core_install/templates/events/admin/bin/cleanup_rollback.bsh root root 644
+core_install/templates/events/admin/bin/cleanup_sybase_logs.bsh root root 755
+core_install/templates/events/admin/bin/configure_cep_mediation.bsh root root 644
+core_install/templates/events/admin/bin/create_async_share_cmds.bsh root root 644
+core_install/templates/events/admin/bin/create_sym_links.bsh root root 644
+core_install/templates/events/admin/bin/defrag_eniq_sfs.bsh root root 755
+core_install/templates/events/admin/bin/dwh_reader root root 755
+core_install/templates/events/admin/bin/dwhdb root root 755
+core_install/templates/events/admin/bin/ec_configuration.bsh root root 644
+core_install/templates/events/admin/bin/esm root root 755
+core_install/templates/events/admin/bin/iniget root root 755
+core_install/templates/events/admin/bin/install_storage_api.bsh root root 644
+core_install/templates/events/admin/bin/manage_deployment_services.bsh root root 644
+core_install/templates/events/admin/bin/manage_eniq_oss.bsh root root 644
+core_install/templates/events/admin/bin/manage_eniq_services.bsh root root 644
+core_install/templates/events/admin/bin/manage_eniq_status.bsh root root 644
+core_install/templates/events/admin/bin/manage_features.bsh root root 644
+core_install/templates/events/admin/bin/upgrade_opengeo.bsh root root 755
+core_install/templates/events/admin/bin/manage_oss_ip.bsh root root 644
+core_install/templates/events/admin/bin/manage_storage_fs.bsh root root 644
+core_install/templates/events/admin/bin/post_upgrade.bsh root root 644
+core_install/templates/events/admin/bin/post_upgrade_configuration.bsh root root 644
+core_install/templates/events/admin/bin/postgresql_og root root 755
+core_install/templates/events/admin/bin/repdb root root 755
+core_install/templates/events/admin/bin/resizedb root root 644
+core_install/templates/events/admin/bin/resize_nas_fs.bsh root root 644
+core_install/templates/events/admin/bin/transaction_log_admin.bsh root root 644
+core_install/templates/events/admin/bin/update_cell_node_count.bsh root root 644
+core_install/templates/events/admin/bin/upgrade_nas_api.bsh root root 644
+core_install/templates/events/admin/bin/enable_mounts.bsh root root 755
+core_install/templates/events/admin/bin/manage_dtrace.bsh root root 755
+core_install/templates/events/admin/bin/call_dtrace.bsh root root 755
+core_install/templates/events/admin/bin/start_dtrace.d root root 755
+core_install/templates/events/admin/bin/regenerate_symlinks.bsh root root 755
+core_install/templates/events/admin/bin/DbCheck.bsh root root 755
+core_install/templates/events/admin/bin/exp_add_maindb.bsh root root 644
+core_install/templates/events/admin/bin/exp_add_sysmain.bsh root root 644
+core_install/templates/events/admin/bin/upgrade_platform_modules.bsh root root 644
+core_install/templates/events/admin/bin/disable_mounts.bsh root root 755
+core_install/templates/events/admin/bin/drop_idle_connection.bsh root root 755
+
+core_install/templates/events/admin/etc root root 755
+core_install/templates/events/admin/etc/clean_archives.cfg root root 640
+core_install/templates/events/admin/etc/cleanup_files.cfg root root 640
+core_install/templates/events/admin/etc/mem_factors.cfg root root 644
+core_install/templates/events/admin/etc/password_list root root 644
+core_install/templates/events/admin/etc/smf_contract_config root root 644
+core_install/templates/events/admin/etc/dbcheck.env root root 644
+
+core_install/templates/events/admin/lib root root 755
+core_install/templates/events/admin/lib/common_functions.lib root root 555
+core_install/templates/events/admin/lib/get_ip_order.pl root root 755
+core_install/templates/events/admin/lib/iniadd.pl root root 755
+core_install/templates/events/admin/lib/inidel.pl root root 755
+core_install/templates/events/admin/lib/port_ping.pl root root 755
+
+core_install/templates/events/admin/managed_oss root root 755
+
+core_install/templates/events/admin/sql root root 755
+
+core_install/templates/events/admin/sql/create_check_db_size_events.sql root root 644
+core_install/templates/events/admin/sql/create_dbuser_procedures.sql root root 644
+core_install/templates/events/admin/sql/create_drop_idle_users_exceeding_fourHR_fortyGB_Connections.sql root root 644
+core_install/templates/events/admin/sql/create_dropIdle_dcpublic_dcbo_Connections.sql root root 644
+core_install/templates/events/admin/sql/create_event_drop_idle_query_users.sql root root 644
+core_install/templates/events/admin/sql/create_event_drop_idle_users_exceeding_fourHR_fortyGB.sql root root 644
+core_install/templates/events/admin/sql/create_proc_lock_unlock.sql root root 644
+core_install/templates/events/admin/sql/create_show_dwhdb_usage.sql root root 644
+core_install/templates/events/admin/sql/create_users_dwhdb.sql root root 644
+core_install/templates/events/admin/sql/create_users_repdb.sql root root 644
+core_install/templates/events/admin/sql/dboptions_dwhdb.sql root root 644
+core_install/templates/events/admin/sql/dboptions_repdb.sql root root 644
+core_install/templates/events/admin/sql/kill_idle.sql root root 644
+core_install/templates/events/admin/sql/rebuild_idx.sql root root 644
+core_install/templates/events/admin/sql/repdb_authenticate.sql root root 644
+core_install/templates/events/admin/sql/repdb_connection_authentication.sql root root 644
+core_install/templates/events/admin/sql/template_include_reader.sql root root 644
+core_install/templates/events/admin/sql/sp_eniq_login_environment.sql root root 644
+core_install/templates/events/admin/sql/create_drop_idle_users_repdb.sql root root 644
+core_install/templates/events/admin/sql/create_event_drop_idle_users_repdb.sql root root 644
+
+core_install/templates/events/admin/sybase_conf root root 755
+core_install/templates/events/admin/sybase_conf/dwhdb.cfg root root 644
+core_install/templates/events/admin/sybase_conf/repdb.cfg root root 644
+
+core_install/templates/events/i386 root root 755
+
+core_install/templates/events/i386/skel_dir root root 755
+
+core_install/templates/events/i386/skel_dir/.profile root root 555
+core_install/templates/events/i386/skel_dir/.ssh root root 700
+core_install/templates/events/i386/skel_dir/.ssh/config root root 544
+
+core_install/templates/events/sparc root root 755
+
+core_install/templates/events/sparc/skel_dir root root 755
+
+core_install/templates/events/sparc/skel_dir/.profile root root 555
+core_install/templates/events/sparc/skel_dir/.ssh root root 700
+core_install/templates/events/sparc/skel_dir/.ssh/config root root 544
+
+core_install/templates/stats root root 755
+
+core_install/templates/stats/RBAC.ini root root 644
+core_install/templates/stats/SunOS.ini_raw root root 644
+core_install/templates/stats/SunOS.ini_vnx root root 644
+core_install/templates/stats/SunOS.ini_unity root root 644
+core_install/templates/stats/SunOS.ini_unityXT root root 644
+core_install/templates/stats/SunOS.ini_fs root root 644
+core_install/templates/stats/SunOS.ini_fs_compact root root 644
+core_install/templates/stats/soem.ini root root 644
+core_install/templates/stats/ini_config_file.cfg root root 644
+core_install/templates/stats/interfaces root root 444
+core_install/templates/stats/ipmp.ini root root 644
+core_install/templates/stats/ipmp.ini_fs root root 644
+core_install/templates/stats/ipmp.ini_fs_bond root root 644
+core_install/templates/stats/ipmp.ini_unityXT root root 644
+core_install/templates/stats/niq.ini root root 644
+core_install/templates/stats/niq.rc root root 644
+core_install/templates/stats/sentinel.ini root root 644
+core_install/templates/stats/drop_connection.conf root root 644
+core_install/templates/stats/ssh_input_file root root 644
+core_install/templates/stats/storage_ini.extralrg root root 644
+core_install/templates/stats/storage_ini.extralrg_unityXT root root 644
+core_install/templates/stats/storage_ini.ft root root 644
+core_install/templates/stats/storage_ini.lrg root root 644
+core_install/templates/stats/storage_ini.lrg_unityXT root root 644
+core_install/templates/stats/storage_ini.med root root 644
+core_install/templates/stats/storage_ini.sml root root 644
+core_install/templates/stats/storage_ini.vm root root 644
+core_install/templates/stats/sym_links.ini root root 644
+core_install/templates/stats/backup_migration_data.ini root root 644
+core_install/templates/stats/password_encryption.cfg root root 644
+core_install/templates/stats/db_exp.conf root root 644
+core_install/templates/stats/upgrade_params.ini root root 755
+core_install/templates/stats/admin root root 755
+core_install/templates/stats/admin/bin root root 755
+
+core_install/templates/stats/admin/bin/admin_query_user.bsh root root 640
+core_install/templates/stats/admin/bin/catalog_cache_tuning.bsh root root 755
+core_install/templates/stats/admin/bin/cleanup_log_files.bsh root root 755
+core_install/templates/stats/admin/bin/cleanup_sybase_logs.bsh root root 755
+core_install/templates/stats/admin/bin/change_db_password.bsh root root 640
+core_install/templates/stats/admin/bin/counter_statistics.bsh root root 755
+core_install/templates/stats/admin/bin/counter_statistics_tool.bsh root root 755
+core_install/templates/stats/admin/bin/counter_tool_master_cron.bsh root root 755
+core_install/templates/stats/admin/bin/create_async_share_cmds.bsh root root 644
+core_install/templates/stats/admin/bin/create_query_user.bsh root root 640
+core_install/templates/stats/admin/bin/create_query_user_login_policy.bsh root root 640
+core_install/templates/stats/admin/bin/C2VMigration.bsh root root 755
+core_install/templates/stats/admin/bin/defrag_eniq_sfs.bsh root root 755
+core_install/templates/stats/admin/bin/dwh_reader root root 755
+core_install/templates/stats/admin/bin/dwhdb root root 755
+core_install/templates/stats/admin/bin/esm root root 755
+core_install/templates/stats/admin/bin/encrypt_user_passwords.bsh root root 640
+core_install/templates/stats/admin/bin/exp_add_maindb.bsh root root 644
+core_install/templates/stats/admin/bin/exp_add_sysmain.bsh root root 644
+core_install/templates/stats/admin/bin/exp_eniq_multi_blade.bsh root root 644
+core_install/templates/stats/admin/bin/exp_rm_temp_dbspaces.bsh root root 644
+core_install/templates/stats/admin/bin/exp_set_deployment.bsh root root 644
+core_install/templates/stats/admin/bin/iniget root root 755
+core_install/templates/stats/admin/bin/install_eu_fix.bsh root root 644
+core_install/templates/stats/admin/bin/manage_deployment_services.bsh root root 755
+core_install/templates/stats/admin/bin/manage_eniq_oss.bsh root root 644
+core_install/templates/stats/admin/bin/manage_eniq_services.bsh root root 644
+core_install/templates/stats/admin/bin/manage_eniq_status.bsh root root 644
+core_install/templates/stats/admin/bin/manage_features.bsh root root 644
+core_install/templates/stats/admin/bin/manage_oss_ip.bsh root root 644
+core_install/templates/stats/admin/bin/manage_storage_fs.bsh root root 644
+core_install/templates/stats/admin/bin/migrate_tunneld.bsh root root 644
+core_install/templates/stats/admin/bin/parsing_levels.py root root 755
+core_install/templates/stats/admin/bin/post_upgrade.bsh root root 644
+core_install/templates/stats/admin/bin/post_upgrade_configuration.bsh root root 644
+core_install/templates/stats/admin/bin/queryUserConf_db_sync.bsh root root 755
+core_install/templates/stats/admin/bin/repdb root root 755
+core_install/templates/stats/admin/bin/resizedb root root 644
+core_install/templates/stats/admin/bin/resize_nas_fs.bsh root root 755
+core_install/templates/stats/admin/bin/transaction_log_admin.bsh root root 644
+core_install/templates/stats/admin/bin/update_cell_node_count.bsh root root 644
+core_install/templates/stats/admin/bin/upgrade_nas_api.bsh root root 644
+core_install/templates/stats/admin/bin/userTrackingSetup.bsh root root 640
+core_install/templates/stats/admin/bin/enable_mounts.bsh root root 755
+core_install/templates/stats/admin/bin/manage_dtrace.bsh root root 755
+core_install/templates/stats/admin/bin/call_dtrace.bsh root root 755
+core_install/templates/stats/admin/bin/start_dtrace.d root root 755
+core_install/templates/stats/admin/bin/es_start_dtrace.d root root 755
+core_install/templates/stats/admin/bin/regenerate_symlinks.bsh root root 755
+core_install/templates/stats/admin/bin/DbCheck.bsh root root 755
+core_install/templates/stats/admin/bin/upgrade_platform_modules.bsh root root 755
+core_install/templates/stats/admin/bin/disable_mounts.bsh root root 755
+core_install/templates/stats/admin/bin/drop_idle_connection.bsh root root 755
+core_install/templates/stats/admin/bin/drop_connection_longer_than_60_mins.bsh root root 755
+core_install/templates/stats/admin/bin/drop_external_connections.bsh root root 755
+core_install/templates/stats/admin/bin/repdb_monitor.bsh root root 755
+core_install/templates/stats/admin/bin/counter_vol_exp_zfs.bsh root root 755
+core_install/templates/stats/admin/bin/lwphelper root root 755
+core_install/templates/stats/admin/bin/update_cell_node_count_rack.bsh root root 755
+core_install/templates/stats/admin/bin/remove_iq_sysmain.bsh root root 755
+core_install/templates/stats/admin/bin/triggerBitmapCheck.bsh root root 755
+core_install/templates/stats/admin/bin/bitmapCheck.bsh root root 755
+core_install/templates/stats/admin/bin/nbit2flat_Auto.bsh root root 755
+core_install/templates/stats/admin/etc root root 755
+core_install/templates/stats/admin/etc/cleanup_files.cfg root root 640
+core_install/templates/stats/admin/etc/manage_sym_links.cfg root root 640
+core_install/templates/stats/admin/etc/mem_factors.cfg root root 644
+core_install/templates/stats/admin/etc/password_list root root 644
+core_install/templates/stats/admin/etc/smf_contract_config root root 644
+core_install/templates/stats/admin/etc/sym_link_location.txt root root 600
+core_install/templates/stats/admin/etc/dbcheck.env root root 644
+core_install/templates/stats/admin/etc/dbextract_load.env root root 644
+core_install/templates/stats/admin/etc/bitmapCheck.env root root 755
+core_install/templates/stats/admin/bin/manageUnityDataCollection.bsh root root 755
+core_install/templates/stats/admin/lib root root 755
+core_install/templates/stats/admin/bin/dwh_dir_perm_check.bsh root root 755
+core_install/templates/stats/admin/bin/sp_diag.bsh root root 755
+
+core_install/templates/stats/admin/lib/common_functions.lib root root 555
+core_install/templates/stats/admin/lib/get_ip_order.pl root root 755
+core_install/templates/stats/admin/lib/iniadd.pl root root 755
+core_install/templates/stats/admin/lib/inidel.pl root root 755
+core_install/templates/stats/admin/lib/port_ping.pl root root 755
+
+core_install/templates/stats/admin/managed_oss root root 755
+
+core_install/templates/stats/admin/raw root root 755
+
+core_install/templates/stats/admin/raw/etc root root 755
+
+core_install/templates/stats/admin/raw/etc/systemd root root 755
+
+core_install/templates/stats/admin/raw/etc/systemd/system root root 755
+
+core_install/templates/stats/admin/raw/etc/systemd/system/eniq root root 755
+
+core_install/templates/stats/admin/raw/etc/systemd/system/eniq/runtime root root 755
+
+core_install/templates/stats/admin/raw/etc/systemd/system/eniq/runtime/eniq-connectd.service root root 444
+core_install/templates/stats/admin/raw/etc/systemd/system/eniq/runtime/eniq-dwhdb.service root root 444
+core_install/templates/stats/admin/raw/etc/systemd/system/eniq/runtime/eniq-repdb.service root root 444
+core_install/templates/stats/admin/raw/etc/systemd/system/eniq/runtime/eniq-dwh_reader.service root root 444
+core_install/templates/stats/admin/raw/etc/systemd/system/eniq/runtime/eniq-engine.service root root 444
+core_install/templates/stats/admin/raw/etc/systemd/system/eniq/runtime/eniq-lwphelper.service root root 444
+core_install/templates/stats/admin/raw/etc/systemd/system/eniq/runtime/eniq-fls.service root root 444
+core_install/templates/stats/admin/raw/etc/systemd/system/eniq/runtime/eniq-esm.service root root 444
+core_install/templates/stats/admin/raw/etc/systemd/system/eniq/runtime/eniq-licmgr.service root root 444
+core_install/templates/stats/admin/raw/etc/systemd/system/eniq/runtime/eniq-rmiregistry.service root root 444
+core_install/templates/stats/admin/raw/etc/systemd/system/eniq/runtime/eniq-scheduler.service root root 444
+core_install/templates/stats/admin/raw/etc/systemd/system/eniq/runtime/eniq-webserver.service root root 444
+core_install/templates/stats/admin/raw/etc/systemd/system/eniq/runtime/eniq-roll-snap.service root root 444
+
+core_install/templates/stats/admin/sql root root 755
+
+core_install/templates/stats/admin/sql/create_aggregation_count_history.sql root root 644
+core_install/templates/stats/admin/sql/create_check_db_size_events.sql root root 644
+core_install/templates/stats/admin/sql/create_dbuser_procedures.sql root root 644
+core_install/templates/stats/admin/sql/create_drop_idle_users_exceeding_fourHR_fortyGB_Connections.sql root root 644
+core_install/templates/stats/admin/sql/create_dropIdle_customized_users_Connections.sql root root 644
+core_install/templates/stats/admin/sql/create_dropIdle_dc_Connections.sql root root 644
+core_install/templates/stats/admin/sql/create_dropIdle_dcpublic_dcbo_Connections.sql root root 644
+core_install/templates/stats/admin/sql/create_event_drop_idle_customized_users.sql root root 644
+core_install/templates/stats/admin/sql/create_event_drop_idle_dc.sql root root 644
+core_install/templates/stats/admin/sql/create_event_drop_idle_query_users.sql root root 644
+core_install/templates/stats/admin/sql/create_event_drop_idle_users_exceeding_fourHR_fortyGB.sql root root 644
+core_install/templates/stats/admin/sql/create_iq_userpwd_history_table.sql root root 644
+core_install/templates/stats/admin/sql/create_proc_lock_unlock.sql root root 644
+core_install/templates/stats/admin/sql/create_show_dwhdb_usage.sql root root 644
+core_install/templates/stats/admin/sql/create_users_dwhdb.sql root root 644
+core_install/templates/stats/admin/sql/create_users_repdb.sql root root 644
+core_install/templates/stats/admin/sql/dboptions_dwhdb.sql root root 644
+core_install/templates/stats/admin/sql/dboptions_repdb.sql root root 644
+core_install/templates/stats/admin/sql/kill_idle.sql root root 644
+core_install/templates/stats/admin/sql/rebuild_idx.sql root root 644
+core_install/templates/stats/admin/sql/repdb_authenticate.sql root root 644
+core_install/templates/stats/admin/sql/repdb_connection_authentication.sql root root 644
+core_install/templates/stats/admin/sql/template_include_reader.sql root root 644
+core_install/templates/stats/admin/sql/sp_eniq_login_environment.sql root root 644
+core_install/templates/stats/admin/sql/create_drop_idle_users_repdb.sql root root 644
+core_install/templates/stats/admin/sql/create_event_drop_idle_users_repdb.sql root root 644
+core_install/templates/stats/admin/sql/forceLockTableList.sql root root 644
+core_install/templates/stats/admin/sql/forceDropTableList.sql root root 644
+core_install/templates/stats/admin/sql/forceDropView.sql root root 644
+core_install/templates/stats/admin/sql/catalog_cache_ejection.sql root root 644
+
+core_install/templates/stats/admin/sybase_conf root root 755
+
+core_install/templates/stats/admin/sybase_conf/dwhdb_multi.cfg root root 644
+core_install/templates/stats/admin/sybase_conf/dwhdb_single.cfg root root 644
+core_install/templates/stats/admin/sybase_conf/dwhdb.cfg_upgrade root root 644
+core_install/templates/stats/admin/sybase_conf/repdb.cfg root root 644
+
+core_install/templates/stats/admin/fs root root 755
+
+core_install/templates/stats/admin/fs/etc root root 755
+
+core_install/templates/stats/admin/fs/etc/systemd root root 755
+
+core_install/templates/stats/admin/fs/etc/systemd/system root root 755
+
+core_install/templates/stats/admin/fs/etc/systemd/system/eniq root root 755
+
+core_install/templates/stats/admin/fs/etc/systemd/system/eniq/runtime root root 755
+
+core_install/templates/stats/admin/fs/etc/systemd/system/eniq/runtime/eniq-connectd.service root root 444
+core_install/templates/stats/admin/fs/etc/systemd/system/eniq/runtime/eniq-dwhdb.service root root 444
+core_install/templates/stats/admin/fs/etc/systemd/system/eniq/runtime/eniq-repdb.service root root 444
+core_install/templates/stats/admin/fs/etc/systemd/system/eniq/runtime/eniq-esm.service root root 444
+core_install/templates/stats/admin/fs/etc/systemd/system/eniq/runtime/eniq-engine.service root root 444
+core_install/templates/stats/admin/fs/etc/systemd/system/eniq/runtime/eniq-lwphelper.service root root 444
+core_install/templates/stats/admin/fs/etc/systemd/system/eniq/runtime/eniq-fls.service root root 444
+core_install/templates/stats/admin/fs/etc/systemd/system/eniq/runtime/eniq-licmgr.service root root 444
+core_install/templates/stats/admin/fs/etc/systemd/system/eniq/runtime/eniq-rmiregistry.service root root 444
+core_install/templates/stats/admin/fs/etc/systemd/system/eniq/runtime/eniq-scheduler.service root root 444
+core_install/templates/stats/admin/fs/etc/systemd/system/eniq/runtime/eniq-webserver.service root root 444
+core_install/templates/stats/admin/fs/etc/systemd/system/eniq/runtime/eniq-roll-snap.service root root 444
+
+core_install/templates/stats/i386 root root 755
+
+core_install/templates/stats/i386/skel_dir root root 755
+
+core_install/templates/stats/i386/skel_dir/.profile root root 555
+core_install/templates/stats/i386/skel_dir/.ssh root root 700
+core_install/templates/stats/i386/skel_dir/.ssh/config root root 544
+
+core_install/templates/stats/sparc root root 755
+
+core_install/templates/stats/sparc/skel_dir root root 755
+
+core_install/templates/stats/sparc/skel_dir/.profile root root 555
+core_install/templates/stats/sparc/skel_dir/.ssh root root 700
+core_install/templates/stats/sparc/skel_dir/.ssh/config root root 544
+
+core_install/version root root 755
+core_install/version/pkginfo root root 444
+core_install/templates/stats/x86_64 root root 755
+core_install/templates/stats/x86_64/skel_dir root root 755
+core_install/templates/stats/x86_64/skel_dir/.bash_profile root root 555
+core_install/templates/stats/x86_64/skel_dir/.ssh root root 700
+core_install/templates/stats/x86_64/skel_dir/.ssh/config root root 544

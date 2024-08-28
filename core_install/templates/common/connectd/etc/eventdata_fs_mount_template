@@ -1,0 +1,13 @@
+#
+# This file contains Events symbolic link filesystem to be mounted on ENIQ Events server by connectd daemon
+#
+# NFS		Hostname or ip          Shared Data                 		Mount Point relative
+# Resource	of nfs server           Filesystem                  		to PM_SYM_LINKS_DIR
+#
+# <OSS/NAS>	<NFS Server>            <NFS Share>                 		<Mount Point>
+# OSS		events_oss_1			/ossrc/data/pmMediation/eventData 	/
+#
+OSS			<IP>			/ossrc/data/pmMediation/eventData	/
+NAS			<IP>			/vx/<OSS_POOL_ID>-eniq_events_vol			/
+ENM                     <IP>                    /vx/<OSS_POOL_ID>-pmlinks1/pmlinksEvents1	/
+

@@ -1,0 +1,7 @@
+get_ipmp_info
+backup_iqheader_info
+stop_eniq_services
+stop_nas_services
+stop_smf_services
+zfs_pool_backup
+cleanup

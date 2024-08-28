@@ -1,0 +1,448 @@
+#!/bin/bash
+# ********************************************************************
+# Ericsson Radio Systems AB                                     SCRIPT
+# ********************************************************************
+#
+#
+# (c) Ericsson Radio Systems AB 2011 - All rights reserved.
+#
+# The copyright to the computer program(s) herein is the property
+# of Ericsson Radio Systems AB, Sweden. The programs may be used 
+# and/or copied only with the written permission from Ericsson Radio 
+# Systems AB or in accordance with the terms and conditions stipulated 
+# in the agreement/contract under which the program(s) have been 
+# supplied.
+#
+# ********************************************************************
+# Name    : cleanup_rollback.bsh
+# Date    : 03/05/2011
+# Revision: A
+# Purpose : update/remove entries from the SunOS.ini
+#          
+#
+# Usage   : cleanup_rollback.bsh
+#
+# ********************************************************************
+#
+# 	Command Section
+#
+# ********************************************************************
+AWK=/usr/bin/awk
+BASENAME=/usr/bin/basename
+BC=/usr/bin/bc
+CAT=/usr/bin/cat
+CHMOD=/usr/bin/chmod
+CHOWN=/usr/bin/chown
+CLEAR=/usr/bin/clear
+CMP=/usr/bin/cmp
+CP=/usr/bin/cp
+CPIO=/usr/bin/cpio
+DATE=/usr/bin/date
+DIRNAME=/usr/bin/dirname
+DOMAINNAME=/usr/bin/domainname
+DTCONFIG=/usr/dt/bin/dtconfig
+DUMPADM=/usr/sbin/dumpadm
+ECHO=/usr/bin/echo
+EGREP=/usr/bin/egrep
+EJECT=/usr/bin/eject
+ENV=/usr/bin/env
+EXPR=/usr/bin/expr
+FIND=/usr/bin/find
+FLARCREATE=/usr/sbin/flarcreate
+FORMAT=/usr/sbin/format
+FUSER=/usr/sbin/fuser
+GEGREP=/usr/sfw/bin/gegrep
+GETENT=/usr/bin/getent
+GETTEXT=/usr/bin/gettext
+GREP=/usr/bin/grep
+GROUPADD=/usr/sbin/groupadd
+GTAR=/usr/sfw/bin/gtar
+GZCAT=/usr/bin/gzcat
+HEAD=/usr/bin/head
+HOSTNAME=/usr/bin/hostname
+ID=/usr/bin/id
+INIT=/usr/sbin/init
+LS=/usr/bin/ls
+MKDIR=/usr/bin/mkdir
+MORE=/usr/bin/more
+MV=/usr/bin/mv
+NAWK=/usr/bin/nawk
+PGREP=/usr/bin/pgrep
+PING=/usr/sbin/ping
+PKGADD=/usr/sbin/pkgadd
+PKGINFO=/usr/bin/pkginfo
+PRTCONF=/usr/sbin/prtconf
+PSRINFO=/usr/sbin/psrinfo
+PWD=/usr/bin/pwd
+RM=/usr/bin/rm
+RCP=/usr/bin/rcp
+RSH=/usr/bin/rsh
+SED=/usr/bin/sed
+SLEEP=/usr/bin/sleep
+SORT=/usr/bin/sort
+SU=/usr/bin/su
+SVCADM=/usr/sbin/svcadm
+SVCCFG=/usr/sbin/svccfg
+SVCS=usr/bin/svcs
+SWAP=/usr/sbin/swap
+SYNC=/usr/sbin/sync
+TAIL=/usr/bin/tail
+TEE=/usr/bin/tee
+TOUCH=/usr/bin/touch
+TPUT=/usr/bin/tput
+UADMIN=/usr/sbin/uadmin
+UNAME=/usr/bin/uname
+USERADD=/usr/sbin/useradd
+VOLD=/usr/sbin/vold
+WC=/usr/bin/wc
+ZFS=/usr/sbin/zfs
+ZPOOL=/usr/sbin/zpool
+
+# ********************************************************************
+#
+#       Configuration Section
+#
+# ********************************************************************
+
+# ********************************************************************
+#
+#       Pre-execution Operations
+#
+# ********************************************************************
+# Default user
+DEFAULT_USER=root
+
+# Name of SunOS & ENIQ ini Files
+SUNOS_INI=SunOS.ini
+
+
+# ********************************************************************
+#
+# 	Functions
+#
+# ********************************************************************
+### Function: abort_script ###
+#
+#   This will is called if the script is aborted thru an error
+#   signal sent by the kernel such as CTRL-C or if a serious
+#   error is encountered during runtime
+#
+# Arguments:
+#       $1 - Error message from part of program (Not always used)
+# Return Values:
+#       none
+abort_script()
+{
+_err_time_=`$DATE '+%Y-%b-%d_%H.%M.%S'`
+
+if [ "$1" ]; then
+    _err_msg_="${_err_time_} - $1"
+else
+    _err_msg_="${_err_time_} - ERROR : Script aborted.......\n"
+fi
+
+if [ "${LOGFILE}" ]; then
+    $ECHO "\nERROR : $_err_msg_\n" | $TEE -a ${LOGFILE}
+else
+    $ECHO "\nERROR : $_err_msg_\n"
+fi
+
+cd $SCRIPTHOME
+$RM -rf ${TEM_DIR}
+
+exit 1
+}
+
+### Function: check_files_and_scripts ###
+#
+#   Checks required files/scripts are present
+#
+# Arguments:
+#       $1 : User ID name
+# Return Values:
+#       none
+check_files_and_scripts()
+{
+$ECHO "\nChecking for required files and scripts" | $TEE -a ${LOGFILE}
+	
+if [ ! -s ${ENIQ_CONF_DIR}/${SUNOS_INI} ]; then
+    _err_msg_="Cannot locate ${ENIQ_CONF_DIR}/${SUNOS_INI}"
+    abort_script "$_err_msg_"
+fi
+}
+
+### Function: check_id ###
+#
+#   Check that the effective id of the user is correct
+#   If not print error msg and exit.
+#
+# Arguments:
+#       $1 : User ID name
+# Return Values:
+#       none
+check_id()
+{
+_check_id_=`$ID  | $AWK -F\( '{print $2}' | $AWK -F\) '{print $1}'`
+if [ "$_check_id_" != "$1" ]; then
+    _err_msg_="You must be $1 to execute this script."
+    abort_script "$_err_msg_"
+fi
+}
+
+### Function: chk_create_logfile ###
+#
+# Check/Create Logfile
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+chk_create_logfile()
+{
+$MKDIR -p `$DIRNAME ${LOGFILE}`
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not create directory `$DIRNAME ${LOGFILE}`"
+     abort_script "$_err_msg_"
+fi
+
+$TOUCH -a ${LOGFILE}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not write to file ${LOGFILE}"
+    abort_script "$_err_msg_"
+fi
+}
+
+### Function: delete_zfs_fs ###
+#
+# Delete the specified ZFS filesystem
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+delete_zfs_fs()
+{
+_name_=$1
+
+$ECHO "Removing ZFS filesystem ${_name_}" | $TEE -a ${LOGFILE}
+$ZFS destroy -rf ${_name_} >> /dev/null 2>&1
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not delete ZFS filesystem ${_name_}"
+    abort_script "$_err_msg_"
+fi
+
+}
+
+### Function: get_absolute_path ###
+#
+# Determine absolute path to software
+#
+# Arguments:
+#	none
+# Return Values:
+#	none
+get_absolute_path() 
+{
+_dir_=`$DIRNAME $0`
+SCRIPTHOME=`cd $_dir_ 2>/dev/null && pwd || $ECHO $_dir_`
+}
+
+### Function: setup_env ###
+#
+# Set up environment variables for script. 
+#
+# Arguments:
+#	none
+# Return Values:
+#	none
+setup_env()
+{
+if [ ! "${ENIQ_BASE_DIR}" ]; then
+    # Directory on the root filesystem
+    ENIQ_BASE_DIR=/eniq
+fi
+
+# Main Directory for the Installation SW
+ENIQ_INST_DIR=${ENIQ_BASE_DIR}/installation
+
+# This should not be needed in the future
+ENIQ_CONF_DIR=${ENIQ_INST_DIR}/config
+
+# Main Directory for the Core Installation SW
+ENIQ_CORE_INST_DIR=${ENIQ_INST_DIR}/core_install
+
+ENIQ_ADMIN_DIR=${ENIQ_BASE_DIR}/admin
+
+# ENIQ Log Directory
+ENIQ_LOG_DIR=${ENIQ_BASE_DIR}/local_logs
+
+# Source the common functions
+if [ -s ${ENIQ_CORE_INST_DIR}/lib/common_functions.lib ]; then
+    . ${ENIQ_CORE_INST_DIR}/lib/common_functions.lib
+else
+    _err_msg_="File ${ENIQ_CORE_INST_DIR}/lib/common_functions.lib not found"
+    abort_script "$_err_msg_"
+fi
+
+}
+
+### Function: usage_msg ###
+#
+#   Print out the usage message
+#
+# Arguments:
+#	none
+# Return Values:
+#	none
+usage_msg() 
+{
+$CLEAR
+$ECHO "
+Usage: `$BASENAME $0` [-l <logfile>] 
+                      
+options:
+
+-l  : Used to specify a logfile. Default will be used if none specified.         
+
+"
+}
+
+### Function: user_confirm ###
+#
+# Get confirmation from user to proceed with snapshot action
+#
+# Arguments:
+#       $1 : Message string
+# Return Values:
+#       none
+user_confirm()
+{
+while :; do
+    unset USER_CONF
+    $CLEAR
+    $CAT ${TEM_DIR}/zfs_delete_list.txt
+    $ECHO "\n${1}"
+    $ECHO "Enter [Yes | No] (case sensitive) : \c"
+
+    read USER_CONF
+    if [ "$USER_CONF" == "Yes" -o "$USER_CONF" == "No" ]; then
+        break
+    fi
+done
+
+}
+
+# ********************************************************************
+#
+# 	Main body of program
+#
+# ********************************************************************
+#
+RUN_TIME=`$DATE '+%Y-%b-%d_%H.%M.%S'`
+
+# Determine absolute path to software
+get_absolute_path
+
+# Check that the effective id of the user is root
+check_id $DEFAULT_USER
+
+while getopts ":b:l:N:" arg; do
+  case $arg in
+    b) ENIQ_BASE_DIR="$OPTARG"
+       ;;
+    l) LOGFILE="$OPTARG" 
+       ;;    
+    N) NO_CONFIRM="YES"
+       ;;
+   \?) usage_msg
+       exit 1
+       ;;
+  esac
+done
+shift `expr $OPTIND - 1`
+
+# Set up environment variables for script. 
+setup_env
+
+if [ ! "${LOGFILE}" ]; then
+    LOGFILE=${ENIQ_LOG_DIR}/upgrade/post_upgrade.log
+fi	
+  
+# Check/Create Logfile
+chk_create_logfile
+
+$ECHO "\n-------------------------------------------------------" >> ${LOGFILE}
+$ECHO "${RUN_TIME} - Starting post  configuration" >> ${LOGFILE}
+$ECHO "-------------------------------------------------------" >> ${LOGFILE}
+
+# Check all required files/scripts exist on the server
+check_files_and_scripts
+
+# Create a temporary Directory
+TEM_DIR=/tmp/post_rollback.$$
+$RM -rf ${TEM_DIR}
+$MKDIR -p -m 777 ${TEM_DIR}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not create directory ${TEM_DIR}"
+    abort_script "$_err_msg_"
+fi
+
+# Get a list of ZFS parent tags
+$ECHO "Creating a list of ZFS tags" | $TEE -a ${LOGFILE}
+_zfs_parent_tags_=`iniget SunOS_ZFS_FS -f ${ENIQ_CONF_DIR}/${SUNOS_INI}`
+if [ ! "${_zfs_parent_tags_}" ]; then
+    _err_msg_="Could not get a list of ZFS filesystem information from ${ENIQ_CONF_DIR}/${SUNOS_INI}"
+    abort_script "$_err_msg_"
+fi
+
+	
+for _tag_ in ${_zfs_parent_tags_}; do
+    # Determine the dir path
+    _zfs_fs_=`iniget ${_tag_} -f ${ENIQ_CONF_DIR}/${SUNOS_INI} -v mountpoint | $NAWK -F\/ '{print $NF}'`
+    if [ ! "${_zfs_fs_}" ]; then
+        _err_msg_="Could not get ZFS filesystem mountpoint for ${_tag_} in ${ENIQ_CONF_DIR}/${SUNOS_INI}"
+        abort_script "$_err_msg_"
+    fi
+
+    if [ "${_zfs_fs_list_}" == "" ]; then
+        _zfs_fs_list_="${_zfs_fs_}"
+    else
+        _zfs_fs_list_="${_zfs_fs_list_}|${_zfs_fs_}"
+    fi
+done
+
+_current_zfs_list_=`$ZFS list -H -t filesystem | $NAWK '{print $1}' | $NAWK -F"/" '{print $2}'`
+
+for _fs_ in ${_current_zfs_list_}; do
+    $ECHO ${_fs_} | $EGREP "${_zfs_fs_list_}" >> /dev/null 2>&1
+    if [ $? -ne 0 ]; then
+        _zfs_name_=`$ZFS list -H -t filesystem | $GREP "\/${_fs_}" | $NAWK '{print $1}'`
+        if [ ! "${_zfs_name_}" ]; then
+            _err_msg_="Could not get ZFS filesystem name for ${_fs_}"
+            abort_script "$_err_msg_"
+        fi
+        $ECHO ${_zfs_name_} >> ${TEM_DIR}/zfs_delete_list.txt
+    fi
+done
+
+
+
+if [ ! -s ${TEM_DIR}/zfs_delete_list.txt ]; then
+    $ECHO "No ZFS filesystem found to be removed" | $TEE -a ${LOGFILE}
+else
+    if [ ! "${NO_CONFIRM}" ]; then
+        user_confirm "Are you sure you wish to delete the above ZFS filesystems"
+        if [ $USER_CONF == No ]; then
+            $RM -rf ${TEM_DIR}
+            exit 0
+        fi    
+    fi
+    $ECHO "Removing unwanted ZFS filesystems" | $TEE -a ${LOGFILE}
+    for _tag_ in `$CAT ${TEM_DIR}/zfs_delete_list.txt`; do
+        delete_zfs_fs ${_tag_}
+    done
+fi
+
+$RM -rf ${TEM_DIR}
+
+exit 0

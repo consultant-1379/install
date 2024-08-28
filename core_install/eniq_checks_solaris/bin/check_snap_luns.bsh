@@ -1,0 +1,340 @@
+#!/bin/bash
+# ********************************************************************
+# Ericsson Radio Systems AB                                     SCRIPT
+# ********************************************************************
+# Ericsson Radio Systems AB 2019 - All rights reserved.
+#
+# The copyright to the computer program(s) herein is the property
+# of Ericsson Radio Systems AB, Sweden. The programs may be used
+# and/or copied only with the written permission from Ericsson Radio
+# Systems AB or in accordance with the terms and conditions stipulated
+# in the agreement/contract under which the program(s) have been
+# supplied.
+#
+# ********************************************************************
+#
+# Name    : check_snap_luns.bsh
+# Date    : 16/12/2019
+# Revision: \main\Statistics_18.2_18.2.8_EU03\1
+#
+# Purpose : This script will list the inactive snap Luns present which needs to be deleted.
+#
+# Usage   : check_snap_luns.bsh
+#
+# Exit Values:
+#
+#   SUCCESS=0
+#   FAILED=1
+#   WARNING=2
+#   PRECHECK_ABORTED=3
+#   
+#
+# ********************************************************************
+#
+#   Command Section
+#
+# ********************************************************************
+
+NAWK=/usr/bin/nawk
+BASH=/usr/bin/bash
+CAT=/usr/bin/cat
+CUT=/usr/bin/cut
+CP=/usr/bin/cp
+DATE=/usr/bin/date
+DIRNAME=/usr/bin/dirname
+ECHO='/usr/bin/echo -e'
+GEGREP=/usr/bin/gegrep
+GETENT=/usr/bin/getent
+GREP=/usr/bin/grep
+HOSTNAME=/usr/bin/hostname
+NAVISECCLI=/opt/Navisphere/bin/naviseccli
+SED=/usr/bin/sed
+TOUCH=/usr/bin/touch
+TEE=/usr/bin/tee
+WC=/usr/bin/wc
+
+
+#### RETURN CODE ENUM's ####
+SUCCESS=0
+FAILED=1
+WARNING=2
+PRECHECK_ABORTED=3
+ROOT_USER_FAILED=71
+NAVISECCLI_CMD_NOT_EXECUTED=134
+
+
+
+
+
+### Function: abort_script
+#
+#   This will be called if the script is aborted through an error
+#   encountered during runtime
+#
+# Arguments: $1 - Error message from part of program (Not always used)
+# Return Values: none
+#
+#
+abort_script()
+{
+_err_time_=`$DATE '+%Y-%b-%d_%H.%M.%S'`
+
+if [ "$1" ]; then
+    _err_msg_="${_err_time_} - $1"
+else
+    _err_msg_="${_err_time_} - ERROR : Script aborted.......\n"
+fi
+if [ "${LOGFILE}" ]; then
+    $ECHO "\nERROR: ${_err_msg_}\n" | $TEE -a ${LOGFILE}
+else
+    $ECHO "\nERROR: ${_err_msg_}\n"
+fi
+exit 3
+}
+    
+
+### Function: check_user ###
+#
+#   Check that the effective id of the user is correct
+#   If not print error msg and exit.
+#
+# Arguments:
+#       $1 : User ID name
+# Return Values:
+#       none
+#
+check_user()
+{
+   local _check_id_=`$ID  | $NAWK -F\( '{print $2}' | $NAWK -F\) '{print $1}'`
+
+   if [ "$_check_id_" != "$1" ]; then
+      _err_msg_="You must be $1 to execute this script."
+      abort_script "$_err_msg_"
+   fi
+}
+
+### Function: check_iq_file_readwrite
+#
+#   This will be called if the script is aborted through an error
+#   encountered during runtime
+#
+# Arguments: $1 - Error message from part of program (Not always used)
+# Return Values: none
+#
+#
+check_snap_luns()
+{
+
+    $ECHO "$RUN_TIME - Check Snap Luns"  >> ${LOGFILE}
+    
+    SECFILE=/ericsson/storage/san/plugins/vnx/cred/
+    
+    $ECHO "$RUN_TIME - $NAVISECCLI -secfilepath  /ericsson/storage/san/plugins/vnx/cred/ -Address ${SPA_IP} snapview -listsnapshots"  >> ${LOGFILE}
+    
+    $ECHO "Listing inactive SnapLuns" >> ${LOGFILE}
+
+    $NAVISECCLI -secfilepath $SECFILE -Address ${SPA_IP} snapview -listsnapshots  > $TEM_DIR/inactive_luns 2>&1
+    if [ $? -eq 0 ];then
+        $SED -e '/^$/d' $TEM_DIR/inactive_luns > $TEM_DIR/inactive_luns_content
+        if [ -s "$TEM_DIR/inactive_luns_content" ]; then
+            log_msg -l ${LOGFILE} -q -t -s "Inactive Snap Luns Present.\n"
+            $CAT $TEM_DIR/inactive_luns >> $LOGFILE
+            RET_CODE=$FAILED
+        else
+            log_msg -l ${LOGFILE} -q -t -s "No Inactive Snap Luns Present."
+            RET_CODE=$SUCCESS
+        fi
+    else
+        log_msg -l ${LOGFILE} -q -t -s "Could not execute NAVISECCLI command.\n"
+        RET_CODE=$NAVISECCLI_CMD_NOT_EXECUTED
+    fi
+
+return $RET_CODE
+}
+
+#### Function: create_log_file ######
+#
+#   Check that the effective id of the user is correct
+#   If not print error msg and exit.
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+#
+
+create_log_file()
+{
+   $ECHO "" > ${LOGFILE}  
+}
+
+
+### Function: get_absolute_path ###
+#
+# Determine absolute path to software
+#
+# Arguments:
+#    none
+# Return Values:
+#    none
+get_absolute_path()
+{
+_dir_=`$DIRNAME $0`
+SCRIPTHOME=`cd $_dir_ 2>/dev/null && pwd || $ECHO $_dir_`
+}
+
+
+### Function: setup_env
+#
+#   This will be called if the script is aborted through an error
+#   encountered during runtime
+#
+# Arguments: $1 - Error message from part of program (Not always used)
+# Return Values: none
+#
+#
+setup_env()
+{
+
+if [ ! "${ENIQ_BASE_DIR}" ]; then
+    # Directory on the root filesystem
+    ENIQ_BASE_DIR=/eniq
+fi
+
+
+SYM_LINKS_INI=sym_links.ini
+COORD_SYM_LINKS_INI=coordinator_sym_links.ini
+SUNOS_INI=SunOS.ini
+BLK_STOR_INI=block_storage.ini
+BACKUP_DATA_INI=backup_migration_data.ini
+ENIQ_INI=niq.ini
+TEM_DIR=/var/tmp
+
+# Main Directory for the Core Installation SW
+ENIQ_INST_DIR=${ENIQ_BASE_DIR}/installation
+
+# Main Directory for the Core Installation SW
+ENIQ_CORE_INST_DIR=${ENIQ_INST_DIR}/core_install
+
+# ENIQ Config Directory
+ENIQ_CONF_DIR=${ENIQ_INST_DIR}/config
+
+# Precheck logs directory
+ENIQ_PRECHECK_LOG_DIR=${ENIQ_BASE_DIR}/local_logs/precheck_logs
+
+#Installation lib directory
+ENIQ_LIB_DIR=${ENIQ_INST_DIR}/core_install/lib/
+
+#Configuration directory
+ENIQ_SW_CONF=${ENIQ_BASE_DIR}/sw/conf
+
+# Logfile path
+LOGFILE=${ENIQ_PRECHECK_LOG_DIR}/check_snap_luns.log
+
+if [ -s ${ENIQ_CORE_INST_DIR}/lib/common_functions.lib ]; then
+    . ${ENIQ_CORE_INST_DIR}/lib/common_functions.lib
+else
+    _err_msg_="File ${ENIQ_CORE_INST_DIR}/lib/common_functions.lib not found"
+    abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+fi
+
+
+# Read location of storage API command
+_stor_api_cmd_=`iniget STOR_API -f ${ENIQ_CONF_DIR}/${SUNOS_INI} -v STOR_API_CMD`
+if [ ! "${_stor_api_cmd_}" ]; then
+    _err_msg_="Could not read STOR_API_CMD param from ${ENIQ_CONF_DIR}/${SUNOS_INI}"
+    abort_script "${_err_msg_}"
+fi
+
+# Get current server type
+CURR_SERVER_TYPE=`$CAT ${ENIQ_CONF_DIR}/installed_server_type | $GEGREP -v  '^[[:blank:]]*#' | $SED -e 's/ //g'`
+if [ ! "${CURR_SERVER_TYPE}" ]; then
+    _err_msg_="Could not determine which server type this is"
+    abort_script "${_err_msg_}"
+fi
+
+# Check if server is Coordinator or Reader type
+CO_SERVER=""
+RD_SERVER=""
+if [ "${CURR_SERVER_TYPE}" == "stats_coordinator" -o "${CURR_SERVER_TYPE}" == "eniq_stats" ]; then
+    CO_SERVER="YES"
+elif [ "${CURR_SERVER_TYPE}" == "stats_iqr" ]; then
+    RD_SERVER="YES"
+fi
+
+
+
+SYSUSER=`iniget ENIQ_INSTALL_CONFIG -f ${ENIQ_CONF_DIR}/${SUNOS_INI} -v ENIQ_SYSUSER`
+if [ ! "${SYSUSER}" ]; then
+    _err_msg_="Could not read System User from ${CLI_CONF_DIR}/${ENIQ_INI}"
+    abort_script "${_err_msg_}"
+fi
+
+
+# Get the required environment variables for Sybase
+$SU - ${SYSUSER} -c "$ENV |$EGREP '^(SYBASE|ASDIR|IQDIR|ASALOGDIR|SQLANY)'" > $TEM_DIR/sybase_det.$$
+$CAT $TEM_DIR/sybase_det.$$ |$EGREP '^(SYBASE|ASDIR|IQDIR|ASALOGDIR|SQLANY)' > $TEM_DIR/sybase_det_var.$$
+. $TEM_DIR/sybase_det_var.$$ >> /dev/null 2>&1
+
+if [ -z "$IQDIR" ] ; then
+    _err_msg_="ERROR: IQDIR is not set"
+    abort_script "${_err_msg_}"
+fi
+
+
+HNAME=`${HOSTNAME}`
+
+
+if [ ! -x ${NAVISECCLI} ]; then
+    _err_msg_="${NAVISECCLI} not found or not executable"
+    abort_script "${_err_msg_}"
+fi
+
+
+SPA_IP=`$CAT /eniq/installation/config/block_storage.ini  | $GREP BLK_STORAGE_IP_SPA | $CUT -d "=" -f2`
+
+}
+
+
+# ********************************************************************
+#
+#   Main body of program
+#
+# ********************************************************************
+
+RUN_TIME=`$DATE '+%Y-%b-%d_%H:%M:%S'`
+
+# Default return code
+RET_CODE=0
+
+# Set up environment variables for script.
+setup_env
+
+#Check and create the log file
+create_log_file
+
+# Check the current user as root
+check_user "root"; RET_CODE=$?
+if [ "$RET_CODE" -ne ${SUCCESS} ]
+then
+   log_msg -t -s "FAILED : You need to be a root user to execute this script" -l ${LOGFILE}
+   RET_CODE=${ROOT_USER_FAILED}
+   
+   exit ${RET_CODE}
+fi
+
+# Determine absolute path to software
+get_absolute_path
+
+#Check whether Snap Luns Exist
+if [ "${STORAGE_TYPE}" == "zfs" ]; then
+    log_msg -s "This check is not applicable for RACK servers." -l $LOGFILE
+    exit ${RACK_NOT_APPLICABLE}
+else
+    log_msg -t -s " INFO : Listing Snap Luns for ${HNAME}: BEGIN\n" $LOGFILE -l ${LOGFILE}
+    check_snap_luns; rCode=$?
+    log_msg -t -s "INFO :IQ Lun mapping check completed for ${HNAME}: END, RC:$rCode" -l ${LOGFILE}
+    log_msg -t -s "Check log $LOGFILE\n"
+fi
+
+exit $rCode

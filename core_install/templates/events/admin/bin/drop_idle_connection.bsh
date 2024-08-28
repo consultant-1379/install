@@ -1,0 +1,155 @@
+#!/bin/bash
+# ********************************************************************
+# Ericsson Radio Systems AB                                     SCRIPT
+# ********************************************************************
+#
+#
+# (c) Ericsson Radio Systems AB 2019 - All rights reserved.
+#
+# The copyright to the computer program(s) herein is the property
+# of Ericsson Radio Systems AB, Sweden. The programs may be used 
+# and/or copied only with the written permission from Ericsson Radio 
+# Systems AB or in accordance with the terms and conditions stipulated 
+# in the agreement/contract under which the program(s) have been 
+# supplied.
+#
+# ********************************************************************
+# Name    :  drop_idle_connection.bsh
+# Date    :  18/12/2019 
+# Revision:  6
+# Purpose :  To kill the connections which are leading us to IQ_SYSTEM_MAIN FULL issue
+#           
+#
+# Usage   :  {dcuser}: bash /eniq/admin/bin/drop_idle_connection.bsh 
+#
+# ********************************************************************
+#
+# Command Section
+#
+# ********************************************************************
+AWK=/usr/bin/awk
+CAT=/usr/bin/cat
+ECHO=/usr/bin/echo
+EGREP=/usr/bin/egrep
+GREP=/usr/bin/grep
+HEAD=/usr/bin/head
+PS=/usr/bin/ps
+SED=/usr/bin/sed
+TAIL=/usr/bin/tail
+TEE=/usr/bin/tee
+
+CORE_INSTALL_LIB=/eniq/admin/lib/
+SERVER=dwhdb
+CONFIG_DIR=/eniq/sw/conf
+ENIQ_INI=$CONFIG_DIR/niq.ini
+LOGFILE=/eniq/log/sw_log/iq/drop_connection.log
+if [ ! -s $CORE_INSTALL_LIB/common_functions.lib ]; then
+    _err_msg_="Cannot locate $CORE_INSTALL_LIB/common_functions.lib"
+    abort_script "$_err_msg_"
+else
+   . $CORE_INSTALL_LIB/../lib/common_functions.lib
+fi
+CURR_SERVER_TYPE=`$CAT /eniq/installation/config/installed_server_type`
+DWH_PORT_CO=`iniget DWH -v PortNumber -f ${ENIQ_INI}`
+DWH_PORT_READER=`iniget DWH_READER_SETTINGS -v PortNumber -f ${ENIQ_INI}`
+DBA_PASSWORD=`inigetpassword DB -f ${ENIQ_INI} -v DBAPassword`
+# ********************************************************************
+#
+#   functions
+#
+# ********************************************************************
+
+## Function: abort_script ###
+#
+#   This will is called if the script is aborted thru an error
+#   signal sent by the kernel such as CTRL-C or if a serious
+#   error is encountered during runtime
+#
+# Arguments:
+#       $1 - Error message from part of program (Not always used)
+# Return Values:
+#       none
+abort_script()
+{
+if [ "$1" ]; then
+    _err_msg_=$1
+else
+    _err_msg_="$TIMESTAMP - ERROR : Script aborted.......\n"
+fi
+
+if [ "${LOGFILE}" ]; then
+    $ECHO "\n$TIMESTAMP - ERROR : $_err_msg_\n" | $TEE -a ${LOGFILE}
+else
+     $ECHO "\n$TIMESTAMP - ERROR : $_err_msg_\n"
+fi
+
+exit 1
+}
+
+## Function: get_connection_string ###
+#
+#   This will be called to create connection string for
+#   sybase connection
+#   
+#
+# Arguments:
+#       $1 - Server to which connection is required
+#       $2 - quite mode TRUE/FALSE
+# Return Values:
+#       conn_string 
+get_connection_string()
+{
+if [ $2 == "false" ]; then
+   if [ $1 == "dwhdb" ]; then
+      ConnString="dbisql -nogui -c eng="$1";links=tcpip{host="$1";port="$DWH_PORT_CO"};uid=dba;pwd="$DBA_PASSWORD
+   else
+      ConnString="dbisql -nogui -c eng="$1";links=tcpip{host="$1";port="$DWH_PORT_READER"};uid=dba;pwd="$DBA_PASSWORD
+   fi
+else
+   if [ $1 == "dwhdb" ]; then
+      ConnString="dbisql -nogui -onerror continue -q -c eng="$1";links=tcpip{host="$1";port="$DWH_PORT_CO"};uid=dba;pwd="$DBA_PASSWORD
+   else
+      ConnString="dbisql -nogui -onerror continue -q -c eng="$1";links=tcpip{host="$1";port="$DWH_PORT_READER"};uid=dba;pwd="$DBA_PASSWORD
+   fi
+fi
+}
+# ********************************************************************
+#
+#   Main body of program
+#
+# ********************************************************************
+#
+
+if [ ${LOGNAME} != "dcuser"  ] ; then
+  _err_msg_="You need to be dcuser to run this script."
+  abort_script "$_err_msg_"
+fi
+
+if [ "${CURR_SERVER_TYPE}" != "stats_coordinator" ] && [ "${CURR_SERVER_TYPE}" != "eniq_stats" ] ; then
+  exit 0
+fi
+  
+get_connection_string $SERVER "false"
+output=`$ConnString "select VersionID,MaxKBRelease,server from sp_iqversionuse() where MaxKBRelease >= 41943040 AND IQConnID = 0 order by MaxKBRelease DESC" |$GREP -v VersionID |$GREP -v "-" |$HEAD -1|$SED 's/^ *//g'`
+VersionID=`$ECHO $output |$AWK '{print $1}'`
+MaxKBRelease=`$ECHO $output |$AWK '{print $2}'`
+SERVER=`$ECHO $output |$AWK '{print $3}'`
+if [ -z $SERVER ]; then
+   log_msg -t -s "No connection exists with version more than 40GB" -l ${LOGFILE}
+   exit 0
+fi   
+get_connection_string $SERVER "false"
+connHandle=`$ConnString "select conn.ConnHandle from sp_iqconnection() conn, sp_iqversionuse() ver where conn.IQConnID = ver.IQConnID AND DATEDIFF(mi,conn.LastReqTime,now()) >= 180 AND VersionID=$VersionID"|$GREP -v ConnHandle |$GREP -v "-" |$HEAD -1|$SED 's/^ *//g'`
+get_connection_string $SERVER "true"
+
+if [ -z ${connHandle} ]; then
+   log_msg -t -s "No connection exist with version : $VersionID which is idle for 3 Hours" -l ${LOGFILE}
+else
+   `$ConnString drop connection $connHandle`
+   if [ $? -eq 0 ]; then
+      message="A connection (ConnHandle:"$connHandle") was dropped as it was consuming version in CO node and was created by $SERVER"
+      log_msg -t -s "$message" -l ${LOGFILE}
+      `$ConnString "message '$message'"`
+   fi
+fi
+

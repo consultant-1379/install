@@ -1,0 +1,315 @@
+#!/bin/bash
+# ********************************************************************
+# Ericsson Radio Systems AB                                     SCRIPT
+# ********************************************************************
+#
+# (c) Ericsson Radio Systems AB 2020 - All rights reserved.
+#
+# The copyright to the computer program(s) herein is the property
+# of Ericsson Radio Systems AB, Sweden. The programs may be used
+# and/or copied only with the written permission from Ericsson Radio
+# Systems AB or in accordance with the terms and conditions stipulated
+# in the agreement/contract under which the program(s) have been
+# supplied.
+#
+# ********************************************************************
+# Name    : add_reader_temp_dbspaces.bsh
+# Date    : 20/10/2023
+# Purpose : Create reader temp dbspaces
+# Revision: /main/19
+# Usage   : add_reader_temp_dbspaces.bsh -c <path_to_cli_conf> -d <niq.ini_file_location>
+#                               [-l <logfile>]
+#
+# ********************************************************************
+#
+#   Command Section
+#
+# ********************************************************************
+AWK=/usr/bin/awk
+BASENAME=/usr/bin/basename
+CAT=/usr/bin/cat
+DATE=/usr/bin/date
+DIRNAME=/usr/bin/dirname
+ECHO='/usr/bin/echo -e'
+EGREP=/usr/bin/egrep
+EXPR=/usr/bin/expr
+GETENT=/usr/bin/getent
+GREP=/usr/bin/grep
+HOSTNAME=/usr/bin/hostname
+RM=/usr/bin/rm
+SORT=/usr/bin/sort
+TEE=/usr/bin/tee
+
+# Name of SunOS ini File
+SUNOS_INI=SunOS.ini
+
+# ********************************************************************
+#
+#   Functions
+#
+# ********************************************************************
+### Function: abort_script ###
+#
+#   This will is called if the script is aborted thru an error
+#   signal sent by the kernel such as CTRL-C or if a serious
+#   error is encountered during runtime
+#
+# Arguments:
+#       $1 - Error message from part of program (Not always used)
+# Return Values:
+#       none
+abort_script()
+{
+if [ "$1" ]; then
+    _err_msg_=$1
+else
+    _err_msg_="`$DATE +%d.%m.%y_%H:%M:%S` - ERROR : Script aborted.......\n"
+fi
+
+if [ "${LOGFILE}" ]; then
+    $ECHO "\n`$DATE +%d.%m.%y_%H:%M:%S` - ERROR : $_err_msg_\n" | $TEE -a ${LOGFILE}
+else
+    $ECHO "\n`$DATE +%d.%m.%y_%H:%M:%S` - ERROR : $_err_msg_\n"
+fi
+$RM -rf ${CON_STR_ENC}
+exit 55
+}
+
+### Function: get_absolute_path ###
+#
+# Determine absolute path to software
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+get_absolute_path()
+{
+_dir_=`$DIRNAME $0`
+SCRIPTHOME=`cd $_dir_ 2>/dev/null && pwd || $ECHO $_dir_`
+}
+
+### Function: setup_variables ###
+#
+# Set up some script variables
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+setup_variables()
+{
+
+if [ ! "${ENIQ_BASE_DIR}" ]; then
+    # Directory on the root filesystem
+    ENIQ_BASE_DIR=/eniq
+fi
+
+# Tmp directory
+TEM=/var/tmp
+
+# Admin Directory
+ENIQ_ADMIN_DIR=${ENIQ_BASE_DIR}/admin
+
+# Main Directory for the Core Installation SW
+ENIQ_INST_DIR=${ENIQ_BASE_DIR}/installation
+
+# Main Directory for the Core Installation SW
+ENIQ_CORE_INST_DIR=${ENIQ_INST_DIR}/core_install
+
+# Config dir
+ENIQ_CONF_DIR=${ENIQ_INST_DIR}/config
+
+#ipmp.ini
+IPMP_INI=${ENIQ_CONF_DIR}/ipmp.ini
+
+# Reader params
+DWH_PORT=`iniget DWH_READER_SETTINGS -v PortNumber -f ${ENIQ_INI}`
+
+local _count_=`$CAT ${CONF_DIR}/service_names | $GREP "${IP_ADDRESS}" | $GREP "dwh_" | $GREP -o "::" | $WC -l`
+if [ "${_ip_type_}" == "IPv6" -a "${_count_}" == 3 ]; then
+   DWH_ENG=`$EGREP -w "${IP_ADDRESS}" ${CONF_DIR}/service_names | $GREP "dwh" | $AWK -F\:: '{print $4}'`
+else
+    DWH_ENG=`$EGREP -w "${IP_ADDRESS}" ${CONF_DIR}/service_names | $GREP "dwh" | $AWK -F\:: '{print $3}'`
+fi
+if [ ! "${DWH_PORT}" -o ! "${DWH_ENG}" ]; then
+	_err_msg_="`$DATE +%d.%m.%y_%H:%M:%S` - Could not read IQ values from ${ENIQ_INI} or $CAT ${CONF_DIR}/service_names "
+	abort_script "$_err_msg_"
+fi
+
+DBA_PASSWORD=`inigetpassword DB -f ${ENIQ_INI} -v DBAPassword`
+if [ ! ${DBA_PASSWORD} ]; then
+    if [ -f ${ENIQ_BASE_DIR}/sw/installer/dbusers ]; then
+        DBA_PASSWORD=`${ENIQ_BASE_DIR}/sw/installer/dbusers dba dwhrep`
+        if [ ! "${DBA_PASSWORD}" ] ; then
+            _err_msg_="`$DATE +%d.%m.%y_%H:%M:%S` - Could not get dwhdb DBA Password"
+            abort_script "$_err_msg_"
+        fi
+    else
+        err_msg_="`$DATE +%d.%m.%y_%H:%M:%S` - Could not get dwhdb DBA Password"
+        abort_script "$_err_msg_"
+    fi
+fi
+
+
+READER_CONN_STR="-c \"uid=dba;pwd=${DBA_PASSWORD};eng=${DWH_ENG};links=tcpip{host=${DWH_ENG};port=${DWH_PORT};dobroadcast=no;verify=no}\""
+CON_STR_ENC=/tmp/conn_str_encrypt.`uuidgen`
+
+# encrypt the connection string.
+get_encrypt_file "${READER_CONN_STR}" "${CON_STR_ENC}"
+
+#get ip type from ipmp.ini
+check_ip_type
+if [ ! "${_ip_type_}" ]; then
+    _err_msg_="Could not read parameter _ip_type_ from file ${ENIQ_CONF_DIR}/${IPMP_INI}"
+    abort_script "$_err_msg_"
+fi
+}
+
+### Function: usage_msg ###
+#
+# Usage
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+usage_msg()
+{
+$ECHO "
+Usage: `$BASENAME $0` -c <conf dir> -d <niq.ini file> -s <sym_links.ini> [-l <logfile>]
+
+options:
+
+-l : Optional parameter specifying what logfile to use
+
+-c : Conf dir where niq.rc resides
+
+-d : Path to the niq.ini file.
+
+-s : Path to the sym_links.ini file.
+"
+}
+
+# ********************************************************************
+#
+#   Main body of program
+#
+# ********************************************************************
+#
+TIMESTAMP=`$DATE +%d.%m.%y_%H:%M:%S`
+
+# Determine absolute path to software
+get_absolute_path
+
+while getopts ":l:c:d:s:" arg; do
+	case $arg in
+	    l)	LOGFILE="$OPTARG"
+	        ;;
+	    c)  CONF_DIR="$OPTARG"
+	        ;;
+	    d)  ENIQ_INI="$OPTARG"
+	        ;;
+	    s)  SYM_INI="$OPTARG"
+	    ;;
+	    \?) usage_msg
+	        exit 1
+	        ;;
+	esac
+done
+shift `$EXPR $OPTIND - 1`
+
+# Source the common functions
+if [ -s $SCRIPTHOME/../lib/common_functions.lib ]; then
+    . $SCRIPTHOME/../lib/common_functions.lib
+else
+    _err_msg_="File $SCRIPTHOME/../lib/common_functions.lib not found"
+    abort_script "$_err_msg_"
+fi
+
+# Check required files and scripts exist
+if [ ! -s ${CONF_DIR}/niq.rc ]; then
+    _err_msg_="`$DATE +%d.%m.%y_%H:%M:%S` - File ${CONF_DIR}/niq.rc not found, or is empty"
+    abort_script "$_err_msg_"
+else
+    #$ECHO "Sourcing ${CONF_DIR}/niq.rc" 
+    . ${CONF_DIR}/niq.rc
+fi
+
+if [ ! "$LOGFILE" ] ; then
+    LOGFILE=${IQLOGDIR}/add_reader_temp_dbspace_${TIMESTAMP}.log
+fi
+
+if [ -z "$CONF_DIR" ] ; then
+     _err_msg_="`$DATE +%d.%m.%y_%H:%M:%S` - ERROR: CONF_DIR is not set"
+    abort_script "$_err_msg_"
+fi
+
+if [ ! -f ${ENIQ_INI} ]; then
+     _err_msg_="`$DATE +%d.%m.%y_%H:%M:%S` - ${ENIQ_INI} does not exists"
+    abort_script "$_err_msg_"
+fi
+
+if [ ! -f ${SYM_INI} ]; then
+     _err_msg_="`$DATE +%d.%m.%y_%H:%M:%S` - ${SYM_INI} does not exists"
+    abort_script "$_err_msg_"
+fi
+
+Server_Name=`/usr/bin/hostname`
+IP_ADDRESS=`${HOSTNAME} -i | $AWK '{print $1}'`
+
+# Need to Determine which Reader am i.
+_count_=`$CAT ${CONF_DIR}/service_names|$GREP ${IP_ADDRESS} |$GREP -o "::" | $WC -l`
+if [ "${_ip_type_}" == "IPv6" -a "${_count_}" == 3 ]; then
+   _reader_num_=`$CAT ${CONF_DIR}/service_names | $GREP ${IP_ADDRESS} | $GREP dwh | $AWK -F\:: '{print $4}' | $AWK -F\_ '{print $NF}'`
+else
+   _reader_num_=`$CAT ${CONF_DIR}/service_names | $GREP ${IP_ADDRESS} | $GREP dwh | $AWK -F\:: '{print $3}' | $AWK -F\_ '{print $NF}'`
+fi
+if [ ! "${_reader_num_}" ]; then
+    _err_msg_="`$DATE +%d.%m.%y_%H:%M:%S` - Could not read reader number from ${CONF_DIR}/service_names"
+    abort_script "$_err_msg_"
+fi
+	
+# Set up variables
+setup_variables
+
+i=0
+DBSPACE=IQ_SYSTEM_TEMP
+_dbfile_list_=`iniget DWH_DBSPACES_TEMP -f ${SYM_INI}`
+if [ ! "${_dbfile_list_}" ]; then
+    _err_msg_="`$DATE +%d.%m.%y_%H:%M:%S` - Could not find any temp dbspaces in ${SYM_INI}"
+    abort_script "$_err_msg_"
+fi
+
+for _space_ in ${_dbfile_list_}; do
+	let i=$i+1
+    _dbfile_=`iniget ${_space_} -f ${SYM_INI} -v Path`
+    _raw_device_=`iniget ${_space_} -f ${SYM_INI} -v Link`
+    DBFILE=`$ECHO ${_dbfile_}|$AWK -F\/ '{print $NF}'|$AWK -F\. '{print $1}'`
+    i=`$ECHO ${DBFILE}|$AWK -F\_ '{print $5}'` 
+    if [ ! "${_dbfile_}" -o ! "${_raw_device_}" ]; then
+        _err_msg_="`$DATE +%d.%m.%y_%H:%M:%S` - Could not read values from ${SYM_INI}"
+        abort_script "$_err_msg_"
+    fi
+	
+    #Check to see if dbspace already exists
+    ${IQDIR}/bin64/dbisql -nogui -onerror exit @${CON_STR_ENC} "sp_iqfile; OUTPUT to /var/tmp/temp_exp_${_cnt_}.log" >> /dev/null 2>&1
+    $GREP -w ${_dbfile_} /var/tmp/temp_exp_${_cnt_}.log >> /dev/null 2>&1
+    if [ $? -eq 0 ]; then
+        log_msg -t -l ${LOGFILE} -q -s "DBFILE ${_dbfile_} already exists. Skipping....."
+	continue
+    fi
+    log_msg -t -l ${LOGFILE} -q -s "Adding ${_dbfile_} as dbfile to ${DBSPACE}"  
+    $ECHO "ALTER DBSPACE ${DBSPACE}" >  ${ENIQ_ADMIN_DIR}/sql/add_dbspace_file_reader_${DWH_ENG}_temp_$i.sql
+    $ECHO "ADD FILE reader_${_reader_num_}_temp_$i '${_dbfile_}'" >> ${ENIQ_ADMIN_DIR}/sql/add_dbspace_file_reader_${DWH_ENG}_temp_$i.sql
+    ${IQDIR}/bin64/dbisql -nogui @${CON_STR_ENC} -q ${ENIQ_ADMIN_DIR}/sql/add_dbspace_file_reader_${DWH_ENG}_temp_$i.sql
+    if [ $? -ne 0 ]; then
+        _err_msg_="`$DATE +%d.%m.%y_%H:%M:%S` - Adding dbfile '${_dbfile_}' to ${DBSPACE} failed"
+        abort_script "$_err_msg_"
+    fi
+
+done
+
+$RM -rf ${CON_STR_ENC}
+
+exit 0

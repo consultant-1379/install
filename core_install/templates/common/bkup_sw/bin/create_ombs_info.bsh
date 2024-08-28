@@ -1,0 +1,659 @@
+#!/bin/bash
+# ********************************************************************
+# Ericsson Radio Systems AB                                     SCRIPT
+# ********************************************************************
+#
+#
+# (c) Ericsson Radio Systems AB 2019 - All rights reserved.
+#
+# The copyright to the computer program(s) herein is the property
+# of Ericsson Radio Systems AB, Sweden. The programs may be used
+# and/or copied only with the written permission from Ericsson Radio
+# Systems AB or in accordance with the terms and conditions stipulated
+# in the agreement/contract under which the program(s) have been
+# supplied.
+#
+# ********************************************************************
+# Name    : create_ombs_info.bsh
+# Date    : 16/10/2023
+# Revision: \main\14
+# Purpose : The primary purpose of this script is to take copy of
+#           all files/information required by OMBS to perform backup.
+#
+# Usage   : create_ombs_info.bsh
+#
+# ********************************************************************
+#
+#       Command Section
+#
+# ********************************************************************
+AWK=/usr/bin/awk
+BASENAME=/usr/bin/basename
+BASH=/usr/bin/bash
+BC=/usr/bin/bc
+CHMOD=/usr/bin/chmod
+CHOWN=/usr/bin/chown
+CAT=/usr/bin/cat
+CD=/usr/bin/cd
+CP=/usr/bin/cp
+DATE=/usr/bin/date
+DIRNAME=/usr/bin/dirname
+ECHO='/usr/bin/echo -e'
+EGREP=/usr/bin/egrep
+EXPR=/usr/bin/expr
+FINDMNT=/usr/bin/findmnt
+GREP=/usr/bin/grep
+HEAD=/usr/bin/head
+ID=/usr/bin/id
+MKDIR=/usr/bin/mkdir
+PERL=/usr/bin/perl
+PWD=/usr/bin/pwd
+RM=/usr/bin/rm
+SED=/usr/bin/sed
+SSH=/usr/bin/ssh			
+SU=/usr/bin/su
+SUDO=/usr/bin/sudo
+UNAME=/bin/uname
+WC=/usr/bin/wc
+
+# ********************************************************************
+#
+#       Configuration Section
+#
+# ********************************************************************
+
+BKUP_CONF=eniq_backup.conf
+BLOCK_STORAGE_INI=block_storage.ini
+SUNOS_INI=SunOS.ini
+SYM_LINK_INI=sym_links.ini
+STORAGE_INI=storage.ini
+
+# ********************************************************************
+#
+#       Functions
+#
+# ********************************************************************
+### Function: abort_script ###
+#
+#   This will is called if the script is aborted thru an error
+#   signal sent by the kernel such as CTRL-C or if a serious
+#   error is encountered during runtime
+#
+# Arguments:
+#       $1 - Error message from part of program (Not always used)
+# Return Values:
+#       none
+abort_script()
+{
+_err_time_=`$DATE '+%Y-%b-%d_%H.%M.%S'`
+
+if [ "$1" ]; then
+   _err_msg_="${_err_time_} - $1"
+else
+   _err_msg_="${_err_time_} - ERROR : Script aborted.......\n"
+fi
+
+if [ "${LOGFILE}" ]; then
+    $ECHO "\nERROR : ${_err_msg_}\n" | $TEE -a ${LOGFILE}
+else
+    $ECHO "\nERROR : ${_err_msg_}\n"
+fi
+
+$RM -rf ${TMP_DIR}
+
+if [ "$2" ]; then
+    ${2}
+else
+   exit 1
+fi
+}
+
+### Function: check_id ###
+#
+#   Check that the effective id of the user is correct
+#   If not print error msg and exit.
+#
+# Arguments:
+#       $1 : User ID name
+# Return Values:
+#       none
+check_id()
+{
+_check_id_=`$ID  | $AWK -F\( '{print $2}' | $AWK -F\) '{print $1}'`
+if [ "${_check_id_}" != "$1" ]; then
+    _err_msg_="You must be $1 or have equal permissions to execute this script."
+    abort_script "${_err_msg_}" 
+fi
+}
+
+### Function: check_files_and_scripts ### 
+#
+# Check required files and scripts exist
+#
+# Arguments:
+#   none
+# Return Values:
+#    none
+check_files_and_scripts()
+{
+if [ "${STORAGE_TYPE}" != "fs" ]; then    
+    if [ ! -f ${ENIQ_CONF_DIR}/${STORAGE_INI} ]; then
+        _err_msg_="File ${ENIQ_CONF_DIR}/${STORAGE_INI} not found"
+        abort_script "$_err_msg_"
+    fi    
+                   
+    if [ ! -f ${ENIQ_CONF_DIR}/${BLOCK_STORAGE_INI} ]; then
+        _err_msg_="File ${ENIQ_CONF_DIR}/${BLOCK_STORAGE_INI} not found"
+        abort_script "$_err_msg_"
+    fi
+fi                    
+
+if [ ! -f ${ENIQ_CONF_DIR}/${SYM_LINK_INI} ]; then
+    _err_msg_="File ${ENIQ_CONF_DIR}/${SYMLINKS_INI} not found"
+    abort_script "$_err_msg_"
+fi
+
+if [ ! -f ${ENIQ_CONF_DIR}/installed_server_type ]; then
+    _err_msg_="File ${ENIQ_CONF_DIR}/installed_server_type not found"
+    abort_script "$_err_msg_"
+fi                   
+                   
+if [ ! -f ${ENIQ_CONF_DIR}/om_sw_locate ]; then
+    _err_msg_="File ${ENIQ_CONF_DIR}/om_sw_locate not found"
+    abort_script "$_err_msg_"
+fi                   
+                   
+if [ ! -f ${ENIQ_CONF_DIR}/ericsson_use_config ]; then
+    _err_msg_="File ${ENIQ_CONF_DIR}/ericsson_use_config not found"
+    abort_script "$_err_msg_"
+fi                    
+                    
+if [ ! -f ${ENIQ_CONF_DIR}/san_details ]; then
+    _err_msg_="File ${ENIQ_CONF_DIR}/san_details not found"
+    abort_script "$_err_msg_"
+fi  
+
+}
+
+### Function: dump_server_specific_data ###
+#
+# Run commands on all blades and collect output in coordinator
+#
+# Arguments: 
+#   $1 : server_order_list
+# Return Values:
+#   none
+
+dump_server_specific_data()
+{
+local _server_det_file_=$1
+
+# Build up the command to use for stopping the services
+
+for _line_ in `$CAT ${_server_det_file_}`; do
+	local _count_=`$ECHO "${_line_}" | $GREP -o "::" | $WC -l`
+	if [ "${_ip_type_}" == "IPv6" -a "${_count_}" == 4 ]; then
+		local _ip_address_=`$ECHO ${_line_} | $GREP -oE '([a-fA-F0-9]{1,4}::?){1,7}[a-fA-F0-9]{1,4}' | $HEAD -n 1 | $AWK -F "::" '{ print $1 "::" $2}'`
+		local _serv_hostname_=`$ECHO ${_line_} | $AWK -F"::" '{print $3}'`
+		local _server_type_=`$ECHO ${_line_} | $AWK -F"::" '{print $4}'`
+		local _backup_hostname_=`$ECHO "${_line_}" | $AWK -F"::" '{print $5}'`
+	else
+		local _ip_address_=`$ECHO ${_line_} | $AWK -F"::" '{print $1}'`
+		local _serv_hostname_=`$ECHO ${_line_} | $AWK -F"::" '{print $2}'`
+		local _server_type_=`$ECHO ${_line_} | $AWK -F"::" '{print $3}'`
+		local _backup_hostname_=`$ECHO "${_line_}" | $AWK -F"::" '{print $4}'`
+	fi
+
+	local _run_cmd_="$UNAME"
+	local _run_cmd_1="$SUDO $BASH ${ENIQ_BKUP_BIN_DIR}/get_fs_backup_list.bsh"
+	
+    if [ ! "${_ip_address_}" -o ! "${_serv_hostname_}" ]; then
+        _err_msg_="Could not read required info from ${_server_det_file_}"
+        abort_script "${_err_msg_}"
+    fi
+    
+    # If the IP found in the order file matches my IP,
+    # then run the command locally - no need to ssh
+
+    if [ "${_ip_address_}" == "${HOST_IP}" ]; then
+	$MKDIR -p ${TMP_DIR}/BKUP_CLIENTS/${_backup_hostname_}
+            if [ $? -ne 0 ]; then
+                _err_msg_="Failed to create ${TMP_DIR}/BKUP_CLIENTS/${_serv_hostname_} "
+                abort_script "${_err_msg_}"
+            fi
+        ${_run_cmd_} > ${TMP_DIR}/BKUP_CLIENTS/${_backup_hostname_}/eniq_os_type
+            if [ $? -ne 0 ]; then
+                _err_msg_="Could not save OS of ${_serv_hostname_}"
+                abort_script "${_err_msg_}"
+            fi
+		#Executing get_fs_backup_list to get list of file system to be back up.
+		${_run_cmd_1} > ${TMP_DIR}/BKUP_CLIENTS/${_backup_hostname_}/fs_backup_list
+		    if [ $? -ne 0 ]; then
+                _err_msg_="Could not execute ${ENIQ_BKUP_BIN_DIR}/get_fs_backup_list.bsh on ${_serv_hostname_} "
+                abort_script "${_err_msg_}"
+            fi
+		# fetching root details
+		_check_efi_=`df -h | $EGREP -w /boot/efi`
+		if [ -z "$_check_efi_" ]; then
+			$ECHO "/boot" > ${TMP_DIR}/BKUP_CLIENTS/${_backup_hostname_}/root_backup_list
+			$FINDMNT -l | $GREP -w ${VG_ROOT} | $AWK '{print $1}'  >> ${TMP_DIR}/BKUP_CLIENTS/${_backup_hostname_}/root_backup_list 2>/dev/null
+				if [ $? -ne 0 ]; then
+				   _err_msg_="Could not get root details on ${_serv_hostname_} "
+				   abort_script "${_err_msg_}"
+				fi
+		else
+		    $ECHO "/boot" > ${TMP_DIR}/BKUP_CLIENTS/${_backup_hostname_}/root_backup_list
+			$ECHO "/boot/efi" >> ${TMP_DIR}/BKUP_CLIENTS/${_backup_hostname_}/root_backup_list
+			$FINDMNT -l | $GREP -w ${VG_ROOT} | $AWK '{print $1}'  >> ${TMP_DIR}/BKUP_CLIENTS/${_backup_hostname_}/root_backup_list 2>/dev/null
+				if [ $? -ne 0 ]; then
+				_err_msg_="Could not get root details on ${_serv_hostname_} "
+				abort_script "${_err_msg_}"
+				fi
+		fi
+    else
+		$MKDIR -p ${TMP_DIR}/BKUP_CLIENTS/${_backup_hostname_}
+		    if [ $? -ne 0 ]; then
+                _err_msg_="Failed to create ${TMP_DIR}/BKUP_CLIENTS/${_serv_hostname_} "
+                abort_script "${_err_msg_}"
+            fi
+        $run_remote_cmd1 $DEFAULT_USER@${_serv_hostname_} "${_run_cmd_}" > ${TMP_DIR}/BKUP_CLIENTS/${_backup_hostname_}/eniq_os_type
+            if [ $? -ne 0 ]; then
+                _err_msg_="Could not save OS of ${_serv_hostname_}"
+                abort_script "${_err_msg_}"
+            fi
+		$run_remote_cmd1 $DEFAULT_USER@${_serv_hostname_} "${_run_cmd_1}" > ${TMP_DIR}/BKUP_CLIENTS/${_backup_hostname_}/fs_backup_list
+		    if [ $? -ne 0 ]; then
+                _err_msg_="Could not execute ${ENIQ_BKUP_BIN_DIR}/get_fs_backup_list.bsh on ${_serv_hostname_} "
+                abort_script "${_err_msg_}"
+            fi
+		_check_efi_=`$run_remote_cmd1 $DEFAULT_USER@${_serv_hostname_} df -h | $EGREP -w /boot/efi`
+		if [ -z "$_check_efi_" ]; then
+			$ECHO "/boot" > ${TMP_DIR}/BKUP_CLIENTS/${_backup_hostname_}/root_backup_list
+			$run_remote_cmd1 $DEFAULT_USER@${_serv_hostname_} "$FINDMNT -l"| $GREP -w ${VG_ROOT} | $AWK '{print $1}' >> ${TMP_DIR}/BKUP_CLIENTS/${_backup_hostname_}/root_backup_list 2>/dev/null
+				if [ $? -ne 0 ]; then
+				   _err_msg_="Could not get root details on ${_serv_hostname_} "
+				   abort_script "${_err_msg_}"
+				fi
+		else
+			$ECHO "/boot" > ${TMP_DIR}/BKUP_CLIENTS/${_backup_hostname_}/root_backup_list
+            $ECHO "/boot/efi" >> ${TMP_DIR}/BKUP_CLIENTS/${_backup_hostname_}/root_backup_list
+			$run_remote_cmd1 $DEFAULT_USER@${_serv_hostname_} "$FINDMNT -l"| $GREP -w ${VG_ROOT} | $AWK '{print $1}' >> ${TMP_DIR}/BKUP_CLIENTS/${_backup_hostname_}/root_backup_list 2>/dev/null
+				if [ $? -ne 0 ]; then
+					_err_msg_="Could not get root details on ${_serv_hostname_} "
+					abort_script "${_err_msg_}"
+				fi
+		fi
+    fi
+done    
+}
+
+
+### Function: get_absolute_path ###
+#
+# Determine absolute path to software
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+get_absolute_path()
+{
+_dir_=`$DIRNAME $0`
+SCRIPTHOME=`cd ${_dir_} 2>/dev/null && pwd || $ECHO ${_dir_}`
+}
+
+### Function: get_deployment_order ###
+#
+# Get the order of the deployment
+# for running few commands
+#
+# Arguments:
+#    none
+# Return Values:
+#    none
+get_deployment_order()
+{
+$RM -rf ${TEM_DIR}/server_order_list
+
+# Get an ordered list of servers based on the server_list file
+${PERL} ${GET_IP_ORDER} -f ${TEM_DIR}/server_order_list
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not get an ordered list of servers"
+    abort_script "${_err_msg_}"
+fi
+}
+
+
+### Function: get_disk_lisk ###
+#
+# Create a list of disks that will be snapped
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+get_snap_disk_list()
+{
+# get sys main
+_sys_main_list_=`iniget DWH_SYSTEM_MAIN -f ${ENIQ_CONF_DIR}/${SYM_LINK_INI}`
+for _sys_main_ in ${_sys_main_list_}; do
+    _sys_main_disk_=`iniget ${_sys_main_} -f ${ENIQ_CONF_DIR}/${SYM_LINK_INI} -v Lun_ID`
+    if [ "${_sys_main_disk_}" ]; then
+        $ECHO ${_sys_main_disk_} >> ${TMP_DIR}/luns_to_be_snapped
+    else
+        _err_msg_="Could not read Lun_ID for ${_sys_main_} in ${ENIQ_CONF_DIR}/${SYM_LINK_INI}."
+        abort_script "$_err_msg_"
+    fi
+done
+
+# get main dbs
+_db_space_list_=`iniget DWH_DBSPACES_MAIN -f ${ENIQ_CONF_DIR}/${SYM_LINK_INI}`
+for _db_space_ in ${_db_space_list_}; do
+    _main_db_disk_=`iniget ${_db_space_} -f ${ENIQ_CONF_DIR}/${SYM_LINK_INI} -v Lun_ID`
+    if [ "${_main_db_disk_}" ]; then
+        $ECHO ${_main_db_disk_} >> ${TMP_DIR}/luns_to_be_snapped
+    else
+        _err_msg_="Could not read Lun_ID for ${_db_space_} in ${ENIQ_CONF_DIR}/${SYM_LINK_INI}."
+        abort_script "$_err_msg_"
+    fi
+done
+
+}
+
+### Function: setup_env ###
+#
+# Set up script environment etc
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+setup_env()
+{
+
+export HOME=/root
+
+ENIQ_BASE_DIR=/eniq
+
+ENIQ_BKUP_SW=${ENIQ_BASE_DIR}/bkup_sw
+
+#eniq backup dir
+if [ ! -d ${ENIQ_BKUP_SW} ]; then
+    _err_msg_="Could not locate file ${ENIQ_BKUP_SW}"
+    abort_script "$_err_msg_"    
+fi
+
+#eniq back dir
+ENIQ_BKUP_BIN_DIR=${ENIQ_BKUP_SW}/bin
+
+# ENIQ BKUP SW ETC Directory
+ENIQ_BKUP_ETC_DIR=${ENIQ_BKUP_SW}/etc
+
+# Main Directory for the Core Installation SW
+ENIQ_INST_DIR=${ENIQ_BASE_DIR}/installation
+
+# Main Directory for the Core Installation SW
+ENIQ_CORE_INST_DIR=${ENIQ_INST_DIR}/core_install
+
+# ENIQ Config Directory
+ENIQ_CONF_DIR=${ENIQ_INST_DIR}/config
+
+# Initializing SSH
+run_remote_cmd1="$SSH -o StrictHostKeyChecking=no -o BatchMode=yes"	  
+# Get IP Order script
+GET_IP_ORDER=${ENIQ_CORE_INST_DIR}/lib/get_ip_order.pl
+
+BKUP_CONF_FILE="`$DIRNAME ${SCRIPTHOME}`/etc/eniq_backup.conf"
+if [ ! -s ${BKUP_CONF_FILE} ]; then
+    _err_msg_="Could not locate file ${BKUP_CONF_FILE}"
+    abort_script "$_err_msg_"
+fi
+
+if [ -s ${ENIQ_BASE_DIR}/admin/lib/common_functions.lib ]; then
+	. ${ENIQ_BASE_DIR}/admin/lib/common_functions.lib
+else
+    _err_msg_="File ${ENIQ_BASE_DIR}/admin/lib/common_functions.lib not found"
+    abort_script "$_err_msg_"
+fi
+
+if [ ! -f ${ENIQ_CONF_DIR}/${SUNOS_INI} ]; then
+    _err_msg_="File ${ENIQ_CONF_DIR}/${SUNOS_INI} not found"
+    abort_script "$_err_msg_"
+fi
+
+if [ ! -f ${ENIQ_BKUP_ETC_DIR}/server_details ]; then
+    _err_msg_="File ${ENIQ_BKUP_ETC_DIR}/server_details not found"
+    abort_script "$_err_msg_"
+fi
+
+#Fetching user detail
+SCRIPT_USER=`iniget ENIQ_INSTALL_CONFIG -f ${ENIQ_CONF_DIR}/${SUNOS_INI} -v ENIQ_SYSUSER`
+if [ ! "${SCRIPT_USER}" ]; then
+    _err_msg_="Could not read ${SCRIPT_USER} param"
+    abort_script "${_err_msg_}"
+fi
+
+#fetching storage type of the ENIQ server
+STORAGE_TYPE=`iniget STOR_TYPE -f ${ENIQ_CONF_DIR}/${SUNOS_INI} -v STORAGE_TYPE`
+if [ ! "${STORAGE_TYPE}" ]; then
+    _err_msg_="Could not read ${STORAGE_TYPE} param"
+    abort_script "${_err_msg_}"
+fi
+
+# Determine the current server type
+CURR_SERVER_TYPE=`$CAT ${ENIQ_CONF_DIR}/installed_server_type | $EGREP -v '^[[:blank:]]*#' | $SED -e 's/ //g'`
+if [ ! "${CURR_SERVER_TYPE}" ]; then
+    _err_msg_="Could not determine which server type this is"
+    abort_script "$_err_msg_"
+fi
+
+if [ "${CURR_SERVER_TYPE}" == "stats_coordinator" -o "${CURR_SERVER_TYPE}" == "eniq_stats" ]; then
+    SERVER_TYPE="CO"
+else
+    SERVER_TYPE="${CURR_SERVER_TYPE}"
+fi
+
+LOGDIR=${ENIQ_BASE_DIR}/local_logs/backup_logs
+ENIQ_BKUP_SW_OMBS_CFG=${ENIQ_BKUP_SW}/ombs_cfg
+
+HOSTNAME=/usr/bin/hostname
+HOST_IP=`${HOSTNAME} -i | $AWK '{print $1}' | $HEAD -1`
+
+BLKCLI=/ericsson/storage/san/bin/blkcli
+
+TEM_DIR=/tmp
+
+VG_ROOT=vg_root
+
+#Check IP Type
+check_ip_type
+if [ ! "${_ip_type_}" ]; then
+    _err_msg_="Could not read parameter _ip_type_ from ipmp.ini file"
+    abort_script "$_err_msg_"
+fi
+}
+
+# ********************************************************************
+#
+#       Main body of program
+#
+# ********************************************************************
+#
+DEFAULT_USER=root			 
+RUN_TIME=`$DATE '+%Y-%b-%d_%H.%M.%S'`
+
+# Determine absolute path to software
+get_absolute_path
+
+# Check that the effective id of the user is root
+check_id $DEFAULT_USER
+
+while getopts ":l:" arg; do
+  case $arg in
+    l) LOGFILE="$OPTARG"
+       ;;
+   \?) usage_msg
+       exit 1
+       ;;
+  esac
+done
+shift `$EXPR $OPTIND - 1`
+
+# Set up script environment etc
+setup_env
+
+# Set up default logfile if required
+if [ ! "${LOGFILE}" ]; then
+    LOGFILE="${LOGDIR}/create_ombs_info.log"
+fi
+
+$MKDIR -p `$DIRNAME ${LOGFILE}`
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not create directory `$DIRNAME ${LOGFILE}`"
+    abort_script "$_err_msg_"
+fi 
+
+# Check/Create Logfile
+$TOUCH -a ${LOGFILE}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not create ${LOGFILE}"
+    abort_script "$_err_msg_"
+fi
+
+# Check the files and scripts exist
+check_files_and_scripts
+
+# Get the order to run few commands
+get_deployment_order
+
+log_msg -q -s  "=====< ${RUN_TIME} - Started running ${ENIQ_BKUP_BIN_DIR}/create_ombs_info.bsh on ${HOST_NAME} >===\n" -l ${LOGFILE}
+
+# Create a temporary Directory
+TMP_DIR=/tmp/ombs_cfg.$$.$$
+$RM -rf ${TMP_DIR}
+$MKDIR -p ${TMP_DIR} >> /dev/null 2>&1
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not create directory ${TMP_DIR}"
+    abort_script "${_err_msg_}"
+fi
+
+if [ "${SERVER_TYPE}" == "CO" ]; then
+    log_msg -s "Creating ${ENIQ_BKUP_SW_OMBS_CFG} directory \n"  -l ${LOGFILE}
+    $SU - ${SCRIPT_USER} -c "$MKDIR -m 755 -p ${ENIQ_BKUP_SW_OMBS_CFG} >> /dev/null 2>&1"
+    if [ $? -ne 0 ]; then
+        _err_msg_="Could not create directory ${ENIQ_BKUP_SW_OMBS_CFG}"
+        abort_script "${_err_msg_}"
+    fi
+
+    # these are the files residing in ENIQ server 
+    MANDATORY_FILES="${BKUP_CONF_FILE} ${ENIQ_CONF_DIR}/${SUNOS_INI} ${ENIQ_CONF_DIR}/${STORAGE_INI} ${ENIQ_CONF_DIR}/${SYM_LINK_INI}
+                   ${ENIQ_CONF_DIR}/installed_server_type ${ENIQ_CONF_DIR}/om_sw_locate ${ENIQ_CONF_DIR}/ericsson_use_config ${ENIQ_CONF_DIR}/san_details ${ENIQ_CONF_DIR}/${BLOCK_STORAGE_INI} ${ENIQ_BKUP_ETC_DIR}/server_details"
+    _optional_files_="${ENIQ_CONF_DIR}/extra_params/storprot"
+                   
+    if [ "${STORAGE_TYPE}" != "fs" ]; then
+        _file_list_="${MANDATORY_FILES}"
+        
+    else
+        $ECHO ${MANDATORY_FILES} | $SED 's/ /\n/g' > ${TMP_DIR}/file_list
+            if [ $? -ne 0 ]; then
+                _err_msg_="Could not create file ${TMP_DIR}/file_list"
+                abort_script "${_err_msg_}"
+            fi
+        _exclude_list_="${ENIQ_CONF_DIR}/${STORAGE_INI}|${ENIQ_CONF_DIR}/${BLOCK_STORAGE_INI}"
+        _file_list_=`$CAT ${TMP_DIR}/file_list | $EGREP -v "${_exclude_list_}"`
+    fi    
+
+    for _file_ in ${_file_list_}; do
+        $CP ${_file_} ${TMP_DIR} >> /dev/null 2>&1
+            if [ $? -ne 0 ]; then
+                _err_msg_="Could not make a copy of ${_file_}"
+                abort_script "${_err_msg_}"
+            fi
+    done
+    
+$RM -rf ${TMP_DIR}/file_list
+
+    for _file_ in ${_optional_files_}; do
+        if [ -s ${_file_} ]; then
+            $CP ${_file_} ${TMP_DIR} >> /dev/null 2>&1
+            if [ $? -ne 0 ]; then
+                _err_msg_="Could not make a copy of ${_file_}"
+                abort_script "${_err_msg_}"
+            fi
+        fi
+    done
+
+    # Create a list of disks that will be snapped
+    if [ "${STORAGE_TYPE}" != "fs" ]; then
+        get_snap_disk_list
+    fi    
+     
+    #creating list of luns	 
+    if [ "${STORAGE_TYPE}" != "fs" ]; then
+    log_msg -s "Generating lun list" -l ${LOGFILE}
+    ${BLKCLI} --action listluns >> ${TMP_DIR}/listluns 2>/dev/null
+        if [ $? -ne 0 ]; then
+            _err_msg_="Could not get list of snapshots for ENIQ Luns"
+            abort_script "${_err_msg_}"
+        fi
+	fi
+    
+    # Fetching detail of the user running the script
+    _run_user_det_=`$ID ${SCRIPT_USER} 2>> /dev/null|$AWK '{print $1,$2}'`
+    if [ ! "${_run_user_det_}" ]; then
+        _err_msg_="Could not store ENIQ used ID details"
+        abort_script "${_err_msg_}"
+    else
+        for _det_ in ${_run_user_det_}; do
+            $ECHO ${_det_}|$SED -e 's|=| |' -e 's|(| |' -e 's|)| |' >> ${TMP_DIR}/run_user_details
+        done
+    fi
+fi
+
+dump_server_specific_data ${ENIQ_BKUP_ETC_DIR}/server_details
+
+# check UID of script_user 
+_id_=`$ID -u  ${SCRIPT_USER}`
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not get uid of ${SCRIPT_USER}"
+    abort_script "${_err_msg_}"
+fi
+
+# check GID of script_user 
+_gid_=`$ID -g  ${SCRIPT_USER}`
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not get gid of ${SCRIPT_USER}"
+    abort_script "${_err_msg_}"
+fi
+
+$CHOWN -R ${_id_}:${_gid_} ${TMP_DIR}/* >> /dev/null 2>&1
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not set ownership of files to ${SCRIPT_USER}"
+    abort_script "${_err_msg_}"
+fi
+
+log_msg -s "Started copying files in ${ENIQ_BKUP_SW_OMBS_CFG} \n" -l ${LOGFILE}
+
+
+#Copying file from TMP_DIR to location which ombs can access
+
+$RM -rf ${ENIQ_BKUP_SW_OMBS_CFG}/* >> /dev/null 2>&1
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not delete old files in ${ENIQ_BKUP_SW_OMBS_CFG}"
+    abort_script "${_err_msg_}"
+fi
+
+$SU - ${SCRIPT_USER} -c "$CP -r ${TMP_DIR}/* ${ENIQ_BKUP_SW_OMBS_CFG} >> /dev/null 2>&1"
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not copy ombs_cfg files to ${ENIQ_BKUP_SW_OMBS_CFG}"
+    abort_script "${_err_msg_}"
+fi
+
+log_msg -s "Successfully copied all the required files in ${ENIQ_BKUP_SW_OMBS_CFG} \n"
+
+log_msg -q -s "=====< ${RUN_TIME} - Successfully completed execution of ${ENIQ_BKUP_BIN_DIR}/create_ombs_info.bsh on ${HOST_NAME} >===\n" -l ${LOGFILE}
+
+$RM -rf ${TMP_DIR}
+
+exit 0
+

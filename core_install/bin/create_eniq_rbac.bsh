@@ -1,0 +1,394 @@
+#!/bin/bash
+# ********************************************************************
+# Ericsson Radio Systems AB                                     SCRIPT
+# ********************************************************************
+#
+#
+# (c) Ericsson Radio Systems AB 2018 - All rights reserved.
+#
+# The copyright to the computer program(s) herein is the property
+# of Ericsson Radio Systems AB, Sweden. The programs may be used 
+# and/or copied only with the written permission from Ericsson Radio 
+# Systems AB or in accordance with the terms and conditions stipulated 
+# in the agreement/contract under which the program(s) have been 
+# supplied.
+#
+# ********************************************************************
+# Name    : create_eniq_rbac.bsh
+# Date    : 18/08/2023
+# Revision: main\7
+# Purpose : Script to add sudo users and entries on ENIQ server
+#
+# Usage   : create_eniq_rbac.bsh
+#
+# ********************************************************************
+#
+# 	Command Section
+#
+# ********************************************************************
+AWK=/usr/bin/awk
+BASENAME=/usr/bin/basename
+BASH=/usr/bin/bash
+CAT=/usr/bin/cat
+CP=/usr/bin/cp
+DATE=/usr/bin/date
+DIRNAME=/usr/bin/dirname
+ECHO="/usr/bin/echo -e"
+EGREP=/usr/bin/egrep
+GETENT=/usr/bin/getent
+GREP=/usr/bin/grep
+ID=/usr/bin/id
+MKDIR=/usr/bin/mkdir
+PWD=/usr/bin/pwd
+RM=/usr/bin/rm
+SED=/usr/bin/sed
+TEE=/usr/bin/tee
+TOUCH=/usr/bin/touch
+TR=/usr/bin/tr
+
+# ********************************************************************
+#
+#       Configuration Section
+#
+# ********************************************************************
+# Default user
+DEFAULT_USER=root
+
+# Base SW dir
+ENIQ_BASE_DIR=/eniq
+
+# Define sudo file
+SUDOFILE=/etc/sudoers
+
+# ********************************************************************
+#
+#       Pre-execution Operations
+#
+# ********************************************************************
+
+
+# ********************************************************************
+#
+# 	Functions
+#
+# ********************************************************************
+### Function: abort_script ###
+#
+#   This will be called if the script is aborted thru an error or
+#   error signal sent by the kernel such as CTRL-C or if a serious
+#   error is encountered during runtime
+#
+# Arguments:
+#       $1 - Error message from part of program (Not always used)
+# Return Values:
+#       none
+abort_script()
+{
+_err_time_=`$DATE '+%Y-%b-%d_%H.%M.%S'`
+
+if [ "$1" ]; then
+	_err_msg_="${_err_time_} - $1"
+else
+	_err_msg_="${_err_time_} - ERROR : Script aborted.......\n"
+fi
+
+$ECHO "\n$_err_msg_\n" | $TEE -a ${LOGFILE}
+
+cd $SCRIPTHOME
+
+if [ "$2" ]; then
+    ${2}
+else
+   exit 1
+fi
+}
+
+
+### Function: chk_create_logfile ###
+#
+# Check/Create Logfile
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+chk_create_logfile()
+{
+$MKDIR -p `$DIRNAME ${LOGFILE}`
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not create directory `$DIRNAME ${LOGFILE}`"
+     abort_script "$_err_msg_"
+fi
+
+$TOUCH -a ${LOGFILE}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not write to file ${LOGFILE}"
+    abort_script "$_err_msg_"
+fi
+}
+
+### Function: check_id ###
+#
+#   Check that the effective id of the user is correct
+#   If not print error msg and exit.
+#
+# Arguments:
+#       $1 : User ID name
+# Return Values:
+#       none
+check_id()
+{
+_check_id_=`$ID  | $AWK -F\( '{print $2}' | $AWK -F\) '{print $1}'`
+if [ "$_check_id_" != "$1" ]; then
+    _err_msg_="You must be $1 to execute this script."
+    abort_script "$_err_msg_" 
+fi
+}
+
+### Function: check_params ###
+#
+# Check Input Params
+#
+# Arguments:
+#	none
+# Return Values:
+#	none
+check_params()
+{
+# Must have following Params
+if [ ! "${ROLE_INI_FILE}" -o ! "${SUNOS_INI_FILE}" ]; then
+    usage_msg
+    exit 1
+fi
+
+# Make sure that user entered a full pathname for ini file
+_dir_path_=`$ECHO ${ROLE_INI_FILE} | $SED 's/\/[\/]*/\//g'|$SED 's/[\/]*$//g'`
+$ECHO ${_dir_path_} | $EGREP '^[/]'  >> /dev/null 2>&1
+if [ $? -ne 0 ]; then
+    _err_msg_="Full path must be specified to Role ini file."
+    abort_script "$_err_msg_" 
+fi
+
+ROLE_INI_FILE=${_dir_path_}
+if [ ! -s ${ROLE_INI_FILE} ]; then
+    _err_msg_="Valid RBAC.ini file not found."
+    abort_script "$_err_msg_" 
+fi
+}
+
+### Function: get_absolute_path ###
+#
+# Determine absolute path to software
+#
+# Arguments:
+#	none
+# Return Values:
+#	none
+get_absolute_path() 
+{
+_dir_=`$DIRNAME $0`
+SCRIPTHOME=`cd $_dir_ 2>/dev/null && pwd || $ECHO $_dir_`
+}
+
+### Function: usage_msg ###
+#
+#   Print out the usage message
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+usage_msg()
+{
+$ECHO "
+Usage: `$BASENAME $0` -f <role_ini file> -u <sunos_ini file>
+
+options:
+
+-f	: Full Path to ini file containg the roles to be defined for the given user
+
+-s	: Full Path to the SunOS.ini file
+
+"
+}
+
+# ********************************************************************
+#
+# 	Main body of program
+#
+# ********************************************************************
+#
+# Determine absolute path to software
+get_absolute_path
+
+# Check that the effective id of the user is root
+check_id $DEFAULT_USER
+
+while getopts ":f:l:s:" arg; do
+  case $arg in
+    f) ROLE_INI_FILE="$OPTARG" 
+       ;;
+    l) LOGFILE="$OPTARG" 
+       ;;
+    s) SUNOS_INI_FILE="$OPTARG" 
+       ;;
+    *) :
+       ;;
+  esac
+done
+shift `expr $OPTIND - 1`
+
+if [ ! -s $SCRIPTHOME/add_eniq_role.bsh ]; then
+    _err_msg_="Could not locate file $SCRIPTHOME/add_eniq_role.bsh"
+    abort_script "$_err_msg_"
+fi	
+
+if [ ! "${LOGFILE}" ]; then
+	LOGFILE=${ENIQ_BASE_DIR}/local_logs/misc/create_sudo_roles.log
+fi	
+  
+# Check/Create Logfile
+chk_create_logfile
+
+# Create a temporary Directory
+TEM_DIR=/tmp/$0.$$.$$
+$RM -rf ${TEM_DIR}
+$MKDIR -p ${TEM_DIR}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not create directory ${TEM_DIR}"
+    abort_script "$_err_msg_"
+fi
+
+# Source the common functions
+ENIQ_INST_DIR=`$DIRNAME ${SCRIPTHOME}`
+if [ -s $ENIQ_INST_DIR/lib/common_functions.lib ]; then
+    . $ENIQ_INST_DIR/lib/common_functions.lib
+else
+    _err_msg_="File $ENIQ_INST_DIR/lib/common_functions.lib not found"
+    abort_script "$_err_msg_" 
+fi
+
+# Check Input Params
+check_params
+
+# Get the System User.
+_sysuser_=`iniget ENIQ_INSTALL_CONFIG -f ${SUNOS_INI_FILE} -v ENIQ_SYSUSER`
+if [ ! "${_sysuser_}" ]; then
+    _err_msg_="Could not read parameter ENIQ_SYSUSER from ${SUNOS_INI_FILE} file"
+    abort_script "$_err_msg_"
+fi
+
+# Create a temporary file for the role names
+_role_name_list_="${TEM_DIR}/role_name_list"
+$RM -f ${_role_name_list_}
+
+# Get the list of ENIQ roles to be configured
+_eniq_role_list_=`iniget ENIQ_ROLE_CONFIG -f ${ROLE_INI_FILE}`
+if [ ! "${_eniq_role_list_}" ]; then
+    log_msg -l ${LOGFILE} -s "No ENIQ user to be configured in sudoers."
+    $RM -rf ${TEM_DIR}
+    exit 0
+fi
+
+# Create a backup for sudoers
+if [ ! -f ${SUDOFILE}.preroleset ]; then
+    $CP -rp ${SUDOFILE} ${SUDOFILE}.preroleset
+    if [ $? -ne 0 ]; then
+        _err_msg_="Unable to copy ${SUDOFILE} to ${SUDOFILE}.preroleset"
+        abort_script "$_err_msg_"
+    fi
+fi
+
+# Add the ENIQ roles
+for _eniq_role_ in ${_eniq_role_list_}; do
+    _user_name_=`iniget ${_eniq_role_} -f ${ROLE_INI_FILE} -v user_name`
+    _runas_user_=`iniget ${_eniq_role_} -f ${ROLE_INI_FILE} -v runas_user`
+    _user_alias_=`iniget ${_eniq_role_} -f ${ROLE_INI_FILE} -v user_alias`
+    _runas_alias_=`iniget ${_eniq_role_} -f ${ROLE_INI_FILE} -v runas_alias`
+    _cmnd_alias_=`iniget ${_eniq_role_} -f ${ROLE_INI_FILE} -v cmnd_alias`
+
+    if [ ! "${_user_name_}" -o ! "${_user_alias_}" -o ! "${_runas_user_}" -o ! "${_runas_alias_}" ]; then
+        _err_msg_="Unable to get values for user ${_user_} from ${ROLE_INI_FILE}"
+        abort_script "$_err_msg_"
+    fi
+
+    # Check if the users exists
+    for _user_ in ${_user_name_} ${_runas_user_}; do
+        $GETENT passwd ${_user_} >> /dev/null 2>&1
+        if [ $? -ne 0 ]; then
+            _err_msg_="User ${_user_} does not exist"
+            abort_script "$_err_msg_"
+        fi
+    done
+
+    # Add/update ENIQ roles to sudoers
+    log_msg -l ${LOGFILE} -s "Configuring ${_user_name_} privileges for executing ${_runas_user_} user commands."
+    log_msg -l ${LOGFILE} -q -s "Executing Command:\n$BASH $SCRIPTHOME/add_eniq_role.bsh -u ${_user_name_} -U ${_user_alias_} -r ${_runas_user_} -R ${_runas_alias_} -C ${_cmnd_alias_} -l ${LOGFILE}"
+    $BASH $SCRIPTHOME/add_eniq_role.bsh -u ${_user_name_} -U ${_user_alias_} -r ${_runas_user_} -R ${_runas_alias_} -C ${_cmnd_alias_} -l ${LOGFILE}
+    if [ $? -ne 0 ]; then
+        _err_msg_="Could not add role ${_runas_alias_} for ${_user_name_}."
+        abort_script "$_err_msg_"
+    fi
+
+    # Add the roles' commands
+    _command_list_=""
+    _role_list_=`iniget SunOS_RBAC_ROLE -f ${ROLE_INI_FILE}`
+    for _role_ in ${_role_list_}; do
+        _role_user_=`iniget ${_role_} -f ${ROLE_INI_FILE} -v role_user`
+        if [ ! "${_role_user_}" ]; then
+            _role_user_="${_sysuser_}"
+        fi
+
+        _role_name_=`iniget ${_role_} -f ${ROLE_INI_FILE} -v role_name`
+        _role_path_=`iniget ${_role_} -f ${ROLE_INI_FILE} -v role_path`
+
+        if [ "${_runas_alias_}" == "${_role_name_}" ]; then
+            _command_list_="${_role_path_} ${_command_list_}"
+        fi
+    done
+    
+    # Re-format the commands list as per sudoers syntax
+    if [ "${_command_list_}" ]; then
+        _command_list_=`$ECHO "${_command_list_}" | $SED 's/ $//' | $TR ' ' ', '`
+    fi
+
+    _temp_sudoers_=${TEM_DIR}/temp_sudoers
+    _old_cmds_=`$CAT ${SUDOFILE} | $GREP -w "Cmnd_Alias ${_cmnd_alias_}=" | $CUT -f2 -d=`
+    $CAT ${SUDOFILE} | $SED "s|${_cmnd_alias_}=${_old_cmds_}|${_cmnd_alias_}=${_command_list_}|" > ${_temp_sudoers_}
+    if [ $? -ne 0 ]; then
+        _err_msg_="Could not replace new values for commands."
+        abort_script "$_err_msg_"
+    fi
+    $MV -f ${_temp_sudoers_} ${SUDOFILE}
+    if [ $? -ne 0 ]; then
+        _err_msg_="Could not update command for ${role_name} in ${SUDOFILE}."
+        abort_script "$_err_msg_"
+    fi
+    log_msg -l ${LOGFILE} -s "Successfully configured ${_user_name_} privileges in ${SUDOFILE}."
+done
+
+# Add/update the Default RHEL settings as recommends
+$CAT ${SUDOFILE} | $GREP -w "sudo.log" >>/dev/null 2>&1
+if [ $? -ne 0 ]; then
+    $ECHO "## Default RHEL settings" >> ${SUDOFILE}
+    $ECHO "Defaults logfile=/var/log/sudo.log" >> ${SUDOFILE}
+    log_msg -l ${LOGFILE} -s "Added default logfile for SUDO users"
+fi
+
+# Add/update the Default RHEL settings as recommends
+$CAT ${SUDOFILE} | $GREP -w "use_pty" >>/dev/null 2>&1
+if [ $? -ne 0 ]; then
+    $ECHO "Defaults use_pty" >> ${SUDOFILE}
+    log_msg -l ${LOGFILE} -s "Added default terminal settings for SUDO users"
+fi
+
+# Ensure susoers is read-only
+$CHMOD 440 ${SUDOFILE}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not change permission of ${SUDOFILE} to readonly."
+    abort_script "$_err_msg_"
+fi
+
+$RM -rf ${TEM_DIR}
+
+exit 0

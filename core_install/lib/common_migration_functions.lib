@@ -1,0 +1,647 @@
+# ********************************************************************
+# Ericsson Radio Systems AB                                     SCRIPT
+# ********************************************************************
+#
+# (c) Ericsson Radio Systems AB 2021 - All rights reserved.
+#
+# The copyright to the computer program(s) herein is the property
+# of Ericsson Radio Systems AB, Sweden. The programs may be used
+# and/or copied only with the written permission from Ericsson Radio
+# Systems AB or in accordance with the terms and conditions stipulated
+# in the agreement/contract under which the program(s) have been
+# supplied.
+#
+# ********************************************************************
+# Name    : common_migration_functions.lib
+# Date    : 13/05/2021
+# Revision: main\13
+# Purpose : This file contains a set of functions that can be sourced.
+#           NOTE : THESE FUNCTIONS ARE FOR ENIQ SOLARIS MIGRATION ONLY 
+#           AND THEREFORE IF THEY NEED TO BE CHANGED ONLY THE ENIQ 
+#           SOLARIS MIGRATION SCRIPTS WILL BE CONSIDERED.
+# ********************************************************************
+#
+#       Command Section
+#
+# ********************************************************************
+
+BC=/usr/bin/bc
+CAT=/usr/bin/cat
+CP=/usr/bin/cp
+CUT=/usr/bin/cut
+DF=/usr/bin/df
+EGREP=/usr/bin/egrep
+GREP=/usr/bin/grep
+MKDIR=/usr/bin/mkdir
+MV=/usr/bin/mv
+RM=/usr/bin/rm
+SED=/usr/bin/sed
+TOUCH=/usr/bin/touch
+UNAME=/usr/bin/uname
+ZPOOL=/usr/sbin/zpool
+
+# ********************************************************************
+#
+#       Configuration Section
+#
+# ********************************************************************
+# Determine Solaris OS version
+unset SOLARIS_11
+OS_VERSION=`$UNAME -r`
+if [ "${OS_VERSION}" == "5.11" ]; then
+    SOLARIS_11="YES"
+fi
+
+# Setting AWK and ECHO commands based on OS version
+if [ ! "${SOLARIS_11}" ];then
+    AWK=/usr/bin/awk
+    ECHO='/usr/bin/echo -e'
+else
+    AWK=/usr/bin/nawk
+    ECHO=/usr/bin/echo
+fi
+
+#############
+#
+# Functions #
+#
+#############
+
+### Function: ask_for_input ###
+#
+#   Common function to ask for user input
+#   and stores user input in USER_VALUE
+#
+# Arguments:
+#       $1 : User message
+# Return Values:
+#       none
+ask_for_input()
+{
+_msg_=$*
+unset USER_VALUE
+
+while [ 1 ]; do
+    $ECHO "\nPlease enter ${_msg_}"
+    read USER_VALUE
+    
+    if [ ! "$USER_VALUE" ];then
+        $ECHO "Please enter a valid input"
+        continue
+    else
+        break
+    fi
+done
+}
+
+
+### Function: check_and_copy ###
+#
+#   Common function to check and copy a file
+#   to a directory
+#
+# Arguments:
+#       $1 : File name
+#       $2 : Directory path
+# Return Values:
+#       none
+check_and_copy()
+{
+if [ $# -ne 2 ];then
+    _err_msg_="Incorrect number of parameters passed to check_and_copy"
+    abort_script "${_err_msg_}"
+fi
+
+_file_from_=$1
+_dir_to_=$2
+
+if [ ! -f ${_file_from_} ];then
+    _err_msg_="File ${_file_from_} not found."
+    abort_script "${_err_msg_}"
+fi
+
+if [ ! -d ${_dir_to_} ];then
+    _err_msg_="Directory ${_dir_to_} not present."
+    abort_script "${_err_msg_}"
+fi
+
+$CP ${_file_from_} ${_dir_to_} >> /dev/null 2>&1
+if [ $? -ne 0 ];then
+    _err_msg_="Unable to copy ${_file_from_} to ${_dir_to_}"
+    abort_script "${_err_msg_}"
+fi
+}
+
+
+### Function: common_save_sw_loc_path ###
+#
+#   Common function to ask user for parameter value 
+#   and store it in given file in param=value format
+#
+# Arguments:
+#       $1 : File name
+#       $2 : Location for Activity type [migration/recovery]
+#       $3 : Value type [curr/new]
+# Return Values:
+#       none
+common_save_sw_loc_path()
+{
+_user_input_=0
+
+# validate argument passed for file 
+if [ ! "$1" ];then
+  _err_msg_="File name is required"
+  abort_script "${_err_msg_}"
+fi
+_temp_conf_file_=$1
+if [ ! -f "${_temp_conf_file_}" ]; then
+    _err_msg_="Invalid file ${_temp_conf_file_} passed."
+    abort_script "${_err_msg_}"
+fi
+
+# validate argument passed for activity type 
+if [ ! "$2" ]; then
+  _err_msg_="Activity name is required"
+  abort_script "${_err_msg_}"
+fi
+_activity_type_=$2 
+case $_activity_type_ in
+  migration) BASE_SW_LOC=MIG_BASE_SW_LOC
+             OM_SW_LOC=MIG_OM_SW_LOC
+             FEAT_SW_LOC=MIG_FEAT_SW_LOC
+            ;;
+  recovery) BASE_SW_LOC=REC_BASE_SW_LOC
+            OM_SW_LOC=REC_OM_SW_LOC
+            ;;
+  *) _err_msg_="Invalid value passed in location for action type"
+      abort_script "${_err_msg_}"
+esac
+
+# validate argument passed for value type required
+if [ ! "$3" ]; then
+  _err_msg_="Activity name is required"
+  abort_script "${_err_msg_}"
+fi
+
+_value_type_=$3 
+if [ "${_value_type_}" != "curr" -a "${_value_type_}" != "new" ]; then
+    _err_msg_="Invalid value passed in value type"
+    abort_script "${_err_msg_}"
+fi
+
+# If current SW locations to be saved in file
+if [ "${_value_type_}" == "curr" ]; then
+    # Determine current SW location of eniq_base_sw and om_sw_locate 
+    # Get current base sw and om sw
+    _base_sw_file_=${ENIQ_CONF_DIR}/eniq_sw_locate
+    _om_sw_file_=${ENIQ_CONF_DIR}/om_sw_locate
+    if [ ! -s ${_base_sw_file_} -a ! -s ${_om_sw_file_} ]; then
+        $ECHO "\nFiles containing SW location is not found or is empty"
+        _user_input_=1
+       # In case of virtual media ask the input from user 
+        $ECHO "\nTaking inputs from user"
+    else
+        _mws_ip_=`$CAT ${_base_sw_file_} | $AWK -F"@" '{print $1}'`
+        _mws_loc_base_=`$CAT ${_base_sw_file_} | $AWK -F"@" '{print $2}'`
+        _base_sw_path_="/net/${_mws_ip_}${_mws_loc_base_}/eniq_base_sw"
+
+        # Get current om sw
+        _mws_ip_=`$CAT ${_om_sw_file_} | $AWK -F"@" '{print $1}'`
+        _mws_loc_om_=`$CAT ${_om_sw_file_} | $AWK -F"@" '{print $2}'`
+        _om_sw_path_="/net/${_mws_ip_}${_mws_loc_om_}/om"
+
+        # Take user confirmation
+        _disp_file_=${TEM_DIR}/disp_file
+        $ECHO "\nENIQ Base SW and OM SW Location for ${_activity_type_}" > ${_disp_file_}
+        $ECHO "------------------------------------------------" >> ${_disp_file_}
+        $ECHO "Base SW Location for ${_activity_type_}\t\t: ${_base_sw_path_}" >> ${_disp_file_}
+        $ECHO "O&M SW Location for ${_activity_type_}\t\t: ${_om_sw_path_}" >> ${_disp_file_}
+	    
+
+        $CAT ${_disp_file_}
+        $ECHO "\n\nPlease confirm if the above details are correct for ${_activity_type_}."
+        user_confirm
+        if [ "${_response_}" != "YES" ];then
+            _user_input_=1
+        fi
+    fi
+else
+    _user_input_=1
+fi
+    
+# If user inputs are required for path names
+if [ $_user_input_ -eq 1 ]; then	
+    # Take input from user
+    while [ 1 ]; do
+    clear
+        ask_for_input "ENIQ base SW location for ${_activity_type_}"
+        _base_sw_path_=${USER_VALUE}
+        if [ ! -f ${_base_sw_path_}/.eniq_base_sw ];then
+            $ECHO "\nPlease enter valid paths for ENIQ Base SW. \nPress any key to continue..."
+            read
+            continue
+        fi
+
+        if [ "${_value_type_}" == "new" ]; then
+            ask_for_input "O&M SW location for ${_activity_type_}"
+            _om_sw_path_=${USER_VALUE}
+            if [ ! -f ${_om_sw_path_}/.om_linux ];then
+                $ECHO "\nPlease enter valid path for O&M SW. \nPress any key to continue..."
+                read
+                continue
+            fi
+        else
+            ask_for_input "O&M SW location for ${_activity_type_}"
+            _om_sw_path_=${USER_VALUE}
+            if [ ! -f ${_om_sw_path_}/.om ];then
+                $ECHO "\nPlease enter valid path for O&M SW. \nPress any key to continue..."
+                read
+                continue
+            fi
+        fi
+
+        if [ "${_value_type_}" == "new" ]; then
+            ask_for_input "Feature SW location for ${_activity_type_}"
+            _feat_sw_path_=${USER_VALUE}
+            if [ ! -f ${_feat_sw_path_}/eniq_techpacks/eniq.xml ];then
+                $ECHO "\nPlease enter valid path for Feature SW. \nPress any key to continue..."
+                read
+                continue
+            fi
+        fi
+
+        # Take user confirmation for entered values
+        _disp_file_=${TEM_DIR}/disp_file
+        if [ "${_value_type_}" == "new" ]; then
+            $ECHO "\nENIQ Base SW, OM SW and Feature SW Location for ${_activity_type_}" > ${_disp_file_}
+        else
+            $ECHO "\nENIQ Base SW and OM SW Location for ${_activity_type_}" > ${_disp_file_}
+        fi
+        $ECHO "------------------------------------------------" >> ${_disp_file_}
+        $ECHO "Base SW Location for ${_activity_type_}\t\t: ${_base_sw_path_}" >> ${_disp_file_}
+        $ECHO "O&M SW Location for ${_activity_type_}\t\t: ${_om_sw_path_}" >> ${_disp_file_}
+        if [ "${_value_type_}" == "new" ]; then
+            $ECHO "Feature SW Location for ${_activity_type_}\t: ${_feat_sw_path_}" >> ${_disp_file_}
+        fi
+
+        $CAT ${_disp_file_}
+        $ECHO "\n\nPlease confirm if the above details are correct for ${_activity_type_}."
+        user_confirm
+        if [ "${_response_}" != "YES" ]; then
+            continue
+        else
+            break
+        fi
+    done
+    set_conf_value "${FEAT_SW_LOC}" ${_feat_sw_path_} ${_temp_conf_file_}
+fi
+
+set_conf_value "${BASE_SW_LOC}" ${_base_sw_path_} ${_temp_conf_file_}
+set_conf_value "${OM_SW_LOC}" ${_om_sw_path_} ${_temp_conf_file_}
+
+}
+
+### Function: common_save_sw_rep_loc_path ###
+#
+#   Common function to ask user for parameter value 
+#   and store it in given file in param=value format
+#
+# Arguments:
+#       $1 : File name
+#       $2 : Location for Activity type [replacement/rep-recovery]
+#       $3 : Value type [curr/new]
+# Return Values:
+#       none
+common_save_sw_rep_loc_path()
+{
+_user_input_=0
+
+# validate argument passed for file 
+if [ ! "$1" ];then
+  _err_msg_="File name is required"
+  abort_script "${_err_msg_}"
+fi
+_temp_conf_file_=$1
+if [ ! -f "${_temp_conf_file_}" ]; then
+    _err_msg_="Invalid file ${_temp_conf_file_} passed."
+    abort_script "${_err_msg_}"
+fi
+
+# validate argument passed for activity type 
+if [ ! "$2" ]; then
+  _err_msg_="Activity name is required"
+  abort_script "${_err_msg_}"
+fi
+_activity_type_=$2 
+case $_activity_type_ in
+ replacement) BASE_SW_LOC=REP_BASE_SW_LOC
+             OM_SW_LOC=REP_OM_SW_LOC
+            ;;
+ rep-recovery) BASE_SW_LOC=REC_BASE_SW_LOC
+            OM_SW_LOC=REC_OM_SW_LOC
+            ;;
+ *) _err_msg_="Invalid value passed in location for action type"
+      abort_script "${_err_msg_}"
+esac
+
+# validate argument passed for value type required
+if [ ! "$3" ]; then
+  _err_msg_="Activity name is required"
+  abort_script "${_err_msg_}"
+fi
+
+_value_type_=$3 
+if [ "${_value_type_}" != "curr" -a "${_value_type_}" != "new" ]; then
+    _err_msg_="Invalid value passed in value type"
+    abort_script "${_err_msg_}"
+fi
+
+# If current SW locations to be saved in file
+if [ "${_value_type_}" == "curr" ]; then
+    # Determine current SW location of eniq_base_sw and om_sw_locate
+    # Get current base sw and om sw
+    _base_sw_file_=${ENIQ_CONF_DIR}/eniq_sw_locate
+    _om_sw_file_=${ENIQ_CONF_DIR}/om_sw_locate
+    if [ ! -s ${_base_sw_file_} -a ! -s ${_om_sw_file_} ]; then
+        $ECHO "\nFiles containing SW location is not found or is empty"
+        _user_input_=1
+       # In case of virtual media ask the input from user 
+        $ECHO "\nTaking inputs from user"
+    else
+        _mws_ip_=`$CAT ${_base_sw_file_} | $AWK -F"@" '{print $1}'`
+        _mws_loc_base_=`$CAT ${_base_sw_file_} | $AWK -F"@" '{print $2}'`
+        _base_sw_path_="/net/${_mws_ip_}${_mws_loc_base_}/eniq_base_sw"
+
+        # Get current om sw
+        _mws_ip_=`$CAT ${_om_sw_file_} | $AWK -F"@" '{print $1}'`
+        _mws_loc_om_=`$CAT ${_om_sw_file_} | $AWK -F"@" '{print $2}'`
+        _om_sw_path_="/net/${_mws_ip_}${_mws_loc_om_}/om_linux"
+
+        # Take user confirmation
+        _disp_file_=${TEM_DIR}/disp_file
+        $ECHO "\nENIQ Base SW and OM SW Location for ${_activity_type_}" > ${_disp_file_}
+        $ECHO "------------------------------------------------" >> ${_disp_file_}
+        $ECHO "Base SW Location for ${_activity_type_}\t: ${_base_sw_path_}" >> ${_disp_file_}
+        $ECHO "O&M SW Location for ${_activity_type_}\t: ${_om_sw_path_}" >> ${_disp_file_}
+
+        $CAT ${_disp_file_}
+        $ECHO "\n\nPlease confirm if the above details are correct for ${_activity_type_}."
+        user_confirm
+        if [ "${_response_}" != "YES" ];then
+            _user_input_=1
+        fi
+    fi
+else
+    _user_input_=1
+fi
+    
+# If user inputs are required for path names
+if [ $_user_input_ -eq 1 ]; then    
+    # Take input from user
+    while [ 1 ]; do
+    clear
+        ask_for_input "ENIQ base SW location for ${_activity_type_}"
+        _base_sw_path_=${USER_VALUE}
+        if [ ! -f ${_base_sw_path_}/.eniq_base_sw ];then
+            $ECHO "\nPlease enter valid paths for ENIQ Base SW. \nPress any key to continue..."
+            read
+            continue
+        fi
+    
+        ask_for_input "O&M SW location for ${_activity_type_}"
+        _om_sw_path_=${USER_VALUE}
+        if [ ! -f ${_om_sw_path_}/.om_linux ];then
+            $ECHO "\nPlease enter valid path for O&M SW. \nPress any key to continue..."
+            read
+            continue
+        fi
+
+        # Take user confirmation for entered values
+        _disp_file_=${TEM_DIR}/disp_file
+        $ECHO "\nENIQ Base SW and OM SW Location for ${_activity_type_}" > ${_disp_file_}
+        $ECHO "------------------------------------------------" >> ${_disp_file_}
+        $ECHO "Base SW Location for ${_activity_type_}\t: ${_base_sw_path_}" >> ${_disp_file_}
+        $ECHO "O&M SW Location for ${_activity_type_}\t: ${_om_sw_path_}" >> ${_disp_file_}
+
+        $CAT ${_disp_file_}
+        $ECHO "\n\nPlease confirm if the above details are correct for ${_activity_type_}."
+        user_confirm
+        if [ "${_response_}" != "YES" ]; then
+            continue
+        else
+            break
+        fi
+    done
+fi
+
+set_conf_value "${BASE_SW_LOC}" ${_base_sw_path_} ${_temp_conf_file_}
+set_conf_value "${OM_SW_LOC}" ${_om_sw_path_} ${_temp_conf_file_}
+}
+
+
+
+### Function: read_value ###
+#
+#   Common function to get value from file
+#   having the param=value format
+#
+# Arguments:
+#       $1 : Parameter name
+#       $2 : File name
+# Return Values:
+#       $_value_
+read_value()
+{
+if [ $# -ne 2 ];then
+    _err_msg_="Incorrect number of arguments passed to read_value"
+    echo "${_err_msg_}"
+    exit 1
+fi
+
+_param_=$1
+_file_=$2
+
+if [ ! -f ${_file_} ];then
+    _err_msg_="Could not find ${_file_} to read value from."
+    echo "${_err_msg_}"
+    exit 1
+fi
+
+_value_=""
+# Read the value
+_value_=`$CAT ${_file_} | $GREP "^${_param_}=" | $CUT -f 2 -d =`
+if [ ! "${_value_}" ];then
+    _err_msg_="Could not get the ${_param_} value from ${_file_} file."
+    echo "${_err_msg_}"
+    exit 1
+fi
+echo $_value_
+}
+
+
+### Function: set_conf_value ###
+#
+#   Common function to set value in file
+#   having the param=value format
+#
+# Arguments:
+#       $1 : Parameter name
+#       $2 : Value
+#       $3 : File name
+# Return Values:
+#       none
+set_conf_value()
+{
+if [ $# -ne 3 ];then
+    _err_msg_="Incorrect number of parameters passed to set_conf_value"
+    abort_script "${_err_msg_}"
+fi
+
+_param_=$1
+_value_=$2
+_file_=$3
+
+# Update param=value
+# Check if the param exists in file
+$CAT ${_file_} | $GREP "^${_param_}=" >> /dev/null
+if [ $? -ne 0 ];then
+    $ECHO "${_param_}=${_value_}" >> ${_file_}
+else
+    $CAT ${_file_} | $SED 's/"${_param_}=*"/"${_param_}=${_value_}"/' > /tmp/updated_file.$$.$$
+    if [ $? -ne 0 ];then
+        _err_msg_="Failed to update ${_param_} value in ${_file_}"
+        abort_script "${_err_msg_}"
+    fi
+    $MV /tmp/updated_file.$$.$$ ${_file_}
+    if [ $? -ne 0 ];then
+        _err_msg_="Failed to save ${_param_} value in ${_file_}"
+        abort_script "${_err_msg_}"
+    fi
+fi
+}
+
+### Function: user_confirm ###
+#
+#   Take user confirmation
+#
+# Arguments:
+#   $1 : User display message
+# Return Values:
+#   User response : YES/NO
+user_confirm()
+{
+_usr_msg_="\n\nDo you want to proceed? (Yy/Nn)"
+unset _response_
+
+while [ 1 ]
+do
+    $ECHO ${_usr_msg_}
+    read ans
+
+    case $ans in
+      Y|y) _response_="YES"
+                       break
+                       ;;
+      N|n) _response_="NO"
+                    break
+                    ;;
+      *) $ECHO "Invalid input. Enter again."
+         ;;
+    esac
+done
+}
+
+### Function: check_NAS_fs_size ###
+#
+# To calculate used size for NAS file systems
+#
+# Arguments:
+#    none
+# Return Values:
+#    none
+check_NAS_fs_size()
+{
+unset _total_used_size_
+_total_used_size_=0
+
+_nas_fs_list="log admin sw sentinel"
+
+for _fs_ in `$ECHO ${_nas_fs_list}`; do
+    unset _final_val_
+    _final_val_=0
+    _size_=`$DF -hk /eniq/${_fs_} | $AWK '{print $2}' | $GREP -vi 'Size' | $AWK -F"G" '{print $1}'`
+    _final_val_=`$DF -hk /eniq/${_fs_} | $AWK '{print $5}' | $GREP -vi 'Capacity' | $AWK -F"%" '{print $1}'`
+
+    _used_size_=`$ECHO "scale=2; ${_size_}*${_final_val_} /100" | $BC`
+    _total_used_size_=`$ECHO "scale=2; ${_total_used_size_}+${_used_size_}" | $BC`
+done
+
+TOTAL_USED_NAS_SIZE=`$ECHO ${_total_used_size_}`
+}
+
+### Function: check_root_fs_size ###
+#
+# To calculate used size for root file system
+#
+# Arguments:
+#    none
+# Return Values:
+#    none
+check_root_fs_size()
+{
+unset _total_used_size_
+_total_used_size_=0
+
+_root_fs_list="/ /var"
+
+for _fs_ in `$ECHO ${_root_fs_list}`; do
+    unset _final_val_
+    _final_val_=0
+    _size_=`$DF -hk ${_fs_} | $AWK '{print $2}' | $GREP -vi 'Size' | $AWK -F"G" '{print $1}'`
+    _final_val_=`$DF -hk ${_fs_} | $AWK '{print $5}' | $GREP -vi 'Capacity' | $AWK -F"%" '{print $1}'`
+
+    _used_size_=`$ECHO "scale=2; ${_size_}*${_final_val_} /100" | $BC`
+    _total_used_size_=`$ECHO "scale=2; ${_total_used_size_} + ${_used_size_}" | $BC`
+done
+
+TOTAL_USED_ROOT_SIZE=`$ECHO ${_total_used_size_}`
+$ECHO ${TOTAL_USED_ROOT_SIZE}
+}
+
+### Function: check_zpool_size ###
+#
+# To calculate used size for both zpools
+#
+# Arguments:
+#    none
+# Return Values:
+#    none
+check_zpool_size()
+{
+ENIQ_CONF_DIR=/eniq/installation/config
+# Sourcing common_functions.lib
+. /eniq/installation/core_install/lib/common_functions.lib
+unset _total_used_size_
+_total_used_size_=0
+
+# Getting FS list from SunOS.ini file
+_fs_list_=`iniget SunOS_ZFS_FS -f ${ENIQ_CONF_DIR}/SunOS.ini`
+
+for _pool_ in `$ZPOOL list | $AWK '{print $1}' | $EGREP -v 'NAME|rpool'`; do
+    unset _final_val_
+    _final_val_=0
+    _size_=`$ZPOOL list | $GREP ${_pool_} | $AWK '{print $2}' | $AWK -F"G" '{print $1}'`
+    for _fs_ in ${_fs_list_}; do
+        _fs_mount_point_=`iniget ${_fs_} -f ${ENIQ_CONF_DIR}/SunOS.ini -v mountpoint`
+        $DF -hk ${_fs_mount_point_} | $GREP ${_pool_} >> /dev/null 2>&1
+         if [ $? -eq 0 ]; then
+            _val_=`$DF -hk ${_fs_mount_point_} | $GREP -v "Filesystem" | $AWK '{print $5}' | $AWK -F"%" '{print $1}'`
+            _final_val_=`expr ${_final_val_} + ${_val_}`
+         fi
+    done
+    _used_size_=`$ECHO "scale=2; ${_size_}*${_final_val_} /100" | $BC`
+   _total_used_size_=`$ECHO "scale=2; ${_total_used_size_} + ${_used_size_}" | $BC`
+done
+
+$ECHO "${_total_used_size_}"
+}

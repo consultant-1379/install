@@ -1,0 +1,164 @@
+#!/bin/bash
+# ********************************************************************
+# Ericsson Radio Systems AB                                     SCRIPT
+# ********************************************************************
+#
+#
+# (c) Ericsson Radio Systems AB 2019 - All rights reserved.
+#
+# The copyright to the computer program(s) herein is the property
+# of Ericsson Radio Systems AB, Sweden. The programs may be used
+# and/or copied only with the written permission from Ericsson Radio
+# Systems AB or in accordance with the terms and conditions stipulated
+# in the agreement/contract under which the program(s) have been
+# supplied.
+#
+# ********************************************************************
+# Name    : trigger_roll_snap.bsh
+# Date    : 16/01/2019
+# Revision: E
+# Purpose : The purpose of this script is to trigger a rolling snapshot.
+#           backup. This script will normally be called by crontab
+#
+# Usage   : trigger_roll_snap.bsh
+#
+# ********************************************************************
+#
+#       Command Section
+#
+# ********************************************************************
+AWK=/usr/bin/awk
+DATE=/usr/bin/date
+DIRNAME=/usr/bin/dirname
+ECHO=/usr/bin/echo
+EGREP=/usr/bin/egrep
+GREP=/usr/bin/grep
+ID=/usr/bin/id
+MKDIR=/usr/bin/mkdir
+SYSTEMCTL=/usr/bin/systemctl
+TOUCH=/usr/bin/touch
+
+# ********************************************************************
+#
+#       Configuration Section
+#
+# ********************************************************************
+ENIQ_ROLL_SNAP_SMF_ID="eniq-roll-snap.service"
+
+DEFAULT_USER=root
+
+ENIQ_BASE_DIR=/eniq
+
+# ********************************************************************
+#
+#       Pre-execution Operations
+#
+# ********************************************************************
+
+# ********************************************************************
+#
+#       functions
+#
+# ********************************************************************
+### Function: abort_script ###
+#
+#   This will is called if the script is aborted thru an error
+#   error signal sent by the kernel such as CTRL-C or if a serious
+#   error is encountered during runtime
+#
+# Arguments:
+#       $1 - Error message from part of program (Not always used)
+# Return Values:
+#       none
+abort_script()
+{
+_err_time_=`$DATE '+%Y-%b-%d_%H.%M.%S'`
+
+if [ "${1}" ]; then
+        _err_msg_="${_err_time_} - ERROR : ${1}\n\nScript aborted"
+else
+    _err_msg_="${_err_time_} - ERROR : Script aborted.......\n"
+fi
+
+$ECHO ${_err_msg_}
+
+cd ${SCRIPTHOME}
+
+exit 1
+}
+
+### Function: check_id ###
+#
+#   Check that the effective id of the user is correct
+#   If not print error msg and exit.
+#
+# Arguments:
+#       $1 : User ID name
+# Return Values:
+#       none
+check_id()
+{
+_check_id_=`$ID  | $AWK -F\( '{print $2}' | $AWK -F\) '{print $1}'`
+if [ "$_check_id_" != "$1" ]; then
+    _err_msg_="You must be $1 to execute this script."
+    abort_script "$_err_msg_"
+fi
+}
+
+### Function: get_absolute_path ###
+#
+# Determine absolute path to software
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+get_absolute_path()
+{
+_dir_=`$DIRNAME $0`
+SCRIPTHOME=`cd $_dir_ 2>/dev/null && pwd || $ECHO $_dir_`
+}
+
+### Function: setup_env ###
+#
+# Setup some variables
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+setup_env()
+{
+LOGDIR=${ENIQ_BASE_DIR}/local_logs/rolling_snapshot_logs
+
+ENIQ_BKUP_DIR=${ENIQ_BASE_DIR}/bkup_sw
+}
+
+# ********************************************************************
+#
+#       Main body of program
+#
+# ********************************************************************
+#
+# Determine absolute path to software
+get_absolute_path
+
+# Check that the effective id of the user is root
+check_id $DEFAULT_USER
+
+setup_env
+
+$MKDIR -p ${LOGDIR}
+if [ $? -ne 0 ]; then
+        _err_msg_="Could not create directory ${LOGDIR}"
+        abort_script "$_err_msg_"
+fi
+
+# Check if rolling snapshot service is active
+ _service_state=`$SYSTEMCTL show -p ActiveState ${ENIQ_ROLL_SNAP_SMF_ID} | $AWK -F "=" '{print $2}'`
+if [ "${_service_state}" == "active" ]; then
+    # Trigger the rolling snapshot
+    $TOUCH ${ENIQ_BKUP_DIR}/etc/.create_rolling_snapshot
+fi
+
+exit 0

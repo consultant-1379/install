@@ -1,0 +1,1163 @@
+#!/usr/bin/bash
+#********************************************************************
+# Ericsson Radio Systems AB SCRIPT
+#********************************************************************
+#
+# (c) Ericsson Radio Systems AB 2022 - All rights reserved.
+#
+# The copyright to the computer program(s) herein is the property
+# of Ericsson Radio Systems AB, Sweden. The programs may be used
+# and/or copied only with the written permission from Ericsson Radio
+# Systems AB or in accordance with the terms and conditions stipulated
+# in the agreement/contract under which the program(s) have been
+# in the agreement/contract under which the program(s) have been
+# supplied.
+#
+#********************************************************************
+# Name     : upgrade_linux_os.bsh
+# Date     : 11/10/2023
+# Revision : /main/15
+# Purpose  : Objective of the package is to enable users to check whether
+#         RHEL linux upgrade is needed on all servers and trigger the same
+#         parallel to reduce time for RLU.
+#
+# Usage    : bash /eniq/installation/core_install/bin/upgrade_linux_os.bsh -D <O&M_Media_location> -p <LU_PATH> -A <ACTION_TYPE>
+#
+#********************************************************************
+#
+#       Command Section
+#
+#********************************************************************
+
+AWK=/usr/bin/awk
+BASENAME=/usr/bin/basename
+BASH=/usr/bin/bash
+CAT=/usr/bin/cat
+DATE=/usr/bin/date
+DIRNAME=/usr/bin/dirname
+ECHO='/usr/bin/echo -e'
+ENV=/usr/bin/env
+EGREP=/usr/bin/egrep
+GETENT=/usr/bin/getent
+GREP=/usr/bin/grep
+HEAD=/usr/bin/head
+MYHOSTNAME=/usr/bin/hostname
+ID=/usr/bin/id
+LS=/usr/bin/ls
+MKDIR=/usr/bin/mkdir
+PERL=/usr/bin/perl
+PING=/usr/bin/ping
+PYTHON=/usr/bin/python
+RM=/usr/bin/rm
+SLEEP=/usr/bin/sleep
+SED=/usr/bin/sed
+SUDO=/usr/bin/sudo
+SSH=/usr/bin/ssh
+TAC=/usr/bin/tac
+TEE=/usr/bin/tee
+TOUCH=/usr/bin/touch
+
+
+# ********************************************************************
+#
+#       Configuration Section
+#
+# ********************************************************************
+
+# Default user
+#DEFAULT_USER=root
+
+#NODE_HARDENING_COMPLIANCE_script
+NH_post_patch="/ericsson/security/compliance/NH_post_patch.py"
+COMPLIANCE_script="/ericsson/security/compliance/NH_Compliance.py"
+
+# ********************************************************************
+#
+#   Functions
+#
+# ********************************************************************
+### Function: abort_script ###
+#
+#   This will is called if the script is aborted thru an error
+#   signal sent by the kernel such as CTRL-C or if a serious
+#   error is encountered during runtime
+#
+# Arguments:
+#       $1 - Error message from part of program (Not always used)
+# Return Values:
+#       none
+abort_script()
+{
+_err_time_=`$DATE '+%Y-%b-%d_%H.%M.%S'`
+
+if [ "$1" ]; then
+    _err_msg_="${_err_time_} - $1"
+else
+    _err_msg_="${_err_time_} - ERROR : Script aborted.......\n"
+fi
+
+if [ "${LOGFILE}" -a "${CONSOLELOGS}" ]; then
+    $ECHO "\nERROR : ${_err_msg_}\n" | $TEE -a ${LOGFILE} ${CONSOLELOGS}
+else
+    $ECHO "\nERROR : ${_err_msg_}\n"
+fi
+$RM -rf ${TEM_DIR}
+exit 1
+}
+
+### Function: check_id ###
+#
+#   Check that the effective id of the user is correct
+#   If not print error msg and exit.
+#
+# Arguments:
+#       $1 : User ID name
+# Return Values:
+#       none
+check_id()
+{
+
+_get_id_=`$ENV |$GREP -w SUDO_USER | $EGREP "^[[:blank:]]*SUDO_USER="|$AWK -F\= '{print $2}'|$SED -e 's|"||g'`
+
+_check_id_=`$ID | $AWK -F\( '{print $2}' | $AWK -F\) '{print $1}'`
+
+_check_group_=`$ID $_get_id_ | $AWK -F\( '{print $3}' | $AWK -F\) '{print $1}'`
+
+
+    if [ "${_get_id_}" == "" ]; then
+
+        if [ "${_check_id_}" == "root" ]; then
+           # Set 1 for true
+           _user_root=1
+
+        else
+           _err_msg_="You must be root or admin to execute this script."
+           abort_script "${_err_msg_}"
+        fi
+          else
+            if [ "${_check_group_}" == "ENIQ_ADMIN_ROLE" ]; then
+               # Set 0 for false
+               _user_root=0
+
+            else
+               _err_msg_="You must be root or admin to execute this script." 
+               abort_script "${_err_msg_}"
+            fi
+    fi
+}
+
+### Function: check_params ###
+#
+# Check Input Params
+#
+# Arguments:
+#    none
+# Return Values:
+#    none
+check_params()
+{
+if [ ! "${OM_MEDIA_PATH}" -o ! "${ACTION_TYPE}" -o ! "${LU_PATH}" ]; then
+    usage_msg
+    exit 1
+fi
+}
+
+### Function: checkif_upgrade_needed ###
+#
+# This function checks if RHEL linux upgrade is required
+# on all the servers in current deployment
+#
+# Arguments:
+#       $1 : Server order list
+# Return Values:
+#       none
+checkif_upgrade_needed()
+{
+local _server_order_file_=$1
+
+for _line_ in `$CAT ${_server_order_file_}`; do
+        unset _ip_address_ _serv_hostname_ _check_rlu_state_ _count_
+		local _ip_address_ _serv_hostname_ _count_
+		_count_=`$ECHO "${_line_}" | grep -o "::" | wc -l`
+
+		if [ "${_ip_type_}" == "IPv6" ] && [ "${_count_}" == 3 ]; then
+			_ip_address_=`$ECHO ${_line_} | grep -oE '([a-fA-F0-9]{1,4}::?){1,7}[a-fA-F0-9]{1,4}' | head -n 1 | awk -F "::" '{ print $1 "::" $2}'`
+			_serv_hostname_=`$ECHO ${_line_} | $AWK -F"::" '{print $3}'`
+		else
+			_ip_address_=`$ECHO ${_line_} | $AWK -F"::" '{print $1}'`
+			_serv_hostname_=`$ECHO ${_line_} | $AWK -F"::" '{print $2}'`
+		fi
+        export _serv_hostname_
+        if [ ! "${_ip_address_}" ] || [ ! "${_serv_hostname_}" ]; then
+            _err_msg_="Could not read required info from ${_server_order_file_}"
+            abort_script "${_err_msg_}"
+        fi
+
+    insert_header_footer head  "Verifying if RHEL linux Upgrade is required on ${_serv_hostname_}" ${LOGFILE} | $TEE -a ${CONSOLELOGS}
+    local _check_rlu_state_=`iniget RLU_STATUS -f ${ENIQ_CONF_DIR}/rlu.ini -v ${_serv_hostname_}`
+    if [ ! "${_check_rlu_state_}" ]; then
+        _err_msg_="Could not obtain the status of RHEL linux upgrade for ${_serv_hostname_} from ini file"
+        abort_script "${_err_msg_}"
+    fi
+    if [ "${_check_rlu_state_}" == "DONE" ]; then
+        log_msg -s "RHEL linux upgrade is not required on ${_serv_hostname_}" -l ${LOGFILE} | $TEE -a ${CONSOLELOGS}
+        continue
+    elif [ "${_check_rlu_state_}" == "NOT STARTED" -o "${_check_rlu_state_}" == "NOTREQUIRED" ]; then
+        if [ "${_ip_address_}" == "${HOST_IP}" ]; then
+            $BASH ${OM_MEDIA_PATH}/patch/bin/pre_upgrade_patchrhel.bsh ${LU_PATH} ${OM_MEDIA_PATH}
+            _upgrade_needed_=$?
+        else
+            if [ "${_user_root}" == 1 ]; then
+        
+				# Execute Root command
+				$RUN_REM_CMD root@$_ip_address_  "$BASH ${OM_MEDIA_PATH}/patch/bin/pre_upgrade_patchrhel.bsh ${LU_PATH} ${OM_MEDIA_PATH}"
+				_upgrade_needed_=$?
+			else
+				# Execute non root admin user command
+				$SUDO -u $_get_id_ $RUN_REM_CMD $_get_id_@$_ip_address_  "$SUDO $BASH ${OM_MEDIA_PATH}/patch/bin/pre_upgrade_patchrhel.bsh ${LU_PATH} ${OM_MEDIA_PATH}" 
+				_upgrade_needed_=$?          
+			fi 
+        fi
+        if [ ${_upgrade_needed_} -eq 0 ]; then
+            log_msg -s "Upgrade required" -l ${LOGFILE}
+            iniset RLU_STATUS -f ${ENIQ_CONF_DIR}/rlu.ini $_serv_hostname_="REQUIRED"
+        elif [ ${_upgrade_needed_} -eq 1 ]; then
+            log_msg -s "Upgrade is not required" -l ${LOGFILE}
+            iniset RLU_STATUS -f ${ENIQ_CONF_DIR}/rlu.ini $_serv_hostname_="NOTREQUIRED"
+        else
+            log_msg -s "pre_upgrade failed due to mount path or repo creation or version of bundle"  -l ${LOGFILE} | $TEE -a ${CONSOLELOGS}
+            abort_script "${_err_msg_}"
+        fi
+    else
+        log_msg -s "\nRHEL linux pre upgrade check is completed on ${_serv_hostname_}. Skipping verification check now." -l ${LOGFILE} | $TEE -a ${CONSOLELOGS}
+    fi
+done
+}
+
+### Function: create_rlu_ini ###
+#
+# Create an ini file to maintain 
+# the status of RHEL linux Upgrade
+#
+# Arguments:
+#       $1 : Server order list
+# Return Values:
+#       none
+create_rlu_ini()
+{
+local _server_order_file_=$1
+if [ -f ${ENIQ_CONF_DIR}/rlu.ini ]; then
+    $RM -rf ${ENIQ_CONF_DIR}/rlu.ini
+fi
+
+$TOUCH ${ENIQ_CONF_DIR}/rlu.ini
+log_msg -s -q "Creating INI file for maintaining the status of rlu" -l ${LOGFILE}
+for var in RLU_STATUS; do
+    iniset $var -f ${ENIQ_CONF_DIR}/rlu.ini
+    if [ $? -ne 0 ]; then
+        _err_msg_="Could not set $var in rlu.ini"
+        abort_script "${_err_msg_}"
+    fi
+    for _line_ in `$CAT ${_server_order_file_}`; do
+        unset _ip_address_ _serv_hostname_ _count_
+		local _ip_address_ _serv_hostname_ _count_
+		
+		_count_=`$ECHO "${_line_}" | grep -o "::" | wc -l`
+
+		if [ "${_ip_type_}" == "IPv6" ] && [ "${_count_}" == 3 ]; then
+			_ip_address_=`$ECHO ${_line_} | grep -oE '([a-fA-F0-9]{1,4}::?){1,7}[a-fA-F0-9]{1,4}' | head -n 1 | awk -F "::" '{ print $1 "::" $2}'`
+			_serv_hostname_=`$ECHO ${_line_} | $AWK -F"::" '{print $3}'`
+		else
+			_ip_address_=`$ECHO ${_line_} | $AWK -F"::" '{print $1}'`
+			_serv_hostname_=`$ECHO ${_line_} | $AWK -F"::" '{print $2}'`
+		fi
+
+        if [ ! "${_ip_address_}" ] || [ ! "${_serv_hostname_}" ]; then
+            _err_msg_="Could not read required info from ${_server_order_file_}"
+            abort_script "${_err_msg_}"
+        fi
+
+        iniset $var -f ${ENIQ_CONF_DIR}/rlu.ini ${_serv_hostname_}="NOT STARTED"
+        if [ $? -ne 0 ]; then
+            _err_msg_="Could not initialize $var for ${_serv_hostname_} in rlu.ini"
+            abort_script "${_err_msg_}"
+        fi
+    done
+    $ECHO " " >> ${ENIQ_CONF_DIR}/rlu.ini
+done
+log_msg -s -q "INI file created" -l ${LOGFILE}
+log_msg -s -q "Setting up RHEL Patch upgrade flag" -l ${LOGFILE}
+$TOUCH /var/tmp/rhel_linux_upgrade_in_progress
+}
+
+### Function: display_summary ###
+#
+# This function displays a summary of linux upgrade and boot environment
+# activation status
+#
+# Arguments:
+#       $1 : Server order list
+# Return Values:
+#   none
+display_summary()
+{
+insert_header_footer head "RHEL linux Upgrade Results" ${LOGFILE} | $TEE -a ${CONSOLELOGS}
+
+$RM -rf ${TEM_DIR}/Summary_RLU 2>/dev/null
+$TOUCH ${TEM_DIR}/Summary_RLU
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not create file summary file for RLU"
+    abort_script "${_err_msg_}"
+fi
+printf '%-20s | %-20s | %-20s \n \n' "SERVER" "linux UPGRADE STATUS" >> ${TEM_DIR}/Summary_RLU
+
+local _server_order_file_=$1
+
+for _line_ in `$CAT ${_server_order_file_}`; do
+        unset _ip_address_ _serv_hostname_ _count_
+		local _ip_address_ _serv_hostname_ _count_
+		
+		_count_=`$ECHO "${_line_}" | grep -o "::" | wc -l`
+
+		if [ "${_ip_type_}" == "IPv6" ] && [ "${_count_}" == 3 ]; then
+			_ip_address_=`$ECHO ${_line_} | grep -oE '([a-fA-F0-9]{1,4}::?){1,7}[a-fA-F0-9]{1,4}' | head -n 1 | awk -F "::" '{ print $1 "::" $2}'`
+			_serv_hostname_=`$ECHO ${_line_} | $AWK -F"::" '{print $3}'`
+		else
+			_ip_address_=`$ECHO ${_line_} | $AWK -F"::" '{print $1}'`
+			_serv_hostname_=`$ECHO ${_line_} | $AWK -F"::" '{print $2}'`
+		fi
+        export _serv_hostname_
+        if [ ! "${_ip_address_}" ] || [ ! "${_serv_hostname_}" ]; then
+            _err_msg_="Could not read required info from ${_server_order_file_}"
+            abort_script "${_err_msg_}"
+        fi
+    _rlu_status_=`iniget RLU_STATUS -f ${ENIQ_CONF_DIR}/rlu.ini -v ${_serv_hostname_}`
+        if [ ! "${_rlu_status_}" ]; then
+            _err_msg_="Could not obtain the status of RHEL linux upgrade for ${_serv_hostname_} from ini file"
+            abort_script "${_err_msg_}"
+        fi
+
+    printf '%-20s | %-20s | %-20s\n \n' "${_serv_hostname_}" "${_rlu_status_}" >> ${TEM_DIR}/Summary_RLU 
+done
+$CAT ${TEM_DIR}/Summary_RLU | $TEE -a ${CONSOLELOGS}
+}
+
+### Function: execute_linux_upgrade ###
+#
+# This function performs RHEL linux upgrade 
+# on all the servers in current deployment
+#
+# Arguments:
+#       $1 : Server order list
+# Return Values:
+#       none
+execute_linux_upgrade()
+{
+local _server_order_file_=$1
+
+for _line_ in `$CAT ${_server_order_file_}`; do
+        unset _ip_address_ _serv_hostname_ _check_rlu_state_ _count_
+		local _ip_address_ _serv_hostname_ _count_
+		
+		_count_=`$ECHO "${_line_}" | grep -o "::" | wc -l`
+
+		if [ "${_ip_type_}" == "IPv6" ] && [ "${_count_}" == 3 ]; then
+			_ip_address_=`$ECHO ${_line_} | grep -oE '([a-fA-F0-9]{1,4}::?){1,7}[a-fA-F0-9]{1,4}' | head -n 1 | awk -F "::" '{ print $1 "::" $2}'`
+			_serv_hostname_=`$ECHO ${_line_} | $AWK -F"::" '{print $3}'`
+		else
+			_ip_address_=`$ECHO ${_line_} | $AWK -F"::" '{print $1}'`
+			_serv_hostname_=`$ECHO ${_line_} | $AWK -F"::" '{print $2}'`
+		fi
+        
+        export _serv_hostname_
+        if [ ! "${_ip_address_}" -o ! "${_serv_hostname_}" ]; then
+            _err_msg_="Could not read required info from ${_server_order_file_}"
+            abort_script "${_err_msg_}"
+        fi
+
+    insert_header_footer head  "Performing upgrade on server ${_serv_hostname_} based on requirement" ${LOGFILE} | $TEE -a ${CONSOLELOGS}
+    local _check_rlu_state_=`iniget RLU_STATUS -f ${ENIQ_CONF_DIR}/rlu.ini -v ${_serv_hostname_}`
+    if [ ! "${_check_rlu_state_}" ]; then
+        _err_msg_="Could not obtain the status of RHEL linux upgrade for ${_serv_hostname_} from ini file"
+        abort_script "${_err_msg_}"
+    fi
+    if [ "${_check_rlu_state_}" == "NOTREQUIRED" -o "${_check_rlu_state_}" == "DONE" ]; then
+        log_msg -s "RHEL linux upgrade is not required on ${_serv_hostname_}" -l ${LOGFILE} | $TEE -a ${CONSOLELOGS}
+        continue
+    elif [ "${_check_rlu_state_}" == "REQUIRED" ]; then
+        if [ "${_ip_address_}" == "${HOST_IP}" ]; then
+            $BASH ${OM_MEDIA_PATH}/patch/bin/upgrade_patchrhel.bsh -a ${ACTION_TYPE}
+            _linux_upgrade_=$?
+        else
+			if [ "${_user_root}" == 1 ]; then
+        
+				# Execute Root command
+				$RUN_REM_CMD root@$_ip_address_  "$BASH ${OM_MEDIA_PATH}/patch/bin/upgrade_patchrhel.bsh -a ${ACTION_TYPE}" 
+				_linux_upgrade_=$?
+			else
+				# Execute non root admin user command
+				$SUDO -u $_get_id_ $RUN_REM_CMD $_get_id_@$_ip_address_  "$SUDO $BASH ${OM_MEDIA_PATH}/patch/bin/upgrade_patchrhel.bsh -a ${ACTION_TYPE}"
+				_linux_upgrade_=$?          
+			fi
+        fi
+        if [ ${_linux_upgrade_} -eq 0 ]; then
+            log_msg -s "RHEL linux upgrade was successful on ${_serv_hostname_}" -l ${LOGFILE} | $TEE -a ${CONSOLELOGS}
+            iniset RLU_STATUS -f ${ENIQ_CONF_DIR}/rlu.ini $_serv_hostname_="DONE"
+        else
+            _err_msg_="RHEL linux upgrade was unsuccessful on ${_serv_hostname_}"
+            abort_script "${_err_msg_}"
+        fi
+    else
+        log_msg -s "RHEL linux upgrade unsuccessful due to pre-upgrade failure" -l ${LOGFILE} | $TEE -a ${CONSOLELOGS}
+    fi
+done
+}
+
+### Function: get_deployment_order ###
+#
+# Get the order of the deployment
+# for triggering RHEL linux Upgrade
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+get_deployment_order()
+{
+log_msg -s -q "Removing the list of servers if already exists" -l ${LOGFILE}
+$RM -rf ${TEM_DIR}/server_order_list ${TEM_DIR}/service_reverse_order_list 
+
+# Get an ordered list of servers based on the server_list file
+log_msg -s -q "Getting server order file" -l ${LOGFILE}
+$PERL ${ENIQ_CORE_INST_DIR}/lib/get_ip_order.pl -f ${TEM_DIR}/server_order_list
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not get an ordered list of servers"
+    abort_script "${_err_msg_}"
+fi
+
+log_msg -s -q "Reversing the list of servers obtained" -l ${LOGFILE}
+# Reverse the created file for the stop order
+$TAC ${TEM_DIR}/server_order_list > ${TEM_DIR}/service_reverse_order_list
+}
+
+### Function: get_absolute_path ###
+#
+# Determine absolute path to software
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+get_absolute_path()
+{
+_dir_=`$DIRNAME $0`
+SCRIPTHOME=`cd $_dir_ 2>/dev/null && pwd || $ECHO $_dir_`
+}
+
+### Function: insert_header_footer ###
+#
+#   Insert a stage header/footer message
+#
+# Arguments:
+#   $1 : head/foot
+#   $2 : Message
+#   $3 : Logfile
+# Return Values:
+#   none
+insert_header_footer()
+{
+if [ $# -ne 3 ]; then
+    _err_msg_="3 Parameters must be passed to header/footer function"
+    abort_script "${_err_msg_}" 
+fi
+
+if [ "$1" != "head" -a "$1" != "foot" ]; then
+    _err_msg_="Only Param of head/foot is allowed...exiting!"
+    abort_script "${_err_msg_}" 
+fi
+_type_=$1
+
+_msg_=$2
+
+_logfile_=$3
+$MKDIR -p `$DIRNAME ${_logfile_}`
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not create directory `$DIRNAME ${_logfile_}`"
+    abort_script "${_err_msg_}" 
+fi
+
+$TOUCH -a ${_logfile_}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not write to file ${_logfile_}"
+    abort_script "${_err_msg_}" 
+fi
+
+_time_=`$DATE '+%Y-%b-%d_%H.%M.%S'`
+if [ "$_type_" == "head" ]; then
+    log_msg -s "\n-----------------------------------------------------" -l ${_logfile_}
+    log_msg -s "-----------------------------------------------------" -l ${_logfile_}
+    log_msg -s "$_time_ : $_msg_" -l ${_logfile_}
+    log_msg -s "-----------------------------------------------------" -l ${_logfile_}
+fi
+
+if [ "$_type_" == "foot" ]; then
+    log_msg -s "\n-----------------------------------------------------" -l ${_logfile_}
+    log_msg -s "$_time_ : $_msg_" -l ${_logfile_}
+    log_msg -s "-----------------------------------------------------" -l ${_logfile_}
+    log_msg -s "-----------------------------------------------------\n" -l ${_logfile_}
+fi
+}
+
+### Function: nh_compliance_check ###
+#
+# This function to perform NH Compliance check post OS patch upgrade
+#
+# Arguments:
+#       $1 : Server order list
+# Return Values:
+#       none
+nh_compliance_check()
+{
+local _server_order_file_=$1
+
+for _line_ in `$CAT ${_server_order_file_}`; do
+        unset _ip_address_ _serv_hostname_ _check_rlu_state_ _count_
+		local _ip_address_ _serv_hostname_ _count_
+		
+		_count_=`$ECHO "${_line_}" | grep -o "::" | wc -l`
+
+		if [ "${_ip_type_}" == "IPv6" ] && [ "${_count_}" == 3 ]; then
+			_ip_address_=`$ECHO ${_line_} | grep -oE '([a-fA-F0-9]{1,4}::?){1,7}[a-fA-F0-9]{1,4}' | head -n 1 | awk -F "::" '{ print $1 "::" $2}'`
+			_serv_hostname_=`$ECHO ${_line_} | $AWK -F"::" '{print $3}'`
+		else
+			_ip_address_=`$ECHO ${_line_} | $AWK -F"::" '{print $1}'`
+			_serv_hostname_=`$ECHO ${_line_} | $AWK -F"::" '{print $2}'`
+		fi
+        export _serv_hostname_
+        if [ ! "${_ip_address_}" -o ! "${_serv_hostname_}" ]; then
+            _err_msg_="Could not read required info from ${_server_order_file_}"
+            abort_script "${_err_msg_}"
+        fi
+
+    insert_header_footer head "Performing NH Compliance check post OS patch upgrade on ${_serv_hostname_}" ${LOGFILE} | $TEE -a ${CONSOLELOGS}
+    if [ "${_ip_address_}" == "${HOST_IP}" ]; then
+        $LS -rt ${COMPLIANCE_script} >/dev/null 2>&1
+        if [ $? -eq 0 ]; then
+            $PYTHON ${NH_post_patch}
+            _node_hardening_=$?
+        else
+            log_msg -s "NH post patch compliance check is not required on ${_serv_hostname_}" -l ${LOGFILE} | $TEE -a ${CONSOLELOGS}
+            continue
+        fi
+    else
+         if [ "${_user_root}" == 1 ]; then
+        
+				# Execute Root command
+				$RUN_REM_CMD root@$_ip_address_ "$LS -rt ${COMPLIANCE_script}" >/dev/null 2>&1
+				if [ $? -eq 0 ]; then
+					$RUN_REM_CMD root@$_ip_address_  "$PYTHON ${NH_post_patch}"
+					_node_hardening_=$?
+				else
+					log_msg -s "NH post patch compliance check is not required on ${_serv_hostname_}" -l ${LOGFILE} | $TEE -a ${CONSOLELOGS}
+					continue
+				fi
+		
+		else
+				# Execute non root admin user command
+				 $SUDO -u $_get_id_ $RUN_REM_CMD $_get_id_@$_ip_address_  "$SUDO $LS -rt ${COMPLIANCE_script}" >/dev/null 2>&1
+				 if [ $? -eq 0 ]; then
+				 	$SUDO -u $_get_id_ $RUN_REM_CMD $_get_id_@$_ip_address_  "$SUDO $PYTHON ${NH_post_patch}"
+				 	_node_hardening_=$?
+				 else
+				 	log_msg -s "NH post patch compliance check is not required on ${_serv_hostname_}" -l ${LOGFILE} | $TEE -a ${CONSOLELOGS}
+				 	continue
+				 fi
+		
+		fi
+    fi
+    if [ ${_node_hardening_} -eq 0 ]; then
+        log_msg -s "NH post patch compliance check completed successfully on ${_serv_hostname_}" -l ${LOGFILE} | $TEE -a ${CONSOLELOGS}
+    else
+        log_msg -s "NH post patch compliance check is unsuccessful on ${_serv_hostname_}" -l ${LOGFILE} | $TEE -a ${CONSOLELOGS}
+    fi
+done
+}
+
+### Function: post_kernel_check ###
+#
+# This function checks for kernel patch validation
+#
+# Arguments:
+#       $1 : Server order list
+# Return Values:
+#       none
+post_kernel_check()
+{
+local _server_order_file_=$1
+
+for _line_ in `$CAT ${_server_order_file_}`; do
+        unset _ip_address_ _serv_hostname_ _check_rlu_state_ _count_
+		local _ip_address_ _serv_hostname_ _count_
+		
+		_count_=`$ECHO "${_line_}" | grep -o "::" | wc -l`
+
+		if [ "${_ip_type_}" == "IPv6" ] && [ "${_count_}" == 3 ]; then
+			_ip_address_=`$ECHO ${_line_} | grep -oE '([a-fA-F0-9]{1,4}::?){1,7}[a-fA-F0-9]{1,4}' | head -n 1 | awk -F "::" '{ print $1 "::" $2}'`
+			_serv_hostname_=`$ECHO ${_line_} | $AWK -F"::" '{print $3}'`
+		else
+			_ip_address_=`$ECHO ${_line_} | $AWK -F"::" '{print $1}'`
+			_serv_hostname_=`$ECHO ${_line_} | $AWK -F"::" '{print $2}'`
+		fi
+        export _serv_hostname_
+        if [ ! "${_ip_address_}" -o ! "${_serv_hostname_}" ]; then
+            _err_msg_="Could not read required info from ${_server_order_file_}"
+            abort_script "${_err_msg_}"
+        fi
+
+    insert_header_footer head  "Performing Kernel check on server ${_serv_hostname_}" ${LOGFILE} | $TEE -a ${CONSOLELOGS}
+    if [ "${_ip_address_}" == "${HOST_IP}" ]; then
+        $BASH ${OM_MEDIA_PATH}/patch/bin/post_kernel_check.bsh
+        _kernel_check_=$?
+    else
+        if [ "${_user_root}" == 1 ]; then
+        
+			# Execute Root command
+			$RUN_REM_CMD root@$_ip_address_  "$BASH ${OM_MEDIA_PATH}/patch/bin/post_kernel_check.bsh"
+			_kernel_check_=$?
+		else
+			# Execute non root admin user command
+			$SUDO -u $_get_id_ $RUN_REM_CMD $_get_id_@$_ip_address_  "$SUDO $BASH ${OM_MEDIA_PATH}/patch/bin/post_kernel_check.bsh"
+			_kernel_check_=$?          
+		fi
+    fi
+    if [ ${_kernel_check_} -eq 0 ]; then
+        log_msg -s "Kernel is up to date with latest version" -l ${LOGFILE} | $TEE -a ${CONSOLELOGS}
+        $TOUCH /var/tmp/rhel_post_upgrade_successful
+        continue
+    else
+        #removing the /var/tmp/rhel_post_upgrade_successful flag since the Kernel version upgrade failed
+        $RM -rf /var/tmp/rhel_post_upgrade_successful
+        _err_msg_="Kernel version failed to update. Go for Rollback"
+        abort_script "${_err_msg_}"
+    fi
+done
+}
+
+### Function: reboot_all_servers ###
+#
+#
+# Arguments:
+#       $1 : Server order list
+# Return Values:
+#   none
+reboot_all_servers()
+{
+local _server_order_file_=$1
+
+for _line_ in `$CAT ${_server_order_file_}`; do
+    unset _ip_address_ _serv_hostname_ _count_
+	local _ip_address_ _serv_hostname_ _count_
+	
+	_count_=`$ECHO "${_line_}" | grep -o "::" | wc -l`
+
+	if [ "${_ip_type_}" == "IPv6" ] && [ "${_count_}" == 3 ]; then
+		_ip_address_=`$ECHO ${_line_} | grep -oE '([a-fA-F0-9]{1,4}::?){1,7}[a-fA-F0-9]{1,4}' | head -n 1 | awk -F "::" '{ print $1 "::" $2}'`
+		_serv_hostname_=`$ECHO ${_line_} | $AWK -F"::" '{print $3}'`
+	else
+		_ip_address_=`$ECHO ${_line_} | $AWK -F"::" '{print $1}'`
+		_serv_hostname_=`$ECHO ${_line_} | $AWK -F"::" '{print $2}'`
+	fi
+
+    if [ ! "${_ip_address_}" -o ! "${_serv_hostname_}" ]; then
+        _err_msg_="Could not read required info from ${_server_order_file_}"
+        abort_script "${_err_msg_}"
+    fi
+
+    _check_rlu_state_=`iniget RLU_STATUS -f ${ENIQ_CONF_DIR}/rlu.ini -v ${_serv_hostname_}`
+    if [ "${_check_rlu_state_}" == "NOTREQUIRED" ]; then
+        log_msg -h -s "Skipping reboot on ${_serv_hostname_} as it is not required" -l ${LOGFILE} | $TEE -a ${CONSOLELOGS}
+        continue
+    elif [ "${_check_rlu_state_}" == "REQUIRED" ]; then
+        log_msg -h -s "Skipping reboot on ${_serv_hostname_} as upgrade failed" -l ${LOGFILE} | $TEE -a ${CONSOLELOGS}
+        continue
+    else
+        if [ "${_ip_address_}" != "${HOST_IP}" ]; then
+            log_msg -s "Rebooting ${_serv_hostname_}" -l ${LOGFILE} | $TEE -a ${CONSOLELOGS}
+           if [ "${_user_root}" == 1 ]; then
+        
+			# Execute Root command
+			$RUN_REM_CMD -f root@$_ip_address_  "init 6" >/dev/null 2>&1
+            $SLEEP 60
+			ping_command=$(check_ping)
+			$ping_command -c 4 ${_ip_address_} >>/dev/null 2>&1
+            if [ $? -eq 0 ]; then
+               log_msg -s "Reboot was not initiated so re-intiating for ${_serv_hostname_}" -l ${LOGFILE} | $TEE -a ${CONSOLELOGS}
+               $RUN_REM_CMD -f root@$_ip_address_  "init 6" >/dev/null 2>&1
+            fi
+			continue
+		else
+				# Execute non root admin user command
+			$SUDO -u $_get_id_ $RUN_REM_CMD -f $_get_id_@$_ip_address_  "$SUDO init 6" >/dev/null 2>&1
+            $SLEEP 60
+			ping_command=$(check_ping)
+			$ping_command -c 4 ${_ip_address_} >>/dev/null 2>&1
+            if [ $? -eq 0 ]; then
+               log_msg -s "Reboot was not initiated so re-intiating for ${_serv_hostname_}" -l ${LOGFILE} | $TEE -a ${CONSOLELOGS}
+               $SUDO -u $_get_id_ $RUN_REM_CMD -f $_get_id_@$_ip_address_  "$SUDO init 6" >/dev/null 2>&1
+            fi
+			continue
+			
+		fi
+    fi
+
+        _timeout_=0
+        _server_rebooted_=0
+        local _server_reboot_file_="/tmp/server_reboot_file"
+        $CP -p ${_server_order_file_} ${_server_reboot_file_}
+        _num_of_server_=`wc -l ${_server_reboot_file_}  | $AWK  '{print $1}'`
+        if [ "${_num_of_server_}" == "1" ]; then
+		    unset _count_
+			local _count_
+		    _count_=`$CAT ${_server_reboot_file_} | grep -o "::" | wc -l`
+
+	        if [ "${_ip_type_}" == "IPv6" ] && [ "${_count_}" == 3 ]; then
+			    _ip_address_=`$CAT ${_server_reboot_file_} | grep -oE '([a-fA-F0-9]{1,4}::?){1,7}[a-fA-F0-9]{1,4}' | head -n 1 | awk -F "::" '{ print $1 "::" $2}'`
+            	_serv_hostname_=`$CAT ${_server_reboot_file_} | $AWK -F"::" '{print $3}'`
+			else
+		        _ip_address_=`$CAT ${_server_reboot_file_} | $AWK -F"::" '{print $1}'`
+            	_serv_hostname_=`$CAT ${_server_reboot_file_} | $AWK -F"::" '{print $2}'`
+			fi
+			if [ ! "${_ip_address_}" -o ! "${_serv_hostname_}" ]; then
+				_err_msg_="Could not read required info from ${_server_reboot_file_}"
+				abort_script "${_err_msg_}"
+			fi
+		    if [ "${_ip_address_}" == "${HOST_IP}" ]; then
+		        log_msg -s "Rebooting ${_serv_hostname_}" -l ${LOGFILE} | $TEE -a ${CONSOLELOGS}
+                        log_msg -s "RHEL linux upgrade is completed. Cleaning up flag /var/tmp/rhel_linux_upgrade_in_progress" -l ${LOGFILE} | $TEE -a ${CONSOLELOGS}
+                        $RM -rf /var/tmp/rhel_linux_upgrade_in_progress
+        	        insert_header_footer foot "The session will be terminated at this point." ${LOGFILE} | $TEE -a ${CONSOLELOGS}
+        	        init 6 | $TEE -a ${CONSOLELOGS}
+	        fi
+        else	
+        while [ ${_server_rebooted_} -lt 3 ]; do
+            for _line_ in `cat ${_server_reboot_file_}`; do
+               unset _ip_address_ _serv_hostname__count_
+			   local _ip_address_ _serv_hostname__count_
+			   _count_=`$ECHO "${_line_}" | grep -o "::" | wc -l`
+
+		       if [ "${_ip_type_}" == "IPv6" ] && [ "${_count_}" == 3 ]; then
+			        _ip_address_=`$ECHO ${_line_} | grep -oE '([a-fA-F0-9]{1,4}::?){1,7}[a-fA-F0-9]{1,4}' | head -n 1 | awk -F "::" '{ print $1 "::" $2}'`
+			        _serv_hostname_=`$ECHO ${_line_} | $AWK -F"::" '{print $3}'`
+		       else
+			        _ip_address_=`$ECHO ${_line_} | $AWK -F"::" '{print $1}'`
+			        _serv_hostname_=`$ECHO ${_line_} | $AWK -F"::" '{print $2}'`
+		       fi
+               if [ ! "${_ip_address_}" -o ! "${_serv_hostname_}" ]; then
+					_err_msg_="Could not read required info from ${_server_reboot_file_}"
+					abort_script "${_err_msg_}"
+			   fi
+               if [ "${_ip_address_}" != "${HOST_IP}" ]; then
+		    _check_rlu_state_=`iniget RLU_STATUS -f ${ENIQ_CONF_DIR}/rlu.ini -v ${_serv_hostname_}`
+	           if [ "${_check_rlu_state_}" == "DONE" ] && [ ! -z "${_check_rlu_state_}" ]; then
+			           ping_command=$(check_ping)
+			           $ping_command -c 1 ${_ip_address_} >>/dev/null 2>&1
+                       if [ $? -ne 0 ]; then
+                           log_msg -s "Reboot of ${_serv_hostname_} still in progress, Please wait for some more time...." -l ${LOGFILE} | $TEE -a ${CONSOLELOGS}
+                       else
+                              log_msg -s "${_serv_hostname_} server rebooted successfully." -l ${LOGFILE} | $TEE -a ${CONSOLELOGS}
+                              $CAT ${_server_reboot_file_}  | $GREP -v ${_ip_address_} > "/tmp/server_reboot_file_tmp"
+                              $CP -p "/tmp/server_reboot_file_tmp" ${_server_reboot_file_}
+                              (( _server_rebooted_= ${_server_rebooted_} + 1 ))
+                       fi
+                       if [ "${_timeout_}" -ge 30 ]; then
+                              log_msg -s "Max Timeout has reached for reboot on the ${_serv_hostname_} server. Kindly check the state of server and try to check with \"last reboot\" command" -l ${LOGFILE} | $TEE -a ${CONSOLELOGS}
+                              $CAT ${_server_reboot_file_}  | $GREP -v ${_ip_address_} > "/tmp/server_reboot_file_tmp"
+                              $CP -p "/tmp/server_reboot_file_tmp" ${_server_reboot_file_}
+			      (( _server_rebooted_ = ${_server_rebooted_} + 1 ))
+                              break
+                       fi
+		       else 
+				     $CAT ${_server_reboot_file_}  | $GREP -v ${_ip_address_} > "/tmp/server_reboot_file_tmp"
+				     $CP -p "/tmp/server_reboot_file_tmp" ${_server_reboot_file_}
+					 (( _server_rebooted_ = ${_server_rebooted_} + 1 ))
+		       fi
+	         fi
+            done
+            (( _timeout_ = ${_timeout_} + 1 ))
+            $SLEEP 30
+            continue
+        done
+        log_msg -s "Rebooting ${HOST_IP}" -l ${LOGFILE} | $TEE -a ${CONSOLELOGS}
+        log_msg -s "RHEL linux upgrade is completed. Cleaning up flag /var/tmp/rhel_linux_upgrade_in_progress" -l ${LOGFILE} | $TEE -a ${CONSOLELOGS}
+        $RM -rf /var/tmp/rhel_linux_upgrade_in_progress
+        insert_header_footer foot "The session will be terminated at this point." ${LOGFILE} | $TEE -a ${CONSOLELOGS}
+        init 6 | $TEE -a ${CONSOLELOGS}
+      fi
+   fi
+done
+}
+
+
+
+### Function: restart_eniq_services ###
+#
+# This function restarts eniq services
+# on all the servers in current deployment
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+restart_eniq_services()
+{
+if [ ! -f "${ENIQ_ADMIN_BIN_DIR}/manage_deployment_services.bsh" ]; then
+    _err_msg_="${ENIQ_ADMIN_BIN_DIR}/manage_deployment_services.bsh not found"
+    abort_script "${_err_msg_}"
+else
+    $BASH ${ENIQ_ADMIN_BIN_DIR}/manage_deployment_services.bsh -a restart -s ALL -N | $TEE -a ${CONSOLELOGS}
+    rc_restart=`$ECHO ${PIPESTATUS[0]}`
+    if [ "${rc_restart}" -ne 0 ]; then
+        _err_msg_="Unable to restart eniq services"
+        abort_script "${_err_msg_}"
+    fi
+fi
+}
+
+### Function: setup_env ###
+#
+# Set up environment variables for script.
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+setup_env()
+{
+# ENIQ Base Directory
+ENIQ_BASE_DIR=/eniq
+
+# ENIQ Admin Directory
+ENIQ_ADMIN_DIR=${ENIQ_BASE_DIR}/admin
+
+# ENIQ LIB Directory
+LIB_DIR=/lib
+
+# ENIQ Admin Bin Directory
+ENIQ_ADMIN_BIN_DIR=${ENIQ_ADMIN_DIR}/bin
+
+# ENIQ Core Installation Directory
+ENIQ_INST_DIR=${ENIQ_BASE_DIR}/installation
+
+# ENIQ Core Installation SW
+ENIQ_CORE_INST_DIR=${ENIQ_INST_DIR}/core_install
+
+# ENIQ Log Directory
+ENIQ_LOG_DIR=${ENIQ_BASE_DIR}/local_logs
+
+# ENIQ Config Directory
+ENIQ_CONF_DIR=${ENIQ_INST_DIR}/config
+
+HNAME=`${MYHOSTNAME}`
+HOST_IP=`$MYHOSTNAME -i | $AWK '{print $1}' | $HEAD -1`
+
+# Source the common functions
+if [ -s ${SCRIPTHOME}/../lib/common_functions.lib ]; then
+    . ${SCRIPTHOME}/../lib/common_functions.lib
+else
+    _err_msg_="File ${SCRIPTHOME}/../lib/common_functions.lib not found"
+    abort_script "${_err_msg_}" 
+fi
+
+if [ -s ${ENIQ_CORE_INST_DIR}/${LIB_DIR}/common_core_install_functions.lib ]; then
+    . ${ENIQ_CORE_INST_DIR}/${LIB_DIR}/common_core_install_functions.lib
+else
+    _err_msg_="File ${ENIQ_CORE_INST_DIR}/${LIB_DIR}/common_core_install_functions.lib not found"
+    abort_script "${_err_msg_}"
+fi
+
+if [ -s ${ENIQ_CORE_INST_DIR}/${LIB_DIR}/common_inirator_functions.lib ]; then
+    . ${ENIQ_CORE_INST_DIR}/${LIB_DIR}/common_inirator_functions.lib
+else
+    _err_msg_="File ${ENIQ_CORE_INST_DIR}/${LIB_DIR}/common_inirator_functions.lib not found"
+    abort_script "${_err_msg_}"
+fi
+
+#checks the existence of scripts on MWS
+if [ ! -s ${OM_MEDIA_PATH}/patch/bin/pre_upgrade_patchrhel.bsh ]; then
+    _err_msg_="Pre-upgrade script is not present on MWS"
+    abort_script "${_err_msg_}"
+fi
+
+if [ ! -s ${OM_MEDIA_PATH}/patch/bin/upgrade_patchrhel.bsh ]; then
+    _err_msg_="Upgrade script is not present on MWS"
+    abort_script "${_err_msg_}"
+fi
+
+if [ ! -s ${OM_MEDIA_PATH}/patch/bin/post_kernel_check.bsh ]; then
+    _err_msg_="Kernel script is not present on MWS"
+    abort_script "${_err_msg_}"
+fi
+
+#SSH command with options
+RUN_REM_CMD="$SSH -o StrictHostKeyChecking=no -o BatchMode=yes"
+
+#Fetching IP Type from ipmp.ini file.
+check_ip_type
+
+if [ ! "${_ip_type_}" ]; then
+    _err_msg_="Could not read parameter _IP_TYPE_ from file ${ENIQ_CONF_DIR}/${IPMP_INI}"
+    abort_script "$_err_msg_"
+fi
+}
+
+### Function: stop_eniq_services ###
+#
+# This function stops eniq services
+# on all the servers in current deployment
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+stop_eniq_services()
+{
+if [ ! -f "${ENIQ_ADMIN_BIN_DIR}/manage_deployment_services.bsh" ]; then
+    _err_msg_="${ENIQ_ADMIN_BIN_DIR}/manage_deployment_services.bsh not found"
+    abort_script "${_err_msg_}"
+else
+    $BASH ${ENIQ_ADMIN_BIN_DIR}/manage_deployment_services.bsh -a stop -s ALL -N | $TEE -a ${CONSOLELOGS}
+    rc_stop=`$ECHO ${PIPESTATUS[0]}`
+    if [ "${rc_stop}" -ne 0 ]; then
+        _err_msg_="Unable to stop eniq services"
+        abort_script "${_err_msg_}"
+    fi
+fi
+}
+
+### Function: usage_msg ###
+#
+#   Print out the usage message
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+usage_msg()
+{
+$CLEAR
+$ECHO "
+Usage: `$BASENAME $0` -D <O&M_Media_location> -p <LU_PATH> -A <ACTION_TYPE>
+
+options:
+
+-D  : Mandatory parameter specifying the full path to OM MEDIA location.
+
+-p  : Mandatory parameter referring to the directory where the linux Upgrade kit is extracted.
+
+-A  : Mandatory parameter specifying the action type to perform
+"
+}
+
+# ********************************************************************
+#
+#   Main body of program
+#
+# ********************************************************************
+
+# Determine absolute path to software
+get_absolute_path
+
+# Check that the effective id of the user is root
+check_id 
+
+ while getopts ":D:p:A:" arg; do
+   case $arg in
+     D) OM_MEDIA_PATH="$OPTARG"
+        ;;
+     p) LU_PATH="$OPTARG"
+        ;;
+     A) ACTION_TYPE="$OPTARG"
+        ;;
+    \?) usage_msg
+        exit 1
+        ;;
+   esac
+ done
+shift `expr $OPTIND - 1`
+
+#Checking for parameters
+check_params
+
+#Setting up environment variables
+setup_env
+
+#Logging the console
+CONSOLELOGS="${ENIQ_LOG_DIR}/upgrade/rlu_console.log"
+if [ -f "${CONSOLELOGS}" ]; then
+    $RM -f ${CONSOLELOGS}
+fi
+
+# Log file
+$MKDIR -p ${ENIQ_LOG_DIR}/upgrade
+LOGFILE="${ENIQ_LOG_DIR}/upgrade/rhel_linux_upgrade.log"
+
+log_msg -h -l ${LOGFILE} -t -s "Entering RHEL linux Upgrade procedure." | $TEE -a ${CONSOLELOGS}
+
+# Create a temporary Directory
+TEM_DIR=/tmp/blade_upgrade.$$.$$
+$RM -rf ${TEM_DIR}
+$MKDIR -p ${TEM_DIR}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not create directory $TEM_DIR"
+    abort_script "${_err_msg_}"
+fi
+
+#Get the list of servers on this deployment
+get_deployment_order
+
+NFS_PATCH_OSBACKUP_remove="om_linux/patch/bin/nfs_patch_osbackup.py remove"
+
+if [ "${ACTION_TYPE}" == "upgrade" -o "${ACTION_TYPE}" == "update" ]; then
+   if [ -f /var/tmp/rhel_linux_upgrade_in_progress ]; then
+        log_msg -h -l ${LOGFILE} -t -s "RHEL patch upgrade flag file is already present. Resuming now." | $TEE -a ${CONSOLELOGS}
+   else
+    #Create ini file to keep status of linux upgrades
+    create_rlu_ini ${TEM_DIR}/server_order_list
+   fi
+
+    #Check if upgrade is required on all the servers in the deployment and execute if needed
+    checkif_upgrade_needed ${TEM_DIR}/service_reverse_order_list
+
+    #Execute RHEL linux upgrade
+    execute_linux_upgrade ${TEM_DIR}/service_reverse_order_list
+
+    #Display the summary
+    display_summary ${TEM_DIR}/server_order_list
+
+    #stop eniq services and reboot server based on the DONE status
+    for _entry_ in `$CAT ${TEM_DIR}/server_order_list`; do
+        _count_=`$ECHO "${_entry_}" | grep -o "::" | wc -l`
+
+	    if [ "${_ip_type_}" == "IPv6" ] && [ "${_count_}" == 3 ]; then
+			_host_=`$ECHO ${_entry_} | $AWK -F "::" '{print $3}'`
+		else
+			_host_=`$ECHO ${_entry_} | $AWK -F "::" '{print $2}'`
+        fi
+		if [ ! "${_host_}" ]; then
+				_err_msg_="Could not read required info from server_order_list"
+				abort_script "${_err_msg_}"
+		fi
+        
+        $CAT ${ENIQ_CONF_DIR}/rlu.ini | $GREP -w "${_host_}" | $GREP -w "REQUIRED" >/dev/null 2>&1
+        if [ $? -eq 0 ]; then
+            $ECHO "${_host_}" >> ${TEM_DIR}/upgrade_failed_server
+        else
+            $CAT ${ENIQ_CONF_DIR}/rlu.ini | $GREP -w "${_host_}" | $GREP -w "NOTREQUIRED" >/dev/null 2>&1   
+            if [ $? -eq 0 ]; then
+                log_msg -h -l ${LOGFILE} -t -s "SERVER ${_host_} is already upgraded" | $TEE -a ${CONSOLELOGS}
+                $TOUCH /var/tmp/rhel_linux_upgrade_not_required
+            else 
+               $TOUCH ${TEM_DIR}/restart_required
+            fi
+        fi  
+    done
+
+    if [ -f "${TEM_DIR}/upgrade_failed_server" ]; then
+          log_msg -h -l ${LOGFILE} -t -s "Below server(s) are not successfully upgraded" | $TEE -a ${CONSOLELOGS}
+          if [ -f /var/tmp/rhel_linux_upgrade_not_required ]; then
+              $RM -rf /var/tmp/rhel_linux_upgrade_not_required
+          fi
+          $CAT ${TEM_DIR}/upgrade_failed_server
+          abort_script
+    elif [ -f "${TEM_DIR}/restart_required" ]; then
+       stop_eniq_services
+       if [ -f /var/tmp/rhel_linux_upgrade_not_required ]; then
+           $RM -rf /var/tmp/rhel_linux_upgrade_not_required
+       fi
+       
+       #Reboot the server
+       reboot_all_servers ${TEM_DIR}/service_reverse_order_list
+    else
+       #Cleaning up rhel linux upgrade flag
+       $RM -rf /var/tmp/rhel_linux_upgrade_in_progress
+    fi
+	
+	if [ -f /var/tmp/rhel_linux_upgrade_not_required ]; then
+        
+		ENIQ_CONF_DIR=/eniq/installation/config
+		OM_SW_DIR=`iniget inputs -v om_sw -f ${ENIQ_CONF_DIR}/upgrade_params.ini`
+		if [ ! "${OM_SW_DIR}" ]; then
+			_err_msg_="Could not determine OM SW DIR from $ENIQ_CONF_DIR/upgrade_params.ini"
+			abort_script "$_err_msg_"
+		fi
+		log_msg -s "\nRHEL linux upgrade is Not Required. Removing the OS Configuration Backup. \n" -l ${LOGFILE} | $TEE -a ${CONSOLELOGS}
+
+                $PYTHON ${OM_SW_DIR}/${NFS_PATCH_OSBACKUP_remove}
+                OS_configuration_backup_remove=$?
+                
+                if [ ${OS_configuration_backup_remove} -ne 0 ]; then
+			_err_msg_="Could not remove OS Configuration Backup. Fix the issue and rerun the Script."
+			abort_script "$_err_msg_"
+		fi
+
+		log_msg -s "\nRemoved OS Configuration Backup successfully. Cleaning up flag /var/tmp/rhel_linux_upgrade_not_required\n" -l ${LOGFILE} | $TEE -a ${CONSOLELOGS}
+        	$RM -rf /var/tmp/rhel_linux_upgrade_not_required
+                flag_removed=$?
+		if [ ${flag_removed} -ne 0 ]; then
+			_err_msg_="Could not remove flag /var/tmp/rhel_linux_upgrade_not_required. Delete it manually"
+			abort_script "$_err_msg_"
+		fi
+   fi
+
+elif [ "${ACTION_TYPE}" == "postupgrade" ]; then
+	# If flag /var/tmp/rhel_post_upgrade_successful is present then will skip the post_kernal_check stage
+        if [ ! -f /var/tmp/rhel_post_upgrade_successful ]; then
+		#Script for kernel patch validation
+		post_kernel_check ${TEM_DIR}/service_reverse_order_list
+        fi
+
+    #Script for node hardening compliance check
+    #nh_compliance_check ${TEM_DIR}/service_reverse_order_list
+	
+   if [ -f /var/tmp/rhel_post_upgrade_successful ]; then
+        
+        ENIQ_CONF_DIR=/eniq/installation/config
+        OM_SW_DIR=`iniget inputs -v om_sw -f ${ENIQ_CONF_DIR}/upgrade_params.ini`
+        if [ ! "${OM_SW_DIR}" ]; then
+                _err_msg_="Could not determine OM SW DIR from $ENIQ_CONF_DIR/upgrade_params.ini"
+                abort_script "$_err_msg_"
+        fi
+        log_msg -s "\nRHEL linux upgrade is completed. Removing the OS Configuration Backup. \n" -l ${LOGFILE} | $TEE -a ${CONSOLELOGS}
+
+        $PYTHON ${OM_SW_DIR}/${NFS_PATCH_OSBACKUP_remove}
+        OS_configuration_backup_remove=$?
+                
+        if [ ${OS_configuration_backup_remove} -ne 0 ]; then
+                _err_msg_="Could not remove OS Configuration Backup. Fix the issue and rerun the Script."
+                abort_script "$_err_msg_"
+        fi
+
+        log_msg -s "\nRemoved OS Configuration Backup successfully. Cleaning up flag /var/tmp/rhel_post_upgrade_successful\n" -l ${LOGFILE} | $TEE -a ${CONSOLELOGS}
+        
+        $RM -rf /var/tmp/rhel_post_upgrade_successful
+        flag_removed=$?
+        if [ ${flag_removed} -ne 0 ]; then
+                _err_msg_="Could not remove flag /var/tmp/rhel_post_upgrade_successful. Delete it manually"
+                abort_script "$_err_msg_"
+        fi
+   else
+        _err_msg_="RHEL linux Post Upgrade is not successful. Aborting the script.."
+        abort_script "$_err_msg_"
+   fi
+
+    #Restart eniq services
+    restart_eniq_services
+
+    $RM -rf ${TEM_DIR}
+
+else
+    log_msg -h -l ${LOGFILE} -t -s "Choose the proper action type : upgrade or update or postupgrade" | $TEE -a ${CONSOLELOGS}
+fi
+
+exit 0
+

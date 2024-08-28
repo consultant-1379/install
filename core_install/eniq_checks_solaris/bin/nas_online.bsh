@@ -1,0 +1,334 @@
+#!/usr/bin/bash
+#********************************************************************
+# Ericsson Radio Systems AB SCRIPT
+#********************************************************************
+#
+# (c) Ericsson Radio Systems AB 2016 - All rights reserved.
+#
+# The copyright to the computer program(s) herein is the property
+# of Ericsson Radio Systems AB, Sweden. The programs may be used
+# and/or copied only with the written permission from Ericsson Radio
+# Systems AB or in accordance with the terms and conditions stipulated
+# in the agreement/contract under which the program(s) have been
+# supplied.
+#
+#********************************************************************
+# Name     : nas_online.bsh
+# Date     : 06/24/2016
+# Revision : A
+# Purpose  : Objective of the package is to enable users to check if
+#            NAS is up and running
+#
+# Usage    : nas_online.bsh
+# Exit Values:
+#    0   : Success
+#    3   : No Run: Abort Script
+#    16  : No Run: Not Applicable
+#    116 : Fail  : NAS down
+#********************************************************************
+#
+#       Command Section
+#
+#********************************************************************
+AWK=/usr/bin/awk
+BASH=/usr/bin/bash
+CAT=/usr/bin/cat
+CUT=/usr/bin/cut
+CP=/usr/bin/cp
+DATE=/usr/bin/date
+DF=/usr/bin/df
+ECHO=/usr/bin/echo
+GETENT=/usr/bin/getent
+GREP=/usr/bin/grep
+HEAD=/usr/bin/head
+MYHOSTNAME=/usr/bin/hostname
+ID=/usr/bin/id
+MKDIR=/usr/bin/mkdir
+NAWK=/usr/bin/nawk
+PING=/usr/sbin/ping
+PWD=/usr/bin/pwd
+RM=/usr/bin/rm
+SCP=/usr/bin/scp
+SLEEP=/usr/bin/sleep
+SVCS=/usr/bin/svcs
+TAIL=/usr/bin/tail
+TEE=/usr/bin/tee
+TOUCH=/usr/bin/touch
+ZFS=/usr/sbin/zfs
+MV=/usr/bin/mv
+
+# ********************************************************************
+#
+#       Configuration Section
+#
+# ********************************************************************
+
+# Default user
+DEFAULT_USER=root
+
+#Present Working Directory
+CURR_DIR=`pwd`
+
+
+# ********************************************************************
+#
+#   Functions
+#
+# ********************************************************************
+
+### Function: abort_script ###
+#
+#   This will is called if the script is aborted thru an error
+#   signal sent by the kernel such as CTRL-C or if a serious
+#   error is encountered during runtime
+#
+# Arguments:
+#       $1 - Error message from part of program (Not always used)
+# Return Values:
+#       none
+abort_script()
+{
+_err_time_=`$DATE '+%Y-%b-%d_%H.%M.%S'`
+
+if [ "$1" ]; then
+    _err_msg_="${_err_time_} - $1"
+else
+    _err_msg_="${_err_time_} - ERROR : Script aborted.......\n"
+fi
+
+if [ "${LOGFILE}" ]; then
+    $ECHO "\nERROR : ${_err_msg_}\n" | $TEE -a ${LOGFILE}
+else
+    $ECHO "\nERROR : ${_err_msg_}\n"
+fi
+cleanup
+exit 3
+}
+
+
+### Function: check_id ###
+#
+#   Check that the effective id of the user is correct
+#   If not print error msg and exit.
+#
+# Arguments:
+#       $1 : User ID name
+# Return Values:
+#       none
+check_id()
+{
+_check_id_=`$ID | $AWK -F\( '{print $2}' | $AWK -F\) '{print $1}'`
+if [ "$_check_id_" != "$1" ]; then
+    _err_msg_="You must be $1 to execute this script."
+    abort_script "${_err_msg_}"
+fi
+}
+
+
+### Function: cleanup ###
+#
+# Cleanup of temporary directory
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+cleanup()
+{
+if [ -f "$LOGFILE" ] ;then
+    $ECHO "Cleaning up the temporary directory" >> $LOGFILE
+fi
+$RM -rf ${TEM_DIR}
+}
+
+### Function: nas_online ###
+#
+# Set up environment variables for script.
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+nas_online(){
+_nas_status_=`$SVCS -a | $GREP "NAS-online" | $AWK '{print $1}'`
+if [ $? -ne 0 ]; then
+    _err_msg_="Unable to obtain status of NAS-online service."
+    abort_script "${_err_msg_}"
+fi
+
+if [ "${_nas_status_}" == "online" ]; then
+log_msg -t -s "NAS-online service is in ${_nas_status_} state." -l $LOGFILE
+cleanup
+exit 0
+else
+log_msg -t -s "NAS-online service is in ${_nas_status_} state." -l $LOGFILE
+cleanup
+exit 116
+fi
+}
+
+### Function: setup_env ###
+#
+# Set up environment variables for script.
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+setup_env()
+{
+# ENIQ Base Directory
+ENIQ_BASE_DIR=/eniq
+
+# ENIQ Admin Directory
+ENIQ_ADMIN_DIR=${ENIQ_BASE_DIR}/admin
+
+# ENIQ VAR Directory
+ENIQ_VAR_DIR=/var
+
+# ERICSSON Directory
+ERICSSON_DIR=/ericsson
+
+# ENIQ OPT Directory
+OPT_DIR=/opt
+
+# ENIQ LIB Directory
+LIB_DIR=/lib
+
+# ENIQ ETC Directory
+ETC_DIR=/etc
+
+# ENIQ SSH Directory
+SSH_DIR=/.ssh
+
+# ENIQ Admin Bin Directory
+ENIQ_ADMIN_BIN_DIR=${ENIQ_ADMIN_DIR}/bin
+
+# ENIQ Core Installation Directory
+ENIQ_INST_DIR=${ENIQ_BASE_DIR}/installation
+
+# ENIQ Core Installation SW
+ENIQ_CORE_INST_DIR=${ENIQ_INST_DIR}/core_install
+
+# ENIQ Core Installation Bin Directory
+ENIQ_CORE_DIR=${ENIQ_CORE_INST_DIR}/bin
+
+# ENIQ Log Directory
+ENIQ_LOG_DIR=${ENIQ_BASE_DIR}/local_logs
+
+# ENIQ Config Directory
+ENIQ_CONF_DIR=${ENIQ_INST_DIR}/config
+
+# ENIQ SW Conf Directory
+ENIQ_SW_CONF_DIR=${ENIQ_BASE_DIR}/sw/conf
+
+HNAME=`${MYHOSTNAME}`
+HOST_IP=`$GETENT hosts ${HNAME} | $NAWK '{print $1}' | $HEAD -1`
+
+# Source the common functions
+if [ -s ${ENIQ_CORE_INST_DIR}/${LIB_DIR}/common_functions.lib ]; then
+    . ${ENIQ_CORE_INST_DIR}/${LIB_DIR}/common_functions.lib
+else
+    _err_msg_="File ${ENIQ_CORE_INST_DIR}/${LIB_DIR}/common_functions.lib not found"
+    abort_script "${_err_msg_}"
+fi
+
+if [ -s ${ENIQ_CORE_INST_DIR}/${LIB_DIR}/common_core_install_functions.lib ]; then
+    . ${ENIQ_CORE_INST_DIR}/${LIB_DIR}/common_core_install_functions.lib
+else
+    _err_msg_="File ${ENIQ_CORE_INST_DIR}/${LIB_DIR}/common_core_install_functions.lib not found"
+    abort_script "${_err_msg_}"
+fi
+
+if [ -s ${ENIQ_CORE_INST_DIR}/${LIB_DIR}/common_inirator_functions.lib ]; then
+    . ${ENIQ_CORE_INST_DIR}/${LIB_DIR}/common_inirator_functions.lib
+else
+    _err_msg_="File ${ENIQ_CORE_INST_DIR}/${LIB_DIR}/common_inirator_functions.lib not found"
+    abort_script "${_err_msg_}"
+fi
+
+
+
+# File containing the type of OSS installation. Eg. events or statistics
+INST_TYPE_FILE=${ENIQ_CONF_DIR}/ericsson_use_config
+if [ ! -s "${INST_TYPE_FILE}" ]; then
+    _err_msg_="ENIQ install type not defined in ${INST_TYPE_FILE}"
+    abort_script "${_err_msg_}"
+fi
+
+# Read the installation type - should be "events" or "stats"
+INST_TYPE=`$CAT ${INST_TYPE_FILE} | $NAWK -F\= '{print $2}'`
+
+# Storage type
+STORAGE_TYPE=`iniget STOR_TYPE -f ${ENIQ_BASE_DIR}/installation/config/SunOS.ini -v STORAGE_TYPE`
+if [ ! "${STORAGE_TYPE}" ]; then
+    _err_msg_="Could not obtain storage type from ${ENIQ_BASE_DIR}/installation/config/SunOS.ini"
+    abort_script "${_err_msg_}"
+fi
+
+# Templates Directory
+ENIQ_TEMPL_DIR=${ENIQ_CORE_INST_DIR}/templates/${INST_TYPE}
+}
+
+
+
+
+
+# ********************************************************************
+#
+#   Main body of program
+#
+# ********************************************************************
+
+# Timestamp
+TIMESTAMP=`$DATE '+%d-%m-%y_%H.%M.%S'`
+
+
+# Ctrl+C
+trap "abort_script" INT
+
+
+# Check that the effective id of the user is root
+check_id $DEFAULT_USER
+
+
+# Set up environment variables for script.
+setup_env
+
+
+# Log file
+LOGFILE="/var/tmp/Precheck/logs/nas_online/nas_status.log"
+if [ ! -d  /var/tmp/Precheck/logs/nas_online ]; then
+   $MKDIR -p /var/tmp/Precheck/logs/nas_online 
+   $TOUCH $LOGFILE
+else
+   if [ -e "${LOGFILE}" ]; then
+        $RM -rf $LOGFILE
+   fi
+   $TOUCH $LOGFILE
+fi
+
+
+# Create a temporary Directory
+TEM_DIR=/tmp/nas_online.$$.$$
+$RM -rf ${TEM_DIR}
+$MKDIR -p ${TEM_DIR}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not create directory $TEM_DIR"
+    abort_script "${_err_msg_}"
+fi
+
+# Check Storage type
+if [ "${STORAGE_TYPE}" == "zfs" ]; then
+    log_msg -s "This check is not applicable for RACK servers." -l $LOGFILE
+    cleanup
+    exit 16
+fi
+
+
+# Check Status of NAS-online service
+log_msg -t -s "Checking status of NAS-online service" -l $LOGFILE
+$SVCS -a | $GREP "NAS" > /$TEM_DIR/nas.txt
+log_msg -s "`$CAT /$TEM_DIR/nas.txt`" -l $LOGFILE
+nas_online
+

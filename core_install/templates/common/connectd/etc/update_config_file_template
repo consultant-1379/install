@@ -1,0 +1,5 @@
+#update_config_file to provide information when updating mount points
+#
+Mount_Choice=
+Storage_Pool_Name=
+Pre12_OSS_Release=

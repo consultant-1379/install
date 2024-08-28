@@ -1,0 +1,669 @@
+#!/bin/bash
+# ********************************************************************
+# Ericsson Radio Systems AB                                     SCRIPT
+# ********************************************************************
+#
+#
+# (c) Ericsson Radio Systems AB 2019 - All rights reserved.
+#
+# The copyright to the computer program(s) herein is the property
+# of Ericsson Radio Systems AB, Sweden. The programs may be used
+# and/or copied only with the written permission from Ericsson Radio
+# Systems AB or in accordance with the terms and conditions stipulated
+# in the agreement/contract under which the program(s) have been
+# supplied.
+#
+# ********************************************************************
+# Name    : manage_eniq_sentinel.bsh
+# Date    : 06/10/2023
+# Revision: main\12
+# Purpose : Script to manage sentinel on ENIQ
+#
+# Usage   : manage_eniq_sentinel.bsh
+#
+# ********************************************************************
+#
+#   Command Section
+#
+# ********************************************************************
+AWK=/usr/bin/awk
+BASENAME=/usr/bin/basename
+CAT=/usr/bin/cat
+CLEAR=/usr/bin/clear
+CP=/usr/bin/cp
+CUT=/usr/bin/cut
+DATE=/usr/bin/date
+DIRNAME=/usr/bin/dirname
+ECHO='/usr/bin/echo -e'
+EGREP=/usr/bin/egrep
+ENV=/usr/bin/env
+GETENT=/usr/bin/getent
+GREP=/usr/bin/grep
+GTAR=/usr/bin/gtar
+HEAD=/usr/bin/head
+MYHOSTNAME=/usr/bin/hostname
+ID=/usr/bin/id
+LS=/usr/bin/ls
+MKDIR=/usr/bin/mkdir
+MV=/usr/bin/mv
+RM=/usr/bin/rm
+SED=/usr/bin/sed
+SLEEP=/usr/bin/sleep
+SU=/usr/bin/su
+TEE=/usr/bin/tee
+TOUCH=/usr/bin/touch
+
+# ********************************************************************
+#
+#       Configuration Section
+#
+# ********************************************************************
+# Name of SunOS & ENIQ ini Files
+if [ -n $SUNOS_INI ]; then
+	SUNOS_INI=SunOS.ini
+fi
+SENTINEL_INI=sentinel.ini
+
+
+
+# DVD LABEL or Jumpstart Directory where all ENIQ SW will reside
+ENIQ_BASE_SW=eniq_base_sw
+
+# File used to identify correct DVD
+ENIQ_BASE_SW_FILE_ID=".eniq_base_sw"
+
+# Directory on the root filesystem
+ENIQ_ROOT_DIR=/eniq
+
+# Core install directory that contains scripts
+ENIQ_CORE_DIR=${ENIQ_ROOT_DIR}/installation/core_install
+
+DEFAULT_USER=root
+
+# ********************************************************************
+#
+#       Pre-execution Operations
+#
+# ********************************************************************
+
+
+# ********************************************************************
+#
+#   functions
+#
+# ********************************************************************
+### Function: abort_script ###
+#
+#   This is called if the script is aborted through an error
+#   error signal sent by the kernel such as CTRL-C or if a serious
+#   error is encountered during runtime
+#
+# Arguments:
+#       $1 - Error message from part of program (Not always used)
+# Return Values:
+#       none
+abort_script()
+{
+if [ "$1" ]; then
+    _err_msg_=$1
+else
+    _err_msg_="Script aborted.......\n"
+fi
+
+if [ "${LOGFILE}" ]; then
+    $ECHO "\n$_err_msg_\n" | $TEE -a ${LOGFILE}
+else
+    $ECHO "\n$_err_msg_\n"
+fi
+
+cd $SCRIPTHOME
+
+$RM -rf ${TEM_DIR}
+
+if [ "$2" ]; then
+    ${2}
+else
+   exit 1
+fi
+}
+
+### Function: check_id ###
+#
+#   Check that the effective id of the user is correct
+#   If not print error msg and exit.
+#
+# Arguments:
+#       $1 : User ID name
+# Return Values:
+#       none
+check_id()
+{
+_check_id_=`$ID  | $AWK -F\( '{print $2}' | $AWK -F\) '{print $1}'`
+if [ "$_check_id_" != "$1" ]; then
+    _err_msg_="You must be $1 to execute this script."
+    abort_script "$_err_msg_"
+fi
+}
+
+### Function: chk_create_logfile ###
+#
+# Check/Create Logfile
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+chk_create_logfile()
+{
+$MKDIR -p `$DIRNAME ${LOGFILE}`
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not create directory `$DIRNAME ${LOGFILE}`"
+     abort_script "$_err_msg_"
+fi
+
+$TOUCH -a ${LOGFILE}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not write to file ${LOGFILE}"
+    abort_script "$_err_msg_"
+fi
+}
+
+### Function: check_templates_dir ###
+#
+# Check that I have a templates directory associated with
+# my installation type
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+check_templates_dir()
+{
+if [ ! -s "${INST_TYPE_FILE}" ]; then
+    _err_msg_="ENIQ install type not defined in ${INST_TYPE_FILE}"
+    abort_script "$_err_msg_"
+fi
+# Read the installation type
+INSTALL_TYPE=`$CAT ${INST_TYPE_FILE} | $AWK -F\= '{print $2}'`
+
+# Templates Directory
+ENIQ_TEMPL_DIR="`$DIRNAME ${SCRIPTHOME}`/templates/${INSTALL_TYPE}"
+
+# Do we have a templates dir for the install type
+if [ ! -d ${ENIQ_TEMPL_DIR} ]; then
+    _err_msg_="Template directory ${ENIQ_TEMPL_DIR} not found"
+    abort_script "$_err_msg_"
+fi
+
+$LS ${ENIQ_TEMPL_DIR}/*.ini >> /dev/null 2>&1
+if [ $? -ne 0 ]; then
+    _err_msg_="Template directory ${ENIQ_TEMPL_DIR} contains no ini template files"
+    abort_script "$_err_msg_"
+fi
+}
+
+### Function: get_absolute_path ###
+#
+# Determine absolute path to software
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+get_absolute_path()
+{
+_dir_=`$DIRNAME $0`
+SCRIPTHOME=`cd $_dir_ 2>/dev/null && pwd || $ECHO $_dir_`
+}
+
+### Function: get_licence_loc ###
+#
+# Determine absolute path to software
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+get_licence_loc()
+{
+unset LIC_LOC
+
+# Create the Display file
+_disp_file_=${TEM_DIR}/disp_file
+$RM -f ${_disp_file_}
+
+if [ ! -s ${ENIQ_PORTBACKUP}/${HNAME}/ROOT/${VAR_TMP_UPGRADE}/${LIC_FILE} ]; then
+     $ECHO "\nEnter the location of the licence file" >> ${_disp_file_}
+     $ECHO "e.g. /var/tmp/<licence_file>" >> ${_disp_file_}
+     
+     while :; do
+         $CLEAR
+         $CAT ${_disp_file_}
+         read _lic_file_loc_
+     
+         if [ ! "${_lic_file_loc_}" ]; then
+             continue
+         fi
+     
+         if [ -f "${_lic_file_loc_}" ]; then
+              if [ ! -s "${_lic_file_loc_}" ]; then
+                   $ECHO "${_lic_file_loc_} cannot be found, or is empty"
+                   $ECHO "Press (enter) to continue"
+                   read _any_
+                   continue
+              else
+                   LIC_LOC=${_lic_file_loc_}
+                   break
+              fi
+         else
+              $ECHO "${_lic_file_loc_} is not a file"
+              $ECHO "Press (enter) to continue"
+              read _any_
+              continue
+         fi
+     done
+else
+     LIC_LOC="${ENIQ_PORTBACKUP}/${HNAME}/ROOT/${VAR_TMP_UPGRADE}/${LIC_FILE}"
+fi
+
+# Create a backup copy of the licence file
+$ECHO "Creating a backup of the SeninelLM licence file in ${ENIQ_SENTINEL_DIR}/etc/ENIQ_licence_file_backup_${RUN_TIME}" >> ${LOGFILE}
+$CP ${LIC_LOC} ${ENIQ_SENTINEL_DIR}/etc/ENIQ_licence_file_backup_${RUN_TIME}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not copy ${LIC_LOC} to ${ENIQ_SENTINEL_DIR}/etc/ENIQ_licence_file_backup_${RUN_TIME}"
+    abort_script "$_err_msg_"
+fi
+
+LIC_FILE_STR="-c ${LIC_LOC}"
+
+iniset SENTINEL_INFO -f ${TEM_DIR}/${SENTINEL_INI} Sentinal_Licence_File=${ENIQ_SENTINEL_DIR}/etc/ENIQ_licence_file_backup_${RUN_TIME}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not update ${TEM_DIR}/${SENTINEL_INI} with Sentinal_Licence_File=${ENIQ_SENTINEL_DIR}/etc/ENIQ_licence_file_backup_${RUN_TIME}"
+    abort_script "$_err_msg_"
+fi
+}
+
+### Function: setup_env ###
+#
+# Setup up path environment etc
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+setup_env()
+{
+if [ ! "${ENIQ_BASE_DIR}" ]; then
+    ENIQ_BASE_DIR=/eniq
+fi
+
+ENIQ_CONF_DIR=${ENIQ_BASE_DIR}/installation/config
+if [ ! -s ${ENIQ_CONF_DIR}/inst_type ]; then
+    _err_msg_="Could not locate file ${ENIQ_CONF_DIR}/inst_type"
+    abort_script "$_err_msg_"
+fi
+
+# File containing the type of OSS installation. Eg. oss or single
+INST_TYPE_FILE=${ENIQ_CONF_DIR}/ericsson_use_config
+
+ENIQ_SENTINEL_DIR=${ENIQ_BASE_DIR}/sentinel
+ENIQ_SENTINEL_BIN_DIR=${ENIQ_SENTINEL_DIR}/bin
+ENIQ_SENTINEL_ENV=${ENIQ_SENTINEL_DIR}/etc/sentinel.env
+
+# Set the log directory
+LOGFILE_DIR="${ENIQ_BASE_DIR}/log/sentinel_logs"
+
+# Set up Variable to hold network path to SW
+if [ -s ${ENIQ_CONF_DIR}/eniq_sw_locate ]; then
+    ENIQ_SW_PATH_FILE=${ENIQ_CONF_DIR}/eniq_sw_locate
+else
+    unset ENIQ_SW_PATH_FILE
+fi
+
+HNAME=`${MYHOSTNAME}`
+
+if [ -s "${ENIQ_CONF_DIR}/linux_migration_${HNAME}.conf" ]; then
+    LIC_FILE=`$GREP "MIG_LIC_INFO_PATH" ${ENIQ_CONF_DIR}/linux_migration_${HNAME}.conf|$AWK -F/ '{print $NF}'` 
+fi
+
+
+ENIQ_PORTBACKUP=/eniq/portbackup
+
+VAR_TMP_UPGRADE=/var/tmp/upgrade
+
+#Check IP Type
+check_ip_type
+}
+
+### Function: update_sentinel_env ###
+#
+# Update the sentinel environment file
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+update_sentinel_env()
+{
+$RM -rf ${TEM_DIR}/sentinel_env
+_update_env_=0
+
+_lshost_str_=`$CAT ${ENIQ_SENTINEL_ENV} | $EGREP '^[ 	]*LSHOST=' | $AWK -F\= '{print $2}'`
+if [ "${_lshost_str_}" == "<CHANGE><LSHOST_IP>" ]; then
+	_update_env_=1
+fi
+
+if [ ${_update_env_} -eq 1 ]; then
+
+	if [ "${_ip_type_}" == "IPv4" ]; then        
+            $ECHO "Updating ${ENIQ_SENTINEL_ENV} with Sentinel IP address" >> ${LOGFILE}
+            $CAT ${ENIQ_SENTINEL_ENV} | $SED -e "s/${_lshost_str_}/${IP_ADDR}/g" > ${TEM_DIR}/sentinel_env
+        else
+            $ECHO "Updating ${ENIQ_SENTINEL_ENV} with Sentinel IP address" >> ${LOGFILE}
+            $ECHO "LSTCPIPVER=6" > ${TEM_DIR}/sentinel_env
+            $ECHO "export LSTCPIPVER" >> ${TEM_DIR}/sentinel_env
+            $CAT ${ENIQ_SENTINEL_ENV} | $SED -e "s/${_lshost_str_}/${IP_ADDR}/g" >> ${TEM_DIR}/sentinel_env
+    fi    
+
+	
+	$CP ${TEM_DIR}/sentinel_env ${ENIQ_SENTINEL_ENV}
+	if [ $? -ne 0 ]; then
+	    _err_msg_="Could not copy ${TEM_DIR}/sentinel_env to ${ENIQ_SENTINEL_ENV}"
+	    abort_script "$_err_msg_"
+	fi
+	
+	UPDATE_BINARIES=1
+	
+	iniset SENTINEL_INFO -f ${TEM_DIR}/${SENTINEL_INI} Sentinel_ENV_File=${ENIQ_SENTINEL_ENV}
+	if [ $? -ne 0 ]; then
+	    _err_msg_="Could not update ${TEM_DIR}/${SENTINEL_INI} with Sentinel_ENV_File=${ENIQ_SENTINEL_ENV}"
+	    abort_script "$_err_msg_"
+	fi
+fi
+}
+
+### Function: usage_msg ###
+#
+#   Print out the usage message
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+usage_msg()
+{
+	
+	$CLEAR
+$ECHO "
+Usage: `$BASENAME $0` [-b <eniq_base_dir>] -d <eniq_sw_dir> -f <sentinel_ini_file>  [-i] [-l <path_to_logfile>] [-I] [-S] [-s]
+
+options:
+
+-b  : Optional parameter specifying the full path to where the ENIQ
+      BASEDIR directory is (eg. /eniq). If not specified, then the
+      script will assume the the base directory is
+      ../../<directory_that_this_script_is_in>
+
+-d  : Parameter specifying the full path to the directory
+      containing the ENIQ BASE SW directory structure.
+      
+-f  : Parameter specifying the full path to the sentinel.ini file
+      e.g. /eniq/installation/config/sentinel.ini
+
+-i  : Optional parameter specifying the IPADDRESS
+
+-l  : Optional parameter specifying the full path to logfile. If not specified, a 
+      logfile will be created in ${LOGFILE_DIR}
+      
+-I	: Parameter specifying that an initial install is in progress
+
+-S	: Parameter specifying to start Sentinel service  
+
+-s  : Optional parameter specifying the SunOS.ini file to use from the templates directory
+		e.g. SunOS.ini_raw
+    
+"
+}
+
+# ********************************************************************
+#
+#   Main body of program
+#
+# ********************************************************************
+#
+RUN_TIME=`$DATE '+%Y-%b-%d_%H.%M.%S'`
+
+# Determine absolute path to software
+get_absolute_path
+
+# Check that the effective id of the user is root
+check_id $DEFAULT_USER
+while getopts ":b:d:f:i:ISUl:s:" arg; do
+  case $arg in
+    b) ENIQ_BASE_DIR="$OPTARG"
+       ;;
+    d) BASE_SW_DIR="$OPTARG"
+       ;;
+    f) INI_FILE="$OPTARG"
+       ;;
+    i) IP_ADDR="$OPTARG"
+       ;;
+    I) INSTALL="YES"
+       ;;
+    l) LOGFILE="$OPTARG"
+       ;;
+    S) START_SENTINEL="YES"
+       ;;
+    s) SUNOS_INI="$OPTARG"
+	   ;;
+    U) UPGRADE="YES"
+	   ;;
+   \?) usage_msg
+       exit 1
+       ;;
+  esac
+done
+shift `expr $OPTIND - 1`
+
+if [ ! "${BASE_SW_DIR}" -o ! "${INI_FILE}" ]; then
+    usage_msg
+    exit 1
+fi
+
+if [ ! -s $SCRIPTHOME/../lib/common_functions.lib ]; then
+    _err_msg_="Cannot locate $SCRIPTHOME/../lib/common_functions.lib"
+    abort_script "$_err_msg_"
+else
+   . $SCRIPTHOME/../lib/common_functions.lib
+fi
+
+# Setup up path environment etc
+setup_env
+
+if [ ! "$IP_ADDR" ]; then
+	HNAME=`${MYHOSTNAME}`
+	IP_ADDR=`${MYHOSTNAME} -i | $AWK '{print $1}' | $HEAD -1`
+fi
+
+# Check that I have a templates directory associated with
+# my installation type
+check_templates_dir
+
+if [ ! "${LOGFILE}" ]; then
+    LOGFILE=${LOGFILE_DIR}/manage_sentinel.log
+fi
+
+# Check/Create Logfile
+chk_create_logfile
+
+# Set a flag to determine if the binaries need to be installed
+UPDATE_BINARIES=0
+
+$ECHO "\n=======================================================" >> ${LOGFILE}
+$ECHO "${RUN_TIME} - Starting ENIQ Sentinel management script" >> ${LOGFILE}
+$ECHO "=======================================================\n" >> ${LOGFILE}
+
+if [ "${BASE_SW_DIR}" ]; then
+    SW_DIR=${BASE_SW_DIR}
+else
+    if [ "${ENIQ_SW_PATH_FILE}" ]; then
+        insert_media -l ${ENIQ_BASE_SW} -f ${ENIQ_BASE_SW_FILE_ID} -s ${ENIQ_SW_PATH_FILE} -n 5 "ENIQ SW Distribution"
+    else
+        insert_media -l ${ENIQ_BASE_SW} -f ${ENIQ_BASE_SW_FILE_ID} -n 5 "ENIQ SW Distribution"
+    fi
+fi
+
+if [ ! "$SW_DIR" ]; then
+    _err_msg_="Failed to locate ENIQ SW Distribution... exiting!"
+    abort_script "$_err_msg_"
+fi
+
+# Create a temporary Directory
+TEM_DIR=/tmp/manage_eniq_sentinel.$$.$$
+$RM -rf ${TEM_DIR}
+$MKDIR -p ${TEM_DIR}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not create directory ${TEM_DIR}"
+    abort_script "$_err_msg_"
+fi
+
+$ECHO "Sourcing Sentinel information in ${ENIQ_TEMPL_DIR}/${SUNOS_INI}" >> ${LOGFILE}
+_sentinel_src_dir_=`iniget SENTINEL -f ${ENIQ_TEMPL_DIR}/${SUNOS_INI} -v SENTINEL_SOURCE_DIR`
+_sentinel_sw_bndl_=`iniget SENTINEL -f ${ENIQ_TEMPL_DIR}/${SUNOS_INI} -v SENTINEL_SW_BUNDLE`
+_sentinel_inst_prog_=`iniget SENTINEL -f ${ENIQ_TEMPL_DIR}/${SUNOS_INI} -v SENTINEL_INST_PROG`
+
+if [ ! "${_sentinel_src_dir_=}" -o ! "${_sentinel_sw_bndl_}" -o ! "${_sentinel_inst_prog_}" ]; then
+    _err_msg_="Could not read all required Sentinel info from ${ENIQ_TEMPL_DIR}/${SUNOS_INI}"
+    abort_script "$_err_msg_"
+fi
+
+_installation_prog_="$SW_DIR/${_sentinel_src_dir_}/admin/${_sentinel_inst_prog_}"
+_sentinel_sw_="$SW_DIR/${_sentinel_src_dir_}/admin/${_sentinel_sw_bndl_}"
+
+if [ ! -s "${_installation_prog_}" ]; then
+    _err_msg_="${_installation_prog_} could not be found, or is not executable"
+    abort_script "$_err_msg_"
+fi
+
+if [ ! -s "${_sentinel_sw_}" ]; then
+    _err_msg_="Could not find Sentinel installation software ${_sentinel_sw_}"
+    abort_script "$_err_msg_"
+fi
+
+if [ ! -d ${ENIQ_SENTINEL_DIR}/admin ]; then
+    $MKDIR -p ${ENIQ_SENTINEL_DIR}/admin
+    if [ $? -ne 0 ]; then
+        _err_msg_="Failed to create ${ENIQ_SENTINEL_DIR}/admin"
+        abort_script "$_err_msg_"
+    fi
+fi
+
+$ECHO "Checking if Sentinel binaries need to be installed/upgraded" >> ${LOGFILE}
+# If this is an initial install, then install binaries
+if [ "${INSTALL}" ]; then
+	UPDATE_BINARIES=1
+	
+	# Create /eniq/sentinel/admin
+	$ECHO "Copying files from $SW_DIR/${_sentinel_src_dir_}/admin to ${ENIQ_SENTINEL_DIR}" >> ${LOGFILE}
+	$CP -r $SW_DIR/${_sentinel_src_dir_}/admin ${ENIQ_SENTINEL_DIR}
+	if [ $? -ne 0 ]; then
+	    _err_msg_="Could not copy $SW_DIR/${_sentinel_src_dir_} to ${ENIQ_SENTINEL_DIR}/admin"
+	    abort_script "$_err_msg_"
+	fi
+	
+	# Copy the env file from the DVD
+	if [ ! -s ${ENIQ_SENTINEL_DIR}/etc/sentinel.env ]; then
+	    if [ ! -s $SW_DIR/${_sentinel_src_dir_}/etc/sentinel.env ]; then
+	        _err_msg_="sentinel.env cannot be found in $SW_DIR/${_sentinel_src_dir_}/etc"
+	        abort_script "$_err_msg_"
+	    else
+	        $MKDIR -p ${ENIQ_SENTINEL_DIR}/etc
+	        if [ $? -ne 0 ]; then
+	            _err_msg_="Failed to make ${ENIQ_SENTINEL_DIR}/etc"
+	            abort_script "$_err_msg_"
+	        fi
+	        
+	        $ECHO "Copying $SW_DIR/${_sentinel_src_dir_}/etc/sentinel.env to ${ENIQ_SENTINEL_DIR}/etc" >> ${LOGFILE}
+	        $CP $SW_DIR/${_sentinel_src_dir_}/etc/sentinel.env ${ENIQ_SENTINEL_DIR}/etc
+	        if [ $? -ne 0 ]; then
+	            _err_msg_="Could not copy $SW_DIR/${_sentinel_src_dir_}/etc/sentinel.env\nto ${ENIQ_SENTINEL_DIR}/etc"
+	            abort_script "$_err_msg_"
+	        fi
+	    fi
+	fi
+fi
+
+if [ "${UPGRADE}" ]; then
+	$ECHO "Copying files from $SW_DIR/${_sentinel_src_dir_}/admin to ${ENIQ_SENTINEL_DIR}" >> ${LOGFILE}
+	$CP -r $SW_DIR/${_sentinel_src_dir_}/admin ${ENIQ_SENTINEL_DIR}
+	if [ $? -ne 0 ]; then
+	    _err_msg_="Could not copy $SW_DIR/${_sentinel_src_dir_} to ${ENIQ_SENTINEL_DIR}/admin"
+	    abort_script "$_err_msg_"
+	fi
+fi
+
+# Check version files. If they don't exist, or are different then install binaries
+if [ -s ${ENIQ_SENTINEL_DIR}/version ]; then
+	_curent_version_=`$CAT ${ENIQ_SENTINEL_DIR}/version | $GREP -iw "VERSION" | $AWK -F\= '{print $2}'`
+	_new_version_=`$CAT $SW_DIR/${_sentinel_src_dir_}/admin/version | $GREP -iw "VERSION" | $AWK -F\= '{print $2}'`
+	if [ ${_new_version_} -gt ${_curent_version_} ]; then
+		UPDATE_BINARIES=1
+	fi
+fi
+
+# Copy the sentinel.ini file to TEM_DIR
+if [ -s ${INI_FILE} ]; then
+    $CP ${INI_FILE} ${TEM_DIR}
+    if [ $? -ne 0 ]; then
+        _err_msg_="Failed to copy ${INI_FILE} to ${TEM_DIR}"
+        abort_script "$_err_msg_"
+    fi
+fi	
+	
+# Install the sentinel binaries
+if [ ${UPDATE_BINARIES} -eq 1 ]; then
+	if [ ! "${UPGRADE}" ]; then
+		# Get the location of the licence
+		get_licence_loc
+	fi
+	
+	_srv_type_str_="\nInstalling SentinelLM binaries and Sentinel service\nPlease wait..."
+	_setup_option_="-a local -e ${ENIQ_SENTINEL_ENV} ${LIC_FILE_STR}"
+	
+	# Update the sentinel env file
+	update_sentinel_env
+else
+	_srv_type_str_="\nInstalling SentinelLM as an Systemd service\nPlease wait..."
+	_setup_option_="-a systemd"
+fi
+
+if [ "$START_SENTINEL" -a "$UPGRADE" ]; then
+	_setup_option_="${_setup_option_} -S"
+fi
+
+_sentinel_inst_code_="${ENIQ_SENTINEL_DIR}/admin/${_sentinel_inst_prog_}"
+if [ ! -e "${_sentinel_inst_code_}" ]; then
+    _err_msg_="${_sentinel_inst_code_} could not be found, or is not executable"
+    abort_script "$_err_msg_"
+fi
+
+# Finish Sentinel Installation
+$ECHO "${_srv_type_str_}" | $TEE -a ${LOGFILE}
+$ECHO "Installing SentinelLM using the following command:" >> ${LOGFILE}
+$ECHO "/usr/bin/bash ${_sentinel_inst_code_} ${_setup_option_} -l ${LOGFILE}\n" >> ${LOGFILE}
+/usr/bin/bash ${_sentinel_inst_code_} ${_setup_option_} -l ${LOGFILE}
+if [ $? -ne 0 ]; then
+    _err_msg_="Failed to setup Sentinel...exiting!"
+    abort_script "$_err_msg_"
+fi
+
+$ECHO "Copying ${TEM_DIR}/${SENTINEL_INI} to ${INI_FILE}" >> ${LOGFILE}
+$CP ${TEM_DIR}/${SENTINEL_INI} ${INI_FILE}
+if [ $? -ne 0 ]; then
+    _err_msg_="Failed to copy ${TEM_DIR}/${SENTINEL_INI} to ${INI_FILE}"
+    abort_script "$_err_msg_"
+fi
+
+$RM -rf ${TEM_DIR}
+
+exit 0

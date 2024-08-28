@@ -1,0 +1,363 @@
+#!/bin/bash
+# ********************************************************************
+# Ericsson Radio Systems AB                                     SCRIPT
+# ********************************************************************
+# (c) Ericsson Radio Systems AB 2016 - All rights reserved.
+#
+# The copyright to the computer program(s) herein is the property
+# of Ericsson Radio Systems AB, Sweden. The programs may be used
+# and/or copied only with the written permission from Ericsson Radio
+# Systems AB or in accordance with the terms and conditions stipulated
+# in the agreement/contract under which the program(s) have been
+# supplied.
+#
+# ********************************************************************
+# Name    : check_lockfile.bsh
+# Date    : 08/16/2016 
+# Revision: B 
+# Purpose : Script to check if lockfile is present 
+# Usage   : ./check_lockfile.bsh      ( to check install lockfile(s) and glassfish lockfile(s) in ENIQ Events )
+#           ./check_lockfile.bsh -i   ( to check presence of install lockfile(s) in ENIQ Stats )
+#           ./check_lockfile.bsh -g   ( to check glassfish lockfile(s) )
+# Exit Values: 
+#     0   : Success
+#     3   : NO RUN:Precheck Aborted  
+#    15   : NO RUN:Config file unavailable 
+#   106   : Failure 
+#   112   : Directory path not found
+# ********************************************************************
+#
+#   Command Section
+#
+# ********************************************************************
+AWK=/usr/bin/awk
+CAT=/usr/bin/cat
+DATE=/usr/bin/date
+ECHO=/usr/bin/echo
+GREP=/usr/bin/grep
+ID=/usr/bin/id
+MKDIR=/usr/bin/mkdir
+RM=/usr/bin/rm
+TEE=/usr/bin/tee
+TOUCH=/usr/bin/touch
+SORT=/usr/bin/sort
+# ********************************************************************
+#                                                                    *
+#                     Functions                                      *
+#                                                                    *
+# ********************************************************************
+
+### Function: abort_script 
+#                                                                     
+#   This will be called if the script is aborted through an error        
+#   encountered during runtime                               
+#                                                                     
+# Arguments:                                                          
+#       $1 - Error message from part of program (Not always used)     
+# Return Values:                                                      
+#       none                                                          
+#
+abort_script()
+{
+
+_err_time_=`$DATE '+%Y-%b-%d_%H.%M.%S'`
+
+if [ "$1" ]; then
+    _err_msg_="${_err_time_} - $1"
+else
+    _err_msg_="${_err_time_} - ERROR : Script aborted.......\n"
+fi
+if [ "${LOGFILE}" ]; then
+    $ECHO "\nERROR : ${_err_msg_}\n" | $TEE -a ${LOGFILE}
+else
+    $ECHO "\nERROR : ${_err_msg_}\n"
+fi
+exit 3 
+}
+
+### Function: check_id ###
+#
+#   Check that the effective id of the user is correct
+#   If not print error msg and exit.
+#
+# Arguments:
+#       $1 : User ID name
+# Return Values:
+#       none
+#
+check_id()
+{
+local _check_id_=`$ID  | $AWK -F\( '{print $2}' | $AWK -F\) '{print $1}'`
+
+if [ "$_check_id_" != "$1" ]; then
+    _err_msg_="You must be $1 to execute this script."
+    abort_script "$_err_msg_"
+fi
+}
+
+### Function: check_create_logfile ###
+#
+# Checks presence/creation of Logfile
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+#
+check_create_logfile()
+{
+
+if [ -s $LOGFILE ]; then
+    $RM -rf $LOGFILE
+    if [ -f $LOGFILE ]; then
+        _err_msg_="Warning : Could not remove older ${LOGFILE}"
+        abort_script "$_err_msg_"
+    fi	
+fi
+
+if [ ! -d  ${ENIQ_PRECHECK_LOG_DIR} ]; then
+    ${MKDIR} -p ${ENIQ_PRECHECK_LOG_DIR}
+fi
+
+$TOUCH -a ${LOGFILE}
+if [ $? -ne 0 ]; then 
+    _err_msg_="Could not write to file ${LOGFILE}"
+    abort_script "$_err_msg_"
+fi
+
+$CHMOD 640 ${LOGFILE}
+if [ $? -ne 0 ]; then 
+    _err_msg_="Could not change the permissions of the ${LOGFILE}"
+    abort_script "$_err_msg_"
+fi
+
+}
+
+
+### Function: check_lockfile ###
+#
+# Checks if lockfile file is present or not
+#
+# Arguments:
+#       None
+#Return values:
+#        15: NO RUN: Config file unavailable  
+#None
+#
+check_lockfile()
+{ 
+if [ -f ${SCRIPT_PATH} ]; then
+$CAT $SCRIPT_PATH | $GREP -v "#"| $GREP CHECK_LOCKFILE >/tmp/config_check_lockfile 
+while read line
+do
+     LOCKFILE_DIR=`$ECHO ${line} | $NAWK -F":" '{print $2}'`
+     LOCKFILE_NAME=`$ECHO ${line} | $NAWK -F":" '{print $3}'`
+
+        if [ -d ${LOCKFILE_DIR} ]; then
+          if [ -f ${LOCKFILE_DIR}/${LOCKFILE_NAME} ]; then
+             log_msg -q -s "ERROR: Lock File ${LOCKFILE_NAME} is present at ${LOCKFILE_DIR}" -l ${LOGFILE}
+             LOCK_ERROR=1 
+          else
+             log_msg -q -s "INFO: Lock File ${LOCKFILE_NAME} not found at ${LOCKFILE_DIR}" -l ${LOGFILE}
+             LOCK_ERROR=0 
+          fi
+        else
+          log_msg -q -s "ERROR: Directory path ${LOCKFILE_DIR} for lockfile is not present" -l ${LOGFILE}
+          LOCK_DIRECTORY=1 
+        fi
+  continue
+done < /tmp/config_check_lockfile 
+$RM -rf /tmp/config_check_lockfile
+else
+  log_msg -s "WARNING: ${SCRIPT_PATH} file missing, this is required for this script, exiting!!!!" -l ${LOGFILE}
+  exit 15
+fi
+}
+### Function: check_glassfish_lockfile ###
+#
+# Checks if lockfile is present on glassfish server or not
+#
+# Arguments:
+#       None
+#
+# Return values
+# 
+check_glassfish_lockfile()
+{ 
+   server_type=`$CAT ${SERVER_TYPE}`
+   glassfish_lockfile=`run_remote_cmd "glassfish" "$ECHO '::walk lock_graph | ::print lock_descriptor_t l_vnode | ::vnode2path' | mdb -k | $SORT -u|$GREP -i ejbtimer"`   
+  
+   if [ $? == 0 ]; then
+      
+      ### Checking if glassfish lockfile for domain2 is present on ENIQ Events server or not ### 
+      $ECHO ${glassfish_lockfile}|$GREP domain2 > /dev/null 2>&1  
+     
+      if [ $server_type == "eniq_coordinator" ] && [ $? != 0 ]; then
+          GLASSFISH_LOCK_ERROR=1
+          log_msg -q -s "ERROR: Glassfish lockfile is not present for domain2" -l ${LOGFILE}
+      else
+          GLASSFISH_LOCK_ERROR=0
+          log_msg -q -s "INFO: Glassfish lockfile(s) is present at ${glassfish_lockfile}" -l ${LOGFILE}   
+      fi
+    else
+       GLASSFISH_LOCK_ERROR=1
+       log_msg -q -s "ERROR: Glassfish lockfile is not present. Please check the glassfish status on Presentation server." -l ${LOGFILE}
+    fi
+}
+### Function: return_lockfile_result ###
+#
+# returns success or failure  for check_lockfile and check_glassfish_lockfile
+#  
+# Arguments:
+#   none
+# Return Values:
+#    0     : Lockfile check successful  
+#    106   : Lockfile Error 
+#    112   : Directory path not found
+#
+return_lockfile_result()
+{
+if [ ${LOCK_ERROR} -ne 0 ] || [ ${GLASSFISH_LOCK_ERROR} -ne 0 ]; then
+    RET_CODE=106
+elif [ ${LOCK_DIRECTORY} -ne 0 ]; then
+    RET_CODE=112
+else
+    RET_CODE=0
+fi
+}
+######### Check for stats or events server ##
+#
+# Arguments:
+#           None
+# Return values:
+#           15 : NO RUN : Config file unavailable
+#
+
+
+### Function: setup_env ###
+#
+# Setup path environment
+# Imports the common lib files which imports common functions 
+# 
+# Arguments:
+#   none
+# Return Values:
+
+#
+setup_env()
+{
+
+if [ ! "${ENIQ_BASE_DIR}" ]; then 
+   ENIQ_BASE_DIR=/eniq
+fi
+
+# Main Directory for the Core Installation SW
+ENIQ_INST_DIR=${ENIQ_BASE_DIR}/installation
+
+#Installation lib directory
+ENIQ_LIB_DIR=${ENIQ_INST_DIR}/core_install/lib
+
+#Common function directory
+COMMON_FUNCS_LIB=${ENIQ_LIB_DIR}/common_functions.lib
+
+#ENIQ config directory
+ENIQ_CONF_DIR=${ENIQ_INST_DIR}/config
+
+#Installation config Directory
+SERVER_TYPE=${ENIQ_CONF_DIR}/installed_server_type
+
+# Ericsson config file path
+ERICSSON_USE_CONFIG=${ENIQ_CONF_DIR}/ericsson_use_config
+
+# Events_checks config file
+EVENTS_CHECK_CONFIG=${ENIQ_INST_DIR}/core_install/eniq_checks/config/precheck_events.cfg
+
+# Stats_checks config file
+STATS_CHECK_CONFIG=${ENIQ_INST_DIR}/core_install/eniq_checks/config/precheck_stats.cfg
+
+# Precheck logs directory
+ENIQ_PRECHECK_LOG_DIR=${ENIQ_BASE_DIR}/local_logs/precheck_logs
+
+# Logfile path
+LOGFILE=${ENIQ_PRECHECK_LOG_DIR}/log_lockfile.log
+
+#Flag to check error scenario for lockfile
+LOCK_ERROR=0
+
+#Flag to check error scenario for glassfish lockfile
+GLASSFISH_LOCK_ERROR=0
+
+#Flag to check if directory is present
+LOCK_DIRECTORY=0
+
+# Return code declaration
+RET_CODE=0
+
+#Imports the common library functions
+if [ ! -f "${COMMON_FUNCS_LIB}" ]; then
+    _err_msg_="${COMMON_FUNCS_LIB} missing, this is required for this script, exiting!!!!"
+    abort_script "${_err_msg_}"
+fi
+
+. ${COMMON_FUNCS_LIB}
+
+if [ $? -ne 0 ]; then
+    _err_msg_="Importing functions of ${COMMON_FUNCS_LIB} failed, exiting!!!!"
+    abort_script "${_err_msg_}"
+fi
+}
+#
+#determining the eniq checks config file to be used based on server type
+check_server_type()
+{
+if [ ! -f "${ERICSSON_USE_CONFIG}" ]; then
+   log_msg -s "WARNING: ${ERICSSON_USE_CONFIG} file missing, this is required for this script, exiting!!!!" -l ${LOGFILE}
+   exit 15
+fi
+
+server=`$CAT $ERICSSON_USE_CONFIG | $CUT -d "=" -f2`
+if [[ $server == "stats" ]]; then
+   SCRIPT_PATH="${STATS_CHECK_CONFIG}"
+ elif [[ $server == "events" ]]; then
+   SCRIPT_PATH=${EVENTS_CHECK_CONFIG}
+fi
+}
+
+
+# ********************************************************************
+#
+#       Main body of program
+#
+# ********************************************************************
+
+# Default user
+DEFAULT_USER=root
+
+# Check that the effective id of the user is root
+check_id $DEFAULT_USER
+
+# Set up environment variables for script.
+setup_env
+
+# Check/Create Logfile
+check_create_logfile
+
+#Set SCRIPT_PATH
+check_server_type
+
+#Check for the lockfile 
+case $1 in 
+-i)check_lockfile 
+;;
+-g)check_glassfish_lockfile
+;;
+*)check_lockfile
+  check_glassfish_lockfile
+;;
+esac
+return_lockfile_result
+
+log_msg -t -s "ENIQ check_lockfile check completed" -l ${LOGFILE}
+log_msg -t -s "Check log $LOGFILE\n"
+exit $RET_CODE
+

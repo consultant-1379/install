@@ -1,0 +1,892 @@
+#!/bin/bash
+# ********************************************************************
+# Ericsson Radio Systems AB                                     SCRIPT
+# ********************************************************************
+#
+#
+# (c) Ericsson Radio Systems AB 2021 - All rights reserved.
+#
+# The copyright to the computer program(s) herein is the property
+# of Ericsson Radio Systems AB, Sweden. The programs may be used
+# and/or copied only with the written permission from Ericsson Radio
+# Systems AB or in accordance with the terms and conditions stipulated
+# in the agreement/contract under which the program(s) have been
+# supplied.
+#
+# ********************************************************************
+# Name    : unpack_core_sw.bsh
+# Date    : 11/10/2023
+# Revision: main\18
+# Purpose : A wrapper script that will unpack the core SW on all blades in 
+# 			a deployment.	
+#
+# Usage   : unpack_core_sw.bsh -a [create|delete]
+#
+# ********************************************************************
+#
+#   Command Section
+#
+# ********************************************************************
+AWK=/usr/bin/awk
+BASENAME=/usr/bin/basename
+BC=/usr/bin/bc
+CAT=/usr/bin/cat
+CHMOD=/usr/bin/chmod
+CLEAR=/usr/bin/clear
+CP=/usr/bin/cp
+CUT=/usr/bin/cut
+DATE=/usr/bin/date
+DF=/usr/bin/df
+DIRNAME=/usr/bin/dirname
+ECHO=/usr/bin/echo
+ENV=/usr/bin/env
+EGREP=/usr/bin/egrep
+GETENT=/usr/bin/getent
+GREP=/usr/bin/grep
+GTAR=/usr/bin/gtar
+HEAD=/usr/bin/head
+HOSTNAME=/usr/bin/hostname
+ID=/usr/bin/id
+LS=/usr/bin/ls
+MKDIR=/usr/bin/mkdir
+MV=/usr/bin/mv
+MYHOSTNAME=/usr/bin/hostname
+NAWK=/usr/bin/nawk
+PING=/usr/sbin/ping
+PWD=/usr/bin/pwd
+RM=/usr/bin/rm
+SED=/usr/bin/sed
+SLEEP=/usr/bin/sleep
+SORT=/usr/bin/sort
+SU=/usr/bin/su
+SUDO=/usr/bin/sudo
+TAIL=/usr/bin/tail
+TEE=/usr/bin/tee
+TOUCH=/usr/bin/touch
+
+
+# ********************************************************************
+#
+#       Configuration Section
+#
+# ********************************************************************
+
+# ********************************************************************
+#
+#       Pre-execution Operations
+#
+# ********************************************************************
+# Number of log files to keep
+NUM_LOGS=10
+
+# Size in kbytes that the log file is allowed to grow to
+SIZE_LOGS=2048000
+
+# Flag to determine whether to compress log or not (Must be y/n)
+COMPRESS_LOG=n
+
+# Core SW file and location
+CORE_SW_BUNDLE="install/eniq_core_inst_sw_bundle.tar.gz"
+
+# ********************************************************************
+#
+#   functions
+#
+# ********************************************************************
+### Function: abort_script ###
+#
+#   This will is called if the script is aborted thru an error
+#   error signal sent by the kernel such as CTRL-C or if a serious
+#   error is encountered during runtime
+#
+# Arguments:
+#       $1 - Error message from part of program (Not always used)
+# Return Values:
+#       none
+abort_script()
+{
+_err_time_=`$DATE '+%Y-%b-%d_%H.%M.%S'`
+
+if [ "$1" ]; then
+    _err_msg_="${_err_time_} - $1"
+else
+    _err_msg_="${_err_time_} - Script aborted.......\n"
+fi
+if [ "${LOGFILE}" ]; then
+    $ECHO "\nERROR : $_err_msg_\n" | $TEE -a ${LOGFILE}
+else
+    $ECHO "\nERROR : $_err_msg_\n"
+fi
+
+cd $SCRIPTHOME
+$RM -rf ${TEM_DIR}
+
+if [ "$2" ]; then
+    ${2}
+else
+   exit 1
+fi
+}
+
+# Check/Create Logfile
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+chk_create_logfile()
+{
+$MKDIR -p `$DIRNAME ${LOGFILE}`
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not create directory `$DIRNAME ${LOGFILE}`"
+     abort_script "$_err_msg_"
+fi
+
+$TOUCH -a ${LOGFILE}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not write to file ${LOGFILE}"
+    abort_script "$_err_msg_"
+fi
+}
+
+### Function: check_id ###
+#
+#   Check that the effective id of the user is correct
+#   If not print error msg and exit.
+#
+# Arguments:
+#       $1 : User ID name
+# Return Values:
+#       none
+check_id()
+{
+
+_get_id_=`$ENV |$GREP -w SUDO_USER | $EGREP "^[[:blank:]]*SUDO_USER="|$AWK -F\= '{print $2}'|$SED -e 's|"||g'`
+
+_check_id_=`$ID | $AWK -F\( '{print $2}' | $AWK -F\) '{print $1}'`
+
+_check_group_=`$ID $_get_id_ | $AWK -F\( '{print $3}' | $AWK -F\) '{print $1}'`
+
+
+    if [ "${_get_id_}" == "" ]; then
+
+        if [ "${_check_id_}" == "root" ]; then
+           # Set 1 for true
+           _user_root=1
+
+        else
+           _err_msg_="You must be root or admin to execute this script."
+           abort_script "${_err_msg_}"
+        fi
+          else
+            if [ "${_check_group_}" == "ENIQ_ADMIN_ROLE" ]; then
+               # Set 0 for false
+               _user_root=0
+
+            else
+               _err_msg_="You must be root or admin to execute this script." 
+               abort_script "${_err_msg_}"
+            fi
+    fi
+}
+
+
+### Function: check_params ###
+#
+# Check Input Params
+#
+# Arguments:
+#	none
+# Return Values:
+#	none
+check_params()
+{
+# Check that we got the required params
+if [ ! "${UNPACK_ACTION}" ] ;then
+	usage_msg
+	exit 1
+fi
+
+if [ "${UNPACK_ACTION}" == "create" ]; then
+	if [ ! "${BASE_SW_DIR}" -o ! "${UPGRADE_SW_DIR}" ]; then
+		usage_msg
+		exit 1
+	fi	
+fi 
+
+if [ "${UNPACK_ACTION}" == "copy_precheck_sw" ]; then
+        if [ ! "${UPGRADE_SW_DIR}" ]; then
+                usage_msg
+                exit 1
+        fi
+fi
+
+case "${UNPACK_ACTION}" in
+	create)	:
+			;;
+	delete)	:
+			;;
+        copy_precheck_sw) :
+			;;
+	*)		usage_msg
+			exit 1
+			;;
+esac
+}
+
+### Copy precheck sw ###
+#
+# Copy the precheck SW on all blades
+#
+# Arguments:
+#   $1 - List of deployed servers 
+# Return Values:
+#   none
+copy_precheck_sw()
+{
+# Determine Rhel OS version
+unset RHEL
+OS_VERSION=`$UNAME`
+if [ "${OS_VERSION}" == "Linux" ]; then
+    RHEL=YES
+fi
+
+local _server_order_file_=$1
+
+log_msg -s "Copying Precheck SW. " -l $LOGFILE -h -t
+
+for _line_ in `$CAT ${_server_order_file_}`; do
+    unset _ip_address_ _serv_hostname_ _count_
+	local _ip_address_ _serv_hostname_ _count_
+	_count_=`$ECHO "${_line_}" | grep -o "::" | wc -l`
+	
+	if [ "${_ip_type_}" == "IPv6" ] && [ "${_count_}" == 3 ]; then
+		if [ "${RHEL}" ];then
+			_ip_address_=`$ECHO ${_line_} | grep -oE '([a-fA-F0-9]{1,4}::?){1,7}[a-fA-F0-9]{1,4}' | head -n 1 | $AWK -F "::" '{ print $1 "::" $2}'`
+			_serv_hostname_=`$ECHO ${_line_} | $AWK -F"::" '{print $3}'`
+		else
+			_ip_address_=`$ECHO ${_line_} | grep -oE '([a-fA-F0-9]{1,4}::?){1,7}[a-fA-F0-9]{1,4}' | head -n 1 | $NAWK -F "::" '{ print $1 "::" $2}'`
+			_serv_hostname_=`$ECHO ${_line_} | $NAWK -F"::" '{print $3}'`
+		fi
+	else 
+		if [ "${RHEL}" ];then
+			_ip_address_=`$ECHO ${_line_} | $AWK -F"::" '{print $1}'`
+			_serv_hostname_=`$ECHO ${_line_} | $AWK -F"::" '{print $2}'`
+		else
+			_ip_address_=`$ECHO ${_line_} | $NAWK -F"::" '{print $1}'`
+			_serv_hostname_=`$ECHO ${_line_} | $NAWK -F"::" '{print $2}'`
+		fi
+	fi
+
+        if [ ! "${_ip_address_}" -o ! "${_serv_hostname_}" ]; then
+                _err_msg_="Could not read required info from ${_server_order_file_}"
+                abort_script "${_err_msg_}"
+        fi
+    
+        if [ "${_ip_address_}" == "${HOST_IP}" ]; then
+                if [ "${RHEL}" ];then
+                    log_msg -s "Copying Precheck SW on ${_serv_hostname_}" -l ${LOGFILE}
+                    $CP -rp ${UNPACK_CORE_SW_LOC}/core_install/eniq_checks_linux ${ENIQ_CORE_INST_DIR}
+                    if [ $? -ne 0 ]; then
+                       _err_msg_="Copying of ${UNPACK_CORE_SW_LOC}/core_install/eniq_checks failed on ${_serv_hostname_}"
+                       abort_script "$_err_msg_"
+                    fi
+                    if [ -d ${ENIQ_CORE_INST_DIR}/eniq_checks ]; then
+                            $RM -rf ${ENIQ_CORE_INST_DIR}/eniq_checks
+                    fi
+                    $MV ${ENIQ_CORE_INST_DIR}/eniq_checks_linux ${ENIQ_CORE_INST_DIR}/eniq_checks
+                        if [ $? -ne 0 ]; then
+                            _err_msg_="Could not move ${ENIQ_CORE_INST_DIR}/eniq_checks_linux to ${ENIQ_CORE_INST_DIR}/eniq_checks`$DATE '+%y%m%d'`"
+                            abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+                        fi
+                else
+                    log_msg -s "Copying Precheck SW on ${_serv_hostname_}" -l ${LOGFILE}
+                    $CP -rp ${UNPACK_CORE_SW_LOC}/core_install/eniq_checks_solaris ${ENIQ_CORE_INST_DIR}
+                    if [ $? -ne 0 ]; then
+                       _err_msg_="Copying of ${UNPACK_CORE_SW_LOC}/core_install/eniq_checks failed on ${_serv_hostname_}"
+                       abort_script "$_err_msg_"
+                    fi
+                    if [ -d ${ENIQ_CORE_INST_DIR}/eniq_checks ]; then
+                            $RM -rf ${ENIQ_CORE_INST_DIR}/eniq_checks
+                    fi
+                    $MV ${ENIQ_CORE_INST_DIR}/eniq_checks_solaris ${ENIQ_CORE_INST_DIR}/eniq_checks
+                        if [ $? -ne 0 ]; then
+                              _err_msg_="Could not move ${ENIQ_CORE_INST_DIR}/eniq_checks_solaris to ${ENIQ_CORE_INST_DIR}/eniq_checks`$DATE '+%y%m%d'`"
+                        fi
+                fi
+
+        else
+            if [ "${_user_root}" == 1 ]; then
+					if [ "${RHEL}" ];then
+						log_msg -s "Copying Precheck SW on ${_serv_hostname_}" -l ${LOGFILE}
+						run_remote_cmd "${_serv_hostname_}" "$CP -rp ${UNPACK_CORE_SW_LOC}/core_install/eniq_checks_linux ${ENIQ_CORE_INST_DIR}" "${LOGFILE}"
+						if [ $? -ne 0 ]; then
+							_err_msg_="Copying of ${UNPACK_CORE_SW_LOC}/core_install/eniq_checks failed on ${_serv_hostname_}"
+								abort_script "$_err_msg_"
+						fi
+						if [ -d ${ENIQ_CORE_INST_DIR}/eniq_checks ]; then
+							run_remote_cmd "${_serv_hostname_}" "$RM -rf ${ENIQ_CORE_INST_DIR}/eniq_checks"
+						fi
+						run_remote_cmd "${_serv_hostname_}" "$MV ${ENIQ_CORE_INST_DIR}/eniq_checks_linux ${ENIQ_CORE_INST_DIR}/eniq_checks" "${LOGFILE}"
+						if [ $? -ne 0 ]; then
+							_err_msg_="Could not move ${ENIQ_CORE_INST_DIR}/eniq_checks_linux to ${ENIQ_CORE_INST_DIR}/eniq_checks`$DATE '+%y%m%d'`"
+							abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+						fi
+					else
+						log_msg -s "Copying Precheck SW on ${_serv_hostname_}" -l ${LOGFILE}
+						run_remote_cmd "${_serv_hostname_}" "$CP -rp ${UNPACK_CORE_SW_LOC}/core_install/eniq_checks_solaris ${ENIQ_CORE_INST_DIR}" "${LOGFILE}"
+						if [ $? -ne 0 ]; then
+							_err_msg_="Copying of ${UNPACK_CORE_SW_LOC}/core_install/eniq_checks failed on ${_serv_hostname_}"
+							abort_script "$_err_msg_"
+						fi
+						if [ -d ${ENIQ_CORE_INST_DIR}/eniq_checks ]; then
+							run_remote_cmd "${_serv_hostname_}" "$RM -rf ${ENIQ_CORE_INST_DIR}/eniq_checks"
+						fi
+						run_remote_cmd "${_serv_hostname_}" "$MV ${ENIQ_CORE_INST_DIR}/eniq_checks_solaris ${ENIQ_CORE_INST_DIR}/eniq_checks" "${LOGFILE}"
+						if [ $? -ne 0 ]; then
+							_err_msg_="Could not move ${ENIQ_CORE_INST_DIR}/eniq_checks_solaris to ${ENIQ_CORE_INST_DIR}/eniq_checks`$DATE '+%y%m%d'`"
+						fi
+					fi
+			else 
+					if [ "${RHEL}" ];then
+						log_msg -s "Copying Precheck SW on ${_serv_hostname_}" -l ${LOGFILE}
+						run_remote_cmd "${_serv_hostname_}" "$SUDO $CP -rp ${UNPACK_CORE_SW_LOC}/core_install/eniq_checks_linux ${ENIQ_CORE_INST_DIR}" "${LOGFILE}" "$_get_id_" 
+						if [ $? -ne 0 ]; then
+							_err_msg_="Copying of ${UNPACK_CORE_SW_LOC}/core_install/eniq_checks failed on ${_serv_hostname_}"
+								abort_script "$_err_msg_"
+						fi
+						if [ -d ${ENIQ_CORE_INST_DIR}/eniq_checks ]; then
+							run_remote_cmd "${_serv_hostname_}" "$SUDO $RM -rf ${ENIQ_CORE_INST_DIR}/eniq_checks" "" "$_get_id_" 
+						fi
+						run_remote_cmd "${_serv_hostname_}" "$SUDO $MV ${ENIQ_CORE_INST_DIR}/eniq_checks_linux ${ENIQ_CORE_INST_DIR}/eniq_checks" "${LOGFILE}" "$_get_id_"
+						if [ $? -ne 0 ]; then
+							_err_msg_="Could not move ${ENIQ_CORE_INST_DIR}/eniq_checks_linux to ${ENIQ_CORE_INST_DIR}/eniq_checks`$DATE '+%y%m%d'`"
+							abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+						fi
+					else
+						log_msg -s "Copying Precheck SW on ${_serv_hostname_}" -l ${LOGFILE}
+						run_remote_cmd "${_serv_hostname_}" "$SUDO $CP -rp ${UNPACK_CORE_SW_LOC}/core_install/eniq_checks_solaris ${ENIQ_CORE_INST_DIR}" "${LOGFILE}" "$_get_id_"
+						if [ $? -ne 0 ]; then
+							_err_msg_="Copying of ${UNPACK_CORE_SW_LOC}/core_install/eniq_checks failed on ${_serv_hostname_}"
+							abort_script "$_err_msg_"
+						fi
+						if [ -d ${ENIQ_CORE_INST_DIR}/eniq_checks ]; then
+							run_remote_cmd "${_serv_hostname_}" "$SUDO $RM -rf ${ENIQ_CORE_INST_DIR}/eniq_checks" "" "$_get_id_"
+						fi
+						run_remote_cmd "${_serv_hostname_}" "$SUDO $MV ${ENIQ_CORE_INST_DIR}/eniq_checks_solaris ${ENIQ_CORE_INST_DIR}/eniq_checks" "${LOGFILE}" "$_get_id_"
+						if [ $? -ne 0 ]; then
+							_err_msg_="Could not move ${ENIQ_CORE_INST_DIR}/eniq_checks_solaris to ${ENIQ_CORE_INST_DIR}/eniq_checks`$DATE '+%y%m%d'`"
+						fi
+					fi
+			fi 
+            
+        fi
+        log_msg -s "Successfully finished Copying Precheck SW on ${_serv_hostname_}" -l ${LOGFILE}
+
+done
+}
+
+### delete_core_inst_sw ###
+#
+# Delete the directory
+#
+# Arguments:
+#   $1 - List of deployed servers
+# Return Values:
+#   none
+delete_core_inst_sw()
+{
+local _server_order_file_=$1
+
+for _line_ in `$CAT ${_server_order_file_}`; do
+    unset _ip_address_ _serv_hostname_ _count_
+	local _ip_address_ _serv_hostname_ _count_
+	_count_=`$ECHO "${_line_}" | grep -o "::" | wc -l`
+
+	if [ "${_ip_type_}" == "IPv6" ] && [ "${_count_}" == 3 ]; then
+		_ip_address_=`$ECHO ${_line_} | grep -oE '([a-fA-F0-9]{1,4}::?){1,7}[a-fA-F0-9]{1,4}' | head -n 1 | awk -F "::" '{ print $1 "::" $2}'`
+		_serv_hostname_=`$ECHO ${_line_} | $AWK -F"::" '{print $3}'`
+	else
+		_ip_address_=`$ECHO ${_line_} | $AWK -F"::" '{print $1}'`
+		_serv_hostname_=`$ECHO ${_line_} | $AWK -F"::" '{print $2}'`
+	fi
+    
+    if [ ! "${_ip_address_}" -o ! "${_serv_hostname_}" ]; then
+        _err_msg_="Could not read required info from ${_server_order_file_}"
+        abort_script "${_err_msg_}"
+    fi
+    
+    log_msg -h -s "Removing ${UNPACK_CORE_SW_DIR} on ${_serv_hostname_}" -l ${LOGFILE}    
+    if [ "${_ip_address_}" == "${HOST_IP}" ]; then
+        $RM -rf ${UNPACK_CORE_SW_DIR}
+        if [ $? -ne 0 ]; then
+            _err_msg_="Could not remove directory ${UNPACK_CORE_SW_DIR} on ${_serv_hostname_}"
+            abort_script "$_err_msg_"
+        fi
+    else
+        if [ "${_user_root}" == 1 ]; then
+				# Execute Root command
+				run_remote_cmd "${_serv_hostname_}" "$RM -rf ${UNPACK_CORE_SW_DIR}" "${LOGFILE}"
+				if [ $? -ne 0 ]; then
+					_err_msg_="Could not remove remote directory ${UNPACK_CORE_SW_DIR} on ${_serv_hostname_}"
+					abort_script "$_err_msg_"
+				fi	   
+		else
+				# Execute non root admin user command	
+				run_remote_cmd "${_serv_hostname_}" "$SUDO $RM -rf ${UNPACK_CORE_SW_DIR}" "${LOGFILE}" "$_get_id_"
+				if [ $? -ne 0 ]; then
+					_err_msg_="Could not remove remote directory ${UNPACK_CORE_SW_DIR} on ${_serv_hostname_}"
+					abort_script "$_err_msg_"
+				fi
+		fi 
+    fi
+    log_msg -s "Successfully deleted ${UNPACK_CORE_SW_DIR} on ${_serv_hostname_}" -l ${LOGFILE}
+    done
+            
+}
+
+### Function: get_absolute_path ###
+#
+# Determine absolute path to software
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+get_absolute_path() 
+{
+_dir_=`$DIRNAME $0`
+SCRIPTHOME=`cd $_dir_ 2>/dev/null && pwd || $ECHO $_dir_`
+}
+
+### Function: get_deployment_order ###
+#
+# Get the order of the deployment
+# for taking snapshot
+#
+# Arguments:
+#    none
+# Return Values:
+#    none
+get_deployment_order()
+{
+$RM -rf ${TEM_DIR}/server_order_list    
+# get the list for order
+/usr/bin/perl ${ENIQ_CORE_INST_DIR}/lib/get_ip_order.pl -f ${TEM_DIR}/server_order_list
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not get an ordered list of servers"
+    abort_script "$_err_msg_"
+fi
+}
+
+### Function: setup_env ###
+#
+# Setup up path environment etc
+#
+# Arguments:
+#    none
+# Return Values:
+#    none
+setup_env()
+{
+if [ ! "${ENIQ_BASE_DIR}" ]; then
+    # Directory on the root filesystem
+    ENIQ_BASE_DIR=/eniq
+fi
+
+# Main Directory for the Core Installation SW
+ENIQ_INST_DIR=${ENIQ_BASE_DIR}/installation
+
+# Main Directory for the Core Installation SW
+ENIQ_CORE_INST_DIR=${ENIQ_INST_DIR}/core_install
+
+# ENIQ Config Directory
+ENIQ_CONF_DIR=${ENIQ_INST_DIR}/config
+
+# ini file to determine storage type
+SUNOS_INI=SunOS.ini
+
+# Coordinator server list
+CO_SERVER_TYPE="eniq_coordinator|stats_coordinator|eniq_events|eniq_stats|eniq_iqw|son_coordinator|eniq_es"
+
+# Set up default logfile 
+LOGDIR="${ENIQ_BASE_DIR}/log/upgrade"
+
+# Source the common functions
+if [ -s ${SCRIPTHOME}/../lib/common_functions.lib ]; then
+    . ${SCRIPTHOME}/../lib/common_functions.lib
+else
+    _err_msg_="File ${SCRIPTHOME}/../lib/common_functions.lib not found"
+    abort_script "${_err_msg_}" 
+fi
+
+# Determine the current server type
+CURR_SERVER_TYPE=`$CAT $ENIQ_CONF_DIR/installed_server_type | $GREP -v '^[[:blank:]]*#' | $SED -e 's/ //g'`
+if [ ! "${CURR_SERVER_TYPE}" ]; then
+    _err_msg_="Could not determine which server type this is"
+    abort_script "$_err_msg_"
+fi
+
+$ECHO "${CURR_SERVER_TYPE}" | $EGREP "${CO_SERVER_TYPE}" >> /dev/null 2>&1
+if [ $? -eq 0 ]; then
+    SERVER_TYPE="CO"
+else
+    SERVER_TYPE="${SERVER_TYPE}"
+fi
+
+# Read the storage type
+if [ -s ${ENIQ_CONF_DIR}/${SUNOS_INI} ]; then
+    STORAGE_TYPE=`iniget STOR_TYPE -f ${ENIQ_CONF_DIR}/${SUNOS_INI} -v STORAGE_TYPE`
+else
+    if [ -s ${ENIQ_CONF_DIR}/san_details ]; then
+        STORAGE_TYPE=`$CAT ${ENIQ_CONF_DIR}/san_details | $GREP "^STORAGE_TYPE=" | $AWK -F\= '{print $2}'`
+    fi
+fi
+
+if [ ! "${STORAGE_TYPE}" ]; then
+    _err_msg_="Could not read STORAGE_TYPE param "
+    abort_script "${_err_msg_}"
+fi
+
+#set host name and host ip
+HNAME=`${MYHOSTNAME}`
+HOST_IP=`$HOSTNAME -i | $AWK '{print $1}' | $HEAD -1`
+
+# Set up unpack core sw dir
+UNPACK_CORE_SW_DIR="/var/tmp/upgrade"
+UNPACK_CORE_SW_LOC="${UNPACK_CORE_SW_DIR}/${UPGRADE_SW_DIR}"
+
+#Fetching IP Type from ipmp.ini file.
+check_ip_type
+
+if [ ! "${_ip_type_}" ]; then
+    _err_msg_="Could not read parameter _IP_TYPE_ from file ${ENIQ_CONF_DIR}/${IPMP_INI}"
+    abort_script "$_err_msg_"
+fi
+}
+
+### Unpack core sw ###
+#
+# Unpack the SW on all blades
+#
+# Arguments:
+#   $1 - List of deployed servers
+# Return Values:
+#   none
+unpack_core_inst_sw()
+{
+local _server_order_file_=$1
+
+log_msg -s "Unpacking core sw started " -l $LOGFILE -h -t
+
+for _line_ in `$CAT ${_server_order_file_}`; do
+    unset _ip_address_ _serv_hostname_ _count_
+	local _ip_address_ _serv_hostname_ _count_
+	_count_=`$ECHO "${_line_}" | grep -o "::" | wc -l`
+
+	if [ "${_ip_type_}" == "IPv6" ] && [ "${_count_}" == 3 ]; then
+		_ip_address_=`$ECHO ${_line_} | grep -oE '([a-fA-F0-9]{1,4}::?){1,7}[a-fA-F0-9]{1,4}' | head -n 1 | awk -F "::" '{ print $1 "::" $2}'`
+		_serv_hostname_=`$ECHO ${_line_} | $AWK -F"::" '{print $3}'`
+	else
+		_ip_address_=`$ECHO ${_line_} | $AWK -F"::" '{print $1}'`
+		_serv_hostname_=`$ECHO ${_line_} | $AWK -F"::" '{print $2}'`
+	fi
+    
+    if [ ! "${_ip_address_}" -o ! "${_serv_hostname_}" ]; then
+        _err_msg_="Could not read required info from ${_server_order_file_}"
+        abort_script "${_err_msg_}"
+    fi
+    
+    log_msg -h -s "Unpacking core sw on ${_serv_hostname_}" -l ${LOGFILE}
+    if [ "${_ip_address_}" == "${HOST_IP}" ]; then
+        log_msg -s "Removing ${UNPACK_CORE_SW_LOC} dir on ${_serv_hostname_}" -l ${LOGFILE}
+        $RM -rf ${UNPACK_CORE_SW_LOC}
+        if [ $? -ne 0 ]; then
+            _err_msg_="Could not remove directory ${UNPACK_CORE_SW_LOC} on ${_serv_hostname_}"
+            abort_script "$_err_msg_"
+        fi
+        
+        log_msg -s "Creating ${UNPACK_CORE_SW_LOC} dir on ${_serv_hostname_}" -l ${LOGFILE}
+        $MKDIR -p ${UNPACK_CORE_SW_LOC}
+        if [ $? -ne 0 ]; then
+            _err_msg_="Could not create directory ${UNPACK_CORE_SW_LOC} on ${_serv_hostname_}"
+            abort_script "$_err_msg_"
+        fi
+        
+        log_msg -s "Unpacking SW on ${_serv_hostname_}" -l ${LOGFILE}
+        $GTAR zxf ${BASE_SW_DIR}/${CORE_SW_BUNDLE} -C ${UNPACK_CORE_SW_LOC}
+        if [ $? -ne 0 ]; then
+            _err_msg_="Extraction of ${BASE_SW_DIR}/${CORE_SW_BUNDLE} failed on ${_serv_hostname_}"
+            abort_script "$_err_msg_"
+        fi
+        
+    else
+		if [ "${_user_root}" == 1 ]; then
+			log_msg -s "Removing ${UNPACK_CORE_SW_LOC} dir on ${_serv_hostname_}" -l ${LOGFILE}
+			run_remote_cmd "${_serv_hostname_}" "$RM -rf ${UNPACK_CORE_SW_LOC}" "${LOGFILE}"
+			if [ $? -ne 0 ]; then
+				_err_msg_="Could not remove directory ${UNPACK_CORE_SW_LOC} on ${_serv_hostname_}"
+				abort_script "$_err_msg_"
+			fi
+			
+			log_msg -s "Creating ${UNPACK_CORE_SW_LOC} dir on ${_serv_hostname_}" -l ${LOGFILE}
+			run_remote_cmd "${_serv_hostname_}"  "$MKDIR -p ${UNPACK_CORE_SW_LOC}" "${LOGFILE}"
+			if [ $? -ne 0 ]; then
+				_err_msg_="Could not create directory ${UNPACK_CORE_SW_LOC} on ${_serv_hostname_}"
+				abort_script "$_err_msg_"
+			fi
+			
+			log_msg -s "Unpacking SW on ${_serv_hostname_}" -l ${LOGFILE}
+			run_remote_cmd "${_serv_hostname_}" "$GTAR zxf ${BASE_SW_DIR}/${CORE_SW_BUNDLE} -C ${UNPACK_CORE_SW_LOC}" "${LOGFILE}"
+			if [ $? -ne 0 ]; then
+				_err_msg_="Extraction of ${BASE_SW_DIR}/${CORE_SW_BUNDLE} failed on ${_serv_hostname_}"
+				abort_script "$_err_msg_"
+			fi
+		else 
+			log_msg -s "Removing ${UNPACK_CORE_SW_LOC} dir on ${_serv_hostname_}" -l ${LOGFILE}
+			run_remote_cmd "${_serv_hostname_}" "$SUDO $RM -rf ${UNPACK_CORE_SW_LOC}" "${LOGFILE}" "$_get_id_"
+			if [ $? -ne 0 ]; then
+				_err_msg_="Could not remove directory ${UNPACK_CORE_SW_LOC} on ${_serv_hostname_}"
+				abort_script "$_err_msg_"
+			fi
+			
+			log_msg -s "Creating ${UNPACK_CORE_SW_LOC} dir on ${_serv_hostname_}" -l ${LOGFILE}
+			run_remote_cmd "${_serv_hostname_}"  "$SUDO $MKDIR -p ${UNPACK_CORE_SW_LOC}" "${LOGFILE}" "$_get_id_"
+			if [ $? -ne 0 ]; then
+				_err_msg_="Could not create directory ${UNPACK_CORE_SW_LOC} on ${_serv_hostname_}"
+				abort_script "$_err_msg_"
+			fi
+			
+			log_msg -s "Unpacking SW on ${_serv_hostname_}" -l ${LOGFILE}
+			run_remote_cmd "${_serv_hostname_}" "$SUDO $GTAR zxf ${BASE_SW_DIR}/${CORE_SW_BUNDLE} -C ${UNPACK_CORE_SW_LOC}" "${LOGFILE}" "$_get_id_"
+			if [ $? -ne 0 ]; then
+				_err_msg_="Extraction of ${BASE_SW_DIR}/${CORE_SW_BUNDLE} failed on ${_serv_hostname_}"
+				abort_script "$_err_msg_"
+			fi
+		fi
+    fi
+    log_msg -s "Successfully finished unpacking core SW on ${_serv_hostname_}" -l ${LOGFILE}
+    
+done            
+}
+
+### Function: usage_msg ###
+#
+#   Print out the usage message
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+usage_msg()
+{
+$CLEAR
+$ECHO "
+Usage: `$BASENAME $0` -a <UNPACK_Action> -d <eniq_sw_dir> -p <new_sw_extraction_loc>
+
+options:
+
+-a  :  UNPACK_Action. Must be either
+              create   --> Create a dir inside /var/tmp/upgrade specified with -p option on all the blades in the deployment 
+              and unpack core sw from coordinator
+              delete   --> Delete  the directory created that stores the unpacked SW on all the blades 
+              in the deployment. i.e. /var/tmp/upgrade will be removed from each blade in the deployment
+    copy_precheck_sw   --> Copy the upgrade precheck software from a directory inside /var/tmp/upgrade specified with -p option
+                          to /eniq/installation/core_install on all the blades in the deployment
+
+              
+-d  : Parameter specifying the full path to the directory containing the ENIQ BASE SW MWS location .
+        This parameter is not required in case UNPACK_Action is delete.
+        
+-l  : Optional parameter specifying the full path to logfile. If not specified, a 
+      logfile will be created in /eniq/log/upgrade        
+
+-p  : Parameter specifying the dir name where new core SW is to be extracted. dir will be created inside /var/tmp/upgrade .
+      e.g. <revision>_upgrade_sw. This parameter is not required in case UNPACK_Action is delete.
+
+"
+}
+
+### Function: user_confirm ###
+#
+# Get confirmation from user to proceed with snapshot action
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+user_confirm()
+{
+# Determine Rhel OS version
+unset RHEL
+OS_VERSION=`$UNAME`
+if [ "${OS_VERSION}" == "Linux" ]; then
+RHEL=YES
+fi
+
+local _server_order_file_=$1
+while :; do
+    unset USER_CONF
+    $CLEAR
+    $ECHO "\nDeployed Servers\n================"
+	
+    rm -rf ${VAR_TMP_DIR}/server_hostname.txt
+	for _line_ in `$CAT ${_server_order_file_}`; do
+		unset _serv_hostname_ _count_
+		local _serv_hostname_ _count_
+		_count_=`$ECHO "${_line_}" | grep -o "::" | wc -l`
+
+		if [ "${_ip_type_}" == "IPv6" ] && [ "${_count_}" == 3 ]; then
+			if [ "${RHEL}" ];then
+				_serv_hostname_=`$ECHO ${_line_} | $AWK -F"::" '{print $3}'`
+			else
+				_serv_hostname_=`$ECHO ${_line_} | $NAWK -F"::" '{print $3}'`
+			fi
+		else
+			if [ "${RHEL}" ];then
+				_serv_hostname_=`$ECHO ${_line_} | $AWK -F"::" '{print $2}'`
+			else
+				_serv_hostname_=`$ECHO ${_line_} | $NAWK -F"::" '{print $2}'`
+			fi
+		fi
+		if [ ! "${_serv_hostname_}" ]; then
+			_err_msg_="Could not read required info from ${_server_order_file_}"
+			abort_script "${_err_msg_}"
+		fi
+		$ECHO ${_serv_hostname_} >> ${VAR_TMP_DIR}/server_hostname.txt
+	done
+	$CAT ${VAR_TMP_DIR}/server_hostname.txt
+    
+	if [[ "${UNPACK_ACTION}" != "copy_precheck_sw" ]]; then
+    if [ "${UNPACK_ACTION}" == "create" ]; then
+                if [ "${STORAGE_TYPE}" == "raw" ]; then
+            $ECHO "\nAre you sure you wish to unpack the core SW on all blades in the deployment on location $UNPACK_CORE_SW_LOC on each blade?"
+                else
+                    $ECHO "\nAre you sure you wish to unpack the core SW on the RACK server on location $UNPACK_CORE_SW_LOC?"
+                fi
+        $ECHO "\nPlease note that if $UNPACK_CORE_SW_LOC exists already, it will be deleted on each blade."
+    elif [ "${UNPACK_ACTION}" == "delete" ]; then
+        $ECHO "\nAre you sure you wish to remove the core SW on all blades in the deployment on location $UNPACK_CORE_SW_LOC?"
+    else
+        $ECHO "\nAre you sure you wish to copy the precheck SW on all blades in the deployment on location ${ENIQ_CORE_INST_DIR}?"
+                $ECHO "\nPlease note that if precheck SW exists already, it will be replaced on each blade."
+    fi 
+    else
+        USER_CONF="Yes"
+		rm -rf ${VAR_TMP_DIR}/server_hostname.txt
+        break
+    fi
+    
+	rm -rf ${VAR_TMP_DIR}/server_hostname.txt
+    $ECHO "Enter [Yes | No] (case sensitive) : \c"
+
+    read USER_CONF
+    if [ "$USER_CONF" == "Yes" -o "$USER_CONF" == "No" ]; then
+        break
+    fi
+done
+}
+
+# ********************************************************************
+#
+#   Main body of program
+#
+# ********************************************************************
+#
+# Determine absolute path to software
+get_absolute_path
+
+# Check that the effective id of the user is root
+check_id
+
+
+while getopts ":a:l:p:d:Nr" arg; do
+    case $arg in
+        a)     UNPACK_ACTION="$OPTARG"
+            ;;
+        l)     LOGFILE="$OPTARG"
+               ;;
+        N)    NO_CONFIRM="YES"
+            ;;
+        d)     BASE_SW_DIR="$OPTARG"
+               ;;
+        p)     UPGRADE_SW_DIR="$OPTARG"
+               ;;
+        \?) usage_msg
+            exit 1
+            ;;
+    esac
+done
+shift `expr $OPTIND - 1`
+
+#setup env
+setup_env
+
+# Check Input Params
+check_params 
+
+if [ ! "${LOGFILE}" ]; then
+    LOGFILE="${LOGDIR}/unpack_core_sw.log"
+fi
+
+# Check/Create Logfile
+chk_create_logfile
+
+# Create a temporary Directory
+TEM_DIR=/tmp/unpack_core_sw.$$.$$
+$RM -rf ${TEM_DIR}
+$MKDIR -p ${TEM_DIR}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not create directory ${TEM_DIR}"
+    abort_script "$_err_msg_"
+fi
+$CHMOD 777 ${TEM_DIR}
+
+# Only run on the coordinator
+if [ "${SERVER_TYPE}" != "CO" ]; then
+    _err_msg_="$0 can not be executed on ${SERVER_TYPE} server type"
+    abort_script "$_err_msg_"
+fi
+
+if [ "${UNPACK_ACTION}" == "create" ]; then
+    # Make sure we have the SW
+    if [ ! -s ${BASE_SW_DIR}/${CORE_SW_BUNDLE} ]; then
+        _err_msg_="Could not find ${BASE_SW_DIR}/${CORE_SW_BUNDLE} SW bundle"
+        abort_script "${_err_msg_}"
+    fi
+fi
+
+# Call in the function to create file with eniq server IPs in order
+get_deployment_order
+
+# User confirmation
+if [ ! "$NO_CONFIRM" ]; then
+    user_confirm ${TEM_DIR}/server_order_list
+    if [ $USER_CONF == No ]; then
+        $RM -rf ${TEM_DIR}
+        exit 0
+    fi
+fi
+
+case "${UNPACK_ACTION}" in
+    create)    unpack_core_inst_sw ${TEM_DIR}/server_order_list 
+            ;;
+    delete)    delete_core_inst_sw ${TEM_DIR}/server_order_list
+            ;;
+        copy_precheck_sw) copy_precheck_sw ${TEM_DIR}/server_order_list
+            ;;
+    *)        usage_msg
+            exit 1
+            ;;
+esac
+
+# Rotate and compress the logs if necessary
+rotate_compress_logs ${LOGFILE} ${NUM_LOGS} ${SIZE_LOGS} ${COMPRESS_LOG}
+
+$RM -rf ${TEM_DIR}
+
+if [ ! "${NO_CONFIRM}" ]; then
+    $ECHO "\nLOGFILE: $LOGFILE\n\n"
+fi
+
+exit 0

@@ -1,0 +1,259 @@
+#!/bin/bash
+# ********************************************************************
+# Ericsson Radio Systems AB                                     SCRIPT
+# ********************************************************************
+#
+#
+# (c) Ericsson Radio Systems AB 2019 - All rights reserved.
+#
+# The copyright to the computer program(s) herein is the property
+# of Ericsson Radio Systems AB, Sweden. The programs may be used
+# and/or copied only with the written permission from Ericsson Radio
+# Systems AB or in accordance with the terms and conditions stipulated
+# in the agreement/contract under which the program(s) have been
+# supplied.
+#
+# ********************************************************************
+# Name    : collect_root_disk_conf.bsh
+# Date    : 04/04/2022
+# Revision: main/8
+# Purpose : It collects the lvm dump of root filesystem          
+#
+#
+# Usage   : collect_root_disk_conf.bsh [ directory name ] 
+#
+# ********************************************************************
+#
+#       Command Section
+#
+# ********************************************************************
+AWK=/usr/bin/awk
+CP=/bin/cp
+CAT=/usr/bin/cat
+LS=/bin/ls
+GREP=/bin/grep
+PARTED=/sbin/parted
+PVS=/usr/sbin/pvs
+LVMDUMP=/sbin/lvmdump
+MKDIR=/bin/mkdir
+LSBLK=/usr/bin/lsblk
+LVS=/sbin/lvs
+VGS=/sbin/vgs
+
+# ********************************************************************
+#
+#       functions
+#
+# ********************************************************************
+### Function: abort_script ###
+#
+#   This will is called if the script is aborted thru an error
+#   error signal sent by the kernel such as CTRL-C or if a serious
+#   error is encountered during runtime
+#
+# Arguments:
+#       $1 - Error message from part of program (Not always used)
+# Return Values:
+#       none
+abort()
+{
+  echo $1
+  exit 1
+}
+### Function: checkExitCodes ###
+#
+# checks the exit code of a command
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+checkExitCodes()
+{
+ EXITCODES=($1)
+ for i in "${EXITCODES[@]}"
+ do
+    if [ "$i" -ne "0" ]
+    then
+        abort "$2"
+    fi
+ done
+}
+### Function: check_volume_group_names ###
+#
+#check volume group names
+#
+# Arguments:
+#      vg_name
+# Return Values:
+#       none
+check_volume_group_names()
+{
+  v_groups=$($VGS -o vg_name --noheadings | sort | xargs)
+  vg_files=$($LS $1 | xargs)
+  if [ "$v_groups" = "$vg_files" ]
+  then
+    echo "Volume group files exists"
+  else
+    abort "Volume group files does not exist"
+  fi
+}
+### Function: check_scheme_files ###
+#
+#check scheme files
+#
+# Arguments:
+#      none
+# Return Values:
+#       none
+check_scheme_files()
+{
+for sc_file in $($LSBLK | $GREP -v "fd0" | $GREP -B 4 "${VGNAME}" | $GREP -w "disk" | $AWK '{print $1}')
+  do
+    sc_file=${sc_file%[0-9]}
+    sc_file=${sc_file%p}
+    scheme_file=$1$sc_file.scheme
+    if [ ! -s $scheme_file ]
+    then
+      abort "Partition scheme file $scheme_file file is not created or it's empty!"
+    fi
+  done  
+}
+### Function: validate_dump ###
+#
+#validates the lvm dump
+#
+# Arguments:
+#      none
+# Return Values:
+#       none
+validate_dump()
+{
+  if [ ! -s $LOCAL_MOUNT_POINTS_FILE ]
+  then
+    abort "Mount points file is not created or it's empty!"
+  fi
+  [ "$(ls -A $LVM_BACKUP_CONFIG_DIR)" ] && echo "LVM config dir ok." || abort "LVM configuration directory not created or is empty!"
+  if [ ! -s $ROOT_DISK_FILE ]
+  then
+    abort "Root disk file is not created or it's empty!"
+  fi
+  [ "$(ls -A $BLKID_TAB_DST_DIR)" ] && echo "Blkid.tab destination dir ok." || abort "Blkid.tab destination directory not created or is empty!"
+  check_volume_group_names $LVM_BACKUP_CONFIG_DIR/lvm/backup
+  check_scheme_files $DISK_SCHEMES_DIR
+}
+### Function: get_ms_mount_options ###
+#
+#fetches mount options
+#
+# Arguments:
+#      none
+# Return Values:
+#       none
+get_ms_mount_options()
+{
+    echo "Collecting default mount options"
+    ms_mount_options="${BACKUP_CONFIG_ROOT_DIR}/ms_mount_options"
+    > ${ms_mount_options} || abort "Error creating mount options file ${ms_mount_options}"
+    boot_partition=`$CAT /etc/mtab | $GREP -w boot | $GREP -v /boot/efi | $AWK '{print $1}'`
+    for device in $(${LVS} $VGNAME --noheadings -o lv_path| grep -iv swap) ${boot_partition}
+    do
+        mount_options=$(dumpe2fs -h ${device} 2>/dev/null| awk -F":"  '/Default mount options/{sub(/[ ]+/,"",$2); print $2 }')
+        [[ -z "${mount_options}" ]]  && abort "Failed to get file system information: dumpe2fs -h ${device}"
+	[[ "${mount_options}" =~ "(none)" ]] && echo  "There are no default mount options set for ${device}"  && continue
+        echo "${device} ${mount_options}" >> ${ms_mount_options} || abort "Failed to append mount information to ${ms_mount_options} for ${device}"
+    done
+    echo "############ Default mount options #############"
+    cat ${ms_mount_options}
+    echo "###################################################"
+}
+
+### Function: get_ms_disk_information ###
+#
+#fetches root disk information
+#
+# Arguments:
+#      none
+# Return Values:
+#       none
+get_ms_disk_information()
+{
+    echo "Collecting MS disk and LVM information"
+    echo "Dumping lvm configuration"
+    $LVMDUMP -d ${LVM_BACKUP_CONFIG_DIR}  && echo "LVM configuration dumped successfully" || abort "Failed to dump LVM configuration"
+    echo "Figuring out the root drive path"
+    VGNAME="vg_root"
+	
+    # Checking if the dump is consistent
+    pv_dev=`$PVS --noheading | $GREP -w "$VGNAME" | $AWK '{print $1}'`
+    if [ ! "${pv_dev}" ]; then
+        abort "Could not get the device driver of $VGNAME"
+    fi
+	
+    if [ "${pv_dev}" == /dev/md* ]; then
+        $GREP -w "/dev/md0" ${LVM_BACKUP_CONFIG_DIR}/lvm/backup/${VGNAME}
+        if [ $? -ne 0 ];then
+            abort "Mirror disk is not in proper state for backup"
+        fi
+    fi
+	
+    ROOT_DRV=`$LSBLK | $GREP -v "fd0" | $GREP -B 4 "${VGNAME}" | $GREP -w "disk" | $AWK '{print $1}'`
+  
+    echo "Saving root drive path"
+   
+    for pv in $ROOT_DRV
+    do
+      pv=/dev/$pv
+ 
+      echo "Dumping the partition scheme for: $pv"
+      $PARTED $pv -sm unit s print > ${DISK_SCHEMES_DIR}/${pv##*/}.scheme && echo "$pv partition scheme dumped successfully" || abort "Failed to dump partition scheme for $pv"
+	 echo "$pv" >> ${ROOT_DISK_FILE}				  
+    done
+    echo "Dumping mount points"
+    grep -v  "^rootfs\|proc\|shm\|/sys\|cgroup\|devtmpfs\|devpts\|/selinux\|sunrpc" /proc/mounts | grep -v /software >${LOCAL_MOUNT_POINTS_FILE} && echo  "Mount points dumped successfully" || abort "Can't find any mounted drives"
+    echo "Creating blkid.tab file"
+	# Create the BLKID_TAB_DST_DIR directory if it does not exist
+	if [[ ! -e ${BLKID_TAB_DST_DIR} ]]; then
+		${MKDIR} -p ${BLKID_TAB_DST_DIR} && echo "${BLKID_TAB_DST_DIR} created successfully" || abort "Failed to create ${BLKID_TAB_DST_DIR} directory"
+	fi
+    /sbin/blkid >${BLKID_TAB_DST_DIR}/blkid.tab && echo "blkid.tab created successfully" || abort "Failed to create blkid.tab file"
+}
+# ********************************************************************
+#
+#       Main body of program
+#
+# ********************************************************************
+
+if [ $# -lt 1 ]; then
+    echo "$0 Invalid number of arguments! 1 must be given!"
+    exit 1
+fi
+BACKUP_ROOT_DIR=$1
+BACKUP_CONFIG_ROOT_DIR=${BACKUP_ROOT_DIR}/config
+LOCAL_MOUNT_POINTS_FILE=${BACKUP_CONFIG_ROOT_DIR}/mounts
+LVM_BACKUP_CONFIG_DIR=${BACKUP_CONFIG_ROOT_DIR}/lvm
+DISK_SCHEMES_DIR=${BACKUP_CONFIG_ROOT_DIR}/drv_schemes/
+ROOT_DISK_FILE=${DISK_SCHEMES_DIR}/root.drv
+BLKID_TAB_SRC_DIR=/etc/blkid/
+BLKID_TAB_DST_DIR=${DISK_SCHEMES_DIR}/blkid/
+
+# Create the backup directory if it does not exist
+if [[ ! -e ${BACKUP_ROOT_DIR} ]]; then
+    ${MKDIR} -p ${BACKUP_ROOT_DIR}
+else
+    echo "Cleaning config dir"
+    rm -rf ${LVM_BACKUP_CONFIG_DIR}
+    rm -rf ${DISK_SCHEMES_DIR}       
+fi
+
+echo "Creating config dir structure"
+${MKDIR} -p ${DISK_SCHEMES_DIR}
+
+# Get the root disk info from the server
+get_ms_disk_information
+
+# Get filesystem mount options info from the server
+get_ms_mount_options
+
+# Validate that all data is dumped
+validate_dump

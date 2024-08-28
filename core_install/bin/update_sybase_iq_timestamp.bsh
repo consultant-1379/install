@@ -1,0 +1,464 @@
+#!/bin/bash
+# ********************************************************************
+# Ericsson Radio Systems AB                                     SCRIPT
+# ********************************************************************
+#
+#
+# (c) Ericsson Radio Systems AB 2022 - All rights reserved.
+#
+# The copyright to the computer program(s) herein is the property
+# of Ericsson Radio Systems AB, Sweden. The programs may be used
+# and/or copied only with the written permission from Ericsson Radio
+# Systems AB or in accordance with the terms and conditions stipulated
+# in the agreement/contract under which the program(s) have been
+# supplied.
+#
+# ********************************************************************
+# Name    : update_sybase_iq_timestamp.bsh
+# Date    : 13/10/2023
+# Revision: main\5
+# Purpose : Add Sybase install/update date
+#
+# Usage   : update_sybase_iq_timestamp.bsh [-l <logfile>]
+#                               
+#
+# ********************************************************************
+#
+#   Command Section
+#
+# ********************************************************************
+AWK=/usr/bin/awk
+BASENAME=/usr/bin/basename
+CUT=/usr/bin/cut
+DATE=/usr/bin/date
+DIRNAME=/usr/bin/dirname
+ECHO=/usr/bin/echo
+EGREP=/usr/bin/egrep
+GREP=/usr/bin/grep
+ID=/usr/bin/id
+LESS=/usr/bin/less
+RM=/usr/bin/rm
+TEE=/usr/bin/tee
+TOUCH=/usr/bin/touch
+TR=/usr/bin/tr
+GREP=/usr/bin/grep
+RM=/usr/bin/rm
+SED=/usr/bin/sed
+SU=/usr/bin/su
+
+# ********************************************************************
+#
+#       Configuration Section
+#
+# ********************************************************************
+# Default user
+DEFAULT_USER=root
+
+# Name of SunOS & ENIQ ini Files
+ENIQ_INI=niq.ini
+SUNOS_INI=SunOS.ini
+
+
+
+# ********************************************************************
+#
+#   Functions
+#
+# ********************************************************************
+### Function: abort_script ###
+#
+#   This will is called if the script is aborted thru an error
+#   signal sent by the kernel such as CTRL-C or if a serious
+#   error is encountered during runtime
+#
+# Arguments:
+#       $1 - Error message from part of program (Not always used)
+# Return Values:
+#       none
+abort_script()
+{
+
+_err_time_=$($DATE '+%Y-%b-%d_%H.%M.%S')
+
+if [ "$1" ]; then
+    _err_msg_="${_err_time_} - $1"
+else
+    _err_msg_="${_err_time_} - ERROR : Script aborted.......\n"
+fi
+
+$ECHO -e "\n$_err_msg_\n" | $TEE -a "${LOGFILE}"
+
+$RM -rf "${TEM_DIR}/sybase_update_flag"
+$RM -rf "${CONN_STR_USER_DBA_ENC}"
+$RM -rf "${TEM_DIR}/select_iq_history"
+$RM -rf "${TEM_DIR}/update_sybase_iq_timestamp.${TIMESTAMP}.log"
+
+exit 1
+}
+
+### Function: check_id ###
+#
+#   Check that the effective id of the user is correct
+#   If not print error msg and exit.
+#
+# Arguments:
+#       $1 : User ID name
+# Return Values:
+#       none
+check_id()
+{
+local _check_id_
+_check_id_=$($ID | $AWK -F\( '{print $2}' | $AWK -F\) '{print $1}')
+
+if [ "$_check_id_" != "$1" ]; then
+    _err_msg_="You must be $1 to execute this script."
+    abort_script "${_err_msg_}"
+fi
+}
+
+### Function: check_server ###
+#
+#   Check if the script is run on the coordinator
+#
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+check_server()
+{
+
+if ! CURR_SERVER_TYPE=$($LESS "${ENIQ_CONF_DIR}/installed_server_type" | $EGREP -v  '^[[:blank:]]*#' | $SED -e 's/ //g'); then
+    _err_msg_="Could not determine which server type this is"
+    abort_script "$_err_msg_"
+fi
+
+if [ "${CURR_SERVER_TYPE}" == "eniq_coordinator" ] || [ "${CURR_SERVER_TYPE}" == "stats_coordinator" ] || [ "${CURR_SERVER_TYPE}" == "eniq_stats" ] || [ "${CURR_SERVER_TYPE}" == "eniq_iqw" ]; then 
+    SERVER_TYPE="CO"
+fi
+
+if [ "$SERVER_TYPE" != "CO" ]; then
+    _err_msg_="You must be on coordinator to execute this script."
+    abort_script "$_err_msg_"
+fi
+}
+
+### Function: cleanup ###
+#
+# cleanups iq_version file
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+cleanup()
+{
+# Cleanup admin version file
+if $GREP -qv "::" ${ENIQ_SYBASE_VERSION_FILE}; then
+    $SED -in '/\::/!d' ${ENIQ_SYBASE_VERSION_FILE}
+fi
+# Cleanup iq version file
+if $GREP -qwo "INIT\|UPGRADE" ${SYBASE_VERSION_FILE}; then
+    $SED -in '/INIT\|UPGRADE/d' ${SYBASE_VERSION_FILE}
+fi
+
+if $GREP -qv "::" ${SYBASE_VERSION_FILE}; then
+    $SED -in '/\::/!d' ${SYBASE_VERSION_FILE}
+fi
+
+# Cleanup admin history file
+if $GREP -qv "::\|=" ${ENIQ_SYBASE_HISTORY_FILE}; then
+    $SED -ien '/^[0-9]/d' ${ENIQ_SYBASE_HISTORY_FILE}
+fi
+}
+### Function: dupicate_process_check ###
+#
+# Determine absolute path to software
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+dupicate_process_check()
+{
+if [[ -f ${TEM_DIR}/sybase_update_flag ]]; then
+        _err_msg_="Abort! an another instance of this script is already running"
+        abort_script "$_err_msg_"
+fi
+
+$TOUCH "${TEM_DIR}/sybase_update_flag"
+}
+
+### Function: get_absolute_path ###
+#
+# Determine absolute path to software
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+get_absolute_path()
+{
+_dir_=$("$DIRNAME" $0)
+SCRIPTHOME=$(cd "$_dir_" 2>/dev/null && pwd || $ECHO "$_dir_")
+}
+
+### Function: setup_variables ###
+#
+# Set up some script variables
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+setup_variables()
+{
+
+if [ ! "${ENIQ_BASE_DIR}" ]; then
+    ENIQ_BASE_DIR=/eniq
+fi
+
+#Temp directory.
+TEM_DIR=/tmp
+
+# Admin Directory
+ENIQ_ADMIN_DIR=${ENIQ_BASE_DIR}/admin
+
+# Main Directory for the Core Installation SW
+ENIQ_INST_DIR=${ENIQ_BASE_DIR}/installation
+
+# Admin Version Directory 
+ENIQ_VERSION_DIR=${ENIQ_ADMIN_DIR}/version
+
+# Config dir
+ENIQ_CONF_DIR=${ENIQ_INST_DIR}/config
+
+# Admin Current Sybase Version File 
+ENIQ_SYBASE_VERSION_FILE=${ENIQ_VERSION_DIR}/iq_version
+
+# Admin History Sybase Version File 
+ENIQ_SYBASE_HISTORY_FILE=${ENIQ_VERSION_DIR}/sybase_history
+
+# Sybase Directory for the Sybase
+ENIQ_SYBASE_DIR=${ENIQ_BASE_DIR}/sybase_iq
+
+# Sybase Version Directory
+ENIQ_SYBASE_VERSION_DIR=${ENIQ_SYBASE_DIR}/version
+
+# Sybase Version file
+SYBASE_VERSION_FILE=${ENIQ_SYBASE_VERSION_DIR}/iq_version
+
+# sourcing common functions.
+if [ ! -s "$SCRIPTHOME/../lib/common_functions.lib" ]; then
+    _err_msg_="Cannot locate $SCRIPTHOME/../lib/common_functions.lib"
+    abort_script "$_err_msg_"
+else
+   . "$SCRIPTHOME/../lib/common_functions.lib"
+fi
+
+# Set the Connect DB parameters
+DWH_PORT=$(iniget DWH -f ${ENIQ_CONF_DIR}/${ENIQ_INI} -v PortNumber)
+DWH_ENG=$(iniget DWH -f ${ENIQ_CONF_DIR}/${ENIQ_INI} -v ServerName)
+if [ -z "${DWH_PORT}" ] || [ -z "${DWH_ENG}" ];then
+    _err_msg_="Could not read DB values from ${ENIQ_CONF_DIR}/${ENIQ_INI}"
+    abort_script "$_err_msg_"
+fi
+
+DBA_PASSWORD=$(inigetpassword DB -f ${ENIQ_CONF_DIR}/${ENIQ_INI} -v DBAPassword)
+if [ ! "${DBA_PASSWORD}" ]; then
+    if [ -f ${ENIQ_BASE_DIR}/sw/installer/dbusers ]; then
+        DBA_PASSWORD=$(${ENIQ_BASE_DIR}/sw/installer/dbusers dba dwhrep)
+        if [ ! "${DBA_PASSWORD}" ] ; then
+            _err_msg_="Could not get dwhdb DBA Password"
+            abort_script "$_err_msg_"
+        fi
+    else
+        _err_msg_="Could not get dwhdb DBA Password"
+        abort_script "$_err_msg_"
+    fi
+fi
+
+# Get the System User/Group. All directories are owned by this
+SYSUSER=$(iniget ENIQ_INSTALL_CONFIG -f ${ENIQ_CONF_DIR}/${SUNOS_INI} -v ENIQ_SYSUSER)
+if [ ! "${SYSUSER}" ]; then
+    _err_msg_="Could not read SYSUSER param from ${ENIQ_CONF_DIR}/${SUNOS_INI}"
+    abort_script "$_err_msg_"
+fi
+
+# Defining DBISQL
+DBISQL="$(ls /eniq/sybase_iq/IQ-*/bin64/dbisql)"
+if [ ! -x "$DBISQL" ]; then
+    _err_msg_="$DBISQL commands not found or not executable."
+    abort_script "$_err_msg_"
+fi
+
+
+CONN_STR_USER_DBA="-c \"uid=dba;pwd=${DBA_PASSWORD};eng=${DWH_ENG};links=tcpip{host=localhost;port=${DWH_PORT};dobroadcast=no;verify=no}\""
+CONN_STR_USER_DBA_ENC=${TEM}/conn_str_add_iq_encrypt.txt.$(uuidgen) >> /dev/null 2>&1
+
+# encrypt the connection string.
+get_encrypt_file "${CONN_STR_USER_DBA}" "${CONN_STR_USER_DBA_ENC}" >> /dev/null 2>&1
+}
+
+### Function: sybase_time ###
+#
+# Updates iq_version file with install date
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+sybase_time()
+{
+
+# Get Sybase history 
+if ! $SU - $SYSUSER -c  "$DBISQL @${CONN_STR_USER_DBA_ENC} \"select substring(operation,1, 12) as operation, substring(version,1, 12) as version, first_time, last_time, substring(platform,1, 20) as platform from SYSHISTORY order by last_time;OUTPUT TO "${TEM_DIR}/select_iq_history" FORMAT TEXT\"" >> /dev/null 2>&1; then
+ _err_msg_="Unable to execute the script, maybe ${DWH_ENG} is down."
+ abort_script "$_err_msg_"
+fi
+
+# Get Sybase version of the most recent database server started 
+current_version_string=$($GREP -h LAST_START ${TEM_DIR}/select_iq_history | $AWK -F "," '{print $2}' | $TR -d "''")
+if [ -z "${current_version_string}" ]; then
+ _err_msg_="IQ last start string is empty, skipping this for now"
+ abort_script "$_err_msg_"
+fi
+
+# Get if most recent database server was start was after Install or Upgrade
+required_type_string=$($GREP -h "${current_version_string}" "${TEM_DIR}/select_iq_history" | $GREP -wo "INIT\|UPGRADE")
+if [ -z "${required_type_string}" ]; then
+ _err_msg_="IQ version string is empty, skipping this for now"
+ abort_script "$_err_msg_"
+fi 
+ 
+# Get the version of Install or Upgrade the most recent server start was based on.
+required_version_string=$($GREP -h "${required_type_string}" "${TEM_DIR}/select_iq_history" | $GREP -h "${current_version_string}" | $AWK -F "," '{print $3}' | $CUT -f1 -d".")
+if [ -z "${required_version_string}" ]; then
+ _err_msg_="Required IQ version string is empty, skipping this for now"
+ abort_script "$_err_msg_"
+fi
+
+# The string to be added in the Sybase version files
+_add_string_="${required_type_string}::${required_version_string}"
+if [ -z "${_add_string_}" ]; then
+ _err_msg_="IQ system date string is empty, skipping this for now"
+ abort_script "$_err_msg_"
+fi
+
+if [ -f "${SYBASE_VERSION_FILE}" ]; then # if file there 
+ _version_string_=$($GREP -w "VERSION" ${SYBASE_VERSION_FILE})
+ _patch_string_=$($GREP -w "ESD" ${SYBASE_VERSION_FILE})
+fi
+
+# Create IQ current version file with date in Admin Version Dir
+if [ -f "${ENIQ_SYBASE_VERSION_FILE}" ]; then
+  _string_found_admin_ver_=$($GREP -w "${_add_string_}" ${ENIQ_SYBASE_VERSION_FILE})
+  if [ -z "${_string_found_admin_ver_}" ]; then
+    $ECHO "${_version_string_}" > ${ENIQ_SYBASE_VERSION_FILE}
+    $ECHO "${_patch_string_}" >> ${ENIQ_SYBASE_VERSION_FILE}
+    $ECHO "${_add_string_}" >> ${ENIQ_SYBASE_VERSION_FILE}
+    fi
+else
+  $TOUCH "${ENIQ_SYBASE_VERSION_FILE}"
+  $ECHO "${_version_string_}" > ${ENIQ_SYBASE_VERSION_FILE}
+  $ECHO "${_patch_string_}" >> ${ENIQ_SYBASE_VERSION_FILE}
+  $ECHO "${_add_string_}" >> ${ENIQ_SYBASE_VERSION_FILE}
+fi
+
+
+# Check if version already in IQ history file
+if [ -s ${ENIQ_SYBASE_VERSION_FILE} ]; then
+  if [ ! -f ${ENIQ_SYBASE_HISTORY_FILE} ]; then
+   $TOUCH ${ENIQ_SYBASE_HISTORY_FILE}
+   $ECHO "====================================" >> ${ENIQ_SYBASE_HISTORY_FILE}
+   $LESS ${ENIQ_SYBASE_VERSION_FILE} >> ${ENIQ_SYBASE_HISTORY_FILE}
+   $ECHO "====================================" >> ${ENIQ_SYBASE_HISTORY_FILE}
+  else
+   _string_found_admin_his_=$($GREP -w "${_add_string_}" ${ENIQ_SYBASE_HISTORY_FILE})
+   if [ -z "${_string_found_admin_his_}" ]; then
+    # Create IQ history file with date in Admin Version Dir
+    $ECHO "====================================" >> ${ENIQ_SYBASE_HISTORY_FILE}
+    $LESS ${ENIQ_SYBASE_VERSION_FILE} >> ${ENIQ_SYBASE_HISTORY_FILE}
+    $ECHO "====================================" >> ${ENIQ_SYBASE_HISTORY_FILE}
+   fi
+  fi
+fi
+
+$ECHO -e "\n${TIMESTAMP} -- Script succesfully executed\n" | $TEE "${LOGFILE}"
+}
+
+### Function: usage_msg ###
+#
+# Usage
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+usage_msg()
+{
+$ECHO "
+Usage: $("$BASENAME" $0) [-l <logfile>]
+
+options:
+
+-l : Logfile to be used.
+"
+}
+
+# ********************************************************************
+#
+#   Main body of program
+#
+# ********************************************************************
+#
+TIMESTAMP=$($DATE +%d.%m.%y_%H:%M:%S)
+
+# Determine absolute path to software
+get_absolute_path
+
+while getopts ":l:" arg; do
+    case $arg in
+    l)  LOGFILE="$OPTARG"
+        ;;
+    \?) usage_msg
+    exit 1
+    ;;
+    esac
+done
+shift "$(expr $OPTIND - 1)"
+
+# Check that the effective id of the user is root
+check_id ${DEFAULT_USER}
+
+# Set up IQ commands
+setup_variables
+
+# Check if this script is already running
+dupicate_process_check
+
+# Check the current server type
+check_server
+
+# Check required files and scripts exist
+if [ ! -s ${SYBASE_VERSION_FILE} ]; then
+        _err_msg_="File ${SYBASE_VERSION_FILE} not found, or is empty"
+        abort_script "$_err_msg_"
+fi
+
+if [ ! "$LOGFILE" ] ; then
+   LOGFILE=${TEM_DIR}/update_sybase_iq_timestamp.${TIMESTAMP}.log
+fi
+
+# Adding timestamp to the DB creation.
+sybase_time
+
+# cleanup of EQEV-126434
+cleanup
+
+$RM -rf "${CONN_STR_USER_DBA_ENC}"
+$RM -rf "${TEM_DIR}/select_iq_history"
+$RM -rf "${TEM_DIR}/update_sybase_iq_timestamp.${TIMESTAMP}.log"
+$RM -rf "${TEM_DIR}/sybase_update_flag"
+
+exit 0

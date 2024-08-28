@@ -1,0 +1,998 @@
+#!/bin/bash
+# ********************************************************************
+# Ericsson Radio Systems AB                                     SCRIPT
+# ********************************************************************
+#
+# (c) Ericsson Radio Systems AB 2023 - All rights reserved.
+#
+# The copyright to the computer program(s) herein is the property
+# of Ericsson Radio Systems AB, Sweden. The programs may be used
+# and/or copied only with the written permission from Ericsson Radio
+# Systems AB or in accordance with the terms and conditions stipulated
+# in the agreement/contract under which the program(s) have been
+# supplied.
+#
+# ********************************************************************
+# Name    : exp_add_maindb.bsh
+# Date    : 20/07/2023
+# Revision: main\29
+# Purpose : This Script is to only ran as part of the Expansion of Stats single blade
+# a multi-blade environment it reduces the number of tempDB to one
+#
+# Usage   : exp_add_sysmain.bsh -c <path_to_cli_conf> -d <niq.ini_file_location>
+#                               [-l <logfile>]
+#
+# ********************************************************************
+#
+#   Command Section
+#
+# ********************************************************************
+
+AWK=/usr/bin/awk
+BASENAME=/usr/bin/basename
+BASH=/usr/bin/bash
+CAT=/usr/bin/cat
+CHMOD=/usr/bin/chmod
+CP=/usr/bin/cp
+DATE=/usr/bin/date
+DIRNAME=/usr/bin/dirname
+ECHO="/usr/bin/echo -e"
+ENV=/usr/bin/env
+EGREP=/usr/bin/egrep
+EXPR=/usr/bin/expr
+GREP=/usr/bin/grep
+ID=/usr/bin/id
+MKDIR=/usr/bin/mkdir
+PWD=/usr/bin/pwd
+RM=/usr/bin/rm
+SED=/usr/bin/sed
+SLEEP=/usr/bin/sleep
+SORT=/usr/bin/sort
+SU=/usr/bin/su
+SED=/usr/bin/sed
+SUDO=/usr/bin/sudo
+TEE=/usr/bin/tee
+TOUCH=/usr/bin/touch
+
+# ********************************************************************
+#
+#   Configuration
+#
+# ********************************************************************
+
+# Name of SunOS ini File
+SUNOS_INI=SunOS.ini
+SYM_INI_FILE=sym_links.ini
+LUN_INI_FILE=lun_map.ini
+SYM_CO_INI_FILE=coordinator_sym_links.ini
+DBTYPE="DWH_DBSPACES_MAIN"
+DBDISC="MAINDB_DISKS"
+DBFILE_NAME="IQ_MAIN"
+
+# ********************************************************************
+#
+#   Functions
+#
+# ********************************************************************
+
+### Function: abort_script ###
+#
+#   This will is called if the script is aborted thru an error
+#   signal sent by the kernel such as CTRL-C or if a serious
+#   error is encountered during runtime
+#
+# Arguments:
+#       $1 - Error message from part of program (Not always used)
+# Return Values:
+#       none
+
+abort_script()
+{
+if [ "$1" ]; then
+    _err_msg_=$1
+else
+    _err_msg_="${TIMESTAMP} - ERROR : Script aborted.......\n"
+fi
+
+if [ "${LOGFILE}" ]; then
+    $ECHO "\n${TIMESTAMP} - ERROR : ${_err_msg_}\n" | $TEE -a ${LOGFILE}
+else
+    $ECHO "\n${TIMESTAMP} - ERROR : ${_err_msg_}\n"
+fi
+
+$RM -rf ${TEM_DIR}
+$RM -rf ${CONN_STR_USER_DBA_ENC}
+exit 55
+}
+
+### Function: allocate_disks_for_readers ###
+#
+#   This will be called if maindb luns are to be added to Reader blades during expansion
+#
+allocate_disks_for_readers()
+{
+_expand_time_=`$DATE '+%Y-%b-%d_%H.%M.%S'`
+log_msg -s "${_expand_time_}: Expanding the system" -l $LOGFILE
+    
+if [ ! -d ${ENIQ_CONF_DIR}/backup/ ]; then
+    $MKDIR -p ${ENIQ_CONF_DIR}/backup/
+fi
+    
+if [ -s ${LUN_INI} ]; then
+    log_msg -s "Backing up the ${LUN_INI} File" -l $LOGFILE
+    $CP ${LUN_INI} ${ENIQ_CONF_DIR}/backup/${LUN_INI_FILE}_bkup.$$.${_expand_time_}
+fi
+    
+if [ -s ${SYM_INI} ]; then
+    log_msg -s "Backing up the ${SYM_INI} File" -l $LOGFILE
+    $CP ${SYM_INI} ${ENIQ_CONF_DIR}/backup/${SYM_INI_FILE}_bkup.$$.${_expand_time_}
+fi
+    
+log_msg -s "Updating the ${LUN_INI} File with the latest Luns" -l $LOGFILE
+${ENIQ_CORE_BIN_DIR}/eniq_core_install.bsh -s create_lun_map -n >> $LOGFILE
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not update the ${LUN_INI} file"
+    abort_script "$_err_msg_" 
+fi
+    
+log_msg -s "Copying ${ENIQ_CONF_DIR}/${SUNOS_INI} to ${TEM_DIR}/${SUNOS_INI}" -l $LOGFILE
+$CP ${ENIQ_CONF_DIR}/${SUNOS_INI} ${TEM_DIR}/${SUNOS_INI}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not copy ${ENIQ_CONF_DIR}/${SUNOS_INI} to ${TEM_DIR}/${SUNOS_INI}"
+    abort_script "$_err_msg_" 
+fi
+    
+log_msg -s "Copying ${SYM_INI} to ${TEM_DIR}/${SYM_INI_FILE}" -l $LOGFILE
+$CP ${SYM_INI} ${TEM_DIR}/${SYM_INI_FILE}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not copy ${SYM_INI} to ${TEM_DIR}/${SYM_INI_FILE}"
+    abort_script "$_err_msg_" 
+fi
+
+_lun_list_=""
+_mpath_list_=""    
+for _maindb_lun_det_ in `iniget DWH_DBSPACES_MAIN -f ${SYM_CO_INI_SW}`; do
+    _main_disk_lun_id_=`iniget ${_maindb_lun_det_} -f ${SYM_CO_INI_SW} -v Lun_ID`
+    if [ ! "${_main_disk_lun_id_}" ]; then
+        _err_msg_="Could not read ${_maindb_lun_det_}:Lun_ID param from ${SYM_CO_INI_SW}"
+        abort_script "$_err_msg_" 
+    fi
+    if [ ! "${_lun_list_}" ]; then
+        _lun_list_="${_main_disk_lun_id_}"
+    else
+        _lun_list_="${_lun_list_} ${_main_disk_lun_id_}"
+    fi
+done
+
+for _single_lun_id_ in ${_lun_list_}; do
+    $CAT ${SYM_INI} |$EGREP "^[[:blank:]]*Lun_ID=${_single_lun_id_}[[:blank:]]*$" >> /dev/null 2>&1
+    if [ $? -eq 0 ]; then
+        continue
+    fi
+    _mpath_id_=`$CAT ${LUN_INI} | $EGREP -B 5 ${_single_lun_id_} | $EGREP -w DISK_ID | $AWK -F"=" '{print $2}'`
+    if [ ! "${_mpath_list_}" ]; then
+        _mpath_list_="${_mpath_id_}"
+    else
+        _mpath_list_="${_mpath_list_} ${_mpath_id_}"
+    fi
+done
+
+# Store the IQ disks
+_main_db_dsk_list_=`$ECHO ${_mpath_list_}`
+
+# check if the DB_DISK_ALLOC information is already set
+_db_disk_alloc_chk_=`iniget DB_DISK_ALLOC -f ${TEM_DIR}/${SYM_INI_FILE}`
+if [ ! "${_db_disk_alloc_chk_}" ]; then
+    $ECHO "\n[DB_DISK_ALLOC]" >> ${TEM_DIR}/${SYM_INI_FILE}
+    $ECHO "MAINDB_DISKS=${_main_db_dsk_list_}" >> ${TEM_DIR}/${SYM_INI_FILE}  
+else    
+    # check the orginal values and add the new values to them        
+    _main_db_dsk_list_org=`iniget DB_DISK_ALLOC -f ${TEM_DIR}/${SYM_INI_FILE} -v MAINDB_DISKS | $SED -e 's/^[ ]*//'`
+    log_msg -s "\nSetting DB_DISK_ALLOC in ${TEM_DIR}/${SYM_INI_FILE} with MAINDB_DISKS=${_main_db_dsk_list_org} ${_main_db_dsk_list_}" -l ${LOGFILE}
+    iniset DB_DISK_ALLOC -f ${TEM_DIR}/${SYM_INI_FILE} MAINDB_DISKS="${_main_db_dsk_list_org} ${_main_db_dsk_list_}"
+    if [ $? -ne 0 ]; then
+        _err_msg_="Could not update ${TEM_DIR}/${SYM_INI_FILE} with MAINDB_DISKS=${_main_db_dsk_list_org} ${_main_db_dsk_list_}"
+        abort_script "$_err_msg_"
+    fi
+        
+fi
+        
+log_msg -s "Updating the files after expansion" -l $LOGFILE
+log_msg -s "Copying ${TEM_DIR}/${SYM_INI_FILE} to ${SYM_INI}" -l $LOGFILE
+$CP ${TEM_DIR}/${SYM_INI_FILE} ${SYM_INI}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not copy ${TEM_DIR}/${SYM_INI_FILE} to ${SYM_INI}"
+    abort_script "$_err_msg_" 
+else 
+    update_block_storage_ini
+fi
+
+}
+### Function: check_id ###
+#
+#   Check that the effective id of the user is correct
+#   If not print error msg and exit.
+#
+# Arguments:
+#       $1 : User ID name
+# Return Values:
+#       none
+
+check_id()
+{
+_get_id_=`$ENV |$GREP -w SUDO_USER | $EGREP "^[[:blank:]]*SUDO_USER="|$AWK -F\= '{print $2}'|$SED -e 's|"||g'`
+
+_check_id_=`$ID | $AWK -F\( '{print $2}' | $AWK -F\) '{print $1}'`
+
+_check_group_=`$ID $_get_id_ | $AWK -F\( '{print $3}' | $AWK -F\) '{print $1}'`
+
+
+    if [ "${_get_id_}" == "" ]; then
+
+        if [ "${_check_id_}" == "root" ]; then
+           # Set 1 for true
+           _user_root=1
+
+        else
+           _err_msg_="You must be root or admin to execute this script."
+           abort_script "${_err_msg_}"
+        fi
+    else
+        if [ "${_check_group_}" == "ENIQ_ADMIN_ROLE" ]; then
+           # Set 0 for false
+           _user_root=0
+
+        else
+            _err_msg_="You must be root or admin to execute this script." 
+            abort_script "${_err_msg_}"
+        fi
+    fi
+}
+
+### Function: chk_create_logfile ###
+#
+# Check/Create Logfile
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+
+chk_create_logfile()
+{
+if [[ ! -d "$(${DIRNAME} ${LOGFILE})" ]]; then
+    ${MKDIR} -p $(${DIRNAME} ${LOGFILE}) > /dev/null 2>&1
+    if [ $? -ne 0 ]; then
+        _err_msg_="Could not create directory [$($DIRNAME ${LOGFILE})]"
+        abort_script "${_err_msg_}"
+    fi
+fi
+$TOUCH -a ${LOGFILE}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not write to file [${LOGFILE}]"
+    abort_script "${_err_msg_}"
+fi
+$CHMOD 777 ${LOGFILE}
+}
+
+### Function: clean_up ###
+#
+# restores the orignal sym)links
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+
+clean_up()
+{
+$CP ${SYM_LINK_BACKUP} ${SYM_INI}
+if [[ $? -ne 0 ]]; then
+    abort_script "ERROR : Failed to copy ${SYM_LINK_BACKUP} to ${SYM_INI}"
+fi
+}
+
+### Function: get_disksmaindb_sym_link ###
+#
+# get the current size of 
+#
+# Arguments:
+#   String for sym_link file
+# Return Values:
+#   none
+#Set globals
+#
+get_disksmaindb_sym_link()
+{
+unset NUMBER_DBFILES
+unset NUMBER_DISCS
+#get the DWH_SYSTEM_MAIN's file sym_links
+local index_dbfiles=0
+local index_discs=0
+local _dbfile_sym_list_=`iniget ${DBTYPE} -f ${SYM_INI}`
+
+if [ ! "${_dbfile_sym_list_}" ]; then
+    _err_msg_="Could not find any DWH_SYSTEM_MAIN in ${SYM_INI}"
+    abort_script "${_err_msg_}"
+fi
+
+for _dbfile_ in ${_dbfile_sym_list_}; do
+    index_dbfiles=$((${index_dbfiles}+1))
+done
+
+NUMBER_DBFILES=${index_dbfiles}
+local _dbfile_sym_discs_=`iniget DB_DISK_ALLOC -f ${SYM_INI} -v ${DBDISC}`
+if [ ! "${_dbfile_sym_discs_}" ]; then
+    _err_msg_="Could not get ${DBDISC} value from ${SYM_INI}"
+    abort_script "${_err_msg_}"
+fi
+
+for _disc_ in ${_dbfile_sym_discs_}; do
+    index_discs=$((${index_discs}+1))
+done
+
+NUMBER_DISCS=${index_discs}
+
+}
+
+### Function: dwhdb_stop ###
+#
+# stops the dwhdb 
+# Arguments:
+#       None
+# Return Values:
+#       none
+
+dwhdb_stop()
+{
+$SU - ${SYSUSER} -c "${IQDIR}/bin64/dbping -q @${CONN_STR_USER_DBA_ENC}" 
+if [ $? -eq 0 ]; then
+    $ECHO "NOTE : stopping dwhdb service." | $TEE -a  ${LOGFILE}
+    $BASH ${MANAGE_SERVICES_BSH} -a stop -s dwhdb -N -l ${LOGFILE}
+    if [[ $? -ne 0 ]]; then
+        abort_script "Failed to stop dwhdb ENIQ service, exiting...."
+    fi
+fi
+}
+
+### Function: dwhdb_start ###
+#
+# starts the dwhdb 
+# Arguments:
+#       None
+# Return Values:
+#       none
+
+dwhdb_start()
+{
+$ECHO "NOTE : Starting dwhdb service." | $TEE -a  ${LOGFILE}
+$BASH ${MANAGE_SERVICES_BSH} -a start -s dwhdb -N -l ${LOGFILE}
+if [[ $? -ne 0 ]]; then
+    abort_script "Failed to start dwhdb ENIQ service, exiting...."
+fi
+
+dwhdb_ping
+}
+
+### Function: dwhdb_ping ###
+#
+# Ping the dwhdb 
+# Arguments:
+#       None
+# Return Values:
+#       none
+
+dwhdb_ping()
+{
+local cnt=0
+local ping_cnt=40
+local sleep_time=5
+$ECHO "NOTE : Pinging dwhdb service." | $TEE -a  ${LOGFILE}
+until [ ${cnt} -eq ${ping_cnt} ]; do
+    $SU - ${SYSUSER} -c "${IQDIR}/bin64/dbping -q @${CONN_STR_USER_DBA_ENC}" 
+    if [ $? -eq 0 ]; then
+        break
+    fi
+    $SLEEP ${sleep_time}
+    let cnt=cnt+1
+    $ECHO "NOTE : Pinging dwhdb service again attempt ${cnt}" | $TEE -a  ${LOGFILE}
+done
+if [ ${cnt} -eq ${ping_cnt} ]; then
+    _err_msg_="dwhdb not responding"
+    abort_script "${_err_msg_}"
+fi
+}
+
+### Function: get_absolute_path ###
+#
+# Determine absolute path to software
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+
+get_absolute_path()
+{
+_dir_=`$DIRNAME $0`
+SCRIPTHOME=`cd ${_dir_} 2>/dev/null && pwd || $ECHO ${_dir_}`
+}
+
+### Function: get_mainfiles_sybase ###
+#
+# get the current size of 
+#
+# Arguments:
+#   None
+# Return Values:
+#   none
+#Set globals
+#
+
+get_mainfiles_sybase()
+{
+$ECHO "\nChecking number of dbfiles in sybase" | $TEE -a ${LOGFILE}
+$SU - ${SYSUSER} -c "${IQDIR}/bin64/dbping -q @${CONN_STR_USER_DBA_ENC}" 
+if [ $? -ne 0 ]; then
+    dwhdb_start
+fi
+#get the other dbfiles from sybase that have to be dropped
+unset MAIN_DBFILES_COUNT
+unset MAIN_DBFILES
+
+if [ -f "/var/tmp/db21_sp_iqfile.txt" ]; then
+  rm -rf /var/tmp/db21_sp_iqfile.txt
+fi
+local index
+#MAIN_DBFILES=$( $SU - ${SYSUSER} -c "${IQDIR}/bin64/dbisql @${CONN_STR_USER_DBA_ENC} sp_iqfile" | $EGREP -i "^${DBFILE_NAME}" | $AWK '{print $2"::"$3}' | $SORT )
+$SU - ${SYSUSER} -c "${IQDIR}/bin64/dbisql @${CONN_STR_USER_DBA_ENC} \"sp_iqfile; output to /var/tmp/db21_sp_iqfile.txt APPEND HEXADECIMAL ASIS FORMAT TEXT DELIMITED BY ' ' QUOTE '' ;\"" > /dev/null 2>&1
+MAIN_DBFILES=`$CAT /var/tmp/db21_sp_iqfile.txt | $EGREP -i "^${DBFILE_NAME}" | $AWK '{print $2"::"$3}' | $SORT`
+if [ ! "${MAIN_DBFILES}" ]; then
+    _err_msg_="Could not get sp_iqfile sybase"
+    abort_script "${_err_msg_}"
+fi
+
+for _dbfile_ in ${MAIN_DBFILES}; do
+    index=$((${index}+1))
+done
+
+MAIN_DBFILES_COUNT=${index}
+if [ ! "${MAIN_DBFILES_COUNT}" ]; then
+    _err_msg_="Error setting {MAIN_DBFILES_COUNT}"
+    abort_script "${_err_msg_}"
+fi
+
+}
+
+### Function: create_sym_label ###
+#
+# create sym link and label
+# Arguments:
+#       dbfile
+# Return Values:
+#       none
+
+create_sym_label()
+{
+    $ECHO "Create sym links ${ENIQ_CORE_INSTALL_BSH} -s create_db_sym_links -n\n" | $TEE -a ${LOGFILE}
+    $BASH ${ENIQ_CORE_INSTALL_BSH} -s create_db_sym_links -n -l ${LOGFILE}
+    if [ $? -ne 0 ]; then
+        _err_msg_="Could not create ${ENIQ_CORE_INSTALL_BSH} -s create_db_sym_links -n"
+        abort_script "${_err_msg_}"
+    fi
+}
+
+### Function: check_files_and_scripts ###
+#
+#   Checks required files/scripts are present
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+
+check_files_and_scripts()
+{
+$ECHO "\nChecking for required files and scripts" | $TEE -a ${LOGFILE}
+
+if [ ! -f ${ENIQ_INI} ]; then
+    _err_msg_="Unable to access ${ENIQ_INI}. Exiting Script."
+    abort_script "${_err_msg_}";
+fi
+
+if [ ! -f ${SYM_INI} ]; then
+    _err_msg_="Unable to access ${SYM_INI}. Exiting Script."
+    abort_script "${_err_msg_}";
+fi
+
+if [ "${STANDALONE_SERVER}" != "YES" ]; then
+    if [ ! -f ${SYM_CO_INI} ]; then
+        _err_msg_="Unable to access ${SYM_CO_INI}. Exiting Script."
+        abort_script "${_err_msg_}";
+    fi
+
+    if [ ! -f ${SYM_CO_INI_SW} ]; then
+        _err_msg_="Unable to access ${SYM_CO_INI}. Exiting Script."
+        abort_script "${_err_msg_}";
+    fi
+fi
+
+if [ ! -s ${UPDATE_CELL_COUNT_BSH} ]; then
+    _err_msg_="Unable to access ${UPDATE_CELL_COUNT_BSH}. Exiting Script."
+    abort_script "${_err_msg_}";
+fi
+
+if [ ! -s ${ENIQ_CORE_INSTALL_BSH} ]; then
+    _err_msg_="Unable to access ${ENIQ_CORE_INSTALL_BSH}. Exiting Script."
+    abort_script "${_err_msg_}";
+fi
+
+if [ ! -s ${GET_DISC_INFO_BSH} ]; then
+    _err_msg_="Unable to access ${GET_DISC_INFO_BSH}. Exiting Script."
+    abort_script "${_err_msg_}";
+fi
+
+if [ ! -s ${ADD_MAINSAPCEDB_BSH} ]; then
+    _err_msg_="Unable to access ${ADD_MAINSAPCEDB_BSH}. Exiting Script."
+    abort_script "${_err_msg_}";
+fi
+
+if [ ! -s ${MANAGE_SERVICES_BSH} ]; then
+    _err_msg_="Failed to locate ENIQ service manager script - ${MANAGE_SERVICES_BSH}"
+    abort_script "${_err_msg_}"
+fi
+
+if [ ! -s "${INST_TYPE_FILE}" ]; then
+    _err_msg_="ENIQ install type not defined in ${INST_TYPE_FILE}"
+    abort_script "${_err_msg_}" 
+fi
+
+if [ -z "${CONF_DIR}" ] ; then
+    _err_msg_="Unable to access ${CONF_DIR}. Exiting Script."
+    abort_script "${_err_msg_}";
+fi
+}
+
+### Function: setup_env ###
+#
+# Set up some setup_env
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+
+setup_env()
+{
+if [ ! "${ENIQ_BASE_DIR}" ]; then
+    # Directory on the root filesystem
+    ENIQ_BASE_DIR=/eniq
+fi
+#copy of sym_ini file
+
+# Admin Directory
+ENIQ_ADMIN_DIR=${ENIQ_BASE_DIR}/admin
+ENIQ_ADMIN_BIN_DIR=${ENIQ_ADMIN_DIR}/bin
+
+#Temp directory.
+TEM=/tmp
+
+# Main Directory for the Core Installation SW
+ENIQ_INST_DIR=${ENIQ_BASE_DIR}/installation
+
+# Main Directory for the Core Installation SW
+ENIQ_CORE_INST_DIR=${ENIQ_INST_DIR}/core_install
+
+ENIQ_CORE_BIN_DIR=${ENIQ_CORE_INST_DIR}/bin
+
+# Config dir
+ENIQ_CONF_DIR=${ENIQ_INST_DIR}/config
+SYM_INI=${ENIQ_CONF_DIR}/${SYM_INI_FILE}
+LUN_INI=${ENIQ_CONF_DIR}/${LUN_INI_FILE}
+SYM_CO_INI=${ENIQ_CONF_DIR}/${SYM_CO_INI_FILE}
+SYM_CO_INI_SW=${ENIQ_BASE_DIR}/sw/conf/${SYM_CO_INI_FILE}
+
+
+ENIQ_CORE_INSTALL_BSH=${ENIQ_CORE_INST_DIR}/bin/eniq_core_install.bsh
+GET_DISC_INFO_BSH=${ENIQ_CORE_INST_DIR}/bin/get_disk_info.bsh
+ADD_MAINSAPCEDB_BSH=${ENIQ_CORE_INST_DIR}/bin/add_main_dbspaces.bsh
+UPDATE_CELL_COUNT_BSH=${ENIQ_ADMIN_BIN_DIR}/update_cell_node_count.bsh 
+
+MANAGE_SERVICES_BSH=${ENIQ_ADMIN_BIN_DIR}/manage_eniq_services.bsh 
+
+
+# Set up Variable to hold network path to SW
+if [ ! -s ${ENIQ_CORE_INST_DIR}/lib/iniadd.pl ]; then
+    _err_msg_="Cannot locate ${ENIQ_CORE_INST_DIR}/lib/iniadd.pl"
+    abort_script "${_err_msg_}"
+else
+    INIADD=${ENIQ_CORE_INST_DIR}/lib/iniadd.pl
+fi
+
+if [ ! -s ${ENIQ_CORE_INST_DIR}/lib/inidel.pl ]; then
+    _err_msg_="Cannot locate ${ENIQ_CORE_INST_DIR}/lib/inidel.pl"
+    abort_script "${_err_msg_}"
+else
+    INIDEL=${ENIQ_CORE_INST_DIR}/lib/inidel.pl
+fi
+# Source the common functions
+if [ -s ${ENIQ_CORE_INST_DIR}/lib/common_functions.lib ]; then
+    . ${ENIQ_CORE_INST_DIR}/lib/common_functions.lib
+else
+    _err_msg_="File /eniq/installation/core_install/lib/common_functions.lib not found"
+    abort_script "${_err_msg_}"
+fi
+
+# Check required files and scripts exist
+if [ ! -s ${CONF_DIR}/niq.rc ]; then
+    _err_msg_="File ${CONF_DIR}/niq.rc not found, or is empty"
+    abort_script "${_err_msg_}"
+else
+    #$ECHO "Sourcing ${CONF_DIR}/niq.rc" 
+    . ${CONF_DIR}/niq.rc
+fi
+# File containing the type of OSS installation. Eg. statistics
+INST_TYPE_FILE=${ENIQ_CONF_DIR}/ericsson_use_config
+
+# Read the installation type - should be "stats"
+INSTALL_TYPE=`$CAT ${INST_TYPE_FILE} | $AWK -F\= '{print $2}'`
+
+
+LOG_DIR=${ENIQ_BASE_DIR}/local_logs/expansion
+if [ ! "$LOGFILE" ] ; then
+    LOGFILE=${LOG_DIR}/exp_add_mainspacedb_${TIMESTAMP}.log
+fi
+
+SYM_LINK_BACKUP=${LOG_DIR}/_maindb_${SYM_INI_FILE}_${TIMESTAMP}
+
+
+
+# Create a temporary Directory
+TEM_DIR=/tmp/expansion.$$.$$
+$RM -rf ${TEM_DIR}
+$MKDIR -p ${TEM_DIR}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not create directory $TEM_DIR"
+    abort_script "${_err_msg_}"
+fi
+
+STORAGE_TYPE=`iniget STOR_TYPE -f ${ENIQ_CONF_DIR}/${SUNOS_INI} -v STORAGE_TYPE`
+if [ ! "${STORAGE_TYPE}" ]; then
+    _err_msg_="Could not read STORAGE_TYPE param"
+    abort_script "${_err_msg_}"
+fi
+}
+### Function: setup_sybase ###
+#
+#   Setup Sybase variables
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+setup_sybase()
+{
+# Set the Connect DB parameters
+
+DWH_PORT=`iniget DWH -v PortNumber -f ${ENIQ_INI}`
+DWH_ENG=`iniget DWH -v ServerName -f ${ENIQ_INI}`
+if [ ! "${DWH_PORT}" -o ! "${DWH_ENG}" ]; then
+    _err_msg_="Could not read IQ values from ${ENIQ_INI}"
+    abort_script "${_err_msg_}"
+fi
+
+DBA_PASSWORD=`inigetpassword DB -f ${ENIQ_INI} -v DBAPassword`
+if [ ! "${DBA_PASSWORD}" ]; then
+    if [ -f ${ENIQ_BASE_DIR}/sw/installer/dbusers ]; then
+        DBA_PASSWORD=`${ENIQ_BASE_DIR}/sw/installer/dbusers dba dwhrep`
+        if [ ! "${DBA_PASSWORD}" ] ; then
+            _err_msg_="Could not get dwhdb DBA Password"
+            abort_script "${_err_msg_}"
+        fi
+    else
+        err_msg_="Could not get dwhdb DBA Password"
+        abort_script "${_err_msg_}"
+    fi
+fi
+                                                                                                                                                                      
+
+
+
+_CONN_STR_USER_DBA="-c \"uid=dba;pwd=${DBA_PASSWORD};eng=${DWH_ENG};links=tcpip{host=${DWH_ENG};port=${DWH_PORT};dobroadcast=no;verify=no}\""
+CONN_STR_USER_DBA_ENC=${TEM}/_conn_str_main_encrypt.txt.`uuidgen`
+
+# encrypt the connection string.
+get_encrypt_file "${_CONN_STR_USER_DBA}" "${CONN_STR_USER_DBA_ENC}"
+
+
+SYSUSER=`iniget ENIQ_INSTALL_CONFIG -f ${ENIQ_CONF_DIR}/${SUNOS_INI} -v ENIQ_SYSUSER`
+if [ ! "${SYSUSER}" ]; then
+    _err_msg_="Could not read System User from  ${ENIQ_CONF_DIR}/${SUNOS_INI}"
+    abort_script "${_err_msg_}"
+fi
+
+#get dcuser env variables
+$SU - ${SYSUSER} -c "$ENV |$EGREP '^(SYBASE|ASDIR|IQDIR|ASALOGDIR|SQLANY)'" > $TEM_DIR/sybase_det.$$
+$CAT $TEM_DIR/sybase_det.$$ |$EGREP '^(SYBASE|ASDIR|IQDIR|ASALOGDIR|SQLANY)' > $TEM_DIR/sybase_det_var.$$
+. $TEM_DIR/sybase_det_var.$$ >> /dev/null 2>&1
+
+if [ -z "${IQDIR}" ] ; then
+    _err_msg_="ERROR: IQDIR is not set"
+    abort_script "${_err_msg_}" 
+fi
+}
+
+### Function: usage_msg ###
+#
+# Usage
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+
+usage_msg()
+{
+$ECHO "
+Usage: `$BASENAME $0` -c <conf dir> -d <niq.ini file> [-l <logfile>]
+
+options:
+
+-l : Optional parameter specifying what logfile to us
+
+-c : Conf dir where niq.rc resides
+
+-d : Path to the niq.ini file.
+
+"
+}
+
+# ********************************************************************
+#
+#   Main body of program
+#
+# ********************************************************************
+#
+
+DEFAULT_USER=root
+
+TIMESTAMP=`$DATE +%d.%m.%y_%H:%M:%S`
+
+# Determine absolute path to software
+get_absolute_path
+
+while getopts ":c:d:l:i:a:" arg; do
+    case $arg in
+    c)  CONF_DIR="$OPTARG"
+        ;;
+    d)  ENIQ_INI="$OPTARG"
+        ;;
+    l)  LOGFILE="$OPTARG"
+        ;;
+    a)  AUTOMATION="YES"
+        ;;
+    \?) usage_msg
+    exit 1
+    ;;
+    esac
+done
+shift `$EXPR $OPTIND - 1`
+
+dbexpansion_flag=""
+if [ "${AUTOMATION}" == "YES" ]; then
+    dbexpansion_flag="true"
+fi
+
+# Check that the effective id of the user is root
+check_id
+
+if [ ! "${CONF_DIR}" ]; then
+    usage_msg
+    exit 1
+fi
+
+if [ ! "${ENIQ_INI}" ]; then
+    usage_msg
+    exit 1
+fi
+
+
+# set up env
+setup_env
+$ECHO "Starting to Run `$BASENAME $0`"
+
+chk_create_logfile
+
+CURR_SERVER_TYPE=`$CAT $ENIQ_CONF_DIR/installed_server_type | $EGREP -v  '^[[:blank:]]*#' | $SED -e 's/ //g'`
+READER_SERVER_TYPE=NO
+STANDALONE_SERVER=NO
+
+if [ "${CURR_SERVER_TYPE}" = "stats_iqr" -o "${CURR_SERVER_TYPE}" = "eniq_iqr" ]; then
+    READER_SERVER_TYPE=YES
+fi
+
+if [ "${CURR_SERVER_TYPE}" = "eniq_stats" ]; then
+    STANDALONE_SERVER=YES
+fi
+
+check_files_and_scripts
+
+setup_sybase
+
+
+if [ "${STORAGE_TYPE}" != "raw" ]; then
+    _err_msg_="script only for raw storage type"
+    abort_script "${_err_msg_}"
+fi
+
+if [ "${INSTALL_TYPE}" != "stats" ]; then
+    _err_msg_="script only for INSTALL_TYPE stats " 
+    abort_script "${_err_msg_}"
+fi
+
+$ECHO "NOTE : Stopping ENIQ services." | $TEE -a  ${LOGFILE}
+$BASH ${MANAGE_SERVICES_BSH} -a stop -s ALL -N -l ${LOGFILE}
+if [ $? -ne 0 ]; then
+    abort_script "Failed to start some ENIQ services, exiting...."
+fi
+
+$CP ${SYM_INI} ${SYM_LINK_BACKUP}
+if [[ $? -ne 0 ]]; then
+    abort_script "ERROR : Failed to copy ${SYM_INI} to ${SYM_LINK_BACKUP}"
+fi
+
+get_disksmaindb_sym_link
+NUMBER_DBFILES_START=${NUMBER_DBFILES}
+NUMBER_DISCS_START=${NUMBER_DISCS}
+
+if [ ${NUMBER_DBFILES_START} -ne ${NUMBER_DISCS_START} ] ; then
+    abort_script "ERROR : Sym link file ${SYM_INI} not configure properly"
+fi
+
+if [ "${READER_SERVER_TYPE}" != "YES" ]; then
+    get_mainfiles_sybase
+    MAIN_DBFILES_COUNT_START=${MAIN_DBFILES_COUNT}
+    MAIN_DBFILES_START=${MAIN_DBFILES}
+
+    if [ ${NUMBER_DBFILES_START} -ne ${MAIN_DBFILES_COUNT_START} ] ; then
+        abort_script "ERROR : Sym link file ${SYM_INI} not configure properly"
+    fi
+fi
+
+$ECHO "Running script to get available LUNs to added to main db to symlink file." | $TEE -a  ${LOGFILE}
+
+$ECHO "Running ${GET_DISC_INFO_BSH}" | $TEE -a  ${LOGFILE}
+
+if [ "${CURR_SERVER_TYPE}" != "stats_iqr" ]; then
+    if [ "$dbexpansion_flag" == "true" ]; then
+        $BASH "${GET_DISC_INFO_BSH}" -i "${INSTALL_TYPE}" -l "${LOGFILE}" -t "${STORAGE_TYPE}" -e -M -a automation
+    else
+        $BASH "${GET_DISC_INFO_BSH}" -i "${INSTALL_TYPE}" -l "${LOGFILE}" -t "${STORAGE_TYPE}" -e -M
+    fi
+    if [[ $? -ne 0 ]]; then
+        clean_up
+        abort_script "Failed to select LUNs"
+    fi
+else
+    allocate_disks_for_readers
+fi
+
+get_disksmaindb_sym_link
+NUMBER_DBFILES_ADD_DISC_SYM=${NUMBER_DBFILES}
+NUMBER_DISCS_ADD_DISC_SYM=${NUMBER_DISCS}
+
+NUMBER_ADDED_DISCS=$(($NUMBER_DISCS_ADD_DISC_SYM-$NUMBER_DBFILES_ADD_DISC_SYM))
+if [ ${NUMBER_ADDED_DISCS} -lt 1 ]; then
+    clean_up
+    abort_script "Must add at least one maindb"
+fi
+
+$ECHO "Running ${UPDATE_CELL_COUNT_BSH}" | $TEE -a  ${LOGFILE}
+
+if [ "$dbexpansion_flag" == "true" ]; then
+    $BASH ${UPDATE_CELL_COUNT_BSH} -r -m ${NUMBER_ADDED_DISCS} -M -N -l ${LOGFILE}
+     _status_=$?
+    if [[ ${_status_} -ne 0 ]]; then
+        clean_up
+        if [[ ${_status_} -eq 2 ]]; then
+            exit 0
+        else
+            abort_script "Failed to update symlink with new main db"
+        fi
+    fi
+else
+     $BASH ${UPDATE_CELL_COUNT_BSH} -r -m ${NUMBER_ADDED_DISCS} -M -l ${LOGFILE}
+     _status_=$?
+    if [[ ${_status_} -ne 0 ]]; then
+        clean_up
+        if [[ ${_status_} -eq 2 ]]; then
+            exit 0
+        else
+            abort_script "Failed to update symlink with new main db"
+        fi
+    fi
+fi
+
+
+get_disksmaindb_sym_link
+NUMBER_DBFILES_CELL_SYM=${NUMBER_DBFILES}
+NUMBER_DISCS_CELL_SYM=${NUMBER_DISCS}
+if [ ${NUMBER_DBFILES_CELL_SYM} -ne ${NUMBER_DISCS_CELL_SYM} ] ; then
+    abort_script "ERROR : Sym link file ${SYM_INI} not configure properly"
+fi
+
+NUMBER_CHECK_DFFILES_SYM=$(($NUMBER_DBFILES_CELL_SYM-$NUMBER_DBFILES_ADD_DISC_SYM))
+if [ ${NUMBER_CHECK_DFFILES_SYM} -ne  ${NUMBER_ADDED_DISCS} ]; then
+    clean_up
+    abort_script "Restoring original sy_link file as sym_link not correct"
+fi
+
+create_sym_label
+
+if [ "${READER_SERVER_TYPE}" != "YES" ]; then
+    dwhdb_start
+    $ECHO "Running ${ADD_MAINSAPCEDB_BSH}" | $TEE -a  ${LOGFILE}
+    $SU - ${SYSUSER} -c "$BASH ${ADD_MAINSAPCEDB_BSH} -c ${CONF_DIR} -d ${ENIQ_INI} -s ${SYM_INI} -l ${LOGFILE}"
+    if [[ $? -ne 0 ]]; then
+        clean_up
+        _err_msg_="Could not $BASH ${ADD_MAINSAPCEDB_BSH} -c ${CONF_DIR} -d ${ENIQ_INI} -s ${SYM_INI} -l ${LOGFILE}"
+        abort_script "${_err_msg_}"
+    fi
+
+    get_disksmaindb_sym_link
+    NUMBER_DBFILES_FINISH_SYM=${NUMBER_DBFILES}
+    NUMBER_DISCS_FINISH_SYM=${NUMBER_DISCS}
+
+    if [ ${NUMBER_DBFILES_FINISH_SYM} -ne ${NUMBER_DISCS_FINISH_SYM} ] ; then
+        abort_script "ERROR : Sym link file ${SYM_INI} not configure properly"
+    fi
+
+    get_mainfiles_sybase
+    MAIN_DBFILES_COUNT_FINISH=${MAIN_DBFILES_COUNT}
+    MAIN_DBFILES_FINISH=${MAIN_DBFILES}
+
+    if [ ${NUMBER_DBFILES_FINISH_SYM} -ne ${MAIN_DBFILES_COUNT_FINISH} ] ; then
+        abort_script "ERROR : Sym link ${SYM_INI} not matching sybase"
+    fi
+
+    if [ ${NUMBER_DBFILES_CELL_SYM} -ne ${MAIN_DBFILES_COUNT_FINISH} ] ; then
+        abort_script "ERROR : No of main db in sybase doesn't match with ${SYM_INI} \n Files in sybase are ${MAIN_DBFILES_FINISH}"
+    fi
+
+    if [ "${STANDALONE_SERVER}" != "YES" ]; then
+        $CP ${SYM_INI} ${SYM_CO_INI}
+        if [[ $? -ne 0 ]]; then
+            abort_script "ERROR : Failed to copy ${SYM_INI} to ${SYM_CO_INI}"
+        fi
+
+        $CP ${SYM_INI} ${SYM_CO_INI_SW}
+        if [[ $? -ne 0 ]]; then
+            abort_script "ERROR : Failed to copy ${SYM_INI} to ${SYM_CO_INI_SW}"
+        fi
+
+    fi
+
+    dwhdb_stop
+
+fi
+
+if [ "${READER_SERVER_TYPE}" == "YES" ]; then
+$CP ${SYM_CO_INI_SW} ${SYM_CO_INI}
+if [ $? -ne 0 ]; then
+    abort_script "ERROR : Failed to copy ${SYM_CO_INI_SW} to ${SYM_CO_INI}"
+fi
+fi
+
+$ECHO "Successfully added mainDB files" | $TEE -a ${LOGFILE}
+$RM -rf ${TEM_DIR}
+$RM -rf ${CONN_STR_USER_DBA_ENC}
+
+$ECHO "Changing permission of the ${LOGFILE} to 644" | $TEE -a ${LOGFILE}
+$CHMOD 644 ${LOGFILE}
+    if [ $? -ne 0 ]; then
+        _err_msg_="Could not change ${LOGFILE} file permission to 644"
+        abort_script "${_err_msg_}"
+    fi
+
+exit 0
+

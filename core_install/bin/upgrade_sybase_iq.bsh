@@ -1,0 +1,1959 @@
+#!/bin/bash
+# ********************************************************************
+# Ericsson Radio Systems AB                                     SCRIPT
+# ********************************************************************
+#
+#
+# (c) Ericsson Radio Systems AB 2022 - All rights reserved.
+#
+# The copyright to the computer program(s) herein is the property
+# of Ericsson Radio Systems AB, Sweden. The programs may be used 
+# and/or copied only with the written permission from Ericsson Radio 
+# Systems AB or in accordance with the terms and conditions stipulated 
+# in the agreement/contract under which the program(s) have been 
+# supplied.
+#
+# ********************************************************************
+# Name    : upgrade_sybase_iq.bsh
+# Date    : 11/10/2023
+# Revision: /Main/70
+# Purpose : This script will update the Sybase IQ SW on the ENIQ server
+#
+# Usage   : upgrade_sybase_iq.bsh -d <eniq_sw_dir> [ -b <eniq_base_dir> ]
+#                     [ -l <path_to_logfile> ] [ -T ] 
+#
+# ********************************************************************
+#
+#   Command Section
+#
+# ********************************************************************
+AWK=/usr/bin/awk
+BASENAME=/usr/bin/basename
+BASH=/usr/bin/bash
+CAT=/usr/bin/cat
+CHMOD=/usr/bin/chmod
+CHOWN=/usr/bin/chown
+CLEAR=/usr/bin/clear
+CP=/usr/bin/cp
+CUT=/usr/bin/cut
+DATE=/usr/bin/date
+DIRNAME=/usr/bin/dirname
+ECHO=/usr/bin/echo
+EGREP=/usr/bin/egrep
+ENV=/usr/bin/env
+EXPR=/usr/bin/expr
+FIND=/usr/bin/find
+GETENT=/usr/bin/getent
+GREP=/usr/bin/grep
+GTAR=/usr/bin/gtar
+HOSTNAME=/usr/bin/hostname
+ID=/usr/bin/id
+LS=/usr/bin/ls
+MV=/usr/bin/mv
+PWD=/usr/bin/pwd
+RM=/usr/bin/rm
+SED=/usr/bin/sed
+SU=/usr/bin/su
+TAR=/usr/bin/tar
+TEE=/usr/bin/tee
+TOUCH=/usr/bin/touch
+UNAME=/usr/bin/uname
+PS=/usr/bin/ps
+
+# ********************************************************************
+#
+#       Configuration Section
+#
+# ********************************************************************
+# Name of SunOS & ENIQ ini Files
+ENIQ_ENV=niq.rc
+ENIQ_INI=niq.ini
+SUNOS_INI=SunOS.ini
+
+# Get the architecture of the server.
+# Need to upgrade the correct sybase version - sparc or x86
+SYS_ARCH=`$UNAME -p`
+
+VERSION_FILE_ID="./version/iq_version"
+VERSION_FILE_NAME="iq_version"
+
+# ********************************************************************
+#
+#       Pre-execution Operations
+#
+# ********************************************************************
+
+# ********************************************************************
+#
+#   Functions
+#
+# ********************************************************************
+### Function: abort_script ###
+#
+#   This will is called if the script is aborted thru an error
+#   error signal sent by the kernel such as CTRL-C or if a serious
+#   error is encountered during runtime
+#
+# Arguments:
+#       $1 - Error message from part of program (Not always used)
+# Return Values:
+#       none
+abort_script()
+{
+if [ -s ${TEM_DIR}/${VERSION_FILE_NAME} ]; then
+    log_msg -s "Reverting the Sybase_IQ version file to version before upgrade" -l ${LOGFILE}
+    $MV ${TEM_DIR}/${VERSION_FILE_NAME} ${ORIG_SYBIQ_TGT_DIR}/${VERSION_FILE_ID}
+    if [ $? -ne 0 ]; then
+        log_msg -s="Could not revert the old IQ version file ${VERSION_FILE_NAME}" -l ${LOGFILE}
+    fi
+fi
+if [ "$1" ]; then
+    _err_msg_=$1
+else
+    _err_msg_="Script aborted.......\n"    
+fi
+if [ "${LOGFILE}" ]; then
+    $ECHO "\n$_err_msg_\n"|$TEE -a ${LOGFILE}
+else
+    $ECHO "\n$_err_msg_\n"
+fi
+
+$RM -rf ${dwh_connection_string_enc}
+
+$RM -rf ${rep_connection_string_enc}
+
+$RM -rf ${conn_str_enc}
+
+$RM -rf ${connection_string_enc}
+
+$RM -rf ${conn_string_enc}
+
+$RM -rf ${conn_str_continue_enc}
+
+$RM -rf ${conn_str_exit_enc}
+
+$RM -rf ${conn_str_dwh_enc}
+cd $SCRIPTHOME
+$RM -rf ${TEM_DIR}
+
+if [ "$2" ]; then
+    ${2}
+else
+   exit 1
+fi
+$RM -rf ${TEM_DIR}
+}
+
+### Function: chk_create_logfile ###
+#
+# Check/Create Logfile
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+chk_create_logfile()
+{
+$MKDIR -p `$DIRNAME ${LOGFILE}`
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not create directory `$DIRNAME ${LOGFILE}`"
+     abort_script "$_err_msg_"
+fi  
+
+$TOUCH -a ${LOGFILE}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not write to file ${LOGFILE}"
+    abort_script "$_err_msg_"
+fi  
+}
+
+### Function: check_id ###
+#
+#   Check that the effective id of the user is correct
+#   If not print error msg and exit.
+#
+# Arguments:
+#       $1 : User ID name
+# Return Values:
+#       none
+check_id()
+{
+_check_id_=`$ID  | $AWK -F\( '{print $2}' | $AWK -F\) '{print $1}'`
+if [ "$_check_id_" != "$1" ]; then
+    _err_msg_="You must be $1 to execute this script."
+    abort_script "$_err_msg_"
+fi
+}
+
+### Function: check_iq_sw_upg_required ###
+#
+# Check if I need to upgrade IQ SW
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+check_iq_sw_upg_required()
+{
+# If I do not have a version file, then assume this version is newer.
+if [ ! -s ${ORIG_SYBIQ_TGT_DIR}/${VERSION_FILE_ID} ]; then
+    $ECHO "Upgrade of Sybase IQ Required" >> ${TEM_DIR}/upgrade_disp_file
+    IQ_SW_UPGRADE_REQ=YES
+    return 0
+fi
+
+# Get IQ revision info
+_old_disp_iq_ver_=`$CAT ${ORIG_SYBIQ_TGT_DIR}/${VERSION_FILE_ID}|$EGREP '^[[:blank:]]*VERSION::'|$AWK -F"::" '{print $2}'`
+_old_iq_ver_=`$ECHO ${_old_disp_iq_ver_}|$SED -e 's|\.||g'`
+if [ ! "${_old_iq_ver_}" ]; then
+    _err_msg_="Could not read IQ Version from ${ORIG_SYBIQ_TGT_DIR}/${VERSION_FILE_ID}"
+    abort_script "$_err_msg_" 
+fi
+$ECHO ${_old_iq_ver_}|$EGREP '[^0-9]' >> /dev/null 2>&1
+if [ $? -eq 0 ]; then
+    _err_msg_="Invalid IQ Version found in ${ORIG_SYBIQ_TGT_DIR}/${VERSION_FILE_ID}"
+    abort_script "$_err_msg_" 
+fi
+
+_old_esd_num_=`$CAT ${ORIG_SYBIQ_TGT_DIR}/${VERSION_FILE_ID}|$EGREP '^[[:blank:]]*ESD::'|$SED -e 's/sp//g' -e t -e 's/SP//g' |$AWK -F"::" '{print $2}'`
+if [ ! "${_old_esd_num_}" ]; then
+    _err_msg_="No ESD value found in ${ORIG_SYBIQ_TGT_DIR}/${VERSION_FILE_ID}"
+    abort_script "$_err_msg_" 
+else 
+    $ECHO ${_old_esd_num_}|$EGREP '[^0-9.]' >> /dev/null 2>&1
+    if [ $? -eq 0 ]; then
+        _err_msg_="Invalid ESD value found in ${ORIG_SYBIQ_TGT_DIR}/${VERSION_FILE_ID}"
+        abort_script "$_err_msg_"
+    fi
+fi
+
+# Extract the version file from the SYBASE SW bundle
+cd ${TEM_DIR}
+log_msg -s "Extracting IQ version file(s) from ${SYBIQ_FILE}...Please Wait" -l ${LOGFILE}
+$GTAR -zxf ${SYBIQ_FILE} ${VERSION_FILE_ID}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not extract ${SYBIQ_FILE}"
+    abort_script "$_err_msg_" 
+fi
+    
+_new_disp_iq_ver_=`$CAT ${VERSION_FILE_ID}|$EGREP '^[[:blank:]]*VERSION::'|$AWK -F"::" '{print $2}'`
+_new_iq_ver_=`$ECHO ${_new_disp_iq_ver_}|$SED -e 's|\.||g'`
+if [ ! "${_new_iq_ver_}" ]; then
+    _err_msg_="Could not read IQ Version from extracted version file ${VERSION_FILE_ID}"
+    abort_script "$_err_msg_"
+fi
+$ECHO ${_new_iq_ver_}|$EGREP '[^0-9]' >> /dev/null 2>&1
+if [ $? -eq 0 ]; then
+    _err_msg_="Invalid IQ Version found in extracted version file ${VERSION_FILE_ID}"
+    abort_script "$_err_msg_"
+fi
+
+
+NEW_SW_ESD_NUM=`$CAT ${VERSION_FILE_ID}|$EGREP '^[[:blank:]]*ESD::'|$SED -e 's/sp//g' -e t -e 's/SP//g' |$AWK -F"::" '{print $2}'`
+if [ ! "${NEW_SW_ESD_NUM}" ]; then
+    _err_msg_="No ESD value found in extracted version file ${VERSION_FILE_ID}"
+    abort_script "$_err_msg_" 
+else
+    $ECHO ${NEW_SW_ESD_NUM}|$EGREP '[^0-9.]' >> /dev/null 2>&1
+    if [ $? -eq 0 ]; then
+        _err_msg_="Invalid ESD value found in extracted version file ${VERSION_FILE_ID}"
+        abort_script "$_err_msg_"
+    fi
+fi
+
+
+$RM -f ${TEM_DIR}/upgrade_disp_file
+
+# Get IQ revision info
+if [ "${_old_esd_num_}" ]; then
+    _out_str_="Current Sybase IQ version ${_old_disp_iq_ver_} / ESD sp${_old_esd_num_}\n"
+else 
+    _out_str_="Current Sybase IQ version ${_old_disp_iq_ver_}\n"
+fi
+$ECHO ${_out_str_} >> ${TEM_DIR}/upgrade_disp_file
+
+
+if [ "${NEW_SW_ESD_NUM}" ]; then
+    _out_str_="New Sybase IQ version ${_new_disp_iq_ver_} / ESD sp${NEW_SW_ESD_NUM}\n"
+else
+    _out_str_="New Sybase IQ version ${_new_disp_iq_ver_}\n"
+fi
+$ECHO ${_out_str_} >> ${TEM_DIR}/upgrade_disp_file
+
+
+# Comparing IQ version. 
+if [ ${_new_iq_ver_} -gt ${_old_iq_ver_} ]; then
+    IQ_SW_UPGRADE_REQ=YES
+    $ECHO "New Sybase IQ version ${_new_disp_iq_ver_}\n" >> ${TEM_DIR}/upgrade_disp_file
+    return 0
+elif  [ ${_new_iq_ver_} -lt ${_old_iq_ver_} ]; then
+    IQ_SW_UPGRADE_REQ=NO
+    log_msg -s "New Sybase IQ version is latest then the older\n" -l ${LOGFILE}
+    return 0
+fi
+
+# If the IQ versions are the same, compare the ESD numbers
+
+if [ "${_old_esd_num_}" == "${NEW_SW_ESD_NUM}" ]; then
+    IQ_SW_UPGRADE_REQ=NO
+    log_msg -s "SAP IQ is on the same version" -l ${LOGFILE}
+    return 0
+else
+  if [ ${#_old_esd_num_} -ge ${#NEW_SW_ESD_NUM} ]; then
+  _max_length_=`echo ${#_old_esd_num_}`
+  else
+  _max_length_=`echo ${#NEW_SW_ESD_NUM}`
+  fi
+
+  declare -a _arr_old_
+  declare -a _arr_new_
+
+  _arr_old_=(`version_string $_old_esd_num_`)
+  _arr_new_=(`version_string $NEW_SW_ESD_NUM`)
+
+
+for ((i=0;i<_max_length_;i++));
+  do
+    if [ ${_arr_old_[$i]} -gt ${_arr_new_[$i]} ]; then
+    IQ_SW_UPGRADE_REQ=No
+    log_msg -s "No upgrade required" -l ${LOGFILE}
+    break
+    elif [ ${_arr_old_[$i]} -lt ${_arr_new_[$i]} ]; then
+    IQ_SW_UPGRADE_REQ=YES
+    log_msg -s "Upgrade Required" -l ${LOGFILE}
+    break
+    fi
+  done
+fi
+}
+
+
+### Function: check_templates_dir ###
+#
+# Check that I have a templates directory associated with 
+# my installation type
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+check_templates_dir()
+{
+if [ ! -s "${INST_TYPE_FILE}" ]; then
+    _err_msg_="ENIQ install type not defined in ${INST_TYPE_FILE}"
+    abort_script "$_err_msg_"
+fi
+# Read the installation type 
+INSTALL_TYPE=`$CAT ${INST_TYPE_FILE} | $AWK -F"=" '{print $2}'`
+
+# Templates Directory
+ENIQ_TEMPL_DIR="${ENIQ_INST_DIR}/templates/${INSTALL_TYPE}"
+
+# Do we have a templates dir for the install type
+if [ ! -d ${ENIQ_TEMPL_DIR} ]; then
+    _err_msg_="Template directory ${ENIQ_TEMPL_DIR} not found"
+    abort_script "$_err_msg_" 
+fi
+}
+
+### Function: check_upd_iq_sys_main ###
+#
+# Check if we need to update IQ SYS MAIN
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+check_upd_iq_sys_main()
+{
+# Check if IQ SYS MAIN is OK
+${BASH} ${ENIQ_ADMIN_BIN_DIR}/update_cell_node_count.bsh -s -N -f ${TEM_DIR}/iq_sys_main_chng_file
+if [ $? -ne 0 ]; then
+    _err_msg_=""
+    abort_script "$_err_msg_"
+fi
+
+if [ -f ${TEM_DIR}/iq_sys_main_chng_file ]; then
+    $ECHO "Expanding the IQ SYS Main DB spaces"
+    $SU - ${SYSUSER} -c "${BASH} ${ENIQ_INST_DIR}/bin/add_iq_sys_main_dbspaces.bsh -c ${CLI_CONF_DIR} -d ${CLI_CONF_DIR}/${ENIQ_INI} 2>/dev/null"
+    if [ $? -ne 0 ]; then
+        _err_msg_="Failed to resize IQ SYS MAIN dbspace"
+        abort_script "$_err_msg_"
+    fi
+fi
+}
+
+### Function: create_iq_interf ###
+#
+# Create the SYBASE IQ interfaces file
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+create_iq_interf()
+{
+_iqdir_=$1
+if [ ! -d ${_iqdir_} ]; then
+    _err_msg_="Could not locate Sybase IQ directory ${_iqdir_}"
+    abort_script "$_err_msg_"
+fi  
+
+if [ ! -s  ${ENIQ_TEMPL_DIR}/interfaces ]; then
+    _err_msg_="Could not locate ${ENIQ_TEMPL_DIR}/interfaces"
+    abort_script "$_err_msg_"
+fi  
+
+_dwh_port_num_=`iniget DWH -f ${ENIQ_CONF_DIR}/${ENIQ_INI} -v PortNumber`
+if [ ! "${_dwh_port_num_}" ]; then
+    _err_msg_="Could not read DWH Port Number from ${ENIQ_CONF_DIR}/${ENIQ_INI}"
+    abort_script "$_err_msg_"
+fi  
+
+_rep_port_num_=`iniget REP -f ${ENIQ_CONF_DIR}/${ENIQ_INI} -v PortNumber`
+if [ ! "${_rep_port_num_}" ]; then
+    _err_msg_="Could not read REP Port Number from ${ENIQ_CONF_DIR}/${ENIQ_INI}"
+    abort_script "$_err_msg_"
+fi  
+
+$CAT ${ENIQ_TEMPL_DIR}/interfaces | $SED -e "s|<CHANGE><DWH_PORT_NUM>|${_dwh_port_num_}|g"   \
+                                           -e "s|<CHANGE><REP_PORT_NUM>|${_rep_port_num_}|g" > ${TEM_DIR}/interfaces
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not create Sybase IQ Interfaces File"
+    abort_script "$_err_msg_"
+fi  
+
+$CP ${TEM_DIR}/interfaces ${_iqdir_}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not copy Sybase IQ Interfaces File to ${_iqdir_}"
+    abort_script "$_err_msg_"
+fi
+
+# This is just to make sure that all required aliases are in the hosts file
+_hname_=`${HOSTNAME}`
+_ip_=`$HOSTNAME -i | $AWK '{print $1}' | $HEAD -1`
+
+_update_=0
+_alias_list_="dwhdb repdb"
+for _alias_ in ${_alias_list_}; do
+    $CAT /etc/hosts | $EGREP "^[[:blank:]]*${_ip_}[[:blank:]]+${_hname_}"|$GREP -w ${_alias_} >> /dev/null 2>&1
+    if [ $? -ne 0 ]; then
+        if [ ! "${_add_alias_list_}" ]; then
+            _add_alias_list_=${_alias_}
+        else
+            _add_alias_list_="${_add_alias_list_} ${_alias_}"
+        fi
+    _update_=1
+    fi
+done
+
+if [ ${_update_} -eq 1 ]; then
+    if [ ! -f /etc/inet/hosts.orig ]; then
+        $CP -p /etc/inet/hosts /etc/inet/hosts.orig >> /dev/null 2>&1
+        if [ $? -ne 0 ]; then 
+            _err_msg_="Could not make backup of /etc/inet/hosts"
+            abort_script "$_err_msg_"
+        fi
+    fi
+    for _alias_ in ${_add_alias_list_}; do
+        $CAT /etc/inet/hosts|$SED -e "s|^\(${_ip_}\)\(.*\)\(${_hname_}\)\(.*\)|\1\2\3\4 ${_alias_}|" > ${TEM_DIR}/hosts
+        $CP ${TEM_DIR}/hosts /etc/inet/hosts
+        if [ $? -ne 0 ]; then 
+            _err_msg_="Could not update /etc/inet/hosts with Aliases"
+            abort_script "$_err_msg_"
+        fi
+    done
+fi
+}
+
+### Function: get_absolute_path ###
+#
+# Determine absolute path to software
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+get_absolute_path()
+{
+_dir_=`$DIRNAME $0`
+SCRIPTHOME=`cd $_dir_ 2>/dev/null && pwd || $ECHO $_dir_`
+}
+
+### Function: install_sybase_iq ###
+#
+# Install Sybase 
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+install_sybase_iq()
+{
+if [ ! "${SYBIQ_TGT_DIR}" ]; then
+    _err_msg_="Could not Determine the SYBIQ_TGT_DIR"
+    abort_script "$_err_msg_"
+fi
+
+cd ${SYBIQ_TGT_DIR}
+
+# Backup the interface file
+if [ -s ${SYBIQ_TGT_DIR}/interfaces ]; then
+    $ECHO "Backup up the Sybase IQ interfaces file"
+    $CP ${SYBIQ_TGT_DIR}/interfaces ${TEM_DIR}/interfaces
+    if [ $? -ne 0 ]; then
+        _err_msg_="Failed to backup file ${SYBIQ_TGT_DIR}/interfaces"
+        abort_script "$_err_msg_"
+    fi
+else
+    $ECHO "No Sybase IQ interfaces file found to backup"
+fi
+
+$ECHO "Removing old SW"
+$RM -rf ${SYBIQ_TGT_DIR}/*
+
+$ECHO "Installing Sybase IQ SW"
+$GTAR -zxf ${SYBIQ_FILE}
+if [ $? -ne 0 ]; then
+    if [ "${DEPLOYMENT_TYPE}" = "ft" ]; then
+        $TAR -xf ${SYBIQ_FILE}
+        if [ $? -ne 0 ]; then
+            _err_msg_="Failed to install ENIQ Core Install SW with Tar...exiting!"
+            abort_script "${_err_msg_}"
+        fi
+        else
+            _err_msg_="Failed to install ENIQ Core Install SW...exiting!"
+            abort_script "${_err_msg_}"
+        fi
+fi
+
+
+# Okay I need to locate the files that I have to update path in
+# I build this SW bundle in a different path than I installed it
+if [ ! -s ${SYBIQ_TGT_DIR}/file_change_list.txt ]; then
+   $RM -f ${TEM_DIR}/file_change_list.txt
+   $ECHO "Determining Files that need to be updated...Please Wait"
+   $FIND ${SYBIQ_TGT_DIR} -type f -exec $EGREP -l "<CHANGE><IQ_SYB_DIR>" {} \; >> ${TEM_DIR}/file_change_list.txt
+   $CAT ${TEM_DIR}/file_change_list.txt | $SED -e "s|${SYBIQ_TGT_DIR}\/||g" > ${SYBIQ_TGT_DIR}/file_change_list.txt
+fi
+
+# Okay Have I any files to change?
+if [ -s ${SYBIQ_TGT_DIR}/file_change_list.txt ]; then
+    for _file_ in `$CAT ${SYBIQ_TGT_DIR}/file_change_list.txt`; do
+        $RM -f ${TEM_DIR}/file.$$.$$
+        $ECHO "Updating ${_file_}"
+        if [ -s ${_file_} ]; then
+            $ECHO "Updating ${_file_}"
+            $CAT ${_file_} |$SED -e "s|<CHANGE><IQ_SYB_DIR>|${SYBIQ_TGT_DIR}/|g" >  ${TEM_DIR}/file.$$.$$
+            if [ $? -ne 0 ]; then
+                _err_msg_="Failed to update <CHANGE><IQ_SYB_DIR> ${_file_}"
+                abort_script "$_err_msg_"
+            fi
+            $CP ${TEM_DIR}/file.$$.$$ ${_file_}
+            if [ $? -ne 0 ]; then
+                _err_msg_="Failed to update file ${_file_}"
+                abort_script "$_err_msg_"
+            fi
+        fi
+    done
+    $RM -f ${SYBIQ_TGT_DIR}/file_change_list.txt
+fi
+
+# Okay Have I any files to change?
+if [ -s ${SYBIQ_TGT_DIR}/link_change_list.txt ]; then
+    $RM -f ${TEM_DIR}/link_change_list.txt
+    $CAT ${SYBIQ_TGT_DIR}/link_change_list.txt | $SED -e "s|<CHANGE><IQ_SYB_DIR>|${SYBIQ_TGT_DIR}|g" > ${TEM_DIR}/link_change_list.txt
+    /bin/bash ${TEM_DIR}/link_change_list.txt
+    $RM -f ${SYBIQ_TGT_DIR}/link_change_list.txt
+fi
+
+# Create/Restore the SYBASE IQ interfaces file
+if [ -s ${TEM_DIR}/interfaces ];then
+    $ECHO "Restoring the Sybase IQ interfaces file"
+    $CP ${TEM_DIR}/interfaces ${SYBIQ_TGT_DIR}/interfaces
+    if [ $? -ne 0 ]; then
+        _err_msg_="Failed to restore file ${TEM_DIR}/interfaces"
+        abort_script "$_err_msg_"
+    fi
+else
+    create_iq_interf ${SYBIQ_TGT_DIR}
+fi
+
+DIR_LIST=`$LS -a ${SYBIQ_TGT_DIR}`
+for DIR_NAME in ${DIR_LIST}; do
+    if [[ ${DIR_NAME} != *ckpt* ]] && [ ${DIR_NAME} != "." ] && [ ${DIR_NAME} != ".." ]; then
+        $CHOWN -Rh ${SYSUSER}:${SYSGRP} ${SYBIQ_TGT_DIR}/${DIR_NAME} >> /dev/null 2>&1
+        if [ $? -ne 0 ]; then 
+            _err_msg_="Could not change ownership of to ${SYBIQ_TGT_DIR}/${DIR_NAME} ${SYSUSER}:${SYSGRP}"
+            abort_script "$_err_msg_"
+        fi
+    fi
+done
+}
+
+### Function: lock_customized_db_user ###
+#
+#   This function locks customized db user in iq.
+#   
+#
+# Arguments:
+#        
+# Return Values:
+# 
+lock_customized_db_user()
+{
+if [ -s ${CLI_CONF_DIR}/queryUserConf.cfg ]; then
+${BASH} ${ENIQ_ADMIN_BIN_DIR}/admin_query_user.bsh -n All -a Lock -i No
+    if [ $? -ne 0 ]; then
+        _err_msg_="Failed to lock customized database users"
+        abort_script "$_err_msg_" 
+    else
+        log_msg -s -q  "Successfully locked customized database users" -l ${LOGFILE}
+    fi
+fi
+}
+
+### Function: lock_unlock_user_iq_db ###
+#
+#   This function (un)locks user in iq.
+#   
+#
+# Arguments:
+#        dba password, db port, user, action
+# Return Values:
+#       none
+lock_unlock_user_iq_db()
+{
+    _dba_pass_=$1
+    _db_port_=$2
+    user=$3
+    action=$4
+    
+    
+    conn_string="-nogui -c \"eng=dwhdb;links=tcpip{host=localhost;port=${_db_port_}};uid=dba;pwd=${_dba_pass_}\""  
+    conn_string_enc=${TEM}/conn_string_sybase_iq_encrypt.txt.`uuidgen`    
+    
+    # encrypt the connection string.
+    get_encrypt_file "${conn_string}" "${conn_string_enc}"
+    
+    $SU - $SYSUSER -c  "$DBISQL @${conn_string_enc} \"set temporary option ON_ERROR='EXIT'; CALL sp_iqlocklogin('${user}','${action}')\""
+    if [ $? -ne 0 ]; then
+        _err_msg_="Issue ${action}ing ${user} in the ${_db_}"
+        abort_script "$_err_msg_" 
+    fi
+    $RM -rf ${conn_string_enc}
+}
+
+
+## Function: read_storage_type ###
+#
+# Arguments:
+#   none
+# Return Values:
+#   set varibale STORAGE_TYPE
+read_storage_type()
+{
+# Read the storage type
+if [ -s ${ENIQ_CONF_DIR}/${SUNOS_INI} ]; then
+    STORAGE_TYPE=`iniget STOR_TYPE -f ${ENIQ_CONF_DIR}/${SUNOS_INI} -v STORAGE_TYPE`
+else
+    if [ -s ${ENIQ_CONF_DIR}/san_details ]; then
+        STORAGE_TYPE=`$CAT ${ENIQ_CONF_DIR}/san_details | $EGREP "^STORAGE_TYPE=" | $AWK -F\= '{print $2}'`
+    fi
+fi
+
+if [ ! "${STORAGE_TYPE}" ]; then
+    _err_msg_="Could not read STORAGE_TYPE param "
+    abort_script "$_err_msg_"
+fi
+}
+
+### Function: setup_env ###
+#
+# Setup up path environment etc
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+setup_env()
+{
+if [ ! "${ENIQ_BASE_DIR}" ]; then
+    ENIQ_BASE_DIR=/eniq
+fi
+
+#Temp directory.
+TEM=/tmp
+
+# ENIQ Admin Directory
+ENIQ_ADMIN_DIR=${ENIQ_BASE_DIR}/admin
+
+# CLI Conf dir
+CLI_CONF_DIR=${ENIQ_BASE_DIR}/sw/conf
+if [ ! -s ${CLI_CONF_DIR}/${ENIQ_ENV} ]; then
+    _err_msg_="Could not locate file ${CLI_CONF_DIR}/${ENIQ_ENV}"
+    abort_script "$_err_msg_"
+else
+    . ${CLI_CONF_DIR}/${ENIQ_ENV}
+fi
+
+# ENIQ Admin Bin Directory
+ENIQ_ADMIN_BIN_DIR=${ENIQ_ADMIN_DIR}/bin
+
+ENIQ_CONF_DIR=${ENIQ_BASE_DIR}/installation/config
+if [ ! -s ${ENIQ_CONF_DIR}/ericsson_use_config ]; then
+    _err_msg_="Could not locate file ${ENIQ_CONF_DIR}/ericsson_use_config"
+    abort_script "$_err_msg_"
+fi
+
+#File containing the deployment type
+DEPLOYMENT_TYPE=`$CAT ${ENIQ_CONF_DIR}/extra_params/deployment`
+if [ ! "${DEPLOYMENT_TYPE}" ]; then
+    _err_msg_="Could not determine the deployment type for this server"
+    abort_script "$_err_msg_"
+fi
+
+# File containing the type of OSS installation. Eg. oss or single
+INST_TYPE_FILE=${ENIQ_CONF_DIR}/ericsson_use_config
+
+# Main Directory for the Core Installation SW
+ENIQ_INST_DIR=${ENIQ_BASE_DIR}/installation/core_install
+
+# Set the log directory
+LOG_DIR=${ENIQ_BASE_DIR}/log
+LOGFILE_DIR="$LOG_DIR/sybase_iq"
+
+# File that contains DB info
+BKUP_DB_FILESYS_LIST="${ENIQ_BASE_DIR}/bkup_sw/etc/iq_filesystem_list"
+if [ ! -s ${BKUP_DB_FILESYS_LIST} ]; then
+    _err_msg_="Could not locate file ${BKUP_DB_FILESYS_LIST}"
+    abort_script "$_err_msg_"
+fi
+
+CURR_SERVER_TYPE=`$CAT $ENIQ_CONF_DIR/installed_server_type | $EGREP -v '^[[:blank:]]*#' | $SED -e 's/ //g'`
+if [ ! "${CURR_SERVER_TYPE}" ]; then
+    _err_msg_="Could not determine which server type this is"
+    abort_script "$_err_msg_"
+fi
+
+#Fetching IP Type from ipmp.ini file.
+check_ip_type
+
+if [ ! "${_ip_type_}" ]; then
+    _err_msg_="Could not read parameter _IP_TYPE_ from file ${ENIQ_CONF_DIR}/${IPMP_INI}"
+    abort_script "$_err_msg_"
+fi
+}
+
+### Function: setup_sybase_env ###
+#
+# Set up Sybase environment
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+setup_sybase_env()
+{
+$SU - ${SYSUSER} >> /dev/null -c "$ENV |$EGREP '^(SYBASE|ASDIR|IQDIR|ASALOGDIR|SQLANY)' > $TEM_DIR/sybase_det.$$" >> /dev/null 2>&1
+
+# Source the environment
+set -a
+. $TEM_DIR/sybase_det.$$ >> /dev/null 2>&1
+set +a
+
+if [ ! "${SYBASE}" ]; then 
+    _err_msg_="Could not determine Sybase environment variable \${SYBASE}"
+    abort_script "$_err_msg_"
+fi
+
+DBISQL="$(ls /eniq/sybase_iq/IQ-*/bin64/dbisql)"
+if [ ! -x "$DBISQL" ]; then
+    _err_msg_="$DBISQL commands not found or not executable."
+    abort_script "$_err_msg_"
+fi
+
+ISQL="$(ls /eniq/sybase_iq/OCS-*/bin/isql)"
+if [ ! -x "$ISQL" ]; then
+    _err_msg_="$ISQL commands not found or not executable."
+    abort_script "$_err_msg_"
+fi
+
+}
+
+### Function: usage_msg ###
+#
+#   Print out the usage message
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+usage_msg() 
+{
+$CLEAR
+$ECHO "
+Usage: `$BASENAME $0` -d <eniq_sw_dir> [ -b <eniq_base_dir> ] [ -l <path_to_logfile> ] [ -T ]
+                      
+options:
+
+-b  : Optional parameter specifying the full path to where the ENIQ
+      BASEDIR directory is (eg. /eniq). If not specified, then the 
+      script will assume the the base directory is 
+      ../../<directory_that_this_script_is_in>
+
+-d  : Parameter specifying the full path to the directory 
+      containing the ENIQ BASE SW directory structure. Under this
+      directory, this script will locate a directory that contains a list of 
+      all the TechPacks that will be used in addition of new TechPacks or the
+      or updating of existing TechPacks.
+      EG. <path_base_dir_sw>/${ENIQ_INTERF_INPUT_DIR}/techpack_description
+
+-l  : Optional parameter specifying the full path to logfile. If not specified, a 
+      logfile will be created in ${LOGFILE_DIR}
+
+-T  : Optional Parameter specifying the script should run in Test Mode. This
+      means that the script will only report if upgrade is required or not.
+
+-s  : Path and tar file with sybase IQ that you with to install
+
+-t  : Optional parameter specifying the target directory in which you wish to install IQ
+"
+}
+
+### Function: upd_user_profile ###
+#
+#   Update the SYSTEM USER profile file
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+upd_user_profile()
+{
+_iq_dir_=`iniget SYBASE_IQ -f ${ENIQ_CONF_DIR}/${SUNOS_INI} -v SYBASE_IQ_TARGET_DIR`
+_bin_dir_=`$CAT ${ENIQ_CONF_DIR}/${ENIQ_ENV} | $EGREP '^[[:blank:]]*BIN_DIR=' | $AWK -F\= '{print $2}'`
+_rt_dir_=`$CAT ${ENIQ_CONF_DIR}/${ENIQ_ENV} | $EGREP '^[[:blank:]]*RT_DIR=' | $AWK -F\= '{print $2}'`
+_asa_tgt_dir_=`iniget SYBASE_ASA -f ${ENIQ_CONF_DIR}/${SUNOS_INI} -v SYBASE_ASA_TARGET_DIR`
+
+# Get a list of users to be updated
+_user_list_=`iniget SunOS_USER -f ${ENIQ_CONF_DIR}/${SUNOS_INI}`
+for _user_ in ${_user_list_}; do
+    _user_name_=`iniget ${_user_} -f ${ENIQ_CONF_DIR}/${SUNOS_INI} -v name`
+    $GETENT passwd ${_user_name_} >> /dev/null 2>&1
+    if [ $? -ne 0 ]; then
+        _err_msg_="User ${_user_name_} not created"
+        abort_script "$_err_msg_" 
+    fi
+    
+    _sys_home_=`$GETENT passwd ${_user_name_}|$AWK -F\: '{print $6}'`
+    if [ ! "${_sys_home_}" ]; then
+        _err_msg_="Error reading  ${_user_name_} home area from /etc/passwd"
+        abort_script "$_err_msg_" 
+    fi
+
+    if [ ! -s ${_iq_dir_}/IQ.sh ]; then
+        _err_msg_="Could not locate ${_iq_dir_}/IQ.sh"
+        abort_script "$_err_msg_" 
+    fi
+    _sybase_ocs_=`$CAT ${_iq_dir_}/IQ.sh | $EGREP '^[[:blank:]]*SYBASE_OCS=' | $AWK -F\= '{print $2}'`
+
+    if [ -f ${_sys_home_}/.bash_profile ]; then
+        $CP ${_sys_home_}/.bash_profile ${_sys_home_}/.bash_profile.bkup
+    fi
+
+    $CP ${ENIQ_TEMPL_DIR}/${SYS_ARCH}/skel_dir/.bash_profile ${_sys_home_}/.bash_profile
+
+    $CAT ${_sys_home_}/.bash_profile | $SED -e "s|<CHANGE><IQ_SYB_DIR>|${_iq_dir_}|g"             \
+                                        -e "s|<CHANGE><ASA_SYB_DIR>|${_asa_tgt_dir_}|g"     \
+                                        -e "s|<CHANGE><CONF_DIR>|${CLI_CONF_DIR}|g"         \
+                                        -e "s|<CHANGE><BIN_DIR>|${_bin_dir_}|g"             \
+                                        -e "s|<CHANGE><RT_DIR>|${_rt_dir_}|g"               \
+                                        -e "s|\(SYBASE_OCS=\)\(.*OCS-.*\)|\1${_sybase_ocs_}|g" > ${TEM_DIR}/bash_profile
+    
+    $CP ${TEM_DIR}/bash_profile ${_sys_home_}/.bash_profile
+done
+}
+
+### Function: drop_loginpolicies ###
+#
+# Drop Login Policies 
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+drop_loginpolicies()
+{
+log_msg -s "Drop Login policies" -l ${LOGFILE}
+
+# Create hushlogin hidden file to suppress messages we get when doing switch user
+touch /eniq/home/dcuser/.hushlogin > /dev/null 2>&1 
+
+conn_str="-c \"eng=dwhdb;links=tcpip{host=localhost;port=${_db_port_}};uid=dba;pwd=${_dba_pass_}; -nogui \""
+conn_str_enc=${TEM}/_conn_str_sybase_iq_encrypt.txt.`uuidgen`  
+
+# encrypt the connection string.
+get_encrypt_file "${conn_str}" "${conn_str_enc}"
+
+
+$SU - $SYSUSER -c "$DBISQL @${conn_str_enc} \"select user_name from sysuser, sysloginpolicy where sysuser.login_policy_id = sysloginpolicy.login_policy_id and sysloginpolicy.login_policy_name = 'locked_users';OUTPUT TO ${TEM_DIR}/locked_users FORMAT TEXT\" 1>/dev/null 2>/tmp/error_locked_user.log"
+if [ $? -ne 0 ] ; then
+    $CAT /tmp/error_locked_user.log >> ${LOGFILE}
+    $RM    /tmp/error_locked_user.log
+    _err_msg_="Could not query the users assigned to the locked_users Login policy"
+    abort_script "$_err_msg_"
+fi
+$RM    /tmp/error_locked_user.log
+
+
+$SU - $SYSUSER -c "$DBISQL @${conn_str_enc} \"select user_name from sysuser, sysloginpolicy where sysuser.login_policy_id = sysloginpolicy.login_policy_id and sysloginpolicy.login_policy_name = 'unlocked_users';OUTPUT TO ${TEM_DIR}/unlocked_users FORMAT TEXT \" 1>/dev/null 2>/tmp/error_unlocked_user.log"
+if [ $? -ne 0 ] ; then
+    $CAT /tmp/error_unlocked_user.log >> ${LOGFILE}
+    $RM    /tmp/error_unlocked_user.log
+    _err_msg_="Could not query the users assigned to the unlocked_users Login policy"
+    abort_script "$_err_msg_"
+fi
+$RM    /tmp/error_unlocked_user.log
+
+_locked_users_=` $CAT ${TEM_DIR}/locked_users | $SED "s/^'//g"| $SED "s/'$//g" `
+_unlocked_users_=` $CAT ${TEM_DIR}/unlocked_users | $SED "s/^'//g"| $SED "s/'$//g"`
+
+_users_list_=( ${_locked_users_} ${_unlocked_users_} )
+
+for _user_ in "${_users_list_[@]}"; do
+    log_msg -s "Assigning user ${_user_} to root Login Policy" -l ${LOGFILE}
+    $SU - $SYSUSER -c "$DBISQL @${conn_str_enc} \"set temporary option ON_ERROR='EXIT';ALTER USER ${_user_} LOGIN POLICY root;\""
+    if [ $? -ne 0 ] ; then
+        _err_msg_="Could not assign user ${_user_} to root Login Policy"
+        abort_script "$_err_msg_"
+    fi
+done
+
+$SU - $SYSUSER -c "$DBISQL @${conn_str_enc} \"set temporary option ON_ERROR='EXIT';drop login policy locked_users;\""
+if [ $? -ne 0 ] ; then
+    _err_msg_="Could not drop login policy locked_users"
+    abort_script "$_err_msg_"
+fi
+
+$SU - $SYSUSER -c "$DBISQL @${conn_str_enc} \"set temporary option ON_ERROR='EXIT';drop login policy unlocked_users;\""
+if [ $? -ne 0 ] ; then
+    _err_msg_="Could not drop login policy unlocked_users"
+    abort_script "$_err_msg_"
+fi
+
+# remove the hushlogin hidden file
+rm -f /eniq/home/dcuser/.hushlogin > /dev/null 2>&1
+    
+}
+### Function: upgrade_databases ###
+#
+# Upgrade the databases
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+upgrade_databases()
+{
+log_msg -s "Starting the RepDB database" -l ${LOGFILE}
+${BASH} ${ENIQ_ADMIN_BIN_DIR}/manage_eniq_services.bsh -a start -s repdb -N -l ${LOGFILE}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not start RepDB" 
+    abort_script "$_err_msg_"
+
+fi
+    
+_dba_pass_=`inigetpassword DB -f ${ENIQ_CONF_DIR}/${ENIQ_INI} -v DBAPassword`
+if [ ! ${_dba_pass_} ]; then
+    if [ -f ${ENIQ_BASE_DIR}/sw/installer/dbusers ]; then
+        $SU - ${SYSUSER} >> /dev/null -c "${ENIQ_BASE_DIR}/sw/installer/dbusers dba dwh > ${TEM_DIR}/password"
+        _dba_pass_=`$CAT ${TEM_DIR}/password`
+        if [ ! "${_dba_pass_}" ] ; then
+            _err_msg_="`$DATE +%d.%m.%y_%H:%M:%S` - Could not get DWHDB DBA Password"
+            abort_script "$_err_msg_"
+        fi
+    else
+        _err_msg_="`$DATE +%d.%m.%y_%H:%M:%S` - Could not read DBA password from ${CLI_CONF_DIR}/${ENIQ_INI}"
+        abort_script "$_err_msg_"
+    fi
+fi
+
+
+# Upgrade the databases
+local _db_="dwhdb"
+# Get the INI section associated with the database 
+_ini_sect_=`$CAT ${BKUP_DB_FILESYS_LIST}|$EGREP "^[[:blank:]]*${_db_}"|$AWK -F"::" '{print $2}'`
+if [ ! "${_ini_sect_}" ]; then
+    _err_msg_="Could not read INI section for ${_db_} from ${BKUP_DB_FILESYS_LIST}"
+    abort_script "$_err_msg_"
+fi  
+
+# Get the port number associated with the database 
+_db_port_=`iniget ${_ini_sect_} -f ${ENIQ_CONF_DIR}/${ENIQ_INI} -v PortNumber`
+if [ ! "${_db_port_}" ]; then
+    _err_msg_="Could not read port number of ${_db_} from ${ENIQ_CONF_DIR}/${ENIQ_INI}"
+    abort_script "$_err_msg_"
+fi  
+
+_dwh_eng_=`iniget ${_ini_sect_} -f ${ENIQ_CONF_DIR}/${ENIQ_INI} -v ServerName`
+if [ ! "${_dwh_eng_}" ]; then
+        _err_msg_="Could not read server name of ${_db_} from ${ENIQ_CONF_DIR}/${ENIQ_INI}"
+        abort_script "$_err_msg_"
+fi
+
+# Get the main and temp cache for the coordinators DWHDB 
+MAINCACHE=`iniget DWH -v MainCache -f ${CLI_CONF_DIR}/${ENIQ_INI}`
+if [ ! ${MAINCACHE} ]; then
+    _err_msg_="Could not read MainCache param from ${CLI_CONF_DIR}/${ENIQ_INI}"
+    abort_script "$_err_msg_"
+fi
+
+TEMPCACHE=`iniget DWH -v TempCache -f ${CLI_CONF_DIR}/${ENIQ_INI}`
+if [ ! ${TEMPCACHE} ]; then
+    _err_msg_="Could not read TempCache param from ${CLI_CONF_DIR}/${ENIQ_INI}"
+    abort_script "$_err_msg_"
+fi
+
+DWH_PORT=`iniget DWH -v PortNumber -f ${CONF_DIR}/${ENIQ_INI}`
+if [ ! ${DWH_PORT} ]; then
+    _err_msg_="Could not read PortNumber param from ${CONF_DIR}/${ENIQ_INI}"
+    abort_script "$_err_msg_"
+fi
+
+    conn_str_continue="-c \"eng=${_dwh_eng_};links=tcpip{host=localhost;port=${_db_port_}};uid=dba;pwd=${_dba_pass_};\""
+    conn_str_continue_enc=${TEM}/str_continue_sybase_iq_encrypt.txt.`uuidgen`
+    
+    # encrypt the connection string.
+    get_encrypt_file "${conn_str_continue}" "${conn_str_continue_enc}"
+
+    conn_str_exit="-c \"eng=${_dwh_eng_};links=tcpip{host=localhost;port=${_db_port_}};uid=dba;pwd=${_dba_pass_}; -nogui -onerror exit\""
+    conn_str_exit_enc=${TEM}/str_exit_sybase_iq_encrypt.txt.`uuidgen`
+
+    # encrypt the connection string.
+    get_encrypt_file "${conn_str_exit}" "${conn_str_exit_enc}"
+
+    conn_str_dwh="-c \"con=${_dwh_eng_};eng=${_dwh_eng_};links=tcpip{host=${_dwh_eng_};port=${DWH_PORT};dobroadcast=none;verify=no};uid=dba;pwd=${_dba_pass_}\""
+    conn_str_dwh_enc=${TEM}/str_exit_sybase_iq_encrypt_dwh.txt.`uuidgen`
+
+    # encrypt the connection string.
+    get_encrypt_file "${conn_str_dwh}" "${conn_str_dwh_enc}"
+
+
+if [ "${CURR_SERVER_TYPE}" == "stats_coordinator" ]; then
+
+    $CP -p ${DWH_DIR}/dwhdb.cfg ${DWH_DIR}/dwhdb.cfg_${RUN_TIME}
+    if [ $? -ne 0 ]; then
+        _err_msg_="Could not make backup of ${DWH_DIR}/dwhdb.cfg"
+        abort_script "$_err_msg_"
+    fi
+
+    log_msg -s "Adding single node mode option in dwhdb.cfg" -l ${LOGFILE}
+    $ECHO -iqmpx_sn 1 >> ${DWH_DIR}/dwhdb.cfg
+    if [ $? -ne 0 ]; then
+        _err_msg_="Could not add single node mode option in ${DWH_DIR}/dwhdb.cfg"
+        abort_script "$_err_msg_"
+    fi
+
+    log_msg -s "\nStarting the DWHDB in single node mode (-iqmpx_sn 1)" -l ${LOGFILE}
+    ${BASH} ${ENIQ_ADMIN_BIN_DIR}/manage_eniq_services.bsh -a start -s dwhdb -N -l ${LOGFILE}
+    if [ $? -ne 0 ]; then
+        _err_msg_="`$DATE +%d.%m.%y_%H:%M:%S` - Error running ${ENIQ_ADMIN_BIN_DIR}/manage_eniq_services.bsh"
+        abort_script "$_err_msg_"
+    fi
+
+    # Check if server is up
+    $SU - ${SYSUSER} -c "${IQDIR}/bin64/dbping -q @${conn_str_dwh_enc}" >> ${LOGFILE} 2>&1
+    if [ $? -eq 0 ] ; then
+        $ECHO "Database DWHDB successfully started in single node mode (-iqmpx_sn 1)" >> ${LOGFILE}
+    else
+        _err_msg_="IQ server $_dwh_eng_ start failed"
+        abort_script "$_err_msg_"
+    fi
+fi
+
+log_msg -s "Starting the DWHDB database" -l ${LOGFILE}
+${BASH} ${ENIQ_ADMIN_BIN_DIR}/manage_eniq_services.bsh -a start -s dwhdb -N -l ${LOGFILE}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not start DWHDB" 
+    abort_script "$_err_msg_"
+
+fi
+
+log_msg -s "Locking  'dc', 'dcpublic' & 'dcbo' in the ${_db_}." -l ${LOGFILE}
+lock_unlock_user_iq_db "${_dba_pass_}" "${_db_port_}" "dc" "lock"
+lock_unlock_user_iq_db "${_dba_pass_}" "${_db_port_}" "dcpublic" "lock"
+lock_unlock_user_iq_db "${_dba_pass_}" "${_db_port_}" "dcbo" "lock"
+
+#locking customized database user
+lock_customized_db_user 
+
+log_msg -s "\nRestarting DWHDB to kick off any existing database connections before performing upgrade" -l ${LOGFILE}
+${BASH} ${ENIQ_ADMIN_BIN_DIR}/manage_eniq_services.bsh -a restart -s dwhdb -N -l ${LOGFILE}
+if [ $? -ne 0 ]; then
+    _err_msg_="`$DATE +%d.%m.%y_%H:%M:%S` - Error running ${ENIQ_ADMIN_BIN_DIR}/manage_eniq_services.bsh"
+    abort_script "$_err_msg_"
+fi
+
+# Check if server is up
+
+$SU - ${SYSUSER} -c "${IQDIR}/bin64/dbping -q @${conn_str_dwh_enc}" >> ${LOGFILE} 2>&1
+
+if [ $? -eq 0 ] ; then
+    $ECHO "Database DWHDB successfully started" >> ${LOGFILE}
+else
+    _err_msg_="IQ server $_dwh_eng_ start failed"
+    abort_script "$_err_msg_"
+fi
+
+if [ -f "${DWH_DIR}/dwhdb.cfg_${RUN_TIME}" ]; then
+      log_msg -s "Setting database config file to original" -l ${LOGFILE}
+      $CP -p ${DWH_DIR}/dwhdb.cfg_${RUN_TIME} ${DWH_DIR}/dwhdb.cfg
+      if [ $? -ne 0 ]; then
+          _err_msg_="Could not set ${DWH_DIR}/dwhdb.cfg to original"
+          abort_script "$_err_msg_"
+      else 
+          $RM -rf ${DWH_DIR}/dwhdb.cfg_${RUN_TIME}
+      fi
+fi
+
+
+PID=`$PS -auxww | $EGREP "iqsrv" | $EGREP -vi GREP | $EGREP -w ${_dwh_eng_} | $AWK '{print $2}'`
+PID1=${PID}
+log_msg -s "Upgrading Database ${_db_} to ${1}" -l ${LOGFILE}
+_retry_count_=1
+while [ ${_retry_count_} -le 3 ]
+do
+    $SU - $SYSUSER -c "$DBISQL -nogui -onerror continue @${conn_str_continue_enc} \"ALTER DATABASE UPGRADE PROCEDURE ON;\" " > ${TEM_DIR}/alter_output.txt 2>&1    
+    _sqlcode_val_=`$CAT ${TEM_DIR}/alter_output.txt | $GREP SQLCODE | $CUT -d',' -f1 |  $CUT -d'=' -f2`
+    if [[ "${_sqlcode_val_}" && ${_sqlcode_val_} -ne "-308" ]]; then
+        _retry_count_=$(( _retry_count_ +1 ))
+        _err_msg_="Database ${_db_} has not been upgraded. Retrying alter database." 
+        log_msg -s "$_err_msg_" -l ${LOGFILE}
+    else
+        break
+    fi
+sleep 10
+done
+if [ ${_retry_count_} -eq 4 ]; then
+    _err_msg_="Alter Database Upgrade for ${_db_} failed"
+    abort_script "$_err_msg_" 
+fi
+log_msg -s "Internal Database restart after upgrade. Waiting for 300 seconds before proceeding." -l ${LOGFILE}
+break_count=1
+while [ ${PID} -eq ${PID1} ]; do
+    # sleep for 5 seconds
+    sleep 5
+    PID=`$PS -auxww | $EGREP "iqsrv" | $EGREP -vi GREP | $EGREP -w ${_dwh_eng_} | $AWK '{print $2}'`
+    let break_count=${break_count}+1
+    if [ ${break_count} -gt 61 ]; then
+        break
+    fi
+done
+
+_count_=1
+_retry_=5
+$TOUCH /tmp/error_$$.log
+$CHMOD 777 /tmp/error_$$.log
+while [ ${_count_} -le ${_retry_} ]; do
+    log_msg -s "Starting loop ${_count_} of ${_retry_} to ensure the database has restarted and can be queried." -l ${LOGFILE}
+    $SU - $SYSUSER -c "$DBISQL @${conn_str_exit_enc} \"sp_iqstatus\" >/dev/null 2>/tmp/error_$$.log"
+    if [ $? -eq 0 ]; then
+        log_msg -s "Database ${_db_} is up, running and can be queried. Exit the loop" -l ${LOGFILE}
+        $RM /tmp/error_$$.log
+        break
+    fi
+    let _count_=${_count_}+1
+    $CAT /tmp/error_$$.log >>${LOGFILE}
+    $RM /tmp/error_$$.log
+    # sleep for 5 seconds
+    sleep 5
+done
+
+# Get IQ version from DB
+$SU - $SYSUSER -c "$DBISQL @${conn_str_exit_enc} \"select top 1 version from syshistory where operation='START' order by version desc;  OUTPUT TO ${TEM_DIR}/check_IQ_version_DB.log\"" 1>/dev/null
+
+if [ -f ${TEM_DIR}/check_IQ_version_DB.log ]; then
+    _iq_version_=`$CAT ${TEM_DIR}/check_IQ_version_DB.log`
+fi
+
+# Check upgrade status in DB
+$SU - $SYSUSER -c "$DBISQL @${conn_str_exit_enc} \"select count(*) from syshistory where operation='UPGRADE' and version=${_iq_version_};  OUTPUT TO ${TEM_DIR}/check_IQ_version.log\"" 1>/dev/null
+
+# Verify if IQ is upgraded successfully or not
+if [ -f ${TEM_DIR}/check_IQ_version.log ]; then
+
+   _result_=`$CAT ${TEM_DIR}/check_IQ_version.log`
+
+   if [ ${_result_} -eq 1 ]; then
+
+       log_msg -s "Database successfully upgraded" -l ${LOGFILE}
+
+   elif [ ${_result_} -eq 0 ]; then
+
+       _err_msg_="Failed to upgrade IQ"
+       abort_script "${_err_msg_}"
+   fi
+else
+    _err_msg_="Could not verify upgrade status for ${_iq_version_} from syshistory table"
+    abort_script "${_err_msg_}"
+fi
+
+if [ ${_count_} -gt ${_retry_} ]; then
+    _err_msg_="Database ${_db_} has not restarted successfully after upgrade"
+    abort_script "$_err_msg_"
+fi
+
+if [ "${CURR_SERVER_TYPE}" == "stats_coordinator" ]; then
+    log_msg -s "Altering login policies due their reset during upgrade. " -l ${LOGFILE}
+    drop_loginpolicies
+fi
+
+
+
+if [ "${CURR_SERVER_TYPE}" == "stats_coordinator" ]; then
+    host_name_variable=$( $SU - $SYSUSER -c "$DBISQL @${conn_str_exit_enc} \"select connection_info from sysiqmpxserver where server_name like '${_dwh_eng_}';\"" )
+    if [ $? -ne 0 ]; then
+        _err_msg_="Failed to retrieve connection info for ${_dwh_eng_}"
+        abort_script "$_err_msg_" 
+    fi
+    $ECHO ${host_name_variable}  | $GREP ${_dwh_eng_} >/dev/null
+    if [ $? -ne 0 ]; then
+   
+    log_msg -s "\nStopping the DWHDB database" -l ${LOGFILE}
+    ${BASH} ${ENIQ_ADMIN_BIN_DIR}/manage_eniq_services.bsh -a stop -s dwhdb -N -l ${LOGFILE}
+    if [ $? -ne 0 ]; then
+    _err_msg_="`$DATE +%d.%m.%y_%H:%M:%S` - Error running ${ENIQ_ADMIN_BIN_DIR}/manage_eniq_services.bsh"
+    abort_script "$_err_msg_"
+    fi
+ 
+       #abort on normal multiplex start issue
+       log_msg -s "Altering multiplex server host address to '${_dwh_eng_}'." -l ${LOGFILE}
+
+
+    $SU - $SYSUSER -c "$DBISQL -nogui -onerror continue @${conn_str_continue_enc} \"ALTER MULTIPLEX SERVER ${_dwh_eng_} HOST '${_dwh_eng_}' PORT ${DWH_PORT};\"" >/dev/null 2>&1
+sleep 10
+
+
+log_msg -s "Stopping the DWHDB database" -l ${LOGFILE}
+$SU - ${SYSUSER} -c "${IQDIR}/bin64/dbstop -y -q @${conn_str_dwh_enc}"
+
+
+PID=`$PS -auxww | $EGREP "iqsrv" | $EGREP -vi GREP | $EGREP -w ${_dwh_eng_} | $AWK '{print $2}'`
+if [ -z "${PID}" ] ; then
+    log_msg -s  "Database is down" -l ${LOGFILE}
+else
+    log_msg -s  "Database ${_dwh_eng_} refused to stop. Attempting to force kill it." -l ${LOGFILE}
+    $KILL -9 ${PID} >> ${LOGFILE} 2>&1
+    if [ $? -ne 0 ]; then
+        _err_msg_="Could not kill IQ SERVER PID ${PID}"
+        abort_script "$_err_msg_"
+    fi
+
+    log_msg -s  "Database killed." -l ${LOGFILE}
+fi
+
+log_msg -s "\nStarting DWHDB after altering multiplex server" -l ${LOGFILE}
+${BASH} ${ENIQ_ADMIN_BIN_DIR}/manage_eniq_services.bsh -a start -s dwhdb -N -l ${LOGFILE}
+if [ $? -ne 0 ]; then
+    _err_msg_="`$DATE +%d.%m.%y_%H:%M:%S` - Error running ${ENIQ_ADMIN_BIN_DIR}/manage_eniq_services.bsh"
+    abort_script "$_err_msg_"
+fi
+
+fi
+fi
+
+
+
+if [ "${CURR_SERVER_TYPE}" == "stats_coordinator" ]; then
+    log_msg -s "Assigning back the users to their respective login policies" -l ${LOGFILE}
+    for _locked_user_ in ${_locked_users_}; do
+        log_msg -s "Assigning back user ${_locked_user_} to locked_users login policy" -l ${LOGFILE}
+        lock_unlock_user_iq_db ${_dba_pass_} ${_db_port_} ${_locked_user_} 'lock'
+    done
+
+    for _unlocked_user_ in ${_unlocked_users_}; do
+        log_msg -s "Assigning back user ${_unlocked_user_} to unlocked_users login policy" -l ${LOGFILE}
+        lock_unlock_user_iq_db ${_dba_pass_} ${_db_port_} ${_unlocked_user_} 'unlock'
+    done
+fi
+
+log_msg -s "Unlocking  'dc', 'dcpublic' & 'dcbo' in the ${_db_}." -l ${LOGFILE}
+lock_unlock_user_iq_db ${_dba_pass_} ${_db_port_} 'dc' 'unlock'
+lock_unlock_user_iq_db ${_dba_pass_} ${_db_port_} 'dcpublic' 'unlock'
+lock_unlock_user_iq_db ${_dba_pass_} ${_db_port_} 'dcbo' 'unlock'
+
+
+log_msg -s "\nStopping the DWHDB database" -l ${LOGFILE}
+${BASH} ${ENIQ_ADMIN_BIN_DIR}/manage_eniq_services.bsh -a stop -s dwhdb -N -l ${LOGFILE}
+if [ $? -ne 0 ]; then
+    _err_msg_="`$DATE +%d.%m.%y_%H:%M:%S` - Error running ${ENIQ_ADMIN_BIN_DIR}/manage_eniq_services.bsh"
+    abort_script "$_err_msg_"
+fi
+}
+
+
+### Function: user_confirm_upgrade ###
+#
+# Get confirmation from user to proceed with snapshot action
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+user_confirm_upgrade()
+{
+while :; do
+    unset USER_CONF
+    $CLEAR
+    if [ -s ${TEM_DIR}/upgrade_disp_file ]; then
+        $CAT ${TEM_DIR}/upgrade_disp_file
+    fi
+
+    $ECHO "\nAre you sure you wish to upgrade Sybase IQ"
+    $ECHO "This will involve the stopping of all running ENIQ services/processes"
+    $ECHO "Enter [Yes | No] (case sensitive) : \c"
+    read USER_CONF
+    if [ "$USER_CONF" == "Yes" -o "$USER_CONF" == "No" ]; then
+        break
+    fi
+done
+}
+
+
+### Function: update_customized_db_users ###
+#
+# update the customized database users with their associated login policies
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+update_customized_db_users ()
+{
+
+local DWH_PORT=`iniget DWH -v PortNumber -f ${CLI_CONF_DIR}/niq.ini`
+local DWH_ENG=`iniget DWH -v ServerName -f ${CLI_CONF_DIR}/niq.ini`
+if [ ! "${DWH_PORT}" -o ! "${DWH_ENG}" ]; then
+        _err_msg_="Could not read db values from ${CLI_CONF_DIR}/${ENIQ_INI}"
+        abort_script "$_err_msg_"
+fi
+
+local DBA_PASSWORD=`inigetpassword DB -f ${CLI_CONF_DIR}/${ENIQ_INI} -v DBAPassword`
+if [ ! ${DBA_PASSWORD} ]; then
+  if [ -f ${ENIQ_BASE_DIR}/sw/installer/dbusers ]; then
+            DBA_PASSWORD=`${ENIQ_BASE_DIR}/sw/installer/dbusers dba dwh`
+     if [ ! "${DBA_PASSWORD}" ] ; then
+                _err_msg_="Could not get dwhdb DBA Password"
+                abort_script "$_err_msg_"
+     fi
+   fi
+fi
+
+
+
+
+#Initializing the connection string for dwhdb
+local dwh_connection_string="-nogui -onerror exit -c \"eng=${DWH_ENG};links=tcpip{host=localhost;port=${DWH_PORT}};uid=dba;pwd=${DBA_PASSWORD}\""
+dwh_connection_string_enc=${TEM}/conn_str_sybase_iq_encrypt.`uuidgen`
+
+# encrypt the connection string.
+get_encrypt_file "${dwh_connection_string}" "${dwh_connection_string_enc}"
+
+local REP_PORT=`iniget REP -v PortNumber -f ${CLI_CONF_DIR}/niq.ini`
+local REP_ENG=`iniget REP -v ServerName -f ${CLI_CONF_DIR}/niq.ini`
+if [ ! "${REP_PORT}" -o ! "${REP_ENG}" ]; then
+        _err_msg_="Could not read db values from ${CLI_CONF_DIR}/${ENIQ_INI}"
+        abort_script "$_err_msg_"
+fi
+
+
+
+#Initializing the connection string for dwhdb
+local rep_connection_string="-nogui -onerror exit -c \"eng=${REP_ENG};links=tcpip{host=localhost;port=${REP_PORT}};uid=dba;pwd=${DBA_PASSWORD}\""
+rep_connection_string_enc=${TEM}/con_str_sybase_iq_encrypt.`uuidgen`
+
+# encrypt the connection string.
+get_encrypt_file "${rep_connection_string}" "${rep_connection_string_enc}"
+
+
+if [ -s ${CLI_CONF_DIR}/queryUserConf.cfg ]; then
+    $CAT ${CLI_CONF_DIR}/queryUserConf.cfg | $AWK -F"::" '{$2="";print}' | $GREP -v "User_Name" | uniq > ${TEM_DIR}/queryUserConf.cfg
+    while IFS= read -r line
+    do
+      if [ ! -z "${line}" ]; then
+        
+            user_name=`$ECHO "${line}" | $AWK '{print$1}'`
+            login_policy=`$ECHO "${line}" | $AWK '{print$2}'`
+            max_connections=`$ECHO "${line}" | $AWK '{print$3}'`
+            password_lifetime=`$ECHO "${line}" | $AWK '{print$5}'`
+            password_grace_time=`$ECHO "${line}" | $AWK '{print$7}'`
+            login_attempt=`$ECHO "${line}" | $AWK '{print$8}'`
+            if [ -z "$user_name" ] || [ -z "$login_policy" ] || [ -z "$max_connections" ] || [ -z "$password_lifetime" ] || [ -z "$password_grace_time" ] || [ -z "$login_attempt" ]; then
+                _err_msg_="Failed to get the details from configuration file" 
+                abort_script "$_err_msg_" 
+            fi
+
+            user_pwd=$( $SU - $SYSUSER -c "$DBISQL @${rep_connection_string_enc} \"select password from dba.IQ_UserPwd_History where user_name='${user_name}' and password_creation_time=(select max(password_creation_time) from dba.IQ_UserPwd_History where user_name='${user_name}')\"" | $AWK 'NR==3{print$1}')
+            if [ -z "$user_pwd" ]; then 
+                _err_msg_="Failed to get the password for "${user_name}""
+                abort_script "$_err_msg_"
+            fi
+            policy_chk=$( $SU - $SYSUSER -c "$DBISQL @${dwh_connection_string_enc} \"select count() from sysloginpolicy where login_policy_name='${login_policy}'\"" | $AWK 'NR==3{print$1}')
+            if [ -z "$policy_chk" ]; then 
+                _err_msg_="Failed to get the policy count"
+                abort_script "$_err_msg_" 
+            fi
+            user_chk=$( $SU - $SYSUSER -c "$DBISQL @${dwh_connection_string_enc} \"select count() from sysuser where user_name='${user_name}'\"" | $AWK 'NR==3{print$1}')
+            if [ -z "$user_chk" ]; then 
+                _err_msg_="Failed to get the user count"
+                abort_script "$_err_msg_" 
+            fi
+            
+            if [ $policy_chk -eq 0 ] && [ $user_chk -eq 0 ]; then
+                $SU - $SYSUSER -c "$DBISQL @${dwh_connection_string_enc} \"Create LOGIN POLICY ${login_policy} MAX_CONNECTIONS=${max_connections} PASSWORD_LIFE_TIME=${password_lifetime} PASSWORD_GRACE_TIME=${password_grace_time} MAX_FAILED_LOGIN_ATTEMPTS=${login_attempt} LOCKED=OFF;\"" 
+                if [ $? -ne 0 ]; then
+                    _err_msg_="Failed to create the login policy: "${login_policy}""
+                    abort_script "$_err_msg_" 
+                else
+                    $SU - $SYSUSER -c " $DBISQL @${dwh_connection_string_enc} \"Create user ${user_name} identified by '{user_pwd}' LOGIN POLICY ${login_policy}\""
+                    if [ $? -ne 0 ]; then
+                        _err_msg_="Failed to create user: "${user_name}" and assign login policy: "${login_policy}""
+                        abort_script "$_err_msg_" 
+                    else
+                        log_msg -s "Successfully created user: "${user_name}" with login policy: "${login_policy}" " -l ${LOGFILE}
+                    fi    
+                fi
+                
+            elif [ $policy_chk -eq 0 ] && [ $user_chk -ne 0 ]; then
+                $SU - $SYSUSER -c "$DBISQL @${dwh_connection_string_enc} \"Create LOGIN POLICY ${login_policy} MAX_CONNECTIONS=${max_connections} PASSWORD_LIFE_TIME=${password_lifetime} PASSWORD_GRACE_TIME=${password_grace_time} MAX_FAILED_LOGIN_ATTEMPTS=${login_attempt} LOCKED=OFF;\"" 
+                if [ $? -ne 0 ]; then
+                    _err_msg_="Failed to create the login policy: "${login_policy}""
+                    abort_script "$_err_msg_" 
+                else
+                    $SU - $SYSUSER -c "$DBISQL @${dwh_connection_string_enc} \"Alter user ${user_name} LOGIN POLICY ${login_policy}\""
+                    if [ $? -ne 0 ]; then
+                        _err_msg_="Failed to assign login policy: "${login_policy}" to user: "${user_name}""
+                        abort_script "$_err_msg_" 
+                    else
+                        log_msg -s "Successfully created login policy: "${login_policy}" and assigned to user: "${user_name}"" -l ${LOGFILE}
+                    fi
+                fi    
+                
+            elif [ $policy_chk -ne 0 ] && [ $user_chk -eq 0 ];    then    
+                $SU - $SYSUSER -c "$DBISQL @${dwh_connection_string_enc} \"Create user ${user_name} identified by '{user_pwd}' LOGIN POLICY ${login_policy}\""
+                if [ $? -ne 0 ]; then
+                    _err_msg_="Failed to create user: "${user_name}" and assign login policy: "${login_policy}" "
+                    abort_script "$_err_msg_" 
+                else
+                    log_msg -s "Successfully created user: "${user_name}" and assigned login policy: "${login_policy}"" -l ${LOGFILE}
+                fi        
+                
+            else
+                $SU - $SYSUSER -c "$DBISQL @${dwh_connection_string_enc} \"Alter user ${user_name} LOGIN POLICY ${login_policy}\""
+                if [ $? -ne 0 ]; then
+                    _err_msg_="Failed to assign login policy: "${login_policy}" to user: "${user_name}""
+                    abort_script "$_err_msg_" 
+                else
+                    log_msg -s "Successfully assigned login policy: "${login_policy}" to user: "${user_name}"" -l ${LOGFILE}
+                fi
+            fi
+        fi
+    done < "${TEM_DIR}/queryUserConf.cfg"
+else 
+    log_msg -s "The database does not have any customized user and it's associated login policy" -l ${LOGFILE}
+fi
+}
+
+
+### Function: update_dboptions ###
+#
+# Update database dboptions
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+update_dboptions()
+{
+# Start RepDB so we can get the passwords
+log_msg -s "\nStarting the RepDB database" -l ${LOGFILE} 
+${BASH} ${ENIQ_ADMIN_BIN_DIR}/manage_eniq_services.bsh -a start -s repdb -N -l ${LOGFILE}
+if [ $? -ne 0 ]; then
+    _err_msg_="Error running ${ENIQ_ADMIN_BIN_DIR}/manage_eniq_services.bsh"
+    abort_script "$_err_msg_"
+fi 
+           
+# Change ownership of dboptions file
+log_msg -s "Changing ownership of files in ${ENIQ_ADMIN_DIR}/sql to $SYSUSER:$SYSGRP" -l ${LOGFILE}
+$CHOWN $SYSUSER:$SYSGRP ${ENIQ_ADMIN_DIR}/sql/*
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not change ownership of files in ${ENIQ_ADMIN_DIR}/sql to $SYSUSER:$SYSGRP" 
+    abort_script "$_err_msg_"
+fi
+    
+local _db_="dwhdb"
+log_msg -s "Starting the ${_db_} database" -l ${LOGFILE}
+${BASH} ${ENIQ_ADMIN_BIN_DIR}/manage_eniq_services.bsh -a start -s ${_db_} -N -l ${LOGFILE}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not start ${_db_}" 
+    abort_script "$_err_msg_"
+fi
+
+_tmp_log_=${TEM_DIR}/dboptions_${_db_}.log
+$SU - ${SYSUSER} -c "${BASH} ${ENIQ_INST_DIR}/bin/dboptions_${_db_}.bsh -l ${_tmp_log_} -c ${CLI_CONF_DIR} -d ${CLI_CONF_DIR}/${ENIQ_INI}"
+if [ $? -ne 0 ]; then
+    $CAT ${_tmp_log_} >> ${LOGFILE}
+    _err_msg_="${ENIQ_INST_DIR}/bin/dboptions_dwhdb.bsh was not successful\n"
+    abort_script "$_err_msg_"
+fi
+
+}
+
+### Function: rebuildWideIndexes ###
+#
+# runs IQ stored procedure to rebuild wide and flat indexes.
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+rebuildWideIndexes()
+{
+# Start repdb so we can get the passwords
+log_msg -s "\nStarting repdb database" -l ${LOGFILE} 
+${BASH} ${ENIQ_ADMIN_BIN_DIR}/manage_eniq_services.bsh -a start -s repdb -N -l ${LOGFILE}
+if [ $? -ne 0 ]; then
+    _err_msg_="Error running ${ENIQ_ADMIN_BIN_DIR}/manage_eniq_services.bsh"
+    abort_script "$_err_msg_"
+fi 
+
+DWH_PORT=`iniget DWH -v PortNumber -f ${ENIQ_CONF_DIR}/${ENIQ_INI}`
+DWH_NAME=`iniget DWH -v ServerName -f ${ENIQ_CONF_DIR}/${ENIQ_INI}`
+if [ ! "${DWH_PORT}" -o ! "${DWH_NAME}" ]; then
+    _err_msg_="Could not read DB values from ${ENIQ_INI}"
+    abort_script "$_err_msg_"
+fi
+
+DBA_PASSWORD=`inigetpassword DB -f ${ENIQ_CONF_DIR}/${ENIQ_INI} -v DBAPassword`
+if [ ! ${DBA_PASSWORD} ]; then
+    if [ -f ${ENIQ_BASE_DIR}/sw/installer/dbusers ]; then
+        DBA_PASSWORD=`${ENIQ_BASE_DIR}/sw/installer/dbusers dba dwh`
+        if [ ! "${DBA_PASSWORD}" ] ; then
+            _err_msg_="`$DATE +%d.%m.%y_%H:%M:%S` - Could not get dwhdb DBA Password"
+            abort_script "$_err_msg_"
+        fi
+    else
+        _err_msg_="`$DATE +%d.%m.%y_%H:%M:%S` - Could not get dwhdb DBA Password"
+        abort_script "$_err_msg_"
+    fi
+fi
+
+if [ ! -s ${ENIQ_INST_DIR}/bin/set_core_memcache.bsh ]; then
+     _err_msg_="Failed to locate script ${ENIQ_INST_DIR}/bin/set_core_memcache.bsh"
+     abort_script "$_err_msg_"
+fi
+
+
+log_msg "Updating the ini settings for database cache values" -l ${LOGFILE} 
+${BASH} ${ENIQ_INST_DIR}/bin/set_core_memcache.bsh -d ${ENIQ_CONF_DIR} -m -T 15 -M 15 -L 15 -C 55 -f -l ${LOGFILE} 
+if [ $? -ne 0 ]; then
+    _err_msg_="`$DATE +%d.%m.%y_%H:%M:%S` - Error running ${ENIQ_INST_DIR}/bin/set_core_memcache.bsh"
+    abort_script "$_err_msg_"
+fi
+
+${BASH} ${ENIQ_ADMIN_BIN_DIR}/manage_eniq_services.bsh -a restart -s dwhdb -N -l ${LOGFILE}
+if [ $? -ne 0 ]; then
+    _err_msg_="`$DATE +%d.%m.%y_%H:%M:%S` - Error running ${ENIQ_ADMIN_BIN_DIR}/manage_eniq_services.bsh"
+    abort_script "$_err_msg_"
+fi 
+
+log_msg -s "`$DATE +%d.%m.%y_%H:%M:%S` Running the sp_iqrebuildindexwide procedure in ${DWH_NAME}, this will take time please have patience." -l ${LOGFILE}
+
+connection_string="-c \"'uid=dba;pwd=${DBA_PASSWORD}'-host localhost -port ${DWH_PORT} -nogui\""
+connection_string_enc=${TEM}/connection_string_sybase_iq_encrypt.`uuidgen`
+
+#encrypt the connection string
+get_encrypt_file "${connection_string}" "${connection_string_enc}"
+
+$SU - $SYSUSER -c $DBISQL @${connection_string_enc} "set temporary option ON_ERROR='EXIT';CALL sp_iqrebuildindexwide('','dc',3);"
+
+if [ $? -ne 0 ] ; then
+    _err_msg_="`$DATE +%d.%m.%y_%H:%M:%S` - Issue rebuilding wide and flat indexes in ${DWH_NAME}."
+    abort_script "$_err_msg_"
+fi
+log_msg -s "`$DATE +%d.%m.%y_%H:%M:%S` Completed execution of sp_iqrebuildindexwide procedure in ${DWH_NAME}." -l ${LOGFILE}
+
+log_msg "Reverting back the ini settings for database cache values" -l ${LOGFILE}
+${BASH} ${ENIQ_INST_DIR}/bin/set_core_memcache.bsh -d ${ENIQ_CONF_DIR} -m -f -l ${LOGFILE}
+if [ $? -ne 0 ]; then
+    _err_msg_="`$DATE +%d.%m.%y_%H:%M:%S` - Error running ${ENIQ_INST_DIR}/bin/set_core_memcache.bsh"
+    abort_script "$_err_msg_"
+fi
+
+${BASH} ${ENIQ_ADMIN_BIN_DIR}/manage_eniq_services.bsh -a restart -s dwhdb -N -l ${LOGFILE}
+if [ $? -ne 0 ]; then
+    _err_msg_="`$DATE +%d.%m.%y_%H:%M:%S` - Error running ${ENIQ_ADMIN_BIN_DIR}/manage_eniq_services.bsh"
+    abort_script "$_err_msg_"
+fi 
+
+}
+
+### Function: version_string ###
+#
+# Sets the version as array
+# Arguments:
+#  Version number
+# Return Values:
+#  Array consisting of ESD number separated by spaces.
+
+version_string()
+{
+_esd_num_=$1
+_flag_=0
+declare -a arr
+for ((i=0;i<_max_length_;i++));
+do
+  num=`$EXPR $i + 1`
+  if [ $_flag_ -eq 1 ]; then
+   arr[$i]=0
+else
+   if [[ $_esd_num_ == *.* ]]; then
+   arr[$i]=`$ECHO ${_esd_num_}|$CUT -f$num -d'.'`
+    if [ ! ${arr[$i]} ]; then
+     arr[$i]=0
+    fi
+   else
+   arr[$i]=${_esd_num_}
+   _flag_=1
+   fi
+  fi
+done
+$ECHO ${arr[@]}
+}
+
+
+
+
+# ********************************************************************
+#
+#   Main body of program
+#
+# ********************************************************************
+#
+# Save the time of running. I do this here as I want all
+# dates and time to be the same
+RUN_TIME=`$DATE '+%Y-%b-%d_%H.%M.%S'`
+
+# Determine absolute path to software
+get_absolute_path
+
+# Check that the effective id of the user is root
+check_id root
+
+while getopts ":b:d:Fl:Ns:t:T" arg; do
+  case $arg in
+    b) ENIQ_BASE_DIR="$OPTARG" 
+       ;;
+    d) BASE_SW_DIR="$OPTARG"
+       ;;
+    F) FORCE_UPG="YES"
+       ;;
+    l) LOGFILE="$OPTARG" 
+       ;;
+    N) NO_CONFIRM="YES"
+       ;;
+    s) SYBIQ_FILE="$OPTARG" 
+       ;;
+    t) SYBIQ_TGT_DIR="$OPTARG" 
+       ;;
+    T) TEST_MODE="YES"
+       ;;
+   \?) usage_msg
+       exit 1
+       ;;
+  esac
+done
+shift `expr $OPTIND - 1`
+
+if [ ! "${BASE_SW_DIR}" ]; then
+    usage_msg
+    exit 1
+fi
+
+if [ ! -d ${BASE_SW_DIR} ]; then
+    _err_msg_="Directory ${BASE_SW_DIR} not found"
+    abort_script "$_err_msg_"
+fi
+
+# sourcing common functions.
+if [ ! -s $SCRIPTHOME/../lib/common_functions.lib ]; then
+    _err_msg_="Cannot locate $SCRIPTHOME/../lib/common_functions.lib"
+    abort_script "$_err_msg_"
+else
+   . $SCRIPTHOME/../lib/common_functions.lib
+fi
+
+# Setup up path environment etc
+setup_env
+
+if [ ! "${LOGFILE}" ]; then
+    LOGFILE=${LOGFILE_DIR}/upgrade_sybaseiq.log
+fi    
+
+# Check/Create Logfile
+chk_create_logfile
+
+_upgrade_iq_=0
+# Only run on coordinator servers
+if [ "${CURR_SERVER_TYPE}" == "eniq_stats" -o "${CURR_SERVER_TYPE}" == "stats_coordinator" ]; then
+    _upgrade_iq_=0
+else
+    _upgrade_iq_=1
+fi
+
+if [ ${_upgrade_iq_} -eq 1 ]; then
+    log_msg -s "Sybase IQ upgrade script should not be run on ${CURR_SERVER_TYPE} server types" -l ${LOGFILE} -t
+    exit 0
+fi
+    
+log_msg -s "Starting Sybase upgrade" -l ${LOGFILE} -q -t -h 
+
+# Check that I have a templates directory associated with 
+# my installation type
+check_templates_dir
+
+if [ ! -s ${ENIQ_ADMIN_BIN_DIR}/manage_eniq_services.bsh ]; then 
+    _err_msg_="File ${ENIQ_ADMIN_BIN_DIR}/manage_eniq_services.bsh not found"
+    abort_script "$_err_msg_"
+fi
+
+# Stop only running eniq services
+$BASH ${ENIQ_ADMIN_BIN_DIR}/manage_eniq_services.bsh -a stop -s  ALL -u -N -l ${LOGFILE}
+if [ $? -ne 0 ]; then
+    _err_msg_="Error running ${ENIQ_ADMIN_BIN_DIR}/manage_eniq_services.bsh"
+    abort_script "$_err_msg_"
+fi  
+
+if [ "${INST_TYPE}" == "stats" ]; then
+    if [ ! -s ${ENIQ_ADMIN_BIN_DIR}/update_cell_node_count.bsh ]; then 
+        _err_msg_="File ${ENIQ_ADMIN_BIN_DIR}/update_cell_node_count.bsh not found"
+        abort_script "$_err_msg_"
+    fi
+fi
+
+if [ ! -s ${ENIQ_INST_DIR}/bin/dboptions_dwhdb.bsh ]; then 
+    _err_msg_="File ${ENIQ_INST_DIR}/bin/dboptions_dwhdb.bsh not found"
+    abort_script "$_err_msg_"
+fi
+
+if [ ! -s ${ENIQ_INST_DIR}/bin/add_iq_sys_main_dbspaces.bsh ]; then 
+    _err_msg_="File ${ENIQ_INST_DIR}/bin/add_iq_sys_main_dbspaces.bsh not found"
+    abort_script "$_err_msg_"
+fi
+
+if [ ! "${SYBIQ_FILE}" ]; then
+    _src_dir_=`iniget SYBASE_IQ -f ${ENIQ_CONF_DIR}/${SUNOS_INI} -v SYBASE_IQ_SOURCE_DIR`
+    if [ ! "${_src_dir_}" ]; then
+        _err_msg_="Could not read SYBASE_IQ_SOURCE_DIR parameter from ${ENIQ_CONF_DIR}/${SUNOS_INI}"
+        abort_script "$_err_msg_"
+    fi
+
+    _sw_bndl_=`iniget SYBASE_IQ -f ${ENIQ_CONF_DIR}/${SUNOS_INI} -v SYBASE_IQ_SW_BUNDLE`
+    if [ ! "${_sw_bndl_}" ]; then
+        _err_msg_="Could not read SYBASE_IQ_SW_BUNDLE parameter from ${ENIQ_CONF_DIR}/${SUNOS_INI}"
+        abort_script "$_err_msg_"
+    fi
+
+    SYBIQ_FILE="S{BASE_SW_DIR}/${_src_dir_}/${INSTALL_TYPE}/sw/${SYS_ARCH}/${_sw_bndl_}"
+    if [ ! -s ${SYBIQ_FILE} ]; then
+        SYBIQ_FILE="${BASE_SW_DIR}/${_src_dir_}/common/sw/${SYS_ARCH}/${_sw_bndl_}"
+        if [ ! -s ${SYBIQ_FILE} ]; then
+            _err_msg_="Sybase IQ SW bundle could not be found in ${BASE_SW_DIR}/${_src_dir_}/common/sw/${SYS_ARCH} or ${BASE_SW_DIR}/${_src_dir_}/${INSTALL_TYPE}/sw/${SYS_ARCH}"
+            abort_script "$_err_msg_" "${EXEC_SHELL_CMD}"
+        fi
+    fi    
+    $ECHO "Using IQ binaries in ${SYBIQ_FILE}" 
+fi
+
+ORIG_SYBIQ_TGT_DIR=`iniget SYBASE_IQ -f ${ENIQ_CONF_DIR}/${SUNOS_INI} -v SYBASE_IQ_TARGET_DIR`
+if [ ! "${ORIG_SYBIQ_TGT_DIR}" ]; then
+    _err_msg_="Could not read SYBASE_IQ_TARGET_DIR parameter from ${ENIQ_CONF_DIR}/${SUNOS_INI}"
+    abort_script "$_err_msg_"
+fi
+
+if [ ! "${SYBIQ_TGT_DIR}" ]; then
+    SYBIQ_TGT_DIR=${ORIG_SYBIQ_TGT_DIR}
+fi
+
+# Check that the bundle exists
+if [ ! -s ${SYBIQ_FILE} ]; then
+    _err_msg_="Failed to find SW bundle\n${SYBIQ_FILE}"
+    abort_script "$_err_msg_"
+fi
+
+# Create a temporary Directory
+TEM_DIR=/tmp/upgrade_sybase_iq.$$.$$
+$RM -rf ${TEM_DIR}
+$MKDIR -p ${TEM_DIR}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not create directory ${TEM_DIR}"
+    abort_script "$_err_msg_"
+fi  
+$CHMOD 777 ${TEM_DIR}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not update directory ${TEM_DIR} permissions"
+    abort_script "$_err_msg_"
+fi
+
+#Taking a backup of sybase version file
+if [ -s ${ORIG_SYBIQ_TGT_DIR}/${VERSION_FILE_ID} ]; then
+    log_msg -s "Taking a backup of sybase version file in ${TEM_DIR}" -l ${LOGFILE}
+    $CP -p ${ORIG_SYBIQ_TGT_DIR}/${VERSION_FILE_ID} ${TEM_DIR}
+    if [ $? -ne 0 ]; then
+        log_msg -s  "Failed to keep a copy of the sybase version file in ${TEM_DIR}" -l ${LOGFILE}
+        abort_script "$_err_msg_"
+    fi
+fi    
+
+IQ_SW_UPGRADE_REQ=NO
+IQ_EBF_UPGRADE_REQ=NO
+if [ "${TEST_MODE}" ]; then
+    check_iq_sw_upg_required
+
+    if [ -s ${TEM_DIR}/upgrade_disp_file ]; then
+        $ECHO "\n\n"
+        $CAT ${TEM_DIR}/upgrade_disp_file
+    else
+        $ECHO "No Sybase IQ Upgrade Required" 
+    fi
+    cd ${SCRIPTHOME}
+    $RM -rf ${TEM_DIR}
+    exit 0    
+fi
+
+# Check if I need to upgrade unless forced by parameter
+if [ ! "${FORCE_UPG}" ]; then
+    check_iq_sw_upg_required
+else
+    IQ_SW_UPGRADE_REQ=YES
+fi
+
+cd ${SCRIPTHOME}
+
+if [ "${IQ_SW_UPGRADE_REQ}" == "YES" -o "${IQ_EBF_UPGRADE_REQ}" == "YES" ]; then
+    if [ ! "${NO_CONFIRM}" ]; then
+        user_confirm_upgrade
+        if [ $USER_CONF == No ]; then
+            IQ_SW_UPGRADE_REQ=NO
+        fi    
+    fi
+fi
+
+CLI_CONF_DIR=`$CAT ${ENIQ_CONF_DIR}/${ENIQ_ENV} | $EGREP "^[[:blank:]]*CONF_DIR="|$AWK -F\= '{print $2}'|$SED -e 's|"||g'`
+if [ ! "${CLI_CONF_DIR}" ]; then
+    _err_msg_="Could not read CONF_DIR parameter from ${ENIQ_CONF_DIR}/${ENIQ_INI}"
+    abort_script "$_err_msg_" "${EXEC_SHELL_CMD}"
+fi
+
+# Get the System User/Group. All directories are owned by this
+SYSUSER=`iniget ENIQ_INSTALL_CONFIG -f ${ENIQ_CONF_DIR}/${SUNOS_INI} -v ENIQ_SYSUSER`
+if [ ! "${SYSUSER}" ]; then
+    _err_msg_="Could not read SYSUSER param from ${ENIQ_CONF_DIR}/${SUNOS_INI}"
+    abort_script "$_err_msg_"
+fi
+
+SYSGRP=`$ID ${SYSUSER}|$AWK '{print $2}'|$AWK -F\( '{print $2}'|$AWK -F\) '{print $1}'`
+if [ ! "${SYSGRP}" ]; then
+    _err_msg_="Could not read SYSGRP param from ${ENIQ_CONF_DIR}/${SUNOS_INI}"
+    abort_script "$_err_msg_"
+fi
+
+old_iq_ver_=`$CAT ${SYBIQ_TGT_DIR}/${VERSION_FILE_ID}|$EGREP '^[[:blank:]]*VERSION::'|$AWK -F"::" '{print $2}'|$SED -e 's/\.//g'`
+
+if [ "${IQ_SW_UPGRADE_REQ}" == "YES" ]; then
+        
+         # Stop all ENIQ servies
+         $BASH ${ENIQ_ADMIN_BIN_DIR}/manage_eniq_services.bsh -a stop -s  repdb,dwhdb -N -l ${LOGFILE}
+        if [ $? -ne 0 ]; then
+            _err_msg_="Error running ${ENIQ_ADMIN_BIN_DIR}/manage_eniq_services.bsh"
+            abort_script "$_err_msg_"
+        fi  
+
+        # Install the SW
+        install_sybase_iq
+        
+        # Update the SYSTEM USER profile file
+        upd_user_profile
+        
+        # Set up Sybase environment
+        setup_sybase_env
+
+        _iq_ver_=`$CAT ${SYBIQ_TGT_DIR}/${VERSION_FILE_ID}|$EGREP '^[[:blank:]]*VERSION::'|$AWK -F"::" '{print $2}'`
+        _esd_num_=`$CAT ${SYBIQ_TGT_DIR}/${VERSION_FILE_ID}|$EGREP '^[[:blank:]]*ESD::'|$AWK -F"::" '{print $2}'`
+        
+        # Upgrade the databases
+        upgrade_databases "Sybase IQ ${_iq_ver_} ESD ${_esd_num_}"
+        log_msg -s "Successfully upgraded Sybase IQ to ${_iq_ver_} ESD ${_esd_num_}" -l ${LOGFILE} 
+
+        #Removing the backed up IQ version file since upgrade is success
+        if [ -f ${TEM_DIR}/${VERSION_FILE_NAME} ]; then
+            log_msg -s "Removing old Sybase IQ version file from ${TEM_DIR}" -l ${LOGFILE}
+            $RM -f ${TEM_DIR}/${VERSION_FILE_NAME}       
+        fi
+else
+   setup_sybase_env
+   log_msg -s "No Sybase IQ Upgrade Performed\n" -l ${LOGFILE}
+fi
+
+# Update dboptions
+log_msg -s "Running default ENIQ options into the database.\n"  -l ${LOGFILE}
+update_dboptions
+
+
+# rebuild wide indexes
+if [ ${old_iq_ver_} -lt 160 ]; then
+    log_msg -s "`$DATE +%d.%m.%y_%H:%M:%S` Calling rebuildWideIndexes function." -l ${LOGFILE} 
+    rebuildWideIndexes
+    log_msg -s "`$DATE +%d.%m.%y_%H:%M:%S` rebuildWideIndexes function completed successfully." -l ${LOGFILE} 
+fi
+
+#update the customized database users with their associated login policies
+update_customized_db_users
+
+# Truncating the DWHDB transaction log dwhdb.log
+log_msg -s "Truncating the DWHDB transaction log & renaming to dwhdb.tran if need.\n"  -l ${LOGFILE}
+${BASH} ${ENIQ_ADMIN_BIN_DIR}/transaction_log_admin.bsh -t dwhdb -u -R -l ${LOGFILE} -N
+if [ $? -ne 0 ]; then
+    _err_msg_="Failed to truncate DWHDB transaction log"
+    abort_script "$_err_msg_"
+fi
+
+if [ "${INST_TYPE}" == "stats" ]; then
+    # Check if we need to update IQ SYS MAIN
+    check_upd_iq_sys_main
+fi
+
+$RM -rf ${TEM_DIR}
+
+
+log_msg -s "Successfully executed upgrade_sybase_iq.bsh" -l ${LOGFILE}
+
+$RM -rf ${dwh_connection_string_enc}
+
+$RM -rf ${rep_connection_string_enc}
+
+$RM -rf ${conn_str_enc}
+
+$RM -rf ${connection_string_enc}
+
+$RM -rf ${conn_string_enc}
+
+$RM -rf ${conn_str_continue_enc}
+
+$RM -rf ${conn_str_exit_enc}
+
+$RM -rf ${conn_str_dwh_enc}
+
+exit 0
+

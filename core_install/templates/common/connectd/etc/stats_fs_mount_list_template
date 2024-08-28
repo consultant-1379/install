@@ -1,0 +1,22 @@
+#
+# NFS_resource	NFS_share_on_Master_server    Mount_Point_relative_to_OSS_Alias       	Description
+# ip/hostname
+#
+OSS	<IP>	/ossrc/data/sgw/sgwcg			/ossrc/data/sgw/sgwcg					NWS_SGw
+NAS	<IP>	/vx/<OSS_POOL_ID>-sgwcg			/sgwcg									NWS_SGw
+OSS	<IP>	<PDM_SHARE_OSS>    				<PDM_MOUNT_POINT>         				NWS_PDM
+NAS	<IP>	/vx/<OSS_POOL_ID>-pm_storage    /pm_storage								NWS_PDM
+OSS	<IP>	/ossrc/data/pms/segment1		/ossrc/data/pms/segment1				NWS_PMS
+NAS	<IP>	/vx/<OSS_POOL_ID>-segment1		/segment1								NWS_PMS
+OSS	<IP>	/ossrc/data/eba/eba_ebss        /ossrc/data/eba/eba_ebss        		EBA_EBSS
+NAS	<IP>	/vx/<OSS_POOL_ID>-eba_ebss      /eba_ebss/data                				EBA_EBSS
+OSS	<IP>	/ossrc/data/eba/eba_ebsw        /ossrc/data/eba/eba_ebsw        		EBA_EBSW
+NAS	<IP>	/vx/<OSS_POOL_ID>-eba_ebsw      /eba_ebsw/data                				EBA_EBSW
+OSS	<IP>	/ossrc/data/eba/eba_rsdm        /ossrc/data/eba/eba_ebsg        		EBA_EBSG
+NAS	<IP>	/vx/<OSS_POOL_ID>-eba_ebsg      /eba_ebsg/data                				EBA_EBSG
+SOEM    <IP> 	/opt/mv36/core/nmc/hist 	/ 						SOEM PM
+ENM     <IP>    /vx/<OSS_POOL_ID>-pm1      /				ENM_PM
+vENM    <IP>     <FILESYSTEM>                 /                            ENM_PM
+
+
+

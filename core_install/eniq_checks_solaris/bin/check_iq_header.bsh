@@ -1,0 +1,420 @@
+#!/bin/bash
+# ********************************************************************
+# Ericsson Radio Systems AB                                     SCRIPT
+# ********************************************************************
+# Ericsson Radio Systems AB 2019 - All rights reserved.
+#
+# The copyright to the computer program(s) herein is the property
+# of Ericsson Radio Systems AB, Sweden. The programs may be used
+# and/or copied only with the written permission from Ericsson Radio
+# Systems AB or in accordance with the terms and conditions stipulated
+# in the agreement/contract under which the program(s) have been
+# supplied.
+#
+# ********************************************************************
+#
+# Name    : check_iq_header.bsh
+# Date    : 16/12/2019
+# Revision: \main\Statistics_18.2_18.2.8_EU16
+#
+# Purpose : This script will validate IQ Header File IDs. No 2 IQ Files should have same File ID.
+#
+# Usage   : check_iq_header.bsh
+# Exit Values:
+#      0   : Success
+#      1   : Failure
+#      3   : No Run: Abort script
+#      53  : No Run: Not applicable for multiblade stats coordinator
+#
+# ********************************************************************
+#
+#   Command Section
+#
+# ********************************************************************
+
+NAWK=/usr/bin/nawk
+BASH=/usr/bin/bash
+CAT=/usr/bin/cat
+CD=/usr/bin/cd
+CP=/usr/bin/cp
+CUT=/usr/bin/cut
+DATE=/usr/bin/date
+DIRNAME=/usr/bin/dirname
+ECHO=/usr/bin/echo
+GEGREP=/usr/bin/gegrep
+FIND=/usr/bin/find
+GETENT=/usr/bin/getent
+GREP=/usr/bin/grep
+GEREP=/usr/bin/gegrep
+HEAD=/usr/bin/head
+LS=/usr/bin/ls
+HOSTNAME=/usr/bin/hostname
+SED=/usr/bin/sed
+TOUCH=/usr/bin/touch
+TEE=/usr/bin/tee
+WC=/usr/bin/wc
+
+
+
+#### RETURN CODE ENUM's ####
+SUCCESS=0
+FAILED=1
+ROOT_USER_FAILED=71
+RACK_NOT_APPLICABLE=16
+ENGINE_NOT_APPLICABLE=54
+HEADER_FILE_NOT_CREATED=248
+
+
+
+
+### Function: abort_script
+#
+#   This will be called if the script is aborted through an error
+#   encountered during runtime
+#
+# Arguments: $1 - Error message from part of program (Not always used)
+# Return Values: none
+#
+#
+abort_script()
+{
+_err_time_=`$DATE '+%Y-%b-%d_%H.%M.%S'`
+
+if [ "$1" ]; then
+    _err_msg_="${_err_time_} - $1"
+else
+    _err_msg_="${_err_time_} - ERROR : Script aborted.......\n"
+fi
+if [ "${LOGFILE}" ]; then
+    $ECHO "\nERROR: ${_err_msg_}\n" | $TEE -a ${LOGFILE}
+else
+    $ECHO "\nERROR: ${_err_msg_}\n"
+fi
+exit 3
+}
+
+
+### Function: check_user ###
+#
+#   Check that the effective id of the user is correct
+#   If not print error msg and exit.
+#
+# Arguments:
+#       $1 : User ID name
+# Return Values:
+#       none
+#
+check_user()
+{
+   local _check_id_=`$ID  | $NAWK -F\( '{print $2}' | $NAWK -F\) '{print $1}'`
+
+   if [ "$_check_id_" != "$1" ]; then
+      _err_msg_="You must be $1 to execute this script."
+      abort_script "$_err_msg_"
+   fi
+}
+
+
+
+
+
+### Function: check_iq_lun_mapping ###
+#
+#Verify IQ Lun mapping and header information
+#
+# Arguments: $1 : User ID name
+# Return Values: none
+#
+#
+check_iqheader()
+{
+_fail_cnt_=0
+
+log_msg -l ${LOGFILE} -q -t -s "--------------------Checking IQ Header File IDs----------------------"
+
+if [ -s /eniq/installation/config/iq_header_info ];then
+    for _file_id_ in `$CAT /eniq/installation/config/iq_header_info | $NAWK -F " " '{print $2}'`;do
+        _file_id_cnt_=`$GREP ${_file_id_} /eniq/installation/config/iq_header_info | $WC -l`
+        $ECHO "\nINFO : $_file_id_ = $_file_id_cnt_" >> $LOGFILE
+        if [ ! -z ${_file_id_cnt_} ];then
+            if [ $_file_id_cnt_ -ne 1 ];then
+                _fail_cnt_=`expr $_fail_cnt_ + 1`
+                log_msg -l ${LOGFILE} -q -t -s "Multiple IQ Header FILE ID present for ${_file_id_}"
+                $GREP ${_file_id_} /eniq/installation/config/iq_header_info >> $LOGFILE
+                continue
+            fi
+        fi
+    done
+
+else
+    log_msg -l ${LOGFILE} -q -t -s "/eniq/installation/config/iq_header_info file not created."
+    exit $HEADER_FILE_NOT_CREATED
+fi
+
+if [ $_fail_cnt_ -ne 0 ];then
+    log_msg -l ${LOGFILE} -q -t -s "IQ Header FILE IDs are inconsistent."
+    RET_CODE=$FAILED
+else
+    log_msg -l ${LOGFILE} -q -t -s "IQ Header FILE IDs are consistent."
+    RET_CODE=$SUCCESS
+fi
+
+return $RET_CODE
+
+}
+
+
+#### Function: create_log_file ######
+#
+#   Check that the effective id of the user is correct
+#   If not print error msg and exit.
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+#
+
+create_log_file()
+{
+   $ECHO "" > ${LOGFILE}  
+}
+
+
+### Function: get_absolute_path ###
+#
+# Determine absolute path to software
+#
+# Arguments:
+#    none
+# Return Values:
+#    none
+get_absolute_path()
+{
+_dir_=`$DIRNAME $0`
+SCRIPTHOME=`$CD $_dir_ 2>/dev/null && pwd || $ECHO $_dir_`
+}
+
+
+### Function: setup_env
+#
+#   This will be called if the script is aborted through an error
+#   encountered during runtime
+#
+# Arguments: $1 - Error message from part of program (Not always used)
+# Return Values: none
+#
+#
+setup_env()
+{
+
+if [ ! "${ENIQ_BASE_DIR}" ]; then
+    # Directory on the root filesystem
+    ENIQ_BASE_DIR=/eniq
+fi
+
+
+SYM_LINKS_INI=sym_links.ini
+COORD_SYM_LINKS_INI=coordinator_sym_links.ini
+SUNOS_INI=SunOS.ini
+BLK_STOR_INI=block_storage.ini
+BACKUP_DATA_INI=backup_migration_data.ini
+ENIQ_INI=niq.ini
+TEM_DIR=/var/tmp
+
+# Main Directory for the Core Installation SW
+ENIQ_INST_DIR=${ENIQ_BASE_DIR}/installation
+
+# Main Directory for the Core Installation SW
+ENIQ_CORE_INST_DIR=${ENIQ_INST_DIR}/core_install
+
+# ENIQ Config Directory
+ENIQ_CONF_DIR=${ENIQ_INST_DIR}/config
+
+# Precheck logs directory
+ENIQ_PRECHECK_LOG_DIR=${ENIQ_BASE_DIR}/local_logs/precheck_logs/
+
+#Installation lib directory
+ENIQ_LIB_DIR=${ENIQ_INST_DIR}/core_install/lib/
+
+#Configuration directory
+ENIQ_SW_CONF=${ENIQ_BASE_DIR}/sw/conf
+
+# Logfile path
+LOGFILE=${ENIQ_PRECHECK_LOG_DIR}check_iq_header.log
+
+if [ -s ${ENIQ_CORE_INST_DIR}/lib/common_functions.lib ]; then
+    . ${ENIQ_CORE_INST_DIR}/lib/common_functions.lib
+else
+    _err_msg_="File ${ENIQ_CORE_INST_DIR}/lib/common_functions.lib not found"
+    abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+fi
+
+
+# Get current server type
+CURR_SERVER_TYPE=`$CAT ${ENIQ_CONF_DIR}/installed_server_type | $GEGREP -v  '^[[:blank:]]*#' | $SED -e 's/ //g'`
+if [ ! "${CURR_SERVER_TYPE}" ]; then
+    _err_msg_="Could not determine which server type this is"
+    abort_script "${_err_msg_}"
+fi
+
+# Check if server is Coordinator or Reader type
+CO_SERVER=""
+RD_SERVER=""
+if [ "${CURR_SERVER_TYPE}" == "stats_coordinator" -o "${CURR_SERVER_TYPE}" == "eniq_stats" ]; then
+    CO_SERVER="YES"
+elif [ "${CURR_SERVER_TYPE}" == "stats_iqr" ]; then
+    RD_SERVER="YES"
+fi
+
+
+
+# Source the common functions
+if [ -s ${ENIQ_BASE_DIR}/installation/core_install/lib/common_functions.lib ]; then
+    . ${ENIQ_BASE_DIR}/installation/core_install/lib/common_functions.lib
+fi
+
+
+STORAGE_TYPE=`iniget STOR_TYPE -f ${ENIQ_BASE_DIR}/installation/config/${SUNOS_INI} -v STORAGE_TYPE`
+if [ ! "${STORAGE_TYPE}" ]; then
+    _err_msg_="Could not read STORAGE_TYPE param "
+    abort_script "${_err_msg_}"
+fi
+
+
+
+
+SYSUSER=`iniget ENIQ_INSTALL_CONFIG -f ${ENIQ_CONF_DIR}/${SUNOS_INI} -v ENIQ_SYSUSER`
+if [ ! "${SYSUSER}" ]; then
+    _err_msg_="Could not read System User from ${ENIQ_CONF_DIR}/${SUNOS_INI}"
+    abort_script "${_err_msg_}"
+fi
+
+
+
+
+DWH_PORT=`iniget DWH -v PortNumber -f ${ENIQ_CONF_DIR}/${ENIQ_INI}`
+DWH_NAME=`iniget DWH -v ServerName -f ${ENIQ_CONF_DIR}/${ENIQ_INI}`
+if [ ! "${DWH_PORT}" -o ! "${DWH_NAME}" ]; then
+    _err_msg_="Could not read DB values from ${ENIQ_INI}"
+    abort_script "$_err_msg_"
+fi
+
+if [ "${CURR_SERVER_TYPE}" == "stats_coordinator" ]; then
+     _reader_list_=`iniget DWH_READER -f ${ENIQ_SW_CONF}/niq.ini`
+     if [ ! "${_reader_list_}" ]; then
+         _err_msg_="Could not find values for DWH_READER in ${ENIQ_SW_CONF}/niq.ini"
+         abort_script "${_err_msg_}"
+     fi
+
+     DWH_READER_PORT=`iniget DWH_READER_SETTINGS -v PortNumber -f ${ENIQ_SW_CONF}/${ENIQ_INI}`
+     for _reader_ in ${_reader_list_}; do
+         eval "${_reader_}"_ENG=`iniget ${_reader_} -v Service_Name -f ${ENIQ_SW_CONF}/${ENIQ_INI}`
+         if [ ! "${DWH_READER_PORT}" -o ! "${_reader_}_ENG" ]; then
+                _err_msg_="Could not read IQ values from ${ENIQ_SW_CONF}/${ENIQ_INI}"
+                abort_script "${_err_msg_}"
+         fi
+         done
+fi
+
+
+DBA_PASSWORD=`inigetpassword DB -f ${ENIQ_CONF_DIR}/${ENIQ_INI} -v DBAPassword`
+if [ ! ${DBA_PASSWORD} ]; then
+    if [ -f ${ENIQ_BASE_DIR}/sw/installer/dbusers ]; then
+        DBA_PASSWORD=`${ENIQ_BASE_DIR}/sw/installer/dbusers dba dwh`
+        if [ ! "${DBA_PASSWORD}" ] ; then
+            _err_msg_="`$DATE +%d.%m.%y_%H:%M:%S` - Could not get dwhdb DBA Password"
+            abort_script "$_err_msg_"
+        fi
+    else
+        _err_msg_="`$DATE +%d.%m.%y_%H:%M:%S` - Could not get dwhdb DBA Password"
+        abort_script "$_err_msg_"
+    fi
+fi
+
+CONN_STR_USER_DBA="uid=dba;pwd=${DBA_PASSWORD};eng=${DWH_NAME};links=tcpip{host=${DWH_NAME};port=${DWH_PORT};dobroadcast=no;verify=no}"                 
+
+
+
+# Get the required environment variables for Sybase
+$SU - ${SYSUSER} -c "$ENV |$EGREP '^(SYBASE|ASDIR|IQDIR|ASALOGDIR|SQLANY)'" > $TEM_DIR/sybase_det.$$
+$CAT $TEM_DIR/sybase_det.$$ |$EGREP '^(SYBASE|ASDIR|IQDIR|ASALOGDIR|SQLANY)' > $TEM_DIR/sybase_det_var.$$
+. $TEM_DIR/sybase_det_var.$$ >> /dev/null 2>&1
+
+if [ -z "$IQDIR" ] ; then
+    _err_msg_="ERROR: IQDIR is not set"
+    abort_script "${_err_msg_}"
+fi
+
+
+
+
+# Get iqheader binary
+_iqheader_=`$FIND ${ENIQ_BASE_DIR}/sybase_iq/IQ*|$EGREP "\/IQ-.*\/bin.*\/iqheader[[:blank:]]*$"|$HEAD -1`
+if [ ! -x ${_iqheader_} ]; then
+    _err_msg_="Could not locate the iqheader binary"
+    abort_script "${_err_msg_}"
+fi
+
+HNAME=`${HOSTNAME}`
+HOST_IP=`$GETENT hosts ${HNAME} | $NAWK '{print $1}' | $HEAD -1`
+
+}
+
+
+
+
+# ********************************************************************
+#
+#   Main body of program
+#
+# ********************************************************************
+
+RUN_TIME=`$DATE '+%Y-%b-%d_%H:%M:%S'`
+
+# Default return code
+RET_CODE=0
+
+
+
+# Set up environment variables for script.
+setup_env
+
+#Check and create the log file
+create_log_file
+
+# Determine absolute path to software
+get_absolute_path
+
+# Check the current user as root
+check_user "root"; RET_CODE=$?
+if [ "$RET_CODE" -ne ${SUCCESS} ]
+then
+   log_msg -t -s "FAILED : You need to be a root user to execute this script" -l ${LOGFILE}
+   RET_CODE=${ROOT_USER_FAILED}
+   exit ${RET_CODE}
+fi
+
+
+#Save IQ_header information
+save_iq_header_info
+
+
+# Check IQ Header
+if [ "${STORAGE_TYPE}" == "zfs" ]; then
+    log_msg -s "This check is not applicable for RACK servers." -l $LOGFILE
+    exit ${RACK_NOT_APPLICABLE}
+else
+    if [ "${CO_SERVER}" == "YES" -o "${RD_SERVER}" == "YES" ]; then
+        check_iqheader;rCode=$?
+        log_msg -t -s "INFO :IQ Header check completed for ${HNAME}: END, RC:$rCode" -l ${LOGFILE}
+        log_msg -t -s "Check log $LOGFILE\n"
+        exit $rCode
+    else
+        log_msg -t -s "INFO :IQ Header check not applicable for Engine Blade : ${HNAME}: END" -l ${LOGFILE}
+        exit $ENGINE_NOT_APPLICABLE
+    fi
+fi
+
+
+

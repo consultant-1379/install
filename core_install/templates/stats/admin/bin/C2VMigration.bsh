@@ -1,0 +1,910 @@
+#!/bin/bash
+# ********************************************************************
+# Ericsson Radio Systems AB                                     SCRIPT
+# ********************************************************************
+#
+#
+# (c) Ericsson Radio Systems AB 2016, 2017 - All rights reserved.
+#
+# The copyright to the computer program(s) herein is the property
+# of Ericsson Radio Systems AB, Sweden. The programs may be used
+# and/or copied only with the written permission from Ericsson Radio
+# Systems AB or in accordance with the terms and conditions stipulated
+# in the agreement/contract under which the program(s) have been
+# supplied.
+#
+# ********************************************************************
+# Name    : C2VMigration.bsh
+# Date    : 02/06/2023
+# Revision: G
+# Purpose : This script identify all base tables residing in IQ_MAIN. It populate a move status table with the table names.
+#           It will then run sp_iqmovetablefromfile for each of the tables per tp which is disabled. If move fails it will
+#           mark the table status as 'failed'.If the table is moved it will mark it 'moved'.
+#           Subsequently runs will moved tables that status is not 'moved'. Script has been updated to work on Linux environment
+#
+# Usage   :  bash C2VMigration.bsh
+#
+# ********************************************************************
+#
+#       Command Section
+#
+# ********************************************************************
+AWK=/usr/bin/awk
+BASENAME=/usr/bin/basename
+CAT=/usr/bin/cat
+CHMOD=/usr/bin/chmod
+CHOWN=/usr/bin/chown
+CP=/usr/bin/cp
+CUT=/usr/bin/cut
+DATE=/usr/bin/date
+ECHO=/usr/bin/echo
+EXPR=/usr/bin/expr
+FIND=/usr/bin/find
+GREP=/usr/bin/grep
+ID=/usr/bin/id
+KILL=/usr/bin/kill
+LS=/usr/bin/ls
+MKDIR=/usr/bin/mkdir
+PS=/usr/bin/ps
+PWD=/usr/bin/pwd
+RM=/usr/bin/rm
+SED=/usr/bin/sed
+SLEEP=/usr/bin/sleep
+TAIL=/usr/bin/tail
+TEE=/usr/bin/tee
+TOUCH=/usr/bin/touch
+WC=/usr/bin/wc
+
+
+
+# Run if Hang up detected on controlling terminal -SIGHUP
+# Run if user sends an interrupt signal (Ctrl + C) -SIGINT
+# Run if Software termination signal (sent by kill by default) -SIGTERM
+# The SIGABRT signal is sent to a process to tell it to abort, i.e. to terminate -SIGABRT
+# SIGQUIT by default, this causes the process to terminate and dump core -SIGQUIT
+# SIGTSTP by default, this causes the process to suspend execution. -SIGTSTP
+# SIGUSR1 & SIGUSR2 User-defined signals
+# to test e.g. kill -SIGTERM pid
+trap '$RM -rf $TMPDIR; $KILL -9 $$' SIGHUP SIGINT SIGTERM SIGABRT SIGQUIT SIGTSTP SIGUSR1 SIGUSR2
+
+
+### Function: abort_script ###
+#
+# abort function
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+abort_script()
+{
+if [ "$1" ]; then
+    _err_msg_=$1
+else
+    _err_msg_="Script aborted.......\n"
+fi
+
+if [ -z ${LOGFILE} ]
+then
+        $ECHO $_err_msg_
+else
+        $ECHO $_err_msg_  | $TEE -a  ${LOGFILE}
+fi
+$TOUCH /eniq/log/sw_log/iq/tail_exit
+exit 1
+}
+
+### Function: clean_up ###
+#
+# Removes temporary tables/server : remote_DWHPartition, remote_DWHType, table_move_status, remote_repdb                        
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+clean_up()
+{
+        ${DBISQL} @${_connection_string_enc} "
+        IF (select count (*) from systab where table_name = 'remote_DWHPartition') = 1
+        BEGIN
+        drop table dc.remote_DWHPartition
+        END;
+
+        IF (select count(*) from systab where table_name = 'remote_DWHType') = 1
+        BEGIN
+        drop table dc.remote_DWHType
+        END;
+
+        IF (select count(*) from systab where table_name = 'table_move_status') = 1
+        BEGIN
+        drop table dc.table_move_status
+        END; 
+
+        IF (select count (*) from sysserver where srvname = 'remote_repdb') = 1
+        BEGIN
+        drop server remote_repdb
+        END;" > /dev/null 2>>${LOGFILE}
+
+        if [ $? -ne 0 ]; then
+                _err_msg_="Could not drop temporary tables"
+                abort_script "$_err_msg_"
+        fi
+        exit 1
+
+}
+
+
+### Function: setup_env ###
+#
+# Setup up path environment etc
+#
+# Arguments:
+#       none
+# Return Values:
+#       DWH_port,DWH_eng and DBA password
+
+setup_env()
+{
+# Name of SunOS & ENIQ ini Files
+ENIQ_INI=niq.ini
+
+# Check that the effective id of the user is dcuser
+check_id dcuser
+
+# TMPDIR is the location of directory where temporary files are stored.
+export TMPDIR=/tmp/migrateDb
+
+if [ -d $TMPDIR ]
+then
+        $RM -rf $TMPDIR
+        if [ $? -ne 0 ]
+        then
+                $ECHO "failed to remove $TMPDIR folder. Exiting script"
+                exit 1
+        fi
+fi
+
+$MKDIR -p $TMPDIR
+if [ $? -ne 0 ]
+then
+        $ECHO "failed to recreate $TMPDIR folder. Exiting script"
+        exit 1
+else
+        $ECHO $TMPDIR recreated
+fi
+
+ENIQ_BASE_DIR=/eniq
+ENIQ_SW_DIR=${ENIQ_BASE_DIR}/sw
+ENIQ_BKUPSW_DIR=${ENIQ_BASE_DIR}/bkup_sw
+CLI_CONF_DIR=${ENIQ_BASE_DIR}/sw/conf
+ENIQ_CORE_BIN_DIR=${ENIQ_BASE_DIR}/installation/core_install/bin/
+
+SYBENV="$ENIQ_BASE_DIR/sybase_iq/IQ-*"
+
+ENIQ_CONF_DIR=${ENIQ_BASE_DIR}/installation/config
+if [ ! -s ${ENIQ_CONF_DIR}/SunOS.ini ]; then
+    _err_msg_="Could not locate file ${ENIQ_CONF_DIR}/SunOS.ini"
+    abort_script "$_err_msg_"
+fi
+
+# File containing the type of OSS installation. Eg. events or statistics
+INST_TYPE_FILE=${ENIQ_CONF_DIR}/ericsson_use_config
+if [ ! -s "${INST_TYPE_FILE}" ]; then
+    _err_msg_="ENIQ install type not defined in ${INST_TYPE_FILE}"
+    abort_script "$_err_msg_"
+fi
+# Read the installation type - should be "events" or "stats"
+INSTALL_TYPE=`$CAT ${INST_TYPE_FILE} | $AWK -F\= '{print $2}'`
+
+if [ "${INSTALL_TYPE}" != "stats" ]; then
+        _err_msg_="This script should only be run for ENIQ Statistics.  Exiting... "
+    abort_script "$_err_msg_"
+fi
+
+# Source the common functions
+if [ -s ${ENIQ_BASE_DIR}/admin/lib/common_functions.lib ]; then
+    . ${ENIQ_BASE_DIR}/admin/lib/common_functions.lib
+else
+    _err_msg_="File ${ENIQ_BASE_DIR}/admin/lib/common_functions.lib not found"
+    abort_script "$_err_msg_"
+fi
+
+
+
+DWH_PORT=`iniget DWH -v PortNumber -f ${CLI_CONF_DIR}/niq.ini`
+DWH_ENG=`iniget DWH -f ${ENIQ_CONF_DIR}/${ENIQ_INI} -v ServerName`
+if [ ! "${DWH_PORT}" -o ! "${DWH_ENG}" ]; then
+        _err_msg_="Could not read db values from ${CLI_CONF_DIR}/${ENIQ_INI}"
+        abort_script "$_err_msg_"
+fi
+
+DBA_PASSWORD=`inigetpassword DB -f ${CLI_CONF_DIR}/${ENIQ_INI} -v DBAPassword`
+if [ ! ${DBA_PASSWORD} ]; then
+  if [ -f ${ENIQ_BASE_DIR}/sw/installer/dbusers ]; then
+            DBA_PASSWORD=`${ENIQ_BASE_DIR}/sw/installer/dbusers dba dwh`
+     if [ ! "${DBA_PASSWORD}" ] ; then
+                _err_msg_="Could not get dwhdb DBA Password"
+                abort_script "$_err_msg_"
+     fi
+   fi
+fi
+
+# Get the System User and Group. All directories are owned by this
+SYSUSER=`iniget ENIQ_INSTALL_CONFIG -f ${ENIQ_CONF_DIR}/SunOS.ini -v ENIQ_SYSUSER`
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not read SYSUSER param from ${ENIQ_CONF_DIR}/SunOS.ini"
+    abort_script "$_err_msg_"
+fi
+
+SYSGRP=`$ID ${SYSUSER}|$AWK '{print $2}'|$AWK -F\( '{print $2}'|$AWK -F\) '{print $1}'`
+if [ ! "${SYSGRP}" ]; then
+    _err_msg_="Could not read SYSGRP"
+    abort_script "$_err_msg_"
+fi
+
+
+# Initialize the connection string for dwhdb
+connection_string="-c \"eng=${DWH_ENG};links=tcpip{host=localhost;port=${DWH_PORT}};uid=dba;pwd=$DBA_PASSWORD\""
+_connection_string_enc=/tmp/conn_str_C2V_encrypt.txt.`uuidgen`
+
+# encrypt the connection string.
+get_encrypt_file "${connection_string}" "${_connection_string_enc}"
+
+# Source the sybase environment
+SYBSOURCE="$SYBENV/IQ-*.sh"
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not find sybase.sh file under $SYBENV"
+    abort_script "$_err_msg_"
+fi
+
+# shellcheck source=/dev/null
+source ${SYBSOURCE} 
+sybase_env_variables_ec=$?
+if [ $sybase_env_variables_ec -ne 0 ]; then
+    _err_msg_="Could not source sybase environment"
+    abort_script "$_err_msg_"
+fi
+
+
+DBISQL="$($LS $SYBENV/bin64/dbisql)"
+
+# MAXPARALLEL sets the number of simultaneous table migrations
+
+${DBISQL} @${_connection_string_enc} "select server_name from sp_iqmpxinfo() where server_name like 'dwh_reader_2'" | $GREP dwh_reader_2 > /dev/null 2>&1
+if [ $? -eq 0 ]
+then
+        MAXPARALLEL=5
+else
+        MAXPARALLEL=3
+fi
+
+# Setup logfile if not given by user
+if [ ! "${LOGFILE}" ] ; then
+    LOGFILE=/eniq/log/sw_log/iq/C2VMigration.log
+fi
+
+if [ ! -f "${LOGFILE}" ]
+then
+        $TOUCH -a ${LOGFILE}
+        if [ $? -ne 0 ]; then
+                _err_msg_="Could not write to file ${LOGFILE}"
+                abort_script "$_err_msg_"
+        fi
+
+        $CHMOD 777 ${LOGFILE} >> /dev/null 2>&1
+        if [ $? -ne 0 ]; then
+                        _err_msg_="Could not change permissions of log file"
+                        abort_script "$_err_msg_"
+        fi
+        $CHOWN $SYSUSER:$SYSGRP ${LOGFILE} >> /dev/null 2>&1
+        if [ $? -ne 0 ]; then
+                 _err_msg_="Could not change ownership of log file"
+                 abort_script "$_err_msg_"
+        fi
+
+
+        log_msg -t -l ${LOGFILE} -s "Started logging in file ${LOGFILE}\n"
+
+
+
+
+fi
+
+
+declare -a TP_LIST_ARRAY
+declare -a TABLE_LIST_PER_TP_ARRAY
+declare -a TABLE_LIST_BLANK_MOVES
+
+}
+
+
+
+### Function: usage_msg ###
+#
+#   Print out the usage message
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+usage_msg()
+{
+$ECHO "
+Usage:`$BASENAME $0` -s <h|a|c> [-l]
+
+Compulsory:
+-s : Flag to indicate active (a), historic (h) run or cleanup (c).
+
+options:
+-l  : To generate logfile other than default path
+
+"
+}
+
+
+### Function: sp_iqmovetablefromfile ###
+#
+#   run sp_iqmovetablefromfile for given table
+#
+# Arguments:
+#       table
+# Return Values:
+#       none
+sp_iqmovetablefromfile()
+{
+
+table_name=$1
+User=`$ECHO ${table_name} | $CUT -d'.' -f1 | $SED "s/'//g"`
+Table=`$ECHO ${table_name}  | $CUT -d'.' -f2 | $SED "s/'//g"`
+stage=$2
+tp=$3
+
+SqlFile=`mktemp -t ExtTabSql.XXXXXXXXXX`
+
+if [ "${tp}" != "cust" ]
+then
+        if [ "${stage}" == "h" ]
+        then
+                active_table=$(dbisql @${_connection_string_enc} "SELECT TABLENAME FROM dc.remote_DWHPartition where tablename like '${Table}' and endtime > DATEADD( hour, 12, now() ) and starttime <= now() union all SELECT TABLENAME FROM dc.remote_DWHPartition where tablename like '${Table}' and endtime is null"  | $GREP ${Table})
+
+                if  [[ $Table == *_CALC ]]
+                then
+                        log_msg -t -l ${LOGFILE} -s "${Table} is an active table. Setting move status to active and skipping since historic mode is running"
+                        dbisql @${_connection_string_enc} -q "LOCK TABLE dc.table_move_status IN WRITE MODE WAIT; UPDATE dc.table_move_status SET status='active' WHERE tablename like '${Table}'"  > /dev/null 2>>${LOGFILE}
+                        $RM -f $SqlFile
+                        return 0
+                elif [ ! -z "$active_table" ]
+                then
+                        log_msg -t -l ${LOGFILE} -s "${Table} is an active table. Setting move status to active and skipping since historic mode is running"
+                        dbisql @${_connection_string_enc} -q "LOCK TABLE dc.table_move_status IN WRITE MODE WAIT; UPDATE dc.table_move_status SET status='active' WHERE tablename like '${Table}'"  > /dev/null 2>>${LOGFILE}
+                        $RM -f $SqlFile
+                        return 0
+                fi
+        fi
+fi
+$ECHO "sp_iqmovetablefromfile '${Table}'" > $SqlFile
+
+dbisql @${_connection_string_enc} -q "LOCK TABLE dc.table_move_status IN WRITE MODE WAIT; UPDATE dc.table_move_status SET status='moving',StartTime=now() WHERE tablename like '${Table}'" > /dev/null 2>>${LOGFILE}
+
+dbisql @${_connection_string_enc}   $SqlFile > /dev/null 2>>${LOGFILE}
+
+# The table name is pushed into finished log only if not in error
+if [ $? -ne 0 ]
+then
+        log_msg -t -l ${LOGFILE} -s "sp_iqmovetablefromfile for ${table_name} failed"
+        dbisql @${_connection_string_enc} -q "LOCK TABLE dc.table_move_status IN WRITE MODE WAIT; UPDATE dc.table_move_status SET status='failed',FinishTime=now() WHERE tablename like '${Table}'" > /dev/null 2>>${LOGFILE}
+
+else
+        log_msg -t -l ${LOGFILE} -s "sp_iqmovetablefromfile for ${table_name} completed successfully."
+        dbisql @${_connection_string_enc} -q "LOCK TABLE dc.table_move_status IN WRITE MODE WAIT; UPDATE dc.table_move_status SET status='moved',FinishTime=now() WHERE tablename like '${Table}'" > /dev/null 2>>${LOGFILE}
+
+fi
+
+
+
+$RM -f $SqlFile
+
+}
+
+export -f sp_iqmovetablefromfile
+
+### Function: check_id ###
+#
+#   Check that the effective id of the user is correct
+#   If not print error msg and exit.
+#
+# Arguments:
+#       $1 : User ID name
+# Return Values:
+#       none
+check_id()
+{
+        _check_id_=`$ID  | $AWK -F\( '{print $2}' | $AWK -F\) '{print $1}'`
+        if [ "$_check_id_" != "$1" ]; then
+            _err_msg_="You must be $1 to execute this script."
+            abort_script "$_err_msg_"
+        fi
+}
+
+### Function: check_failed_moves_due2load ###
+#
+#   update the move status table entry to failed for tables that
+#   failed to move due to loads.
+#
+# Arguments:
+#       log to check
+# Return Values:
+#       none
+check_failed_moves_due2load()
+{
+
+        TABLE_LIST_BLANK_MOVES=( $($GREP  "Relocated  bytes" ${1} | $AWK '{print $9}' |$CUT -d'.' -f2) )
+
+        for Table in "${TABLE_LIST_BLANK_MOVES[@]}"
+        do
+                dbisql @${_connection_string_enc} -q "LOCK TABLE dc.table_move_status IN WRITE MODE WAIT; UPDATE dc.table_move_status SET status='failed' WHERE tablename like '${Table}'" > /dev/null 2>>${LOGFILE}
+        done
+
+}
+
+### Function: tail_rotating_Log ###
+#
+#   Tail rotating log
+#
+#
+# Arguments:
+#       Inode of the original tailed log, path to output to, path of file to tail
+# Return Values:
+#       none
+tail_rotating_Log() {
+
+        IO=$1
+        run_iqmsg=$2
+        iqmsg=$3
+
+        while true;
+        do
+                pid=$($PS -ef | $GREP $TAIL | $GREP -v $GREP | $GREP dwhdb.iqmsg | $AWK '{print $2}')
+                # as long as the file exists and the inode number did not change
+                while [ "${IO}" == "$($LS -i "${iqmsg}" | $AWK '{print $1}')" ]
+                do
+		if [ -f /eniq/log/sw_log/iq/tail_exit ]
+		then
+			break
+		else
+                        $SLEEP 0.5
+		fi
+                done
+                $KILL $pid 2> /dev/null
+		if [ -f /eniq/log/sw_log/iq/tail_exit ]
+		then
+                        break
+		fi	
+
+                $SLEEP 0.5
+                $TAIL -500f  ${iqmsg} >> ${run_iqmsg} &
+                IO=$($LS -i "${iqmsg}" | $AWK '{print $1}')
+
+
+        done 2> /dev/null
+
+}
+
+# ********************************************************************
+#
+#       Main body of program
+#
+# ********************************************************************
+#
+
+while getopts "l:s:" arg;
+do
+        case $arg in
+                        l)      LOGFILE="$OPTARG"
+
+                                        ;;
+                        s)      stage="$OPTARG"
+
+                                        ;;
+                        \?)     $ECHO "Invalid option(s) passed"
+                                        usage_msg
+                                        exit 1
+                        ;;
+        esac
+done
+shift `$EXPR $OPTIND - 1`
+
+# Pull in the environment
+setup_env
+
+if [ "${stage}" !=  "h" ] && [ "${stage}" !=  "a" ] && [ "${stage}" !=  "c" ]
+then
+        usage_msg
+        _err_msg_="Active phase, historic phase or cleanup phase must be indicated by the stage flag(-s). The stage flag was set to {${stage}}."
+        abort_script "$_err_msg_"
+fi
+
+	
+if [ ! -f /eniq/log/sw_log/iq/completed_historic_stage -a "${stage}" !=  "h" ]
+then
+        _err_msg_="Please complete historic stage before running active stage."
+        abort_script "$_err_msg_"
+fi
+
+log_msg -t -l ${LOGFILE} -h -s "#*************************************************************************************************************************************************************************#"
+log_msg -t -l ${LOGFILE} -h -s "#                                                                    Starting dbfile migration                                                                            #"
+log_msg -t -l ${LOGFILE} -h -s "#*************************************************************************************************************************************************************************#"
+
+if [ "$($PS -ef | $GREP "C2VMigration.bsh" | $GREP -v $GREP | $GREP -v $$)" ]
+then
+        _err_msg_="Script running already. Exiting...."
+        abort_script "$_err_msg_"
+fi
+
+if [ -f /eniq/log/sw_log/iq/tail_exit ]
+then
+        $RM -f /eniq/log/sw_log/iq/tail_exit
+        if [ $? -ne 0 ]
+        then
+                $ECHO "failed to remove tail exit flagfile. Exiting script"
+                exit 1
+        fi
+fi
+
+if [ "$stage" == "c" ]
+then
+                log_msg -t -l ${LOGFILE} -h -s "#*************************************************************************************************************************************************************************#"
+                log_msg -t -l ${LOGFILE} -h -s "#                                            Removing tempoaray tables created during procedure.                                         #"
+                clean_up
+                log_msg -t -l ${LOGFILE} -h -s "#*************************************************************************************************************************************************************************#\n"
+fi
+
+# ********************************************************************
+#       Section to create table_move_status table if does not exist.
+# ********************************************************************
+log_msg -t -l ${LOGFILE} -s "Initialising Table move status table"
+
+${DBISQL} @${_connection_string_enc} "
+IF (select count(*) from sysserver where srvname like 'remote_repdb') = 0
+BEGIN
+   create server remote_repdb class 'asaodbc' using 'Driver=libdbodbc16_r.so;CommLinks=tcpip(host=repdb:2641);ServerName=repdb'
+END;
+
+IF (select count(*) from systab where table_name like 'remote_DWHPartition') = 0
+BEGIN
+        create existing table dc.remote_DWHPartition
+         (
+          STORAGEID VARCHAR(255) NOT NULL,
+          TABLENAME VARCHAR(255) NOT NULL,
+          STARTTIME TIMESTAMP,
+          ENDTIME TIMESTAMP,
+          STATUS VARCHAR(10) NOT NULL,
+          LOADORDER INT
+          )  at 'remote_repdb.repdb.dwhrep.DWHPartition'
+end;
+
+
+IF (select count(*) from systab where table_name like 'remote_DWHType') = 0
+BEGIN
+     create existing table dc.remote_DWHType
+            (
+                TECHPACK_NAME VARCHAR(30) NOT NULL,
+                TYPENAME VARCHAR(255) NOT NULL,
+                TABLELEVEL VARCHAR(50) NOT NULL,
+                STORAGEID VARCHAR(255) NOT NULL,
+                PARTITIONSIZE NUMERIC(9,0) NOT NULL,
+                PARTITIONCOUNT NUMERIC(9,0),
+                STATUS VARCHAR(50) NOT NULL,
+                TYPE VARCHAR(50) NOT NULL,
+                OWNER VARCHAR(50),
+                VIEWTEMPLATE VARCHAR(255) NOT NULL,
+                CREATETEMPLATE VARCHAR(255) NOT NULL,
+                NEXTPARTITIONTIME TIMESTAMP,
+                BASETABLENAME VARCHAR(125) NOT NULL,
+                DATADATECOLUMN VARCHAR(128),
+                PUBLICVIEWTEMPLATE VARCHAR(255),
+                PARTITIONPLAN VARCHAR(128)
+            ) at 'remote_repdb.repdb.dwhrep.DWHType'
+end;
+
+
+IF (select count(*) from systab where table_name like 'table_move_status') = 0
+BEGIN
+        create table dc.table_move_status
+        (
+        Owner varchar(30),
+        Tablename varchar(255),
+        TP varchar(255),
+        Status varchar(10),
+        StartTime TIMESTAMP null,
+        FinishTime TIMESTAMP null
+        )
+end;" > /dev/null 2>>${LOGFILE}
+
+
+if [ $? -ne 0 ]; then
+        _err_msg_="Could not create table_move_status table"
+        abort_script "$_err_msg_"
+fi
+
+# ********************************************************************
+#       Section populate table_move_status table if count is non-zero
+# ********************************************************************
+log_msg -t -l ${LOGFILE} -s "Creating entries for tables that do not have an entry already in the move status table. This can take some time."
+
+${DBISQL} @${_connection_string_enc} "
+SELECT
+            u.user_name,tab.table_name,dwhT.TECHPACK_NAME,'unmoved,'
+        FROM
+            systab tab,
+            sysuser u,
+            sysdbspace dbs,
+            dc.remote_DWHType dwhT,
+            dc.remote_DWHPartition dwhp
+        WHERE
+            tab.table_type_str LIKE 'base'
+        AND u.user_name NOT LIKE 'sys'
+        AND u.user_id=tab.creator
+        AND dbs.dbspace_name LIKE 'IQ_MAIN'
+        AND tab.dbspace_id=dbs.dbspace_id
+        and dwht.STORAGEID=dwhp.STORAGEID
+        and dwhp.tablename=tab.table_name
+        and tab.table_name not in (select tablename from dc.table_move_status)
+union all
+        SELECT
+            u.user_name,LEFT(tab.table_name, LEN(tab.table_name) - 3)||'_CALC' as tablename,dwhT.TECHPACK_NAME,'unmoved,'
+        FROM
+            systab tab ,
+            sysuser u,
+            sysdbspace dbs,
+            dc.remote_DWHType dwhT,
+            dc.remote_DWHPartition dwhp
+        WHERE
+            tab.table_type_str LIKE 'base'
+        AND u.user_id=tab.creator
+        AND dbs.dbspace_name LIKE 'IQ_MAIN'
+        AND tab.dbspace_id=dbs.dbspace_id
+        and dwht.STORAGEID=dwhp.STORAGEID
+        and dwhp.tablename=tab.table_name
+        and tab.table_name not like 'table_move_status'
+        and tab.table_name like '%|_DAYBH|_%' escape '|'
+        AND tab.table_name IN
+            (
+                SELECT
+                    tablename
+                FROM
+                    dc.remote_DWHPartition)
+        and tab.table_name not in (select tablename from dc.table_move_status)
+        group by  u.user_name,tablename,dwhT.TECHPACK_NAME
+union all
+SELECT
+    u.user_name,tab.table_name,'cust','unmoved,'
+FROM
+    systab tab ,
+    sysuser u,
+    sysdbspace dbs
+WHERE
+    tab.table_type_str LIKE 'base'
+AND u.user_name NOT LIKE 'sys'
+AND u.user_id=tab.creator
+AND dbs.dbspace_name LIKE 'IQ_MAIN'
+AND tab.dbspace_id=dbs.dbspace_id
+AND tab.table_name NOT IN
+    (
+        SELECT
+            tablename
+        FROM
+            dc.remote_DWHPartition)
+AND tab.table_name NOT LIKE 'table_move_status'
+AND tab.table_name NOT LIKE'%_|__%|_CALC' ESCAPE '|'
+and tab.table_name not in (select tablename from dc.table_move_status);
+OUTPUT TO \"/tmp/migrateDb/temp_move_status_table_load.sql\" FORMAT ASCII ;" > /dev/null 2>>${LOGFILE}
+temp_load_file_ec="$?"
+
+$CAT ${TMPDIR}/temp_move_status_table_load.sql | $SED "s/'//g" > ${TMPDIR}/move_status_table_load.sql
+load_file_ec="$?"
+
+
+${DBISQL} @${_connection_string_enc} "LOAD TABLE dc.table_move_status (Owner, Tablename, TP, Status)
+from '/tmp/migrateDb/move_status_table_load.sql'
+ESCAPES OFF
+QUOTES off
+DELIMITED BY ','
+WITH CHECKPOINT OFF ;" > /dev/null 2>>${LOGFILE}
+load_ec="$?"
+
+$RM -f ${TMPDIR}/temp_move_status_table_load.sql ${TMPDIR}/move_status_table_load.sql
+
+if [ $temp_load_file_ec -ne 0 -o $load_file_ec -ne 0 -o $load_ec -ne 0  ]; then
+        _err_msg_="Failed to populate the data in create table_move_status table."
+        abort_script "$_err_msg_"
+fi
+
+# ********************************************************************
+#       Section to log dwhdb.iqmsg for this run
+# ********************************************************************
+run_iqmsg="/eniq/log/sw_log/iq/move_table_from_file_dwhdb.iqmsg"
+iqmsg="/eniq/local_logs/iq/dwhdb.iqmsg"
+
+$TOUCH ${run_iqmsg}
+$ECHO "" > ${run_iqmsg}
+IO=$($LS -i "${iqmsg}" | $AWK '{print $1}')
+$TAIL -f  ${iqmsg} >> ${run_iqmsg} &
+
+
+tail_rotating_Log  ${IO} ${run_iqmsg} ${iqmsg} &
+
+# ********************************************************************
+#       Section to get TP list.
+# ********************************************************************
+${DBISQL} @${_connection_string_enc} -q "select distinct tp from dc.table_move_status where status not like 'moved' order by tp asc;OUTPUT TO \"${TMPDIR}/tp_list.txt\" HEXADECIMAL ASIS FORMAT TEXT"
+if [ $? -ne 0 ]; then
+        _err_msg_="Could not generate TP list"
+        abort_script "$_err_msg_"
+fi
+
+TP_LIST_ARRAY=($(${CAT} ${TMPDIR}/tp_list.txt |  $SED "s/'//g"))
+$RM -f  ${TMPDIR}/tp_list.txt
+
+# ********************************************************************
+#       Section to move tables tables
+# ********************************************************************
+num=${#TP_LIST_ARRAY[@]}
+log_msg -t -l ${LOGFILE} -s "Starting dbfile migration. ${num} Techpacks to be moved."
+
+for tp in "${TP_LIST_ARRAY[@]}"
+do
+        #Commenting below code as this is executed as a part of documentation
+        # if [ "${tp}" != "cust" ]
+        # then
+                # if [ "${stage}" == "a" ]
+                # then
+                        # log_msg -t -l ${LOGFILE} -s "Starting dbfile migration for ${tp} during active stage. Disabling the techpack."
+                        # engine -e disableSet ${tp} -d > /dev/null 2>>${LOGFILE}
+                        # if [ $? -ne 0 ]; then
+                                # _err_msg_="Failed to disable techpack ${tp}."
+                                # abort_script "$_err_msg_"
+                        # fi
+                        # scheduler restart > /dev/null 2>>${LOGFILE}
+                        # if [ $? -ne 0 ]; then
+                                # _err_msg_="Failed to restart the scheduler after disabling for ${tp}."
+                                # abort_script "$_err_msg_"
+                        # fi
+                # fi
+        # fi
+
+
+    ${DBISQL} @${_connection_string_enc} -q "SELECT owner||'.'||tablename FROM dc.table_move_status WHERE Status not like 'moved' and TP like '${tp}';OUTPUT TO \"${TMPDIR}/${tp}_table_list.txt\" HEXADECIMAL ASIS FORMAT TEXT"
+        if [ $? -ne 0 ]; then
+                log_msg -t -l ${LOGFILE} -s "Failed to retrieve table list for ${tp}, continuing..."
+                continue
+        fi
+
+        TABLE_LIST_PER_TP_ARRAY=($(${CAT} ${TMPDIR}/${tp}_table_list.txt |  $SED "s/'//g"))
+        $RM -f  ${TMPDIR}/${tp}_table_list.txt
+
+
+
+
+        count_table_move=0
+        for table in "${TABLE_LIST_PER_TP_ARRAY[@]}"
+        do
+                while [ 1 = 1 ]
+                do
+                        Pruns=$($FIND ${TMPDIR} -name "ExtTabSql*"| wc -l)
+                        if [ $Pruns -le $MAXPARALLEL ]
+                        then
+                                sp_iqmovetablefromfile "${table}" "${stage}"  "${tp}" &
+                                let count_table_move=$count_table_move+1
+                                if  ! (( count_table_move % 20 ))
+                                then
+                                        log_msg -t -l ${LOGFILE} -s "${count_table_move} of ${#TABLE_LIST_PER_TP_ARRAY[@]} tables checked for move for ${tp} techpack."
+
+                                fi
+                                break
+                        else
+                                $SLEEP 5
+                        fi
+                done
+        done
+
+
+        while [ 1 = 1 ]
+        do
+                Pruns=$($FIND ${TMPDIR} -name "ExtTabSql*"| wc -l)
+                if [ $Pruns -eq 0 ]
+                then
+                        break
+                else
+                        log_msg -t -l ${LOGFILE} -s "${Pruns} tables left to complete move for ${tp}."
+                        $SLEEP 5
+
+
+                fi
+
+        done
+
+        #Commenting below code as this is executed as a part of documentation
+        # if [ "${tp}" != "cust" ]
+        # then
+                # if [ "${stage}" == "a" ]
+                # then
+                        # log_msg -t -l ${LOGFILE} -s "Re-enabling the techpack ${tp}"
+                        # engine -e enableSet ${tp} -d > /dev/null 2>>${LOGFILE}
+                        # if [ $? -ne 0 ]; then
+                                # _err_msg_="Failed to enable techpack ${tp}."
+                                # abort_script "$_err_msg_"
+                        # fi
+                # fi
+        #fi
+
+
+
+done
+
+#Commenting below code as this is executed as a part of documentation
+# if [ "${stage}" == "a" ]
+# then
+        # scheduler restart > /dev/null 2>>${LOGFILE}
+        # if [ $? -ne 0 ]; then
+               # _err_msg_="Failed to restart the scheduler."
+               # abort_script "$_err_msg_"
+        # fi
+# fi
+
+# ********************************************************************
+#       Section to update move status table for moves that failed due to loads to table.
+# ********************************************************************
+
+
+pid=$($PS -ef | $GREP $TAIL | $GREP -v $GREP | $GREP dwhdb.iqmsg | $AWK '{print $2}')
+$KILL -9 ${pid}  2>&1 > /dev/null
+check_failed_moves_due2load ${run_iqmsg}
+$RM -f ${run_iqmsg} 2>&1 > /dev/null
+
+num_not_moved=$(${DBISQL} @${_connection_string_enc} "select count(*) from dc.table_move_status where status not in ('moved','active')" | $SED '1,2d' | $GREP -v "row" | $GREP -v "Execution time" | $SED 's/[^0-9]*//g')
+$TOUCH /eniq/log/sw_log/iq/tail_exit
+if [ $num_not_moved -ge 1 ]
+then
+        if [ "$stage" == "h" ]
+        then
+
+        #At the end of the historic phase, if there are 50 or more number of tables in failed state,
+        #then user has to rerun Historic mode.
+        #If there are less than 50 number of tables in failed state, then user can proceed to active run.
+        #The active run would move the failed tables.
+
+                if [ $num_not_moved -ge 50 ]
+                then
+                        log_msg -t -l ${LOGFILE} -h -s "#*************************************************************************************************************************************************************************#"
+                        log_msg -t -l ${LOGFILE} -h -s "#                                 A number of tables (${num_not_moved}) still need to be moved, please rerun $0 in historic mode.                                         #"
+                        log_msg -t -l ${LOGFILE} -h -s "#*************************************************************************************************************************************************************************#\n"
+                else
+                        log_msg -t -l ${LOGFILE} -h -s "#*************************************************************************************************************************************************************************#"
+
+                        log_msg -t -l ${LOGFILE} -h -s "#                                            Please continue with the $0 in active mode.                                                                                  #"
+                        log_msg -t -l ${LOGFILE} -h -s "#*************************************************************************************************************************************************************************#\n"
+                        $TOUCH /eniq/log/sw_log/iq/completed_historic_stage
+                fi
+        else
+                log_msg -t -l ${LOGFILE} -h -s "#*************************************************************************************************************************************************************************#"
+                log_msg -t -l ${LOGFILE} -h -s "#                                 A number of tables (${num_not_moved}) still need to be moved, please rerun $0 in active mode.                                          #"
+                log_msg -t -l ${LOGFILE} -h -s "#*************************************************************************************************************************************************************************#\n"
+		
+        fi
+else
+        if [ "$stage" == "h" ]
+        then
+                log_msg -t -l ${LOGFILE} -h -s "#*************************************************************************************************************************************************************************#"
+                log_msg -t -l ${LOGFILE} -h -s "#                                            All tables moved for the historic mode, please continue with the $0 in active mode.                                         #"
+                log_msg -t -l ${LOGFILE} -h -s "#*************************************************************************************************************************************************************************#\n"
+                $TOUCH /eniq/log/sw_log/iq/completed_historic_stage
+        else
+                log_msg -t -l ${LOGFILE} -h -s "#*************************************************************************************************************************************************************************#"
+                log_msg -t -l ${LOGFILE} -h -s "#                                            All tables moved for active mode, please continue with the procedure.                                                        #"
+                log_msg -t -l ${LOGFILE} -h -s "#*************************************************************************************************************************************************************************#\n"
+        fi
+
+fi
+
+

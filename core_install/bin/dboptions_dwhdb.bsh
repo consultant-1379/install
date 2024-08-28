@@ -1,0 +1,696 @@
+#!/bin/bash
+# ********************************************************************
+# Ericsson Radio Systems AB                                     SCRIPT
+# ********************************************************************
+#
+# (c) Ericsson Radio Systems AB 2020 - All rights reserved.
+#
+# The copyright to the computer program(s) herein is the property
+# of Ericsson Radio Systems AB, Sweden. The programs may be used
+# and/or copied only with the written permission from Ericsson Radio
+# Systems AB or in accordance with the terms and conditions stipulated
+# in the agreement/contract under which the program(s) have been
+# supplied.
+#
+# ********************************************************************
+# Name    : dboptions_dwhdb.bsh
+# Date    : 12/01/2021
+# Revision: main\33
+# Purpose : Setup the dwhdb database options
+#
+# Usage   : dboptions_dwhdb.bsh -c <path_to_cli_conf> -d <niq.ini_file_location>
+#                [-l <logfile>]
+#
+# ********************************************************************
+#
+#   Command Section
+#
+# ********************************************************************
+BASENAME=/usr/bin/basename
+CAT=/usr/bin/cat
+DATE=/usr/bin/date
+DIRNAME=/usr/bin/dirname
+ECHO='/usr/bin/echo -e'
+EGREP=/usr/bin/egrep
+OPENSSL=/usr/bin/openssl
+RM=/usr/bin/rm
+SED=/usr/bin/sed
+SU=/usr/bin/su
+TEE=/usr/bin/tee
+TOUCH=/usr/bin/touch
+
+# ********************************************************************
+#
+#   Functions
+#
+# ********************************************************************
+
+### Function: abort_script ###
+#
+#   This will is called if the script is aborted through an error
+#   signal sent by the kernel such as CTRL-C or if a serious
+#   error is encountered during runtime
+#
+# Arguments:
+#       $1 - Error message from part of program (Not always used)
+# Return Values:
+#       none
+abort_script()
+{
+_err_time_="`$DATE +%d.%m.%y_%H:%M:%S`"
+if [ "$1" ]; then
+    _err_msg_=$1
+else
+    _err_msg_="${_err_time_} - ERROR : Script aborted.......\n"
+fi
+
+if [ "${LOGFILE}" ]; then
+    $ECHO "\n${_err_time_} - ERROR : $_err_msg_\n" | $TEE -a ${LOGFILE}
+else
+    $ECHO "\n${_err_time_} - ERROR : $_err_msg_\n"
+fi
+$RM -rf ${DWH_CONN_STR_USER_DBA_ENC}
+$RM -rf ${rep_connection_string_ENC}
+exit 55
+}
+
+### Function: create_sql_file ###
+#
+# Create the dwhdb SQL file
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+create_sql_file()
+{
+$SED -e "/@@dc_passwd@@/s||${DC_PASSWD}|g" ${ENIQ_ADMIN_DIR}/sql/create_users_dwhdb.sql > ${ENIQ_ADMIN_DIR}/sql/create_users_dwhdb.1.sql
+$SED -e "/@@dcbo_passwd@@/s||${DCBO_PASSWD}|g" ${ENIQ_ADMIN_DIR}/sql/create_users_dwhdb.1.sql > ${ENIQ_ADMIN_DIR}/sql/create_users_dwhdb.2.sql
+$SED -e "/@@dcpublic_passwd@@/s||${DCPUBLIC_PASSWD}|g" ${ENIQ_ADMIN_DIR}/sql/create_users_dwhdb.2.sql >  ${ENIQ_ADMIN_DIR}/sql/create_users_dwhdb.3.sql
+}
+
+### Function: get_absolute_path ###
+#
+# Determine absolute path to software
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+get_absolute_path()
+{
+_dir_=`$DIRNAME $0`
+SCRIPTHOME=`cd $_dir_ 2>/dev/null && pwd || $ECHO $_dir_`
+}
+
+### Function: setup_variables ###
+#
+# Set up some script variables
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+setup_variables()
+{
+
+TEM_DIR=/var/tmp
+SUNOS_INI=SunOS.ini
+DWH_PORT=`iniget DWH -v PortNumber -f ${ENIQ_INI}`
+DWH_NAME=`iniget DWH -v ServerName -f ${ENIQ_INI}`
+if [ ! "${DWH_PORT}" -o ! "${DWH_NAME}" ]; then
+    _err_msg_="Could not read DB values from ${ENIQ_INI}"
+    abort_script "$_err_msg_"
+fi
+
+DBA_PASSWORD=`inigetpassword DB -f ${ENIQ_INI} -v DBAPassword`
+if [ ! ${DBA_PASSWORD} ]; then
+    if [ -f ${ENIQ_BASE_DIR}/sw/installer/dbusers ]; then
+        DBA_PASSWORD=`${ENIQ_BASE_DIR}/sw/installer/dbusers dba dwh`
+        if [ ! "${DBA_PASSWORD}" ] ; then
+            _err_msg_="`$DATE +%d.%m.%y_%H:%M:%S` - Could not get dwhdb DBA Password"
+            abort_script "$_err_msg_"
+        fi
+    else
+        _err_msg_="`$DATE +%d.%m.%y_%H:%M:%S` - Could not get dwhdb DBA Password"
+        abort_script "$_err_msg_"
+    fi
+fi
+
+
+DWH_CONN_STR_USER_DBA="-c \"uid=dba;pwd=${DBA_PASSWORD};eng=${DWH_NAME};links=tcpip{host=${DWH_NAME};port=${DWH_PORT};dobroadcast=no;verify=no}\""
+DWH_CONN_STR_USER_DBA_ENC=/tmp/conn_str_encrypt.`uuidgen`
+
+# get the encrypted connection string.
+get_encrypt_file "${DWH_CONN_STR_USER_DBA}" "${DWH_CONN_STR_USER_DBA_ENC}"
+
+REP_PORT=`iniget REP -v PortNumber -f ${ENIQ_INI}`
+REP_ENG=`iniget REP -v ServerName -f ${ENIQ_INI}`
+if [ ! "${REP_PORT}" -o ! "${REP_ENG}" ]; then
+        _err_msg_="Could not read db values from ${CLI_CONF_DIR}/${ENIQ_INI}"
+        abort_script "$_err_msg_"
+fi
+
+#Initialising the connection string for repdb
+rep_connection_string="-nogui -onerror exit -c \"eng=${REP_ENG};links=tcpip{host=localhost;port=${REP_PORT}};uid=dba;pwd=${DBA_PASSWORD}\""
+rep_connection_string_ENC=/tmp/con_str_encrypt.`uuidgen`
+# get the encrypted connection string.
+get_encrypt_file "${rep_connection_string}" "${rep_connection_string_ENC}"
+
+DC_PASSWD=`inigetpassword DWH -v DCPassword -f ${ENIQ_INI}`
+if [ ! ${DC_PASSWD} ]; then
+    if [ -f ${ENIQ_BASE_DIR}/sw/installer/dbusers ]; then
+        DC_PASSWD=`${ENIQ_BASE_DIR}/sw/installer/dbusers dc dwh`
+        if [ ! "${DC_PASSWD}" ] ; then
+            _err_msg_="`$DATE +%d.%m.%y_%H:%M:%S` - Could not get DC Password"
+            abort_script "$_err_msg_"
+        fi
+    else
+        _err_msg_="`$DATE +%d.%m.%y_%H:%M:%S` - Could not get DC Password"
+        abort_script "$_err_msg_"
+    fi
+fi
+
+DCBO_PASSWD=`inigetpassword DWH -v DCBOPassword -f ${ENIQ_INI}`
+if [ ! ${DCBO_PASSWD} ]; then
+    if [ -f ${ENIQ_BASE_DIR}/sw/installer/dbusers ]; then
+        DCBO_PASSWD=`${ENIQ_BASE_DIR}/sw/installer/dbusers dcbo dcbo`
+        if [ ! "${DCBO_PASSWD}" ] ; then
+            _err_msg_="`$DATE +%d.%m.%y_%H:%M:%S` - Could not get DCBO Password"
+            abort_script "$_err_msg_"
+        fi
+    else
+        _err_msg_="`$DATE +%d.%m.%y_%H:%M:%S` - Could not get DCBO Password"
+        abort_script "$_err_msg_"
+    fi
+fi
+
+
+DCPUBLIC_PASSWD=`inigetpassword DWH -v DCPUBLICPassword -f ${ENIQ_INI}`
+if [ ! ${DCPUBLIC_PASSWD} ]; then
+    if [ -f ${ENIQ_BASE_DIR}/sw/installer/dbusers ]; then
+        DCPUBLIC_PASSWD=`${ENIQ_BASE_DIR}/sw/installer/dbusers dcpublic dcpublic`
+        if [ ! "${DCPUBLIC_PASSWD}" ] ; then
+            _err_msg_="`$DATE +%d.%m.%y_%H:%M:%S` - Could not get DCPUBLIC Password"
+            abort_script "$_err_msg_"
+        fi
+    else
+        _err_msg_="`$DATE +%d.%m.%y_%H:%M:%S` - Could not get DCPUBLIC Password"
+        abort_script "$_err_msg_"
+    fi
+fi
+
+if [ -f ${ENIQ_CONF_DIR}/extra_params/deployment ]; then
+    _deployment_=`$CAT ${ENIQ_CONF_DIR}/extra_params/deployment`
+    if [ "${_deployment_}" == "ft" -o "${_deployment_}" == "small" ]; then
+        MAX_UNUSED=10
+        MAX_CONNECTION=35
+    else
+        MAX_UNUSED=10
+        MAX_CONNECTION=100
+    fi
+fi
+
+if [ ! "${DC_PASSWD}" -o ! "${DCBO_PASSWD}" -o ! "${DCPUBLIC_PASSWD}" ]; then
+    _err_msg_="Could not read DB values from ${ENIQ_INI}"
+    abort_script "$_err_msg_"
+fi
+
+CURR_SERVER_TYPE=`$CAT $ENIQ_CONF_DIR/installed_server_type | $EGREP -v '^[[:blank:]]*#' | $SED -e 's/ //g'`
+
+# Get the System User and Group. All directories are owned by this
+SYSUSER=`iniget ENIQ_INSTALL_CONFIG -f ${ENIQ_CONF_DIR}/${SUNOS_INI} -v ENIQ_SYSUSER`
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not read SYSUSER param from ${ENIQ_CONF_DIR}/${SUNOS_INI}"
+    abort_script "$_err_msg_"
+fi
+
+SYSGRP=`$ID ${SYSUSER}|$AWK '{print $2}'|$AWK -F\( '{print $2}'|$AWK -F\) '{print $1}'`
+if [ ! "${SYSGRP}" ]; then
+    _err_msg_="Could not read SYSGRP param from ${ENIQ_CONF_DIR}/${SUNOS_INI}"
+    abort_script "$_err_msg_"
+fi
+
+}
+
+### Function: upgrade_dboptions_file ###
+#
+# Upgrade the dboptions file if required
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+upgrade_dboptions_file()
+{
+local _upd_hash_req_=0
+local _upd_dml_req_=0
+
+log_msg -s "Updating dwhdb_dboptions.sql file" -l ${LOGFILE}
+
+# Read the number of HASH ROWS from ini file
+_temp_cache_=`iniget DWH -v TempCache -f ${ENIQ_INI}`
+if [ ! "${_temp_cache_}" ]; then
+    _err_msg_="Could not read temp cache value from ${ENIQ_INI} for setting Max_Hash_Rows"
+    abort_script "$_err_msg_"
+fi
+
+# Test for numeric
+$ECHO ${_temp_cache_}|$EGREP '[^0-9]' >> /dev/null 2>&1
+if [ $? -eq 0 ]; then
+    _err_msg_="Non-numeric value read for Temp Cache parameter from ${ENIQ_INI}"
+    abort_script "$_err_msg_"
+fi
+
+_main_cache_=`iniget DWH -v MainCache -f ${ENIQ_INI}`
+if [ ! "${_main_cache_}" ]; then
+    _err_msg_="Could not read main cache value from ${ENIQ_INI} for setting Max_Hash_Rows"
+    abort_script "$_err_msg_"
+fi
+
+# Test for numeric
+$ECHO ${_main_cache_}|$EGREP '[^0-9]' >> /dev/null 2>&1
+if [ $? -eq 0 ]; then
+    _err_msg_="Non-numeric value read for Main Cache parameter from ${ENIQ_INI}"
+    abort_script "$_err_msg_"
+fi
+
+# Multiply by factor 
+MAXHASHROWS=$(( ((_temp_cache_+_main_cache_)/4096)*2500000 ))                 # MAXHASHROWS = ((MainCache+TempCache)/4096) * 2500000  
+
+$RM -f ${ENIQ_ADMIN_DIR}/sql/dboptions_dwhdb.1.sql
+$CAT ${ENIQ_ADMIN_DIR}/sql/dboptions_dwhdb.sql | $SED -e "s|@@max_unused@@|${MAX_UNUSED}|g" -e "s|@@max_connection@@|${MAX_CONNECTION}|g" \
+                        -e "s|@@max_hash_rows@@|${MAXHASHROWS}|g" > ${ENIQ_ADMIN_DIR}/sql/dboptions_dwhdb.1.sql
+if [ $? -ne 0 ] ; then
+    _err_msg_="`$DATE +%d.%m.%y_%H:%M:%S` - Failed to update the ${ENIQ_ADMIN_DIR}/sql/dboptions_dwhdb.1.sql file"
+    abort_script "$_err_msg_"
+fi
+
+DropConnectionTimeout=`iniget DWH -v QueryUserDropConnectionTimeout -f ${ENIQ_INI}`
+if [ ! "${DropConnectionTimeout}" ]; then
+    DropConnectionTimeout=720
+fi
+
+# Test for numeric
+$ECHO ${DropConnectionTimeout}|$EGREP '[^0-9]' >> /dev/null 2>&1
+if [ $? -eq 0 ]; then
+    _err_msg_="Non-numeric value read for timeout to drop idle Query users from ${ENIQ_INI}"
+    abort_script "$_err_msg_"
+fi
+
+$RM -f ${ENIQ_ADMIN_DIR}/sql/create_dropIdle_dcpublic_dcbo_Connections.1.sql
+$CAT ${ENIQ_ADMIN_DIR}/sql/create_dropIdle_dcpublic_dcbo_Connections.sql | $SED -e "s|@@timeout@@|${DropConnectionTimeout}|g"  > ${ENIQ_ADMIN_DIR}/sql/create_dropIdle_dcpublic_dcbo_Connections.1.sql
+if [ $? -ne 0 ] ; then
+    _err_msg_="`$DATE +%d.%m.%y_%H:%M:%S` - Failed to update the ${ENIQ_ADMIN_DIR}/sql/create_dropIdle_dcpublic_dcbo_Connections.1.sql file"
+    abort_script "$_err_msg_"
+fi
+
+
+$RM -f ${ENIQ_ADMIN_DIR}/sql/create_dropIdle_customized_users_Connections.1.sql
+$CAT ${ENIQ_ADMIN_DIR}/sql/create_dropIdle_customized_users_Connections.sql | $SED -e "s|@@timeout@@|${DropConnectionTimeout}|g"  > ${ENIQ_ADMIN_DIR}/sql/create_dropIdle_customized_users_Connections.1.sql
+if [ $? -ne 0 ] ; then
+    _err_msg_="`$DATE +%d.%m.%y_%H:%M:%S` - Failed to update the ${ENIQ_ADMIN_DIR}/sql/create_dropIdle_customized_users_Connections.1.sql file"
+    abort_script "$_err_msg_"
+fi
+
+# Create sql for dropping idle dc user connections
+DcDropConnectionTimeout=`iniget DWH -v DcUserDropConnectionTimeout -f ${ENIQ_INI}`
+if [ ! "${DcDropConnectionTimeout}" ]; then
+    DcDropConnectionTimeout=360
+fi
+
+# Test for numeric
+$ECHO ${DcDropConnectionTimeout}|$EGREP '[^0-9]' >> /dev/null 2>&1
+if [ $? -eq 0 ]; then
+    _err_msg_="Non-numeric value read for timeout to drop idle dc users from ${ENIQ_INI}"
+    abort_script "$_err_msg_"
+fi
+
+$RM -f ${ENIQ_ADMIN_DIR}/sql/create_dropIdle_dc_Connections.1.sql
+$CAT ${ENIQ_ADMIN_DIR}/sql/create_dropIdle_dc_Connections.sql | $SED -e "s|@@timeout@@|${DcDropConnectionTimeout}|g"  > ${ENIQ_ADMIN_DIR}/sql/create_dropIdle_dc_Connections.1.sql
+if [ $? -ne 0 ] ; then
+    _err_msg_="`$DATE +%d.%m.%y_%H:%M:%S` - Failed to update the ${ENIQ_ADMIN_DIR}/sql/create_dropIdle_dc_Connections.1.sql file"
+    abort_script "$_err_msg_"
+fi
+}
+
+### Function: update_IQ_UserPwd_History_table ###
+#
+# update the IQ_UserPwd_History_table with new password entry for the database user
+#
+# Arguments: none
+#
+# Return Values: none
+update_IQ_UserPwd_History_table()
+{
+DBA_PASSWORD_ENC=$($ECHO $DBA_PASSWORD | $OPENSSL enc -base64)
+DC_PASSWD_ENC=$($ECHO $DC_PASSWD | $OPENSSL enc -base64)
+DCBO_PASSWD_ENC=$($ECHO $DCBO_PASSWD | $OPENSSL enc -base64)
+DCPUBLIC_PASSWD_ENC=$($ECHO $DCPUBLIC_PASSWD | $OPENSSL enc -base64)
+if [ -f ${ENIQ_ADMIN_DIR}/sql/insert_IQ_UserPwd_History.sql ]; then
+        rm -rf ${ENIQ_ADMIN_DIR}/sql/insert_IQ_UserPwd_History.sql
+        if [ $? -ne 0 ];    then
+            _err_msg_="Failed to remove ${ENIQ_ADMIN_DIR}/sql/insert_IQ_UserPwd_History.sql"
+            abort_script "$_err_msg_"
+        fi
+    else 
+        touch ${ENIQ_ADMIN_DIR}/sql/insert_IQ_UserPwd_History.sql 
+        $ECHO "insert into dba.IQ_UserPwd_History (user_name,password,password_creation_time,password_encrypted) values ('dba','${DBA_PASSWORD_ENC}',getdate(),'Y'); 
+        insert into dba.IQ_UserPwd_History (user_name,password,password_creation_time,password_encrypted) values ('dc','${DC_PASSWD_ENC}',getdate(),'Y');
+        insert into dba.IQ_UserPwd_History (user_name,password,password_creation_time,password_encrypted) values ('dcbo','${DCBO_PASSWD_ENC}',getdate(),'Y');
+        insert into dba.IQ_UserPwd_History (user_name,password,password_creation_time,password_encrypted) values ('dcpublic','${DCPUBLIC_PASSWD_ENC}',getdate(),'Y');" > ${ENIQ_ADMIN_DIR}/sql/insert_IQ_UserPwd_History.sql
+    fi
+    
+    ${IQDIR}/bin64/dbisql  @$rep_connection_string_ENC ${ENIQ_ADMIN_DIR}/sql/insert_IQ_UserPwd_History.sql >/dev/null 2>&1
+    if [ $? -ne 0 ];    then
+        _err_msg_="Failed to update IQ_UserPwd_History_table "
+        abort_script "$_err_msg_"
+    else
+        log_msg -s "Successfully updated IQ_UserPwd_History_table"
+    fi
+    
+    if [ -f ${ENIQ_ADMIN_DIR}/sql/insert_IQ_UserPwd_History.sql ]; then
+        rm -rf ${ENIQ_ADMIN_DIR}/sql/insert_IQ_UserPwd_History.sql
+        if [ $? -ne 0 ];    then
+            _err_msg_="Failed to remove ${ENIQ_ADMIN_DIR}/sql/insert_IQ_UserPwd_History.sql"
+            abort_script "$_err_msg_"
+        fi
+    else 
+        log_msg -s "Successfully removed ${ENIQ_ADMIN_DIR}/sql/insert_IQ_UserPwd_History.sql"
+    fi
+    
+}
+
+### Function: usage_msg ###
+#
+# Usage message
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+usage_msg()
+{
+$ECHO "
+Usage: `$BASENAME $0` -l <logfile> -c <conf dir> -d <niq.ini file>
+
+options:
+
+-l : Logfile to be used.
+
+-c : Conf dir where niq.rc resides
+
+-d : Path to the DWH.ini file.
+"
+}
+
+# ********************************************************************
+#
+#   Main body of program
+#
+# ********************************************************************
+#
+# Determine absolute path to software
+get_absolute_path
+
+while getopts ":l:c:d:" arg; do
+    case $arg in
+    l) LOGFILE="$OPTARG"
+       ;;
+    c) CONF_DIR="$OPTARG"
+       ;;
+    d) ENIQ_INI="$OPTARG"
+       ;;
+    \?) usage_msg
+       exit 1
+    ;;
+    esac
+done
+shift `expr $OPTIND - 1`
+
+# Source the common functions
+if [ -s $SCRIPTHOME/../lib/common_functions.lib ]; then
+    . $SCRIPTHOME/../lib/common_functions.lib
+else
+    _err_msg_="File $SCRIPTHOME/../lib/common_functions.lib not found"
+    abort_script "$_err_msg_"
+fi
+
+# Check required files and scripts exist
+if [ ! -s ${CONF_DIR}/niq.rc ]; then
+    _err_msg_="File ${CONF_DIR}/niq.rc not found, or is empty"
+    abort_script "$_err_msg_"
+else
+    log_msg -s "Sourcing ${CONF_DIR}/niq.rc" -l ${LOGFILE}
+    . ${CONF_DIR}/niq.rc
+fi
+
+if [ ! "$LOGFILE" ] ; then
+    LOGFILE=${LOG_DIR}/iq/dboptions_dwhdb_${TIMESTAMP}.log
+fi
+
+if [ -z "$CONF_DIR" ] ; then
+    _err_msg_="${CONF_DIR} is not set"
+    abort_script "$_err_msg_"
+fi
+
+if [ ! -f ${ENIQ_INI} ]; then
+    _err_msg_="${ENIQ_INI} not found, or is empty"
+    abort_script "$_err_msg_"
+fi
+
+if [ ! "${ENIQ_BASE_DIR}" ]; then
+    # Directory on the root filesystem
+    ENIQ_BASE_DIR=/eniq
+fi
+ 
+# Executing IQ sourcing script
+. /${ENIQ_BASE_DIR}/sybase_iq/IQ.sh
+ 
+# ENIQ Admin Directory
+ENIQ_ADMIN_DIR=${ENIQ_BASE_DIR}/admin
+
+# ENIQ CONF Directory
+ENIQ_CONF_DIR=${ENIQ_BASE_DIR}/installation/config
+
+log_msg -s "Setting DWH Database DB options..." -l ${LOGFILE}
+
+# Set up variables
+setup_variables
+
+# Create the SQL
+create_sql_file
+
+log_msg -s "Creating the lock/unlock procedure by executing the sql file ${ENIQ_ADMIN_DIR}/sql/create_proc_lock_unlock.sql" -l ${LOGFILE}
+${IQDIR}/bin64/dbisql @${DWH_CONN_STR_USER_DBA_ENC} -q ${ENIQ_ADMIN_DIR}/sql/create_proc_lock_unlock.sql
+
+log_msg -s "Creating the rebuild index procedure by executing the sql file ${ENIQ_ADMIN_DIR}/sql/rebuild_idx.sql" -l ${LOGFILE}
+${IQDIR}/bin64/dbisql @${DWH_CONN_STR_USER_DBA_ENC} -q ${ENIQ_ADMIN_DIR}/sql/rebuild_idx.sql
+if [ $? -ne 0 ] ; then
+    _err_msg_="Failed to create rebuild index procedure." 
+    abort_script "$_err_msg_"
+fi
+
+# Upgrade the dboptions file if required
+upgrade_dboptions_file
+
+log_msg -s "Setting DB options using ${ENIQ_ADMIN_DIR}/sql/dboptions_dwhdb.1.sql" -l ${LOGFILE}
+${IQDIR}/bin64/dbisql -nogui @${DWH_CONN_STR_USER_DBA_ENC} -q ${ENIQ_ADMIN_DIR}/sql/dboptions_dwhdb.1.sql
+if [ $? -ne 0 ] ; then
+    _err_msg_="DWH Database DB options failed"
+    abort_script "$_err_msg_"
+fi
+
+log_msg -s "Creating DB users using ${ENIQ_ADMIN_DIR}/sql/create_users_dwhdb.3.sql" -l ${LOGFILE}
+${IQDIR}/bin64/dbisql @${DWH_CONN_STR_USER_DBA_ENC} -q ${ENIQ_ADMIN_DIR}/sql/create_users_dwhdb.3.sql
+if [ $? -ne 0 ] ; then
+    _err_msg_="DWH Database user creation failed"
+    abort_script "$_err_msg_"
+fi
+
+log_msg -s "Creating IQ_UserPwd_History table using ${ENIQ_ADMIN_DIR}/sql/create_iq_userpwd_history_table.sql" -l ${LOGFILE}
+${IQDIR}/bin64/dbisql @${rep_connection_string_ENC} -q ${ENIQ_ADMIN_DIR}/sql/create_iq_userpwd_history_table.sql
+if [ $? -ne 0 ] ; then
+    _err_msg_="IQ_UserPwd_History table creation failed"
+    abort_script "$_err_msg_"
+fi
+
+#Updating the IQ_UserPwd_History table
+$RM -f ${TEM_DIR}/UserDetails.txt
+count_chk=`${IQDIR}/bin64/dbisql @${rep_connection_string_ENC} "select count() from dba.IQ_UserPwd_History" | $AWK 'NR==3{print$1}'`
+if [ $count_chk -eq 0 ] ; then
+    log_msg -s "Updating the IQ_UserPwd_History table with database user details" -l ${LOGFILE}
+    update_IQ_UserPwd_History_table
+else 
+    ${IQDIR}/bin64/dbisql @${rep_connection_string_ENC} "select * from dba.IQ_UserPwd_History;OUTPUT TO ${TEM_DIR}/UserDetails.txt APPEND HEXADECIMAL ASIS FORMAT TEXT DELIMITED BY ';' QUOTE '' ;"  >/dev/null 2>&1
+    if [ -f ${TEM_DIR}/UserDetails.txt ];then 
+        while IFS='' read -r line || [[ -n "$line" ]]; do
+            _user_name_=`$ECHO $line | $AWK  -F ";" '{print $1}'`
+            _password_=`$ECHO $line | $AWK -F ";" '{print $2}'`
+            _password_creation_time_=`$ECHO $line | $AWK -F ";" '{print $3}'`
+            _password_encrypted_=`$ECHO $line | $AWK -F ";" '{print $4}'`
+            if [ -z "$_user_name_" ] || [ -z "$_password_" ] || [ -z "$_password_encrypted_" ]; then
+                _err_msg_="Failed to get the details from the database" 
+                abort_script "$_err_msg_" 
+            fi
+
+            if [ $_password_encrypted_ == 'N' ] ;then
+                log_msg -s "Encrypting password of $_user_name_" -l ${LOGFILE}
+                password_enc=$($ECHO $_password_ | $OPENSSL enc -base64)
+                $ECHO "update dba.IQ_UserPwd_History set password = '$password_enc', password_encrypted = 'Y' where password_creation_time= '$_password_creation_time_';" > ${ENIQ_ADMIN_DIR}/sql/update_IQ_UserPwd_History.sql
+
+                ${IQDIR}/bin64/dbisql @$rep_connection_string_ENC ${ENIQ_ADMIN_DIR}/sql/update_IQ_UserPwd_History.sql >/dev/null 2>&1
+                if [ $? -ne 0 ]; then
+                    _err_msg_="Failed to update encrypted passwords for $_user_name_ in IQ_UserPwd_History_table "
+                    abort_script "$_err_msg_"
+                else
+                    log_msg -s "Successfully updated encrypted passwords for $_user_name_ in IQ_UserPwd_History_table" -l ${LOGFILE}
+                fi
+            else
+                continue
+            fi
+
+        done < ${TEM_DIR}/UserDetails.txt
+    else
+        _err_msg_="Could not find ${TEM_DIR}/UserDetails.txt"
+        abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+    fi
+    log_msg -s "IQ_UserPwd_History table contains the latest database user details " -l ${LOGFILE}
+fi
+
+log_msg -s "Setting DB kill idle process using ${ENIQ_ADMIN_DIR}/sql/kill_idle.sql" -l ${LOGFILE}
+${IQDIR}/bin64/dbisql @${DWH_CONN_STR_USER_DBA_ENC} -q ${ENIQ_ADMIN_DIR}/sql/kill_idle.sql
+if [ $? -ne 0 ] ; then
+    _err_msg_="DWH Database kill idle processes failed"
+    abort_script "$_err_msg_"
+fi
+
+log_msg -s "Setting DB show usage using ${ENIQ_ADMIN_DIR}/sql/create_show_dwhdb_usage.sql" -l ${LOGFILE}
+${IQDIR}/bin64/dbisql @${DWH_CONN_STR_USER_DBA_ENC} -q ${ENIQ_ADMIN_DIR}/sql/create_show_dwhdb_usage.sql
+if [ $? -ne 0 ] ; then
+    _err_msg_="DWH Database show usage failed"
+    abort_script "$_err_msg_"
+fi
+
+log_msg -s "Setting dbuser procedures using ${ENIQ_ADMIN_DIR}/sql/create_dbuser_procedures.sql" -l ${LOGFILE}
+${IQDIR}/bin64/dbisql @${DWH_CONN_STR_USER_DBA_ENC} -q ${ENIQ_ADMIN_DIR}/sql/create_dbuser_procedures.sql
+if [ $? -ne 0 ] ; then
+    _err_msg_="DWH Database create dbuser procedures failed"
+    abort_script "$_err_msg_"
+fi
+
+log_msg -s "Creating drop idle dcbo and dcpublic connection procedure using ${ENIQ_ADMIN_DIR}/sql/create_dropIdle_dcpublic_dcbo_Connections.sql" -l ${LOGFILE}
+${IQDIR}/bin64/dbisql @${DWH_CONN_STR_USER_DBA_ENC} -q ${ENIQ_ADMIN_DIR}/sql/create_dropIdle_dcpublic_dcbo_Connections.1.sql
+if [ $? -ne 0 ] ; then
+    _err_msg_="DWH Database create drop idle connection procedure failed"
+    abort_script "$_err_msg_"
+fi
+
+log_msg -s "Creating event to run drop idle connection procedure using ${ENIQ_ADMIN_DIR}/sql/create_event_drop_idle_query_users.sql" -l ${LOGFILE}
+${IQDIR}/bin64/dbisql @${DWH_CONN_STR_USER_DBA_ENC} -q ${ENIQ_ADMIN_DIR}/sql/create_event_drop_idle_query_users.sql
+if [ $? -ne 0 ] ; then
+    _err_msg_="DWH Database create drop idle event failed"
+    abort_script "$_err_msg_"
+fi
+
+log_msg -s "Creating drop idle customized user connection procedure using ${ENIQ_ADMIN_DIR}/sql/create_dropIdle_customized_users_Connections.sql" -l ${LOGFILE}
+${IQDIR}/bin64/dbisql @${DWH_CONN_STR_USER_DBA_ENC} -q ${ENIQ_ADMIN_DIR}/sql/create_dropIdle_customized_users_Connections.1.sql
+if [ $? -ne 0 ] ; then
+    _err_msg_="Customized database users create drop idle connection procedure failed"
+    abort_script "$_err_msg_"
+fi
+
+log_msg -s "Creating event to run drop idle customized database users connection procedure using ${ENIQ_ADMIN_DIR}/sql/create_event_drop_idle_customized_users.sql" -l ${LOGFILE}
+${IQDIR}/bin64/dbisql @${DWH_CONN_STR_USER_DBA_ENC} -q ${ENIQ_ADMIN_DIR}/sql/create_event_drop_idle_customized_users.sql
+if [ $? -ne 0 ] ; then
+    _err_msg_="Customized database users create drop idle event failed"
+    abort_script "$_err_msg_"
+fi
+
+log_msg -s "Creating drop idle dc connection procedure using ${ENIQ_ADMIN_DIR}/sql/create_dropIdle_dc_Connections.sql" -l ${LOGFILE}
+${IQDIR}/bin64/dbisql @${DWH_CONN_STR_USER_DBA_ENC} -q ${ENIQ_ADMIN_DIR}/sql/create_dropIdle_dc_Connections.1.sql
+if [ $? -ne 0 ] ; then
+    _err_msg_="DWH Database create drop idle dc connection procedure failed"
+    abort_script "$_err_msg_"
+fi
+
+log_msg -s "Creating event to run drop idle dc connection procedure using ${ENIQ_ADMIN_DIR}/sql/create_event_drop_idle_dc.sql" -l ${LOGFILE}
+${IQDIR}/bin64/dbisql @${DWH_CONN_STR_USER_DBA_ENC} -q ${ENIQ_ADMIN_DIR}/sql/create_event_drop_idle_dc.sql
+if [ $? -ne 0 ] ; then
+    _err_msg_="DWH Database create drop idle dc connections event failed"
+    abort_script "$_err_msg_"
+fi
+
+log_msg -s "Creating drop idle connections with large version usage procedure using ${ENIQ_ADMIN_DIR}/sql/create_drop_idle_users_exceeding_fourHR_fortyGB_Connections.sql" -l ${LOGFILE}
+${IQDIR}/bin64/dbisql @${DWH_CONN_STR_USER_DBA_ENC} -q ${ENIQ_ADMIN_DIR}/sql/create_drop_idle_users_exceeding_fourHR_fortyGB_Connections.sql
+if [ $? -ne 0 ] ; then
+    _err_msg_="DWH Database create drop idle connections with large version usage failed"
+    abort_script "$_err_msg_"
+fi
+
+log_msg -s "Creating event to run drop idle connections with large version usage procedure using ${ENIQ_ADMIN_DIR}/sql/create_event_drop_idle_users_exceeding_fourHR_fortyGB.sql" -l ${LOGFILE}
+${IQDIR}/bin64/dbisql @${DWH_CONN_STR_USER_DBA_ENC} -q ${ENIQ_ADMIN_DIR}/sql/create_event_drop_idle_users_exceeding_fourHR_fortyGB.sql
+if [ $? -ne 0 ] ; then
+    _err_msg_="DWH Database create drop idle connections with large version usage event failed"
+    abort_script "$_err_msg_"
+fi
+
+log_msg -s "Creating event to create define different panic levels using ${ENIQ_ADMIN_DIR}/sql/create_check_db_size_events.sql" -l ${LOGFILE}
+${IQDIR}/bin64/dbisql @${DWH_CONN_STR_USER_DBA_ENC} -q ${ENIQ_ADMIN_DIR}/sql/create_check_db_size_events.sql
+if [ $? -ne 0 ] ; then
+    _err_msg_="DWH Database create event create_check_db_size_events event failed"
+    abort_script "$_err_msg_"
+fi
+if [ "${CURR_SERVER_TYPE}" == "eniq_stats" -o "${CURR_SERVER_TYPE}" == "stats_coordinator" ] ; then 
+    log_msg -s "Creating procedure to using ${ENIQ_ADMIN_DIR}/sql/sp_eniq_login_environment.sql" -l ${LOGFILE}
+    ${IQDIR}/bin64/dbisql @${DWH_CONN_STR_USER_DBA_ENC} -q ${ENIQ_ADMIN_DIR}/sql/sp_eniq_login_environment.sql
+    if [ $? -ne 0 ] ; then
+        _err_msg_="DWH Database create procedure sp_eniq_login_environment() failed"
+        abort_script "$_err_msg_"
+    fi
+fi
+
+log_msg -s "Creating procedure to force lock tables using ${ENIQ_ADMIN_DIR}/sql/forceLockTableList.sql" -l ${LOGFILE}
+${IQDIR}/bin64/dbisql @${DWH_CONN_STR_USER_DBA_ENC} -q ${ENIQ_ADMIN_DIR}/sql/forceLockTableList.sql
+if [ $? -ne 0 ] ; then
+    _err_msg_="DWH Database create procedure forceLockTableList() failed"
+    abort_script "$_err_msg_"
+fi
+
+log_msg -s "Creating procedure to force drop tables using ${ENIQ_ADMIN_DIR}/sql/forceDropTableList.sql" -l ${LOGFILE}
+${IQDIR}/bin64/dbisql @${DWH_CONN_STR_USER_DBA_ENC} -q ${ENIQ_ADMIN_DIR}/sql/forceDropTableList.sql
+if [ $? -ne 0 ] ; then
+    _err_msg_="DWH Database create procedure forceDropTableList() failed"
+    abort_script "$_err_msg_"
+fi
+
+log_msg -s "Creating procedure to force drop views using ${ENIQ_ADMIN_DIR}/sql/forceDropView.sql" -l ${LOGFILE}
+${IQDIR}/bin64/dbisql @${DWH_CONN_STR_USER_DBA_ENC} -q ${ENIQ_ADMIN_DIR}/sql/forceDropView.sql
+if [ $? -ne 0 ] ; then
+    _err_msg_="DWH Database create procedure forceDropView() failed"
+    abort_script "$_err_msg_"
+fi
+
+log_msg -s "Creating catalog cache ejection procedure using ${ENIQ_ADMIN_DIR}/sql/catalog_cache_ejection.sql" -l ${LOGFILE}
+${IQDIR}/bin64/dbisql @${DWH_CONN_STR_USER_DBA_ENC} -q ${ENIQ_ADMIN_DIR}/sql/catalog_cache_ejection.sql
+if [ $? -ne 0 ] ; then
+    _err_msg_="DWH Database create procedure sp_unload_table_from_cache() failed"
+    abort_script "$_err_msg_"
+fi
+
+# Setting DBCC_Pinnable_Cache_Percent for EQEV-55330
+if [ "${CURR_SERVER_TYPE}" == "eniq_stats" ] ; then
+    log_msg -s "Setting DBCC Pinnable Cache Percent option" -l ${LOGFILE}
+    ${IQDIR}/bin64/dbisql @${DWH_CONN_STR_USER_DBA_ENC} -q "set option public.DBCC_Pinnable_Cache_Percent = '10'"
+    if [ $? -ne 0 ] ; then
+        _err_msg_="Setting DBCC Pinnable Cache Percent option failed"
+        abort_script "$_err_msg_"
+    fi
+fi
+
+log_msg -s "DWH Database DB options successfully set" -l ${LOGFILE}
+
+$RM -rf ${DWH_CONN_STR_USER_DBA_ENC}
+$RM -rf ${rep_connection_string_ENC}
+
+exit 0

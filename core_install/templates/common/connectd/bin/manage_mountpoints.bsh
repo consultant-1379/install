@@ -1,0 +1,1689 @@
+#!/bin/bash
+# ********************************************************************
+# Ericsson Radio Systems AB                                     SCRIPT
+# ********************************************************************
+#
+#
+# (c) Ericsson Radio Systems AB 2022 - All rights reserved.
+#
+# The copyright to the computer program(s) herein is the property
+# of Ericsson Radio Systems AB, Sweden. The programs may be used
+# and/or copied only with the written permission from Ericsson Radio
+# Systems AB or in accordance with the terms and conditions stipulated
+# in the agreement/contract under which the program(s) have been
+# supplied.
+#
+# ********************************************************************
+# Name    : manage_mountpoints.bsh
+# Date    : 14/02/2023
+# Revision: \main\42
+# Purpose : Script that will build and manage ENIQ mounts
+#
+# Usage   : manage_mountpoints.bsh -a <action> -i <oss_ip_addr>
+#                                   -o <oss_alias> [ -l <logfile> ]
+#
+#
+# ********************************************************************
+#
+#     Command Section
+#
+# ********************************************************************
+AWK=/usr/bin/awk
+BASENAME=/usr/bin/basename
+CAT=/usr/bin/cat
+CMP=/usr/bin/cmp
+CP=/usr/bin/cp
+CUT=/usr/bin/cut
+DATE=/usr/bin/date
+DIRNAME=/usr/bin/dirname
+DF=/usr/bin/df
+ECHO='/usr/bin/echo -e'
+EGREP=/usr/bin/egrep
+EXPR=/usr/bin/expr
+GREP=/usr/bin/grep
+HEAD=/usr/bin/head
+ID=/usr/bin/id
+KILL=/usr/bin/kill
+LS=/usr/bin/ls
+MKDIR=/usr/bin/mkdir
+MV=/usr/bin/mv
+PRINTF=/usr/bin/printf
+PS=/usr/bin/ps
+PWD=/usr/bin/pwd
+RM=/usr/bin/rm
+SED=/usr/bin/sed
+SORT=/usr/bin/sort
+TEE=/usr/bin/tee
+TOUCH=/usr/bin/touch
+SHOWMOUNT=/usr/sbin/showmount
+
+# ********************************************************************
+#
+#       Configuration Section
+#
+# ********************************************************************
+# Directory on the root filesystem
+ENIQ_ROOT_DIR=/eniq
+
+# Default user
+DEFAULT_USER=root
+
+# Where can we mount from?
+POSS_MOUNT="ENM NAS OSS SOEM"
+
+# ********************************************************************
+#
+#       Pre-execution Operations
+#
+# ********************************************************************
+
+
+# ********************************************************************
+#
+#     Functions
+#
+# ********************************************************************
+### Function: abort_script ###
+#
+#   This will is called if the script is aborted through an error
+#   error signal sent by the kernel such as CTRL-C or if a serious
+#   error is encountered during runtime
+#
+# Arguments:
+#       $1 - Error message from part of program (Not always used)
+# Return Values:
+#       none
+abort_script()
+{
+_err_time_=`$DATE '+%Y-%b-%d_%H.%M.%S'`
+    
+if [ "$1" ]; then
+    _err_msg_="${_err_time_} - $1"
+else
+    _err_msg_="${_err_time_} - Script aborted.......\n"
+fi
+
+if [ "${LOGFILE}" ]; then
+    $ECHO "\nERROR : ${_err_msg_}\n"|$TEE -a ${LOGFILE}
+else
+    $ECHO "\nERROR : ${_err_msg_}\n"
+fi
+
+cd $SCRIPTHOME
+$RM -rf ${TEM_DIR}
+$RM /tmp/enm_mode_fls >> /dev/null 2>&1
+
+if [ "$2" ]; then
+    ${2}
+else
+   exit 1
+fi
+
+}
+
+### Function: clear ### 
+#
+# To clear the screen
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+clear()
+{
+
+# Clearing the screen without removing scrollback buffer
+$PRINTF '\33[H\33[2J'
+
+}
+
+### Function: update_fs_mount_list_template ###
+# 
+#Updates stats_fs_mount_list_template and events_fs_mount_list_template as per the INSTALL_TYPE
+#
+# Arguments:
+#    none
+# Return Values:
+#    none
+update_fs_mount_list_template()
+{
+
+$ECHO "Reading the pm volumes from ENM" >> ${LOGFILE}
+     if [ ! -s "${TEM_DIR}/pm_vol_list" ]; then
+         _err_msg_="Could not get the list of ENM PM volumes"
+         abort_script "${_err_msg_}"
+     fi
+
+     $ECHO " List of pm volumes :\n" >> ${LOGFILE}
+     $CAT ${TEM_DIR}/pm_vol_list >> ${LOGFILE}
+if [ "${ENM_TYPE}" == "vENM" ]; then
+     $ECHO "Deleting any existing ENM on Cloud  pm volume names from $FS_MOUNT_LIST_TEMPLATE " >> ${LOGFILE}
+     $CAT $FS_MOUNT_LIST_TEMPLATE | $SED '/^vENM/ d' | $SED '/^$/d' > ${TEM_DIR}/_tmp_
+     $MV ${TEM_DIR}/_tmp_ $FS_MOUNT_LIST_TEMPLATE
+     $ECHO "Updating $FS_MOUNT_LIST_TEMPLATE with ENM on Cloud  PM volumes" >> ${LOGFILE}
+
+     for _vol_name_ in `$CAT ${TEM_DIR}/pm_vol_list`; do
+         _vol_num_=`$ECHO ${_vol_name_} | $SED 's/[^0-9]//g'`
+         $ECHO "vENM     <IP>    $_vol_name_      /"pmic"$_vol_num_                             ENM_PM" >> $FS_MOUNT_LIST_TEMPLATE
+     done
+     $ECHO "\n" >> $FS_MOUNT_LIST_TEMPLATE
+else
+
+     $ECHO "Deleting any existing ENM pm volume names from $FS_MOUNT_LIST_TEMPLATE " >> ${LOGFILE}
+     $CAT $FS_MOUNT_LIST_TEMPLATE | $SED '/^ENM/ d' | $SED '/^$/d' > ${TEM_DIR}/_tmp_
+     $MV ${TEM_DIR}/_tmp_ $FS_MOUNT_LIST_TEMPLATE
+     $ECHO "Updating $FS_MOUNT_LIST_TEMPLATE with ENM on Cloud  PM volumes" >> ${LOGFILE}
+
+     for _vol_name_ in `$CAT ${TEM_DIR}/pm_vol_list`; do
+         _vol_num_=`$ECHO ${_vol_name_} | $AWK -F'-' '{print $2}' | $SED 's/[^0-9]//g'`
+         $ECHO "ENM     <IP>    $_vol_name_      /"pmic"$_vol_num_                             ENM_PM" >> $FS_MOUNT_LIST_TEMPLATE
+     done
+     $ECHO "\n" >> $FS_MOUNT_LIST_TEMPLATE
+
+fi
+
+}
+
+### Function: add_mountpoints ###
+#
+# Add mountpoints
+#
+# Arguments:
+#    none
+# Return Values:
+#    none
+add_mountpoints()
+{
+
+
+if [ "${MOUNT_CHOICE}" == "SOEM_NAS" ]; then
+    while :; do
+        unset SOEM_SYS_ID
+        
+        clear
+
+        $ECHO "\nEnter the SOEM system identifier associated with this NAS"
+
+        read _soem_sys_id_
+        
+        if [ ! "${_soem_sys_id_}" ]; then
+            continue
+        fi
+        
+        SOEM_SYS_ID=${_soem_sys_id_}
+        break
+    done
+fi
+
+if [ "${MOUNT_CHOICE}" == "NAS" -o "${MOUNT_CHOICE}" == "ENM" ]; then
+    if [ "${MOUNT_CHOICE}" != "ENM" ]; then    
+           while :; do
+        unset OSS_SYS_ID
+        
+        clear
+
+        $ECHO "\nEnter the OSS system identifier associated with this NAS"
+
+        read _oss_sys_id_
+        
+        if [ ! "${_oss_sys_id_}" ]; then
+            continue
+        fi
+        
+        OSS_SYS_ID=${_oss_sys_id_}
+        break
+    done
+  fi 
+    if [ "${MOUNT_CHOICE}" == "ENM" ]; then
+              while :; do
+                  unset _fs_num_
+                  $ECHO "\nEnter the number of PM volumes that needs to be mounted on ENIQ"
+                  read _fs_num_
+                  if [ ! "${_fs_num_}" ]; then
+                       continue
+                  else
+                       if ! [[ ${_fs_num_} =~ ^[0-9]+$ ]]; then
+                           $ECHO "Invalid numeric value given."
+                           continue
+                       fi
+                  fi
+                  break
+             done
+
+
+             $RM -rf ${TEM_DIR}/pm_vol_list >> /dev/null 2>&1
+             for ((i=1; i<=${_fs_num_}; i++)); do
+                 while :; do
+                     $ECHO "\nEnter the path for PM volume $i"
+                     read _pm_vol_
+
+                     if [ ! "${_pm_vol_}" ]; then
+                         continue
+                     else
+                         $ECHO $_pm_vol_ >> ${TEM_DIR}/pm_vol_list
+                     fi
+                     break
+                 done
+             done
+
+
+             while :; do
+                unset _pmlink_fs_
+                $ECHO "\nEnter the pmlinks filesystem path"
+                read _pmlink_fs_
+
+                if [ ! "${_pmlink_fs_}" ]; then
+                    continue
+                else
+                    $ECHO ${_pmlink_fs_} >> ${TEM_DIR}/pmlinks_dir
+
+                fi
+
+                break
+            done
+
+    fi 
+
+    if [ "${INSTALL_TYPE}" == "stats" -a "${MOUNT_CHOICE}" == "ENM" ]; then      
+        unset ENM_MODE
+        $ECHO "\nSetting ENM Mode to FLS as default for ${ENM_TYPE} Integration" | $TEE -a ${LOGFILE}
+        ENM_MODE=FLS
+        $ECHO ${ALIAS} >/tmp/enm_mode_fls
+    # while :; do
+            # unset ENM_MODE
+
+                # clear
+                # $ECHO "\nEnter the mode you want to configure for ENM "
+                # $ECHO "NOTE : FLS is the recommended option for ENM Integration."
+                # $ECHO "Available ENM mode :"
+                # $ECHO "[1] FLS (Recommended)"
+                   # read _enm_mode_
+        # case ${_enm_mode_} in
+            # 1) ENM_MODE=FLS
+                   # $ECHO ${ALIAS} >/tmp/enm_mode_fls
+                        # ;;
+            # SYMLINK) ENM_MODE=SYMLINK
+                # ;;
+        # esac
+
+                   # if [ "$ENM_MODE" == "FLS" -o "$ENM_MODE" == "SYMLINK" ]; then
+                        # break 
+                   # else 
+                   # continue
+
+        # fi
+           # done
+    fi
+fi
+
+if [ "${MOUNT_CHOICE}" == "OSS" ]; then
+    while :; do
+        unset PDM_SHARE_OSS PDM_MOUNT_POINT
+
+        clear
+        $ECHO "\nIs the OSS being connected pre O12.0? (Yes/No)"
+        read _oss_rel_version_
+
+        if [ ! "${_oss_rel_version_}" ]; then
+            continue
+        fi
+        
+        if [ "${_oss_rel_version_}" == "Yes" ]; then
+            PDM_SHARE_OSS=`$CAT ${CONNECTD_CONFIG} | $EGREP '^[[:blank:]]*PDM_SHARE_OSS_PRE_12=' | $AWK -F\= '{print $2}' | $SED -e 's|"||g'`
+            PDM_MOUNT_POINT=`$CAT ${CONNECTD_CONFIG} | $EGREP '^[[:blank:]]*PDM_MOUNTPOINT_PRE_12=' | $AWK -F\= '{print $2}' | $SED -e 's|"||g'`
+        elif [ "${_oss_rel_version_}" == "No" ]; then
+            PDM_SHARE_OSS=`$CAT ${CONNECTD_CONFIG} | $EGREP '^[[:blank:]]*PDM_SHARE_OSS_POST_12=' | $AWK -F\= '{print $2}' | $SED -e 's|"||g'`
+            PDM_MOUNT_POINT=`$CAT ${CONNECTD_CONFIG} | $EGREP '^[[:blank:]]*PDM_MOUNTPOINT_POST_12=' | $AWK -F\= '{print $2}' | $SED -e 's|"||g'`
+        else
+            continue
+        fi
+
+        break
+    done
+fi
+
+
+if [ "${ENM_TYPE}" != "cENM" ]; then
+    #Update fs_mount_list_template for ENM
+    if [ "${MOUNT_CHOICE}" == "ENM" ]; then
+         update_fs_mount_list_template
+             get_pmlinks_dir
+    fi
+
+
+    # Create the user file with the mounts and descriptions
+    get_mount_info
+
+    if [ -z "${NO_CONFIRM}" ]; then
+        setup_display_file
+        if [ ! -s ${_disp_file_} ]; then
+            _err_msg_="${_disp_file_} does not exist, or is empty"
+            abort_script "${_err_msg_}"
+        fi
+
+        confirm_user_input ${_disp_file_}
+        # If user hit N/n, exit
+        if [ "${USER_CONF}" == "N" -o "${USER_CONF}" == "n" ]; then
+            $RM -rf ${TEM_DIR}
+            $RM /tmp/enm_mode_fls >> /dev/null 2>&1
+            $ECHO "\n"
+            exit 0
+        fi
+    fi
+
+    # create the fs_mount_list file
+    create_mount_list_file
+fi
+}
+
+
+
+### Function: chk_create_logfile ###
+#
+# Check/Create Logfile
+#
+# Arguments:
+#    none
+# Return Values:
+#    none
+chk_create_logfile()
+{
+$MKDIR -p `$DIRNAME ${LOGFILE}`
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not create directory `$DIRNAME ${LOGFILE}`"
+     abort_script "${_err_msg_}"
+fi
+
+$TOUCH -a ${LOGFILE}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not write to file ${LOGFILE}"
+    abort_script "${_err_msg_}"
+fi
+}
+
+### Function: check_id ###
+#
+#   Check that the effective id of the user is correct
+#   If not print error msg and exit.
+#
+# Arguments:
+#       $1 : User ID name
+# Return Values:
+#       none
+check_id()
+{
+_check_id_=`$ID  | $AWK -F\( '{print $2}' | $AWK -F\) '{print $1}'`
+if [ "$_check_id_" != "$1" ]; then
+    _err_msg_="You must be $1 to execute this script."
+    abort_script "${_err_msg_}"
+fi
+}
+
+### Function: check_params ###
+#
+# Check Input Params
+#
+# Arguments:
+#    none
+# Return Values:
+#    none
+check_params()
+{
+if [ ! ${ACTION} ]; then
+    usage_msg
+    exit 1
+fi
+
+if [ "${ACTION}" == "add" ]; then
+    if [ ${MOUNT_CHOICE} != "ENM" ]; then
+        if [ ! ${ALIAS} -o ! ${SRV_IP} ]; then
+                usage_msg
+                exit 1
+        fi
+    else
+        if [ ! ${ALIAS} -o ! -s ${SRV_IP} ]; then
+            usage_msg
+            exit 1
+        fi
+    fi
+fi
+
+if [ "${ACTION}" == "update" ]; then
+    if [ ! ${ALIAS} ]; then
+        usage_msg
+        exit 1
+    fi
+fi
+
+if [ ! ${MOUNT_CHOICE} ]; then
+    usage_msg
+    exit 1
+fi
+
+# Check that the user specified the OSS alias in format eg. events_oss_
+
+if [ "${MOUNT_CHOICE}" == "SOEM" ]; then
+    $ECHO ${ALIAS} | $EGREP "eniq_soem_[1-9][0-9]*" >> /dev/null 2>&1    
+    if [ $? -ne 0 ]; then
+        _err_msg_="${ALIAS} must be specified in the ALIAS format eg. eniq_soem_1"
+        abort_script "${_err_msg_}"
+    fi
+else
+    if [ "${ALIAS}" ]; then
+        $ECHO ${ALIAS} | $EGREP "${REF_STR}[1-9][0-9]*" >> /dev/null 2>&1
+        if [ $? -ne 0 ]; then
+            $ECHO ${ALIAS} | $EGREP "eniq_events_[1-9][0-9]*" >> /dev/null 2>&1    
+            if [ $? -ne 0 ]; then
+                _err_msg_="${ALIAS} must be specified in the ALIAS format eg. events_oss_1"
+                abort_script "${_err_msg_}"
+            fi
+        fi    
+    fi
+fi
+
+
+if [ "${MOUNT_CHOICE}" == "ENM" ]; then
+   ENM_TYPE=`$CAT ${CONNECTD_INFO}/${ALIAS}/enm_type`
+fi
+
+}
+
+### Function: confirm_user_input ###
+#
+# Confirm with user that values entered are correct
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+confirm_user_input()
+{
+while :; do
+    clear
+    $CAT ${1}
+    read USER_CONF
+
+    # If the User hit nothing
+    if [ ! "${USER_CONF}" ]; then
+        continue
+    fi
+
+    # Did the user input (Y/y)
+    if [ "${USER_CONF}" == "Y" -o "${USER_CONF}" == "y" -o "${USER_CONF}" == "N" -o "${USER_CONF}" == "n" ]; then
+        break
+    fi
+done
+}
+
+### Function: create_mount_list_file ###
+#
+# Create the fs_mount_list file
+#
+# Arguments:
+#    none
+# Return Values:
+#    none
+create_mount_list_file()
+{
+# Make the directory
+$MKDIR -p ${CONNECTD_INFO}/${ALIAS}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not create ${CONNECTD_INFO}/${ALIAS}"
+    abort_script "${_err_msg_}"
+fi
+
+$ECHO "\nDeterming which file to use for data mounts" | $TEE -a ${LOGFILE}
+
+$ECHO $ALIAS | $EGREP "eniq_events" >> /dev/null 2>&1
+if [ $? -ne 0 ]; then
+    _current_mnt_list_=${CONNECTD_INFO}/${ALIAS}/fs_mount_list
+else
+    _current_mnt_list_=${CONNECTD_INFO}/${ALIAS}/stats_events_mount_list
+fi
+
+$ECHO "Using ${_current_mnt_list_} file for data mount information" >> ${LOGFILE}
+
+# Copy the new fs_mount_list file to its final resting place!!
+$ECHO "\nCreating fs_mount_list file in ${CONNECTD_INFO}/${ALIAS}" | $TEE -a ${LOGFILE}
+if [ "${_current_mnt_list_}" ]; then
+    $ECHO "Removing current instance of ${_current_mnt_list_}" | $TEE -a ${LOGFILE}
+    $RM -rf ${_current_mnt_list_}
+    if [ $? -ne 0 ]; then
+        _err_msg_="Could not delete ${_current_mnt_list_}"
+        abort_script "${_err_msg_}"
+    fi
+fi
+
+$ECHO "Updating ${_current_mnt_list_} file" | $TEE -a ${LOGFILE}
+$CP ${TEM_DIR}/mount_list_file ${_current_mnt_list_}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not copy ${TEM_DIR}/mount_list_file to ${_current_mnt_list_}"
+    abort_script "${_err_msg_}"
+fi
+
+if [ "${MOUNT_CHOICE}" != "EVENTS" ]; then    
+    if [ "${ENM_MODE}" != "FLS" ];then   
+    _current_pm_mnt_list_=${CONNECTD_INFO}/${ALIAS}/pmdata_fs_mount
+    
+    # Copy the new pmdata_fs_mount file to its final resting place!!
+    $ECHO "\nCreating pmdata_fs_mount file in ${CONNECTD_INFO}/${ALIAS}"
+    if [ "${_current_pm_mnt_list_}" ]; then
+        $ECHO "Removing current instance of ${_current_pm_mnt_list_}" | $TEE -a ${LOGFILE}
+        $RM -rf ${_current_pm_mnt_list_}
+        if [ $? -ne 0 ]; then
+            _err_msg_="Could not delete ${_current_pm_mnt_list_}"
+            abort_script "${_err_msg_}"
+        fi
+    fi
+    
+    $ECHO "Updating ${_current_pm_mnt_list_} file" | $TEE -a ${LOGFILE}
+    $CP ${TEM_DIR}/pm_mount_list_file ${_current_pm_mnt_list_}
+    if [ $? -ne 0 ]; then
+        _err_msg_="Could not copy ${TEM_DIR}/pm_mount_list_file to ${_current_pm_mnt_list_}"
+        abort_script "${_err_msg_}"
+    fi
+   fi    
+fi
+
+if [ "${INSTALL_TYPE}" != "stats" ]; then
+    _current_event_mnt_list_=${CONNECTD_INFO}/${ALIAS}/eventdata_fs_mount
+
+    # Copy the new eventdata_fs_mount file to its final resting place!!
+    $ECHO "\nCreating eventdata_fs_mount file in ${CONNECTD_INFO}/${ALIAS}"
+    if [ "${_current_event_mnt_list_}" ]; then
+        $ECHO "Removing current instance of ${_current_event_mnt_list_}" | $TEE -a ${LOGFILE}
+        $RM -rf ${_current_event_mnt_list_}
+        if [ $? -ne 0 ]; then
+            _err_msg_="Could not delete ${_current_event_mnt_list_}"
+            abort_script "${_err_msg_}"
+        fi
+    fi
+    
+    $ECHO "Updating ${_current_event_mnt_list_} file" | $TEE -a ${LOGFILE}
+    $CP ${TEM_DIR}/eventdata_mount_list_file ${_current_event_mnt_list_}
+    if [ $? -ne 0 ]; then
+        _err_msg_="Could not copy ${TEM_DIR}/eventdata_mount_list_file to ${_current_event_mnt_list_}"
+        abort_script "${_err_msg_}"
+    fi
+fi
+}
+
+### Function: get_absolute_path ###
+#
+# Determine absolute path to software
+#
+# Arguments:
+#    none
+# Return Values:
+#    none
+get_absolute_path()
+{
+_dir_=`$DIRNAME $0`
+SCRIPTHOME=`cd $_dir_ 2>/dev/null && pwd || $ECHO $_dir_`
+}
+
+
+
+### Function: get_data_file_info ###
+#
+# Add mountpoints
+#
+# Arguments:
+#    none
+# Return Values:
+#    none
+get_data_file_info()
+{
+# Copy the fs_mount_list template to /tmp
+$CAT ${ENIQ_CONNECTD_DIR}/etc/${INSTALL_TYPE}_fs_mount_list_template | $EGREP -v '^[[:blank:]]*#' > ${TEM_DIR}/uptd_mount_list
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not create ${TEM_DIR}/uptd_mount_list"
+    abort_script "${_err_msg_}"
+fi
+
+$RM -rf ${TEM_DIR}/mount_list_file ${TEM_DIR}/mount_list_file_temp
+
+# Create a header for the fs_mount_list file
+$ECHO "#" > ${TEM_DIR}/mount_list_file
+$ECHO "# Mount_IP    NFS_share     Mount_Point_relative_to_ALIAS" >> ${TEM_DIR}/mount_list_file
+$ECHO "#" >> ${TEM_DIR}/mount_list_file
+
+# Determine the MOUNT_TYPE
+MOUNT_TYPE="${MOUNT_CHOICE}"
+if [ "${MOUNT_CHOICE}" == "ENM" ]; then
+    if [ "${ENM_TYPE}" == "vENM" ]; then
+        MOUNT_TYPE="${ENM_TYPE}"
+    fi
+fi
+
+# Update the template
+if [ "${ACTION}" == "add" ]; then
+    $CAT ${ENIQ_CONNECTD_DIR}/etc/${INSTALL_TYPE}_fs_mount_list_template | $EGREP -v '^[[:blank:]]*#' | $GREP -w "${MOUNT_TYPE}" > ${TEM_DIR}/upd_fs_list_temp
+    if [ "${MOUNT_CHOICE}" == "SOEM" -o "${MOUNT_CHOICE}" == "SOEM_NAS" ]; then    
+        if [ "${MOUNT_CHOICE}" == "SOEM_NAS" ]; then
+            $ECHO "\nUpdating temporary copy of ${ENIQ_CONNECTD_DIR}/etc/${INSTALL_TYPE}_fs_mount_list_template with NAS pool information for ${MOUNT_CHOICE}" >> ${LOGFILE}
+            $CAT ${TEM_DIR}/upd_fs_list_temp | $SED -e "s|<SOEM_POOL_ID>|${SOEM_SYS_ID}|g" > ${TEM_DIR}/upd_fs_list
+            if [ $? -ne 0 ]; then
+                _err_msg_="Could not update ${TEM_DIR}/upd_fs_list_temp with SOEM Pool ID"
+                abort_script "${_err_msg_}"
+            fi
+        else
+            $CP ${TEM_DIR}/upd_fs_list_temp ${TEM_DIR}/upd_fs_list
+            if [ $? -ne 0 ]; then
+                _err_msg_="Could not copy ${TEM_DIR}/upd_fs_list_temp to ${TEM_DIR}/upd_fs_list"
+                abort_script "${_err_msg_}"
+            fi
+        fi
+    else
+        if [ "${MOUNT_CHOICE}" == "NAS" ]; then
+            $ECHO "\nUpdating temporary copy of ${ENIQ_CONNECTD_DIR}/etc/${INSTALL_TYPE}_fs_mount_list_template with NAS pool information for ${MOUNT_CHOICE}" >> ${LOGFILE}
+            $CAT ${TEM_DIR}/upd_fs_list_temp | $SED -e "s|<OSS_POOL_ID>|${OSS_SYS_ID}|g" > ${TEM_DIR}/upd_fs_list
+            if [ $? -ne 0 ]; then
+                _err_msg_="Could not update ${TEM_DIR}/upd_fs_list_temp with OSS Pool ID"
+                abort_script "${_err_msg_}"
+            fi
+        else
+            $ECHO "\nUpdating temporary copy of ${ENIQ_CONNECTD_DIR}/etc/${INSTALL_TYPE}_fs_mount_list_template with PDM information for ${MOUNT_CHOICE}" >> ${LOGFILE}
+            $CAT ${TEM_DIR}/upd_fs_list_temp | $SED -e "s|<PDM_SHARE_OSS>|${PDM_SHARE_OSS}|g" -e "s|<PDM_MOUNT_POINT>|${PDM_MOUNT_POINT}|g" > ${TEM_DIR}/upd_fs_list
+            if [ $? -ne 0 ]; then
+                _err_msg_="Could not update ${TEM_DIR}/upd_fs_list_temp with PDM info"
+                abort_script "${_err_msg_}"
+            fi
+        fi
+    fi
+      
+        if [ "${MOUNT_CHOICE}" == "ENM" ]; then
+              if [ "${ENM_TYPE}" != "vENM" ]; then
+                  $CAT ${TEM_DIR}/upd_fs_list_temp | $SED '/^vENM/ d' | $SED '/^$/d' > ${TEM_DIR}/upd_fs_list_temp1
+                  $MV ${TEM_DIR}/upd_fs_list_temp1 ${TEM_DIR}/upd_fs_list_temp
+                  $ECHO "\nUpdating temporary copy of ${ENIQ_CONNECTD_DIR}/etc/${INSTALL_TYPE}_fs_mount_list_template for ${ENM_TYPE}." >> ${LOGFILE}
+                  $CP ${TEM_DIR}/upd_fs_list_temp ${TEM_DIR}/upd_fs_list
+            else
+                $CAT ${TEM_DIR}/upd_fs_list_temp | $SED '/^ENM/ d' | $SED '/^$/d' > ${TEM_DIR}/upd_fs_list_temp1
+                $MV ${TEM_DIR}/upd_fs_list_temp1 ${TEM_DIR}/upd_fs_list_temp
+                   $ECHO "\nUpdating temporary copy of ${ENIQ_CONNECTD_DIR}/etc/${INSTALL_TYPE}_fs_mount_list_template for ${ENM_TYPE}" >> ${LOGFILE}
+                $CP ${TEM_DIR}/upd_fs_list_temp ${TEM_DIR}/upd_fs_list
+            fi
+        fi
+    _current_mnt_list_=${TEM_DIR}/upd_fs_list
+else
+    #Code added for Update fuctionality 
+    $CAT ${ENIQ_CONNECTD_DIR}/etc/${INSTALL_TYPE}_fs_mount_list_template | $EGREP -v '^[[:blank:]]*#' | $GREP -w "${MOUNT_TYPE}" > ${TEM_DIR}/upd_fs_list_temp
+    if [ "${MOUNT_CHOICE}" == "SOEM" -o "${MOUNT_CHOICE}" == "SOEM_NAS" ]; then    
+        if [ "${MOUNT_CHOICE}" == "SOEM_NAS" ]; then
+            $ECHO "\nUpdating temporary copy of ${ENIQ_CONNECTD_DIR}/etc/${INSTALL_TYPE}_fs_mount_list_template with NAS pool information for ${MOUNT_CHOICE}" >> ${LOGFILE}
+            $CAT ${TEM_DIR}/upd_fs_list_temp | $SED -e "s|<SOEM_POOL_ID>|${SOEM_SYS_ID}|g" > ${TEM_DIR}/upd_fs_list
+            if [ $? -ne 0 ]; then
+                _err_msg_="Could not update ${TEM_DIR}/upd_fs_list_temp with SOEM Pool ID"
+                abort_script "${_err_msg_}"
+            fi
+        else
+            $CP ${TEM_DIR}/upd_fs_list_temp ${TEM_DIR}/upd_fs_list
+            if [ $? -ne 0 ]; then
+                _err_msg_="Could not copy ${TEM_DIR}/upd_fs_list_temp to ${TEM_DIR}/upd_fs_list"
+                abort_script "${_err_msg_}"
+            fi
+        fi
+    else
+        if [ "${MOUNT_CHOICE}" == "NAS" ]; then
+            $ECHO "\nUpdating temporary copy of ${ENIQ_CONNECTD_DIR}/etc/${INSTALL_TYPE}_fs_mount_list_template with NAS pool information for ${MOUNT_CHOICE}" >> ${LOGFILE}
+            OSS_SYS_ID=`$CAT ${CONNECTD_INFO}/${ALIAS}/fs_mount_list | $GREP "pm" | $AWK '{printf $2}' | $CUT -d "-" -f 1 | $CUT -d "/" -f 3`
+            if [ $? -ne 0 ]; then
+                _err_msg_="Could not get the existing OSS System Identifier"
+                abort_script "${_err_msg_}"
+            fi
+            $CAT ${TEM_DIR}/upd_fs_list_temp | $SED -e "s|<OSS_POOL_ID>|${OSS_SYS_ID}|g" > ${TEM_DIR}/upd_fs_list
+            if [ $? -ne 0 ]; then
+                _err_msg_="Could not update ${TEM_DIR}/upd_fs_list_temp with OSS Pool ID"
+                abort_script "${_err_msg_}"
+            fi
+        else
+            $ECHO "\nUpdating temporary copy of ${ENIQ_CONNECTD_DIR}/etc/${INSTALL_TYPE}_fs_mount_list_template with PDM information for ${MOUNT_CHOICE}" >> ${LOGFILE}
+            PDM_SHARE_OSS=`$CAT ${CONNECTD_CONFIG} | $EGREP '^[[:blank:]]*PDM_SHARE_OSS_POST_12=' | $AWK -F\= '{print $2}' | $SED -e 's|"||g'`
+            if [ $? -ne 0 ]; then
+                _err_msg_="Could not get the existing OSS Share"
+                abort_script "${_err_msg_}"
+            fi
+            PDM_MOUNT_POINT=`$CAT ${CONNECTD_CONFIG} | $EGREP '^[[:blank:]]*PDM_MOUNTPOINT_POST_12=' | $AWK -F\= '{print $2}' | $SED -e 's|"||g'`
+            if [ $? -ne 0 ]; then
+                _err_msg_="Could not get the existing OSS Mount Point"
+                abort_script "${_err_msg_}"
+            fi
+            $CAT ${TEM_DIR}/upd_fs_list_temp | $SED -e "s|<PDM_SHARE_OSS>|${PDM_SHARE_OSS}|g" -e "s|<PDM_MOUNT_POINT>|${PDM_MOUNT_POINT}|g" > ${TEM_DIR}/upd_fs_list
+            if [ $? -ne 0 ]; then
+                _err_msg_="Could not update ${TEM_DIR}/upd_fs_list_temp with PDM info"
+                abort_script "${_err_msg_}"
+            fi
+        fi
+    fi
+      
+        if [ "${MOUNT_CHOICE}" == "ENM" ]; then
+              if [ "${ENM_TYPE}" != "vENM" ]; then
+                  $CAT ${TEM_DIR}/upd_fs_list_temp | $SED '/^vENM/ d' | $SED '/^$/d' > ${TEM_DIR}/upd_fs_list_temp1
+                  $MV ${TEM_DIR}/upd_fs_list_temp1 ${TEM_DIR}/upd_fs_list_temp
+                  $ECHO "\nUpdating temporary copy of ${ENIQ_CONNECTD_DIR}/etc/${INSTALL_TYPE}_fs_mount_list_template for ${ENM_TYPE}." >> ${LOGFILE}
+                  $CP ${TEM_DIR}/upd_fs_list_temp ${TEM_DIR}/upd_fs_list
+            else
+                $CAT ${TEM_DIR}/upd_fs_list_temp | $SED '/^ENM/ d' | $SED '/^$/d' > ${TEM_DIR}/upd_fs_list_temp1
+                $MV ${TEM_DIR}/upd_fs_list_temp1 ${TEM_DIR}/upd_fs_list_temp
+                   $ECHO "\nUpdating temporary copy of ${ENIQ_CONNECTD_DIR}/etc/${INSTALL_TYPE}_fs_mount_list_template with NAS pool information for ${ENM_TYPE}" >> ${LOGFILE}
+                $CP ${TEM_DIR}/upd_fs_list_temp ${TEM_DIR}/upd_fs_list
+            fi
+        fi
+    $ECHO $ALIAS | $EGREP  "eniq_events" >> /dev/null 2>&1
+    if [ $? -ne 0 ]; then
+        _current_mnt_list_=${TEM_DIR}/upd_fs_list
+    else
+        _current_mnt_list_=${CONNECTD_INFO}/${ALIAS}/stats_events_mount_list
+    fi
+fi
+
+$ECHO "Using ${_current_mnt_list_} file for data mount information" >> ${LOGFILE}
+
+unset _fs_array_ _mnt_point_array_ _desc_array_
+
+_cnt_=1
+_menu_opt_=0
+while read _line_; do
+    _fs_=`$ECHO ${_line_} | $AWK '{print $3}'`
+    _mnt_point_=`$ECHO ${_line_} | $AWK '{print $4}'`
+    _desc_=`$ECHO ${_line_} | $AWK '{print $5}'`
+
+    # Store the details in 2 arrays
+    _fs_array_[${_cnt_}]=${_fs_}
+    _mnt_point_array_[${_cnt_}]=${_mnt_point_}
+    _desc_array_[${_cnt_}]=${_desc_}
+
+    let _cnt_=_cnt_+1
+    let _menu_opt_=_menu_opt_+1
+done < ${TEM_DIR}/upd_fs_list
+
+if [ "${ENM_TYPE}" != "vENM" ] && [ "${ENM_TYPE}" != "pENM" ];then
+    # Build a display file for the user to select which filesystems to mount
+    $RM -rf ${TEM_DIR}/mount_info_file
+    $PRINTF "%-8s%-15s%-35s\n" "" "Description" "Filesystem" >> ${TEM_DIR}/mount_info_file
+    for (( i=1; i<${_cnt_}; i++ )); do
+    $CAT ${_current_mnt_list_} | $EGREP "${_fs_array_[${i}]}" >> /dev/null 2>&1
+    if [ $? -eq 0 ]; then
+        if [ "${ACTION}" == "add" ]; then
+            if [ -s ${CONNECTD_INFO}/${ALIAS}/fs_mount_list ]; then
+                $CAT ${CONNECTD_INFO}/${ALIAS}/fs_mount_list | $EGREP "${_fs_array_[${i}]}" >> /dev/null 2>&1
+                if [ $? -eq 0 ]; then
+                    $PRINTF "%-8s%-15s%-35s%-5s\n" "[${i}]" "${_desc_array_[${i}]}" "${_fs_array_[${i}]}" "(*)" >> ${TEM_DIR}/mount_info_file
+                else
+                    $PRINTF "%-8s%-15s%-35s\n" "[${i}]" "${_desc_array_[${i}]}" "${_fs_array_[${i}]}" >> ${TEM_DIR}/mount_info_file
+                fi
+            else
+                $PRINTF "%-8s%-15s%-35s\n" "[${i}]" "${_desc_array_[${i}]}" "${_fs_array_[${i}]}" >> ${TEM_DIR}/mount_info_file   
+            fi
+        else
+            $DF -h | $GREP ${_fs_array_[${i}]} >> /dev/null 2>&1
+            if [ $? -eq 0 ]; then
+                $PRINTF "%-8s%-15s%-35s%-5s\n" "[${i}]" "${_desc_array_[${i}]}" "${_fs_array_[${i}]}" "(*)" >> ${TEM_DIR}/mount_info_file
+            else
+                $PRINTF "%-8s%-15s%-35s%-5s\n" "[${i}]" "${_desc_array_[${i}]}" "${_fs_array_[${i}]}" >> ${TEM_DIR}/mount_info_file
+            fi
+        fi 
+    else
+        $PRINTF "%-8s%-15s%-35s\n" "[${i}]" "${_desc_array_[${i}]}" "${_fs_array_[${i}]}" >> ${TEM_DIR}/mount_info_file
+    fi    
+    done
+
+    $ECHO "\n(*) indicates the filesystem is already mounted" >> ${TEM_DIR}/mount_info_file
+    $ECHO "Already mounted filesystems will be unmounted if not re-selected" >> ${TEM_DIR}/mount_info_file
+    $ECHO "\nSelect range of filesystems you wish to mount [n,n-n,n...n]" >> ${TEM_DIR}/mount_info_file
+    $ECHO "\tE.G. 1,3-5,6\n" >> ${TEM_DIR}/mount_info_file
+
+    while :; do
+        clear
+        $CAT ${TEM_DIR}/mount_info_file
+        read _opt_
+
+        # If the User hit nothing, loop
+        if [ ! "${_opt_}" ]; then
+            continue
+        fi
+
+        $RM -f ${TEM_DIR}/filesys_to_mount ${TEM_DIR}/filesys_selection
+        _numerror_=0
+
+        for _num_ in `$ECHO ${_opt_} | $SED -e 's| ||g' -e 's|,| |g'`; do
+            $ECHO ${_num_} | $EGREP '-' >> /dev/null 2>&1
+                if [ $? -eq 0 ]; then
+                    _start_=`$ECHO ${_num_} | $AWK -F\- '{print $1}'`
+                    if [ ! "${_start_}" ]; then
+                        continue
+                    fi
+            
+                    _end_=`$ECHO ${_num_} | $AWK -F\- '{print $2}'`
+                    for (( _sel_=${_start_}; _sel_<=${_end_}; _sel_++ )); do
+                        $ECHO ${_sel_} | $EGREP '[^0-9]' >> /dev/null 2>&1
+                        if [ $? -eq 0 ]; then
+                            _numerror_=1
+                            break
+                        fi
+                        if [ ${_sel_} -lt 1 ] || [ ${_sel_} -gt ${_menu_opt_} ]; then
+                            _numerror_=1
+                            break
+                        fi
+                        $ECHO ${_sel_} >> ${TEM_DIR}/filesys_selection
+                    done
+               else
+                    $ECHO ${_num_} | $EGREP '[^0-9]' >> /dev/null 2>&1
+                    if [ $? -eq 0 ]; then
+                        _numerror_=1
+                        break
+                    fi
+                    if [ ${_num_} -lt 1 ] || [ ${_num_} -gt ${_menu_opt_} ]; then
+                        _numerror_=1
+                        break
+                    fi
+                    $ECHO ${_num_} >> ${TEM_DIR}/filesys_selection
+               fi
+        done
+
+        for i in `$CAT ${TEM_DIR}/filesys_selection | $SORT -u`; do
+            # Create a file containing the filesystems we'll try
+            # mount to show to the user for confirmation
+            $ECHO "${_fs_array_[${i}]}" >> ${TEM_DIR}/filesys_to_mount
+            # Build a new fs_mount_list file for the OSS we are
+            # going to mount from
+            $PRINTF "%-35s%-35s%-35s\n" "<ip_address>" "${_fs_array_[${i}]}" "${_mnt_point_array_[${i}]}" >> ${TEM_DIR}/mount_list_file_temp
+        done
+
+        if [ ${_numerror_} -eq 0 ]; then
+            break
+        fi
+    done
+else
+    for ((i=1; i<=${_fs_num_}; i++)); do
+          $ECHO "${_fs_array_[${i}]}" >> ${TEM_DIR}/filesys_to_mount
+         $PRINTF "%-35s%-35s%-35s\n" "<ip_address>" "${_fs_array_[${i}]}" "${_mnt_point_array_[${i}]}" >> ${TEM_DIR}/mount_list_file_temp
+    done
+
+fi
+
+
+_mount_ip_array_=(`$CAT ${TEM_DIR}/mount_list_file_temp | $EGREP -v '^[[:blank:]]*#' | $EGREP -v '^[[:blank:]]*$'\
+     | $SED -e 's/^[ ]*//' -e 's/^[    ]*//' -e 's/\/[\/]*/\//g' -e 's/[\/]*$//g' | $AWK '{print $1}'`)
+_cnt1_=${#_mount_ip_array_[@]}
+if [ ${_cnt1_} -eq 0 ]; then
+    _err_msg_="Could not read NFS SERVER info from ${TEM_DIR}/mount_list_file_temp"
+    abort_script "${_err_msg_}"
+fi
+
+_mount_share_array_=(`$CAT ${TEM_DIR}/mount_list_file_temp | $EGREP -v '^[[:blank:]]*#' | $EGREP -v '^[[:blank:]]*$'\
+     | $SED -e 's/^[ ]*//' -e 's/^[    ]*//' -e 's/\/[\/]*/\//g' -e 's/[\/]*$//g' | $AWK '{print $2}'`)
+_cnt2_=${#_mount_share_array_[@]}
+if [ ${_cnt2_} -eq 0 ]; then
+    _err_msg_="Could not read NFS SHARE info from ${TEM_DIR}/mount_list_file_temp"
+    abort_script "${_err_msg_}"
+fi
+
+_mount_point_array_=(`$CAT ${TEM_DIR}/mount_list_file_temp | $EGREP -v '^[[:blank:]]*#' | $EGREP -v '^[[:blank:]]*$'\
+     | $SED -e 's/^[ ]*//' -e 's/^[    ]*//' -e 's/\/[\/]*/\//g' -e 's/[\/]*$//g' | $AWK '{print $3}'`)
+_cnt3_=${#_mount_point_array_[@]}
+if [ ${_cnt3_} -eq 0 ]; then
+    _err_msg_="Could not read MOUNT POINT info from ${TEM_DIR}/mount_list_file_temp"
+    abort_script "${_err_msg_}"
+fi
+
+if [ ${_cnt1_} -ne ${_cnt2_} -o ${_cnt1_} -ne ${_cnt3_} ]; then
+    _err_msg_="Inconsistent number of values read from ${TEM_DIR}/mount_list_file_temp"
+    abort_script "${_err_msg_}"
+fi
+_mount_array_length_=${_cnt1_}
+
+for (( _loop_cnt_=0; _loop_cnt_<${_mount_array_length_}; _loop_cnt_++ )); do
+    _ip_value_=${_mount_ip_array_[${_loop_cnt_}]}
+    _fs_=${_mount_share_array_[${_loop_cnt_}]}
+    _mntpt_=${_mount_point_array_[${_loop_cnt_}]}
+    
+    while :; do
+        $ECHO "\nEnter the IP to which ${_fs_} will be mounted from"
+        read _ip_
+    
+        if [ ! "${_ip_}" ]; then
+            continue
+        fi
+    
+        validate_ip ${_ip_}
+        if [ $? -ne 0 ]; then
+            continue
+        fi
+        
+        break
+    done
+
+    $ECHO "${_ip_} ${_fs_} ${_mntpt_}" >> ${TEM_DIR}/mount_list_file
+done
+
+$ECHO "\nMountpoint and IP information as supplied by user for data directories" >> ${LOGFILE}
+$CAT ${TEM_DIR}/mount_list_file >> ${LOGFILE}
+}
+
+### Function: get_eventdata_info ###
+#
+# Add mountpoints
+#
+# Arguments:
+#    none
+# Return Values:
+#    none
+get_eventdata_info()
+{
+# Copy the pmdata_fs_mount_template template to /tmp
+$CAT ${ENIQ_CONNECTD_DIR}/etc/eventdata_fs_mount_template | $EGREP -v '^[[:blank:]]*#' > ${TEM_DIR}/uptd_mount_list
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not create ${TEM_DIR}/uptd_mount_list"
+    abort_script "${_err_msg_}"
+fi
+
+$RM -rf ${TEM_DIR}/eventdata_mount_list_file ${TEM_DIR}/event_filesys_to_mount
+
+# Create a header for the pmdata_fs_mount file
+$ECHO "#" > ${TEM_DIR}/eventdata_mount_list_file
+$ECHO "# Mount_IP    NFS_share     Mount_Point_relative_to_EVENT_SYM_LINKS_DIR" >> ${TEM_DIR}/eventdata_mount_list_file
+$ECHO "#" >> ${TEM_DIR}/eventdata_mount_list_file
+
+if [ "${ACTION}" == "add" ]; then
+    $CAT ${ENIQ_CONNECTD_DIR}/etc/eventdata_fs_mount_template | $EGREP -v '^[[:blank:]]*#' | $EGREP "$MOUNT_CHOICE" > ${TEM_DIR}/upd_fs_list_temp
+    if [ "${MOUNT_CHOICE}" == "NAS" -o "${MOUNT_CHOICE}" == "ENM" ]; then
+        $ECHO "\nUpdating temporary copy of ${ENIQ_CONNECTD_DIR}/etc/eventdata_fs_mount_template with NAS pool information for ${MOUNT_CHOICE}" >> ${LOGFILE}
+        $CAT ${TEM_DIR}/upd_fs_list_temp | $SED -e "s|<OSS_POOL_ID>|${OSS_SYS_ID}|g" > ${TEM_DIR}/upd_fs_list
+        if [ $? -ne 0 ]; then
+            _err_msg_="Could not update ${TEM_DIR}/upd_fs_list with OSS System ID"
+            abort_script "${_err_msg_}"
+        fi
+    else
+        $CP ${TEM_DIR}/upd_fs_list_temp ${TEM_DIR}/upd_fs_list
+        if [ $? -ne 0 ]; then
+            _err_msg_="Could not copy ${TEM_DIR}/upd_fs_list_temp to ${TEM_DIR}/upd_fs_list"
+            abort_script "${_err_msg_}"
+        fi
+    fi
+    _current_mnt_list_=${TEM_DIR}/upd_fs_list
+else
+    _current_mnt_list_=${CONNECTD_INFO}/${OSS_ALIAS}/eventdata_fs_mount
+fi
+$ECHO "Using ${_current_mnt_list_} file for eventdata mount information" >> ${LOGFILE}
+
+unset _fs_array_ _mnt_point_array_
+
+_cnt_=0
+while read _line_; do
+    _fs_=`$ECHO ${_line_} | $AWK '{print $3}'`
+    _mnt_point_=`$ECHO ${_line_} | $AWK '{print $4}'`
+
+    # Store the details in 2 arrays
+    _fs_array_[${_cnt_}]=${_fs_}
+    _mnt_point_array_[${_cnt_}]=${_mnt_point_}
+
+    let _cnt_=_cnt_+1
+done < ${_current_mnt_list_}
+
+_mount_array_length_=${#_mnt_point_array_[@]}
+
+for (( i=0; i<${_mount_array_length_}; i++ )); do
+    _fs_=${_fs_array_[${i}]}
+    _mntpt_=${_mnt_point_array_[${i}]}
+    
+    while :; do
+        $ECHO "\nEnter the IP to which ${_fs_} will be mounted from"
+        read _ip_
+    
+        if [ ! "${_ip_}" ]; then
+            continue
+        fi
+    
+        validate_ip ${_ip_}
+        if [ $? -ne 0 ]; then
+            continue
+        fi
+        
+        break
+    done
+
+    # Create a list of FS to mount for display to the user
+    $ECHO "${_fs_}" >> ${TEM_DIR}/event_filesys_to_mount
+
+    $ECHO "${_ip_} ${_fs_} ${_mntpt_}" >> ${TEM_DIR}/eventdata_mount_list_file
+done
+
+$ECHO "\nMountpoint and IP information as supplied by user for eventdata directories" >> ${LOGFILE}
+$CAT ${TEM_DIR}/eventdata_mount_list_file >> ${LOGFILE}
+}
+
+
+
+### Function: get_mount_info ###
+#
+# Add mountpoints
+#
+# Arguments:
+#    none
+# Return Values:
+#    none
+get_mount_info()
+{
+# Get the pm dirs
+get_data_file_info
+
+# Get pmData info
+get_pmdata_info
+
+if [ "${INSTALL_TYPE}" != "stats" ]; then
+    # Get eventData info
+    get_eventdata_info
+fi
+}
+
+### Function: get_pmdata_info ###
+#
+# Add mountpoints
+#
+# Arguments:
+#    none
+# Return Values:
+#    none
+get_pmdata_info()
+{
+
+# Copy the pmdata_fs_mount_template template to /tmp
+    $CAT ${ENIQ_CONNECTD_DIR}/etc/pmdata_fs_mount_template | $EGREP -v '^[[:blank:]]*#' > ${TEM_DIR}/uptd_mount_list
+
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not create ${TEM_DIR}/uptd_mount_list"
+    abort_script "${_err_msg_}"
+fi
+
+$RM -rf ${TEM_DIR}/pm_mount_list_file ${TEM_DIR}/pm_filesys_to_mount
+
+# Create a header for the pmdata_fs_mount file
+$ECHO "#" > ${TEM_DIR}/pm_mount_list_file
+$ECHO "# Mount_IP    NFS_share     Mount_Point_relative_to_PM_SYM_LINKS_DIR" >> ${TEM_DIR}/pm_mount_list_file
+$ECHO "#" >> ${TEM_DIR}/pm_mount_list_file
+
+# Determine the MOUNT_TYPE
+MOUNT_TYPE="${MOUNT_CHOICE}"
+if [ "${MOUNT_CHOICE}" == "ENM" ]; then
+    if [ "${ENM_TYPE}" == "vENM" ]; then
+        MOUNT_TYPE="${ENM_TYPE}"
+    fi
+fi
+
+if [ "${ACTION}" == "add" ]; then
+    $CAT ${ENIQ_CONNECTD_DIR}/etc/pmdata_fs_mount_template | $EGREP -v '^[[:blank:]]*#' | $GREP -w "${MOUNT_TYPE}" > ${TEM_DIR}/upd_fs_list_temp
+    
+    if [ "${MOUNT_CHOICE}" == "SOEM" -o "${MOUNT_CHOICE}" == "SOEM_NAS" ]; then
+        if [ "${MOUNT_CHOICE}" == "SOEM_NAS" ]; then
+            $ECHO "\nUpdating temporary copy of ${ENIQ_CONNECTD_DIR}/etc/pmdata_fs_mount_template with NAS pool information for ${MOUNT_CHOICE}" >> ${LOGFILE}
+            $CAT ${TEM_DIR}/upd_fs_list_temp | $SED -e "s|<SOEM_POOL_ID>|${SOEM_SYS_ID}|g" > ${TEM_DIR}/upd_fs_list
+            if [ $? -ne 0 ]; then
+                _err_msg_="Could not update ${TEM_DIR}/upd_fs_list with SOEM System ID"
+                abort_script "${_err_msg_}"
+            fi
+        else
+            $CP ${TEM_DIR}/upd_fs_list_temp ${TEM_DIR}/upd_fs_list
+            if [ $? -ne 0 ]; then
+                _err_msg_="Could not copy ${TEM_DIR}/upd_fs_list_temp to ${TEM_DIR}/upd_fs_list"
+                abort_script "${_err_msg_}"
+            fi
+        fi
+    else
+        if [ "${MOUNT_CHOICE}" == "NAS" ]; then
+            $ECHO "\nUpdating temporary copy of ${ENIQ_CONNECTD_DIR}/etc/pmdata_fs_mount_template with NAS pool information for ${MOUNT_CHOICE}" >> ${LOGFILE}
+            $CAT ${TEM_DIR}/upd_fs_list_temp | $SED -e "s|<OSS_POOL_ID>|${OSS_SYS_ID}|g" > ${TEM_DIR}/upd_fs_list
+            if [ $? -ne 0 ]; then
+                _err_msg_="Could not update ${TEM_DIR}/upd_fs_list with OSS System ID"
+                abort_script "${_err_msg_}"
+            fi
+        else
+            $CP ${TEM_DIR}/upd_fs_list_temp ${TEM_DIR}/upd_fs_list
+            if [ $? -ne 0 ]; then
+                _err_msg_="Could not copy ${TEM_DIR}/upd_fs_list_temp to ${TEM_DIR}/upd_fs_list"
+                abort_script "${_err_msg_}"
+            fi
+        fi
+    fi
+       
+        if [ "${MOUNT_CHOICE}" == "ENM" ]; then
+              if [ "${ENM_TYPE}" != "vENM" ]; then
+                  $CAT ${TEM_DIR}/upd_fs_list_temp | $SED '/^vENM/ d' | $SED '/^$/d' > ${TEM_DIR}/upd_fs_list_temp1
+                  $MV ${TEM_DIR}/upd_fs_list_temp1 ${TEM_DIR}/upd_fs_list_temp
+                     $ECHO "\nUpdating temporary copy of ${ENIQ_CONNECTD_DIR}/etc/pmdata_fs_mount_template for ${ENM_TYPE}" >> ${LOGFILE}
+                     $CAT ${TEM_DIR}/upd_fs_list_temp | $SED -e "s|<PMLINKS_DIR>|${pm_links_dir}|g" > ${TEM_DIR}/upd_fs_list
+             else
+                 $CAT ${TEM_DIR}/upd_fs_list_temp | $SED '/^ENM/ d' | $SED '/^$/d' > ${TEM_DIR}/upd_fs_list_temp1
+                 $MV ${TEM_DIR}/upd_fs_list_temp1 ${TEM_DIR}/upd_fs_list_temp
+                 $CAT ${TEM_DIR}/upd_fs_list_temp | $SED -e "s|<PMLINKS_DIR>|${pm_links_dir}|g" > ${TEM_DIR}/upd_fs_list
+                       if [ $? -ne 0 ]; then
+                           _err_msg_="Could not update ${TEM_DIR}/upd_fs_list with pmlinks info"
+                           abort_script "${_err_msg_}"
+                       fi
+              fi
+        fi
+
+    _current_mnt_list_=${TEM_DIR}/upd_fs_list
+else
+    $CAT ${ENIQ_CONNECTD_DIR}/etc/pmdata_fs_mount_template | $EGREP -v '^[[:blank:]]*#' | $GREP -w "${MOUNT_TYPE}" > ${TEM_DIR}/upd_fs_list_temp
+    
+    if [ "${MOUNT_CHOICE}" == "SOEM" -o "${MOUNT_CHOICE}" == "SOEM_NAS" ]; then
+        if [ "${MOUNT_CHOICE}" == "SOEM_NAS" ]; then
+            $ECHO "\nUpdating temporary copy of ${ENIQ_CONNECTD_DIR}/etc/pmdata_fs_mount_template with NAS pool information for ${MOUNT_CHOICE}" >> ${LOGFILE}
+            $CAT ${TEM_DIR}/upd_fs_list_temp | $SED -e "s|<SOEM_POOL_ID>|${SOEM_SYS_ID}|g" > ${TEM_DIR}/upd_fs_list
+            if [ $? -ne 0 ]; then
+                _err_msg_="Could not update ${TEM_DIR}/upd_fs_list with SOEM System ID"
+                abort_script "${_err_msg_}"
+            fi
+        else
+            $CP ${TEM_DIR}/upd_fs_list_temp ${TEM_DIR}/upd_fs_list
+            if [ $? -ne 0 ]; then
+                _err_msg_="Could not copy ${TEM_DIR}/upd_fs_list_temp to ${TEM_DIR}/upd_fs_list"
+                abort_script "${_err_msg_}"
+            fi
+        fi
+    else
+        if [ "${MOUNT_CHOICE}" == "NAS" ]; then
+            $ECHO "\nUpdating temporary copy of ${ENIQ_CONNECTD_DIR}/etc/pmdata_fs_mount_template with NAS pool information for ${MOUNT_CHOICE}" >> ${LOGFILE}
+            OSS_SYS_ID=`$CAT ${CONNECTD_INFO}/${ALIAS}/fs_mount_list | $GREP "pm" | $AWK '{printf $2}' | $CUT -d "-" -f 1 | $CUT -d "/" -f 3`
+            if [ $? -ne 0 ]; then
+                _err_msg_="Could not get the existing OSS System Identifier"
+                abort_script "${_err_msg_}"
+            fi
+            $CAT ${TEM_DIR}/upd_fs_list_temp | $SED -e "s|<OSS_POOL_ID>|${OSS_SYS_ID}|g" > ${TEM_DIR}/upd_fs_list
+            if [ $? -ne 0 ]; then
+                _err_msg_="Could not update ${TEM_DIR}/upd_fs_list with OSS System ID"
+                abort_script "${_err_msg_}"
+            fi
+        else
+            $CP ${TEM_DIR}/upd_fs_list_temp ${TEM_DIR}/upd_fs_list
+            if [ $? -ne 0 ]; then
+                _err_msg_="Could not copy ${TEM_DIR}/upd_fs_list_temp to ${TEM_DIR}/upd_fs_list"
+                abort_script "${_err_msg_}"
+            fi
+        fi
+    fi
+       
+        if [ "${MOUNT_CHOICE}" == "ENM" ]; then
+              if [ "${ENM_TYPE}" != "vENM" ]; then
+                  $CAT ${TEM_DIR}/upd_fs_list_temp | $SED '/^vENM/ d' | $SED '/^$/d' > ${TEM_DIR}/upd_fs_list_temp1
+                  $MV ${TEM_DIR}/upd_fs_list_temp1 ${TEM_DIR}/upd_fs_list_temp
+                     $ECHO "\nUpdating temporary copy of ${ENIQ_CONNECTD_DIR}/etc/pmdata_fs_mount_template for ${ENM_TYPE}" >> ${LOGFILE}
+                     $CAT ${TEM_DIR}/upd_fs_list_temp | $SED -e "s|<PMLINKS_DIR>|${pm_links_dir}|g" > ${TEM_DIR}/upd_fs_list
+             else
+                 $CAT ${TEM_DIR}/upd_fs_list_temp | $SED '/^ENM/ d' | $SED '/^$/d' > ${TEM_DIR}/upd_fs_list_temp1
+                 $MV ${TEM_DIR}/upd_fs_list_temp1 ${TEM_DIR}/upd_fs_list_temp
+                 $CAT ${TEM_DIR}/upd_fs_list_temp | $SED -e "s|<PMLINKS_DIR>|${pm_links_dir}|g" > ${TEM_DIR}/upd_fs_list
+                       if [ $? -ne 0 ]; then
+                           _err_msg_="Could not update ${TEM_DIR}/upd_fs_list with pmlinks info"
+                           abort_script "${_err_msg_}"
+                       fi
+              fi
+        fi
+    _current_mnt_list_=${TEM_DIR}/upd_fs_list
+fi
+
+$ECHO "Using ${_current_mnt_list_} file for pmdata mount information" >> ${LOGFILE}
+
+unset _fs_array_ _mnt_point_array_
+
+_cnt_=0
+while read _line_; do
+    _fs_=`$ECHO ${_line_} | $AWK '{print $3}'`
+    _mnt_point_=`$ECHO ${_line_} | $AWK '{print $4}'`
+
+    # Store the details in 2 arrays
+    _fs_array_[${_cnt_}]=${_fs_}
+    _mnt_point_array_[${_cnt_}]=${_mnt_point_}
+
+    let _cnt_=_cnt_+1
+done < ${_current_mnt_list_}
+
+_mount_array_length_=${#_mnt_point_array_[@]}
+
+for (( i=0; i<${_mount_array_length_}; i++ )); do
+    _fs_=${_fs_array_[${i}]}
+    _mntpt_=${_mnt_point_array_[${i}]}
+    
+    while :; do
+        $ECHO "\nEnter the IP to which ${_fs_} will be mounted from"
+        read _ip_
+    
+        if [ ! "${_ip_}" ]; then
+            continue
+        fi
+    
+        validate_ip ${_ip_}
+        if [ $? -ne 0 ]; then
+            continue
+        fi
+        
+        break
+       done
+    
+       # Create a list of FS to mount for display to the user
+       $ECHO "${_fs_}" >> ${TEM_DIR}/pm_filesys_to_mount
+
+       $ECHO "${_ip_} ${_fs_} ${_mntpt_}" >> ${TEM_DIR}/pm_mount_list_file
+       $ECHO "${_ip_} ${_fs_}" >> ${TEM_DIR}/pmlinks_file
+done
+
+if [ ${MOUNT_CHOICE} == "ENM" ]; then
+    # copying pmlinks info to the original location
+    $CP ${TEM_DIR}/pmlinks_file  ${CONNECTD_INFO}/${ALIAS}/pmlinks_file
+    if [ $? -ne 0 ]; then
+       _err_msg_="Could not copy  ${TEM_DIR}/pmlinks_file to ${CONNECTD_INFO}/${ALIAS}/pmlinks_file"
+       abort_script "${_err_msg_}"
+    fi
+    if [ "${ENM_MODE}" == "FLS" ];then
+         $ECHO "\n*************************************************"
+        $ECHO "Mountpoint and IP information as supplied by user for Symlink directories are collected" | $TEE -a ${LOGFILE}
+        $ECHO "This info is required in case of Symlink switching in future" | $TEE -a ${LOGFILE}
+        $ECHO "*************************************************"
+    fi
+fi
+
+$ECHO "\nMountpoint and IP information as supplied by user for pmdata directories" >> ${LOGFILE}
+$CAT ${TEM_DIR}/pm_mount_list_file >> ${LOGFILE}
+}
+
+### Function: get_pmlinks_dir ###
+#
+# get the pmlinks info for vENM for future reference
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+get_pmlinks_dir()
+{
+
+$RM -rf ${CONNECTD_INFO}/${ALIAS}/pmlinks_file  >> /dev/null 2>&1
+
+$CP ${TEM_DIR}/pmlinks_dir ${CONNECTD_INFO}/${ALIAS}/pmlinks_file
+if [ $? -ne  0 ]; then
+   _err_msg_="Could not copy ${TEM_DIR}/pmlinks_dir to ${CONNECTD_INFO}/${ALIAS}/pmlinks_file"
+   abort_script "${_err_msg_}"
+fi
+
+if [ ! -s "${CONNECTD_INFO}/${ALIAS}/pmlinks_file" ]; then
+   _err_msg_="Could not find ${CONNECTD_INFO}/${ALIAS}/pmlinks_file or is empty"
+   abort_script "${_err_msg_}"
+fi
+
+pm_links_dir=`$CAT ${CONNECTD_INFO}/${ALIAS}/pmlinks_file` 
+if [ $? -ne 0 ]; then
+   _err_msg_="Could not get the symlink filesystem from ENM"
+   abort_script "${_err_msg_}"
+fi
+
+}
+
+### Function: list_mountpoints ###
+#
+# List current mountpoints
+#
+# Arguments:
+#    none
+# Return Values:
+#    none
+list_mountpoints()
+{
+$ECHO $ALIAS | $EGREP  "eniq_events" >> /dev/null 2>&1
+if [ $? -ne 0 ]; then
+    _current_mnt_list_=${CONNECTD_INFO}/${ALIAS}/fs_mount_list
+else
+    _current_mnt_list_=${CONNECTD_INFO}/${ALIAS}/stats_events_mount_list
+fi
+
+# Create a display file for the user
+_disp_file_=${TEM_DIR}/disp_file
+$RM -rf ${_disp_file_}
+
+# If an alias was supplied, just list those mounted filesystems
+if [ "${ALIAS}" ]; then
+    $LS ${CONNECTD_INFO} | $GREP -w ${ALIAS} >> /dev/null 2>&1
+    if [ $? -ne 0 ]; then
+        clear
+        $ECHO "\n"
+        _err_msg_="${ALIAS} does not appear to have been set up"
+        abort_script "${_err_msg_}"
+    fi
+
+    $ECHO "\n ${NODE} Alias:\t${ALIAS}" >> ${_disp_file_}
+    _current_mnt_list_=${CONNECTD_INFO}/${ALIAS}/fs_mount_list
+    $PRINTF "\n%-35s%-35s\n" "Filesystem" "Mountpoint" >> ${_disp_file_}
+    $CAT ${_current_mnt_list_} | $EGREP -v '^[[:blank:]]*#' >> ${_disp_file_}
+    $ECHO "" >> ${_disp_file_}
+else
+    # If no alias was supplied, then display all mounts for all
+    # connected OSS's
+    _alias_list_=`$LS ${CONNECTD_INFO} | $EGREP "${REF_STR}[1-9][0-9]*"`
+    for _alias_ in `$ECHO ${_alias_list_}`; do
+        $ECHO "\n${NODE} Alias:\t${_alias_}" >> ${_disp_file_}
+        $PRINTF "\n%-35s%-35s\n" "Filesystem" "Mountpoint" >> ${_disp_file_}
+        $CAT ${CONNECTD_INFO}/${_alias_}/fs_mount_list | $EGREP -v '^[[:blank:]]*#' >> ${_disp_file_}
+        $ECHO "" >> ${_disp_file_}
+    done
+fi
+
+clear
+$CAT ${_disp_file_}
+}
+
+### Function: setup_display_file ###
+#
+# Confirm with user that values entered are correct
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+setup_display_file()
+{
+# Create a display file for the user
+_disp_file_=${TEM_DIR}/disp_file
+$RM -rf ${_disp_file_}
+
+if [ "${ACTION}" == "add" ]; then
+    if [ ${MOUNT_CHOICE} == "ENM" ]; then
+            while read ip ; do
+                 echo -n "${ip} " >> ${TEM_DIR}/ip_list
+            done < ${SRV_IP}
+            $ECHO "\n${NODE}  IP\t\t\t `$CAT ${TEM_DIR}/ip_list`" >>  ${_disp_file_}
+    else
+        $ECHO "\n${NODE} Server IP\t\t\t${SRV_IP}" >> ${_disp_file_}
+    fi
+fi
+
+$ECHO "\nENIQ ${NODE} hostname alias\t\t${ALIAS}\n" >> ${_disp_file_}
+$ECHO "Filesystems to be mounted by ENIQ:" >> ${_disp_file_}
+
+if [ -s ${TEM_DIR}/filesys_to_mount ]; then
+    $CAT ${TEM_DIR}/filesys_to_mount >> ${_disp_file_}
+fi
+
+if [ "${ENM_MODE}" != "FLS" ]; then
+    if [ -s ${TEM_DIR}/pm_filesys_to_mount ]; then
+        $CAT ${TEM_DIR}/pm_filesys_to_mount >> ${_disp_file_}
+    fi
+fi
+
+if [ -s ${TEM_DIR}/event_filesys_to_mount ]; then
+    $CAT ${TEM_DIR}/event_filesys_to_mount >> ${_disp_file_}
+fi
+if [ "${MOUNT_CHOICE}" == "SOEM_NAS" ]; then
+    if [ -s ${ENIQ_CONNECTD_DIR}/etc/mount_warning_soem_nas.txt ]; then 
+        $CAT ${ENIQ_CONNECTD_DIR}/etc/mount_warning_soem_nas.txt >> ${_disp_file_} 
+    fi
+else
+    if [ "${MOUNT_CHOICE}" == "OSS" -o "${MOUNT_CHOICE}" == "SOEM" ]; then 
+        if [ -s ${ENIQ_CONNECTD_DIR}/etc/mount_warning.txt ]; then 
+            $CAT ${ENIQ_CONNECTD_DIR}/etc/mount_warning.txt >> ${_disp_file_} 
+        fi 
+    else  
+           if [ "${MOUNT_CHOICE}" == "ENM" ]; then
+                if [ "${ENM_TYPE}" != "vENM" ]; then 
+                if [ -s ${ENIQ_CONNECTD_DIR}/etc/mount_warning_nas.txt ]; then 
+                    $CAT ${ENIQ_CONNECTD_DIR}/etc/mount_warning_nas.txt >> ${_disp_file_} 
+                fi
+               fi
+           fi 
+    fi
+fi
+
+$ECHO "\nAre you sure you wish to continue mounting the above filesystems? (Yy/Nn)" >> ${_disp_file_}
+}
+
+### Function: setup_env ###
+#
+# Setup up path environment etc
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+setup_env()
+{
+if [ ! "${ENIQ_BASE_DIR}" ]; then
+    ENIQ_BASE_DIR=${ENIQ_ROOT_DIR}
+fi
+
+ENIQ_CONF_DIR=${ENIQ_BASE_DIR}/installation/config
+
+# Create new directory structure for tunnels/interfaces
+ENIQ_ADMIN_DIR=${ENIQ_BASE_DIR}/admin
+
+# File containing the type of OSS installation. Eg. oss or single
+INST_TYPE_FILE=${ENIQ_CONF_DIR}/ericsson_use_config
+
+# Read the installation type
+INSTALL_TYPE=`$CAT ${INST_TYPE_FILE} | $AWK -F\= '{print $2}'`
+
+# ENIQ connectd directory
+ENIQ_CONNECTD_DIR=${ENIQ_BASE_DIR}/connectd
+
+# Connectd info
+CONNECTD_INFO=${ENIQ_CONNECTD_DIR}/mount_info
+
+# fs_mount_list_template
+
+FS_MOUNT_LIST_TEMPLATE=${ENIQ_CONNECTD_DIR}/etc/${INSTALL_TYPE}_fs_mount_list_template
+
+# to be used for PDM fs values
+CONNECTD_CONFIG=${ENIQ_CONNECTD_DIR}/etc/connectd_config_template
+if [ ! -s ${CONNECTD_CONFIG} ]; then
+    _err_msg_="File ${CONNECTD_CONFIG} not found or is empty"
+    abort_script "${_err_msg_}"
+fi
+
+# Do we have a templates dir for the install type
+if [ ! -s ${ENIQ_CONNECTD_DIR}/etc/${INSTALL_TYPE}_fs_mount_list_template ]; then
+    _err_msg_="File ${ENIQ_CONNECTD_DIR}/etc/${INSTALL_TYPE}_fs_mount_list_template not found or is empty"
+    abort_script "${_err_msg_}"
+fi
+
+# String denoting the start of and OSS reference name. Appended
+# To this will be the next available number
+
+if [ "${MOUNT_CHOICE}" == "SOEM" ]; then
+        REF_STR=eniq_soem_
+else
+    if [ "${INSTALL_TYPE}" == "stats" ]; then
+        REF_STR=eniq_oss_
+    else
+        REF_STR=events_oss_
+    fi
+fi
+
+if [ "${MOUNT_CHOICE}" == "NAS" ]; then
+    NODE="OSS NAS"
+else
+    NODE=${MOUNT_CHOICE}
+fi
+
+# Set the log directory
+LOG_DIR=${ENIQ_BASE_DIR}/local_logs
+LOGFILE_DIR="$LOG_DIR/mountpoint_log"
+}
+
+### Function: update_mountpoints ###
+#
+# Add mountpoints
+#
+# Arguments:
+#    none
+# Return Values:
+#    none
+update_mountpoints()
+{
+# Create the user file with the mounts and descriptions
+get_mount_info
+
+if [ -z "${NO_CONFIRM}" ]; then
+    setup_display_file
+    if [ ! -s ${_disp_file_} ]; then
+        _err_msg_="${_disp_file_} does not exist, or is empty"
+        abort_script "${_err_msg_}"
+    fi
+
+    confirm_user_input ${_disp_file_}
+    # If user hit N/n, exit
+    if [ "${USER_CONF}" == "N" -o "${USER_CONF}" == "n" ]; then
+        $RM -rf ${TEM_DIR}
+    $RM /tmp/enm_mode_fls >> /dev/null 2>&1
+        $ECHO "\n"
+        exit 0
+    fi
+fi
+
+if [ "$FORCE_UPD" ]; then
+    # create the fs_mount_list file
+    create_mount_list_file
+else
+    $CMP -s ${TEM_DIR}/mount_list_file ${_current_mnt_list_}
+    # If the files are the same, then no update is required
+    if [ $? -eq 0 ]; then
+        $ECHO "\nNo update required"
+    else
+        create_mount_list_file
+    fi
+fi
+
+# Restart the tunnel monitoring script to read
+# the new fs_mount_list file
+_connectd_pid_=`$PS -ef | $GREP -vw "grep -E" | $EGREP "connectd_${ALIAS}_monitor" | $AWK '{ print $2 }'`
+if [ "${_connectd_pid_}" ]; then
+    $ECHO "\nRestarting ${ALIAS} connection in order to mount updated filesystems" | $TEE -a ${LOGFILE}
+    $KILL -USR2 ${_connectd_pid_} >> /dev/null 2>&1
+fi
+}
+
+### Function: usage_msg ###
+#
+#   Print out the usage message
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+usage_msg()
+{
+clear
+$ECHO "
+Usage: `$BASENAME $0` -a <add|list|update> -i <node ip_addr> -o <node alias>
+                        [ -l <path_to_logfile> ] [ -t <connection type > ]
+
+options:
+
+-a    : Action. Must be one of the following:
+              list    --> List currently mounted filesystems
+              update  --> Update the currently mounted filesystems
+
+-l    : Optional parameter specifying the full path to logfile. If not specified, a
+      logfile will be created in ${LOGFILE_DIR}
+
+-o    : The OSS alias to manage. Must be in the form
+        events_oss_<n> or eniq_oss_<n>
+        The SOEM alias must be in the form of eniq_soem_<n>
+
+-i     : Parameter specifying the Node IP Address list file in case of ENM or Node IP Address in case of other Mount locations
+
+-t  : mandatory parameter to specify connection type from which file
+      system is mounted.
+"
+}
+
+# ********************************************************************
+#
+#     Main body of program
+#
+# ********************************************************************
+#
+# Determine absolute path to software
+get_absolute_path
+
+# Check that the effective id of the user is root
+check_id $DEFAULT_USER
+
+while getopts ":a:Fi:l:No:t:" arg; do
+  case $arg in
+    a) ACTION="$OPTARG"
+       ;;
+    F) FORCE_UPD="YES"
+       ;;
+    i) SRV_IP="$OPTARG"
+       ;;
+    l) LOGFILE="$OPTARG"
+       ;;
+    N) NO_CONFIRM="YES"
+       ;;
+    o) ALIAS="$OPTARG"
+       ;;
+    t) MOUNT_CHOICE="$OPTARG"
+       ;;
+   \?) usage_msg
+       exit 1
+       ;;
+  esac
+done
+shift `expr $OPTIND - 1`
+
+# Source the common functions
+if [ -s ${ENIQ_ROOT_DIR}/admin/lib/common_functions.lib ]; then
+    . ${ENIQ_ROOT_DIR}/admin/lib/common_functions.lib
+else
+    _err_msg_="File ${ENIQ_ROOT_DIR}/admin/lib/common_functions.lib not found"
+    abort_script "${_err_msg_}"
+fi
+
+# Set up the environment variables
+setup_env
+
+# Check Input Params
+check_params
+
+if [ ! "${LOGFILE}" ]; then
+    LOGFILE=${LOGFILE_DIR}/manage_mountpoints.log
+fi
+
+# Check/Create Logfile
+chk_create_logfile
+
+$ECHO "\n=====================================================" >> ${LOGFILE}
+$ECHO "`$DATE '+%Y-%b-%d_%H.%M.%S'` - Beginning to ${ACTION} ${NODE} mountpoints" >> ${LOGFILE}
+$ECHO "=====================================================" >> ${LOGFILE}
+
+# Create a temporary Directory
+TEM_DIR=/tmp/manage_mountpoints.$$.$$
+$RM -rf ${TEM_DIR}
+$MKDIR -p ${TEM_DIR}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not create directory ${TEM_DIR}"
+    abort_script "${_err_msg_}"
+fi
+
+#Skipping manage_mountpoint.bsh script execution as no mount points for Cloud ENM 
+if [ "${ENM_TYPE}" = "cENM" ]; then
+    $ECHO "\nSkipping execution of manage_mountpoint.bsh for Cloud ENM Integration as not needed" | $TEE -a ${LOGFILE}
+    rm -rf ${TEM_DIR}
+    exit 0
+fi
+
+# Perform Required Action
+case ${ACTION} in
+    add)     add_mountpoints
+             ;;
+    list)    list_mountpoints
+             ;;
+    update)  update_mountpoints
+             ;;
+    \?)      usage_msg
+             exit 1
+             ;;
+esac
+
+$RM -rf ${TEM_DIR}
+
+exit 0

@@ -1,0 +1,576 @@
+#!/bin/bash
+# ********************************************************************
+# Ericsson Radio Systems AB                                     SCRIPT
+# ********************************************************************
+#
+#
+# (c) Ericsson Radio Systems AB 2010 - All rights reserved.
+#
+# The copyright to the computer program(s) herein is the property
+# of Ericsson Radio Systems AB, Sweden. The programs may be used 
+# and/or copied only with the written permission from Ericsson Radio 
+# Systems AB or in accordance with the terms and conditions stipulated 
+# in the agreement/contract under which the program(s) have been 
+# supplied.
+#
+# ********************************************************************
+# Name    : set_core_memcache.bsh
+# Date    : 16/12/2010
+# Revision: C
+# Purpose : Script to update the number of CPU cores and/or DWH memcache
+#           values in the niq.ini file
+#
+# Usage   : set_core_memcache.bsh
+#
+# ********************************************************************
+#
+# 	Command Section
+#
+# ********************************************************************
+AWK=/usr/bin/awk
+BASENAME=/usr/bin/basename
+BC=/usr/bin/bc
+CAT=/usr/bin/cat
+CHMOD=/usr/bin/chmod
+CHOWN=/usr/bin/chown
+CLEAR=/usr/bin/clear
+CMP=/usr/bin/cmp
+CP=/usr/bin/cp
+CPIO=/usr/bin/cpio
+DATE=/usr/bin/date
+DIRNAME=/usr/bin/dirname
+DOMAINNAME=/usr/bin/domainname
+DTCONFIG=/usr/dt/bin/dtconfig
+DUMPADM=/usr/sbin/dumpadm
+ECHO=/usr/bin/echo
+EGREP=/usr/bin/egrep
+EJECT=/usr/bin/eject
+ENV=/usr/bin/env
+EXPR=/usr/bin/expr
+FIND=/usr/bin/find
+FLARCREATE=/usr/sbin/flarcreate
+FORMAT=/usr/sbin/format
+FUSER=/usr/sbin/fuser
+GEGREP=/usr/sfw/bin/gegrep
+GETENT=/usr/bin/getent
+GETTEXT=/usr/bin/gettext
+GREP=/usr/bin/grep
+GROUPADD=/usr/sbin/groupadd
+GTAR=/usr/sfw/bin/gtar
+GZCAT=/usr/bin/gzcat
+HEAD=/usr/bin/head
+HOSTNAME=/usr/bin/hostname
+ID=/usr/bin/id
+INIT=/usr/sbin/init
+LS=/usr/bin/ls
+MKDIR=/usr/bin/mkdir
+MORE=/usr/bin/more
+MV=/usr/bin/mv
+NAWK=/usr/bin/nawk
+PGREP=/usr/bin/pgrep
+PING=/usr/sbin/ping
+PKGADD=/usr/sbin/pkgadd
+PKGINFO=/usr/bin/pkginfo
+PRTCONF=/usr/sbin/prtconf
+PSRINFO=/usr/sbin/psrinfo
+PWD=/usr/bin/pwd
+RM=/usr/bin/rm
+RCP=/usr/bin/rcp
+RSH=/usr/bin/rsh
+SED=/usr/bin/sed
+SLEEP=/usr/bin/sleep
+SORT=/usr/bin/sort
+SU=/usr/bin/su
+SVCADM=/usr/sbin/svcadm
+SVCCFG=/usr/sbin/svccfg
+SVCS=usr/bin/svcs
+SWAP=/usr/sbin/swap
+SYNC=/usr/sbin/sync
+TAIL=/usr/bin/tail
+TEE=/usr/bin/tee
+TOUCH=/usr/bin/touch
+TPUT=/usr/bin/tput
+UADMIN=/usr/sbin/uadmin
+UNAME=/usr/bin/uname
+USERADD=/usr/sbin/useradd
+VOLD=/usr/sbin/vold
+WC=/usr/bin/wc
+ZFS=/usr/sbin/zfs
+ZPOOL=/usr/sbin/zpool
+
+# ********************************************************************
+#
+#       Configuration Section
+#
+# ********************************************************************
+
+# ********************************************************************
+#
+#       Pre-execution Operations
+#
+# ********************************************************************
+# Default user
+DEFAULT_USER=root
+
+# Flag to determine whether to compress log or not (Must be y/n)
+COMPRESS_LOG=n
+
+# Name of SunOS & ENIQ ini Files
+ENIQ_ENV=niq.rc
+ENIQ_INI=niq.ini
+SUNOS_INI=SunOS.ini
+STORAGE_INI=storage.ini
+
+# Number of log files to keep
+NUM_LOGS=10
+
+# Size in kbytes that the log file is allowed to grow to
+SIZE_LOGS=204800
+
+# NAS API Packages
+NAS_PLUGGIN_PKG=ERICstmnas
+NAS_API_PKG=ERICstmapi
+
+# SAN API Packages
+SAN_API_PKG=ERICstorapi
+
+# ********************************************************************
+#
+# 	functions
+#
+# ********************************************************************
+### Function: abort_script ###
+#
+#   This will is called if the script is aborted thru an error
+#   error signal sent by the kernel such as CTRL-C or if a serious
+#   error is encountered during runtime
+#
+# Arguments:
+#       $1 - Error message from part of program (Not always used)
+# Return Values:
+#       none
+abort_script()
+{
+if [ "$1" ]; then
+    _err_msg_=$1
+else
+    _err_msg_="Script aborted.......\n"    
+fi
+
+# Check if log_msg() is defined, else define log()
+type log_msg > /dev/null 2>&1
+if [ $? -gt 0 ]; then
+    if [ "${LOGFILE}" ]; then
+	if [ ! "${SNAP_QUIET}" ]; then
+	    $ECHO "\n${_err_msg_}\n" |$TEE -a ${LOGFILE}
+	else
+	    $ECHO "\n${_err_msg_}\n" >> ${LOGFILE}
+        fi
+    else
+	$ECHO "\n${_err_msg_}\n"
+    fi
+else
+    if [ "${LOGFILE}" ]; then
+	log_msg -s "\n${_err_msg_}\n" -l ${LOGFILE} ${SNAP_QUIET}
+    else
+	log_msg -s "\n${_err_msg_}\n" ${SNAP_QUIET}
+    fi
+fi
+
+cd $SCRIPTHOME
+
+$RM -rf  ${TEM_DIR}
+
+if [ "$2" ]; then
+    exit ${2}
+else
+   exit 1
+fi
+}
+
+### Function: check_id ###
+#
+#   Check that the effective id of the user is correct
+#   If not print error msg and exit.
+#
+# Arguments:
+#       $1 : User ID name
+# Return Values:
+#       none
+check_id()
+{
+_check_id_=`$ID  | $AWK -F\( '{print $2}' | $AWK -F\) '{print $1}'`
+if [ "$_check_id_" != "$1" ]; then
+    _err_msg_="You must be $1 to execute this script."
+    abort_script "$_err_msg_"
+fi
+}
+
+### Function: check_templates_dir ###
+#
+# Check that I have a templates directory associated with
+# my installation type
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+check_templates_dir()
+{
+$ECHO "Checking files in template directory" >> ${LOGFILE}
+
+if [ ! -s "${INST_TYPE_FILE}" ]; then
+    _err_msg_="ENIQ install type not defined in ${INST_TYPE_FILE}"
+    abort_script "$_err_msg_"  "${EXEC_SHELL_CMD}"
+fi
+# Read the installation type - should be "events" or "statistics"
+INSTALL_TYPE=`$CAT ${INST_TYPE_FILE} | $NAWK -F\= '{print $2}'`
+
+# Templates Directory
+ENIQ_TEMPL_DIR=${ENIQ_CORE_INST_DIR}/templates/${INSTALL_TYPE}
+
+# Do we have a templates dir for the install type
+if [ ! -d ${ENIQ_TEMPL_DIR} ]; then
+    _err_msg_="Template directory ${ENIQ_TEMPL_DIR} not found"
+    abort_script "$_err_msg_" "${EXEC_SHELL_CMD}"
+fi
+
+}
+
+
+### Function: chk_create_logfile ###
+#
+# Check/Create Logfile
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+chk_create_logfile()
+{
+$MKDIR -p `$DIRNAME ${LOGFILE}`
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not create directory `$DIRNAME ${LOGFILE}`"
+     abort_script "$_err_msg_"
+fi
+
+$TOUCH -a ${LOGFILE}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not write to file ${LOGFILE}"
+    abort_script "$_err_msg_"
+fi
+log_msg -s "----------------------------------------------------------------" -l ${LOGFILE} ${SNAP_QUIET}
+log_msg -s "----------------------------------------------------------------" -l ${LOGFILE} ${SNAP_QUIET}
+log_msg -s "Started Upgrade of NAS API at `$DATE +%d.%m.%y_%H:%M:%S`" -l ${LOGFILE} ${SNAP_QUIET}
+}
+
+### Function: compare_pkg_versions ###
+#
+#   Check the pkg versions of the selected package
+#
+# Arguments:
+#       $1 : Package Name
+# Return Values:
+#       none
+compare_pkg_versions()
+{
+local _lpkg_
+_lpkg_=$1
+
+_curr_version_=`${PKGINFO} -l ${_lpkg_} | ${GREP} VERSION | ${NAWK} '{print $2}'`
+_new_version_=`${PKGINFO} -ld ${PKG_PATH}/${_lpkg_}.pkg | ${GREP} VERSION | ${NAWK} '{print $2}'`
+
+log_msg -s "Current package Version is ${_curr_version_}" -l ${LOGFILE} ${SNAP_QUIET}
+log_msg -s "New package Version is ${_new_version_}" -l ${LOGFILE} ${SNAP_QUIET}
+
+if [[ "${_curr_version_}" == "${_new_version_}" ]]; then
+   log_msg -s "No Upgrade required.\n" -l ${LOGFILE} ${SNAP_QUIET}
+else
+   log_msg -s "Upgrade required.\n" -l ${LOGFILE} ${SNAP_QUIET}
+   _package_upg_=YES
+fi
+
+}
+
+### Function: create_adm_file ###
+#
+# Creates an admin file used for software pkgs during install
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+create_adm_file()
+{
+$ECHO "mail=
+instance=unique
+partial=nocheck
+runlevel=nocheck
+idepend=nocheck
+rdepend=nocheck
+space=nocheck
+setuid=nocheck
+conflict=nocheck
+action=nocheck
+basedir=default
+" >  ${TEM_DIR}/${_pkg_}.adm
+}
+
+
+### Function: get_absolute_path ###
+#
+# Determine absolute path to software
+#
+# Arguments:
+#	none
+# Return Values:
+#	none
+get_absolute_path() 
+{
+_dir_=`$DIRNAME $0`
+SCRIPTHOME=`cd $_dir_ 2>/dev/null && pwd || $ECHO $_dir_`
+}
+
+### Function: setup_script_env ###
+#
+# Set up environment variables for script. 
+#
+# Arguments:
+#	none
+# Return Values:
+#	none
+setup_script_env()
+{
+if [ ! "${ENIQ_BASE_DIR}" ]; then
+    # Directory on the root filesystem
+    ENIQ_BASE_DIR=/eniq
+fi
+
+# Main Directory for the Installation SW
+ENIQ_INST_DIR=${ENIQ_BASE_DIR}/installation
+
+# This should not be needed in the future
+ENIQ_CONF_DIR=${ENIQ_INST_DIR}/config
+
+# Main Directory for the Core Installation SW
+ENIQ_CORE_INST_DIR=${ENIQ_INST_DIR}/core_install
+
+# ENIQ Log Directory
+ENIQ_LOG_DIR=${ENIQ_BASE_DIR}/local_logs
+
+# Determine the current server type
+CURR_SERVER_TYPE=`$CAT $ENIQ_CONF_DIR/installed_server_type`
+
+# File containing the type of OSS installation. Eg. events or statistics
+INST_TYPE_FILE=${ENIQ_CONF_DIR}/ericsson_use_config
+
+# Source the common functions
+if [ -s ${ENIQ_BASE_DIR}/admin/lib/common_functions.lib ]; then
+    . ${ENIQ_BASE_DIR}/admin/lib/common_functions.lib
+else
+    _err_msg_="File ${ENIQ_BASE_DIR}/admin/lib/common_functions.lib not found"
+    abort_script "$_err_msg_"
+fi
+
+_nas_sw_target_dir_=`iniget NAS_STORAGE_API -f ${ENIQ_CONF_DIR}/${SUNOS_INI} -v NAS_API_TARGET_DIR`
+if [ ! "${_nas_sw_target_dir_}" ]; then
+	_err_msg_="Failed to get NAS API target dir information from ${ENIQ_CONF_DIR}/${SUNOS_INI}"
+	abort_script "$_err_msg_" "${EXEC_SHELL_CMD}"
+fi
+
+NASCLI=${_nas_sw_target_dir_}/bin/nascli
+if [ ! -s ${_nascli_} ]; then
+	_err_msg_="${_nascli_} not found"
+	abort_script "$_err_msg_" "${EXEC_SHELL_CMD}"
+fi
+
+}
+
+### Function: upgrade_package ###
+#
+#   Upgrade the listed package
+#
+# Arguments:
+#	none
+# Return Values:
+#	none
+upgrade_packge()
+{
+local _lpkg_
+_lpkg_=$1
+
+$PKGINFO -q $_lpkg_ 2>/dev/null
+if [ $? -eq 0 ]; then
+    log_msg -s "Removing old package ${_lpkg_}.\n" -l ${LOGFILE} ${SNAP_QUIET}
+    ${PKGRM} -n -a ${TEM_DIR}/${_pkg_}.adm ${_lpkg_}
+    if [ $? -ne 0 ]; then
+        _err_msg_="Failed to remove package ${_lpkg_}"
+        abort_script "$_err_msg_" "${EXEC_SHELL_CMD}"
+    fi
+fi
+
+log_msg -s "Installing new package ${_lpkg_}.\n" -l ${LOGFILE} ${SNAP_QUIET}
+${PKGADD} -G -a ${TEM_DIR}/${_pkg_}.adm -n -d ${PKG_PATH}/${_lpkg_}.pkg all  >> ${LOGFILE} 2>&1
+if [ $? -ne 0 ]; then
+    _err_msg_="Failed to add new package ${_lpkg_}"
+    abort_script "$_err_msg_" "${EXEC_SHELL_CMD}"
+fi
+log_msg -s "Successfully Installed new package ${_lpkg_}.\n" -l ${LOGFILE} ${SNAP_QUIET}
+}
+
+### Function: usage_msg ###
+#
+#   Print out the usage message
+#
+# Arguments:
+#	none
+# Return Values:
+#	none
+usage_msg() 
+{
+$CLEAR
+$ECHO "
+Usage: `$BASENAME $0` -d <path_to_niq_ini_dir>  [-l <logfile>] 
+                      
+options:
+
+-d  : Parameter specifying the full path to the NAS API packages
+
+-l  : Used to specify a logfile. Default will be used if none specified.            
+
+"
+}
+
+### Function: user_confirm ###
+#
+# Get confirmation from user to proceed with snapshot action
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+user_confirm()
+{
+while :; do
+    unset USER_CONF
+    $CLEAR
+    $ECHO "\nAre you sure you wish to ${1}"
+    $ECHO "Enter [Yes | No] (case sensitive) : \c"
+
+    read USER_CONF
+    if [ "$USER_CONF" == "Yes" -o "$USER_CONF" == "No" ]; then
+        break
+    fi
+done
+
+}
+
+# ********************************************************************
+#
+# 	Main body of program
+#
+# ********************************************************************
+#
+# Determine absolute path to software
+get_absolute_path
+
+# Check that the effective id of the user is root
+check_id $DEFAULT_USER
+
+while getopts ":d:Nql:" arg; do
+  case $arg in
+    d) PKG_PATH="$OPTARG" 
+       ;;
+    N) NO_CONFIRM="YES"
+       ;;
+    l) LOGFILE="$OPTARG" 
+       ;;       
+    q) SNAP_QUIET="-q"
+       ;;
+   \?) usage_msg
+       exit 1
+       ;;
+  esac
+done
+shift `expr $OPTIND - 1`
+
+if [ ! "${PKG_PATH}" ]; then
+    usage_msg
+    exit 1
+fi
+
+# Set up environment variables for script. 
+setup_script_env
+
+if [ ! "${LOGFILE}" ]; then
+    LOGFILE=${ENIQ_LOG_DIR}/nas_api/upgrade_nas_api.log
+fi	
+  
+# Check/Create Logfile
+chk_create_logfile
+
+# Create a temporary Directory
+TEM_DIR=/tmp/upgrade_nas_api.$$
+$RM -rf ${TEM_DIR}
+$MKDIR -p ${TEM_DIR}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not create directory ${TEM_DIR}"
+    abort_script "$_err_msg_"
+fi
+$CHMOD 777 ${TEM_DIR}
+
+# Check that I have a templates directory
+# associated with my installation type
+check_templates_dir
+
+_setup_nas_connectivity_=NO
+for _pkg_ in $NAS_API_PKG $NAS_PLUGGIN_PKG; do
+    _package_upg_=NO
+    log_msg -s "\nLets check if the package $_pkg_ is already installed" -l ${LOGFILE} ${SNAP_QUIET}
+    $PKGINFO -q $_pkg_ 2>/dev/null
+    if [ $? -eq 0 ]; then
+        log_msg -s "Package $_pkg_ already installed. Lets compare revisions." -l ${LOGFILE} ${SNAP_QUIET}
+        compare_pkg_versions $_pkg_
+    else
+        log_msg -s "Package $_pkg_ not yet installed." -l ${LOGFILE} ${SNAP_QUIET}
+        _package_upg_=YES
+        _setup_nas_connectivity_=YES
+    fi
+
+    if [ "${_package_upg_}" == "YES" ]; then
+        if [ ! "${NO_CONFIRM}" ]; then
+            user_confirm "install/upgrade the following package ${_pkg_}"
+            if [ $USER_CONF == No ]; then
+                $RM -rf ${TEM_DIR}
+                exit 0
+            fi    
+        fi
+        if [ -s ${PKG_PATH}/${_pkg_}.adm ]; then
+            $CP ${PKG_PATH}/${_pkg_}.adm ${TEM_DIR}/${_pkg_}.adm
+        else
+            create_adm_file
+        fi
+        upgrade_packge $_pkg_
+    fi
+done
+
+if [ "${_setup_nas_connectivity_}" == "YES" ]; then
+    log_msg -s "Setting up ssh connectivity for NAS with command:" -l ${LOGFILE} ${SNAP_QUIET}
+    log_msg -s "${_nas_dir_}/bin/setup_ssh_FileStore.sh ${ENIQ_TEMPL_DIR}/ssh_input_file" -l ${LOGFILE} ${SNAP_QUIET}
+    ${_nas_dir_}/bin/setup_ssh_FileStore.sh ${ENIQ_CONF_DIR}/ssh_input_file | $TEE -a ${LOGFILE}
+    if [ $? -ne 0 ]; then
+        _err_msg_="${_nas_dir_}/bin/setup_ssh_FileStore.sh exited due to an error"
+        abort_script "$_err_msg_" "${EXEC_SHELL_CMD}"
+    fi
+fi
+
+log_msg -s "----------------------------------------------------------------" -l ${LOGFILE} ${SNAP_QUIET}
+log_msg -s "----------------------------------------------------------------" -l ${LOGFILE} ${SNAP_QUIET}
+log_msg -s "Finished Upgrade of NAS API at `$DATE +%d.%m.%y_%H:%M:%S`\n" -l ${LOGFILE} ${SNAP_QUIET}
+
+# Rotate and compress the logs if necessary
+rotate_compress_logs ${LOGFILE} ${NUM_LOGS} ${SIZE_LOGS} ${COMPRESS_LOG}
+
+$RM -rf ${TEM_DIR}
+
+exit 0

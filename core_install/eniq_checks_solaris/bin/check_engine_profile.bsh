@@ -1,0 +1,242 @@
+#!/bin/bash
+# ********************************************************************
+# Ericsson Radio Systems AB                                     SCRIPT
+# ********************************************************************
+#
+# (c) Ericsson Radio Systems AB 2016 - All rights reserved.
+#
+# The copyright to the computer program(s) herein is the property
+# of Ericsson Radio Systems AB, Sweden. The programs may be used
+# and/or copied only with the written permission from Ericsson Radio
+# Systems AB or in accordance with the terms and conditions stipulated
+# in the agreement/contract under which the program(s) have been
+# supplied.
+#
+# ********************************************************************
+# Name    : check_engine_profile.bsh
+# Date    : 08/29/2016
+# Revision: B
+# Purpose : Script to check the status of Engine Profile of ENIQ server
+# Usage   : check_engine_profile.bsh
+# Exit Values:
+#    0   : SUCCESS
+#    109 : FAIL    - Engine set to InActive
+#    110 : FAIL    - Error in Engine Profile
+#    202 : WARNING - Engine set to NoLoads
+#
+# ********************************************************************
+#
+#   Command Section
+#
+# ********************************************************************
+
+AWK=/usr/bin/awk
+CHMOD=/usr/bin/chmod
+DATE=/usr/bin/date
+ID=/usr/bin/id
+RM=/usr/bin/rm
+TEE=/usr/bin/tee
+TOUCH=/usr/bin/touch
+SU=/usr/bin/su
+TAIL=/usr/bin/tail
+MKDIR=/usr/bin/mkdir
+ECHO=/usr/bin/echo
+
+# ********************************************************************
+#                                                                    *
+#                        Functions                                   *
+#                                                                    *
+# ********************************************************************
+
+### Function: abort_script
+#
+#   This will be called if the script is aborted through an error
+#   encountered during runtime
+#
+# Arguments: $1 - Error message from part of program (Not always used)     
+# Return Values: none
+#       
+#
+abort_script()
+{
+_err_time_=`$DATE '+%Y-%b-%d_%H.%M.%S'`
+
+if [ "$1" ]; then
+    _err_msg_="${_err_time_} - $1"
+else
+    _err_msg_="${_err_time_} - ERROR : Script aborted.......\n"
+fi
+if [ "${LOGFILE}" ]; then
+    $ECHO "\nERROR: ${_err_msg_}\n" | $TEE -a ${LOGFILE}
+else
+    $ECHO "\nERROR: ${_err_msg_}\n"
+fi
+exit 3
+}
+
+### Function: check_id ###
+#
+#   Check that the effective id of the user is correct
+#   If not print error msg and exit.
+#
+# Arguments: $1 : User ID name
+# Return Values: none
+#      
+#
+
+check_id()
+{
+local _check_id_=`$ID  | $AWK -F\( '{print $2}' | $AWK -F\) '{print $1}'`
+
+if [ "$_check_id_" != "$1" ]; then
+    _err_msg_="You must be $1 to execute this script."
+    abort_script "$_err_msg_"
+fi
+}
+
+### Function: check_create_logfile ###
+#
+# Check/Create Logfile
+#
+# Arguments: none
+# Return Values: none
+#  
+#
+check_create_logfile()
+{
+if [ -s $LOGFILE  ]; then
+    $RM -rf $LOGFILE
+    if [ -f $LOGFILE  ]; then
+        _err_msg_="Could not remove older ${LOGFILE}"
+        abort_script "$_err_msg_"
+    fi
+fi
+
+if [ ! -d  ${ENIQ_PRECHECK_LOG_DIR} ]; then
+    ${MKDIR} -p ${ENIQ_PRECHECK_LOG_DIR}
+    if [ $? -ne 0 ]; then 
+        _err_msg_="Could not create ${ENIQ_PRECHECK_LOG_DIR}"
+        abort_script "$_err_msg_"
+    fi
+fi
+
+$TOUCH ${LOGFILE}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not create log file ${LOGFILE}"
+    abort_script "$_err_msg_"
+fi
+
+$CHMOD 640 ${LOGFILE}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not change the permissions of the ${LOGFILE}"
+    abort_script "$_err_msg_"
+fi
+}
+
+### Function: check_engine_profile ###
+#
+# status of Engine_Profile
+#
+# Arguments: None
+# Return values:
+#    0   : SUCCESS
+#    109 : FAIL    - Engine set to InActive
+#    110 : FAIL    - Error in Engine Profile
+#    202 : WARNING - Engine set to NoLoads
+#
+
+check_engine_profile()
+{
+_engine_profile=`$SU - dcuser -c "engine -e getCurrentProfile" | $TAIL -1`
+if [ "$_engine_profile" == "NoLoads" ] || [ "$_engine_profile" == "InActive" ] || [ "$_engine_profile" == "Normal" ]; then
+    if [ "$_engine_profile" == "NoLoads" ]; then
+       log_msg -s "WARNING: Engine profile set to NoLoads" -l ${LOGFILE}
+       RET_CODE=202
+    elif [ "$_engine_profile" == "InActive" ]; then
+         log_msg -s "ERROR: Engine profile set to InActive" -l ${LOGFILE}
+         RET_CODE=109
+    elif [ "$_engine_profile" == "Normal" ]; then
+         log_msg -s "INFO: Engine profile set to Normal" -l ${LOGFILE}
+         RET_CODE=0
+    fi   
+else
+    log_msg -s "ERROR: Engine Profile is not in correct state.\nFor more information please check engine logs" -l ${LOGFILE}
+    RET_CODE=110
+fi
+}
+
+### Function: setup_env ###
+#
+# Setup path environment
+# Imports the common lib files which imports common functions
+#
+# Arguments: none
+# Return Values: none
+# 
+#
+
+setup_env()
+{
+if [ ! "${ENIQ_BASE_DIR}" ]; then
+    ENIQ_BASE_DIR=/eniq
+fi
+
+# Main Directory for the Core Installation SW
+ENIQ_INST_DIR=${ENIQ_BASE_DIR}/installation
+
+# Installation config directory
+ENIQ_CONF_DIR=${ENIQ_INST_DIR}/config
+
+# Precheck logs directory
+ENIQ_PRECHECK_LOG_DIR=${ENIQ_BASE_DIR}/local_logs/precheck_logs
+
+#Installation lib directory
+ENIQ_LIB_DIR=${ENIQ_INST_DIR}/core_install/lib/
+
+# Logfile path
+LOGFILE=${ENIQ_PRECHECK_LOG_DIR}/log_engine_profile.log
+
+#Common function directory
+COMMON_FUNCS_LIB=${ENIQ_LIB_DIR}/common_functions.lib
+
+#Imports the common library functions
+if [ ! -f "${COMMON_FUNCS_LIB}" ]; then
+    _err_msg_="${COMMON_FUNCS_LIB} missing, this is required for this script, exiting!!!!"
+    abort_script "${_err_msg_}"
+fi
+
+. ${COMMON_FUNCS_LIB}
+
+if [ $? -ne 0 ]; then
+    _err_msg_="Importing functions of ${COMMON_FUNCS_LIB} failed, exiting!!!!"
+    abort_script "${_err_msg_}"
+fi
+
+}
+
+# ********************************************************************
+#
+#       Main body of program
+#
+# ********************************************************************
+
+# Default user
+DEFAULT_USER=root
+
+# Check that the effective id of the user is root
+check_id $DEFAULT_USER
+
+# Set up environment variables for script.
+setup_env
+
+# Return code declaration
+RET_CODE=0
+
+# Check/Create log file
+check_create_logfile
+
+#Check for the status of engine profile
+check_engine_profile
+log_msg -t -s "Engine Profile check completed" -l ${LOGFILE}
+log_msg -t -s "Check log $LOGFILE\n"
+exit $RET_CODE

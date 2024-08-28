@@ -1,0 +1,1058 @@
+#!/bin/bash
+# ********************************************************************
+# Ericsson Radio Systems AB                                     SCRIPT
+# ********************************************************************
+#
+#
+# (c) Ericsson Radio Systems AB 2019 - All rights reserved.
+#
+# The copyright to the computer program(s) herein is the property
+# of Ericsson Radio Systems AB, Sweden. The programs may be used 
+# and/or copied only with the written permission from Ericsson Radio 
+# Systems AB or in accordance with the terms and conditions stipulated 
+# in the agreement/contract under which the program(s) have been 
+# supplied.
+#
+# ********************************************************************
+# Name    : historic_loaddb.bsh
+# Date    : 18/12/2019
+# Revision: /main/10
+# Purpose : This script loads in the data extracted by the extractdb.bsh 
+#           script that contains data for the inactive partitions. If the 
+#           partition has rolled and the data is not valid, it is removed.
+#            
+#    
+# Usage   :  bash historic_loaddb.bsh
+#
+# ********************************************************************
+#
+#     Command Section
+#
+AWK=/usr/bin/awk
+BASENAME=/usr/bin/basename
+CAT=/usr/bin/cat
+CP=/usr/bin/cp
+DATE=/usr/bin/date
+DIRNAME=/usr/bin/dirname
+ECHO=/usr/bin/echo
+EGREP=/usr/bin/egrep
+EXPR=/usr/bin/expr
+FIND=/usr/bin/find
+GREP=/usr/bin/grep
+GZIP=/usr/bin/gzip
+KILL=/usr/bin/kill
+LS=/usr/bin/ls
+MKDIR=/usr/bin/mkdir
+MOUNT=/usr/sbin/mount
+MV=/usr/bin/mv
+PS=/usr/bin/ps
+PWD=/usr/bin/pwd
+RM=/usr/bin/rm
+SED=/usr/bin/sed
+SLEEP=/usr/bin/sleep
+SORT=/usr/bin/sort
+TAIL=/usr/bin/tail
+TEE=/usr/bin/tee
+TOUCH=/usr/bin/touch
+TR=/usr/bin/tr
+WC=/usr/bin/wc
+
+# Name of SunOS & ENIQ ini Files
+ENIQ_INI=niq.ini
+
+abort_script()
+{
+if [ "$1" ]; then
+    _err_msg_=$1
+else
+    _err_msg_="Script aborted.......\n"    
+fi
+$ECHO $_err_msg_  | $TEE -a $RESULTSDIR/HistoricLoad_${RUNNUMBER}.log
+
+exit 1
+}
+
+# ********************************************************************
+#
+#  TRAP handling
+#
+# ********************************************************************
+trap "trap_stop_historic_loaddb" QUIT TERM INT HUP KILL
+
+trap_stop_historic_loaddb()
+{
+    _err_msg_="Received a KILL SIGNAL from parent"
+    abort_script "${_err_msg_}"
+}
+
+## Function: column_append ###
+#
+# Appends blank data to the "column cannot be null" set of tables
+#
+# Arguments:
+#    $1 = This argument decides how many times blank data should be appended.
+# Return Values:
+#    none
+
+column_append()
+{
+
+times_to_add_empty_data=$1
+
+if [ ${column_append_flag} -eq 1 ] ; then
+    
+    # backing up the .gz file
+    if [ -e ${EXTRACTS_LOC}/${User}_${Table}xyz${date_holder}.gz ]; then
+        $CP ${EXTRACTS_LOC}/${User}_${Table}xyz${date_holder}.gz ${EXTRACTS_LOC}/${User}_${Table}xyz${date_holder}_MAIN_original.gz
+        $CP ${EXTRACTS_LOC}/${User}_${Table}xyz${date_holder}.gz ${EXTRACTS_LOC}/${User}_${Table}xyz${date_holder}_original.gz
+        if [ $? -ne 0 ]; then
+            $ECHO "Could not create copy of ${EXTRACTS_LOC}/${User}_${Table}xyz${date_holder}.gz" | $TEE -a $RESULTSDIR/HistoricLoad_${RUNNUMBER}.log >>${LOGFILE}
+            $ECHO "${partition} \t | ${EXTRACTS_LOC}/${User}_${Table}xyz${date_holder}.gz |  ${_stime_} \t | `$DATE +'%Y-%m-%d %H:%M:%S'` \t | ${date_holder} \t | Error " >> ${RESULTSDIR}/load_info_historic_${RUNNUMBER}.txt
+            exit
+        fi
+    fi
+    
+fi
+
+
+if [ ${column_append_flag} -eq 1 -a ${CCN_change_count} > 0 ]; then
+
+    # unzip the file
+    if [ $cols_load_changed_flag -eq 1 ]; then
+        $GZIP -d ${EXTRACTS_LOC}/${User}_${Table}xyz${date_holder} 2>>$RESULTSDIR/HistoricLoadTableError_${RUNNUMBER}.log
+    fi
+    
+    for (( i=0 ; i<${times_to_add_empty_data} ; i++ )) 
+    do
+        # add the Empty data to the end of the file
+        $AWK '{FS="|"; OFS="|"; print $0 " |"}' ${EXTRACTS_LOC}/${User}_${Table}xyz${date_holder}  > ${EXTRACTS_LOC}/${User}_${Table}xyz${date_holder}_temp && $MV -f ${EXTRACTS_LOC}/${User}_${Table}xyz${date_holder}_temp ${EXTRACTS_LOC}/${User}_${Table}xyz${date_holder}
+        added_empty_data=$?
+    done
+    
+    if [ $added_empty_data -ne 0 ]; then
+        $ECHO "Could not append data at the end of ${EXTRACTS_LOC}/${User}_${Table}xyz${date_holder}.gz" | $TEE -a $RESULTSDIR/HistoricLoad_${RUNNUMBER}.log >>${LOGFILE}
+        $ECHO "${partition} \t | ${EXTRACTS_LOC}/${User}_${Table}xyz${date_holder}.gz |  ${_stime_} \t | `$DATE +'%Y-%m-%d %H:%M:%S'` \t | ${date_holder} \t | Error " >> ${RESULTSDIR}/load_info_historic_${RUNNUMBER}.txt
+        $MV ${EXTRACTS_LOC}/${User}_${Table}xyz${date_holder}_original.gz ${EXTRACTS_LOC}/${User}_${Table}xyz${date_holder}.gz
+        $CP ${EXTRACTS_LOC}/${User}_${Table}xyz${date_holder}_MAIN_original.gz ${EXTRACTS_LOC}/${User}_${Table}xyz${date_holder}.gz
+        exit
+    else        
+        # zip the file
+        if [ $cols_load_changed_flag -eq 1 ]; then
+            $GZIP -f ${EXTRACTS_LOC}/${User}_${Table}xyz${date_holder} 2>>$RESULTSDIR/HistoricLoadTableError_${RUNNUMBER}.log
+            if [ $? -ne 0 ] ; then
+                $ECHO "Unable to zip the ${EXTRACTS_LOC}/${User}_${Table}xyz${date_holder}" | $TEE -a $RESULTSDIR/HistoricLoadTableError_${RUNNUMBER}.log >>${LOGFILE}
+                $ECHO "${partition} \t | ${EXTRACTS_LOC}/${User}_${Table}xyz${date_holder}.gz |  ${_stime_} \t | `$DATE +'%Y-%m-%d %H:%M:%S'` \t | ${date_holder} \t | Error " >> ${RESULTSDIR}/load_info_historic_${RUNNUMBER}.txt
+                $MV ${EXTRACTS_LOC}/${User}_${Table}xyz${date_holder}_original.gz ${EXTRACTS_LOC}/${User}_${Table}xyz${date_holder}.gz
+                $CP ${EXTRACTS_LOC}/${User}_${Table}xyz${date_holder}_MAIN_original.gz ${EXTRACTS_LOC}/${User}_${Table}xyz${date_holder}.gz
+                exit
+            fi
+        fi
+        
+    fi
+fi
+
+# Remove the temp files
+$RM -f ${EXTRACTS_LOC}/${User}_${Table}xyz${date_holder}_temp 
+if [ -e ${EXTRACTS_LOC}/${User}_${Table}xyz${date_holder}_original.gz ] ; then
+    $RM -f ${EXTRACTS_LOC}/${User}_${Table}xyz${date_holder}_original.gz
+fi
+}
+
+## Function: column_skip ###
+#
+# skip column
+#
+# Arguments:
+#    none
+# Return Values:
+#    none
+column_skip()
+{
+# If column present for this table get the column number of it
+if [ ${column_present_flag} -eq 1 ]; then
+    $ECHO $cols_load | sed "s/NULL//g" |sed "s/)//g" |sed "s/(//g" |sed "s/'//g" |sed "s/,//g" |sed 's/"//g' |tr " " "\n" > $IMPORT_TMPDIR/cols_load_file
+    nob_num=`$CAT -n $IMPORT_TMPDIR/cols_load_file | $GREP -i  "$column1" | $AWK -F " " '{print $1}'`
+    # Since  cols_load variable containing table name
+    col_num=`$EXPR $nob_num - 1`
+
+    # Modifying cols_load variable to avoid column
+    $ECHO $cols_load > $IMPORT_TMPDIR/cols_load_file
+    $CAT $IMPORT_TMPDIR/cols_load_file | $SED -e "s/\"$column1\"//g" > $IMPORT_TMPDIR/cols_load_file_temp
+    if [ ${col_num} -eq 1 ]; then
+        #remove comma at the end
+        cols_load=`$CAT $IMPORT_TMPDIR/cols_load_file_temp | $SED "s/( NULL('NULL'),/(/g"`
+    else
+        #remove comma in the beginning
+        cols_load=`$CAT $IMPORT_TMPDIR/cols_load_file_temp | $SED "s/, NULL('NULL')//g"`
+    fi
+    
+    if [ -e ${EXTRACTS_LOC}/${User}_${Table}xyz${date_holder}.gz ]
+    then
+        $CP ${EXTRACTS_LOC}/${User}_${Table}xyz${date_holder}.gz ${EXTRACTS_LOC}/${User}_${Table}xyz${date_holder}_original.gz
+        if [ $? -ne 0 ]
+        then
+            $ECHO "Could not create copy of ${EXTRACTS_LOC}/${User}_${Table}xyz${date_holder}.gz" | $TEE -a $RESULTSDIR/HistoricLoad_${RUNNUMBER}.log >>${LOGFILE}
+            echo "${partition} \t | ${EXTRACTS_LOC}/${User}_${Table}xyz${date_holder}.gz |  ${_stime_} \t | `$DATE +'%Y-%m-%d %H:%M:%S'` \t | ${date_holder} \t | Error " >> ${RESULTSDIR}/load_info_historic_${RUNNUMBER}.txt
+            exit
+        fi
+    fi
+fi
+
+
+
+if [ ${column_present_flag} -eq 1 ]; then
+    if [ $col_change_count -eq 0 ]; then
+        $GZIP -d ${EXTRACTS_LOC}/${User}_${Table}xyz${date_holder} 2>>$RESULTSDIR/ActiveLoadTableError_${RUNNUMBER}.log
+    fi
+    # Modify the data file by removing column data
+    (( prefix = $col_num - 1 ))
+    (( suffix = $col_num + 1 ))
+    $CAT ${EXTRACTS_LOC}/${User}_${Table}xyz${date_holder} | $CUT  -d "|" -f -$prefix,$suffix- > ${EXTRACTS_LOC}/${User}_${Table}xyz${date_holder}_temp
+    if [ ! -s ${EXTRACTS_LOC}/${User}_${Table}xyz${date_holder}_temp ]; then
+        $ECHO "Could not update ${EXTRACTS_LOC}/${User}_${Table}xyz${date_holder}"
+        $ECHO "Error Loading ${EXTRACTS_LOC}/${User}_${Table}xyz${date_holder} file..." | $TEE -a $RESULTSDIR/HistoricLoad_${RUNNUMBER}.log >>${LOGFILE}
+        echo "${partition} \t | ${EXTRACTS_LOC}/${User}_${Table}xyz${date_holder}.gz |  ${_stime_} \t | `$DATE +'%Y-%m-%d %H:%M:%S'` \t | ${date_holder} \t | Error " >> ${RESULTSDIR}/load_info_historic_${RUNNUMBER}.txt
+        $RM -f ${EXTRACTS_LOC}/${User}_${Table}xyz${date_holder}
+        $MV ${EXTRACTS_LOC}/${User}_${Table}xyz${date_holder}_original.gz ${EXTRACTS_LOC}/${User}_${Table}xyz${date_holder}.gz
+        exit
+    else
+        $MV ${EXTRACTS_LOC}/${User}_${Table}xyz${date_holder}_temp ${EXTRACTS_LOC}/${User}_${Table}xyz${date_holder}
+    fi
+fi
+    
+}
+
+### Function: loadtable ###
+#
+# Loads tables from $RESULTSDIR/Extract_tables.txt
+#
+# Arguments:
+#    none
+# Return Values:
+#    none
+loadtable()
+{
+
+SqlFile=`mktemp -t ExtTabSql.XXXXXXXXXX`
+_stime_=`$DATE +'%Y-%m-%d %H:%M:%S'`
+
+full_path=$1
+file_name=$(basename ${full_path})
+file_name1=$(echo ${file_name} | sed 's/dc_/dc,/g'| sed 's/xyz/,/g' )
+EXTRACTS_LOC=$($DIRNAME ${full_path})
+
+User=`$ECHO ${file_name1} | cut -d',' -f1 | $SED "s/'//g"| $SED -e 's/^[ \t]*//'`
+Table=`$ECHO ${file_name1} | cut -d',' -f2 | $SED "s/'//g"| $SED -e 's/^[ \t]*//'`
+date_holder=`$ECHO ${file_name1} | cut -d',' -f3 | $SED "s/'//g"| $SED "s/.gz//g"| $SED -e 's/^[ \t]*//'`
+partition_table=${Table%%???}
+
+$GREP $full_path $RESULTSDIR/Historicrun_FinishedTables_date_${RUNNUMBER}.list >>/dev/null 2>&1
+if [ $? -ne 0 ]; then 
+    $ECHO $full_path >>$RESULTSDIR/Historicrun_FinishedTables_date_${RUNNUMBER}.list
+fi
+
+dbisql -nogui -onerror exit -c "eng=repdb;links=tcpip{host=repdb;port=2641};uid=dwhrep;pwd=dwhrep" "select STARTTIME from DWHPartition where tablename like '${partition_table}___';output to '$IMPORT_TMPDIR/startDateTimePartition_${Table}_${date_holder}.txt'" 2>&1 >/dev/null
+if [ ! -s $IMPORT_TMPDIR/startDateTimePartition_${Table}_${date_holder}.txt ]
+then
+    dbisql -nogui -onerror exit -c "eng=repdb;links=tcpip{host=repdb;port=2641};uid=dwhrep;pwd=dwhrep" "select '1970-01-01 01:00:00' from DWHPartition where tablename like '${partition_table}___' and status like 'NEW';output to '$IMPORT_TMPDIR/startDateTimePartition_${Table}_${date_holder}.txt'" 2>&1 >/dev/null
+fi
+
+if [ ! -s $IMPORT_TMPDIR/startDateTimePartition_${Table}_${date_holder}.txt ]
+then
+    $RM -f  $IMPORT_TMPDIR/startDateTimePartition_${Table}_${date_holder}.txt $SqlFile
+    $ECHO "Could not find a start date in the DWHPartition table for ${Table} " | $TEE -a $RESULTSDIR/HistoricLoad_${RUNNUMBER}.log
+    $MKDIR -p ${EXTRACTS_LOC}/nostartdate/
+    cp  ${EXTRACTS_LOC}/${User}_${Table}xyz${date_holder}.gz  ${EXTRACTS_LOC}/nostartdate/${User}_${Table}xyz${date_holder}.gz
+    if [ $? -eq 0 ]
+    then
+        rm -f ${EXTRACTS_LOC}/${User}_${Table}xyz${date_holder}.gz    
+        echo "moved ${EXTRACTS_LOC}/${User}_${Table}xyz${date_holder}.gz to nostartdate "| $TEE -a $RESULTSDIR/HistoricLoad_${RUNNUMBER}.log
+        ## "TABLE_NAME \t\t | FILE_NAME \t\t\t\t | SIZE \t | I_START_TIME \t | I_END_TIME \t | ROW_COUNT_DB \t | ROW_COUNT_FILE \t | DATE \t | STATUS " >> ${RESULTSDIR}/load_info_historic_${RUNNUMBER}.txt
+        echo "${Table} \t | ${EXTRACTS_LOC}/${User}_${Table}xyz${date_holder}.gz |  ${_stime_} \t | `$DATE +'%Y-%m-%d %H:%M:%S'` \t |  ${date_holder} \t | StartDate not found " >> ${RESULTSDIR}/load_info_historic_${RUNNUMBER}.txt
+    else
+        echo "Failed to move ${EXTRACTS_LOC}/${User}_${Table}xyz${date_holder}.gz to nostartdate "| $TEE -a $RESULTSDIR/HistoricLoad_${RUNNUMBER}.log
+        echo "${Table} \t | ${EXTRACTS_LOC}/${User}_${Table}xyz${date_holder}.gz |  ${_stime_} \t | `$DATE +'%Y-%m-%d %H:%M:%S'` \t |  ${date_holder} \t | StartDate not found and failed to move" >> ${RESULTSDIR}/load_info_historic_${RUNNUMBER}.txt
+    fi
+    
+    exit
+fi
+
+
+$GREP "1970-01-01 01:00:00" $IMPORT_TMPDIR/startDateTimePartition_${Table}_${date_holder}.txt 1>/dev/null
+if [ $? -eq 0 ] || [[ "${Table}" == DIM_* ]] || [[ "${Table}" == SELECT_* ]] || [[ "${Table}" == PM_* ]] || [[ "${Table}" == DC_Z_ALARM_* ]]
+then
+    partition=${Table}
+    $RM -f $IMPORT_TMPDIR/startDateTimePartition_${Table}_${date_holder}.txt
+else
+    $ECHO "SELECT TABLENAME FROM DWHPartition where tablename like '${partition_table}___' and endtime > '$date_holder 00:00:00' and starttime <='$date_holder 00:00:00'" > $IMPORT_TMPDIR/${User}_${Table}xyz${date_holder}.sql 
+    $ECHO "go">>$IMPORT_TMPDIR/${User}_${Table}xyz${date_holder}.sql 
+    
+    iqisql -Udwhrep -Pdwhrep -Srepdb -w7000 -i$IMPORT_TMPDIR/${User}_${Table}xyz${date_holder}.sql -o$IMPORT_TMPDIR/${User}_${Table}xyz${date_holder}.txt 2>>$RESULTSDIR/HistoricLoadTableError_${RUNNUMBER}.log
+    db_con_ec=$?
+
+    if [ $db_con_ec -ne 0 ]
+    then
+        $ECHO Error Loading ${EXTRACTS_LOC}/${User}_${Table}xyz${date_holder} file...| $TEE -a $RESULTSDIR/HistoricLoad_${RUNNUMBER}.log >>${LOGFILE}
+        $ECHO Check $RESULTSDIR/HistoricLoadTableError_${RUNNUMBER}.log | $TEE -a $RESULTSDIR/HistoricLoad_${RUNNUMBER}.log
+        $RM -f $SqlFile $IMPORT_TMPDIR/${User}_${Table}xyz${date_holder}.sql $IMPORT_TMPDIR/${User}_${Table}xyz${date_holder}.txt $IMPORT_TMPDIR/get_cols_sql_${Table} $IMPORT_TMPDIR/startDateTimePartition_${Table}_${date_holder}.txt
+        $ECHO "${Table} \t | ${EXTRACTS_LOC}/${User}_${Table}xyz${date_holder}.gz | ${_stime_} \t | `$DATE +'%Y-%m-%d %H:%M:%S'` \t |  ${date_holder} \t | Error " >> ${RESULTSDIR}/load_info_historic_${RUNNUMBER}.txt
+        exit
+    fi
+    
+    partition_temp=$($CAT $IMPORT_TMPDIR/${User}_${Table}xyz${date_holder}.txt| $SED '1,2d'|$SED 'N;$!P;$!D;$d'|$SED '/^$/d')
+    partition=$($ECHO $partition_temp|$SED '/^$/d'|$SED -e 's/^[ \t]*//' )
+    $RM -f $IMPORT_TMPDIR/startDateTimePartition_${Table}_${date_holder}.txt
+fi 
+
+if [ -z "$partition" ]
+then
+    $MKDIR -p ${EXTRACTS_LOC}/rolled_loads
+    $ECHO "$1 not loaded as partition has rolled and moved to ${EXTRACTS_LOC}/rolled_loads/" | $TEE -a $RESULTSDIR/HistoricLoad_${RUNNUMBER}.log
+    cp ${EXTRACTS_LOC}/${User}_${Table}xyz${date_holder}.gz ${EXTRACTS_LOC}/rolled_loads/${User}_${Table}xyz${date_holder}.gz 
+    if [ $? -eq 0 ]
+    then
+        $RM -f ${EXTRACTS_LOC}/${User}_${Table}xyz${date_holder}.gz
+    fi
+    $RM -f $SqlFile $IMPORT_TMPDIR/${User}_${Table}xyz${date_holder}.sql $IMPORT_TMPDIR/${User}_${Table}xyz${date_holder}.txt $IMPORT_TMPDIR/get_cols_sql_${Table}
+    $ECHO "${Table} \t | ${EXTRACTS_LOC}/${User}_${Table}xyz${date_holder}.gz | ${_stime_} \t | `$DATE +'%Y-%m-%d %H:%M:%S'` \t |  ${date_holder} \t | Partition rolled " >> ${RESULTSDIR}/load_info_historic_${RUNNUMBER}.txt
+    exit
+fi
+ 
+# code added by xchamis - if table name ends with number, grep table name by eliminating last 3 digits from Extract_cols.txt else grep with table name as is
+for _dir_ in ${IMPORTS}; do
+    if [ -f ${_dir_}/Extract_tables_cols.txt ];then
+        _table_cols_dir_=${_dir_}
+        break
+    fi
+done
+
+if [ ! "${_table_cols_dir_}" ]; then
+    _err_msg_="Could not locate Extract_tables_cols.txt file"
+    abort_script "${_err_msg_}"
+fi
+
+_tbl_end_=`$ECHO ${Table: -3}` 
+if [[ "${_tbl_end_}" =~ ^_?[0-9]+$ ]]
+then 
+    cols_load=$($CAT ${_table_cols_dir_}/Extract_tables_cols.txt | $GREP -w ${partition_table})    
+    cols_load=`$ECHO ${cols_load} | sed "s/${partition_table}/${partition}/g"`
+else
+    cols_load=$($CAT ${_table_cols_dir_}/Extract_tables_cols.txt | $GREP -w ${partition})
+fi
+if [ -z "$cols_load" ];then
+    $ECHO "Table Schema not found for ${partition}"  | $TEE -a $RESULTSDIR/HistoricLoad_${RUNNUMBER}.log >>${LOGFILE}
+    $MKDIR -p ${EXTRACTS_LOC}/noschema/
+    cp  ${EXTRACTS_LOC}/${User}_${Table}xyz${date_holder}.gz  ${EXTRACTS_LOC}/noschema/${User}_${Table}xyz${date_holder}.gz
+    if [ $? -eq 0 ]
+    then
+        rm -f ${EXTRACTS_LOC}/${User}_${Table}xyz${date_holder}.gz    
+        echo "moved ${EXTRACTS_LOC}/${User}_${Table}xyz${date_holder}.gz to noschema "| $TEE -a $RESULTSDIR/HistoricLoad_${RUNNUMBER}.log
+        ## "TABLE_NAME \t\t | FILE_NAME \t\t\t\t | SIZE \t | I_START_TIME \t | I_END_TIME \t | ROW_COUNT_DB \t | ROW_COUNT_FILE \t | DATE \t | STATUS " >> ${RESULTSDIR}/load_info_historic_${RUNNUMBER}.txt
+        $ECHO "${partition} \t | ${EXTRACTS_LOC}/${User}_${Table}xyz${date_holder}.gz |  ${_stime_} \t | `$DATE +'%Y-%m-%d %H:%M:%S'` \t |  ${date_holder} \t | Error finding table schema " >> ${RESULTSDIR}/load_info_historic_${RUNNUMBER}.txt
+    else
+        echo "Failed to move ${EXTRACTS_LOC}/${User}_${Table}xyz${date_holder}.gz to noschema "| $TEE -a $RESULTSDIR/HistoricLoad_${RUNNUMBER}.log
+        $ECHO "${partition} \t | ${EXTRACTS_LOC}/${User}_${Table}xyz${date_holder}.gz |  ${_stime_} \t | `$DATE +'%Y-%m-%d %H:%M:%S'` \t |  ${date_holder} \t | Error finding table schema and failed to move" >> ${RESULTSDIR}/load_info_historic_${RUNNUMBER}.txt
+    fi
+    
+    exit
+fi
+
+if [[ "${Table}" == DIM_* ]] || [[ "${Table}" == SELECT_* ]] || [[ "${Table}" == LOG_* ]] || [[ "${Table}" == PM_* ]] || [[ "${Table}" == DC_Z_ALARM_* ]]
+then
+    $GREP "Truncated table ${User}.${partition}" $RESULTSDIR/LoadTruncateTables.log 1>/dev/null
+    if [ $? -ne 0 ]
+    then
+        dbisql ${connection_string}  "truncate table ${User}.${partition}" >/dev/null 2>>$RESULTSDIR/HistoricLoadTableError_${RUNNUMBER}.log
+        if [ $? -ne 0 ]
+        then
+            $ECHO "Error truncate table ${User}.${partition}..."| $TEE -a $RESULTSDIR/HistoricLoad_${RUNNUMBER}.log
+            $ECHO "Check $RESULTSDIR/HistoricLoadTableError_${RUNNUMBER}.log" | $TEE -a $RESULTSDIR/HistoricLoad_${RUNNUMBER}.log
+            $RM -f $SqlFile $IMPORT_TMPDIR/${User}_${Table}xyz${date_holder}.sql $IMPORT_TMPDIR/${User}_${Table}xyz${date_holder}.txt $IMPORT_TMPDIR/${User}_${Table}xyz${date_holder}_2.sql  $IMPORT_TMPDIR/get_cols_sql_${Table} $IMPORT_TMPDIR/startDateTimePartition_${Table}_${date_holder}.txt
+            $ECHO "${partition} \t | ${EXTRACTS_LOC}/${User}_${Table}xyz${date_holder}.gz |  ${_stime_} \t | `$DATE +'%Y-%m-%d %H:%M:%S'` \t |  ${date_holder} \t | Error Truncating table " >> ${RESULTSDIR}/load_info_historic_${RUNNUMBER}.txt
+            exit
+        else
+            $ECHO "Truncated table ${User}.${partition}" >> $RESULTSDIR/LoadTruncateTables.log
+        fi
+    fi
+fi
+
+# Checking if table is having column NobeBFunction to be skipped
+count_flag=0
+column_present_flag=0
+$ECHO $cols_load |  $GREP -i "NobeBFunction" > /dev/null 2>&1
+if [ $? -eq 0 ]; then
+    column_present_flag=1
+    col_change_count=0
+    column1=NobeBFunction
+    column_skip
+    count_flag=1
+fi
+
+if [ $count_flag -eq 1 ]; then
+    col_change_count=1
+else
+    col_change_count=0
+
+fi
+
+if [ -s $COLUMN_FAILED_FILE ]; then
+    while read column 
+    do
+        column1=`$ECHO $column | $AWK -F"|" '{print $1}'`
+        table1=`$ECHO $column | $AWK -F"|" '{print $2}'`
+        $ECHO $cols_load |  $GREP -i "$column1" > /dev/null 2>&1
+        if [ $? -eq 0 ]; then
+        
+            if [ "${table1}" == "${partition_table}" ]; then
+        $CAT > $IMPORT_TMPDIR/get_cols_sql_${partition}xyz${date_holder}  <<STOP_SQL_CODE_POINT
+select * from ${User}.${partition} where 1=2;
+go
+STOP_SQL_CODE_POINT
+
+            cols=$(${IQISQL} -UDBA -P${DBA_PASSWORD} -S${DWH_ENG} -i $IMPORT_TMPDIR/get_cols_sql_${partition}xyz${date_holder} | tail -n+1)
+            cols=$($ECHO ${cols}| $SED 's/--.*//') 
+            cols=$($ECHO \(\"${cols}\))
+            cols=$($ECHO ${cols}| $SED 's/ /" NULL('NULL'),"/g') 
+            cols=$($ECHO ${partition} ${cols})
+
+            $ECHO "${cols}" >$IMPORT_TMPDIR/Extract_tables_cols_${Table}xyz${date_holder}.txt
+
+            cat $IMPORT_TMPDIR/Extract_tables_cols_${Table}xyz${date_holder}.txt | sed 's/NULL(NULL),")/NULL(NULL))/g' | sed "s/(NULL)/('NULL')/g"> $IMPORT_TMPDIR/temp_cols_${Table}xyz${date_holder}
+            cols_load_1=$(cat $IMPORT_TMPDIR/temp_cols_${Table}xyz${date_holder})
+            rm -f $IMPORT_TMPDIR/Extract_tables_cols_${Table}xyz${date_holder}.txt $IMPORT_TMPDIR/temp_cols_${Table}xyz${date_holder} $IMPORT_TMPDIR/get_cols_sql_${partition}xyz${date_holder}
+            $ECHO $cols_load_1 |  $GREP -i "$column1" > /dev/null 2>&1
+                if [ $? -ne 0 ]; then
+                    column_present_flag=1
+                    column_skip
+                    let col_change_count='col_change_count+1'
+                else
+                    continue
+                fi
+            else
+                continue
+            fi
+        else
+            continue
+        fi
+    done < ${COLUMN_FAILED_FILE}
+fi
+
+if [ ${column_present_flag} -eq 1 ]; then
+    $GZIP -f ${EXTRACTS_LOC}/${User}_${Table}xyz${date_holder}
+    if [ $? -ne 0 ]; then
+        $ECHO "Error zipping ${EXTRACTS_LOC}/${User}_${Table}xyz${date_holder} file..." | $TEE -a $RESULTSDIR/HistoricLoad_{RUNNUMBER}.log >>${LOGFILE}
+        $ECHO "${partition} \t | ${EXTRACTS_LOC}/${User}_${Table}xyz${date_holder}.gz |  ${_stime_} \t | `$DATE +'%Y-%m-%d %H:%M:%S'` \t | ${date_holder} \t | Error zipping file " >> ${RESULTSDIR}/load_info_historic_${RUNNUMBER}.txt
+        $RM -f ${EXTRACTS_LOC}/${User}_${Table}xyz${date_holder}
+        $MV ${EXTRACTS_LOC}/${User}_${Table}xyz${date_holder}_original.gz ${EXTRACTS_LOC}/${User}_${Table}xyz${date_holder}.gz
+        exit
+    fi
+fi
+
+# -------- > Column Cannot be Null section starts here <--------------
+CCN_change_count=0
+column_append_flag=0
+cols_load_changed_flag=0
+count_of_columns=0
+multiple_columns_flag=0
+
+
+
+if [ -s $COLUMN_NULL_FILE ] ; then
+    
+    #Backup the cols_load
+    cols_load_temp=${cols_load}
+    
+    while read line
+    do        
+        # Getting the column & table name from config file
+        CCN_column=`$ECHO $line | $AWK -F"|" '{print $1}'`
+        CCN_table=`$ECHO $line | $AWK -F"|" '{print $2}'`
+        
+        $GREP $CCN_table $COLUMN_NULL_FILE | $AWK -F"|" '{print $1}'  > $IMPORT_TMPDIR/columns_of_CCN_table
+        count_of_columns=`$GREP $CCN_table $COLUMN_NULL_FILE | $WC -l`
+        
+        
+        #Remove the multiple entries of same column in config file If there are multiple columns for same table.
+        if [ $count_of_columns > 1 ] ; then
+            
+            #Take backup of the $COLUMN_NULL_FILE
+            $CP $COLUMN_NULL_FILE $IMPORT_TMPDIR/column_null_file_orig
+            
+            #Now delete  the multiple entries from the main such that the multiple columns will not be picked up again in next iterations. 
+            $SED "/$CCN_table/d" $IMPORT_TMPDIR/column_null_file_orig >  $COLUMN_NULL_FILE
+            if [ $? -ne 0 ] ; then
+                #Now replace the Original file.
+                $CP $IMPORT_TMPDIR/column_null_file_orig $COLUMN_NULL_FILE
+                $ECHO " `$DATE +'%Y-%m-%d %H:%M:%S'` \t Exiting :: Unable to Modify the multiple entries for ${CCN_table} from $COLUMN_NULL_FILE" | $TEE -a $RESULTSDIR/HistoricLoad_${RUNNUMBER}.log >>${LOGFILE}
+                exit
+            fi
+        fi
+        
+        # Initializing Array, containing the columns to be appended
+        readarray cols_array < $IMPORT_TMPDIR/columns_of_CCN_table
+        
+        # Checking if the column is existing already in source
+        for i in ${cols_array[*]}
+        do
+            $ECHO $cols_load | $GREP $i  > /dev/null 2>&1
+            if [ $? -eq 1 ] ; then
+                # Not exists in the cols_load (source).
+                multiple_columns_flag=1
+            else
+                # Exists in cols_load (source)
+                multiple_columns_flag=0
+            fi
+            
+        done
+     
+        if [ $multiple_columns_flag -eq 0 ]; then
+            # Here the Column exists in Source 
+            # But has a different schema while importing to Destination .
+            continue
+            
+        else
+            # Here, the column doesn't exist in the Destination for which we need to append data
+            if [ "${CCN_table}" == "${partition_table}" ]; then
+                $CAT > $IMPORT_TMPDIR/get_cols_sql_${partition}xyz${date_holder}  <<STOP_SQL_CODE_POINT
+select * from ${User}.${partition} where 1=2;
+go
+STOP_SQL_CODE_POINT
+
+            cols=$(${IQISQL} -UDBA -P${DBA_PASSWORD} -S${DWH_ENG} -i $IMPORT_TMPDIR/get_cols_sql_${partition}xyz${date_holder} | tail -n+1)
+            cols=$($ECHO ${cols}| $SED 's/--.*//') 
+            cols=$($ECHO \(\"${cols}\))
+            cols=$($ECHO ${cols}| $SED 's/ /" NULL('NULL'),"/g') 
+            cols=$($ECHO ${partition} ${cols})
+            
+            $ECHO "${cols}" >$IMPORT_TMPDIR/Extract_tables_cols_${Table}xyz${date_holder}.txt
+
+            $CAT $IMPORT_TMPDIR/Extract_tables_cols_${Table}xyz${date_holder}.txt | $SED 's/NULL(NULL),")/NULL(NULL))/g' | $SED "s/(NULL)/('NULL')/g"> $IMPORT_TMPDIR/temp_cols_${Table}xyz${date_holder}
+            cols_load_1=$(cat $IMPORT_TMPDIR/temp_cols_${Table}xyz${date_holder})
+            $RM -f $IMPORT_TMPDIR/Extract_tables_cols_${Table}xyz${date_holder}.txt $IMPORT_TMPDIR/temp_cols_${Table}xyz${date_holder} $IMPORT_TMPDIR/get_cols_sql_${partition}xyz${date_holder}
+                    
+            # Starting the FOR loop with all the columns in $IMPORT_TMPDIR/columns_of_CCN_table
+            count_add_empty_data=0
+            for i in ${cols_array[*]}
+            do
+                #Initialize the Variables.
+                column_in_source="no"
+                column_in_destination="no"
+                
+                #Checking the column in Destination(cols_load_1) 
+                $ECHO $cols_load_1 |  $GREP "$i" > /dev/null 2>&1 #problematic entry
+                if [ $? -eq 0 ]; then
+                    column_in_destination="yes"
+                else 
+                    column_in_destination="no"
+                fi
+                
+                #Checking the column in Source (cols_load)
+                $ECHO $cols_load | $GREP $i  > /dev/null 2>&1
+                if [ $? -eq 1 ]; then
+                    column_in_source="no"
+                else 
+                    column_in_source="yes"
+                fi
+                
+                if [ "${column_in_source}" == "no" -a "${column_in_destination}" == "yes" ] ; then
+                    cols_load=`echo $cols_load | $SED "s/))/),\"$i\" NULL('NULL'))/"`
+                    if [ $? -ne 0 ] ; then
+                        $ECHO "`$DATE +'%Y-%m-%d %H:%M:%S'` \t  Exiting: Unable to add the column $i to the cols_load" |  $TEE -a $RESULTSDIR/HistoricLoad_${RUNNUMBER}.log >>${LOGFILE}
+                        exit
+                    else
+                        # Updating the Flags
+                        let CCN_change_count='CCN_change_count+1'
+                        let count_add_empty_data='count_add_empty_data+1'
+                        cols_load_changed_flag=1
+                        column_append_flag=1
+                    fi
+                    
+                else
+                    $ECHO "Please add the column which is not in the source but in destination only." |  $TEE -a $RESULTSDIR/HistoricLoad_${RUNNUMBER}.log >>${LOGFILE}
+                fi
+            done
+            
+            #Calling the function column_appnend
+            if [ $cols_load_changed_flag -eq 1 ] ; then
+                $ECHO "`$DATE +'%Y-%m-%d %H:%M:%S'`   Trying to add the Blank data to the below column(s) for table ${CCN_table}"  |  $TEE -a $RESULTSDIR/HistoricLoad_${RUNNUMBER}.log >>${LOGFILE}
+                $ECHO "${cols_array[*]}" |  $TEE -a $RESULTSDIR/HistoricLoad_${RUNNUMBER}.log >>${LOGFILE}
+                column_append ${count_add_empty_data} 
+                if [ $? -eq 0 ] ; then
+                    $ECHO "`$DATE +'%Y-%m-%d %H:%M:%S'` Successfully added the blank data to the below column(s) of table ${CCN_table}"  |  $TEE -a $RESULTSDIR/HistoricLoad_${RUNNUMBER}.log >>${LOGFILE}
+                    $ECHO "${cols_array[*]}" |  $TEE -a $RESULTSDIR/HistoricLoad_${RUNNUMBER}.log >>${LOGFILE}
+                else 
+                    $ECHO "`$DATE +'%Y-%m-%d %H:%M:%S'` Failed to add the blank data to to the below column(s) of table ${CCN_table} which are listed below"  |  $TEE -a $RESULTSDIR/HistoricLoad_${RUNNUMBER}.log >>${LOGFILE}
+                    $ECHO "${cols_array[*]}" |  $TEE -a $RESULTSDIR/HistoricLoad_${RUNNUMBER}.log >>${LOGFILE}
+                fi
+            fi
+            
+            else
+               continue
+            fi
+            
+        fi
+        
+    unset cols_array
+    done < ${COLUMN_NULL_FILE}
+    
+fi
+
+# Restoring & Deleting the temp files.
+if [ -e $IMPORT_TMPDIR/column_null_file_orig ] ; then
+    $CP $IMPORT_TMPDIR/column_null_file_orig $COLUMN_NULL_FILE 
+    $RM -f $IMPORT_TMPDIR/column_null_file_orig
+fi
+$RM -f $IMPORT_TMPDIR/columns_of_CCN_table
+
+#Creating new new sql query file for  tables with auto-incremental columns
+if [[ "${Table}" == DIM_E_ENERGY_NODE ]] || [[ "${Table}" == DIM_E_LTE_OPTIMIZATION_CELL ]] || [[ "${Table}" == DIM_E_LTE_OPTIMIZATION_CELL_RELATION ]] || [[ "${Table}" == DIM_E_LTE_OPTIMIZATION_NODE ]] || [[ "${Table}" == DIM_E_VOWIFI_NODE ]]
+then
+ 
+$CAT > $SqlFile  <<STOP_SQL_CODE_POINT
+set temporary option ESCAPE_CHARACTER='ON';
+set temporary option ON_ERROR='EXIT';
+set temporary option "quoted_identifier" = 'On';
+set temporary option IDENTITY_INSERT = '${User}.${partition}';
+LOCK TABLE ${User}.${partition} IN WRITE MODE WAIT '00:05:00';
+LOAD TABLE ${User}.${cols_load}
+from '${EXTRACTS_LOC}/${User}_${Table}xyz${date_holder}.gz'
+ESCAPES OFF
+QUOTES OFF
+DELIMITED BY '|'
+ROW DELIMITED BY '\n'
+WITH CHECKPOINT OFF ;
+set temporary option IDENTITY_INSERT = '';
+commit;
+STOP_SQL_CODE_POINT
+ 
+else
+ 
+$CAT > $SqlFile  <<STOP_SQL_CODE_POINT
+set temporary option ESCAPE_CHARACTER='ON';
+set temporary option ON_ERROR='EXIT';
+set temporary option "quoted_identifier" = 'On';
+LOCK TABLE ${User}.${partition} IN WRITE MODE WAIT '00:05:00';
+LOAD TABLE ${User}.${cols_load}
+from '${EXTRACTS_LOC}/${User}_${Table}xyz${date_holder}.gz'
+ESCAPES OFF
+QUOTES OFF
+DELIMITED BY '|'
+ROW DELIMITED BY '\n'
+WITH CHECKPOINT OFF ;
+STOP_SQL_CODE_POINT
+
+fi
+
+#Creating new sql query file for LOG_BusyhourHistory table
+if [[ "${Table}" == LOG_BusyhourHistory ]]
+then
+    $CAT $SqlFile | $SED 's|\\n|\&|g' >$IMPORT_TMPDIR/sql_tmpfile
+    $CP $IMPORT_TMPDIR/sql_tmpfile $SqlFile
+    if [ $? -ne 0 ]
+    then
+        $ECHO "Could not create sql query file for ${Table1}" | $TEE -a $RESULTSDIR/HistoricLoad_${RUNNUMBER}.log >>${LOGFILE}
+    fi
+fi
+
+dbisql -c "eng=${server_name};links=tcpip{host=localhost;port=2640};uid=dba;pwd=${DBA_PASSWORD}" -nogui  $SqlFile >/dev/null 2>>$RESULTSDIR/HistoricLoadTableError_${RUNNUMBER}.log
+
+# The table name is pushed into finished log only if not in error
+if [ $? -eq 0 ]
+then
+    $ECHO "${EXTRACTS_LOC}/${User}_${Table}xyz${date_holder}.gz file Loaded" | $TEE -a $RESULTSDIR/HistoricLoad_${RUNNUMBER}.log
+    $ECHO $1 >> $RESULTSDIR/HistoricLoadTableSuccess_${RUNNUMBER}.log
+    $MKDIR -p ${EXTRACTS_LOC}/loaded/
+    cp  ${EXTRACTS_LOC}/${User}_${Table}xyz${date_holder}.gz  ${EXTRACTS_LOC}/loaded/${User}_${Table}xyz${date_holder}.gz
+    if [ $? -eq 0 ]
+    then
+        rm -f ${EXTRACTS_LOC}/${User}_${Table}xyz${date_holder}.gz
+        echo "moved ${EXTRACTS_LOC}/${User}_${Table}xyz${date_holder}.gz to loaded "| $TEE -a $RESULTSDIR/HistoricLoad_${RUNNUMBER}.log
+        $ECHO "${partition} \t | ${EXTRACTS_LOC}/${User}_${Table}xyz${date_holder}.gz |  ${_stime_} \t | `$DATE +'%Y-%m-%d %H:%M:%S'` \t |  ${date_holder} \t | Success " >> ${RESULTSDIR}/load_info_historic_${RUNNUMBER}.txt
+    else
+        echo "Failed to move ${EXTRACTS_LOC}/${User}_${Table}xyz${date_holder}.gz to loaded "| $TEE -a $RESULTSDIR/HistoricLoad_${RUNNUMBER}.log
+        $ECHO "${partition} \t | ${EXTRACTS_LOC}/${User}_${Table}xyz${date_holder}.gz |  ${_stime_} \t | `$DATE +'%Y-%m-%d %H:%M:%S'` \t |  ${date_holder} \t | Success but Failed to move " >> ${RESULTSDIR}/load_info_historic_${RUNNUMBER}.txt
+    fi 
+    
+    if [ ${column_present_flag} -eq 1 ]; then
+        $CP ${EXTRACTS_LOC}/${User}_${Table}xyz${date_holder}_original.gz ${EXTRACTS_LOC}/loaded/${User}_${Table}xyz${date_holder}.gz
+        rm -f ${EXTRACTS_LOC}/${User}_${Table}xyz${date_holder}_original.gz
+    fi
+    
+    if [ ${column_append_flag} -eq 1 ] ; then
+        $CP ${EXTRACTS_LOC}/${User}_${Table}xyz${date_holder}_MAIN_original.gz  ${EXTRACTS_LOC}/loaded/${User}_${Table}xyz${date_holder}.gz
+        $RM -f ${EXTRACTS_LOC}/${User}_${Table}xyz${date_holder}_MAIN_original.gz
+    fi
+    
+else
+    $ECHO Error Loading ${EXTRACTS_LOC}/${User}_${Table}xyz${date_holder}.gz file... | $TEE -a $RESULTSDIR/HistoricLoad_${RUNNUMBER}.log >>${LOGFILE}
+    $ECHO $1 >> $RESULTSDIR/HistoricLoadTableError_${RUNNUMBER}.log
+    $ECHO Check $RESULTSDIR/HistoricLoadTableError_${RUNNUMBER}.log | $TEE -a $RESULTSDIR/HistoricLoad_${RUNNUMBER}.log 
+    $ECHO "${partition} \t | ${EXTRACTS_LOC}/${User}_${Table}xyz${date_holder}.gz |  ${_stime_} \t | `$DATE +'%Y-%m-%d %H:%M:%S'` \t |  ${date_holder} \t | Error " >> ${RESULTSDIR}/load_info_historic_${RUNNUMBER}.txt 
+    if [ ${column_present_flag} -eq 1 ]; then
+        $CP ${EXTRACTS_LOC}/${User}_${Table}xyz${date_holder}_original.gz ${EXTRACTS_LOC}/${User}_${Table}xyz${date_holder}.gz
+        rm -f ${EXTRACTS_LOC}/${User}_${Table}xyz${date_holder}_original.gz
+    fi
+    
+    if [ ${column_append_flag} -eq 1 ] ; then
+        $CP ${EXTRACTS_LOC}/${User}_${Table}xyz${date_holder}_MAIN_original.gz  ${EXTRACTS_LOC}/loaded/${User}_${Table}xyz${date_holder}.gz
+        $RM -f ${EXTRACTS_LOC}/${User}_${Table}xyz${date_holder}_MAIN_original.gz
+    fi
+    
+fi
+
+$RM -f $SqlFile $IMPORT_TMPDIR/${User}_${Table}xyz${date_holder}.sql $IMPORT_TMPDIR/${User}_${Table}xyz${date_holder}.txt $IMPORT_TMPDIR/get_cols_sql_${Table}
+
+}
+
+### Function: setup_env ###
+#
+# Setup up path environment etc
+#
+# Arguments:
+#    none
+# Return Values:
+#    DWH_port,DWH_eng and DBA password
+
+setup_env()
+{
+ENIQ_BASE_DIR=/eniq
+ENIQ_SW_DIR=${ENIQ_BASE_DIR}/sw
+ENIQ_BKUPSW_DIR=${ENIQ_BASE_DIR}/bkup_sw
+CLI_CONF_DIR=${ENIQ_BASE_DIR}/sw/conf
+ENIQ_CORE_BIN_DIR=${ENIQ_BASE_DIR}/installation/core_install/bin/
+IQDIR=/eniq/sybase_iq/IQ-*
+MAXNUMLOG=4
+
+# ENIQ Admin Directory
+ENIQ_ADMIN_DIR=${ENIQ_BASE_DIR}/admin
+
+# ENIQ Admin etc Directory
+ENIQ_ADMIN_ETC=${ENIQ_ADMIN_DIR}/etc
+
+# ENIQ Core Install etc Directory
+ENIQ_CORE_ETC=${ENIQ_BASE_DIR}/installation/core_install/etc
+
+COLUMN_FAILED_FILE=${ENIQ_CORE_ETC}/columnFailedList
+
+COLUMN_NULL_FILE=${ENIQ_CORE_ETC}/columnNullList.txt
+
+DBEXTRACT_ENV_FILE=${ENIQ_ADMIN_ETC}/dbextract_load.env
+if [ ! ${DBEXTRACT_ENV_FILE} ]; then
+    _err_msg_="${DBEXTRACT_ENV_FILE} does not exists "
+    abort_script "${_err_msg_}"
+fi
+    
+ENIQ_CONF_DIR=${ENIQ_BASE_DIR}/installation/config
+if [ ! -s ${ENIQ_CONF_DIR}/SunOS.ini ]; then
+    _err_msg_="Could not locate file ${ENIQ_CONF_DIR}/SunOS.ini"
+    abort_script "$_err_msg_"
+fi
+
+# Source the common functions
+if [ -s ${ENIQ_BASE_DIR}/admin/lib/common_functions.lib ]; then
+    . ${ENIQ_BASE_DIR}/admin/lib/common_functions.lib
+else
+    _err_msg_="File ${ENIQ_BASE_DIR}/admin/lib/common_functions.lib not found"
+    abort_script "$_err_msg_"
+fi
+
+if [ ! -s ${ENIQ_CORE_BIN_DIR}/set_core_memcache.bsh ]; then
+        _err_msg_="Failed to locate script ${ENIQ_CORE_BIN_DIR}/set_core_memcache.bsh"
+        abort_script "$_err_msg_" "${EXEC_SHELL_CMD}"
+fi
+    
+DWH_PORT=`iniget DWH -v PortNumber -f ${CLI_CONF_DIR}/niq.ini`
+DWH_ENG=`iniget DWH -v ServerName -f ${CLI_CONF_DIR}/niq.ini`
+if [ ! "${DWH_PORT}" -o ! "${DWH_ENG}" ]; then
+        _err_msg_="Could not read db values from ${CLI_CONF_DIR}/${ENIQ_INI}"
+        abort_script "$_err_msg_"
+fi
+
+DBA_PASSWORD=`inigetpassword DB -f ${CLI_CONF_DIR}/${ENIQ_INI} -v DBAPassword`
+if [ ! ${DBA_PASSWORD} ]; then
+  if [ -f ${ENIQ_BASE_DIR}/sw/installer/dbusers ]; then
+            DBA_PASSWORD=`${ENIQ_BASE_DIR}/sw/installer/dbusers dba dwh`
+     if [ ! "${DBA_PASSWORD}" ] ; then
+                _err_msg_="Could not get dwhdb DBA Password"
+                abort_script "$_err_msg_"
+     fi
+   fi
+fi
+
+
+
+_dwh_eng_=`iniget DWH -f ${ENIQ_CONF_DIR}/${ENIQ_INI} -v ServerName`
+
+
+#Initialising the connection string for dwhdb
+connection_string="-nogui -onerror exit -c \"eng=${DWH_ENG};links=tcpip{host=localhost;port=${DWH_PORT}};uid=dba;pwd=${DBA_PASSWORD}\""
+
+
+. /eniq/sybase_iq/IQ-*/IQ-*.sh >> /dev/null
+sybase_env_variables_ec=$?
+if [ $sybase_env_variables_ec -ne 0 ]; then
+    _err_msg_="Could not source sybase environment"
+    abort_script "$_err_msg_"
+fi
+
+IQISQL=$(which iqisql)
+}
+
+pause_resume_check()
+{
+_pause_count_=0
+_pause_timeout_=1000
+_pause_sleep_time_=30
+
+while [ -e $RESULTSDIR/pause_process.txt ]; do
+    Pruns=$($PS -ef | $GREP "historic_loaddb.bsh" | $GREP -v $GREP | $GREP -v "Final"| $AWK '{print $2}' | $GREP -v ${PID} | $WC -l)
+    if [ $Pruns -gt 2 ]; then
+        loop_break=0
+        while [ $Pruns -gt 2 ]; do
+            Pruns=$($PS -ef | $GREP "historic_loaddb.bsh" | $GREP -v $GREP | $GREP -v "Final"| $AWK '{print $2}' | $GREP -v ${PID} | $WC -l)
+            $ECHO ".\c" >> ${LOGFILE}
+            $SLEEP ${_pause_sleep_time_}
+            if [ ! -e $RESULTSDIR/pause_process.txt ]; then
+                loop_break=1
+                break
+            fi
+            (( _pause_count_ = _pause_count_ + 1 ))
+            if [ ${_pause_count_} -eq ${_pause_timeout_} ]; then
+                _err_msg_="Timeout has occurred, script has been paused for too long, Exiting"
+                abort_script "${_err_msg_}"
+            fi
+        done
+        if [ $loop_break -eq 1 ]; then
+            break
+        fi
+        $ECHO "\n----------------------------------------------\n" | $TEE -a $RESULTSDIR/HistoricLoad_${RUNNUMBER}.log >>${LOGFILE}
+        $ECHO "`$DATE` : IMPORT PROCESS HAS BEEN PAUSED " | $TEE -a $RESULTSDIR/HistoricLoad_${RUNNUMBER}.log >>${LOGFILE}
+        $ECHO "\n----------------------------------------------\n" | $TEE -a $RESULTSDIR/HistoricLoad_${RUNNUMBER}.log >>${LOGFILE}
+    else
+        $SLEEP ${_pause_sleep_time_}
+    fi
+    
+    if (( $_pause_count_ % 50 == 0 ))
+    then
+        $ECHO "\n----------------------------------------------" | $TEE -a $RESULTSDIR/HistoricLoad_${RUNNUMBER}.log >>${LOGFILE}
+        $ECHO "IMPORT PROCESS HAS BEEN PAUSED" | $TEE -a $RESULTSDIR/HistoricLoad_${RUNNUMBER}.log >>${LOGFILE}
+        $ECHO "----------------------------------------------\n" | $TEE -a $RESULTSDIR/HistoricLoad_${RUNNUMBER}.log >>${LOGFILE}
+    else
+        $ECHO ".\c" | $TEE -a $RESULTSDIR/HistoricLoad_${RUNNUMBER}.log >>${LOGFILE}
+    fi
+    (( _pause_count_ = _pause_count_ + 1 ))
+    if [ ${_pause_count_} -eq ${_pause_timeout_} ]; then
+        _err_msg_="Timeout has occurred, script has been paused for too long, Exiting"
+        abort_script "${_err_msg_}"
+    fi
+done
+$ECHO "\n----------------------------------------------\n" | $TEE -a $RESULTSDIR/HistoricLoad_${RUNNUMBER}.log >>${LOGFILE}
+$ECHO "`$DATE` : Resuming the import table process\n" | $TEE -a $RESULTSDIR/HistoricLoad_${RUNNUMBER}.log >>${LOGFILE}
+$ECHO "----------------------------------------------\n" | $TEE -a $RESULTSDIR/HistoricLoad_${RUNNUMBER}.log >>${LOGFILE}
+}
+
+
+check_mount()
+{
+check_mount_timeout=0
+for _mount_dir_ in ${IMPORTS}; do
+    while [ 1 = 1 ]; do
+        _mount_dir_exists_=`$MOUNT -l | $GREP "${_mount_dir_}"`
+        if [ ! "${_mount_dir_exists_}" ]; then
+            $ECHO "\n\n----------------------------------------------------------------------------------\n!!! ERROR !!! `$DATE` : Mount point ${_mount_dir_} does not exist to import the data... \nPausing the import process, please mount the directory and resume the import process\n\n----------------------------------------------------------------------------------\n\n" | $TEE -a $RESULTSDIR/ExtractedTables_${RUNNUMBER}.log >> ${LOGFILE}
+            $TOUCH $RESULTSDIR/pause_process.txt
+            pause_resume_check
+        else
+            break
+        fi
+    done
+done
+}
+
+
+# ********************************************************************
+#
+#     Main body of program
+#
+# ********************************************************************
+#
+setup_env
+
+IMPORT_TMPDIR=/tmp/LoadDb
+$RM -rf $IMPORT_TMPDIR
+$MKDIR -p $IMPORT_TMPDIR
+
+
+server_name=dwhdb
+PID=$$
+
+DBA_PASSWORD=`/eniq/sw/installer/dbusers dba dwh`
+if [ ! "${DBA_PASSWORD}" ] ; then
+    _err_msg_="Could not get DBA Password"
+    abort_script "$_err_msg_"
+fi
+
+# Pull in the environment
+if [ ! -f "${DBEXTRACT_ENV_FILE}" ]
+then
+    $ECHO "${DBEXTRACT_ENV_FILE} does not exists, exiting "
+    exit 1
+fi
+
+. "${DBEXTRACT_ENV_FILE}"
+
+IMPORTS=`$ECHO ${EXTRACTS} |sed "s/:/ /g"`
+count_tables_loading=$($FIND ${IMPORTS}/ -type f -name *xyz* | $GREP "\.gz" | wc -l)
+
+IQISQL=$(which iqisql)
+
+if [ $count_tables_loading -eq 0 ]
+then
+    $ECHO "No tables to load. Exiting !"
+    exit
+fi
+
+while getopts ":e:l:" arg; do
+  case $arg in
+    l) LOGFILE="$OPTARG"
+       ;;
+    e) RETRY_FLAG="YES"
+       RETRY_FAILED_TABLES_FILE="$OPTARG"
+       ;;
+    \?) _err_msg_="`$BASENAME $0` -s <stage>"
+       abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+       ;;
+  esac
+done
+shift `expr $OPTIND - 1`
+
+$ECHO "Initializing Loading log" | $TEE -a $RESULTSDIR/HistoricLoad_${RUNNUMBER}.log
+$TOUCH $RESULTSDIR/HistoricLoad_${RUNNUMBER}.log 
+$TOUCH $RESULTSDIR/HistoricLoadTableSuccess_${RUNNUMBER}.log
+$TOUCH $RESULTSDIR/HistoricLoadTableError_${RUNNUMBER}.log
+$TOUCH $RESULTSDIR/LoadTruncateTables.log
+$TOUCH $RESULTSDIR/Historic_extracted_tables_dates_${RUNNUMBER}.txt
+
+count=0
+
+#total zip files present in extract directory
+$FIND ${IMPORTS}/ -type f -name *xyz* | $GREP "\.gz" | grep -v "/loaded/"  | grep -v "/rolled_loads/" | grep -v "/noschema/" | grep -v "/nostartdate/" >$RESULTSDIR/Historic_total_tables_${RUNNUMBER}.txt
+
+#Getting total number of zip files by adding number of successfully loaded files
+historic_table_count=`$WC -l $RESULTSDIR/Historic_total_tables_${RUNNUMBER}.txt | $AWK '{print $1}'`
+if [ -s ${RESULTSDIR}/load_info_historic_${RUNNUMBER}.txt ]; then
+    historic_table_success_count=`$CAT ${RESULTSDIR}/load_info_historic_${RUNNUMBER}.txt | $EGREP "Success|Partition rolled|StartDate not found|Error finding table schema" | $WC -l`
+    total_historic_table_count=`$EXPR ${historic_table_count} + ${historic_table_success_count}`
+else
+    total_historic_table_count=${historic_table_count}
+fi
+
+
+for _extract_dir_ in ${IMPORTS}; do
+    #unique dates present in extracts directory
+    if [ -z "${RETRY_FLAG}" ];then
+        $FIND ${_extract_dir_}/ -type f -name *xyz* | $GREP "\.gz" | grep -v "/loaded/"  | grep -v "/rolled_loads/" | grep -v "/noschema/" | grep -v "/nostartdate/" | sed "s|${EXTRACTS}/||g"| cut -d '.' -f1 | sed 's/xyz/+/'|cut -d '+' -f2 | sort -r | uniq >$RESULTSDIR/Historic_extracted_tables_dates_${RUNNUMBER}.txt
+    else
+        cat $RETRY_FAILED_TABLES_FILE | grep ${_extract_dir_} | sed "s|${EXTRACTS}/||g"| cut -d '.' -f1 | sed 's/xyz/+/'|cut -d '+' -f2 | sort -r | uniq >$RESULTSDIR/Historic_extracted_tables_dates_${RUNNUMBER}.txt
+    fi
+    
+    for date1 in `<$RESULTSDIR/Historic_extracted_tables_dates_${RUNNUMBER}.txt`
+    do
+        if [ -z "${RETRY_FLAG}" ];then
+            $FIND  ${_extract_dir_}/${date1} -name  "*xyz*" | $GREP "\.gz" | grep -v "/loaded/" | grep -v "/rolled_loads/" | grep -v "/noschema/" | grep -v "/nostartdate/" |$GREP -v "Extract_tables_cols.txt"  > $RESULTSDIR/Historic_extracted_tables.txt
+        else
+            cat $RETRY_FAILED_TABLES_FILE | grep ${_extract_dir_}/${date1} >$RESULTSDIR/Historic_extracted_tables.txt
+        fi
+        
+        for fl in `<$RESULTSDIR/Historic_extracted_tables.txt`   
+        do
+            if [ -e $RESULTSDIR/pause_process.txt ]; then 
+                echo "\n\n\n-----------------------------------------------------------------------------------" | $TEE -a $RESULTSDIR/HistoricLoad_${RUNNUMBER}.log >>${LOGFILE}
+                echo "`$DATE` : User selected to pause the import process" | $TEE -a $RESULTSDIR/HistoricLoad_${RUNNUMBER}.log >>${LOGFILE}
+                echo "Some table imports are still in progress, please wait for the process to get completed" | $TEE -a $RESULTSDIR/HistoricLoad_${RUNNUMBER}.log >>${LOGFILE}
+                echo "-----------------------------------------------------------------------------------\n\n\n" | $TEE -a $RESULTSDIR/HistoricLoad_${RUNNUMBER}.log >>${LOGFILE}
+                pause_resume_check
+            fi
+            while [ 1 = 1 ]
+            do
+                Pruns=$(ps -ef | grep "historic_loaddb.bsh" | grep -v grep | awk '{print $2}' |grep -v ${PID}  | wc -l)
+                if [ $Pruns -le 10 ]
+                then
+                    ${IQDIR}/bin64/dbping -q -c "con=dwhdb;eng=$DWH_ENG;links=tcpip{host=dwhdb;port=${DWH_PORT};dobroadcast=none;verify=no};uid=dba;pwd=${DBA_PASSWORD}" 2>&1
+                    _resp_=$?
+                    if [ ${_resp_} -eq 0 ]; then
+                        check_mount
+                        loadtable $fl  &
+                        break
+                    else
+                        _retry_=0
+                        while [ ${_retry_} -lt 6 ]; do
+                            ${IQDIR}/bin64/dbping -q -c "con=dwhdb;eng=$DWH_ENG;links=tcpip{host=dwhdb;port=${DWH_PORT};dobroadcast=none;verify=no};uid=dba;pwd=${DBA_PASSWORD}" 2>&1
+                            _resp1_=$?
+                            if [ ${_resp1_} -ne 0 ]; then
+                                $ECHO "$($DATE +'%Y-%m-%d %H:%M:%S'): dwhdb is not running, will wait for sometime and retry ..!" | $TEE -a $RESULTSDIR/HistoricLoad_${RUNNUMBER}.log >>${LOGFILE}
+                                $SLEEP 60
+                                (( _retry_ = _retry_ + 1 ))
+                            else
+                                $ECHO "$($DATE +'%Y-%m-%d %H:%M:%S'): dwhdb is running fine... resuming historic load." | $TEE -a $RESULTSDIR/HistoricLoad_${RUNNUMBER}.log >>${LOGFILE}
+                                check_mount
+                                loadtable $fl  &
+                                break
+                            fi
+                        done
+                        if [ ${_retry_} -eq 6 ]; then
+                            $ECHO "$($DATE +'%Y-%m-%d %H:%M:%S'): Maximum timeout reached trying to wait for dwhdb... Exiting!" | $TEE -a $RESULTSDIR/HistoricLoad_${RUNNUMBER}.log >>${LOGFILE}
+                            exit
+                        fi
+                    fi
+                else
+                    let count=$count+1
+                    if [ $count -ge 60 ]
+                    then
+                        #$ECHO "$($DATE +'%Y-%m-%d %H:%M:%S'): Processing loads."
+                        $ECHO "$($DATE +'%Y-%m-%d %H:%M:%S'): $(wc -l $RESULTSDIR/Historicrun_FinishedTables_date_${RUNNUMBER}.list| awk '{print $1}' ) of ${total_historic_table_count} load files completed." | $TEE -a $RESULTSDIR/HistoricLoad_${RUNNUMBER}.log >>${LOGFILE}
+                        count=0
+                    fi
+
+                    $SLEEP 5
+                fi
+            done
+        done
+        
+        #Waiting for all the files belonging to a particular date to complete
+        while [ 1 = 1 ]
+        do
+            Pruns=$(ps -ef | grep "historic_loaddb.bsh" | grep -v grep | awk '{print $2}' |grep -v ${PID}  | wc -l)
+            if [ $Pruns -le 2 ]
+            then
+                break
+            else
+                let count=$count+1
+                if [ $count -ge 60 ]
+                then
+                    #$ECHO "$($DATE +'%Y-%m-%d %H:%M:%S'): Processing loads."
+                    $ECHO "$($DATE +'%Y-%m-%d %H:%M:%S'): $(wc -l $RESULTSDIR/Historicrun_FinishedTables_date_${RUNNUMBER}.list | awk '{print $1}' ) of ${total_historic_table_count} load files completed." | $TEE -a $RESULTSDIR/HistoricLoad_${RUNNUMBER}.log >>${LOGFILE}
+                    count=0
+                fi
+                $SLEEP 5
+            fi
+        done
+    done
+done
+
+$ECHO "$($DATE +'%Y-%m-%d %H:%M:%S'): $(wc -l $RESULTSDIR/Historicrun_FinishedTables_date_${RUNNUMBER}.list | awk '{print $1}' ) of ${total_historic_table_count} load files completed." | $TEE -a $RESULTSDIR/HistoricLoad_${RUNNUMBER}.log >>${LOGFILE}
+
+count_error=$( wc -l $RESULTSDIR/HistoricLoadTableError_${RUNNUMBER}.log | awk '{print $1}')
+count_tables_left=$($LS -l ${EXTRACTS} |$GREP .gz | wc -l)
+if [ $count_error -gt 1 ]
+then
+    $ECHO Error Loading  files. $count_tables_left tables still to load. Check $RESULTSDIR/HistoricLoadTableError_${RUNNUMBER}.log, remedy issues and rerun script.  | $TEE -a $RESULTSDIR/HistoricLoad_${RUNNUMBER}.log >>${LOGFILE}
+else
+    $ECHO All files loaded successfully.  Finished loading.| $TEE -a $RESULTSDIR/HistoricLoad_${RUNNUMBER}.log >>${LOGFILE}
+fi
+
+
+OLD_RUNNUMBER=$RUNNUMBER
+let 'OLD_RUNNUMBER = OLD_RUNNUMBER + 1'
+$SED "s/RUNNUMBER=$RUNNUMBER/RUNNUMBER=$OLD_RUNNUMBER/" ${DBEXTRACT_ENV_FILE}  > $IMPORT_TMPDIR/tempf
+cp $IMPORT_TMPDIR/tempf ${DBEXTRACT_ENV_FILE}

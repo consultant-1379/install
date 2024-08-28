@@ -1,0 +1,967 @@
+#!/bin/bash
+# ********************************************************************
+# Ericsson Radio Systems AB                                     SCRIPT
+# ********************************************************************
+#
+#
+# (c) Ericsson Radio Systems AB 2019 - All rights reserved.
+#
+# The copyright to the computer program(s) herein is the property
+# of Ericsson Radio Systems AB, Sweden. The programs may be used 
+# and/or copied only with the written permission from Ericsson Radio 
+# Systems AB or in accordance with the terms and conditions stipulated 
+# in the agreement/contract under which the program(s) have been 
+# supplied.
+#
+# ********************************************************************
+# Name    : manage_eniq_services.bsh
+# Date    : 23/09/2022
+# Revision: main\17
+# Purpose : Main ENIQ script that will start and stop ENIQ services
+#			in the correct order.
+#
+# Usage   : manage_eniq_services.bsh -a <service_action> -s <service>
+#				[ -l <logfile> ]
+#										
+#
+# ********************************************************************
+#
+# 	Command Section
+#
+# ********************************************************************
+
+AWK=/usr/bin/awk
+BASENAME=/usr/bin/basename
+CAT=/usr/bin/cat
+CP=/usr/bin/cp
+DATE=/usr/bin/date
+DIRNAME=/usr/bin/dirname
+ECHO="/usr/bin/echo -e"
+EGREP=/usr/bin/egrep
+ENV=/usr/bin/env
+GAWK=/usr/bin/gawk
+GREP=/usr/bin/grep
+HEAD=/usr/bin/head
+MYHOSTNAME=/usr/bin/hostname
+ID=/usr/bin/id
+LS=/usr/bin/ls
+MKDIR=/usr/bin/mkdir
+MV=/usr/bin/mv
+PRINTF=/usr/bin/printf
+PS=/usr/bin/ps
+PWD=/usr/bin/pwd
+RM=/usr/bin/rm
+ROLES=/usr/bin/roles
+SED=/usr/bin/sed
+SUDO=/usr/bin/sudo
+SORT=/usr/bin/sort
+SYSTEMCTL=/usr/bin/systemctl
+TEE=/usr/bin/tee
+TOUCH=/usr/bin/touch
+WC=/usr/bin/wc
+WHO=/usr/bin/who
+
+# ********************************************************************
+#
+#       Configuration Section
+#
+# ********************************************************************
+
+# Default user
+DEFAULT_USER=root
+
+# Directory on the root filesystem
+ENIQ_ROOT_DIR=/eniq
+
+# String that is common to all ENIQ services. I concatenate this and the
+# service name together to give me the service ID eg. eniq-dwhdb
+SVC_COMMON_STR=eniq
+
+# String used to determine if the service is an actual ENIQ managed service
+MANAGED_STR="ENIQ"
+
+# List of services to ignore
+# Ignore the below SUPPORT services
+SERVICE_EXCL_LIST="nasd|sentinel" 
+# Following do not come under ENIQ services 
+NON_ENIQ_SVC="ddc"
+# Following services do not have corresponding service 
+# script in ENIQ admin location
+NON_ADMIN_SVC="connectd|esm|ddc"
+
+# ********************************************************************
+#
+#       Pre-execution Operations
+#
+# ********************************************************************
+
+
+# ********************************************************************
+#
+# 	Functions
+#
+# ********************************************************************
+### Function: abort_script ###
+#
+#   This will be called if the script is aborted through an error
+#   signal sent by the kernel such as CTRL-C or if a serious
+#   error is encountered during runtime
+#
+# Arguments:
+#       $1 - Error message from part of program (Not always used)
+# Return Values:
+#       none
+abort_script()
+{
+_err_time_=`$DATE '+%Y-%b-%d_%H.%M.%S'`	
+
+if [ "$1" ]; then
+    _err_msg_="${_err_time_} - $1"
+else
+    _err_msg_="${_err_time_} - Script aborted.......\n"    
+fi
+if [ "${LOGFILE}" ]; then
+    $ECHO "\nERROR : ${_err_msg_}\n" | $TEE -a ${LOGFILE}
+else
+    $ECHO "\nERROR : ${_err_msg_}\n"
+fi
+
+cd $SCRIPTHOME
+$RM -rf ${TEM_DIR}
+
+if [ "$2" ]; then
+    ${2}
+else
+   exit 1
+fi
+}
+
+### Function: chk_create_logfile ###
+#
+# Check/Create Logfile
+#
+# Arguments:
+#	none
+# Return Values:
+#	none
+chk_create_logfile()
+{
+$MKDIR -p `$DIRNAME ${LOGFILE}`
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not create directory `$DIRNAME ${LOGFILE}`"
+     abort_script "${_err_msg_}"
+fi	
+
+$TOUCH -a ${LOGFILE}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not write to file ${LOGFILE}"
+    abort_script "${_err_msg_}"
+fi	
+
+# Create debug log directory and file
+if [ ! -d ${DEBUG_LOGDIR} ]; then
+    $MKDIR -p ${DEBUG_LOGDIR}
+    if [ $? -ne 0 ]; then
+        _err_msg_="Could not create directory ${DEBUG_LOGDIR}"
+        abort_script "${_err_msg_}"
+    fi
+fi
+if [ ! -f ${DEBUG_LOGFILE} ]; then
+    $TOUCH ${DEBUG_LOGFILE}
+    if [ $? -ne 0 ]; then
+        _err_msg_="Could not write to file ${DEBUG_LOGFILE}"
+        abort_script "${_err_msg_}"
+    fi
+fi
+}
+
+### Function: check_id ###
+#
+#   Check that the effective id of the user is correct
+#   If not print error msg and exit.
+#
+# Arguments:
+#       $1 : User ID name
+# Return Values:
+#       none
+check_id()
+{
+_get_id_=`$ENV |$GREP -w SUDO_USER | $EGREP "^[[:blank:]]*SUDO_USER="|$AWK -F\= '{print $2}'|$SED -e 's|"||g'`
+
+_check_id_=`$ID | $AWK -F\( '{print $2}' | $AWK -F\) '{print $1}'`
+
+_check_group_=`$ID $_get_id_ | $AWK -F\( '{print $3}' | $AWK -F\) '{print $1}'`
+
+
+    if [ "${_get_id_}" == "" ]; then
+
+        if [ "${_check_id_}" == "root" ]; then
+           # Set 1 for true
+           _user_root=1
+
+        else
+           _err_msg_="You must be root or admin to execute this script."
+           abort_script "${_err_msg_}"
+        fi
+          else
+            if [ "${_check_group_}" == "ENIQ_ADMIN_ROLE" ]; then
+               # Set 0 for false
+               _user_root=0
+
+            else
+               _err_msg_="You must be root or admin to execute this script." 
+               abort_script "${_err_msg_}"
+            fi
+    fi
+
+}
+
+### Function: check_params ###
+#
+# Check Input Params
+#
+# Arguments:
+#	none
+# Return Values:
+#	none
+check_params()
+{
+if [ ! "${SRVC_ACTION}" -o ! "${SRVC_NAME}" ]; then
+    usage_msg
+    exit 1
+fi
+
+if [ "${UPGRADE_FLAG}" -a "${SRVC_NAME}" != "ALL" ]; then
+	usage_msg 
+	exit 1
+fi
+
+case "${SRVC_ACTION}" in
+     list)  PRINT_MSG="Listing"
+            ;;
+    start)  ENIQ_OPT=enable
+            PRINT_MSG="Starting"
+            ;;
+     stop)  ENIQ_OPT=disable
+     	    PRINT_MSG="Stopping"
+            ;;
+  restart)  PRINT_MSG="Restarting"
+            ;;
+        *)  _err_msg_="`$BASENAME $0` -a {start|stop|restart|list}"
+            abort_script "${_err_msg_}"
+       	    ;;
+esac
+}
+
+
+### Function: clear ###
+#
+# Clears the terminal screen
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+clear()
+{
+# Clearing the screen without removing scrollback buffer
+$PRINTF '\33[H\33[2J'
+}
+
+
+### Function: get_absolute_path ###
+#
+# Determine absolute path to software
+#
+# Arguments:
+#	none
+# Return Values:
+#	none
+get_absolute_path() 
+{
+_dir_=`$DIRNAME $0`
+SCRIPTHOME=`cd $_dir_ 2>/dev/null && pwd || $ECHO $_dir_`
+}
+
+
+### Function: get_all_services ###
+#
+# Create a list of all ENIQ services from contract file
+#
+# Arguments:
+#      None
+# Return Values:
+#      Service list
+get_all_services()
+{
+$RM -rf ${TEM_DIR}/eniq_service_list $TEM_DIR/server_type_contracts
+
+if [ "${UPGRADE_FLAG}" ]; then
+	# Get all services in the contract file, excluding those in ${SERVICE_EXCL_LIST}
+	$CAT ${SVC_CONTRACT_INFO} | $EGREP ${CURR_SERVER_TYPE} | $EGREP -v "${SERVICE_EXCL_LIST}" > $TEM_DIR/server_type_contracts
+else
+	# Get the services tagged as "ENIQ" in the contracts file
+	$CAT ${SVC_CONTRACT_INFO} | $EGREP ${CURR_SERVER_TYPE} | $EGREP "${MANAGED_STR}" > $TEM_DIR/server_type_contracts
+fi
+
+if [ ! -s $TEM_DIR/server_type_contracts ]; then
+    _err_msg_="Could not parse services for ${CURR_SERVER_TYPE} server from ${SVC_CONTRACT_INFO}"
+    abort_script "${_err_msg_}"
+fi
+
+unset _service_list_
+
+# Create a list of servers for this server type
+while read _line_; do
+        _service_name_=`$ECHO ${_line_} | $GAWK -F"::" '{print $3}'`
+        _service_opt_=`$ECHO ${_line_} | $GAWK -F"::" '{print $4}'`
+        if [ "${_service_opt_}" == "Y" ]; then
+            if [ ! "${_service_list_}" ]; then
+                _service_list_=${_service_name_}
+            else
+                _service_list_="${_service_list_} ${_service_name_}"
+            fi
+        fi
+done < $TEM_DIR/server_type_contracts
+
+$ECHO ${_service_list_}
+}
+
+### Function: get_services_list ###
+#
+# Build a list of all ENIQ services
+#
+# Arguments:
+#       $1: Action to be performed
+# Return Values:
+#       none
+get_services_list()
+{
+unset ENIQ_START_SERVICES ENIQ_STOP_SERVICES
+
+# Create a list of services to start
+_service_list_=`get_all_services`
+
+ENIQ_START_SERVICES=${_service_list_}
+
+# Create a list of services to stop
+for _svc_ in ${_service_list_}; do
+    if [ ! "${_rev_services_}" ]; then
+        _rev_services_=${_svc_}
+    else
+        _rev_services_="${_svc_} ${_rev_services_}"
+    fi
+done
+ENIQ_STOP_SERVICES=${_rev_services_}
+
+if [ "${1}" == "start" ]; then
+    ENIQ_SERVICES=${ENIQ_START_SERVICES}
+else
+    ENIQ_SERVICES=${ENIQ_STOP_SERVICES}
+fi
+
+# If service contract is updated during upgrade process, but service doesn't exist yet
+# log WARNING in the logfile and don't put that service in service list and continue
+# if service script is not present in admin/bin directory during upgrade just log 
+# warning and don't put it in the service list
+for _eniq_service_ in ${ENIQ_SERVICES}; do
+    unset _service_ _service_script_
+
+    if [ ${_eniq_service_} == "fls" ]; then
+        if [ ! -s /eniq/installation/config/fls_conf ]; then
+        # Checking if FLS is configured or not
+          continue
+        fi
+    fi
+
+
+    if [ `$ECHO "${_eniq_service_}" | $EGREP "${NON_ENIQ_SVC}"` ]; then
+        _service_="${_eniq_service_}"
+    else
+        _service_="${SVC_COMMON_STR}-${_eniq_service_}"
+    fi
+
+    # Check if the service unit is present
+    _load_state_=`$SYSTEMCTL show -p LoadState ${_service_} | $CUT -f2 -d=`
+    if [ "${_load_state_}" == "not-found" ]; then
+        _err_msg_="Could not find ${_service_} in services."
+        if [ "${UPGRADE_FLAG}" == "YES" ]; then
+             $ECHO "WARNING:${_err_msg_}" >> ${LOGFILE}
+        else
+             abort_script "${_err_msg_}"
+        fi
+    fi
+
+    # Check if it has any service script in admin bin
+    _service_script_=`$LS ${ENIQ_ADMIN_DIR}/bin | $EGREP "${_eniq_service_}"`
+    if [ -z "${_service_script_}" ]; then
+        # Script is not in /eniq/admin/bin therefore we need a special check for it
+        if [ `$ECHO "${_eniq_service_}" | $EGREP ${NON_ADMIN_SVC}` ]; then
+            $ECHO ${_service_} >> ${TEM_DIR}/eniq_service_list
+        else
+            _err_msg_="Could not find service script ${ENIQ_ADMIN_DIR}/bin/${_eniq_service_}."
+            abort_script "${_err_msg_}"
+        fi
+    else
+        $ECHO ${_service_} >> ${TEM_DIR}/eniq_service_list
+    fi
+done
+}
+
+
+### Function: get_user_service_list ###
+#
+# Build a list of selected services
+#
+# Arguments:
+#	none
+# Return Values:
+#	none
+get_user_service_list()
+{
+_service_list_=`$ECHO ${SRVC_NAME} | $SED -e 's/\,/ /g'`
+
+for _service_ in ${_service_list_}; do
+
+    if [ ${_service_} == "fls" ] ;then
+        if [ ! -s /eniq/installation/config/fls_conf ]; then
+                # Checking if FLS is configured or not
+                _err_msg_="Service ${_service_} is not configured to run on this server"
+                abort_script "${_err_msg_}"
+        fi
+    fi
+
+    # Add prefix COMMON_STR to the service name if not passed
+    if [ ! `$ECHO "${_service_}" | $GREP "${SVC_COMMON_STR}-"` ]; then
+        _service_="${SVC_COMMON_STR}-${_service_}"
+    fi
+
+    # Check if the service is loaded
+    _load_state_=`$SYSTEMCTL show -p LoadState ${_service_} | $AWK -F'=' '{print $2}'`
+    if [ "${_load_state_}" != "loaded" ]; then
+        _err_msg_="Service ${_service_} not found"
+        abort_script "${_err_msg_}"
+    fi
+    $ECHO "${_service_}" >> ${TEM_DIR}/eniq_service_list
+done	
+}
+
+
+### Function: list_eniq_services ###
+#
+# List the ENIQ services and their status
+#
+# Arguments:
+#       $1: Service List File
+# Return Values:
+#       none
+list_eniq_services()
+{
+_service_list_file_=$1
+if [ ! -f "${_service_list_file_}" ]; then
+    log_msg -t -l ${LOGFILE} -s "No services found to List"
+    return 0
+fi
+
+unset _serv_list_name_
+
+log_msg -h -t -l ${LOGFILE} -q -s "${PRINT_MSG} ENIQ services on ${HNAME}"
+_svc_attrib_list_="ActiveState SubState UnitFileState WatchdogTimestamp"
+
+# Display File
+_disp_file_=${TEM_DIR}/display
+$RM -f ${_disp_file_}
+$PRINTF '%-20s  %-10s  %-10s  %-10s  %-30s\n' "SERVICE" "STATE" "SUBSTATE" "ENABLED" "START TIME" >  ${_disp_file_}
+
+for _serv_name_ in `$CAT ${_service_list_file_}`; do
+    printf '%-20s' "${_serv_name_}" >> ${_disp_file_}
+    for _attrib_ in ${_svc_attrib_list_}; do
+        _value_=`$SYSTEMCTL show -p ${_attrib_} ${_serv_name_} | $AWK -F'=' '{print $2}'`
+        if [ ! "${_value_}" ]; then
+            _value_="---"
+        fi
+        if [ "${_attrib_}" == "WatchdogTimestamp" ]; then
+            $PRINTF '  %-30s' "${_value_}" >>${_disp_file_}
+        else
+            $PRINTF '  %-10s' "${_value_}" >>${_disp_file_}
+        fi
+    done
+    $PRINTF "\n" >>${_disp_file_}
+done
+
+# Print the status
+$CAT ${_disp_file_} | $TEE -a ${LOGFILE}
+
+log_msg -h -t -l ${LOGFILE} -q -s "Successfully listed ENIQ services."
+}
+
+
+### Function: log_debug_info ###
+#
+# Logs user/process information of the script invokation
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+log_debug_info()
+{
+log_msg -l ${DEBUG_LOGFILE} -h -t -q -s "Starting to log debugging information"
+
+# Create temp directory
+DEBUG_TEMP=${TEM_DIR}/debug_temp
+if [ ! -d ${DEBUG_TEMP} ]; then
+    $MKDIR -p ${DEBUG_TEMP}
+    if [ $? -ne 0 ]; then
+        log_msg -l ${DEBUG_LOGFILE} -t -q -s "Could not create directory ${DEBUG_TEMP}. Using /tmp directory instead."
+        DEBUG_TEMP=${TEM_DIR}
+    fi
+fi
+
+# Cleanup older logs
+_no_of_retain_logs_=100
+log_msg -l ${DEBUG_LOGFILE} -t -q -s "Removing older logfiles..."
+_debug_log_count_=`$LS -rt ${DEBUG_LOGDIR}/services_debug_log* | $WC -l`
+if [ ${_debug_log_count_} -gt ${_no_of_retain_logs_} ]; then
+    _debug_log_delete_=`$LS -rt ${DEBUG_LOGDIR}/services_debug_log* | $HEAD -1`
+    $RM -rf ${_debug_log_delete_}
+fi
+
+# Get process related info
+_my_pid_=$$
+
+_pid_parentid_=`$PS -p ${_my_pid_} -o ppid=`
+_pid_terminal_=`$PS -p ${_my_pid_} -o tty=`
+_pid_user_=`$PS -p ${_my_pid_} -o user= | xargs`
+_pid_command_=`$PS -p ${_my_pid_} -o args=`
+
+_parent_script_=`$PS -p ${_pid_parentid_} -o args=`
+if [ "${_parent_script_}" == "bash" -o "${_parent_script_}" == "sh" ]; then
+    _parent_script_="None"
+fi
+
+$ECHO "`$WHO`" | $GREP ${_pid_terminal_} >> /dev/null 2>&1
+if [ $? -eq 0 ];then
+    _t_user_login_=`$WHO | $GREP ${_pid_terminal_} | $AWK '{print $1}'`
+    _t_user_login_time_=`$WHO | $GREP ${_pid_terminal_} | $AWK '{print $3,$4}'`
+    _t_user_login_from_=`$WHO | $GREP ${_pid_terminal_} | $AWK '{print $5}' | $SED 's/[()]//g'`
+    _term_user_info_="INFO: User ${_t_user_login_} logged in from ${_t_user_login_from_} at ${_t_user_login_time_}"
+else
+    _term_user_info_="INFO: Script invoked internally by System user ${_pid_user_}"
+fi
+
+# Log the information to debug log
+log_msg -t -l ${DEBUG_LOGFILE} -q -s "Logging script related Information: \n"
+log_msg -l ${DEBUG_LOGFILE} -q -s "\
+\tCommand executed \t: ${_pid_command_} \n\
+\tCommand executed by \t: ${_pid_user_} \n\
+\tCommand process ID \t: ${_my_pid_} \n\
+\tParent command PID \t: ${_pid_parentid_} \n\
+\tParent command is \t: ${_parent_script_} \n\
+${_term_user_info_} \n"
+
+# Log current running processes list to debug log
+_running_process_list_="${DEBUG_TEMP}/running_processes"
+$PS -ef | $EGREP -v 'ssh\/sshd|sleep |grep |egrep |\-sh' | $SORT > ${_running_process_list_}
+log_msg -l ${DEBUG_LOGFILE} -t -q -s "Running processes List:\n"
+$CAT ${_running_process_list_} >> ${DEBUG_LOGFILE}
+
+# Log current ENIQ services status to debug log
+log_msg -l ${DEBUG_LOGFILE} -q -s "\n\n"
+log_msg -l ${DEBUG_LOGFILE} -t -q -s "ENIQ services Status:\n"
+$SYSTEMCTL -a | $GREP "eniq-" | $GREP ".service" >> ${DEBUG_LOGFILE} 2>&1 
+
+log_msg -l ${DEBUG_LOGFILE} -q -s "\n\nINFO: Completed logging to ${DEBUG_LOGFILE}\n"
+}
+
+
+### Function: restart_eniq_services ###
+#
+# Restart the ENIQ service(s)
+#
+# Arguments:
+#	none
+# Return Values:
+#	none
+restart_eniq_services()
+{
+_service_list_file_=$1
+if [ ! -f "${_service_list_file_}" ]; then
+    _err_msg_="No services found to restart"
+    abort_script "${_err_msg_}"
+fi
+
+if [ "${SRVC_ACTION}" == "restart" ]; then
+    log_msg -h -t -l ${LOGFILE} -s "Restarting ENIQ services"
+fi
+    
+# Stop the services
+ENIQ_OPT=disable
+ENIQ_ACT=stop
+PRINT_MSG="Stopping"
+stop_eniq_services ${_service_list_file_}
+
+# Reverse the order in which the services stopped
+unset _rev_services_
+for _serv_start_name_ in `$CAT ${_service_list_file_}`; do    	
+    if [ ! "${_rev_services_}" ]; then
+        _rev_services_=${_serv_start_name_}
+    else
+        _rev_services_="${_serv_start_name_} ${_rev_services_}"
+    fi
+done
+
+$RM -rf ${TEM_DIR}/restart_eniq_service_list
+for _eniq_service_ in ${_rev_services_}; do 
+    $ECHO ${_eniq_service_} >> ${TEM_DIR}/restart_eniq_service_list
+done
+
+# Start the services
+NO_CONFIRM="YES" 
+ENIQ_OPT=enable
+ENIQ_ACT=start
+PRINT_MSG="Starting"
+start_eniq_services ${TEM_DIR}/restart_eniq_service_list
+}
+
+### Function: setup_env ###
+#
+# Set up environment variables for script.
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+setup_env()
+{
+if [ ! "${ENIQ_BASE_DIR}" ]; then
+    # Directory on the root filesystem
+    ENIQ_BASE_DIR=/eniq
+fi
+
+# ENIQ Log Directory
+ENIQ_LOG_DIR=${ENIQ_BASE_DIR}/local_logs
+LOGFILE_DIR="$ENIQ_LOG_DIR/eniq_services_log"
+
+# Main Directory for the Core Installation SW
+ENIQ_INST_DIR=${ENIQ_BASE_DIR}/installation
+
+# ENIQ Config Directory
+ENIQ_CONF_DIR=${ENIQ_INST_DIR}/config
+
+# Get server type
+CURR_SERVER_TYPE=`$CAT $ENIQ_CONF_DIR/installed_server_type`
+if [ ! "${CURR_SERVER_TYPE}" ]; then
+    _err_msg_="Could not read $ENIQ_CONF_DIR/installed_server_type"
+    abort_script "${_err_msg_}" 
+fi
+
+# ENIQ Admin Directory
+ENIQ_ADMIN_DIR=${ENIQ_BASE_DIR}/admin
+
+SVC_CONTRACT_INFO=$ENIQ_ADMIN_DIR/etc/smf_contract_config
+if [ ! -s ${SVC_CONTRACT_INFO} ]; then
+    _err_msg_="Could not find ${SVC_CONTRACT_INFO} file, or it is empty"
+    abort_script "${_err_msg_}" 
+fi
+
+# Source the common functions
+if [ -s ${ENIQ_ROOT_DIR}/admin/lib/common_functions.lib ]; then
+    . ${ENIQ_ROOT_DIR}/admin/lib/common_functions.lib
+else
+    _err_msg_="File ${ENIQ_ROOT_DIR}/admin/lib/common_functions.lib not found"
+    abort_script "$_err_msg_"
+fi
+
+if [ ! "${INCLUDE_ROLLSNAP}" ]; then
+	SERVICE_EXCL_LIST="${SERVICE_EXCL_LIST}|roll-snap"
+fi
+
+HNAME=`${MYHOSTNAME} -s`
+}
+
+### Function: start_eniq_services ###
+#
+# Start the ENIQ service(s)
+#
+# Arguments:
+#	$1: Service List File
+# Return Values:
+#	none
+start_eniq_services()
+{
+_service_list_file_=$1
+if [ ! -f "${_service_list_file_}" ]; then
+    _err_msg_="No services found to start"
+    abort_script "${_err_msg_}"
+fi
+    
+unset _serv_start_name_
+
+if [ ! "${NO_CONFIRM}" ]; then
+	user_confirm "start these services"
+     if [ $USER_CONF == No ]; then
+		$RM -rf ${TEM_DIR}
+		exit 0
+	fi    
+fi
+
+if [ "${SRVC_ACTION}" != "restart" ]; then
+    log_msg -h -t -l ${LOGFILE} -s "${PRINT_MSG} ENIQ services on ${HNAME}"
+fi
+
+for _serv_start_name_ in `$CAT ${_service_list_file_}`; do    	
+    log_msg -t -l ${LOGFILE} -s "${PRINT_MSG} ENIQ service ${_serv_start_name_}"
+    # Starting the service state
+    $SYSTEMCTL ${ENIQ_ACT} ${_serv_start_name_} >> /dev/null 2>&1
+    _service_state_=`$SYSTEMCTL show -p ActiveState ${_serv_start_name_} | $AWK -F'=' '{print $2}'`
+    if [ "${_service_state_}" != "active" ]; then
+		if [ "${_service_state_}" == "activating" ]; then
+			sleep 120
+			_service_state_=`$SYSTEMCTL show -p ActiveState ${_serv_start_name_} | $AWK -F'=' '{print $2}'`
+			if [ "${_service_state_}" != "active" ]; then
+				_err_msg_="Could not ${ENIQ_ACT} ${_serv_start_name_}"
+				abort_script "${_err_msg_}"
+			fi 
+		fi
+    fi
+    # Enabling the service
+    $SYSTEMCTL ${ENIQ_OPT} ${_serv_start_name_} >> /dev/null 2>&1
+    _is_enabled_=`$SYSTEMCTL is-enabled ${_serv_start_name_}`
+    if [ "${_is_enabled_}" != "enabled" ]; then
+        _err_msg_="Could not ${SRVC_ACTION} ${_serv_start_name_}"
+        abort_script "${_err_msg_}" 
+    fi
+done
+
+if [ "${SRVC_ACTION}" != "restart" ]; then
+    log_msg -l ${LOGFILE} -s "\n\nENIQ services started correctly on ${HNAME}\n"
+fi
+}
+
+### Function: stop_eniq_services ###
+#
+# Stop the ENIQ service(s_
+#
+# Arguments:
+#	$1: Service List File
+# Return Values:
+#	none
+stop_eniq_services()
+{
+_service_list_file_=$1
+if [ ! -f "${_service_list_file_}" ]; then
+    _err_msg_="No services found to stop"
+    abort_script "${_err_msg_}"
+fi
+    
+unset _serv_stop_name_
+
+if [ ! "${NO_CONFIRM}" ]; then
+    if [ "${SRVC_ACTION}" != "restart" ]; then
+        user_confirm "stop these services"
+    else
+        user_confirm "restart these services"
+    fi
+    if [ $USER_CONF == No ]; then
+        $RM -rf ${TEM_DIR}
+        exit 0
+    fi    
+fi
+
+if [ "${SRVC_ACTION}" != "restart" ]; then
+    log_msg -h -t -l ${LOGFILE} -s "${PRINT_MSG} ENIQ services"
+fi
+
+for _serv_stop_name_ in `$CAT ${_service_list_file_}`; do    	
+    log_msg -t -l ${LOGFILE} -s "${PRINT_MSG} ENIQ service ${_serv_stop_name_}"
+
+    # Disabling the service
+    $SYSTEMCTL ${ENIQ_OPT} ${_serv_stop_name_} >> /dev/null 2>&1
+    _is_enabled_=`$SYSTEMCTL is-enabled ${_serv_stop_name_}`
+    if [ "${_is_enabled_}" != "disabled" ]; then
+        _err_msg_="Could not ${SRVC_ACTION} ${_serv_stop_name_}"
+        abort_script "${_err_msg_}"
+    fi
+
+    # Stop the service. Clear to ensure service is 'inactive'.
+    $SYSTEMCTL ${ENIQ_ACT} ${_serv_stop_name_} >> /dev/null 2>&1
+    $SYSTEMCTL reset-failed ${_serv_stop_name_} >> /dev/null 2>&1
+    _service_state_=`$SYSTEMCTL show -p ActiveState ${_serv_stop_name_} | $AWK -F'=' '{print $2}'`
+    if [ "${_service_state_}" != "inactive" ]; then
+        _err_msg_="Could not ${ENIQ_ACT} ${_serv_stop_name_}"
+        abort_script "${_err_msg_}"
+    fi
+done	
+
+if [ "${SRVC_ACTION}" != "restart" ]; then
+    log_msg -l ${LOGFILE} -s "\n\nENIQ services stopped correctly on ${HNAME}\n" 
+fi	
+}
+
+### Function: usage_msg ###
+#
+#   Print out the usage message
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+usage_msg()
+{
+clear
+$ECHO "
+Usage: `$BASENAME $0` -a <service_action>  -s <ALL|service_name> [ -l <logfile> ] [ -u ]
+
+Options:
+    
+-a:	Service Action. Must be either 
+                list    --> List the ENIQ service(s)
+		start	--> Start the ENIQ service(s).
+		stop	--> Stop the ENIQ service(s).
+		restart	--> Restart the ENIQ service(s).
+    
+-l:	Optional parameter specifying the full path to logfile. If not specified, a 
+	logfile will be created in ${LOGFILE_DIR}
+      
+-s:	Parameter specifying the service(s) you wish to start/stop.
+	'ALL' can be specified to start/stop all ENIQ services, or a comma
+	seperated list can be specified. e.g. -s dwhdb,repdb
+      
+-u:	Optional parameter to indicate that ALL services must be included 
+	for upgrade. 
+        Note: This should only be used with 'ALL' service flag.
+"
+}
+
+### Function: user_confirm ###
+#
+# Get confirmation from user to proceed with action
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+user_confirm()
+{
+while :; do
+    unset USER_CONF
+    clear
+    $CAT ${TEM_DIR}/eniq_service_list
+    $ECHO "\nAre you sure you wish to ${1}?"
+    $ECHO "Enter [Yes | No] (case sensitive) : \c"
+    read USER_CONF
+    if [ "$USER_CONF" == "Yes" -o "$USER_CONF" == "No" ]; then
+         break
+    fi
+done
+}
+
+# ********************************************************************
+#
+# 	Main body of program
+#
+# ********************************************************************
+#
+RUN_TIME=`$DATE '+%Y-%b-%d_%H.%M.%S'`
+
+# Determine absolute path to software
+get_absolute_path
+
+# Check that the effective id of the user is root or admin
+check_id
+
+while getopts ":a:b:l:Nus:" arg; do
+  case $arg in
+    a) SRVC_ACTION="$OPTARG" 
+       ;;
+    b) ENIQ_BASE_DIR="$OPTARG"
+       ;;
+    l) LOGFILE="$OPTARG"
+       ;;
+    N) NO_CONFIRM="YES" 
+       ;;
+    R) INCLUDE_ROLLSNAP="YES" 
+       ;;
+    s) SRVC_NAME="$OPTARG" 
+       ;;
+    u) UPGRADE_FLAG="YES" 
+       ;;
+   \?) usage_msg 
+       exit 1
+       ;;
+  esac
+done
+shift `expr $OPTIND - 1`
+
+# Set up environment variables for script.
+setup_env
+
+# Check Input Params
+check_params 
+
+if [ ! "${LOGFILE}" ]; then
+    LOGFILE=${LOGFILE_DIR}/manage_eniq_services.log
+fi	
+
+# Setup debug logfile
+DEBUG_LOGDIR=${LOGFILE_DIR}/debug_log
+DEBUG_LOGFILE=${DEBUG_LOGDIR}/services_debug_log.`$DATE '+%Y%m%d'`
+  
+# Check/Create Logfile
+chk_create_logfile
+
+# Create a temporary Directory
+TEM_DIR=/tmp/$0.$$.$$
+$RM -rf ${TEM_DIR}
+$MKDIR -p ${TEM_DIR}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not create directory ${TEM_DIR}"
+    abort_script "${_err_msg_}"
+fi
+
+# Get details of script execution
+log_debug_info
+
+# Get services name as list
+if [ "${SRVC_NAME}" == "ALL" ]; then
+    get_services_list ${SRVC_ACTION}
+    if [ $? -ne 0 ]; then
+        _err_msg_="Could not get list of services"
+        abort_script "${_err_msg_}"
+    fi
+else
+    get_user_service_list
+    if [ $? -ne 0 ]; then
+        _err_msg_="Service ${SRVC_NAME} not found"
+        abort_script "${_err_msg_}"
+    fi
+fi
+
+if [ ! -s ${TEM_DIR}/eniq_service_list ]; then
+     _err_msg_="No services found to manage"
+     abort_script "${_err_msg_}"
+fi
+
+if [ "${SRVC_ACTION}" == "restart" ]; then
+    restart_eniq_services ${TEM_DIR}/eniq_service_list
+else	
+    case "${SRVC_ACTION}" in
+     list) list_eniq_services ${TEM_DIR}/eniq_service_list
+           ;;
+    start) ENIQ_OPT=enable
+           ENIQ_ACT=start
+           start_eniq_services ${TEM_DIR}/eniq_service_list
+           ;;
+     stop) ENIQ_OPT=disable
+           ENIQ_ACT=stop
+           stop_eniq_services ${TEM_DIR}/eniq_service_list
+           ;;
+        *) usage_msg # SHOULD NOT GET HERE
+           ;;
+    esac
+fi
+
+$RM -rf ${TEM_DIR}
+
+exit 0

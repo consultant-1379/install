@@ -1,0 +1,429 @@
+#!/bin/bash
+# ********************************************************************
+# Ericsson Radio Systems AB                                     SCRIPT
+# ********************************************************************
+#
+#
+# (c) Ericsson Radio Systems AB 2019 - All rights reserved.
+#
+# The copyright to the computer program(s) herein is the property
+# of Ericsson Radio Systems AB, Sweden. The programs may be used
+# and/or copied only with the written permission from Ericsson Radio
+# Systems AB or in accordance with the terms and conditions stipulated
+# in the agreement/contract under which the program(s) have been
+# supplied.
+#
+# ********************************************************************
+# Name    : create_snapshots.bsh
+# Date    : 16/01/2019
+# Revision: main\10
+# Purpose : This primary purpose of this script is to prepare ENIQ for Backup.
+#           It will snapshot all required filesystems and mount those under
+#           a pre-defined mountpoint.
+#
+#           It is also used to create/maintain the Rolling Snapshots.
+#
+# ********************************************************************
+#
+#       Command Section
+#
+# ********************************************************************
+AWK=/usr/bin/awk
+BASENAME=/usr/bin/basename
+CAT=/usr/bin/cat
+CD=/usr/bin/cd
+CHMOD=/usr/bin/chmod
+CHOWN=/usr/bin/chown
+CLEAR=/usr/bin/clear
+DATE=/usr/bin/date
+DIRNAME=/usr/bin/dirname
+ECHO='/usr/bin/echo -e'
+EGREP=/usr/bin/egrep
+EXPR=/usr/bin/expr
+GREP=/usr/bin/grep
+ID=/usr/bin/id
+LVS=/usr/sbin/lvs
+MKDIR=/usr/bin/mkdir
+PWD=/usr/bin/pwd
+RM=/usr/bin/rm
+SED=/usr/bin/sed
+SORT=/usr/bin/sort
+TEE=/usr/bin/tee
+TOUCH=/usr/bin/touch
+UNAME=/usr/bin/uname
+
+# ********************************************************************
+#
+#       Configuration Section
+#
+# ********************************************************************
+# Flag to determine whether to compress log or not (Must be y/n)
+COMPRESS_LOG=n
+
+# Name of SunOS & ENIQ ini Files
+ENIQ_ENV=niq.rc
+ENIQ_INI=niq.ini
+SUNOS_INI=SunOS.ini
+
+
+# FS db filesystems to snap
+FS_SNAP_LIST="dwh_main|dwh_main_dbspace" 
+
+# ********************************************************************
+#
+#       functions
+#
+# ********************************************************************
+### Function: abort_script ###
+#
+#   This will is called if the script is aborted thru an error
+#   error signal sent by the kernel such as CTRL-C or if a serious
+#   error is encountered during runtime
+#
+# Arguments:
+#       $1 - Error message from part of program (Not always used)
+# Return Values:
+#       none
+abort_script()
+{
+if [ "$1" ]; then
+    _err_msg_=$1
+else
+    _err_msg_="Script aborted.......\n"
+fi
+
+# Check if log_msg() is defined
+type log_msg > /dev/null 2>&1
+if [ $? -gt 0 ]; then
+    if [ "${LOGFILE}" ]; then
+        if [ ! "${SNAP_QUIET}" ]; then
+            $ECHO "\n${_err_msg_}\n" |$TEE -a ${LOGFILE}
+        else
+            $ECHO "\n${_err_msg_}\n" >> ${LOGFILE}
+        fi
+    else
+        $ECHO "\n${_err_msg_}\n"
+    fi
+else
+    if [ "${LOGFILE}" ]; then
+        log_msg -s "\n${_err_msg_}\n" -l ${LOGFILE} ${SNAP_QUIET}
+    else
+        log_msg -s "\n${_err_msg_}\n" ${SNAP_QUIET}
+    fi
+fi
+
+cd $SCRIPTHOME
+$TOUCH $SCRIPTHOME/.failed_virtual_backup
+$RM -rf ${TEM_DIR}
+
+exit 1
+}
+
+### Function: check_req_scripts_files ###
+#
+# Check that required scripts exist
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+check_req_scripts_files()
+{
+if [ ! -s ${SCRIPTHOME}/manage_fs_snapshots.bsh ]; then
+    _err_msg_="File ${SCRIPTHOME}/manage_fs_snapshots.bsh not found"
+    abort_script "$_err_msg_"
+fi
+
+if [ ! -s ${SCRIPTHOME}/manage_san_snapshots.bsh ]; then
+    _err_msg_="File ${SCRIPTHOME}/manage_san_snapshots.bsh not found"
+    abort_script "$_err_msg_"
+fi	
+
+if [ ! -s ${CLI_CONF_DIR}/${ENIQ_INI} ]; then
+    _err_msg_="Could not locate file ${CLI_CONF_DIR}/${ENIQ_INI}"
+    abort_script "$_err_msg_"
+fi
+
+if [ ! -s ${CLI_CONF_DIR}/${ENIQ_ENV} ]; then
+    err_msg_="File ${CLI_CONF_DIR}/${ENIQ_ENV} not found"
+    abort_script "$_err_msg_"
+fi
+}
+
+### Function: chk_create_logfile ###
+#
+# Check/Create Logfile
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+chk_create_logfile()
+{
+$MKDIR -p `$DIRNAME ${LOGFILE}`
+if [ $? -ne 0 ]; then
+    unset LOGFILE
+    _err_msg_="Could not create directory `$DIRNAME ${LOGFILE}`"
+     abort_script "$_err_msg_"
+fi
+
+$TOUCH -a ${LOGFILE}
+if [ $? -ne 0 ]; then
+    unset LOGFILE
+    _err_msg_="Could not write to file ${LOGFILE}"
+    abort_script "$_err_msg_"
+fi
+
+if [ -s ${LOGFILE} ]; then
+    $ECHO "\n\n" >> ${LOGFILE}
+fi
+
+$ECHO "================================================================" >> ${LOGFILE}
+$ECHO "================================================================" >> ${LOGFILE}
+if [ "${ROLL_SNAP}" ]; then
+    $ECHO "Virtual Encapsulated Snapshot started at `$DATE +%d.%m.%y_%H:%M:%S`\n" >> ${LOGFILE}
+else
+    $ECHO "Virtual Encapsulated Backup Snapshot started at `$DATE +%d.%m.%y_%H:%M:%S`\n" >> ${LOGFILE}
+fi
+}
+
+### Function: get_absolute_path ###
+#
+# Determine absolute path to software
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+get_absolute_path()
+{
+_dir_=`$DIRNAME $0`
+#SCRIPTHOME=`$CD $_dir_ 2>/dev/null && $PWD || $ECHO $_dir_`
+SCRIPTHOME=`$ECHO $_dir_`
+}
+
+### Function: setup_env ###
+#
+# Setup up path environment etc
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+setup_env()
+{
+# Base directory
+ENIQ_BASE_DIR=/eniq
+	
+ENIQ_CONF_DIR=${ENIQ_BASE_DIR}/installation/config
+
+# Determine the current server type
+CURR_SERVER_TYPE=`$CAT $ENIQ_CONF_DIR/installed_server_type | $EGREP -v '^[[:blank:]]*#' | $SED -e 's/ //g'`
+if [ ! "${CURR_SERVER_TYPE}" ]; then
+	_err_msg_="Could not determine which server type this is"
+	abort_script "$_err_msg_"
+fi
+
+CLI_CONF_DIR=${ENIQ_BASE_DIR}/sw/conf
+if [ ! -s ${CLI_CONF_DIR}/${ENIQ_INI} ]; then
+    _err_msg_="Could not locate file ${CLI_CONF_DIR}/${ENIQ_INI}"
+    abort_script "$_err_msg_"
+fi
+
+# File containing the type of OSS installation. Eg. events or statistics
+INST_TYPE_FILE=${ENIQ_CONF_DIR}/ericsson_use_config
+if [ ! -s "${INST_TYPE_FILE}" ]; then
+    _err_msg_="ENIQ install type not defined in ${INST_TYPE_FILE}"
+    abort_script "$_err_msg_"  "${EXEC_SHELL_CMD}"
+fi
+
+# Read the installation type - should be "events" or "stats"
+INSTALL_TYPE=`$CAT ${INST_TYPE_FILE} | $AWK -F\= '{print $2}'`
+if [ ! "${INSTALL_TYPE}" ]; then
+    _err_msg_="Could not determine the install type"
+    abort_script "$_err_msg_"
+fi
+
+# Source the common functions
+if [ -s ${ENIQ_BASE_DIR}/admin/lib/common_functions.lib ]; then
+    . ${ENIQ_BASE_DIR}/admin/lib/common_functions.lib
+else
+    _err_msg_="File ${ENIQ_BASE_DIR}/admin/lib/common_functions.lib not found"
+    abort_script "$_err_msg_"
+fi
+
+# Storage Type
+STORAGE_TYPE=`iniget STOR_TYPE -f ${ENIQ_CONF_DIR}/${SUNOS_INI} -v STORAGE_TYPE`
+if [ ! "${STORAGE_TYPE}" ]; then
+    _err_msg_="Could not determine the storage type from ${ENIQ_CONF_DIR}/${SUNOS_INI}"
+    abort_script "$_err_msg_"
+fi
+
+# Get the System User/Group. All directories are owned by this
+SYSUSER=`iniget ENIQ_INSTALL_CONFIG -f ${ENIQ_CONF_DIR}/${SUNOS_INI} -v ENIQ_SYSUSER`
+if [ ! "${SYSUSER}" ]; then
+    _err_msg_="Could not read parameter ENIQ_SYSUSER from file ${ENIQ_CONF_DIR}/${SUNOS_INI}"
+    abort_script "$_err_msg_" "${EXEC_SHELL_CMD}"
+fi
+
+SYSGRP=`$ID ${SYSUSER} | $AWK '{print $2}' | $AWK -F\( '{print $2}' | $AWK -F\) '{print $1}'`
+if [ ! "${SYSGRP}" ]; then
+    _err_msg_="Could not determine group ID of ${SYSGRP}"
+    abort_script "$_err_msg_" "${EXEC_SHELL_CMD}"
+fi
+
+# Determine OS version
+unset RHEL7_4
+OS_VERSION=`$UNAME -r`
+if [ "${OS_VERSION}" == "3.10.0-693.el7.x86_64" ]; then
+    RHEL7_4=YES
+fi
+
+# Define root user's home
+
+HOME=/root
+
+export HOME
+}
+
+### Function: user_confirm ###
+#
+# Get confirmation from user to proceed with snapshot action
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+user_confirm()
+{
+while :; do
+    unset USER_CONF
+    $CLEAR
+    if [ "${ROLL_SNAP}" ]; then
+        $ECHO "\nAre you sure you wish to create a rolling snapshot of the Database LUNs"
+    else
+        $ECHO "\nAre you sure you wish to snapshot all the Database LUNs in preparation for backup"
+    fi
+    $ECHO "Enter [Yes|No] (case sensitive) : \c"
+
+    read USER_CONF
+    if [ "$USER_CONF" == "Yes" -o "$USER_CONF" == "No" ]; then
+        break
+    fi
+done
+}
+
+# ********************************************************************
+#
+#       Main body of program
+#
+# ********************************************************************
+#
+# Determine absolute path to software
+get_absolute_path
+
+while getopts ":l:n:d:s:NqR:" arg; do
+  case $arg in
+    l) LOGFILE="$OPTARG"
+       ;;
+    n) _snap_name_="$OPTARG"
+       ;;
+    d) _snap_delete_="$OPTARG"
+       ;;
+    s) _san_snap_name_="$OPTARG" 
+       ;; 
+    N) NO_CONFIRM="YES"
+       ;;
+    q) SNAP_QUIET="-q"
+       ;;
+    R) ROLL_SNAP="YES"
+       _roll_snap_="-R"
+       ;;
+   \?) _err_msg_="`$BASENAME $0` [ -l <path_to_logfile> ] [ -N ] -q"
+       abort_script "$_err_msg_"
+       ;;
+  esac
+done
+shift `expr $OPTIND - 1`
+
+# Default Logfile location
+if [ "${ROLL_SNAP}" ]; then
+    readonly LOGDIR="/eniq/local_logs/rolling_snapshot_logs"
+    DEF_LOGFILE="${LOGDIR}/create_snapshot_logs.log"
+else
+    readonly LOGDIR="/eniq/local_logs/backup"
+    DEF_LOGFILE="${LOGDIR}/create_snapshot_logs.log"
+fi
+
+if [ ! "${_san_snap_name_}" ]; then
+    _san_snap_name_="${_snap_name_}"
+fi
+
+# Set up default logfile if required
+if [ ! "${LOGFILE}" ]; then
+    LOGFILE="${DEF_LOGFILE}"
+fi
+
+# Check/Create Logfile
+chk_create_logfile
+
+# Setup up path environment etc
+setup_env
+
+# Check for required scripts
+check_req_scripts_files
+
+# Source niq.rc
+. ${CLI_CONF_DIR}/${ENIQ_ENV}
+
+# Create a temporary Directory
+TEM_DIR=/tmp/create_snapshots.$$.$$
+$RM -rf ${TEM_DIR}
+$MKDIR -p ${TEM_DIR}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not create directory ${TEM_DIR}"
+    abort_script "$_err_msg_"
+fi
+
+# lets build a list of fs db filesystems to snap
+$LVS -a -o lv_name --noheadings | $EGREP -o "${FS_SNAP_LIST}" | $SORT -u >> ${TEM_DIR}/fs_list
+
+_fs_snap_list_=""
+for _fs_ in `$CAT ${TEM_DIR}/fs_list`; do
+    if [ "${_fs_snap_list_}" == "" ]; then
+        _fs_snap_list_="${_fs_}"
+    else
+        _fs_snap_list_="${_fs_snap_list_},${_fs_}"
+    fi
+done
+
+log_msg -q -s "\n`$DATE +%d.%m.%y_%H:%M:%S` - Snapping the FS Database dirs directory [ ${_fs_snap_list_} ] \n" -l ${LOGFILE}
+${SCRIPTHOME}/manage_fs_snapshots.bsh -a create -f ${_fs_snap_list_} -l ${LOGFILE} -n ${_snap_name_} -N -F ${SNAP_QUIET}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not snap the FS backup directory for backup"
+    abort_script "$_err_msg_"
+fi
+
+if [ "${STORAGE_TYPE}" != "fs" ]; then
+    # Snapshot the SAN
+    log_msg -s "\n`$DATE +%d.%m.%y_%H:%M:%S` - Creating the SAN snapshots\n" -l ${LOGFILE} ${SNAP_QUIET}
+    log_msg -q -s "with the following command \"${SCRIPTHOME}/manage_san_snapshots.bsh -a create -f ALL -n ${_san_snap_name_} -N -l ${LOGFILE} ${SNAP_QUIET}\"\n" -l ${LOGFILE}  
+    $BASH ${SCRIPTHOME}/manage_san_snapshots.bsh -a create -f ALL -n ${_san_snap_name_} -N -l ${LOGFILE} ${SNAP_QUIET}
+    if [ $? -ne 0 ]; then
+        _err_msg_="Could not create SAN snapshots for backup"
+        abort_script "$_err_msg_"
+    fi
+    log_msg -s "\n`$DATE +%d.%m.%y_%H:%M:%S` - Successfully created the SAN snapshots\n" -l ${LOGFILE} ${SNAP_QUIET} 
+fi
+
+if [ "${ROLL_SNAP}" ]; then
+     log_msg -q -s "\nVirtual Encapsulated Snapshot finished at `$DATE +%d.%m.%y_%H:%M:%S`\n" -l ${LOGFILE}
+else
+    log_msg -q -s "\nVirtual Encapsulated Backup finished at `$DATE +%d.%m.%y_%H:%M:%S`\n" -l ${LOGFILE}
+fi
+
+log_msg -h -q -s "========================" -l ${LOGFILE}
+
+$RM -rf ${TEM_DIR}
+
+exit 0

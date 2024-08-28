@@ -1,0 +1,1783 @@
+#!/bin/bash
+# ********************************************************************
+# Ericsson Radio Systems AB                                     SCRIPT
+# ********************************************************************
+#
+#
+# (c) Ericsson Radio Systems AB 2012 - All rights reserved.
+#
+# The copyright to the computer program(s) herein is the property
+# of Ericsson Radio Systems AB, Sweden. The programs may be used 
+# and/or copied only with the written permission from Ericsson Radio 
+# Systems AB or in accordance with the terms and conditions stipulated 
+# in the agreement/contract under which the program(s) have been 
+# supplied.
+#
+# ********************************************************************
+# Name    : update_cell_node_count.bsh
+# Date    : 25/06/2016
+# Revision: main\9
+# Purpose : Script to determine number of nodes to be managed,
+#	    	whether to mirror storage pool, and to lay out disks
+#	    	and node numbers in ini files
+#
+# Usage   : update_cell_node_count.bsh
+#
+# ********************************************************************
+#
+# 	Command Section
+#
+# ********************************************************************
+AWK=/usr/bin/awk
+BASENAME=/usr/bin/basename
+BC=/usr/bin/bc
+CAT=/usr/bin/cat
+CFGADM=/usr/sbin/cfgadm
+CHMOD=/usr/bin/chmod
+CLEAR=/usr/bin/clear
+CP=/usr/bin/cp
+CUT=/usr/bin/cut
+DATE=/usr/bin/date
+DF=/usr/bin/df
+DIRNAME=/usr/bin/dirname
+DOMAINNAME=/usr/bin/domainname
+DTCONFIG=/usr/dt/bin/dtconfig
+ECHO=/usr/bin/echo
+EGREP=/usr/bin/egrep
+EJECT=/usr/bin/eject
+ENV=/usr/bin/env
+EXPR=/usr/bin/expr
+FORMAT=/usr/sbin/format
+FUSER=/usr/sbin/fuser
+GEGREP=/usr/sfw/bin/gegrep
+GETENT=/usr/bin/getent
+GETTEXT=/usr/bin/gettext
+GREP=/usr/bin/grep
+GTAR=/usr/sfw/bin/gtar
+GZCAT=/usr/bin/gzcat
+HEAD=/usr/bin/head
+HOSTID=/usr/bin/hostid
+HOSTNAME=/usr/bin/hostname
+ID=/usr/bin/id
+INIT=/usr/sbin/init
+LS=/usr/bin/ls
+METASTAT=/usr/sbin/metastat
+MKDIR=/usr/bin/mkdir
+MORE=/usr/bin/more
+MV=/usr/bin/mv
+NAWK=/usr/bin/nawk
+NETSTAT=/usr/bin/netstat
+PG=/usr/bin/pg
+PGREP=/usr/bin/pgrep
+PING=/usr/sbin/ping
+PKGADD=/usr/sbin/pkgadd
+PKGINFO=/usr/bin/pkginfo
+PRTCONF=/usr/sbin/prtconf
+PRTVTOC=/usr/sbin/prtvtoc
+PSRINFO=/usr/sbin/psrinfo
+PWD=/usr/bin/pwd
+RM=/usr/bin/rm
+RCP=/usr/bin/rcp
+ROUTE=/usr/sbin/route
+RSH=/usr/bin/rsh
+SED=/usr/bin/sed
+SLEEP=/usr/bin/sleep
+SORT=/usr/bin/sort
+SU=/usr/bin/su
+SVCADM=/usr/sbin/svcadm
+SVCCFG=/usr/sbin/svccfg
+SVCS=/usr/bin/svcs
+SYNC=/usr/sbin/sync
+TAIL=/usr/bin/tail
+TEE=/usr/bin/tee
+TOUCH=/usr/bin/touch
+TPUT=/usr/bin/tput
+UADMIN=/usr/sbin/uadmin
+UNAME=/usr/bin/uname
+VOLD=/usr/sbin/vold
+WC=/usr/bin/wc
+ZFS=/usr/sbin/zfs
+ZPOOL=/usr/sbin/zpool
+
+# ********************************************************************
+#
+#       Configuration Section
+#
+# ********************************************************************
+# Name of SunOS & ENIQ ini Files
+ENIQ_ENV=niq.rc
+ENIQ_INI=niq.ini
+SUNOS_INI=SunOS.ini
+SYM_INI=sym_links.ini
+
+# List of available network types
+AVAIL_NETWORK_TYPES="CORE GRAN WRAN"
+
+# Minimum size in MBytes that IQ sys main can be
+IQ_SYS_MAIN_MIN_SIZE=25600
+
+# ********************************************************************
+#
+#       Pre-execution Operations
+#
+# ********************************************************************
+
+# ********************************************************************
+#
+# 	functions
+#
+# ********************************************************************
+### Function: abort_script ###
+#
+#   This will is called if the script is aborted thru an error
+#   error signal sent by the kernel such as CTRL-C or if a serious
+#   error is encountered during runtime
+#
+# Arguments:
+#       $1 - Error message from part of program (Not always used)
+# Return Values:
+#       none
+abort_script()
+{
+if [ "$1" ]; then
+    _err_msg_=$1
+else
+    _err_msg_="Script aborted.......\n"    
+fi
+
+# Check if log_msg() is defined
+type log_msg > /dev/null 2>&1
+if [ $? -gt 0 ]; then
+    if [ "${LOGFILE}" ]; then
+		$ECHO "\n${_err_msg_}\n" |$TEE -a ${LOGFILE}
+    else
+		$ECHO "\n${_err_msg_}\n"
+    fi
+else
+    if [ "${LOGFILE}" ]; then
+		log_msg -s "\n${_err_msg_}\n" ${LOG_OUT_STR}
+    else
+		log_msg -s "\n${_err_msg_}\n"
+    fi
+fi
+
+cd $SCRIPTHOME
+
+$RM -rf ${TEM_DIR}
+
+if [ "$2" ]; then
+    ${2}
+else
+   exit 1
+fi
+}
+
+### Function: calculate_iq_sys_main_details ###
+#
+# Calculate number of IQ SYS dbspaces required and the
+# size of each dbspace
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+calculate_iq_sys_main_details()
+{
+local _chk_
+unset NEXT_SYS_MAIN_DBSPACE_NUM
+
+if [ -s ${TEM_DIR}/dbspace_file_loc_ini ]; then 
+    # Determine if there more than one entry. If there is there will be a file that will end in
+    # iq_system_main_[1-9].iq
+    _chk_=`$CAT ${TEM_DIR}/dbspace_file_loc_ini|$GEGREP '^[[:blank:]]*DWH_SYSTEM_MAIN_[1-9].*_[1-9]+\.iq[[:blank:]]*$'`
+
+    if [ "${_chk_}" ]; then
+	NEXT_SYS_MAIN_DBSPACE_NUM=`$CAT ${TEM_DIR}/dbspace_file_loc_ini|$GEGREP '^[[:blank:]]*DWH_SYSTEM_MAIN_[1-9]' \
+           |$NAWK  '{print $2}'|$SED -e 's|\(.*_\)\(.*\)\(\.iq\)|\2|'|$SORT -n|$TAIL -1`
+	NEXT_SYS_MAIN_DBSPACE_NUM=`$EXPR ${NEXT_SYS_MAIN_DBSPACE_NUM} + 1`
+    else
+	NEXT_SYS_MAIN_DBSPACE_NUM=1
+    fi
+else
+    _err_msg_="No IQ SYS MAIN DBspace details read from IQ"
+    abort_script "$_err_msg_" 
+fi
+
+if [ ! "${NEXT_SYS_MAIN_DBSPACE_NUM}" ]; then
+    _err_msg_="Could not determine next IQ SYS MAIN DBspace number"
+    abort_script "$_err_msg_" 
+fi
+}
+
+### Function: calculate_main_dbspace_details ###
+#
+# Calculate number of main dbspaces required and the
+# size of each dbspace
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+calculate_main_dbspace_details()
+{
+unset NUM_MAIN_DBSPACES
+unset MAIN_SPACE_PER_DBSPACE
+unset START_MAIN_DBSPACE_NUM
+
+if [ "${MAIN_USER_NUM_SPACE}" ]; then
+    NUM_MAIN_DBSPACES=${MAIN_USER_NUM_SPACE}
+else
+    NUM_MAIN_DBSPACES=10
+fi
+
+MAIN_SPACE_PER_DBSPACE=`$EXPR ${1} / ${NUM_MAIN_DBSPACES}`
+if [ ${MAIN_SPACE_PER_DBSPACE} -eq 0 ]; then
+    MAIN_SPACE_PER_DBSPACE=1
+fi
+
+if [ -s ${TEM_DIR}/dbspace_file_loc_ini ]; then 
+    START_MAIN_DBSPACE_NUM=`$CAT ${TEM_DIR}/dbspace_file_loc_ini|$GEGREP '^[[:blank:]]*DWH_DBSPACES_MAIN_[1-9]' \
+           |$NAWK  '{print $2}'|$SED -e 's|\(.*_\)\(.*\)\(\.iq\)|\2|'|$SORT -n|$TAIL -1`
+    START_MAIN_DBSPACE_NUM=`$EXPR ${START_MAIN_DBSPACE_NUM} + 1`
+else
+    START_MAIN_DBSPACE_NUM=1
+fi
+
+if [ ! "${START_MAIN_DBSPACE_NUM}" ]; then
+    _err_msg_="Could not determine next Main DBspace number"
+    abort_script "$_err_msg_" 
+fi
+}
+
+### Function: calculate_temp_dbspace_details ###
+#
+# Calculate number of temp dbspaces required and the
+# size of each dbspace
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+calculate_temp_dbspace_details()
+{
+unset NUM_TEMP_DBSPACES
+unset TEMP_SPACE_PER_DBSPACE
+unset START_TEMP_DBSPACE_NUM
+
+if [ "${TEMP_USER_NUM_SPACE}" ]; then
+    NUM_TEMP_DBSPACES=${TEMP_USER_NUM_SPACE}
+else
+    NUM_TEMP_DBSPACES=5
+fi
+
+TEMP_SPACE_PER_DBSPACE=`$EXPR ${1} / ${NUM_TEMP_DBSPACES}`
+if [ ${TEMP_SPACE_PER_DBSPACE} -eq 0 ]; then
+    TEMP_SPACE_PER_DBSPACE=1
+fi
+
+if [ -s ${TEM_DIR}/dbspace_file_loc_ini ]; then 
+    START_TEMP_DBSPACE_NUM=`$CAT ${TEM_DIR}/dbspace_file_loc_ini|$GEGREP '^[[:blank:]]*DWH_DBSPACES_TEMP_[1-9]' \
+           |$NAWK  '{print $2}'|$SED -e 's|\(.*_\)\(.*\)\(\.iqtmp\)|\2|'|$SORT -n|$TAIL -1`
+    START_TEMP_DBSPACE_NUM=`$EXPR ${START_TEMP_DBSPACE_NUM} + 1`
+else
+    START_TEMP_DBSPACE_NUM=1
+fi
+
+if [ ! "${START_TEMP_DBSPACE_NUM}" ]; then
+    _err_msg_="Could not determine next Temp DBspace number"
+    abort_script "$_err_msg_" 
+fi
+}
+
+### Function: check_disk_space ###
+#
+# Check that the there is adequate disk space
+# for the cell/node configuration.
+#
+# Arguments:
+#       $1 : Required Space
+# Return Values:
+#       none
+check_disk_space()
+{
+# Total required space
+local _req_space_MB_=${1}
+log_msg -s "\nTotal required space is ${_req_space_MB_}Mb" ${LOG_OUT_STR} -q
+
+# The % of total ZFS space we will reserve for ZFS itself and for taking 
+# Snapshots etc.
+_zfs_buf_size_=`iniget SunOS_ZFS_BUF_SIZE -f ${ENIQ_CONF_DIR}/${SUNOS_INI} -v zfs_buf_size`
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not get ZFS buffer information from ${ENIQ_CONF_DIR}/${SUNOS_INI}"
+    abort_script "$_err_msg_"
+fi
+
+# Total disk space available
+_tot_disk_space_=0
+_zfs_filesys_name_=`$DF -k ${CLI_CONF_DIR}|$TAIL -1|$NAWK '{print $1}'`
+_pool_avail_=`$ZFS list -H -o avail ${_zfs_filesys_name_}`
+
+_char_=`$ECHO ${_pool_avail_: -1}`
+_pool_avail_=`$ECHO ${_pool_avail_}|$SED -e 's|[MKGT]||g'`
+
+if [ ! "${_char_}" ]; then
+    _avail_in_mbytes_=0
+else
+    if [ "${_char_}" == "K" ]; then
+	_avail_in_mbytes_=0
+    elif [ "${_char_}" == "M" ]; then
+	_avail_in_mbytes_=`$ECHO "${_pool_avail_} |$NAWK -F\. '{print$1}'`
+    elif [ "${_char_}" == "G" ]; then
+	_avail_in_mbytes_=`$ECHO "${_pool_avail_} * 1024 "|$BC|$NAWK -F\. '{print$1}'`
+    elif [ "${_char_}" == "T" ]; then
+	_avail_in_mbytes_=`$ECHO "${_pool_avail_} * 1024 * 1024"|$BC|$NAWK -F\. '{print$1}'`
+    else
+	_err_msg_="Unrecognised character returned from $ZFS list command"
+	abort_script "$_err_msg_"
+    fi
+fi
+log_msg -s "\nTotal amount of space available in Zpool is ${_avail_in_mbytes_}Mb" ${LOG_OUT_STR} -q
+
+_tot_pool_size_=0
+for _pool_name_ in  `$ZPOOL list -H -o name`; do
+    _pool_size_=`$ZPOOL list -H -o size ${_pool_name_}`
+
+    # Get the last character. I need to know if I am dealing with KB,MB etc
+    _char_=`$ECHO ${_pool_size_: -1}`
+    _pool_size_=`$ECHO ${_pool_size_}|$SED -e 's|[MKGT]||g'`
+
+    if [ ! "${_char_}" ]; then
+	_pool_size_in_mbytes_=0
+    else
+	if [ "${_char_}" == "K" ]; then
+	    _pool_size_in_mbytes_=0
+	elif [ "${_char_}" == "M" ]; then
+	    _pool_size_in_mbytes_=`$ECHO "${_pool_size_} |$NAWK -F\. '{print$1}'`
+	elif [ "${_char_}" == "G" ]; then
+	    _pool_size_in_mbytes_=`$ECHO "${_pool_size_} * 1024 "|$BC|$NAWK -F\. '{print$1}'`
+	elif [ "${_char_}" == "T" ]; then
+	    _pool_size_in_mbytes_=`$ECHO "${_pool_size_} * 1024 * 1024"|$BC|$NAWK -F\. '{print$1}'`
+	else
+	    _err_msg_="Unrecognised character returned from $ZPOOL list command"
+	    abort_script "$_err_msg_"
+	fi
+    fi
+    let _tot_pool_size_=_tot_pool_size_+${_pool_size_in_mbytes_}
+done
+log_msg -s "Total Zpool size is ${_tot_pool_size_}Mb" ${LOG_OUT_STR} -q
+
+_zfs_buf_size_in_mbytes_=`$ECHO "${_tot_pool_size_} * .${_zfs_buf_size_}\)"|$BC|$NAWK -F\. '{print$1}'`
+log_msg -s "\nZFS buffer size is ${_zfs_buf_size_in_mbytes_}Mb" ${LOG_OUT_STR} -q
+_avail_in_mbytes_=`$ECHO "${_avail_in_mbytes_} - ${_zfs_buf_size_in_mbytes_}"|$BC|$NAWK -F\. '{print$1}'`
+log_msg -s "Total space available for expansion is ${_avail_in_mbytes_}Mb" ${LOG_OUT_STR} -q
+
+if [ ${_avail_in_mbytes_} -lt ${_req_space_MB_} ]; then
+    log_msg -s "\nAvailable space (${_avail_in_mbytes_}Mb) is less than required space (${_req_space_MB_})Mb" ${LOG_OUT_STR} -q
+    _err_msg_="Not enough disk space exists to manage the new cell/node configuration"
+    abort_script "$_err_msg_"
+fi
+}
+
+### Function: check_exist_dbspaces ###
+#
+# Check the existing DBSPACES. Check that all dbspaces in the
+# ini file exist and that all dbspaces exist in the ini file
+#
+# Arguments:
+#       $1 : User ID name
+# Return Values:
+#       none
+check_exist_dbspaces()
+{
+local _size_
+
+SYBASEMSG=$TEM_DIR/sybasemsg.$$
+test_iq_login dwhdb 0
+
+cp $SYBASEMSG /tmp/iq_det
+
+# Define the sections I am interested in
+local ini_sections="DWH_SYSTEM_MAIN DWH_DBSPACES_MAIN DWH_DBSPACES_TEMP"
+
+# Get a list of dbspace file paths referenced in Sybase IQ
+if [ $NEW ]; then
+    # for 15.2 new output from sybase
+    $CAT $SYBASEMSG|$NAWK '{print $3}'|$EGREP '^\/' > ${TEM_DIR}/dbspace_file_loc_iq
+    if [ $? -ne 0 ]; then
+	_err_msg_="Cannot create list of dbspaces referenced in Sybase IQ"
+	abort_script "$_err_msg_"
+    fi
+else
+    $CAT $SYBASEMSG|$NAWK '{print $2}'|$EGREP '^\/' > ${TEM_DIR}/dbspace_file_loc_iq
+    if [ $? -ne 0 ]; then
+	_err_msg_="Cannot create list of dbspaces referenced in Sybase IQ"
+	abort_script "$_err_msg_" 
+    fi
+fi
+# Get a list of dbspace file paths referenced in niq.ini and 
+$RM -f ${TEM_DIR}/dbspace_file_loc_ini
+for _ini_ in ${ini_sections}; do
+    _sub_sections_=`iniget ${_ini_} -f ${TEM_DIR}/${SYM_INI}`
+    for _section_ in ${_sub_sections_}; do
+		_file_path_=`iniget ${_section_} -f ${TEM_DIR}/${SYM_INI} -v Path`
+	if [ ! "${_file_path_}" ]; then
+		    _err_msg_="No Path defined for ${_section_} in\n${TEM_DIR}/${SYM_INI}."
+	    abort_script "$_err_msg_" 
+	fi
+	if [ ! -s ${_file_path_} ]; then
+		    _err_msg_="${_file_path_} defined for ${_section_} in\n${TEM_DIR}/${SYM_INI} does not exist or is empty."
+	    abort_script "$_err_msg_" 
+	fi
+	$ECHO "${_section_} ${_file_path_}" >> ${TEM_DIR}/dbspace_file_loc_ini
+	if [ $? -ne 0 ]; then
+		    _err_msg_="Cannot create list of dbspaces referenced in \n${TEM_DIR}/${SYM_INI}"
+	    abort_script "$_err_msg_" 
+	fi
+    done
+done
+
+# Check that all dbspaces referenced in ${SYM_INI} exist in Sybase IQ
+while read _section_ _file_path_; do
+    $EGREP "${_file_path_}" ${TEM_DIR}/dbspace_file_loc_iq >> /dev/null 2>&1
+    if [ $? -ne 0 ]; then
+		_err_msg_="${_file_path_} defined for ${_section_} in\n${SYM_INI} does not exist in IQ."
+	abort_script "$_err_msg_" 
+    fi
+done < ${TEM_DIR}/dbspace_file_loc_ini
+
+# Check that all dbspaces referenced in Sybase IQ exist in ${SYM_INI}
+while read _file_path_; do
+    $EGREP "${_file_path_}" ${TEM_DIR}/dbspace_file_loc_ini >> /dev/null 2>&1
+    if [ $? -ne 0 ]; then
+		_err_msg_="${_file_path_} defined in Sybase IQ dies not exist in\n${SYM_INI}"
+	abort_script "$_err_msg_" 
+    fi
+done < ${TEM_DIR}/dbspace_file_loc_iq
+
+# Build up a total of all MAIN dbspace already allocated to Sybase IQ
+if [ $NEW ]; then
+    # for 15.2 new output from sybase
+    unset TOTAL_MAIN_SYB_IQ_DBSPACE_SIZE
+    for _file_path_ in `$CAT $SYBASEMSG|$NAWK '{if(($1 == "IQ_MAIN") || ($1 == "iq_main")) print $3}'`; do
+	_size_=`$LS -l ${_file_path_}|$NAWK '{print $5}'`
+	let TOTAL_MAIN_SYB_IQ_DBSPACE_SIZE=TOTAL_MAIN_SYB_IQ_DBSPACE_SIZE+${_size_}
+    done
+
+    # Build up a total of all MAIN dbspace already allocated to Sybase IQ
+    unset TOTAL_TEMP_SYB_IQ_DBSPACE_SIZE
+    for _file_path_ in `$CAT $SYBASEMSG|$NAWK '{if($1 == "IQ_SYSTEM_TEMP") print $3}'`; do
+	_size_=`$LS -l ${_file_path_}|$NAWK '{print $5}'`
+	let TOTAL_TEMP_SYB_IQ_DBSPACE_SIZE=TOTAL_TEMP_SYB_IQ_DBSPACE_SIZE+${_size_}
+    done
+else
+    unset TOTAL_MAIN_SYB_IQ_DBSPACE_SIZE
+    for _file_path_ in `$CAT $SYBASEMSG|$NAWK '{if($3 == "MAIN") print $2}'`; do
+	_size_=`$LS -l ${_file_path_}|$NAWK '{print $5}'`
+	let TOTAL_MAIN_SYB_IQ_DBSPACE_SIZE=TOTAL_MAIN_SYB_IQ_DBSPACE_SIZE+${_size_}
+    done 
+
+    # Build up a total of all MAIN dbspace already allocated to Sybase IQ
+    unset TOTAL_TEMP_SYB_IQ_DBSPACE_SIZE
+    for _file_path_ in `$CAT $SYBASEMSG|$NAWK '{if($3 == "TEMPORARY") print $2}'`; do
+	_size_=`$LS -l ${_file_path_}|$NAWK '{print $5}'`
+	let TOTAL_TEMP_SYB_IQ_DBSPACE_SIZE=TOTAL_TEMP_SYB_IQ_DBSPACE_SIZE+${_size_}
+    done 
+fi
+}
+
+### Function: check_id ###
+#
+#   Check that the effective id of the user is correct
+#   If not print error msg and exit.
+#
+# Arguments:
+#       $1 : User ID name
+# Return Values:
+#       none
+check_id()
+{
+_check_id_=`$ID  | $AWK -F\( '{print $2}' | $AWK -F\) '{print $1}'`
+if [ "$_check_id_" != "$1" ]; then
+    _err_msg_="You must be $1 to execute this script."
+    abort_script "$_err_msg_" 
+fi
+}
+
+### Function: check_sys_main_ini_structure ###
+#
+# Check the sys main ini structure is correct
+#
+# Arguments:
+#	none
+# Return Values:
+#	none
+check_sys_main_ini_structure()
+{
+local _chk_
+
+$CP ${ENIQ_CONF_DIR}/${SYM_INI} ${TEM_DIR}/${SYM_INI}
+# Has there been enough IQ SYS MAIN already allocated 
+_chk_=`iniget DWH_SYSTEM_MAIN -f ${TEM_DIR}/${SYM_INI} \
+           |$HEAD -1|$GEGREP '_[0-9]+[[:blank:]]*$'`
+
+if [ "${_chk_}" ]; then
+    return 0
+fi
+
+# Create the addition file
+$RM -f ${TEM_DIR}/ins_sys_main_det ${TEM_DIR}/${SYM_INI}_update_1 ${TEM_DIR}/${SYM_INI}_update_2
+$ECHO "\n;--------------------------------------------------------------------------" >> ${TEM_DIR}/ins_sys_main_det
+$ECHO "; DWH SYSTEM MAIN DBSPACE information" >> ${TEM_DIR}/ins_sys_main_det
+$ECHO ";--------------------------------------------------------------------------" >> ${TEM_DIR}/ins_sys_main_det
+$ECHO "[DWH_SYSTEM_MAIN]" >> ${TEM_DIR}/ins_sys_main_det
+$ECHO "DWH_SYSTEM_MAIN_1\n" >> ${TEM_DIR}/ins_sys_main_det
+$ECHO "[DWH_SYSTEM_MAIN_1]" >> ${TEM_DIR}/ins_sys_main_det
+iniget DWH_SYSTEM_MAIN -f ${TEM_DIR}/${SYM_INI} >> ${TEM_DIR}/ins_sys_main_det
+$ECHO "" >> ${TEM_DIR}/ins_sys_main_det
+
+# Make a working copy without DWH_SYSTEM_MAIN
+${ENIQ_ADMIN_DIR}/lib/inidel.pl -p DWH_SYSTEM_MAIN -i ${TEM_DIR}/${SYM_INI} -o ${TEM_DIR}/${SYM_INI}_update_1 >> /dev/null 2>&1
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not remove DWH_SYSTEM_MAIN refrences from ${SYM_INI}"
+    abort_script "$_err_msg_"
+fi
+
+# Re-Add the details in correct structure
+$CAT ${TEM_DIR}/ins_sys_main_det >> ${TEM_DIR}/${SYM_INI}_update_1
+
+# Tidy up ini file by removing duplicate blank lines
+$CAT ${TEM_DIR}/${SYM_INI}_update_1|$NAWK '/^$/{ if (! blank++) print; next } { blank=0; print }' > ${TEM_DIR}/${SYM_INI}_update_2
+ 
+# Copy the file back in
+$CP ${TEM_DIR}/${SYM_INI}_update_2 ${ENIQ_CONF_DIR}/${SYM_INI}
+
+# Delete tem files
+$RM -f ${TEM_DIR}/ins_sys_main_det ${TEM_DIR}/${SYM_INI}_update_1 ${TEM_DIR}/${SYM_INI}_update_2 ${TEM_DIR}/${SYM_INI}
+}
+
+### Function: chk_create_logfile ###
+#
+# Check/Create Logfile
+#
+# Arguments:
+#	none
+# Return Values: 
+#	none
+chk_create_logfile()
+{
+$MKDIR -p `$DIRNAME ${LOGFILE}`
+if [ $? -ne 0 ]; then
+    unset LOGFILE
+    _err_msg_="Could not create directory `$DIRNAME ${LOGFILE}`"
+	abort_script "$_err_msg_"
+fi	
+
+$TOUCH -a ${LOGFILE}
+if [ $? -ne 0 ]; then
+    unset LOGFILE
+    _err_msg_="Could not write to file ${LOGFILE}"
+    abort_script "$_err_msg_"
+fi
+}
+
+### Function: chk_iq_sys_main_ini ###
+#
+# Check if we need to updated IQ SYS MAIN Size
+#
+# Arguments:
+#	$1 : Optional parameter stating full Main DB size
+# Return Values:
+#	none
+chk_iq_sys_main_size()
+{
+local _tot_main_db_size_
+if [ "${1}" ]; then
+    _tot_main_db_size_=${1}
+fi
+
+# We need to get the path to IQ SYS MAIN
+_iq_sys_main_db_=`iniget DWH_SYSTEM_MAIN -f ${TEM_DIR}/${SYM_INI}|$HEAD -1`
+if [ ! "${_iq_sys_main_db_}" ]; then
+    _err_msg_="Could not read DWH_SYSTEM_MAIN details from ${SYM_INI}"
+    abort_script "$_err_msg_" 
+fi
+
+IQ_SYS_MAIN_DB_PATH=`iniget ${_iq_sys_main_db_} -f ${TEM_DIR}/${SYM_INI} -v Path`
+if [ ! "${IQ_SYS_MAIN_DB_PATH}" ]; then
+    _err_msg_="Could not read ${_iq_sys_main_db_}/Path parameter from ${SYM_INI}"
+    abort_script "$_err_msg_" 
+fi
+
+# Is this on Raw. If so...Not doing anything
+if [ -h ${IQ_SYS_MAIN_DB_PATH} ]; then
+    log_msg -s "IQ SYS MAIN Space is raw device and cannot be expanded currently" ${LOG_OUT_STR}
+    let EXIT_FLAG_CNT=EXIT_FLAG_CNT+1
+    IQ_SYS_MAIN_UPDATE_SPACE=0
+    return 0
+fi
+
+IQ_SYS_MAIN_DB_PATH=`$DIRNAME ${IQ_SYS_MAIN_DB_PATH}|$SED -e 's/\/[\/]*/\//g' -e 's/[\/]*$//g'`
+
+# Was I passed in MAIN DB Size. If not I will calculate from ini file
+if [ ! "${_tot_main_db_size_}" ]; then
+    _iq_main_db_list_=`iniget DWH_DBSPACES_MAIN -f ${TEM_DIR}/${SYM_INI}`
+    _tot_main_db_size_=0
+    for _iq_main_db_ in ${_iq_main_db_list_}; do
+	_iq_main_size_=`iniget ${_iq_main_db_} -f ${TEM_DIR}/${SYM_INI} -v Size`
+	_tot_main_db_size_=`$EXPR ${_tot_main_db_size_} + ${_iq_main_size_}`
+    done
+fi
+
+# Has there been enough IQ SYS MAIN already allocated 
+_sys_main_db_list_=`iniget DWH_SYSTEM_MAIN -f ${TEM_DIR}/${SYM_INI}`
+_tot_sys_main_size_=0
+for _sys_main_db_ in ${_sys_main_db_list_}; do
+    _sys_main_size_=`iniget ${_sys_main_db_} -f ${TEM_DIR}/${SYM_INI} -v Size`
+    _tot_sys_main_size_=`$EXPR ${_tot_sys_main_size_} + ${_sys_main_size_}`
+done
+
+# Get the required IQ SYS MAIN Size
+_req_sys_main_db_size_=`$ECHO "${_tot_main_db_size_} * .02"|$BC|$NAWK -F\. '{print$1}'`
+
+if [ ${_req_sys_main_db_size_} -lt ${IQ_SYS_MAIN_MIN_SIZE} ]; then
+    _req_sys_main_db_size_=${IQ_SYS_MAIN_MIN_SIZE}
+fi
+
+# Do we already have enough
+if [ ${_tot_sys_main_size_} -ge ${_req_sys_main_db_size_} ]; then
+    log_msg -s "Sufficient IQ SYS MAIN Space has already been allocated to Sybase IQ" ${LOG_OUT_STR}
+    let EXIT_FLAG_CNT=EXIT_FLAG_CNT+1
+    IQ_SYS_MAIN_UPDATE_SPACE=0
+else
+    # Get the amount of space I need to add. It will be a minimum of ${IQ_SYS_MAIN_MIN_SIZE} MBytes added
+    # to stop unnecessary fragmentation of IQ SYS MAIN
+    _sys_main_update_space_=`$EXPR ${_req_sys_main_db_size_} - ${_tot_sys_main_size_}`
+
+    if [ ${_tot_sys_main_size_} -ge ${IQ_SYS_MAIN_MIN_SIZE} ]; then
+	if [ ${_sys_main_update_space_} -lt ${IQ_SYS_MAIN_MIN_SIZE} ]; then
+	    _sys_main_update_space_=${IQ_SYS_MAIN_MIN_SIZE}
+	fi
+    fi
+
+    IQ_SYS_MAIN_UPDATE_SPACE=${_sys_main_update_space_}
+    UPDATE_SYS_MAIN_DBSPACE_FLAG=Y
+fi
+}
+
+### Function: confirm_user_input ###
+#
+# Confirm with user that values entered are correct
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+confirm_user_input()
+{
+_disp_file_=${TEM_DIR}/disp_file
+$RM -f ${_disp_file_}
+
+local _dir_num_
+local _loop_cnt_
+
+if [ "${UPDATE_SYS_MAIN_DBSPACE_FLAG}" ]; then
+    printf "%-10s\n" 'Size in' >> ${_disp_file_}
+    printf "%-10s%s\n" 'MBytes' 'IQ SYS MAIN DBSPACE file'>> ${_disp_file_}
+    Path="${IQ_SYS_MAIN_DB_PATH}/iq_system_main_${NEXT_SYS_MAIN_DBSPACE_NUM}.iq"
+    Size="${IQ_SYS_MAIN_UPDATE_SPACE}"
+    printf "%-10s%s\n" ${Size} ${Path} >> ${_disp_file_}
+fi
+
+if [ "${UPDATE_MAIN_DBSPACE_FLAG}" ]; then
+    printf "%-10s\n" 'Size in' >> ${_disp_file_}
+    printf "%-10s%s\n" 'MBytes' 'MAIN DBspace file'>> ${_disp_file_}
+    let _loop_cnt_=${START_MAIN_DBSPACE_NUM}+${NUM_MAIN_DBSPACES}-1
+    for (( i=${START_MAIN_DBSPACE_NUM}; i<=${_loop_cnt_}; i++)); do
+        # Get the last digit
+	_last_dig_=`$ECHO ${i: -1}`
+	if [ ${_last_dig_} -eq 0 ]; then
+	    _dir_num_=10
+	else
+	    _dir_num_=${_last_dig_}
+	fi
+	
+	Path=${MAIN_DB_PATH}/${DB_DIR_NAME_TEMPL}${_dir_num_}/main_${i}.iq
+	Size=${MAIN_SPACE_PER_DBSPACE}
+	printf "%-10s%s\n" ${Size} ${Path} >> ${_disp_file_}
+    done
+
+    _chk_size_=`$EXPR ${TOTAL_MAIN_SYB_IQ_DBSPACE_SIZE} / 1024 / 1024`
+    $ECHO "TOTAL OLD MAIN IQ ${_chk_size_} Mbytes" >> ${_disp_file_}
+    $ECHO "TOTAL NEW MAIN IQ ${TOTAL_NODE_MAIN_SPACE} Mbytes" >> ${_disp_file_}
+fi
+
+if [ "${UPDATE_TEMP_DBSPACE_FLAG}" ]; then
+    printf "\n\n%-10s\n" 'Size in' >> ${_disp_file_}
+    printf "%-10s%s\n" 'MBytes' 'TEMP DBspace file'>> ${_disp_file_}
+    let _loop_cnt_=${START_TEMP_DBSPACE_NUM}+${NUM_TEMP_DBSPACES}-1
+    for (( i=${START_TEMP_DBSPACE_NUM}; i<=${_loop_cnt_}; i++)); do
+        # Get the last digit
+	_last_dig_=`$ECHO ${i: -1}`
+	case ${_last_dig_} in
+	    1|6) _dir_num_=1
+		;;
+	    2|7) _dir_num_=2
+		;;
+	    3|8) _dir_num_=3
+		;;
+	    4|9) _dir_num_=4
+		;;
+	    5|0) _dir_num_=5
+		;;
+	esac
+	
+	Path=${TEMP_DB_PATH}/${DB_DIR_NAME_TEMPL}${_dir_num_}/temp_${i}.iqtmp
+	Size=${TEMP_SPACE_PER_DBSPACE}
+	printf "%-10s%s\n" ${Size} ${Path} >> ${_disp_file_}
+    done
+    _chk_size_=`$EXPR ${TOTAL_TEMP_SYB_IQ_DBSPACE_SIZE} / 1024 / 1024`
+    $ECHO "TOTAL OLD TEMP IQ ${_chk_size_} Mbytes" >> ${_disp_file_}
+    $ECHO "TOTAL NEW TEMP IQ ${TOTAL_NODE_TEMP_SPACE} Mbytes" >> ${_disp_file_}
+fi
+
+while :; do
+    $CLEAR
+    $PG -p "Press any key to continue" -e ${_disp_file_}
+
+    $ECHO "\n\nAre the values above correct (Yy/Nn)"
+    read USER_CONF
+    
+    # If the User hit nothing and there is a default. that will do
+    if [ ! "${USER_CONF}" ]; then
+        continue
+    fi
+
+    # Did the user input (Y/y) 
+    if [ "${USER_CONF}" == "Y" -o "${USER_CONF}" == "y" ]; then
+        break
+    elif [ "${USER_CONF}" == "N" -o "${USER_CONF}" == "n" ]; then
+	break
+    else
+        :
+    fi
+done
+}
+
+### Function: get_absolute_path ###
+#
+# Determine absolute path to software
+#
+# Arguments:
+#	none
+# Return Values:
+#	none
+get_absolute_path() 
+{
+_dir_=`$DIRNAME $0`
+SCRIPTHOME=`cd $_dir_ 2>/dev/null && pwd || $ECHO $_dir_`
+}
+
+## Function: read_storage_type ###
+#
+# Arguments:
+#   none
+# Return Values:
+#   set varibale STORAGE_TYPE
+read_storage_type()
+{
+# Read the storage type
+if [ -s ${ENIQ_CONF_DIR}/${SUNOS_INI} ]; then
+    STORAGE_TYPE=`iniget STOR_TYPE -f ${ENIQ_CONF_DIR}/${SUNOS_INI} -v STORAGE_TYPE`
+else
+    if [ -s ${ENIQ_CONF_DIR}/san_details ]; then
+        STORAGE_TYPE=`$CAT ${ENIQ_CONF_DIR}/san_details | $GEGREP "^STORAGE_TYPE=" | $NAWK -F\= '{print $2}'`
+    fi
+fi
+
+if [ ! "${STORAGE_TYPE}" ]; then
+    _err_msg_="Could not read STORAGE_TYPE paramater from ${ENIQ_CONF_DIR}/${SUNOS_INI} or ${ENIQ_CONF_DIR}/san_details"
+    abort_script "$_err_msg_"
+fi
+}
+
+### Function: set_dbspace_per_node ###
+#
+# Okay I need to set up the amount of dbspace I will allocate per 
+# node/cell of each network type managed
+#
+# Arguments:
+#	$1 : File containing the list of managed network types
+# Return Values:
+#	none
+set_dbspace_per_node()
+{
+for _network_ in `$CAT ${1}|$SORT -u`; do
+    _net_desig_=`iniget NETWORK_DESIGNATION -f ${TEM_DIR}/${ENIQ_INI} -v ${_network_}_NET`
+    if [ $? -ne 0 ]; then
+	_err_msg_="Could not find ${_network_}_NET in ${CLI_CONF_DIR}/${ENIQ_INI}"
+	abort_script "$_err_msg_" 
+    fi
+    
+    # Have these values been set already?
+    _old_main_space_=`iniget DWH_DBSPACES_SPACE_PER_NODE -f ${TEM_DIR}/${ENIQ_INI} -v DWH_DBSPACES_SPACE_PER_NODE_MAIN_${_network_}`
+    if [ "${_old_main_space_}" ]; then
+	# Test for numeric
+	$ECHO ${_old_main_space_} | $EGREP '[^0-9]' >> /dev/null 2>&1
+	
+	if [ $? -eq 0 ]; then
+	    unset _old_main_space_
+	fi
+	if [ ${_old_main_space_} -eq 0 ]; then			
+	    unset _old_main_space_
+	fi
+    fi
+
+    _old_temp_space_=`iniget DWH_DBSPACES_SPACE_PER_NODE -f ${TEM_DIR}/${ENIQ_INI} -v DWH_DBSPACES_SPACE_PER_NODE_TEMP_${_network_}`
+    if [ "${_old_temp_space_}" ]; then
+        # Test for numeric
+	$ECHO ${_old_temp_space_} | $EGREP '[^0-9]' >> /dev/null 2>&1
+	
+	if [ $? -eq 0 ]; then
+	    unset _old_temp_space_
+	fi
+	if [ ${_old_temp_space_} -eq 0 ]; then			
+	    unset _old_temp_space_
+	fi
+    fi
+
+    while :; do
+	$CLEAR
+	
+	$ECHO "\nPlease enter the amount of MAIN DBSPACE space in MBytes to create" 
+	$ECHO "for each ${_network_} ${_net_desig_} you are going to manage"
+	$ECHO "This value should be derived from the ENIQ Configuration Directions"
+	
+	if [ "${_old_main_space_}" ]; then
+	    $ECHO "\nThe existing default value set is ${_old_main_space_} and this value"
+	    $ECHO "will be used if no value is entered"
+	fi
+	read _node_main_space_
+	
+	# Test for numeric
+	$ECHO ${_node_main_space_} | $EGREP '[^0-9]' >> /dev/null 2>&1
+	if [ $? -eq 0 ]; then
+	    continue 
+	fi
+	
+	# If the User hit nothing and there is an existing value
+	# then use that, otherwise loop
+	if [ ! "${_node_main_space_}" ]; then
+	    if [ "${_old_main_space_}" ]; then
+		_node_main_space_=${_old_main_space_}
+	    else
+		continue
+	    fi
+	fi
+	
+	# Zero size not allowed
+	if [ ${_node_main_space_} -eq 0 ]; then
+	    continue
+	fi
+	
+	$ECHO "\n\nPlease enter the amount of TEMP DBSPACE space to create" 
+	$ECHO "for each ${_network_} ${_net_desig_} you are going to manage\n"
+	$ECHO "This value should be derived from the ENIQ Configuration Directions"
+	
+	if [ "${_old_temp_space_}" ]; then
+	    $ECHO "\nThe existing default value set is ${_old_temp_space_} and this value"
+	    $ECHO "will be used if no value is entered"
+	fi
+	read _node_temp_space_
+	
+	# Test for numeric
+	$ECHO ${_node_temp_space_} | $EGREP '[^0-9]' >> /dev/null 2>&1
+	if [ $? -eq 0 ]; then
+	    continue 
+	fi
+	
+	# If the User hit nothing and there is an existing value
+	# then use that, otherwise loop
+	if [ ! "${_node_temp_space_}" ]; then
+	    if [ "${_old_temp_space_}" ]; then
+		_node_temp_space_=${_old_temp_space_}
+	    else
+		continue
+	    fi
+	fi
+	
+	# Zero size not allowed
+	if [ ${_node_temp_space_} -eq 0 ]; then
+	    continue
+	fi
+	
+	break
+    done  
+    
+    log_msg -s "\nSetting DWH_DBSPACES_SPACE_PER_NODE_MAIN_${_network_} to ${_node_main_space_} in ${TEM_DIR}/${ENIQ_INI}" ${LOG_OUT_STR} -q
+    iniset DWH_DBSPACES_SPACE_PER_NODE -f ${TEM_DIR}/${ENIQ_INI} DWH_DBSPACES_SPACE_PER_NODE_MAIN_${_network_}=${_node_main_space_}
+    if [ $? -ne 0 ]; then
+	_err_msg_="Could not set value for DWH_DBSPACES_SPACE_PER_NODE_MAIN_${_network_} in ${TEM_DIR}/${ENIQ_INI}"
+	abort_script "$_err_msg_" 
+    fi
+    
+    log_msg -s "Setting DWH_DBSPACES_SPACE_PER_NODE_TEMP_${_network_} to ${_node_main_space_} in ${TEM_DIR}/${ENIQ_INI}\n" ${LOG_OUT_STR} -q
+    iniset DWH_DBSPACES_SPACE_PER_NODE -f ${TEM_DIR}/${ENIQ_INI} DWH_DBSPACES_SPACE_PER_NODE_TEMP_${_network_}=${_node_temp_space_}
+    if [ $? -ne 0 ]; then
+	_err_msg_="Could not set value for DWH_DBSPACES_SPACE_PER_NODE_TEMP_${_network_} in ${TEM_DIR}/${ENIQ_INI}"
+	abort_script "$_err_msg_" 
+    fi
+done
+	
+}
+
+### Function: setup_env ###
+#
+# Setup up path environment etc
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+setup_env()
+{
+if [ ! "${ENIQ_BASE_DIR}" ]; then
+    ENIQ_BASE_DIR=/eniq
+fi
+
+ENIQ_CONF_DIR=${ENIQ_BASE_DIR}/installation/config
+if [ ! -s ${ENIQ_CONF_DIR}/${SUNOS_INI} ]; then
+    _err_msg_="Could not locate file ${ENIQ_CONF_DIR}/${SUNOS_INI}"
+    abort_script "$_err_msg_"
+fi
+
+# Main Directory for the Core Installation SW
+ENIQ_INST_DIR=${ENIQ_BASE_DIR}/installation/core_install
+
+ENIQ_ADMIN_DIR=${ENIQ_BASE_DIR}/admin
+
+DEF_CLI_CONF_DIR=`$CAT ${ENIQ_CONF_DIR}/${ENIQ_ENV} | $EGREP "^[ 	]*CONF_DIR="|$NAWK -F\= '{print $2}'|$SED -e 's|"||g'`
+if [ ! "${DEF_CLI_CONF_DIR}" ]; then
+    _err_msg_="Could not read CONF_DIR parameter from ${ENIQ_CONF_DIR}/${ENIQ_ENV}"
+    abort_script "$_err_msg_"
+fi
+
+BKUP_DB_FILESYS_LIST="`$DIRNAME ${SCRIPTHOME}`/backup/etc/db_filesystem_list"
+if [ ! -s ${BKUP_DB_FILESYS_LIST} ]; then
+	BKUP_DB_FILESYS_LIST="/eniq/bkup_sw/etc/asa_filesystem_list"
+	BKUP_IQ_FILESYS_LIST="/eniq/bkup_sw/etc/iq_filesystem_list"
+	if [ ! -s ${BKUP_DB_FILESYS_LIST} ]; then
+    _err_msg_="Could not locate file ${BKUP_DB_FILESYS_LIST}"
+    abort_script "$_err_msg_"
+fi
+fi
+
+# Set the log directory
+LOG_DIR=`iniget LOG_FILE_DIR -f ${ENIQ_CONF_DIR}/${ENIQ_INI} -v Logfile_Location`
+LOGFILE_DIR="$LOG_DIR/expansion_log"
+}
+
+### Function: setup_sybase_env ###
+#
+# Set up Sybase environment
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+setup_sybase_env()
+{
+SYSUSER=`iniget ENIQ_INSTALL_CONFIG -f ${ENIQ_CONF_DIR}/${SUNOS_INI} -v ENIQ_SYSUSER`
+if [ ! "${SYSUSER}" ]; then
+    _err_msg_="Could not read System User from  ${ENIQ_CONF_DIR}/${SUNOS_INI}"
+    abort_script "$_err_msg_"
+fi
+
+SYSGRP=`$ID ${SYSUSER}|$NAWK '{print $2}'|$NAWK -F\( '{print $2}'|$NAWK -F\) '{print $1}'`
+if [ ! "${SYSGRP}" ]; then
+    _err_msg_="Could not determine group id of ${SYSUSER}"
+    abort_script "$_err_msg_"
+fi	
+
+$SU - ${SYSUSER} >> /dev/null -c "$ENV |$EGREP '^(SYBASE|ASDIR|IQDIR|ASALOGDIR|SQLANY)' > $TEM_DIR/sybase_det.$$" >> /dev/null 2>&1
+
+# Source the environment
+set -a
+. $TEM_DIR/sybase_det.$$ >> /dev/null 2>&1
+set +a
+
+if [ ! "${SYBASE}" ]; then 
+    _err_msg_="Could not determine Sybase environment variable \${SYBASE}"
+    abort_script "$_err_msg_"
+fi
+
+if [ ! "${ASDIR}" ]; then
+   SYBASE_OCS=/eniq/sybase_iq/OCS-15_0/bin/
+   ISQL=$SYBASE_OCS/isql
+   DBPING=$IQDIR/bin64/dbping
+   export LD_LIBRARY_PATH=$IQDIR/lib64
+   NEW=true
+else
+   ISQL=$SYBASE/$SYBASE_OCS/bin/isql
+   DBPING=${ASDIR}/bin/dbping
+   export LD_LIBRARY_PATH=${ASDIR}/lib
+fi
+
+if [ ! "${SYBASE_OCS}" ]; then 
+    _err_msg_="Could not determine Sybase environment variable \${SYBASE_OCS}"
+    abort_script "$_err_msg_"
+fi
+
+if [ ! -x "$ISQL" ]; then
+    _err_msg_="$ISQL commands not found or not executable."
+    abort_script "$_err_msg_"
+fi
+
+SYB_DBA=dba
+
+SYB_PASS=`inigetpassword DB -f ${TEM_DIR}/${ENIQ_INI} -v DBAPassword`
+if [ ! "${SYB_PASS}" ]; then
+    _err_msg_="Could not read IQ DBA password from ${CLI_CONF_DIR}/${ENIQ_INI}"
+    abort_script "$_err_msg_"
+fi	
+}
+
+### Function: test_iq_login ###
+#
+# Test that I can log into sybase IQ
+#
+# Arguments:
+#	$1 : Database to check
+#	$2 : Flag to indicate rolling snapshot or not (0/1)
+#	$3 : Flag to indicate quiet/verbose operation
+# Return Values:
+#	none
+test_iq_login()
+{
+local _bkup_quiet_ _db_up_res_code_ _roll_snap_flag_ 
+local _dbspace_list_ _dbspace_err_
+
+_dblist_=${1}
+_roll_snap_flag_=${2}
+if [ "${3}" ]; then
+    _bkup_quiet_="-q"
+fi
+
+_db_up_res_code_=0
+
+for _db_ in ${_dblist_}; do
+    # Is the database up. If not assume it is safe to backup
+
+    log_msg -s "Testing database ${_db_} is running" ${LOG_OUT_STR} ${_bkup_quiet_}
+
+    INI_SECTION=`$CAT ${BKUP_IQ_FILESYS_LIST}|$EGREP -v '^[ 	]*#'    \
+                     |$EGREP "^[ 	]*${_db_}::"|$NAWK -F"::" '{print $2}'`
+
+	
+                                                               
+    if [ ! "${INI_SECTION}" ]; then
+	_err_msg_="Could not read INI_SECTION param for ${_db_} from ${BKUP_DB_FILESYS_LIST}"
+	abort_script "$_err_msg_"
+    fi
+
+    _port_=`iniget ${INI_SECTION} -f ${TEM_DIR}/${ENIQ_INI} -v PortNumber`
+    _srvname_=`iniget ${INI_SECTION} -f ${TEM_DIR}/${ENIQ_INI} -v ServerName`
+    _up_=`${DBPING} -q -c "con=${_db_};eng=${_srvname_};links=tcpip{host=localhost;port=${_port_};dobroadcast=none;verify=no};uid=${SYB_DBA};pwd=${SYB_PASS}" 2>/dev/null`
+
+    if [ $? -ne 0 ]; then
+	# If this is a rolling snapshot then all databases must be up
+	if [ ${_roll_snap_flag_} -eq 1 ]; then
+	    _err_msg_="Rolling Snapshot not possible.\nDatabase ${_db_} is not running"
+	    abort_script "$_err_msg_"
+	else
+	    _err_msg_="Database ${_db_} is not running"
+	    abort_script "$_err_msg_"
+	fi
+    fi
+
+    log_msg -s "Testing login of database ${_db_}" ${LOG_OUT_STR} ${_bkup_quiet_}
+    $RM -f $SYBASEMSG
+    if [ $NEW ]; then
+        ## for new output from sybase
+	$ISQL -b -w 500000 -Udba -P${SYB_PASS} -S${_db_} <<EOISQL >>  $SYBASEMSG
+sp_iqfile
+go
+EOISQL
+# Do not put a space after EOISQL
+    	if [ $? -ne 0 ]; then
+        	_err_msg_="Error logging on to database ${_db_} on IQ server."
+        	abort_script "$_err_msg_"
+    	fi
+        
+    else
+	$ISQL -b -w 500000 -Udba -P${SYB_PASS} -S${_db_} <<EOISQL >>  $SYBASEMSG
+sp_iqdbspace
+go
+EOISQL
+# Do not put a space after EOISQL
+	if [ $? -ne 0 ]; then
+	    _err_msg_="Error logging on to database ${_db_} on IQ server."
+	    abort_script "$_err_msg_"
+	fi    
+    fi
+
+    # Check for any reported errors
+    $EGREP 'Msg [0-9][0-9]*\, Level ([0-9][0-9]*)' $SYBASEMSG >> /dev/null 2>&1
+
+    if [ $? -eq 0 ]; then
+    	_err_msg_="Error logging on to database ${_db_} on IQ server."
+    	abort_script "$_err_msg_"
+    fi
+
+    # If this is a rolling snapshot then we check that all dbspaces exist etc.
+    if [ ${_roll_snap_flag_} -eq 1 ]; then
+	# Get the list of dbspaces
+	_dbspace_list_=`$CAT $SYBASEMSG|$NAWK '{print $2}'|$EGREP '^\/'`
+	if [ ! "${_dbspace_list_}" ]; then
+	    _err_msg_="Rolling Snapshot not possible.\nNo IQ dbspaces found associated with database ${_db_}"
+	    abort_script "$_err_msg_"
+	fi
+	
+	# Check that each dbspace exists and has a size greater than 0
+	_dbspace_err_=0
+	for _dbspace_ in ${_dbspace_list_}; do
+	    if [ ! -s ${_dbspace_} ]; then
+		_dbspace_err_=1
+		log_msg -s "${_dbspace_} not found or empty"
+	    fi
+	done
+	if [ ${_dbspace_err_} -eq 1 ]; then
+	    _err_msg_="Rolling Snapshot not possible.\nSome dbspaces are missing"
+	    abort_script "$_err_msg_"
+	fi
+    fi
+done
+return ${_db_up_res_code_}
+}
+
+### Function: update_cell_count ###
+#
+# update Cell managed count
+#
+# Arguments:
+#	none
+# Return Values:
+#	none
+update_cell_count()
+{
+MAIN_DB_PATH=`iniget DWH_DBSPACES_LOCATION -f ${TEM_DIR}/${SYM_INI} -v MAIN_DB_PATH`
+if [ ! "${MAIN_DB_PATH}" ]; then
+    _err_msg_="Could not find MAIN_DB_PATH in ${SYM_INI}"
+    abort_script "$_err_msg_" 
+fi
+
+TEMP_DB_PATH=`iniget DWH_DBSPACES_LOCATION -f ${TEM_DIR}/${SYM_INI} -v TEMP_DB_PATH`
+if [ ! "${TEMP_DB_PATH}" ]; then
+    _err_msg_="Could not find TEMP_DB_PATH in ${SYM_INI}"
+    abort_script "$_err_msg_" 
+fi
+
+DB_DIR_NAME_TEMPL=`iniget DWH_DBSPACES_LOCATION -f ${TEM_DIR}/${SYM_INI} -v DB_DIR_NAME_TEMPL`
+if [ ! "${DB_DIR_NAME_TEMPL}" ]; then
+    _err_msg_="Could not find DB_DIR_NAME_TEMPL in ${SYM_INI}"
+    abort_script "$_err_msg_" 
+fi
+
+# Flag to show whether customer is using all available network types 
+_all_nets_used_=1
+
+# Find what network types have been installed
+$RM -rf ${TEM_DIR}/used_network_types
+for _net_type_ in `$ECHO $AVAIL_NETWORK_TYPES`; do
+    _type_=`iniget ENIQ_NET_INFO -f ${TEM_DIR}/${ENIQ_INI} -v ManagedNodes${_net_type_}`
+    if [ $? -ne 0 ]; then
+	_err_msg_="Could not find ManagedNodes${_net_type_} in ${CLI_CONF_DIR}/${ENIQ_INI}"
+	abort_script "$_err_msg_" 
+    fi
+    if [ "${_type_}" == "" ]; then
+	_all_nets_used_=0
+	continue
+    else
+	$ECHO ${_net_type_} >> ${TEM_DIR}/used_network_types
+    fi
+done
+
+# Are all available net types selected. If not, allow user to
+# add more
+if [ ${_all_nets_used_} -eq 0 ]; then
+    # Does the user want to add new network types
+    while :; do
+	unset _opt_
+	unset _network_array
+	$RM -f ${TEM_DIR}/network_types
+	$CLEAR	
+	$ECHO "Available network types"
+	$ECHO "-----------------------"
+	
+	unset _def_opt_
+	_cnt_=1
+	for _net_type_ in `$ECHO $AVAIL_NETWORK_TYPES`; do
+	    $ECHO "[${_cnt_}]  ${_net_type_}"
+	    _network_array[${_cnt_}]=${_net_type_}
+	    
+	    # Build up a list of the nets already managed 
+	    $GREP -w ${_net_type_} ${TEM_DIR}/used_network_types >> /dev/null 2>&1
+	    if [ $? -eq 0 ]; then
+		if [ ! "${_def_opt_}" ]; then
+		    _def_opt_=${_cnt_}
+		else
+		    _def_opt_="${_def_opt_},${_cnt_}"
+		fi
+	    fi
+	    
+	    let _cnt_=_cnt_+1
+	done
+	
+	$ECHO "\n\nPlease enter the network types you are\ngoing to manage in the form (n,n....n) e.g. 1,2,3 \n"
+	if [ "${_def_opt_}" ]; then
+	    $ECHO "Default selection will be already managed networks [${_def_opt_}]"	
+	fi
+	read _opt_
+	
+	# If the User hit nothing and there is a default. that will do
+	if [ ! "${_opt_}"  ]; then
+	    if [ ! "${_def_opt_}" ]; then
+		continue
+	    else
+		_opt_=${_def_opt_}
+	    fi
+	else
+	    if [ "${_def_opt_}" ]; then
+		_tem_opt_=""
+		# Check that the value the user input, contains at least all the 
+		# existing managed network types
+		_chk_net_list_=`$ECHO ${_opt_}|$SED -e 's|,| |g'`
+		for _chknet_ in ${_chk_net_list_}; do
+		    $ECHO ${_def_opt_}|$GREP -w ${_chknet_} >> /dev/null 2>&1
+		    if [ $? -ne 0 ]; then
+			_def_opt_="${_def_opt_},${_chknet_}"
+		    fi
+		done
+		_opt_=${_def_opt_}
+	    fi
+	fi
+	
+	_numerror_=0
+	for _num_ in `$ECHO ${_opt_} | $SED "s|,| |g"`; do
+	    $ECHO ${_num_} | $EGREP '[^0-9]' >> /dev/null 2>&1
+	    if [ $? -eq 0 ]; then
+		_numerror_=1
+		break
+	    fi        
+	    if [ ${_num_} -lt 1 -o ${_num_} -ge ${_cnt_} ]; then
+		_numerror_=1
+		break
+	    fi
+	    
+	    # Okay I should have a valid choice now. Output details to
+	    # output file. I will output the desc as well as I might 
+	    # show the user
+	    $GREP -w "${_network_array[${_num_}]}" ${TEM_DIR}/network_types >> /dev/null 2>&1
+	    if [ $? -ne 0 ]; then
+		$ECHO "${_network_array[${_num_}]}" >> ${TEM_DIR}/network_types
+	    fi
+	done
+	if [ ${_numerror_} -eq 0 ]; then
+	    break
+	fi	
+    done
+else
+    $CP ${TEM_DIR}/used_network_types ${TEM_DIR}/network_types
+fi
+
+# Okay I need to set up the amount of dbspace I will allocate per 
+# node/cell of each network type managed
+set_dbspace_per_node ${TEM_DIR}/network_types
+
+unset CORE_COUNT GRAN_COUNT WRAN_COUNT TOTAL_NODE_COUNT
+unset TOTAL_NODE_MAIN_SPACE TOTAL_NODE_TEMP_SPACE
+
+_net_updated_=0
+for _network_ in `$CAT ${TEM_DIR}/network_types|$SORT -u`; do
+    _node_main_space_=`iniget DWH_DBSPACES_SPACE_PER_NODE -f ${TEM_DIR}/${ENIQ_INI} -v DWH_DBSPACES_SPACE_PER_NODE_MAIN_${_network_}`
+    if [ $? -ne 0 ]; then
+	_err_msg_="Could not find DWH_DBSPACES_SPACE_PER_NODE_MAIN_${_network_} in ${CLI_CONF_DIR}/${ENIQ_INI}"
+	abort_script "$_err_msg_" 
+    fi
+    _node_temp_space_=`iniget DWH_DBSPACES_SPACE_PER_NODE -f ${TEM_DIR}/${ENIQ_INI} -v DWH_DBSPACES_SPACE_PER_NODE_TEMP_${_network_}`
+    if [ $? -ne 0 ]; then
+	_err_msg_="Could not find DWH_DBSPACES_SPACE_PER_NODE_TEMP_${_network_} in ${CLI_CONF_DIR}/${ENIQ_INI}"
+	abort_script "$_err_msg_" 
+    fi
+    
+    _net_desig_=`iniget NETWORK_DESIGNATION -f ${TEM_DIR}/${ENIQ_INI} -v ${_network_}_NET`
+    if [ $? -ne 0 ]; then
+	_err_msg_="Could not find ${_network_}_NET in ${CLI_CONF_DIR}/${ENIQ_INI}"
+	abort_script "$_err_msg_" 
+    fi
+    
+    while :; do
+	# Get the existing number managed 
+	_old_node_cnt_=`iniget ENIQ_NET_INFO -f ${TEM_DIR}/${ENIQ_INI} -v ManagedNodes${_network_}`
+	if [ "${_old_node_cnt_}" ]; then
+	    $ECHO ${_old_node_cnt_} | $EGREP '[^0-9]' >> /dev/null 2>&1
+	    if [ $? -eq 0 ]; then
+		_err_msg_="Non numeric value read for ManagedNodes${_network_} in ${CLI_CONF_DIR}/${ENIQ_INI}"
+		abort_script "$_err_msg_" 
+	    fi
+	fi
+	
+	$CLEAR
+	$ECHO "\n\nPlease enter the number of ${_network_} ${_net_desig_}s you are going to manage\n"
+	$ECHO "Main DBSPACE Requirement is ${_node_main_space_} MBytes per ${_net_desig_}"
+	$ECHO "Temp DBSPACE Requirement is ${_node_temp_space_} MBytes per ${_net_desig_}"
+	if [ "${_old_node_cnt_}" ]; then
+	    $ECHO "Default number will be already managed ${_network_} ${_net_desig_}s (${_old_node_cnt_})"	
+	fi
+	read _node_cnt_
+	
+	if [ ! "${_node_cnt_}" ]; then
+	    if [ ! "${_old_node_cnt_}" ]; then
+		continue
+	    else
+		_node_cnt_=${_old_node_cnt_}
+	    fi
+	fi
+	
+	# Test for numeric
+	$ECHO ${_node_cnt_} | $EGREP '[^0-9]' >> /dev/null 2>&1
+	if [ $? -eq 0 ]; then
+	    continue 
+	fi
+	
+	# Is the number entered than the number already managed
+	if [ "${_old_node_cnt_}" ]; then
+	    if [ ${_node_cnt_} -lt ${_old_node_cnt_} ]; then
+		continue 
+	    elif [ ${_node_cnt_} -gt ${_old_node_cnt_} ]; then
+		_net_updated_=1
+	    else
+		:
+	    fi
+	else
+	    _net_updated_=1
+	fi
+	
+	# Record the number of Managed Nodes
+	log_msg -s "Setting ManagedNodes${_network_} to ${_node_cnt_} in ${TEM_DIR}/${ENIQ_INI}" ${LOG_OUT_STR} -q
+	iniset ENIQ_NET_INFO -f ${TEM_DIR}/${ENIQ_INI} ManagedNodes${_network_}=${_node_cnt_}
+	if [ $? -ne 0 ]; then
+	    _err_msg_="Could not update ${TEM_DIR}/${ENIQ_INI} with ManagedNodes${_network_}=${_node_cnt_}"
+	    abort_script "$_err_msg_" 
+	fi	
+	break
+    done  
+
+    let TOTAL_NODE_COUNT=TOTAL_NODE_COUNT+${_node_cnt_}
+    if [ "${_network_}" == "CORE" ]; then
+	CORE_COUNT=${_node_cnt_}
+    fi
+    if [ "${_network_}" == "GRAN" ]; then
+	GRAN_COUNT=${_node_cnt_}
+    fi
+    if [ "${_network_}" == "WRAN" ]; then
+	WRAN_COUNT=${_node_cnt_}
+    fi
+    
+    _main_space_required_=`$EXPR ${_node_main_space_} \* ${_node_cnt_}`
+    _temp_space_required_=`$EXPR ${_node_temp_space_} \* ${_node_cnt_}`
+
+    let TOTAL_NODE_MAIN_SPACE=TOTAL_NODE_MAIN_SPACE+${_main_space_required_}
+    let TOTAL_NODE_TEMP_SPACE=TOTAL_NODE_TEMP_SPACE+${_temp_space_required_}
+done
+
+# Has there been enough MAIN DBspace already allocated 
+EXIT_FLAG_CNT=0
+unset UPDATE_MAIN_DBSPACE_FLAG
+_chk_size_=`$EXPR ${TOTAL_NODE_MAIN_SPACE} \* 1024 \* 1024`
+if [ ${TOTAL_MAIN_SYB_IQ_DBSPACE_SIZE} -ge ${_chk_size_} ]; then
+    log_msg -s "Sufficient MAIN Space has already been allocated to Sybase IQ" ${LOG_OUT_STR}
+    let EXIT_FLAG_CNT=EXIT_FLAG_CNT+1
+    MAIN_UPDATE_SPACE=0
+else
+    MAIN_UPDATE_SPACE=`$ECHO \(${_chk_size_} - ${TOTAL_MAIN_SYB_IQ_DBSPACE_SIZE}\) / 1024 / 1024 | $BC`
+    UPDATE_MAIN_DBSPACE_FLAG=Y
+fi
+
+# Has there been enough TEMP DBspace already allocated 
+unset UPDATE_TEMP_DBSPACE_FLAG
+_chk_size_=`$EXPR ${TOTAL_NODE_TEMP_SPACE} \* 1024 \* 1024`
+if [ ${TOTAL_TEMP_SYB_IQ_DBSPACE_SIZE} -ge ${_chk_size_} ]; then
+    log_msg -s "Sufficient TEMP Space has already been allocated to Sybase IQ" ${LOG_OUT_STR}
+    let EXIT_FLAG_CNT=EXIT_FLAG_CNT+1
+    TEMP_UPDATE_SPACE=0
+else
+    TEMP_UPDATE_SPACE=`$ECHO \(${_chk_size_} - ${TOTAL_TEMP_SYB_IQ_DBSPACE_SIZE}\) / 1024 / 1024 | $BC`
+    UPDATE_TEMP_DBSPACE_FLAG=Y
+fi
+
+# Check if we need to updated IQ SYS MAIN Size
+chk_iq_sys_main_size
+
+if [ ${EXIT_FLAG_CNT} -eq 3 ]; then
+    # Clean up
+    $RM -rf ${TEM_DIR}
+    exit 0
+fi
+
+# Check that the there is adequate disk space
+# for the cell/node configuration.
+_req_main_temp_space_MB_=`$EXPR  ${MAIN_UPDATE_SPACE} + ${TEMP_UPDATE_SPACE} + ${IQ_SYS_MAIN_UPDATE_SPACE}`
+check_disk_space ${_req_main_temp_space_MB_}
+
+if [ "${UPDATE_SYS_MAIN_DBSPACE_FLAG}" ]; then
+    # Get the next IQ SYS MAIN NUMBER
+    calculate_iq_sys_main_details ${IQ_SYS_MAIN_UPDATE_SPACE}
+fi
+
+if [ "${UPDATE_MAIN_DBSPACE_FLAG}" ]; then
+    # Calculate number of main dbspaces required and the
+    # size of each dbspace
+    calculate_main_dbspace_details ${MAIN_UPDATE_SPACE}
+fi
+
+if [ "${UPDATE_TEMP_DBSPACE_FLAG}" ]; then
+    # Calculate number of temp dbspaces required and the
+    # size of each dbspace
+    calculate_temp_dbspace_details ${TEMP_UPDATE_SPACE}
+fi
+}
+
+### Function: update_dbspace_ini ###
+#
+# Update the ${SYM_INI} with the dbspaces
+#
+# Arguments:
+#	none
+# Return Values:
+#	none
+update_dbspace_ini()
+{
+local _dir_num_
+local _loop_cnt_
+
+if [ "${UPDATE_MAIN_DBSPACE_FLAG}" ]; then
+	let _loop_cnt_=${START_MAIN_DBSPACE_NUM}+${NUM_MAIN_DBSPACES}-1
+	for (( i=${START_MAIN_DBSPACE_NUM}; i<=${_loop_cnt_}; i++)); do
+	    # Get the directory number. If the last character is 1 then go to dbspace_dir_1,
+	    # if the last character is 2 then go to dbspace_dir_2....
+	    # if the last character is 0 then go to dbspace_dir_10....
+	
+	    # Get the last digit
+	    _last_dig_=`$ECHO ${i: -1}`
+	    if [ ${_last_dig_} -eq 0 ]; then
+			_dir_num_=10
+	    else
+			_dir_num_=${_last_dig_}
+	    fi
+	
+	    $RM -f ${TEM_DIR}/ins_det
+	    $ECHO "[DWH_DBSPACES_MAIN_${i}]" >> ${TEM_DIR}/ins_det
+	    $ECHO "Path=${MAIN_DB_PATH}/${DB_DIR_NAME_TEMPL}${_dir_num_}/main_${i}.iq" >> ${TEM_DIR}/ins_det
+	    $ECHO "Lun_ID=" >> ${TEM_DIR}/ins_det
+	    $ECHO "Type=zfs" >> ${TEM_DIR}/ins_det
+	    $ECHO "Size=${MAIN_SPACE_PER_DBSPACE}" >> ${TEM_DIR}/ins_det
+    	$ECHO "Link=" >> ${TEM_DIR}/ins_det
+
+	    $RM -f  ${TEM_DIR}/${SYM_INI}_tmp
+	    if [ "${LOG_OUT_STR}" ]; then
+			log_msg -s "Updating ${TEM_DIR}/${SYM_INI} with DWH_DBSPACES_MAIN_${i}" ${LOG_OUT_STR} ${_bkup_quiet_}
+	    fi
+	    ${ENIQ_ADMIN_DIR}/lib/iniadd.pl -g DWH_DBSPACES_MAIN -p DWH_DBSPACES_MAIN_${i} -i ${TEM_DIR}/${SYM_INI} -d ${TEM_DIR}/ins_det -o ${TEM_DIR}/${SYM_INI}_tmp
+	    if [ $? -ne 0 ]; then
+			_err_msg_="Error adding DWH_DBSPACES_MAIN_${i} to ${TEM_DIR}/${SYM_INI}"
+			abort_script "$_err_msg_" 
+	    fi
+	
+	    $CP ${TEM_DIR}/${SYM_INI}_tmp ${TEM_DIR}/${SYM_INI}
+	done
+fi
+
+if [ "${UPDATE_TEMP_DBSPACE_FLAG}" ]; then
+	let _loop_cnt_=${START_TEMP_DBSPACE_NUM}+${NUM_TEMP_DBSPACES}-1
+	for (( i=${START_TEMP_DBSPACE_NUM}; i<=${_loop_cnt_}; i++)); do
+	    # Get the directory number. If the last character is 1 then go to dbspace_dir_1,
+	    # if the last character is 2 then go to dbspace_dir_2....
+	    # if the last character is 0 then go to dbspace_dir_10....
+	
+	    # Get the last digit
+	    _last_dig_=`$ECHO ${i: -1}`
+	    case ${_last_dig_} in
+		1|6) _dir_num_=1
+		    ;;
+		2|7) _dir_num_=2
+		    ;;
+		3|8) _dir_num_=3
+		    ;;
+		4|9) _dir_num_=4
+		    ;;
+		5|0) _dir_num_=5
+		    ;;
+	    esac
+	
+	    $RM -f ${TEM_DIR}/ins_det
+	    $ECHO "[DWH_DBSPACES_TEMP_${i}]" >> ${TEM_DIR}/ins_det
+	    $ECHO "Path=${TEMP_DB_PATH}/${DB_DIR_NAME_TEMPL}${_dir_num_}/temp_${i}.iqtmp" >> ${TEM_DIR}/ins_det
+    	$ECHO "Lun_ID=" >> ${TEM_DIR}/ins_det
+    	$ECHO "Type=zfs" >> ${TEM_DIR}/ins_det
+	    $ECHO "Size=${TEMP_SPACE_PER_DBSPACE}" >> ${TEM_DIR}/ins_det
+    	$ECHO "Link=" >> ${TEM_DIR}/ins_det	    
+
+
+	    $RM -f ${TEM_DIR}/${SYM_INI}_tmp
+	
+	    if [ "${LOG_OUT_STR}" ]; then
+			log_msg -s "Updating ${TEM_DIR}/${SYM_INI} with DWH_DBSPACES_TEMP_${i}" ${LOG_OUT_STR} ${_bkup_quiet_}
+	    fi
+	    ${ENIQ_ADMIN_DIR}/lib/iniadd.pl -g DWH_DBSPACES_TEMP -p DWH_DBSPACES_TEMP_${i} -i ${TEM_DIR}/${SYM_INI} -d ${TEM_DIR}/ins_det -o ${TEM_DIR}/${SYM_INI}_tmp
+	    if [ $? -ne 0 ]; then
+			_err_msg_="Error adding DWH_DBSPACES_TEMP_${i} to ${TEM_DIR}/${SYM_INI}"
+			abort_script "$_err_msg_" 
+	    fi
+	
+	    $CP ${TEM_DIR}/${SYM_INI}_tmp ${TEM_DIR}/${SYM_INI}
+	done
+fi
+
+
+if [ "${UPDATE_SYS_MAIN_DBSPACE_FLAG}" ]; then
+    $RM -f ${TEM_DIR}/ins_det
+
+    # Get the next DWH_SYSTEM_MAIN Parent number
+    _iq_parent_num_=`iniget DWH_SYSTEM_MAIN -f ${TEM_DIR}/${SYM_INI} |$NAWK -F\_ '{print $NF}'|$SORT -n|$TAIL -1`
+    let _iq_parent_num_=_iq_parent_num_+1
+
+    $ECHO "[DWH_SYSTEM_MAIN_${_iq_parent_num_}]" >> ${TEM_DIR}/ins_det
+    $ECHO "Path=${IQ_SYS_MAIN_DB_PATH}/iq_system_main_${NEXT_SYS_MAIN_DBSPACE_NUM}.iq" >> ${TEM_DIR}/ins_det
+    $ECHO "Lun_ID=" >> ${TEM_DIR}/ins_det
+    $ECHO "Type=zfs" >> ${TEM_DIR}/ins_det
+    $ECHO "Size=${IQ_SYS_MAIN_UPDATE_SPACE}" >> ${TEM_DIR}/ins_det
+    $ECHO "Link=" >> ${TEM_DIR}/ins_det
+
+    $RM -f ${TEM_DIR}/${SYM_INI}_tmp
+	
+    if [ "${LOG_OUT_STR}" ]; then
+		log_msg -s "Updating ${TEM_DIR}/${SYM_INI} with DWH_SYSTEM_MAIN_${_iq_parent_num_}" ${LOG_OUT_STR} ${_bkup_quiet_}
+    fi
+    ${ENIQ_ADMIN_DIR}/lib/iniadd.pl -g DWH_SYSTEM_MAIN -p DWH_SYSTEM_MAIN_${_iq_parent_num_} -i ${TEM_DIR}/${SYM_INI} -d ${TEM_DIR}/ins_det -o ${TEM_DIR}/${SYM_INI}_tmp
+    if [ $? -ne 0 ]; then
+		_err_msg_="Error adding DWH_DBSPACES_TEMP_${i} to ${TEM_DIR}/${SYM_INI}"
+		abort_script "$_err_msg_" 
+    fi
+    
+    $CP ${TEM_DIR}/${SYM_INI}_tmp ${TEM_DIR}/${SYM_INI}
+fi
+}
+
+### Function: usage_msg ###
+#
+#   Print out the usage message
+#
+# Arguments:
+#	none
+# Return Values:
+#	none
+usage_msg() 
+{
+$CLEAR
+$ECHO "
+Usage: `$BASENAME $0` [ -d <path_to_niq_ini_dir> ] [ -l <path_to_logfile> ] [-c]
+                      
+options:
+
+-c  : Optional parameter to run a consistency check. 
+
+-d  : Optional parameter specifying the full path to the directory containing
+      the niq.ini file to be updated. 
+
+-l  : Optional parameter specifying the full path to logfile.
+"
+}
+
+# ********************************************************************
+#
+# 	Main body of program
+#
+# ********************************************************************
+#
+RUN_TIME=`$DATE '+%Y-%b-%d_%H.%M.%S'`
+
+# Determine absolute path to software
+get_absolute_path
+
+# Check that the effective id of the user is root
+check_id root
+
+while getopts ":cd:f:l:m:Nst:" arg; do
+    case $arg in
+	c) CHK_ONLY="YES" 
+	    ;;
+	d) CLI_CONF_DIR="$OPTARG" 
+	    ;;
+	f) IQ_SYS_MAIN_CHNG_FILE="$OPTARG"
+	    ;;
+	l) LOGFILE="$OPTARG"
+	    ;;
+	m) MAIN_USER_NUM_SPACE="$OPTARG"
+	    ;;
+	N) NO_CONFIRM="YES"
+	    ;;
+	s) UPDATE_SYS_MAIN_ONLY="YES"
+	    ;;
+	t) TEMP_USER_NUM_SPACE="$OPTARG"
+	    ;;
+    esac
+done
+shift `expr $OPTIND - 1`
+
+if [ ! -s $SCRIPTHOME/../lib/common_functions.lib ]; then
+    _err_msg_="Cannot locate $SCRIPTHOME/../lib/common_functions.lib"
+    abort_script "$_err_msg_" 
+else
+    . $SCRIPTHOME/../lib/common_functions.lib
+fi
+
+# Setup up path environment etc
+setup_env
+
+if [ ! "${LOGFILE}" ]; then
+    LOGFILE=${LOGFILE_DIR}/update_cell_count.log
+fi
+
+# Check/Create Logfile
+chk_create_logfile
+LOG_OUT_STR="-l ${LOGFILE}"
+
+log_msg -s "\n-------------------------------------------------------" ${LOG_OUT_STR}
+log_msg -s "${RUN_TIME} - Starting to execute $0" ${LOG_OUT_STR}
+log_msg -s "-------------------------------------------------------" ${LOG_OUT_STR}
+
+# Read the storage type
+read_storage_type
+
+# End this script if we're not on ZFS storage
+if [ "${STORAGE_TYPE}" != "zfs" ]; then
+	log_msg -s "${STORAGE_TYPE} system - no expansion supported" ${LOGFILE}
+	exit 0
+fi
+
+if [ ! "${CLI_CONF_DIR}" ]; then
+    CLI_CONF_DIR=${DEF_CLI_CONF_DIR}
+fi
+
+if [ ! -s ${CLI_CONF_DIR}/${ENIQ_INI} ]; then
+    _err_msg_="File ${CLI_CONF_DIR}/${ENIQ_INI} not found or empty"
+    abort_script "$_err_msg_"
+fi
+
+if [ "${MAIN_USER_NUM_SPACE}" ]; then
+    $ECHO ${MAIN_USER_NUM_SPACE} | $EGREP '[^0-9]' >> /dev/null 2>&1
+    if [ $? -eq 0 ]; then
+	_err_msg_="Numeric value only for number of main spaces"
+	abort_script "$_err_msg_" 
+    fi
+    if [ ${MAIN_USER_NUM_SPACE} -eq 0 ]; then
+	_err_msg_="Numeric value greater than zero for number of main spaces"
+	abort_script "$_err_msg_" 
+    fi
+fi
+
+if [ "${TEMP_USER_NUM_SPACE}" ]; then
+    $ECHO ${TEMP_USER_NUM_SPACE} | $EGREP '[^0-9]' >> /dev/null 2>&1
+    if [ $? -eq 0 ]; then
+	_err_msg_="Numeric value only for number of temp spaces"
+	abort_script "$_err_msg_" 
+    fi
+    if [ ${TEMP_USER_NUM_SPACE} -eq 0 ]; then
+	_err_msg_="Numeric value greater than zero for number of temp spaces"
+	abort_script "$_err_msg_" 
+    fi
+fi
+
+# Create a temporary Directory
+TEM_DIR=/tmp/update_cell_node_count.$$
+$RM -rf ${TEM_DIR}
+$MKDIR -p ${TEM_DIR}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not create directory ${TEM_DIR}"
+    abort_script "$_err_msg_"
+fi	
+
+$CHMOD 777 ${TEM_DIR}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not update directory ${TEM_DIR} permissions"
+    abort_script "$_err_msg_"
+fi  
+
+# Check the sys main ini structure is correct
+check_sys_main_ini_structure
+
+log_msg -s "\nMaking a copy of ${CLI_CONF_DIR}/${ENIQ_INI} and ${ENIQ_CONF_DIR}/${SYM_INI} in ${TEM_DIR}" ${LOG_OUT_STR}
+$CP ${CLI_CONF_DIR}/${ENIQ_INI} ${TEM_DIR}/${ENIQ_INI}
+$CP ${ENIQ_CONF_DIR}/${SYM_INI} ${TEM_DIR}/${SYM_INI}
+
+# Set up Sybase environment
+setup_sybase_env
+
+# Check the existing DBSPACES. Check that all dbspaces in the
+# ini file exist and that all dbspaces exist in the ini file
+check_exist_dbspaces
+
+if [ ! "${CHK_ONLY}" ]; then
+    if [ "${UPDATE_SYS_MAIN_ONLY}" ]; then
+	chk_iq_sys_main_size
+	if [ "${UPDATE_SYS_MAIN_DBSPACE_FLAG}" ]; then
+            # Get the next IQ SYS MAIN NUMBER
+	    calculate_iq_sys_main_details ${IQ_SYS_MAIN_UPDATE_SPACE}
+	fi
+    else
+        # Get the number of nodes/cells to be managed
+	update_cell_count
+    fi
+
+    if [ "${UPDATE_SYS_MAIN_DBSPACE_FLAG}" -o "${UPDATE_MAIN_DBSPACE_FLAG}" -o "${UPDATE_TEMP_DBSPACE_FLAG}" ]; then
+	_upd_flag_=0 
+	if [ ! "$NO_CONFIRM" ]; then
+            # Confirm the User Input
+	    confirm_user_input
+	    
+	    if [ "${USER_CONF}" == "Y" -o "${USER_CONF}" == "y" ]; then
+		_upd_flag_=1
+	    fi
+	else
+	    _upd_flag_=1
+	fi
+	
+	if [ ${_upd_flag_} -eq 1 ]; then
+	            # Update the ${SYM_INI} with the dbspaces
+	    update_dbspace_ini 
+
+            # Catch any interrupts at this stage
+	    trap "abort_script" 1 2 3 14 15
+
+		    log_msg -s "Creating backup of ${CLI_CONF_DIR}/${ENIQ_INI} and ${ENIQ_CONF_DIR}/${SYM_INI} \n in ${ENIQ_CONF_DIR}/backup" ${LOG_OUT_STR} ${_bkup_quiet_}
+	    $MKDIR -p ${ENIQ_CONF_DIR}/backup
+	    $CP ${CLI_CONF_DIR}/${ENIQ_INI} ${ENIQ_CONF_DIR}/backup/${ENIQ_INI}.${RUN_TIME}
+		    $CP ${ENIQ_CONF_DIR}/${SYM_INI} ${ENIQ_CONF_DIR}/backup/${SYM_INI}.${RUN_TIME}
+		    ## Make the updated one's live
+	    $CP ${TEM_DIR}/${ENIQ_INI} ${ENIQ_CONF_DIR}/${ENIQ_INI}
+		    $CP ${TEM_DIR}/${SYM_INI} ${ENIQ_CONF_DIR}/${SYM_INI}
+	    $CP ${TEM_DIR}/${ENIQ_INI} ${CLI_CONF_DIR}/${ENIQ_INI}
+	fi
+    fi
+else
+    log_msg -s "\nConsistency check passed\n" ${LOG_OUT_STR}    
+fi
+
+if [ "${IQ_SYS_MAIN_CHNG_FILE}" -a "${UPDATE_SYS_MAIN_DBSPACE_FLAG}" ]; then
+    $TOUCH ${IQ_SYS_MAIN_CHNG_FILE} >> /dev/null 2>&1
+fi
+
+# Clean up
+$RM -rf ${TEM_DIR}
+
+exit 0

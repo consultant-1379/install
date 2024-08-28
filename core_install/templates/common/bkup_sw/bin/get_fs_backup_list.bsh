@@ -1,0 +1,477 @@
+#!/bin/bash
+# ********************************************************************
+# Ericsson Radio Systems AB                                     SCRIPT
+# ********************************************************************
+#
+#
+# (c) Ericsson Radio Systems AB 2018 - All rights reserved.
+#
+# The copyright to the computer program(s) herein is the property
+# of Ericsson Radio Systems AB, Sweden. The programs may be used
+# and/or copied only with the written permission from Ericsson Radio
+# Systems AB or in accordance with the terms and conditions stipulated
+# in the agreement/contract under which the program(s) have been
+# supplied.
+#
+# ********************************************************************
+# Name    : get_fs_backup_list.bsh
+# Date    : 15/2/2023
+# Revision:  \main\21
+# Purpose : Script to get a list of Eniq fs that need to be backed up.
+#
+# Usage   : get_fs_backup_list.bsh [ -l <logfile> ]
+#
+# ********************************************************************
+#
+#   Command Section
+#
+# ********************************************************************
+AWK=/usr/bin/awk
+BASENAME=/usr/bin/basename
+BC=/usr/bin/bc
+CAT=/usr/bin/cat
+CHMOD=/usr/bin/chmod
+CLEAR=/usr/bin/clear
+CMP=/usr/bin/cmp
+CP=/usr/bin/cp
+CUT=/usr/bin/cut
+DATE=/usr/bin/date
+DF=/usr/bin/df
+DIRNAME=/usr/bin/dirname
+DOMAINNAME=/usr/bin/domainname
+DTCONFIG=/usr/dt/bin/dtconfig
+ECHO='/usr/bin/echo -e'
+EGREP=/usr/bin/egrep
+EJECT=/usr/bin/eject
+ENV=/usr/bin/env
+EXPR=/usr/bin/expr
+FORMAT=/usr/sbin/format
+FSTYP=/usr/sbin/fstyp
+FUSER=/usr/sbin/fuser
+GETENT=/usr/bin/getent
+GETTEXT=/usr/bin/gettext
+GREP=/usr/bin/grep
+GTAR=/usr/sfw/bin/gtar
+GZCAT=/usr/bin/gzcat
+HEAD=/usr/bin/head
+HOSTID=/usr/bin/hostid
+HOSTNAME=/usr/bin/hostname
+ID=/usr/bin/id
+INIT=/usr/sbin/init
+LS=/usr/bin/ls
+MKDIR=/usr/bin/mkdir
+MORE=/usr/bin/more
+MV=/usr/bin/mv
+PGREP=/usr/bin/pgrep
+PKGADD=/usr/sbin/pkgadd
+PKGINFO=/usr/bin/pkginfo
+PRTCONF=/usr/sbin/prtconf
+PRTVTOC=/usr/sbin/prtvtoc
+PSRINFO=/usr/sbin/psrinfo
+PWD=/usr/bin/pwd
+RM=/usr/bin/rm
+RCP=/usr/bin/rcp
+ROLES=/usr/bin/roles
+RSH=/usr/bin/rsh
+SED=/usr/bin/sed
+SLEEP=/usr/bin/sleep
+SORT=/usr/bin/sort
+SU=/usr/bin/su
+SVCCFG=/usr/sbin/svccfg
+SVCS=/usr/bin/svcs
+SYNC=/usr/sbin/sync
+TAIL=/usr/bin/tail
+TEE=/usr/bin/tee
+TOUCH=/usr/bin/touch
+TPUT=/usr/bin/tput
+UADMIN=/usr/sbin/uadmin
+UNAME=/usr/bin/uname
+UNIQ=/usr/bin/uniq
+VOLD=/usr/sbin/vold
+WC=/usr/bin/wc
+
+
+
+# ********************************************************************
+#
+#       Configuration Section
+#
+# ********************************************************************
+SUNOS_INI=SunOS.ini
+STORAGE_INI=storage.ini
+
+# Filesystems that are not snapped by default
+EXCLUDE_LIST="eventdata"
+
+# ********************************************************************
+#
+#       Pre-execution Operations
+#
+# ********************************************************************
+
+
+# ********************************************************************
+#
+#   Functions
+#
+# ********************************************************************
+### Function: abort_script ###
+#
+#   This will is called if the script is aborted thru an error
+#   error signal sent by the kernel such as CTRL-C or if a serious
+#   error is encountered during runtime
+#
+# Arguments:
+#       $1 - Error message from part of program (Not always used)
+# Return Values:
+#       none
+abort_script()
+{
+if [ "$1" ]; then
+    _err_msg_="`$DATE '+%Y-%b-%d_%H.%M.%S'` - $1"
+else
+    _err_msg_="`$DATE '+%Y-%b-%d_%H.%M.%S'` - Script aborted......."
+fi
+
+# Check if log_msg() is defined
+type log_msg > /dev/null 2>&1
+if [ $? -gt 0 ]; then
+    if [ "${LOGFILE}" ]; then
+        if [ ! "${SNAP_QUIET}" ]; then
+            $ECHO "\n${_err_msg_}\n" |$TEE -a ${LOGFILE}
+        else
+            $ECHO "\n${_err_msg_}\n" >> ${LOGFILE}
+        fi
+    else
+        $ECHO "\n${_err_msg_}\n"
+    fi
+else
+    if [ "${LOGFILE}" ]; then
+        log_msg -s "\n${_err_msg_}\n" -l ${LOGFILE} ${SNAP_QUIET}
+    else
+        log_msg -s "\n${_err_msg_}\n" ${SNAP_QUIET}
+    fi
+fi
+
+cd $SCRIPTHOME
+
+if [ "$2" ]; then
+    ${2}
+else
+   exit 1
+fi
+}
+
+# Check/Create Logfile
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+chk_create_logfile()
+{
+$MKDIR -p `$DIRNAME ${LOGFILE}`
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not create directory `$DIRNAME ${LOGFILE}`"
+    abort_script "$_err_msg_"
+fi
+
+$TOUCH -a ${LOGFILE}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not write to file ${LOGFILE}"
+    abort_script "$_err_msg_"
+fi
+
+_log_id_str="-l ${LOGFILE}"
+}
+
+### Function: get_absolute_path ###
+#
+# Determine absolute path to software
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+get_absolute_path()
+{
+_dir_=`$DIRNAME $0`
+SCRIPTHOME=`cd $_dir_ 2>/dev/null && pwd || $ECHO $_dir_`
+}
+
+### get_fs_list ###
+#
+#    Determine the list of filesystems to backup
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+get_fs_list()
+{
+$RM -rf ${TEM_DIR}/backup_list ${TEM_DIR}/fs_list_file ${TEM_DIR}/nfs_list_file ${TEM_DIR}/mount_point
+
+_user_input_=`$CAT ${ENIQ_BKUPSW_DIR}/etc/eniq_backup.conf |$GREP -w BKUP_OPTION_STR |$AWK -F= '{print $2}' 2>/dev/null`
+
+if [ "$_user_input_" == "NoData" ];then
+   _fs_exclude_list_="dwh_main_dbspace|dwh_temp_dbspace|dwh_reader|dwh_main"
+else
+   _fs_exclude_list_=" "
+fi
+
+# Need to exclude archive directory from taking backup in case  of Nodata
+if [ "$_user_input_" == "NoData" -a "${STORAGE_TYPE}" == "fs"  ]; then
+        if [ "${_fs_exclude_list_}" == "" ]; then
+            _fs_exclude_list_="archive"
+        else
+            _fs_exclude_list_="${_fs_exclude_list_}|archive"
+        fi
+    
+fi
+
+# Get a list of the fs filesystems
+$CAT ${FS_SNAP_DET} | $EGREP -v '^[[:blank:]]*#'|$EGREP -v "${_fs_exclude_list_}"> ${TEM_DIR}/fs_list_file
+if [ ! -s ${TEM_DIR}/fs_list_file ]; then
+    _err_msg_="${TEM_DIR}/fs_list_file does not exist, or is empty"
+    abort_script "$_err_msg_"
+fi
+
+# Build a list of filesystems that are NOT to be snapped
+_fs_snap_list_=""
+for _fs_ in `$CAT ${TEM_DIR}/fs_list_file`; do
+    _name_=`$ECHO ${_fs_} | $AWK -F\:: '{print $1}'`
+    _snap_opt_=`$ECHO ${_fs_} | $AWK -F\:: '{print $2}'`
+
+    if [ "${_snap_opt_}" == "Y" ]; then
+        if [ "${_fs_snap_list_}" == "" ]; then
+            _fs_snap_list_="${_name_}"
+        else
+            _fs_snap_list_="${_fs_snap_list_} ${_name_}"
+        fi
+    fi
+done
+
+if [ "${CO_SERVER}" == "YES" -a "${STORAGE_TYPE}" != "fs" ]; then
+    # Get a list of the NFS filesystems
+    if [ "$_user_input_" == "NoData" ]; then
+        $CAT ${NFS_SNAP_DET} | $EGREP -v '^[[:blank:]]*#' | $EGREP -v "archive" > ${TEM_DIR}/nfs_list_file
+    else
+        $CAT ${NFS_SNAP_DET} | $EGREP -v '^[[:blank:]]*#'  > ${TEM_DIR}/nfs_list_file
+    fi
+    
+    if [ ! -s ${TEM_DIR}/nfs_list_file ]; then
+        _err_msg_="${TEM_DIR}/nfs_list_file does not exist, or is empty"
+        abort_script "$_err_msg_"
+    fi
+
+    # Build a list of filesystems that are NOT to be snapped
+    _nfs_snap_list_=""
+    for _fs_ in `$CAT ${TEM_DIR}/nfs_list_file`; do
+        _name_=`$ECHO ${_fs_} | $AWK -F\:: '{print $1}'`
+        _snap_opt_=`$ECHO ${_fs_} | $AWK -F\:: '{print $2}'`
+
+        if [ "${_snap_opt_}" == "Y" ]; then
+            if [ "${_nfs_snap_list_}" == "" ]; then
+                _nfs_snap_list_="${_name_}"
+            else
+                _nfs_snap_list_="${_nfs_snap_list_} ${_name_}"
+            fi
+        fi
+    done
+fi
+
+_snap_list_="${_fs_snap_list_} ${_nfs_snap_list_}"
+
+if [ "${STORAGE_TYPE}" != "fs" ]; then
+    $CAT ${ENIQ_CONF_DIR}/${SUNOS_INI} | $GREP -w "mountpoint" | $AWK -F "=" '{print $2}' > ${TEM_DIR}/mount_point
+    $CAT ${ENIQ_CONF_DIR}/${STORAGE_INI} | $GREP -w "MOUNT_PATH" | $AWK -F "=" '{print $2}' >> ${TEM_DIR}/mount_point
+else
+    $CAT ${ENIQ_CONF_DIR}/${SUNOS_INI} | $GREP -w "mountpoint" | $AWK -F "=" '{print $2}' > ${TEM_DIR}/mount_point
+fi
+
+for _fs_ in `$ECHO ${_snap_list_}`; do
+     _mount_point_=`$CAT ${TEM_DIR}/mount_point | $GREP -w ${_fs_}`
+    _fs_name_=`$DF -h ${_mount_point_} | $AWK '{print $NF}' | $GREP "\/${_fs_}$" | $GREP -w "eniq"`
+    $ECHO "${SNAP_MOUNT_DIR}${_fs_name_}" >> ${TEM_DIR}/backup_list
+done
+
+if [ -f "${FLS_CONFIG_FILE}" -a "${CO_SERVER}" == "YES" ]; then
+    while read _line_ ;do
+       _fs_name_="/eniq/data/pmdata/${_line_}"
+           $ECHO "${SNAP_MOUNT_DIR}${_fs_name_}" >> ${TEM_DIR}/backup_list
+    done<${FLS_CONFIG_FILE}
+fi
+
+$CAT ${TEM_DIR}/backup_list | $EGREP -v "${EXCLUDE_LIST}" | $SORT -u
+}
+
+### Function: setup_env ###
+#
+# Setup up path environment etc
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+setup_env()
+{
+ENIQ_BASE_DIR=/eniq
+
+ENIQ_ADMIN_DIR=${ENIQ_BASE_DIR}/admin
+
+ENIQ_CONF_DIR=${ENIQ_BASE_DIR}/installation/config
+
+# Core install directory that contains scripts
+ENIQ_CORE_DIR=${ENIQ_BASE_DIR}/installation/core_install
+
+ENIQ_BKUPSW_DIR=${ENIQ_BASE_DIR}/bkup_sw
+
+SYS_FLEX_BKUP_CONF=${ENIQ_BKUPSW_DIR}/etc/.flex_data_bkup_conf
+
+LOGDIR=${ENIQ_BASE_DIR}/local_logs/backup_logs
+
+# Source the common functions
+if [ -s ${ENIQ_ADMIN_DIR}/lib/common_functions.lib ]; then
+    . ${ENIQ_ADMIN_DIR}/lib/common_functions.lib
+else
+    if [ -s ${ENIQ_CORE_DIR}/templates/events/admin/lib/common_functions.lib ]; then
+        . ${ENIQ_CORE_DIR}/templates/events/admin/lib/common_functions.lib
+    else
+        _err_msg_="common_functions.lib library file not found"
+        abort_script "$_err_msg_"
+    fi
+fi
+
+# File containing the type of OSS installation. Eg. events or statistics
+INST_TYPE_FILE=${ENIQ_CONF_DIR}/ericsson_use_config
+if [ ! -s "${INST_TYPE_FILE}" ]; then
+    _err_msg_="ENIQ install type not defined in ${INST_TYPE_FILE}"
+    abort_script "$_err_msg_" 
+fi
+# Read the installation type
+INSTALL_TYPE=`$CAT ${INST_TYPE_FILE} | $AWK -F\= '{print $2}'`
+
+# Determine the current server type
+CURR_SERVER_TYPE=`$CAT $ENIQ_CONF_DIR/installed_server_type | $EGREP -v '^[[:blank:]]*#' | $SED -e 's/ //g'`
+if [ ! "${CURR_SERVER_TYPE}" ]; then
+    _err_msg_="Could not determine which server type this is"
+    abort_script "$_err_msg_"
+fi
+
+STORAGE_TYPE=`iniget STOR_TYPE -f ${ENIQ_CONF_DIR}/${SUNOS_INI} -v STORAGE_TYPE`
+if [ ! "${STORAGE_TYPE}" ]; then
+    _err_msg_="Could not read STORAGE_TYPE parameter from ${ENIQ_CONF_DIR}/${SUNOS_INI}"
+    abort_script "$_err_msg_"
+fi
+
+BKUP_CONF_FILE="`$DIRNAME ${SCRIPTHOME}`/etc/eniq_backup.conf"
+if [ ! -s ${BKUP_CONF_FILE} ]; then
+    _err_msg_="Could not locate file ${BKUP_CONF_FILE}"
+    abort_script "$_err_msg_"
+fi
+
+SNAP_MOUNT_DIR=`$CAT ${BKUP_CONF_FILE} | $EGREP '^[[:blank:]]*BKUP_MOUNT_DIR=' | $AWK -F"=" '{print $2}'` 
+if [ ! "${SNAP_MOUNT_DIR}" ]; then
+    _err_msg_="Could not read BKUP_MOUNT_DIR parameter from ${BKUP_CONF_FILE}"
+    abort_script "$_err_msg_"
+fi
+
+# File containing details per NFS FS for snapshots
+if [ "${STORAGE_TYPE}" != "fs" ]; then
+    NFS_SNAP_DET="${ENIQ_BKUPSW_DIR}/etc/${INSTALL_TYPE}_blade_nfs_filesys_snap_det"
+    if [ ! -s ${NFS_SNAP_DET} ]; then
+        _err_msg_="Could not find ${NFS_SNAP_DET} file"
+        abort_script "$_err_msg_" 
+    fi
+fi
+
+# File containing details per FS for snapshots
+if [ "${STORAGE_TYPE}" == "fs" ]; then
+    FS_SNAP_DET="${ENIQ_BKUPSW_DIR}/etc/${INSTALL_TYPE}_rack_fs_filesys_snap_det"
+else
+    FS_SNAP_DET="${ENIQ_BKUPSW_DIR}/etc/${INSTALL_TYPE}_blade_fs_filesys_snap_det"
+fi
+    
+if [ ! -s ${FS_SNAP_DET} ]; then
+    _err_msg_="Could not find ${FS_SNAP_DET} file"
+    abort_script "$_err_msg_" 
+fi
+
+CO_SERVER=""
+if [ "${CURR_SERVER_TYPE}" == "eniq_coordinator" -o "${CURR_SERVER_TYPE}" == "son_coordinator" -o "${CURR_SERVER_TYPE}" == "eniq_events" \
+    -o "${CURR_SERVER_TYPE}" == "eniq_iqw" -o "${CURR_SERVER_TYPE}"  == "eniq_stats"  -o "${CURR_SERVER_TYPE}" == "stats_coordinator" -o "${CURR_SERVER_TYPE}" == "eniq_es" ]; then
+    CO_SERVER="YES"
+fi
+
+FLS_CONFIG_FILE=${ENIQ_CONF_DIR}/fls_conf
+}
+
+### Function: usage_msg ###
+#
+#   Print out the usage message
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+usage_msg()
+{
+$ECHO "
+Usage: `$BASENAME $0` [ -l <logfile> ]"
+}
+
+# ********************************************************************
+#
+#   Main body of program
+#
+# ********************************************************************
+#
+# Determine absolute path to software
+get_absolute_path
+
+while getopts ":l:" arg; do
+  case $arg in
+    l) LOGFILE="$OPTARG"
+       ;;
+   \?) usage_msg
+       exit 1
+       ;;
+  esac
+done
+shift `expr $OPTIND - 1`
+
+# Setup up path environment etc
+setup_env
+
+# Set up default logfile if required
+if [ ! "${LOGFILE}" ]; then
+    LOGFILE="${LOGDIR}/get_fs_backup_list.log"
+fi
+
+# Check/Create Logfile
+chk_create_logfile
+
+$ECHO "\n\n================================================================" >> ${LOGFILE}
+$ECHO "================================================================" >> ${LOGFILE} 
+$ECHO "Generating filesystem backup list started at `$DATE +%d.%m.%y_%H:%M:%S`\n" >> ${LOGFILE} 
+
+# Create a temporary Directory
+TEM_DIR=/tmp/get_fs_backup_list.$$.$$
+$RM -rf ${TEM_DIR}
+$MKDIR -p ${TEM_DIR}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not create directory ${TEM_DIR}"
+    abort_script "$_err_msg_"
+fi
+
+$CHMOD 777 ${TEM_DIR}
+
+get_fs_list
+
+$ECHO "\nGenerating filesystem backup list finished at `$DATE +%d.%m.%y_%H:%M:%S`" >> ${LOGFILE} 
+$ECHO "================================================================" >> ${LOGFILE}
+$ECHO "================================================================" >> ${LOGFILE} 
+
+$RM -rf ${TEM_DIR}
+
+exit 0

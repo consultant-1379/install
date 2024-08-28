@@ -1,0 +1,2700 @@
+#!/bin/bash
+# ********************************************************************
+# Ericsson Radio Systems AB                                     SCRIPT
+# ********************************************************************
+#
+#
+# (c) Ericsson Radio Systems AB 2020 - All rights reserved.
+#
+# The copyright to the computer program(s) herein is the property
+# of Ericsson Radio Systems AB, Sweden. The programs may be used 
+# and/or copied only with the written permission from Ericsson Radio 
+# Systems AB or in accordance with the terms and conditions stipulated 
+# in the agreement/contract under which the program(s) have been 
+# supplied.
+#
+# ********************************************************************
+# Name    : manage_features.bsh
+# Date    : 20/05/2020
+# Revision: \main\187
+# Purpose : Main wrapper script handling the installation of ENIQ Features.
+#
+# Usage   : manage_features.bsh
+#
+# ********************************************************************
+#
+# 	Command Section
+#
+# ********************************************************************
+AWK=/usr/bin/awk
+BASENAME=/usr/bin/basename
+BASH=/usr/bin/bash
+CAT=/usr/bin/cat
+CHMOD=/usr/bin/chmod
+CHOWN=/usr/bin/chown
+CLEAR=/usr/bin/clear
+CMP=/usr/bin/cmp
+CP=/usr/bin/cp
+DATE=/usr/bin/date
+DIRNAME=/usr/bin/dirname
+ECHO='/usr/bin/echo -e'
+EGREP=/usr/bin/egrep
+EXPR=/usr/bin/expr
+FREE=/usr/bin/free
+GETENT=/usr/bin/getent
+GREP=/usr/bin/grep
+HEAD=/usr/bin/head
+ID=/usr/bin/id
+LS=/usr/bin/ls
+MKDIR=/usr/bin/mkdir
+MV=/usr/bin/mv
+MYHOSTNAME=/usr/bin/hostname
+PERL=/usr/bin/perl
+PS=/usr/bin/ps
+PWD=/usr/bin/pwd
+RM=/usr/bin/rm
+SED=/usr/bin/sed
+SLEEP=/usr/bin/sleep
+SORT=/usr/bin/sort
+SU=/usr/bin/su
+SYSTEMCTL=/usr/bin/systemctl
+SWBIN=/eniq/sw/bin
+TEE=/usr/bin/tee
+TOUCH=/usr/bin/touch
+WC=/usr/bin/wc
+
+
+# ********************************************************************
+#
+#       Configuration Section
+#
+# ********************************************************************
+# Default user
+DEFAULT_USER=root
+
+# Name of SunOS & ENIQ ini Files
+ENIQ_ENV=niq.rc
+ENIQ_INI=niq.ini
+SUNOS_INI=SunOS.ini
+
+# DVD LABEL or Jumpstart Directory where all ENIQ SW will reside
+ENIQ_BASE_SW=eniq_base_sw
+
+# Directory on the root filesystem
+ENIQ_ROOT_DIR=/eniq
+
+# Features to be installed file for failed upgrade
+FEATURES_NAME_TO_BE_INSTALLED_FILE=/tmp/_upgrade_features_name_to_be_installed
+
+# Features to be installed file for failed upgrade
+FEATURES_TO_BE_INSTALLED_FILE=/tmp/_upgrade_features_to_be_installed
+
+# Upgrade Type
+UPGRADE_TYPE=""
+
+# Database list
+DB_LIST="repdb,dwhdb"
+
+# Create a temporary Directory
+TEM_DIR=/tmp/install_feature.$$.$$
+
+# List of LTE features
+features_LTE=(CXC4010933 CXC4011049 CXC4011279 CXC4011280 CXC4011318)
+
+# Features to be installed files for LTE and non LTE files
+LTE_FEATURES_TO_BE_INSTALLED_FILE=${TEM_DIR}/_lte_features_to_be_installed
+NON_LTE_FEATURES_TO_BE_INSTALLED_FILE=${TEM_DIR}/_non_lte_features_to_be_installed
+
+# Features to be pre-provisioned
+PRE_PROVISION_LTE_FEATS=${TEM_DIR}/_feats_to_pre_provision
+
+# ********************************************************************
+#
+#       Pre-execution Operations
+#
+# ********************************************************************
+
+
+# ********************************************************************
+#
+# 	Functions
+#
+# ********************************************************************
+### Function: abort_script ###
+#
+#   This will is called if the script is aborted thru an error
+#   error signal sent by the kernel such as CTRL-C or if a serious
+#   error is encountered during runtime
+#
+# Arguments:
+#       $1 - Error message from part of program (Not always used)
+# Return Values:
+#       none
+abort_script()
+{
+_err_time_=`$DATE '+%Y-%b-%d_%H.%M.%S'`
+
+if [ "$1" ]; then
+    _err_msg_="${_err_time_} - $1"
+else
+    _err_msg_="${_err_time_} - ERROR : Script aborted.......\n"
+fi
+
+if [ "${LOGFILE}" ]; then
+    $ECHO "\nERROR : $_err_msg_\n"|$TEE -a ${LOGFILE}
+else
+    $ECHO "\nERROR : $_err_msg_\n"
+fi
+
+cd $SCRIPTHOME
+
+cleanup_manage_features
+
+$RM -rf ${TEM_DIR}
+
+if [ "$2" ]; then
+    ${2}
+else
+   exit 1
+fi
+}
+
+### Function: set_engine ###
+#
+# Set Engine profile to Normal
+#
+# Arguments:
+#	none
+# Return Values:
+#	none
+set_engine()
+{
+if [ "${UPGRADE_TYPE}" == "Rolling" ]; then
+        CURRENT_ENGINE_PROFILE=`$SU - ${_sysuser_} -c "engine -e getCurrentProfile"`
+        $ECHO ${CURRENT_ENGINE_PROFILE} | $GREP -i "normal" > /dev/null 2>&1
+        if [ $? -ne 0 ] ; then
+                local RETRY_COUNT=3
+                while [ ${RETRY_COUNT} -gt 0 ]; do
+                        set_engine_profile "Normal"
+                        if [ $? -ne 0 ]; then
+                                log_msg -q -t -l ${LOGFILE} -s "Failed to set engine to Normal profile."
+                        fi
+                        let RETRY_COUNT=RETRY_COUNT-1
+                done
+        fi
+fi
+}
+
+### Function: activate_features ###
+#
+# Activate the ENIQ Feature(s)
+#
+# Arguments:
+#	none
+# Return Values:
+#	none
+activate_features() 
+{
+_installer_dir_=`$CAT ${CLI_CONF_DIR}/${ENIQ_ENV} | $EGREP '^[[:blank:]]*INSTALLER_DIR=' | $AWK -F\= '{print $2}' | $SED -e 's|"||g'`
+if [ ! -d "${_installer_dir_}" ]; then
+    _err_msg_="Failed to locate ENIQ Installer Directory\n${_installer_dir_}"
+    abort_script "$_err_msg_" 
+fi
+
+if [ "${FEATURE_ACTION}" != "update" -o "${UPGRADE_TYPE}" != "Rolling" ]; then
+	# Get directory where the ENIQ Features are stored on DVD/Jumpstart - eniq_techpacks
+	_eniq_feat_input_dir_=`iniget FEATURE_INFO -f ${CLI_CONF_DIR}/${ENIQ_INI} -v Feature_Input_Dir`
+	if [ ! "${_eniq_feat_input_dir_}" ]; then
+	    _err_msg_="Could not read parameter Feature_Input_Dir from file\n${CLI_CONF_DIR}/${ENIQ_INI}"
+	    abort_script "$_err_msg_"
+	fi
+	
+	# Get file where the ENIQ Features are listed on DVD/Jumpstart - install_features
+	_tem_feat_input_file_=`iniget FEATURE_INFO -f ${CLI_CONF_DIR}/${ENIQ_INI} -v Feature_Input_File`
+	if [ ! "${_tem_feat_input_file_}" ]; then
+	    _err_msg_="Could not read parameter Feature_Input_File from file\n${CLI_CONF_DIR}/${ENIQ_INI}"
+	    abort_script "$_err_msg_"
+	fi
+
+    _eniq_feat_input_file_="$BASE_SW_DIR/${_eniq_feat_input_dir_}/${_tem_feat_input_file_}"
+	
+	if [ ! -s ${_eniq_feat_input_file_} ]; then
+	    _err_msg_="Could not locate ENIQ Features input file\n${_eniq_feat_input_file_}"
+	    abort_script "$_err_msg_"
+	fi
+	
+	# Get Directory where the list of managed features are/will be stored
+	_feature_list_dir_=`iniget FEATURE_INFO -f ${ENIQ_CONF_DIR}/${ENIQ_INI} -v Feature_Interface_Dir`
+	if [ ! "${_feature_list_dir_}" ]; then
+	    _err_msg_="Failed to read Parameter Feature_Interface_Dir from ${ENIQ_CONF_DIR}/${ENIQ_INI}"
+	    abort_script "$_err_msg_"
+	fi
+
+	_eniq_total_feature_output_file_=${_feature_list_dir_}/total_feature_install_list
+	
+	$RM -f ${TEM_DIR}/features_to_be_activated ${TEM_DIR}/features_to_be_activated1 ${TEM_DIR}/features_to_be_activated2	
+	
+	log_msg -t -l ${LOGFILE} -s "Creating list of interfaces for activation"
+	# If this file exists then I need to build up a list for Feature Activation. 
+	# For each feature to be activated, I need to supply all other OSS's that
+	# have these feature(s)
+	if [ -s ${_eniq_total_feature_output_file_} ]; then
+	    while read _line_; do
+			_feature_=`$ECHO ${_line_} | $AWK -F"::" '{print $1}'`
+			_desc_=`$CAT ${FEATURE_INPUT_FILE} | $EGREP "^[[:blank:]]*${_feature_}::" | $AWK -F"::" '{print $2}'`
+			if [ ! "${_feature_}"  ]; then
+			    _err_msg_="${ENIQ_CORE_ETC_DIR}/features_to_be_managed has invalid format"
+			    abort_script "$_err_msg_"
+			fi
+			
+			$ECHO ${_line_} >> ${TEM_DIR}/features_to_be_activated2
+			$CAT ${_eniq_total_feature_output_file_} | $EGREP "^[[:blank:]]*${_feature_}::" >> ${TEM_DIR}/features_to_be_activated2
+ 	    done < ${ENIQ_CORE_ETC_DIR}/features_to_be_managed
+	else
+	    $CP ${ENIQ_CORE_ETC_DIR}/features_to_be_managed ${TEM_DIR}/features_to_be_activated2
+		if [ $? -ne 0 ]; then
+			_err_msg_="Could not copy ${ENIQ_CORE_ETC_DIR}/features_to_be_managed\nto ${TEM_DIR}/features_to_be_activated2"
+			abort_script "$_err_msg_" 
+		fi
+	fi
+	
+	# We need to put the list in order now and remove the duplicates.
+	while read _feat_detail_; do
+	    _feat_=`$ECHO ${_feat_detail_}| $AWK -F"::" '{print $1}'`
+	    $CAT ${TEM_DIR}/features_to_be_activated2 | $SORT -u | $EGREP "^${_feat_}::" >> ${TEM_DIR}/features_to_be_activated1 2>/dev/null
+	done < ${_eniq_feat_input_file_}
+
+	$CAT ${TEM_DIR}/features_to_be_activated1 | $SED 's/::/:/g' | $SORT -t':' -k2 | $SED 's/:/::/g' > ${TEM_DIR}/temp && mv ${TEM_DIR}/temp ${TEM_DIR}/features_to_be_activated1 2>/dev/null
+	
+	log_msg -t -l ${LOGFILE} -s "Checking required interfaces are present in SW repository"
+	while read _line_; do
+	    _feature_=`$ECHO ${_line_} | $AWK -F"::" '{print $1}'`
+	    _hname_=`$ECHO ${_line_} | $AWK -F"::" '{print $3}'`
+	    _desc_=`$CAT ${FEATURE_INPUT_FILE} | $EGREP "^[[:blank:]]*${_feature_}::" | $AWK -F"::" '{print $2}'`
+	    if [ ! "${_feature_}"  ]; then
+			_err_msg_="${TEM_DIR}/features_to_be_activated1 has invalid format"
+			abort_script "$_err_msg_"
+	    fi
+	
+	    $RM -f ${TEM_DIR}/assoc_tp
+	    
+	    $CAT ${FEATURE_MAP_FILE} | $EGREP "^[[:blank:]]*${_feature_}::" | $AWK -F"::" '{print $2}' > ${TEM_DIR}/assoc_tp
+	    if [ ! -s ${TEM_DIR}/assoc_tp ]; then
+		    _err_msg_="No Techpack/Interfaces found to be associated with ${_desc_}"
+		    abort_script "$_err_msg_"
+	    fi
+
+        for _tp_ in `$CAT ${TEM_DIR}/assoc_tp`; do
+			$LS ${BASE_SW_DIR}/${ENIQ_FEATURE_INPUT_DIR} | $EGREP "^${_tp_}_R[0-9]+[a-zA-Z]+_.*\.tpi" >> /dev/null 2>&1
+			if [ $? -ne 0 ]; then
+				log_msg -t -l ${LOGFILE} -s "WARNING: Techpack/Interfaces ${_tp_} associated with ${_desc_} cannot be found in\n${BASE_SW_DIR}/${ENIQ_FEATURE_INPUT_DIR}\n"
+			else
+			$ECHO "${_tp_} ${_hname_}" >> ${TEM_DIR}/features_to_be_activated
+			fi
+		done
+	done < ${TEM_DIR}/features_to_be_activated1
+else
+	#Get the file path for file provided by Installer with list of upgraded tech packs and interfaces
+	_upgraded_tech_packs_file_=`iniget FEATURE_INFO -f ${ENIQ_CONF_DIR}/${ENIQ_INI} -v Last_Tech_Packs_Installed_File`
+	_upgraded_tech_packs_file_="${_installer_dir_}/${_upgraded_tech_packs_file_}"
+	if [ ! -f ${_upgraded_tech_packs_file_} ]; then
+	    _err_msg_="Could not locate installer list of upgraded techpacks and interfaces\n${_upgraded_tech_packs_file_}"
+	    abort_script "$_err_msg_"
+	fi
+	$CP ${_upgraded_tech_packs_file_} /${TEM_DIR}/features_to_be_activated
+		if [ $? -ne 0 ]; then
+			_err_msg_="Could not copy ${_upgraded_tech_packs_file_}\nto ${TEM_DIR}/features_to_be_activated"
+			abort_script "$_err_msg_" 
+		fi
+fi
+
+#Get path of activation script
+#If we are doing an intial install or a standard upgrade then
+if [ "${FEATURE_ACTION}" != "update" -o "${UPGRADE_TYPE}" != "Rolling" ]; then
+	#we want to activate rather than reactivate these features
+	_eniq_tp_act_prog_=`iniget ENIQ_CLI -f ${ENIQ_CONF_DIR}/${SUNOS_INI} -v ENIQ_TP_ACT_PROG`
+	log_msg -t -l ${LOGFILE} -q -s "Beginning activation of feature interfaces"
+
+else
+	_eniq_tp_act_prog_=`iniget ENIQ_CLI -f ${ENIQ_CONF_DIR}/${SUNOS_INI} -v ENIQ_TP_REACT_PROG`
+fi
+_eniq_tp_act_prog_="${_installer_dir_}/${_eniq_tp_act_prog_}"
+if [ ! -x "${_eniq_tp_act_prog_}" ]; then
+    _err_msg_="Failed to locate ${_eniq_tp_act_prog_}, or is not executable"
+    abort_script "$_err_msg_" 
+fi
+
+log_msg -l ${LOGFILE} -q -s "\nThe following feature interfaces will be activated"
+log_msg -l ${LOGFILE} -q -s "=================================================="
+if [ "${FEATURE_ACTION}" != "update" ]; then
+	log_msg -l ${LOGFILE} -q -s "Format: <interface name>  <alias>"
+fi
+$CAT ${TEM_DIR}/features_to_be_activated | $SORT -u >> ${LOGFILE}
+
+# I need to change the ownership of the file to ${SYSUSER}
+$CHOWN -R ${SYSUSER} ${TEM_DIR}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not change ownership of ${TEM_DIR}"
+    abort_script "$_err_msg_"
+fi
+
+log_msg -t -l ${LOGFILE} -q -s "Starting to activate features with command"
+if [ "${FEATURE_ACTION}" != "update" -o "${UPGRADE_TYPE}" != "Rolling" ]; then
+	$ECHO "$SU - ${SYSUSER} -c \"cd ${_installer_dir_}; ${_eniq_tp_act_prog_} -f ${TEM_DIR}/features_to_be_activated\""
+	$SU - ${SYSUSER} -c "cd ${_installer_dir_}; ${_eniq_tp_act_prog_} -f ${TEM_DIR}/features_to_be_activated"
+else
+	$ECHO "$SU - ${SYSUSER} -c \"cd ${_installer_dir_}; ${_eniq_tp_act_prog_} -f ${TEM_DIR}/features_to_be_activated -m /tmp/activeInterfaces -r ${FEATURE_MAP_FILE}\""
+	$SU - ${SYSUSER} -c "cd ${_installer_dir_}; ${_eniq_tp_act_prog_} -f ${TEM_DIR}/features_to_be_activated -m /tmp/activeInterfaces -r ${FEATURE_MAP_FILE}"
+fi
+_res_=$?
+if [ ${_res_} -ne 0 ]; then
+    if [ ${_res_} -eq 40 ]; then
+	    _err_msg_="Exiting....(code: ${_res_})"
+    else
+	    _err_msg_="Failure in ${_eniq_feature_act_prog_} (code: ${_res_})"
+    fi 
+    abort_script "$_err_msg_" 
+fi
+
+if [ "${FEATURE_ACTION}" != "update" -o "${UPGRADE_TYPE}" != "Rolling" ]; then
+    log_msg -t -l ${LOGFILE} -q -s "Activation of feature interfaces completed \n"
+fi
+}
+
+
+### Function: add_features ###
+#
+# Add the ENIQ Feature(s)
+#
+# Arguments:
+#	none
+# Return Values:
+#	none
+add_features() 
+{
+if [ "${_features_file_already_exists_}" = 1 ] ; then
+	log_msg -l ${LOGFILE} -s "${FEATURES_TO_BE_INSTALLED_FILE} already exists, skipping feature list (cxc nums) file creation"
+else
+	while read line; do
+		_feature_=`$ECHO $line | $AWK -F"::" '{print $1}'`
+		if [ ! ${_feature_} ]; then
+			continue
+		fi
+		
+		_desc_=`$CAT ${FEATURE_INPUT_FILE} | $EGREP "^[[:blank:]]*${_feature_}::" | $AWK -F"::" '{print $2}'`
+		if [ ! "${_desc_}"  ]; then
+			_err_msg_="${FEATURE_INPUT_FILE} has invalid format"
+			abort_script "$_err_msg_"
+		fi
+
+		$RM -f ${TEM_DIR}/assoc_tp
+		
+		$CAT ${FEATURE_MAP_FILE} | $EGREP "^[[:blank:]]*${_feature_}::" | $AWK -F"::" '{print $2}' >  ${TEM_DIR}/assoc_tp
+		if [ ! -s ${TEM_DIR}/assoc_tp ]; then
+			_err_msg_="No Techpack/Interfaces found to be associated with ${_desc_}"
+			abort_script "$_err_msg_"
+		fi
+		
+		for _tp_ in `$CAT ${TEM_DIR}/assoc_tp`; do
+				$LS ${BASE_SW_DIR}/${ENIQ_FEATURE_INPUT_DIR} | $EGREP "^${_tp_}_R[0-9]+[a-zA-Z]+_.*\.tpi" >> /dev/null 2>&1
+				if [ $? -ne 0 ]; then
+					log_msg -l ${LOGFILE} -s "WARNING: Techpack/Interfaces ${_tp_} associated with ${_desc_} cannot be found in\n${BASE_SW_DIR}/${ENIQ_FEATURE_INPUT_DIR}\n"
+					
+				fi
+		done
+
+		
+		$ECHO ${_feature_} >> ${TEM_DIR}/_upgrade_features_to_be_installed
+		$ECHO ${_desc_} >> ${TEM_DIR}/_upgrade_features_name_to_be_installed
+	done < ${ENIQ_CORE_ETC_DIR}/features_to_be_managed
+
+	# Make a copy of the _upgrade_features_to_be_installed file in the /tmp directory
+	# so it can be retrieved if the script has to be re-run:
+	$CP ${TEM_DIR}/_upgrade_features_to_be_installed ${FEATURES_TO_BE_INSTALLED_FILE}
+		if [ $? -ne 0 ]; then
+			_err_msg_="Could not copy ${TEM_DIR}/_upgrade_features_to_be_installed\nto ${FEATURES_TO_BE_INSTALLED_FILE}"
+			abort_script "$_err_msg_" 
+		fi
+	
+	$CP ${TEM_DIR}/_upgrade_features_name_to_be_installed ${FEATURES_NAME_TO_BE_INSTALLED_FILE}
+		if [ $? -ne 0 ]; then
+			_err_msg_="Could not copy ${TEM_DIR}/_upgrade_features_name_to_be_installed\nto ${FEATURES_NAME_TO_BE_INSTALLED_FILE}"
+			abort_script "$_err_msg_" 
+		fi
+		
+	if [ ! -s ${FEATURES_TO_BE_INSTALLED_FILE} ] ; then
+		$ECHO "WARNING: failed to copy ${TEM_DIR}/_upgrade_features_to_be_installed to ${FEATURES_TO_BE_INSTALLED_FILE}. "
+	fi
+fi
+
+_eniq_feature_inst_prog_=`iniget ENIQ_CLI -f ${ENIQ_CONF_DIR}/${SUNOS_INI} -v ENIQ_TP_INST_PROG`
+_installer_dir_=`$CAT ${CLI_CONF_DIR}/${ENIQ_ENV} | $EGREP '^[[:blank:]]*INSTALLER_DIR=' | $AWK -F\= '{print $2}' | $SED -e 's|"||g'`
+
+if [ ! -d "${_installer_dir_}" ]; then
+    _err_msg_="Failed to locate ENIQ Installer Directory - ${_installer_dir_}"
+    abort_script "$_err_msg_" 
+fi
+
+_eniq_feature_inst_prog_="${_installer_dir_}/${_eniq_feature_inst_prog_}"
+	
+
+if [ "${INSTALL_TYPE}" == "stats" ]; then
+        SYSUSER=`iniget ENIQ_INSTALL_CONFIG -f ${ENIQ_CONF_DIR}/${SUNOS_INI} -v ENIQ_SYSUSER`
+        if [ ! "${SYSUSER}" ]; then
+                _err_msg_="Could not read parameter ENIQ_SYSUSER from ${ENIQ_CONF_DIR}/${SUNOS_INI} file"
+                abort_script "$_err_msg_"
+        fi
+
+        _eniq_parser_src_dir_=`iniget ENIQ_CLI -f ${ENIQ_CONF_DIR}/${SUNOS_INI} -v ENIQ_PARSERS_DIR`
+        _eniq_parser_inst_prog_=`iniget ENIQ_CLI -f ${ENIQ_CONF_DIR}/${SUNOS_INI} -v ENIQ_PARSERS_INST_PROG`
+
+        # Install ENIQ parsers if eniq_parsers and install_parsers.bsh exist
+        if [ -d "$BASE_SW_DIR/${_eniq_parser_src_dir_}" -a -x "${ENIQ_INSTALLER_DIR}/${_eniq_parser_inst_prog_}" ]; then
+
+           log_msg -l ${LOGFILE} -s "\nInstalling parsers using command"
+ 
+            log_msg -l ${LOGFILE} -s "${SU} - ${SYSUSER} -c \"${BASH} ${ENIQ_INSTALLER_DIR}/${_eniq_parser_inst_prog_} ${BASE_SW_DIR}/${_eniq_parser_src_dir_}\""
+            ${SU} - ${SYSUSER} -c "${BASH} ${ENIQ_INSTALLER_DIR}/${_eniq_parser_inst_prog_} ${BASE_SW_DIR}/${_eniq_parser_src_dir_}"
+            if [ $? -ne 0 ]; then
+                _err_msg_="Failed to install parsers"
+                abort_script "$_err_msg_"
+            else
+                if [ -f ${VAR_TMP_DIR}/current_upgrade_feature_only_ui_stage ]; then
+                    $ECHO "Engine, dwhdb Restart" > ${VAR_TMP_DIR}/current_upgrade_feature_only_ui_stage 
+                elif [ -f ${VAR_TMP_DIR}/current_add_features_ui_stage ]; then
+                    $ECHO "Engine, dwhdb Restart" > ${VAR_TMP_DIR}/current_add_features_ui_stage
+                fi
+                log_msg -l ${LOGFILE} -s "\nParsers installed successfully" 
+            fi
+        fi 
+fi
+
+# Ensure the licmgr is started
+	log_msg -t -l ${LOGFILE} -s "Restarting licmgr service"
+	$SU - ${SYSUSER} -c 'licmgr -restart'
+	if [ $? -ne 0 ]; then
+	_err_msg_="Failed to restart licmgr service"
+	abort_script "$_err_msg_"
+	fi
+
+
+
+#Separating LTE and NON-LTE features to different files
+$TOUCH -a ${LTE_FEATURES_TO_BE_INSTALLED_FILE}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not write to file ${LTE_FEATURES_TO_BE_INSTALLED_FILE}"
+    abort_script "$_err_msg_"
+fi
+if [ "${FEATURE_ACTION}" != "feature_update" ]; then 
+    $TOUCH -a ${NON_LTE_FEATURES_TO_BE_INSTALLED_FILE}
+    if [ $? -ne 0 ]; then
+        _err_msg_="Could not write to file ${NON_LTE_FEATURES_TO_BE_INSTALLED_FILE}"
+        abort_script "$_err_msg_"
+    fi
+fi
+    
+for _feat_name_ in `$CAT ${TEM_DIR}/_upgrade_features_to_be_installed`; do
+    ifLte=0
+    for i in "${features_LTE[@]}"; do
+        if [ "$_feat_name_" == "$i" ]; then
+            $ECHO $_feat_name_>> ${LTE_FEATURES_TO_BE_INSTALLED_FILE}
+            ifLte=1
+            break
+        fi
+    done
+    if [ "${FEATURE_ACTION}" != "feature_update" ]; then
+        if [ ${ifLte} -eq 0 ]; then
+            $ECHO $_feat_name_>> ${NON_LTE_FEATURES_TO_BE_INSTALLED_FILE}
+        fi
+    fi
+done
+
+log_msg -l ${LOGFILE} -q -s "The following features will be added"
+log_msg -l ${LOGFILE} -q -s "===================================="
+$CAT ${TEM_DIR}/_upgrade_features_name_to_be_installed >> ${LOGFILE}
+log_msg -t -l ${LOGFILE} -q -s "Starting to add features"
+ 
+ 
+#Check if the install program exists after platform upgrade.
+if [ ! -x "${_eniq_feature_inst_prog_}" ]; then
+    _err_msg_="${_eniq_feature_inst_prog_} not found or not executable"
+    abort_script "$_err_msg_"
+fi
+if [ "${INSTALL_TYPE}" == "stats" ]; then
+	if [ ! -s ${ENIQ_CORE_BIN_DIR}/set_core_memcache.bsh ]; then
+		_err_msg_="Failed to locate script ${SCRIPTHOME}/set_core_memcache.bsh"
+		abort_script "$_err_msg_" "${EXEC_SHELL_CMD}"
+	fi
+
+	#Checking the total RAM configured on the ENIQ server
+	RAM=`$FREE -h | $EGREP -i 'Mem:' | $AWK -F" " '{print $2}'`
+	TOTAL_RAM=${RAM%?}
+
+	log_msg -l ${LOGFILE} -q -s "Updating the ini setting with command:"
+	if [ "${TOTAL_RAM}" -a "${TOTAL_RAM}" -eq 251 -a "${STORAGE_TYPE}" == "fs" ]; then
+		log_msg -l ${LOGFILE} -q -s "${BASH} ${ENIQ_CORE_BIN_DIR}/set_core_memcache.bsh -d ${ENIQ_CONF_DIR} -m -T 23 -M 23 -L 23 -C 31 -f -l ${LOGFILE}"
+		${BASH} ${ENIQ_CORE_BIN_DIR}/set_core_memcache.bsh -d ${ENIQ_CONF_DIR} -m -T 23 -M 23 -L 23 -C 31 -f -l ${LOGFILE}
+		if [ $? -ne 0 ]; then
+			abort_script "Exiting...." "${EXEC_SHELL_CMD}"
+		fi
+	else
+	log_msg -l ${LOGFILE} -q -s "${BASH} ${ENIQ_CORE_BIN_DIR}/set_core_memcache.bsh -d ${ENIQ_CONF_DIR} -m -T 25 -M 25 -L 25 -C 25 -f -l ${LOGFILE}"
+		${BASH} ${ENIQ_CORE_BIN_DIR}/set_core_memcache.bsh -d ${ENIQ_CONF_DIR} -m -T 25 -M 25 -L 25 -C 25 -f -l ${LOGFILE}
+		if [ $? -ne 0 ]; then
+			abort_script "Exiting...." "${EXEC_SHELL_CMD}"
+		fi
+	fi
+
+    #Stop and start the scheduler,engine and dwhdb services as changing the cache values.  
+    if [ "${INSTALL}" ]; then
+        if [ ! -f ${ENIQ_CORE_ETC_DIR}/service_restart ]; then
+            stop_services "after setting cache values"
+            start_services "after setting cache values"
+        else
+            log_msg -l ${LOGFILE} -s "\nTrying to restart dwhdb ENIQ services"
+
+            $BASH ${ENIQ_ADMIN_BIN_DIR}/manage_eniq_services.bsh -a restart -s dwhdb -N | $TEE -a ${LOGFILE}
+            _rc_dwhdb_restart_=`$ECHO ${PIPESTATUS[0]}`
+            if [ ${_rc_dwhdb_restart_} -ne 0 ]; then
+                abort_script "Failed to restart dwhdb service\nExiting...." "${EXEC_SHELL_CMD}"
+            fi
+
+            log_msg -l ${LOGFILE} -s "\nTrying to restart engine ENIQ service on engine blade"
+            if [ "${CURR_SERVER_TYPE}" == "eniq_stats" ]; then
+                $BASH ${ENIQ_ADMIN_BIN_DIR}/manage_eniq_services.bsh -a restart -s engine -N | $TEE -a ${LOGFILE}
+                _rc_engine_restart_=`$ECHO ${PIPESTATUS[0]}`
+                if [ ${_rc_engine_restart_} -ne 0 ]; then
+                    abort_script "Failed to restart engine service\nExiting...." "${EXEC_SHELL_CMD}"
+                else
+                    log_msg -l ${LOGFILE} -s "Engine service started successfully on ${_host_ip_}"
+                fi
+            else
+                _host_ip_=`$CAT $ETC_HOST | $GREP -i engine | $AWK -F" " '{print $1}'`
+                run_remote_cmd "${_host_ip_}" "$BASH ${ENIQ_ADMIN_BIN_DIR}/manage_eniq_services.bsh -a restart -s engine -N >>/dev/null 2>&1" "$LOGFILE"  
+                if [ $? -ne 0 ]; then
+                    abort_script "Failed to restart engine service on ${_host_ip_}"
+                else
+                    log_msg -l ${LOGFILE} -s "Engine service started successfully on ${_host_ip_}"
+                fi
+            fi
+            if [ -f ${VAR_TMP_DIR}/current_add_features_ui_stage ]; then
+                $ECHO "Feature Install" > ${VAR_TMP_DIR}/current_add_features_ui_stage
+            fi
+        fi
+    fi
+fi
+# If the variable INSTALL is not set and we are doing a rolling upgrade
+# we try to restart all eniq services
+if [ ! "${INSTALL}" -a "${UPGRADE_TYPE}" == "Rolling" ]; then
+	# If we are doing rolling upgrade, enable dtrace before starting the services:
+	$BASH ${ENIQ_ADMIN_BIN_DIR}/manage_dtrace.bsh -a enable
+	if [ $? -ne 0 ]; then
+		_err_msg_="Failed to start symlink logging."
+		abort_script "$_err_msg_"
+	fi
+	
+    #Cleanup_manage_features if its a stats coordinator, because we changed it earlier in the setup_manage_features.
+	#This is done so the engine is only running, on the engine blade, for stats multiblade deployments,
+	#during a rolling upgrade.
+    
+	log_msg -l ${LOGFILE} -s "\nTrying to restart dwhdb ENIQ services"
+        #$BASH ${ENIQ_ADMIN_BIN_DIR}/manage_deployment_services.bsh -a restart -s ALL -N
+        $BASH ${ENIQ_ADMIN_BIN_DIR}/manage_eniq_services.bsh -a restart -s dwhdb -N | $TEE -a ${LOGFILE}
+        _rc_dwhdb_restart_=`$ECHO ${PIPESTATUS[0]}`
+        if [ ${_rc_dwhdb_restart_} -ne 0 ]; then
+            abort_script "Failed to restart dwhdb service\nExiting...." "${EXEC_SHELL_CMD}"
+        fi
+
+        log_msg -l ${LOGFILE} -s "\nTrying to restart engine ENIQ service on engine blade"
+        if [ "${CURR_SERVER_TYPE}" == "eniq_stats" ]; then
+            $BASH ${ENIQ_ADMIN_BIN_DIR}/manage_eniq_services.bsh -a restart -s engine -N | $TEE -a ${LOGFILE}
+            _rc_engine_restart_=`$ECHO ${PIPESTATUS[0]}`
+            if [ ${_rc_engine_restart_} -ne 0 ]; then
+                abort_script "Failed to restart engine service\nExiting...." "${EXEC_SHELL_CMD}"
+            else
+                log_msg -l ${LOGFILE} -s "Engine service started successfully on ${_host_ip_}"
+            fi
+        else
+            _host_ip_=`$CAT $ETC_HOST | $GREP -i engine | $AWK -F" " '{print $1}'`
+            run_remote_cmd "${_host_ip_}" "$BASH ${ENIQ_ADMIN_BIN_DIR}/manage_eniq_services.bsh -a restart -s engine -N >>/dev/null 2>&1" "$LOGFILE"  
+            if [ $? -ne 0 ]; then
+                abort_script "Failed to restart engine service on ${_host_ip_}"
+            else
+                log_msg -l ${LOGFILE} -s "Engine service started successfully on ${_host_ip_}"
+            fi
+
+        fi
+        
+        if [ -f ${VAR_TMP_DIR}/current_upgrade_feature_only_ui_stage ]; then
+            $ECHO "Feature Update" > ${VAR_TMP_DIR}/current_upgrade_feature_only_ui_stage 
+        fi
+
+#        log_msg -l ${LOGFILE} -s "\nTrying to restart dwhdb services"
+#        $BASH ${ENIQ_ADMIN_BIN_DIR}/manage_eniq_services.bsh -a restart -s dwhdb -N | $TEE -a ${LOGFILE}
+#        if [ $? -ne 0 ]; then
+#                #abort_script "Failed to start all ENIQ services\nExiting...." "${EXEC_SHELL_CMD}"
+#                abort_script "Failed to start dwhdb services\nExiting...." "${EXEC_SHELL_CMD}"
+#        fi
+    
+   
+    
+fi
+
+#If we are doing rolling upgrade
+if [ "${FEATURE_ACTION}" == "update" -o "${FEATURE_ACTION}" == "feature_update" ] && [ "${UPGRADE_TYPE}" == "Rolling" ]; then
+      
+	# We want to enable mounts before doing rolling upgrade:
+	log_msg -t -l ${LOGFILE} -s "Re-enabling OSS mounts"
+	# Get an ordered list of servers based on the server_list file:
+	_deployed_servers_="${TEM_DIR}/deployed_servers.$$.tmp"
+	$PERL ${GET_IP_ORDER_SCRIPT} -f ${_deployed_servers_}
+     
+	for _line_ in `$EGREP -i 'engine|coordinator|eniq_stats' ${_deployed_servers_}`; do
+		local _ip_address_=`$ECHO ${_line_} | $AWK -F"::" '{print $1}'`
+		local _serv_hostname_=`$ECHO ${_line_} | $AWK -F"::" '{print $2}'`
+		local _serv_type_=`$ECHO ${_line_} | $AWK -F"::" '{print $3}'` 
+		if [ ! "${_ip_address_}" -o ! "${_serv_hostname_}" -o ! "${_serv_type_}" ]; then
+			_err_msg_="Failed to enable mounts. Could not read required info from ${_deployed_servers_}."
+			abort_script "${_err_msg_}"
+		fi
+		# Stats coordinator should not run the script 
+		if [ "${_serv_type_}" != "stats_coordinator" ]; then        
+			#If the IP found in the order file matches my IP,
+			# then I better run the command locally - no need to ssh            
+			if [ "${_ip_address_}" == "${HOST_IP}" ]; then
+				log_msg -t -l ${LOGFILE} -s "Re-enabling mounts on ${HNAME}"
+				${ENIQ_ADMIN_BIN_DIR}/enable_mounts.bsh
+				if [ $? -ne 0 ]; then
+					abort_script "Failed to enable mounts on ${HNAME}"
+				else
+					log_msg -t -l ${LOGFILE} -s "Enabled mounts on ${HNAME}"
+				fi
+			else
+				log_msg -t -l ${LOGFILE} -s "Re-enabling mounts on ${_serv_hostname_}"
+				run_remote_cmd "${_ip_address_}" "$BASH ${ENIQ_ADMIN_BIN_DIR}/enable_mounts.bsh"
+				if [ $? -ne 0 ]; then
+					abort_script "Failed to enable mounts on ${_serv_hostname_}"
+				else
+					log_msg -t -l ${LOGFILE} -s "Enabled mounts on ${_serv_hostname_}"
+				fi
+			fi
+		fi
+	done
+fi
+
+if [ ! "${INSTALL}" -a "${FEATURE_ACTION}" == "update" -a "${INSTALL_TYPE}" == "stats" ]; then
+	_feature_count_=`iniget FEATURE_CONFIG -f ${ENIQ_CONF_DIR}/${ENIQ_INI} -v feature_count`
+		if [ ! "${_feature_count_}" ]; then
+			_err_msg_="Could not read parameter feature_count from ${ENIQ_CONF_DIR}/${ENIQ_INI} file"
+			abort_script "$_err_msg_"
+		fi
+fi
+
+if [ "${INSTALL}" -a "${FEATURE_ACTION}" == "add" -a "${INSTALL_TYPE}" == "stats" -a "${OPTIMIZED_INSTALLATION}" ]; then
+    _feature_count_=`iniget FEATURE_CONFIG -f ${ENIQ_CONF_DIR}/${ENIQ_INI} -v II_feature_count`
+        if [ ! "${_feature_count_}" ]; then
+            _err_msg_="Could not read parameter II_feature_count from ${ENIQ_CONF_DIR}/${ENIQ_INI} file"
+            abort_script "$_err_msg_"
+        fi
+fi
+
+while [ -s ${TEM_DIR}/_upgrade_features_to_be_installed ]; do
+	if [ ! "${INSTALL}" -a "${FEATURE_ACTION}" == "update" -a "${INSTALL_TYPE}" == "stats" ]; then
+		$HEAD -${_feature_count_} ${TEM_DIR}/_upgrade_features_to_be_installed > ${TEM_DIR}/_upgrade_max_features
+		log_msg -l ${LOGFILE} -q -s "Installing following features:"
+		log_msg -l ${LOGFILE} -q -s "===================================="
+		$CAT ${TEM_DIR}/_upgrade_max_features >> ${LOGFILE}
+		$CHOWN ${SYSUSER} ${TEM_DIR}/_upgrade_max_features
+	elif [ "${INSTALL}" -a "${FEATURE_ACTION}" == "add" -a "${INSTALL_TYPE}" == "stats" -a "${OPTIMIZED_INSTALLATION}" ]; then
+		$HEAD -${_feature_count_} ${TEM_DIR}/_upgrade_features_to_be_installed > ${TEM_DIR}/_install_max_features
+		log_msg -l ${LOGFILE} -q -s "Contents of file being passed to ${_eniq_feature_inst_prog_}"
+		log_msg -l ${LOGFILE} -q -s "Installing following features:"
+		log_msg -l ${LOGFILE} -q -s "===================================="
+		$CAT ${TEM_DIR}/_install_max_features >> ${LOGFILE}
+		$CHOWN ${SYSUSER} ${TEM_DIR}/_install_max_features
+	else
+		# I need to change the ownership of the file to ${SYSUSER}
+		$CHOWN ${SYSUSER} ${TEM_DIR}/_upgrade_features_to_be_installed
+	
+		log_msg -l ${LOGFILE} -q -s "Contents of file being passed to ${_eniq_feature_inst_prog_}"
+		$CAT ${TEM_DIR}/_upgrade_features_to_be_installed >> ${LOGFILE}
+	fi
+	ROLLING_ARGUMENT=""
+	if [ "${UPGRADE_TYPE}" == "Rolling" ]; then
+		ROLLING_ARGUMENT="-R"
+	fi
+
+	if [ ! "${INSTALL}" -a "${FEATURE_ACTION}" == "update" -a "${INSTALL_TYPE}" == "stats" ]; then
+		install_feature ${TEM_DIR}/_upgrade_max_features ${BASE_SW_DIR}
+        elif [ "${INSTALL}" -a "${FEATURE_ACTION}" == "add" -a "${INSTALL_TYPE}" == "stats" -a "${OPTIMIZED_INSTALLATION}" ]; then
+                install_feature ${TEM_DIR}/_install_max_features ${BASE_SW_DIR}                
+        else 
+            install_feature ${TEM_DIR}/_upgrade_features_to_be_installed ${BASE_SW_DIR}
+	fi
+	
+	if [ ! "${INSTALL}" -a "${FEATURE_ACTION}" == "update" -a "${INSTALL_TYPE}" == "stats" ]; then		
+		eval "$AWK 'NR > ${_feature_count_} { print }'" ${TEM_DIR}/_upgrade_features_to_be_installed > ${TEM_DIR}/_upgrade_features_to_be_installed_tmp
+		if [ $? -ne 0 ]; then
+                        abort_script "Failed to update ${TEM_DIR}/_upgrade_features_to_be_installed_tmp"
+                fi
+		$MV ${TEM_DIR}/_upgrade_features_to_be_installed_tmp ${TEM_DIR}/_upgrade_features_to_be_installed
+		if [ $? -ne 0 ]; then
+                        abort_script "Failed to update ${TEM_DIR}/_upgrade_features_to_be_installed"
+                fi
+
+                # Handling for Admin UI  
+                if [ ! -s ${TEM_DIR}/_upgrade_features_to_be_installed ]; then
+                      if [ -f ${VAR_TMP_DIR}/current_upgrade_feature_only_ui_stage ]; then
+                        $ECHO "dwhdb Restart" > ${VAR_TMP_DIR}/current_upgrade_feature_only_ui_stage
+                      fi
+                fi
+				
+				log_msg -l ${LOGFILE} -s "Putting scheduler on hold..."
+                $SU - ${_sysuser_} -c "scheduler hold"
+                _scheduler_flag_=`$SU - ${_sysuser_} -c "scheduler status" | $GREP -i "status" | $TAIL -1| $AWK '{print $2,$3}'` 
+                    if [ "${_scheduler_flag_}" == "on hold" -o "${_scheduler_flag_}" == "ON HOLD" ]; then
+                        log_msg -l ${LOGFILE} -s " Scheduler on hold successfully"
+                    else
+                        _err_msg_="Could not set scheduler to hold"
+                        abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+                    fi
+                	
+                if [ "${CURR_SERVER_TYPE}" == "eniq_stats" ]; then
+                    log_msg -l ${LOGFILE} -s "Stopping engine..."
+                   $SU - ${_sysuser_} -c "${SWBIN}/engine stop"
+                       if [ $? -ne 0 ] ; then
+                       	_err_msg_="engine failed to stop"
+                       	abort_script "${_err_msg_}"
+                       fi    
+                 else
+                    _host_ip_=`$CAT $ETC_HOST | $GREP -i engine | $AWK -F" " '{print $1}'`
+                	log_msg -l ${LOGFILE} -s "Stopping engine..."
+                           run_remote_cmd "${_host_ip_}" "$SU - ${_sysuser_} -c '${SWBIN}/engine stop'"  
+                            if [ $? -ne 0 ] ; then
+                       	        _err_msg_="engine failed to stop"
+                       	        abort_script "${_err_msg_}"
+                            fi
+                fi
+
+                
+                $BASH ${ENIQ_ADMIN_BIN_DIR}/manage_eniq_services.bsh -a restart -s repdb -N | $TEE -a ${LOGFILE}
+                _rc_repdb_restart_=`$ECHO ${PIPESTATUS[0]}`
+                if [ ${_rc_repdb_restart_} -ne 0 ]; then
+                        abort_script "Failed to restart repdb service"
+                fi
+                $BASH ${ENIQ_ADMIN_BIN_DIR}/manage_eniq_services.bsh -a restart -s dwhdb -N | $TEE -a ${LOGFILE}
+                _rc_dwhdb_restart_=`$ECHO ${PIPESTATUS[0]}`
+                if [ ${_rc_dwhdb_restart_} -ne 0 ]; then
+                        abort_script "Failed to restart dwhdb service"
+                fi
+                $SLEEP 10
+				
+				if [ "${CURR_SERVER_TYPE}" == "eniq_stats" ]; then
+                log_msg -l ${LOGFILE} -s "Starting engine..."
+                $SU - ${_sysuser_} -c "${SWBIN}/engine start"
+                   if [ $? -ne 0 ] ; then
+                   	_err_msg_="engine failed to Start"
+                   	abort_script "${_err_msg_}"
+                   fi    
+                else
+                    _host_ip_=`$CAT $ETC_HOST | $GREP -i engine | $AWK -F" " '{print $1}'`
+	                log_msg -l ${LOGFILE} -s "Starting engine..."
+                    run_remote_cmd "${_host_ip_}" "$SU - ${_sysuser_} -c '${SWBIN}/engine start'"   
+                        if [ $? -ne 0 ] ; then
+       	                    _err_msg_="engine failed to start"
+       	                    abort_script "${_err_msg_}"
+                        fi
+                fi		
+
+                log_msg -l ${LOGFILE} -s "Starting scheduler..."
+                $SU - ${_sysuser_} -c "scheduler restart"
+                _scheduler_flag_=`$SU - ${_sysuser_} -c "scheduler status" | $GREP -i "status" | $TAIL -1| $AWK '{print $2}'` 
+                    if [ "${_scheduler_flag_}" == "active" -o "${_scheduler_flag_}" == "ACTIVE" ]; then
+                        log_msg -l ${LOGFILE} -s " Scheduler started successfully"
+                    else
+                        _err_msg_="Could not start scheduler"
+                        abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+                    fi
+
+	elif [ "${INSTALL}" -a "${FEATURE_ACTION}" == "add" -a "${INSTALL_TYPE}" == "stats" -a "${OPTIMIZED_INSTALLATION}" ]; then
+		eval "$AWK 'NR > ${_feature_count_} { print }'" ${TEM_DIR}/_upgrade_features_to_be_installed > ${TEM_DIR}/_upgrade_features_to_be_installed_tmp
+		if [ $? -ne 0 ]; then
+			abort_script "Failed to update ${TEM_DIR}/_upgrade_features_to_be_installed_tmp"
+		fi
+		$MV ${TEM_DIR}/_upgrade_features_to_be_installed_tmp ${TEM_DIR}/_upgrade_features_to_be_installed
+		if [ $? -ne 0 ]; then
+			abort_script "Failed to update ${TEM_DIR}/_upgrade_features_to_be_installed"
+		fi
+		
+		log_msg -l ${LOGFILE} -s "Putting scheduler on hold..."
+        $SU - ${_sysuser_} -c "scheduler hold"
+        _scheduler_flag_=`$SU - ${_sysuser_} -c "scheduler status" | $GREP -i "status" | $TAIL -1| $AWK '{print $2,$3}'` 
+            if [ "${_scheduler_flag_}" == "on hold" -o "${_scheduler_flag_}" == "ON HOLD" ]; then
+                log_msg -l ${LOGFILE} -s " Scheduler on hold successfully"
+            else
+                _err_msg_="Could not set scheduler to hold"
+                abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+            fi
+		
+		if [ "${CURR_SERVER_TYPE}" == "eniq_stats" ]; then
+                    log_msg -l ${LOGFILE} -s "Stopping engine..."
+                   $SU - ${_sysuser_} -c "${SWBIN}/engine stop"
+                       if [ $? -ne 0 ] ; then
+                       	_err_msg_="engine failed to stop"
+                       	abort_script "${_err_msg_}"
+                       fi    
+                 else
+                    _host_ip_=`$CAT $ETC_HOST | $GREP -i engine | $AWK -F" " '{print $1}'`
+                	log_msg -l ${LOGFILE} -s "Stopping engine..."
+                           run_remote_cmd "${_host_ip_}" "$SU - ${_sysuser_} -c '${SWBIN}/engine stop'"  
+                            if [ $? -ne 0 ] ; then
+                       	        _err_msg_="engine failed to stop"
+                       	        abort_script "${_err_msg_}"
+                            fi
+        fi
+		
+		log_msg -l ${LOGFILE} -s "Stopping repdb..."
+		$SU - ${_sysuser_} -c "${ENIQ_ADMIN_BIN_DIR}/repdb stop"
+		if [ $? -ne 0 ] ; then
+			_err_msg_="repdb database failed to stop"
+			abort_script "${_err_msg_}"
+		fi
+		#Checking to see if repdb is still active, do not continue until it is inactive
+		db_service_state=true
+		while [ ${db_service_state} == 'true' ]; do
+			$PS -ef | $EGREP "repdb" | $EGREP "\/dbsrv" | $EGREP -v "grep"  >> /dev/null 2>&1
+			if [ $? -eq 0 ] ; then
+				log_msg -l ${LOGFILE} -s "Waiting until repdb is inactive before continuing"
+				$SLEEP 10
+			else
+				db_service_state=false
+			fi
+		done
+
+		log_msg -l ${LOGFILE} -s "Starting repdb..."
+		$SU - ${_sysuser_} -c "${ENIQ_ADMIN_BIN_DIR}/repdb start"
+		if [ $? -ne 0 ] ; then
+			_err_msg_="repdb database failed to start"
+			abort_script "${_err_msg_}"
+		fi
+		#Checking to see if repdb is active
+		db_service_state=true
+		while [ ${db_service_state} == 'true' ]; do
+			$PS -ef | $EGREP "repdb" | $EGREP "\/dbsrv" | $EGREP -v "grep"  >> /dev/null 2>&1
+			if [ $? -eq 0 ] ; then
+				log_msg -l ${LOGFILE} -s "repdb is active continuing"
+				db_service_state=false
+			else
+				log_msg -l ${LOGFILE} -s "Waiting until repdb is active before continuing"
+				$SLEEP 10
+			fi
+		done
+
+		log_msg -l ${LOGFILE} -s "Stopping dwhdb..."
+		$SU - ${_sysuser_} -c "${ENIQ_ADMIN_BIN_DIR}/dwhdb stop"
+		if [ $? -ne 0 ] ; then
+			_err_msg_="dwhdb database failed to stop"
+			abort_script "${_err_msg_}"
+		fi
+		#Checking to see if dwhdb is still active, do not continue until it is inactive
+		db_service_state=true
+		while [ ${db_service_state} == 'true' ]; do
+			$PS -ef | $EGREP "dwhdb" | $EGREP "\/iqsrv" | $EGREP -v "grep"  >> /dev/null 2>&1
+			if [ $? -eq 0 ] ; then
+				log_msg -l ${LOGFILE} -s "Waiting until dwhdb is inactive before continuing"
+				$SLEEP 10
+			else
+				db_service_state=false
+			fi
+		done
+
+		log_msg -l ${LOGFILE} -s "Starting dwhdb..."
+		$SU - ${_sysuser_} -c "${ENIQ_ADMIN_BIN_DIR}/dwhdb start"
+		if [ $? -ne 0 ] ; then
+			_err_msg_="dwhdb database failed to start"
+			abort_script "${_err_msg_}"
+		fi
+		#Checking to see if dwhdb is active
+		db_service_state=true
+		while [ ${db_service_state} == 'true' ]; do
+			$PS -ef | $EGREP "dwhdb" | $EGREP "\/iqsrv" | $EGREP -v "grep"  >> /dev/null 2>&1
+			if [ $? -eq 0 ] ; then
+				log_msg -l ${LOGFILE} -s "dwhdb is active continuing"
+				db_service_state=false
+			else
+				log_msg -l ${LOGFILE} -s "Waiting until dwhdb is active before continuing"
+				$SLEEP 10
+			fi
+		done
+		
+		if [ "${CURR_SERVER_TYPE}" == "eniq_stats" ]; then
+                log_msg -l ${LOGFILE} -s "Starting engine..."
+                $SU - ${_sysuser_} -c "${SWBIN}/engine start"
+                   if [ $? -ne 0 ] ; then
+                   	_err_msg_="engine failed to Start"
+                   	abort_script "${_err_msg_}"
+                   fi    
+                else
+                    _host_ip_=`$CAT $ETC_HOST | $GREP -i engine | $AWK -F" " '{print $1}'`
+	                log_msg -l ${LOGFILE} -s "Starting engine..."
+                    run_remote_cmd "${_host_ip_}" "$SU - ${_sysuser_} -c '${SWBIN}/engine start'"   
+                        if [ $? -ne 0 ] ; then
+       	                    _err_msg_="engine failed to start"
+       	                    abort_script "${_err_msg_}"
+                        fi
+         fi		
+
+                log_msg -l ${LOGFILE} -s "Starting scheduler..."
+                $SU - ${_sysuser_} -c "scheduler restart"
+                _scheduler_flag_=`$SU - ${_sysuser_} -c "scheduler status" | $GREP -i "status" | $TAIL -1| $AWK '{print $2}'` 
+                    if [ "${_scheduler_flag_}" == "active" -o "${_scheduler_flag_}" == "ACTIVE" ]; then
+                        log_msg -l ${LOGFILE} -s " Scheduler started successfully"
+                    else
+                        _err_msg_="Could not start scheduler"
+                        abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+                    fi
+
+		
+	else
+		$RM -rf ${TEM_DIR}/_upgrade_features_to_be_installed
+	fi
+done
+
+# Revert repdb.cfg connection parameter from -gm 400 to -gm 250
+# Reset cache values in ini back to normal setting..
+if [ "${INSTALL_TYPE}" == "stats" ]; then
+	revert_repdb_connection
+	reset_cache_in_ini
+fi
+
+
+log_msg -t -l ${LOGFILE} -q -s "Addition of features completed \n"
+}
+
+### Function: reset_cache_in_ini ###
+#
+# Reset cache values in ini back to normal setting
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+reset_cache_in_ini()
+{
+log_msg -l ${LOGFILE} -q -s "Putting back the settings in niq.ini for cache with command:"
+log_msg -l ${LOGFILE} -q -s "${BASH} ${ENIQ_CORE_BIN_DIR}/set_core_memcache.bsh -d ${ENIQ_CONF_DIR} -m -f -l ${LOGFILE}"
+${BASH} ${ENIQ_CORE_BIN_DIR}/set_core_memcache.bsh -d ${ENIQ_CONF_DIR} -m -f -l ${LOGFILE}
+if [ $? -ne 0 ]; then
+	abort_script "Exiting...." "${EXEC_SHELL_CMD}"
+fi
+
+#if it's not rolling upgrade restart the services 
+if [ "${UPGRADE_TYPE}" != "Rolling" ] ; then
+    stop_services "after re-setting cache values to original"
+    start_services "after re-setting cache values to original"
+else
+#if it's a rolling upgrade restart all services
+#	log_msg -l ${LOGFILE} -s "\nRestarting all ENIQ services"
+#	$BASH ${ENIQ_ADMIN_BIN_DIR}/manage_deployment_services.bsh -a restart -s ALL -N
+#	if [ $? -ne 0 ]; then
+#		abort_script "Failed to restart all ENIQ services\nExiting...." "${EXEC_SHELL_CMD}"
+#	fi
+    log_msg -l ${LOGFILE} -s "\nRestarting dwhdb services"
+
+    $BASH ${ENIQ_ADMIN_BIN_DIR}/manage_eniq_services.bsh -a restart -s dwhdb -N | $TEE -a ${LOGFILE}
+    _rc_dwhdb_restart_=`$ECHO ${PIPESTATUS[0]}`
+    if [ ${_rc_dwhdb_restart_} -ne 0 ]; then
+        #abort_script "Failed to start all ENIQ services\nExiting...." "${EXEC_SHELL_CMD}"
+        abort_script "Failed to start dwhdb services\nExiting...." "${EXEC_SHELL_CMD}"
+    else
+        if [ ! -f ${VAR_TMP_DIR}/feature_failure ]; then
+            if [ -f ${VAR_TMP_DIR}/current_add_features_ui_stage ]; then
+                $ECHO "Interface Activation" > ${VAR_TMP_DIR}/current_add_features_ui_stage
+            fi
+        else
+            # Removing flag to update current stage file for Admin UI
+            $RM -rf ${VAR_TMP_DIR}/feature_failure
+        fi
+    fi
+fi
+
+}
+
+### Function: chk_create_logfile ###
+#
+# Check/Create Logfile
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+chk_create_logfile()
+{
+$MKDIR -p `$DIRNAME ${LOGFILE}`
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not create directory `$DIRNAME ${LOGFILE}`"
+     abort_script "$_err_msg_"
+fi  
+
+$TOUCH -a ${LOGFILE}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not write to file ${LOGFILE}"
+    abort_script "$_err_msg_"
+fi  
+
+# Changing permission of logfile
+$CHMOD 777 ${LOGFILE}
+}
+
+
+
+### Function: check_id ###
+#
+#   Check that the effective id of the user is correct
+#   If not print error msg and exit.
+#
+# Arguments:
+#       $1 : User ID name
+# Return Values:
+#       none
+check_id()
+{
+_check_id_=`$ID  | $AWK -F\( '{print $2}' | $AWK -F\) '{print $1}'`
+if [ "$_check_id_" != "$1" ]; then
+    _err_msg_="You must be $1 to execute this script."
+    abort_script "$_err_msg_"
+fi
+}
+
+
+
+
+### Function: check_input_params ###
+#
+# Check the Input Parameters.
+#
+# Arguments:
+#       $1 : User ID name
+# Return Values:
+#       none
+check_input_params()
+{
+if [ ! "${FEATURE_ACTION}" ]; then
+    usage_msg
+    exit 1
+fi
+
+case "${FEATURE_ACTION}" in
+    activate) :
+        	  ;;
+    	 add) :
+        	  ;;
+      update) :
+        	  ;;
+    feature_update) :
+                ;;
+    	   *) usage_msg
+    		  exit 1
+       		  ;;
+esac 
+
+if [ "${FEATURE_ACTION}" == "activate" -o "${FEATURE_ACTION}" == "add" ]; then
+    if [ ! "${ENIQ_FEATURE_FILE}" ]; then
+	    usage_msg
+	    exit 1
+    fi
+fi
+
+if [ "${GET_FEATURE_LIST}" != "NO" ]; then
+$RM -rf ${ENIQ_CORE_ETC_DIR}/features_to_be_managed
+fi
+
+if [ "${ENIQ_FEATURE_FILE}" ]; then
+    check_feature_file
+    $CAT ${ENIQ_FEATURE_FILE} >> ${ENIQ_CORE_ETC_DIR}/features_to_be_managed
+fi
+
+if [ "${ENIQ_FEATURE}" ]; then
+  	$ECHO ${ENIQ_FEATURE} >> ${ENIQ_CORE_ETC_DIR}/features_to_be_managed
+fi
+
+# Copy Feature Description/Mapping file
+ copy_feature_files ${BASE_SW_DIR}
+
+# Check/Update Feature Description/Mapping file
+check_update_feature_files
+
+# Recompiling invalid views
+recompile_invalid_views
+}
+### Function: install_feature ###
+# This is used to install feature with tp_installer
+# 
+#
+# Arguments:
+#       $1 :Feature list to be installed  
+#       $2 : Software directory path
+# Return Values:
+#       none
+install_feature(){
+
+log_msg -l ${LOGFILE} -q -s "$SU - ${SYSUSER} -c \"cd ${_installer_dir_}; ${_eniq_feature_inst_prog_} -c ${1} -p ${2}/${ENIQ_FEATURE_INPUT_DIR} ${ROLLING_ARGUMENT} ${TPI_SMF_TYPE} ${NO_PROVISIONING}\""
+$SU - ${SYSUSER} -c "cd ${_installer_dir_}; ${_eniq_feature_inst_prog_} -c ${1} -p ${2}/${ENIQ_FEATURE_INPUT_DIR} ${ROLLING_ARGUMENT} ${TPI_SMF_TYPE} ${NO_PROVISIONING}"
+_res_=$?
+if [ ${_res_} -ne 0 ]; then
+    # Flag to update current stage file for Admin UI
+    $TOUCH ${VAR_TMP_DIR}/feature_failure
+    if [ $? -ne 0 ]; then
+        _err_msg_="Could not create ${VAR_TMP_DIR}/feature_failure." 
+        abort_script "${_err_msg_}"
+    fi
+
+    if [ ${_res_} -eq 40 ]; then
+        _err_msg_="Exiting....(code: ${_res_})"
+    else
+        _err_msg_="Failure in ${_eniq_feature_inst_prog_} (code: ${_res_})"
+    fi
+    # IF -X parameter is passed in , run this
+    # Done because of multi OSS for multi MB not to run this
+	# Revert repdb.cfg connection parameter from -gm 400 to -gm 250
+    # Reset cache values in ini back to normal setting..
+    if [ "${INSTALL_TYPE}" == "stats" ]; then
+        revert_repdb_connection
+		reset_cache_in_ini
+    fi
+    abort_script "${_err_msg_}"
+else
+    if [ -f ${VAR_TMP_DIR}/current_add_features_ui_stage ]; then
+        $ECHO "dwhdb Restart" > ${VAR_TMP_DIR}/current_add_features_ui_stage
+    fi
+fi
+}
+### Function: check_feature_file ###
+#
+# Make sure user specified a full pathname and file is not empty
+# If not print error msg and exit.
+#
+# Arguments:
+#       $1 : User ID name
+# Return Values:
+#       none
+check_feature_file()
+{
+check_full_pathname ${ENIQ_FEATURE_FILE}
+if [ $? -ne 0 ]; then
+    _err_msg_="${ENIQ_FEATURE_FILE} is not a full pathname."
+    abort_script "$_err_msg_"
+fi
+
+if [ ! -s "${ENIQ_FEATURE_FILE}" ]; then
+    _err_msg_="No ENIQ Features listed in ${ENIQ_FEATURE_FILE}"
+    abort_script "$_err_msg_"
+fi	
+}
+
+### Function: check_update_feature_files ###
+#
+# Check/Update Feature Description/Mapping file
+#
+# Arguments:
+#	none
+# Return Values:
+#	none
+check_update_feature_files()
+{
+
+local _no_feature_input_file_=0
+
+# Get Directory on the install media where the feature description file should be
+ENIQ_FEATURE_INPUT_DIR=`iniget FEATURE_INFO -f ${CLI_CONF_DIR}/${ENIQ_INI} -v Feature_Input_Dir`
+if [ ! "${ENIQ_FEATURE_INPUT_DIR}" ]; then
+    _err_msg_="Failed to read Parameter Feature_Input_Dir from ${CLI_CONF_DIR}/${ENIQ_INI}"
+    abort_script "$_err_msg_" 
+fi
+
+# Does the feature directory exist
+if [ ! -d "${BASE_SW_DIR}/${ENIQ_FEATURE_INPUT_DIR}" ]; then
+    _err_msg_="Feature software directory ${BASE_SW_DIR}/${ENIQ_FEATURE_INPUT_DIR} does not exist"
+    abort_script "$_err_msg_" 
+fi
+
+# Get file where the ENIQ Features are listed on install media
+_tem_feature_input_file_=`iniget FEATURE_INFO -f ${CLI_CONF_DIR}/${ENIQ_INI} -v Feature_Input_File`
+if [ ! "${_tem_feature_input_file_}" ]; then
+    _err_msg_="Could not read parameter Feature_Input_File from ${CLI_CONF_DIR}/${ENIQ_INI} file"
+    abort_script "$_err_msg_" 
+fi
+
+FEATURE_INPUT_FILE="${BASE_SW_DIR}/${ENIQ_FEATURE_INPUT_DIR}/${_tem_feature_input_file_}"
+if [ ! -s ${FEATURE_INPUT_FILE} ]; then
+    $ECHO "${FEATURE_INPUT_FILE} file is empty or does not exist"
+	_no_feature_input_file_=1
+fi
+
+if [ ${_no_feature_input_file_} -ne 1 ]; then
+	# Get file where the ENIQ Features are mapped to associated interfaces on install media
+	_tem_feature_map_file_=`iniget FEATURE_INFO -f ${CLI_CONF_DIR}/${ENIQ_INI} -v Feature_Mapping_File`
+	if [ ! "${_tem_feature_map_file_}" ]; then
+		_err_msg_="Could not read parameter Feature_Mapping_File from file\n${CLI_CONF_DIR}/${ENIQ_INI}"
+		abort_script "$_err_msg_" 
+	fi
+     FEATURE_MAP_FILE="${BASE_SW_DIR}/${ENIQ_FEATURE_INPUT_DIR}/${_tem_feature_map_file_}"
+    if [ ! -s ${FEATURE_MAP_FILE} ]; then
+		 _err_msg_="${FEATURE_MAP_FILE} file does not exist"
+		abort_script "$_err_msg_" 
+	fi
+
+	# Get the System User/Group. All directories are owned by this
+	SYSUSER=`iniget ENIQ_INSTALL_CONFIG -f ${ENIQ_CONF_DIR}/${SUNOS_INI} -v ENIQ_SYSUSER`
+	if [ ! "${SYSUSER}" ]; then
+		_err_msg_="Could not read parameter ENIQ_SYSUSER from ${CLI_CONF_DIR}/${ENIQ_INI} file"
+		abort_script "$_err_msg_" 
+	fi
+
+	_sysgrp_=`$ID ${SYSUSER} | $AWK '{print $2}' | $AWK -F\( '{print $2}' | $AWK -F\) '{print $1}'`
+	if [ ! "${_sysgrp_}" ]; then
+		_err_msg_="Could not determine group ID of ${SYSUSER}"
+		abort_script "$_err_msg_" 
+	fi
+
+	_update_=0
+	if [ -s ${CLI_CONF_DIR}/${_tem_feature_input_file_} ]; then
+		# Compare the two files. If different then update
+		$CMP -s ${FEATURE_INPUT_FILE} ${CLI_CONF_DIR}/${_tem_feature_input_file_}
+		if [ $? -ne 0 ]; then
+			_update_=1
+		fi
+	fi
+
+	if [ ${_update_} -eq 1 ]; then
+		# Make a backup of existing file first
+		$MKDIR -p ${CLI_CONF_DIR}/backup
+		$CHOWN ${SYSUSER}:${_sysgrp_} ${CLI_CONF_DIR}/backup
+		$CP ${CLI_CONF_DIR}/${_tem_feature_input_file_} ${CLI_CONF_DIR}/backup/${_tem_feature_input_file_}_${RUN_TIME}
+			if [ $? -ne 0 ]; then
+				_err_msg_="Could not copy ${CLI_CONF_DIR}/${_tem_feature_input_file_}\nto ${CLI_CONF_DIR}/backup/${_tem_feature_input_file_}_${RUN_TIME}"
+				abort_script "$_err_msg_" 
+			fi
+		
+		# Copy the new file in
+		$CP ${FEATURE_INPUT_FILE} ${CLI_CONF_DIR}/${_tem_feature_input_file_}
+			if [ $? -ne 0 ]; then
+				_err_msg_="Could not copy ${FEATURE_INPUT_FILE} to ${CLI_CONF_DIR}/${_tem_feature_input_file_}"
+				abort_script "$_err_msg_" 
+			fi
+	fi
+
+	$CHOWN ${SYSUSER}:${_sysgrp_} ${CLI_CONF_DIR}/${_tem_feature_input_file_}
+	if [ $? -ne 0 ]; then
+		_err_msg_="Could not set ownership of ${CLI_CONF_DIR}/${_tem_feature_input_file_} to ${SYSUSER}:${_sysgrp_}"
+		abort_script "$_err_msg_" 
+	fi
+
+	_update_=0
+	if [ -s ${CLI_CONF_DIR}/${_tem_feature_map_file_} ]; then
+		# Compare the two files. If different then update
+		$CMP -s ${FEATURE_MAP_FILE} ${CLI_CONF_DIR}/${_tem_feature_map_file_}
+		if [ $? -ne 0 ]; then
+			_update_=1
+		fi
+	fi
+
+	if [ ${_update_} -eq 1 ]; then
+		# Make a backup of existing file first
+		$MKDIR -p ${CLI_CONF_DIR}/backup
+		$CHOWN ${SYSUSER}:${_sysgrp_} ${CLI_CONF_DIR}/backup
+		$CP ${CLI_CONF_DIR}/${_tem_feature_map_file_} ${CLI_CONF_DIR}/backup/${_tem_feature_map_file_}_${RUN_TIME}
+			if [ $? -ne 0 ]; then
+				_err_msg_="Could not copy ${CLI_CONF_DIR}/${_tem_feature_map_file_}\nto ${CLI_CONF_DIR}/backup/${_tem_feature_map_file_}_${RUN_TIME}"
+				abort_script "$_err_msg_" 
+			fi
+		
+		# Copy the new file in
+		$CP ${FEATURE_MAP_FILE} ${CLI_CONF_DIR}/${_tem_feature_map_file_}
+			if [ $? -ne 0 ]; then
+				_err_msg_="Could not ${FEATURE_MAP_FILE} to ${CLI_CONF_DIR}/${_tem_feature_map_file_}"
+				abort_script "$_err_msg_" 
+			fi
+	fi
+
+	$CHOWN ${SYSUSER}:${_sysgrp_} ${CLI_CONF_DIR}/${_tem_feature_map_file_}
+	if [ $? -ne 0 ]; then
+		_err_msg_="Could not set ownership of ${CLI_CONF_DIR}/${_tem_feature_map_file_} to ${SYSUSER}:${_sysgrp_}"
+		abort_script "$_err_msg_" 
+	fi
+else
+        $ECHO "Could not generate a list of Feature licences from ${_no_feature_input_file_}.Only ENIQ Standard installation will be processed."
+fi
+
+}
+
+### Function: cleanup_manage_features###
+#
+#   Remove un-used files,reset files that were changed for the upgrade
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+cleanup_manage_features()
+{
+# Get the System User/Group. All directories are owned by this
+_sysuser_=`iniget ENIQ_INSTALL_CONFIG -f ${ENIQ_CONF_DIR}/${SUNOS_INI} -v ENIQ_SYSUSER`
+if [ ! "${_sysuser_}" ]; then
+    _err_msg_="Could not read parameter ENIQ_SYSUSER from file ${ENIQ_CONF_DIR}/${SUNOS_INI}"
+    abort_script "$_err_msg_" "${EXEC_SHELL_CMD}"
+fi
+
+_sysgrp_=`$ID ${_sysuser_} | $AWK '{print $2}' | $AWK -F\( '{print $2}' | $AWK -F\) '{print $1}'`
+if [ ! "${_sysgrp_}" ]; then
+    _err_msg_="Could not determine group ID of ${_sysgrp_}"
+    abort_script "$_err_msg_" "${EXEC_SHELL_CMD}"
+fi
+
+# Revert repdb.cfg connection parameter from -gm 400 to -gm 250.
+revert_repdb_connection
+}
+
+### Function: confirm_user_input ###
+#
+# Confirm with user that values entered are correct
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+confirm_user_input()
+{
+while :; do
+    $CLEAR
+    
+    $CAT ${1}
+    read USER_CONF
+
+    # If the User hit nothing
+    if [ ! "${USER_CONF}" ]; then
+        continue
+    fi
+
+    # Did the user input (Y/y)
+    if [ "${USER_CONF}" == "Y" -o "${USER_CONF}" == "y" -o "${USER_CONF}" == "N" -o "${USER_CONF}" == "n" ]; then
+        break
+    fi
+done
+}
+
+### Function: copy_feature_files ###
+#
+# Copy Feature Description/Mapping file
+#
+# Arguments:
+#    none
+# Return Values:
+#    none
+copy_feature_files()
+{
+log_msg -l ${LOGFILE} -q -s "\nRetrieving feature information from ${ENIQ_CONF_DIR}/${ENIQ_INI}" 
+
+# Get Directory on the install media where the feature description file should be
+ENIQ_FEATURE_INPUT_DIR=`iniget FEATURE_INFO -f ${ENIQ_CONF_DIR}/${ENIQ_INI} -v Feature_Input_Dir`
+if [ ! "${ENIQ_FEATURE_INPUT_DIR}" ]; then
+    _err_msg_="Failed to read Parameter Feature_Input_Dir from ${ENIQ_CONF_DIR}/${ENIQ_INI}"
+    abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+fi
+
+# Does the directory exist
+if [ ! -d "${BASE_SW_DIR}/${ENIQ_FEATURE_INPUT_DIR}" ]; then
+    _err_msg_="Feature Directory ${BASE_SW_DIR}/${ENIQ_FEATURE_INPUT_DIR} does not exist"
+    abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+fi
+
+# Get file where the ENIQ Features are listed on install media
+_tem_feature_input_file_=`iniget FEATURE_INFO -f ${ENIQ_CONF_DIR}/${ENIQ_INI} -v Feature_Input_File`
+if [ ! "${_tem_feature_input_file_}" ]; then
+    _err_msg_="Could not read parameter Feature_Input_File from file\n${ENIQ_CONF_DIR}/${ENIQ_INI}"
+    abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+fi
+
+FEATURE_INPUT_FILE="${BASE_SW_DIR}/${ENIQ_FEATURE_INPUT_DIR}/${_tem_feature_input_file_}"
+if [ ! -s ${FEATURE_INPUT_FILE} ]; then
+    if [ "$INSTALL_TYPE" == "stats" ]; then
+        $ECHO "Feature file ${BASE_SW_DIR}/${ENIQ_FEATURE_INPUT_DIR}/${_tem_feature_input_file_} does not exist"
+        return
+    else
+        _err_msg_="File ${FEATURE_INPUT_FILE} does not exist"
+        abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+    fi
+fi
+
+# Get file name for AdminUI
+_tem_feature_id_file_=`iniget FEATURE_INFO -f ${ENIQ_CONF_DIR}/${ENIQ_INI} -v Feature_Identity_File`
+if [ ! "${_tem_feature_id_file_}" ]; then
+    _err_msg_="Could not read parameter Feature_Identity_File from file\n${ENIQ_CONF_DIR}/${ENIQ_INI}"
+    abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+fi
+
+FEATURE_ID_FILE="${BASE_SW_DIR}/${ENIQ_FEATURE_INPUT_DIR}/${_tem_feature_id_file_}"
+if [ ! -s ${FEATURE_ID_FILE} ]; then
+    _err_msg_="File ${FEATURE_ID_FILE} does not exist"
+    abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+fi
+
+# Get file where the ENIQ Features are mapped to associated interfaces on install media
+_tem_feature_map_file_=`iniget FEATURE_INFO -f ${ENIQ_CONF_DIR}/${ENIQ_INI} -v Feature_Mapping_File`
+if [ ! "${_tem_feature_map_file_}" ]; then
+    _err_msg_="Could not read parameter Feature_Mapping_File from file\n${ENIQ_CONF_DIR}/${ENIQ_INI}"
+    abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+fi
+
+FEATURE_MAP_FILE="${BASE_SW_DIR}/${ENIQ_FEATURE_INPUT_DIR}/${_tem_feature_map_file_}"
+if [ ! -s ${FEATURE_MAP_FILE} ]; then
+    _err_msg_="File ${FEATURE_MAP_FILE} does not exist"
+    abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+fi
+
+# Get file where the ENIQ Features are mapped for BO reports on install media
+_tem_feature_report_file_=`iniget FEATURE_INFO -f ${ENIQ_CONF_DIR}/${ENIQ_INI} -v Feature_Reports_File`
+if [ ! "${_tem_feature_report_file_}" ]; then
+    _err_msg_="Could not read parameter Feature_Reports_File from file\n${ENIQ_CONF_DIR}/${ENIQ_INI}"
+    abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+fi
+
+FEATURE_REPORTS_FILE="${BASE_SW_DIR}/${ENIQ_FEATURE_INPUT_DIR}/${_tem_feature_report_file_}"
+if [ ! -e ${FEATURE_REPORTS_FILE} ]; then
+    _err_msg_="File ${FEATURE_REPORTS_FILE} does not exist"
+    abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+fi
+
+# Get the System User/Group. All directories are owned by this
+_sysuser_=`iniget ENIQ_INSTALL_CONFIG -f ${ENIQ_CONF_DIR}/${SUNOS_INI} -v ENIQ_SYSUSER`
+if [ ! "${_sysuser_}" ]; then
+    _err_msg_="Could not read parameter ENIQ_SYSUSER from file ${ENIQ_CONF_DIR}/${SUNOS_INI}"
+    abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+fi
+
+
+_sysgrp_=`$ID ${_sysuser_} | $AWK '{print $2}' | $AWK -F\( '{print $2}' | $AWK -F\) '{print $1}'`
+if [ ! "${_sysgrp_}" ]; then
+    _err_msg_="Could not determine group ID of ${_sysgrp_}"
+    abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+fi
+
+_cli_conf_dir_=`$CAT ${ENIQ_CONF_DIR}/${ENIQ_ENV} | $EGREP "^[[:blank:]]*CONF_DIR=" | $AWK -F\= '{print $2}' | $SED -e 's|"||g'`
+if [ ! "${_cli_conf_dir_}" ]; then
+    _err_msg_="Could not read CLI_CONF_DIR parameter from ${TEM_DIR}/${ENIQ_ENV}"
+    abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+fi
+
+if [ "${INSTALL_TYPE}" == "stats" ]; then
+    # Get file where the ENIQ SOEM Features are listed on install media
+    _tem_soem_feature_input_file_=`iniget FEATURE_INFO -f ${ENIQ_CONF_DIR}/${ENIQ_INI} -v Soem_Feature_Input_File`
+    if [ ! "${_tem_soem_feature_input_file_}" ]; then
+        _err_msg_="Could not read parameter Feature_Input_File from file\n${ENIQ_CONF_DIR}/${ENIQ_INI}"
+        abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+    fi
+    # Does the file exist
+    SOEM_FEATURE_INPUT_FILE="${BASE_SW_DIR}/${ENIQ_FEATURE_INPUT_DIR}/${_tem_soem_feature_input_file_}"
+    if [ ! -s ${SOEM_FEATURE_INPUT_FILE} ]; then
+        _err_msg_="File ${BASE_SW_DIR}/${ENIQ_FEATURE_INPUT_DIR}/${_tem_soem_feature_input_file_} does not exist"
+        abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+    fi
+
+    log_msg -l ${LOGFILE} -q -s "Copying ${SOEM_FEATURE_INPUT_FILE} to ${_cli_conf_dir_}/${_tem_soem_feature_input_file_}"
+    $CP ${SOEM_FEATURE_INPUT_FILE} ${_cli_conf_dir_}/${_tem_soem_feature_input_file_}
+    if [ $? -ne 0 ]; then
+        _err_msg_="Error copying ${SOEM_FEATURE_INPUT_FILE} to ${_cli_conf_dir_}/${_tem_soem_feature_input_file_}"
+        abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+    fi
+    $CHOWN ${_sysuser_}:${_sysgrp_} ${_cli_conf_dir_}/${_tem_soem_feature_input_file_}
+    if [ $? -ne 0 ]; then
+        _err_msg_="Error setting ownership of ${_cli_conf_dir_}/${_tem_soem_feature_input_file_} to ${_sysuser_}:${_sysgrp_}"
+        abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+    fi
+
+    # Get file where the ESM Mapping description is present on install media
+    _tem_esm_mapping_file_=`iniget FEATURE_INFO -f ${ENIQ_CONF_DIR}/${ENIQ_INI} -v Feature_ESM_Mapping_File`
+    if [ ! "${_tem_esm_mapping_file_}" ]; then
+        _err_msg_="Could not read parameter Feature_Input_File from file\n${ENIQ_CONF_DIR}/${ENIQ_INI}"
+        abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+    fi
+    # Does the file exist
+    ESM_MAPPING_FILE="${BASE_SW_DIR}/${ENIQ_FEATURE_INPUT_DIR}/${_tem_esm_mapping_file_}"
+    if [ ! -s ${ESM_MAPPING_FILE} ]; then
+        _err_msg_="File ${BASE_SW_DIR}/${ENIQ_FEATURE_INPUT_DIR}/${_tem_esm_mapping_file_} does not exist"
+        abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+    fi
+
+    log_msg -l ${LOGFILE} -q -s "Copying ${ESM_MAPPING_FILE} to ${_cli_conf_dir_}/${_tem_esm_mapping_file_}" 
+    $CP ${ESM_MAPPING_FILE} ${_cli_conf_dir_}/${_tem_esm_mapping_file_}
+    if [ $? -ne 0 ]; then
+        _err_msg_="Error copying ${ESM_MAPPING_FILE} to ${_cli_conf_dir_}/${_tem_esm_mapping_file_}"
+        abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+    fi
+    $CHOWN ${_sysuser_}:${_sysgrp_} ${_cli_conf_dir_}/${_tem_esm_mapping_file_}
+    if [ $? -ne 0 ]; then
+        _err_msg_="Error setting ownership of ${_cli_conf_dir_}/${_tem_esm_mapping_file_} to ${_sysuser_}:${_sysgrp_}"
+        abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+    fi
+
+    # Get file that have details about all the in directories for pmdata and topology files
+    _tem_eniq_xml_file_=`iniget FEATURE_INFO -f ${ENIQ_CONF_DIR}/${ENIQ_INI} -v Eniq_xml_File`
+    if [ ! "${_tem_eniq_xml_file_}" ]; then
+        _err_msg_="Could not read parameter Eniq_xml_File from file\n${ENIQ_CONF_DIR}/${ENIQ_INI}"
+        abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+    fi
+
+    # Does the file exist
+    ENIQ_XML_FILE="${BASE_SW_DIR}/${ENIQ_FEATURE_INPUT_DIR}/${_tem_eniq_xml_file_}"
+
+    if [ ! -s ${ENIQ_XML_FILE} ]; then
+        _err_msg_="File ${ENIQ_XML_FILE} does not exist"
+        abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+    fi
+
+    log_msg -l ${LOGFILE} -q -s "Copying ${ENIQ_XML_FILE} to ${_cli_conf_dir_}/${_tem_eniq_xml_file_}"
+    $CP ${ENIQ_XML_FILE} ${_cli_conf_dir_}/${_tem_eniq_xml_file_}
+    if [ $? -ne 0 ]; then
+        _err_msg_="Error copying ${ENIQ_XML_FILE} to ${_cli_conf_dir_}/${_tem_eniq_xml_file_}"
+        abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+    fi
+
+    $CHOWN ${_sysuser_}:${_sysgrp_} ${_cli_conf_dir_}/${_tem_eniq_xml_file_}
+    if [ $? -ne 0 ]; then
+        _err_msg_="Error setting ownership of ${_cli_conf_dir_}/${_tem_eniq_xml_file_} to ${_sysuser_}:${_sysgrp_}"
+        abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+    fi
+
+    # Get file where the nodes are mapped with technology
+    _tem_node_mapping_file_=`iniget FEATURE_INFO -f ${ENIQ_CONF_DIR}/${ENIQ_INI} -v Node_Technology_Mapping_File`
+    if [ ! "${_tem_node_mapping_file_}" ]; then
+        _err_msg_="Could not read parameter Node_Technology_Mapping_File from file\n${ENIQ_CONF_DIR}/${ENIQ_INI}"
+        abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+    fi
+
+
+    # Does the file exist
+    NODE_TECHNOLOGY_MAP_FILE="${BASE_SW_DIR}/${ENIQ_FEATURE_INPUT_DIR}/${_tem_node_mapping_file_}"
+
+    if [ ! -s ${NODE_TECHNOLOGY_MAP_FILE} ]; then
+        _err_msg_="File ${NODE_TECHNOLOGY_MAP_FILE} does not exist"
+        abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+    fi
+
+    log_msg -l ${LOGFILE} -q -s "Copying ${NODE_TECHNOLOGY_MAP_FILE} to ${_cli_conf_dir_}/${_tem_node_mapping_file_}"
+    $CP ${NODE_TECHNOLOGY_MAP_FILE} ${_cli_conf_dir_}/${_tem_node_mapping_file_}
+    if [ $? -ne 0 ]; then
+        _err_msg_="Error copying ${NODE_TECHNOLOGY_MAP_FILE} to ${_cli_conf_dir_}/${_tem_node_mapping_file_}"
+        abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+    fi
+
+    $CHOWN ${_sysuser_}:${_sysgrp_} ${_cli_conf_dir_}/${_tem_node_mapping_file_}
+    if [ $? -ne 0 ]; then
+        _err_msg_="Error setting ownership of ${_cli_conf_dir_}/${_tem_node_mapping_file_} to ${_sysuser_}:${_sysgrp_}"
+        abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+    fi
+
+    # Get file that contains the nodeType and nodeFDN column names for the Topology tables and it’s corresponding TechPack name
+    _tem_topology_table_file_=`iniget FEATURE_INFO -f ${ENIQ_CONF_DIR}/${ENIQ_INI} -v Topology_Table_File`
+    if [ ! "${_tem_topology_table_file_}" ]; then
+        _err_msg_="Could not read parameter Topology_Table_File from file\n${ENIQ_CONF_DIR}/${ENIQ_INI}"
+        abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+    fi
+
+    # Does the file exist
+    TOPOLOGY_TABLE_FILE="${BASE_SW_DIR}/${ENIQ_FEATURE_INPUT_DIR}/${_tem_topology_table_file_}"    
+
+    if [ ! -s ${TOPOLOGY_TABLE_FILE} ]; then
+        _err_msg_="File ${TOPOLOGY_TABLE_FILE} does not exist"
+        abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+    fi
+
+    log_msg -l ${LOGFILE} -q -s "Copying ${TOPOLOGY_TABLE_FILE} to ${_cli_conf_dir_}/${_tem_topology_table_file_}"
+    $CP ${TOPOLOGY_TABLE_FILE} ${_cli_conf_dir_}/${_tem_topology_table_file_}
+    if [ $? -ne 0 ]; then
+        _err_msg_="Error copying ${TOPOLOGY_TABLE_FILE} to ${_cli_conf_dir_}/${_tem_topology_table_file_}"
+        abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+    fi
+
+    $CHOWN ${_sysuser_}:${_sysgrp_} ${_cli_conf_dir_}/${_tem_topology_table_file_}
+    if [ $? -ne 0 ]; then
+        _err_msg_="Error setting ownership of ${_cli_conf_dir_}/${_tem_topology_table_file_} to ${_sysuser_}:${_sysgrp_}"
+        abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+    fi
+
+    # Get file that contains the WCDMA counter information 
+    _tem_wcdma_combined_view_file_=`iniget FEATURE_INFO -f ${ENIQ_CONF_DIR}/${ENIQ_INI} -v WCDMA_Combined_View_File`
+    if [ ! "${_tem_wcdma_combined_view_file_}" ]; then
+        _err_msg_="Could not read parameter WCDMA_Combined_View_File from file\n${ENIQ_CONF_DIR}/${ENIQ_INI}"
+        abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+    fi
+
+    # Does the file exist
+    WCDMA_COMBINED_VIEW_FILE="${BASE_SW_DIR}/${ENIQ_FEATURE_INPUT_DIR}/${_tem_wcdma_combined_view_file_}"
+
+    if [ ! -s ${WCDMA_COMBINED_VIEW_FILE} ]; then
+        _err_msg_="File ${WCDMA_COMBINED_VIEW_FILE} does not exist"
+        abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+    fi
+
+    log_msg -l ${LOGFILE} -q -s "Copying ${WCDMA_COMBINED_VIEW_FILE} to ${ENIQ_INSTALLER_DIR}/${_tem_wcdma_combined_view_file_}"
+    $CP ${WCDMA_COMBINED_VIEW_FILE} ${ENIQ_INSTALLER_DIR}/${_tem_wcdma_combined_view_file_}
+    if [ $? -ne 0 ]; then
+        _err_msg_="Error copying ${WCDMA_COMBINED_VIEW_FILE} to ${ENIQ_INSTALLER_DIR}/${_tem_wcdma_combined_view_file_}"
+        abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+    fi
+
+    $CHOWN ${_sysuser_}:${_sysgrp_} ${ENIQ_INSTALLER_DIR}/${_tem_wcdma_combined_view_file_}
+    if [ $? -ne 0 ]; then
+        _err_msg_="Error setting ownership of ${ENIQ_INSTALLER_DIR}/${_tem_wcdma_combined_view_file_} to ${_sysuser_}:${_sysgrp_}"
+        abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+    fi
+
+    # Get Directory on the install media where eniq executable scripts should be
+    ENIQ_EXECUTABLE_DIR=`iniget FEATURE_INFO -f ${ENIQ_CONF_DIR}/${ENIQ_INI} -v Eniq_Executable`
+    if [ ! "${ENIQ_EXECUTABLE_DIR}" ]; then
+        _err_msg_="Failed to read Parameter Eniq_Executable from ${ENIQ_CONF_DIR}/${ENIQ_INI}"
+        abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+    fi
+
+    # checking if directory is empty or not
+    $LS -l ${BASE_SW_DIR}/${ENIQ_FEATURE_INPUT_DIR}/${ENIQ_EXECUTABLE_DIR}/* >/dev/null 2>&1
+    if [ $? -ne 0 ]; then
+        _err_msg_="Directory ${BASE_SW_DIR}/${ENIQ_FEATURE_INPUT_DIR}/${ENIQ_EXECUTABLE_DIR} does not exist or empty"
+        abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+    else
+        for _file_ in `$LS ${BASE_SW_DIR}/${ENIQ_FEATURE_INPUT_DIR}/${ENIQ_EXECUTABLE_DIR}/`; do
+            log_msg -l ${LOGFILE} -q -s "Copying ${BASE_SW_DIR}/${ENIQ_FEATURE_INPUT_DIR}/${ENIQ_EXECUTABLE_DIR}/${_file_} to ${ENIQ_INSTALLER_DIR}"
+            $CP ${BASE_SW_DIR}/${ENIQ_FEATURE_INPUT_DIR}/${ENIQ_EXECUTABLE_DIR}/${_file_} ${ENIQ_INSTALLER_DIR}
+            if [ $? -ne 0 ]; then
+                _err_msg_="Error copying ${BASE_SW_DIR}/${ENIQ_FEATURE_INPUT_DIR}/${ENIQ_EXECUTABLE_DIR}/${_file_} to ${ENIQ_INSTALLER_DIR}"
+                abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+            fi
+
+            $CHOWN ${_sysuser_}:${_sysgrp_} ${ENIQ_INSTALLER_DIR}/${_file_}
+            if [ $? -ne 0 ]; then
+                _err_msg_="Error setting ownership of ${ENIQ_INSTALLER_DIR}/${_file_} to ${_sysuser_}:${_sysgrp_}"
+                abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+            fi
+        done
+    fi
+fi
+
+# Copy the files
+log_msg -l ${LOGFILE} -q -s "Copying ${FEATURE_ID_FILE} to ${_cli_conf_dir_}/${_tem_feature_id_file_}" 
+if [ "${FEATURE_ACTION}" != "feature_update" ]; then
+$CP ${FEATURE_ID_FILE} ${_cli_conf_dir_}/${_tem_feature_id_file_}
+if [ $? -ne 0 ]; then
+    _err_msg_="Error copying ${FEATURE_ID_FILE} to ${_cli_conf_dir_}/${_tem_feature_id_file_}"
+    abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+fi
+$CHOWN ${_sysuser_}:${_sysgrp_} ${_cli_conf_dir_}/${_tem_feature_id_file_}
+if [ $? -ne 0 ]; then
+    _err_msg_="Error setting ownership of ${_cli_conf_dir_}/${_tem_feature_id_file_} to ${_sysuser_}:${_sysgrp_}"
+    abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+fi
+
+log_msg -l ${LOGFILE} -q -s "Copying ${FEATURE_MAP_FILE} to ${_cli_conf_dir_}/${_tem_feature_map_file_}" 
+$CP ${FEATURE_MAP_FILE} ${_cli_conf_dir_}/${_tem_feature_map_dir_}
+if [ $? -ne 0 ]; then
+    _err_msg_="Error copying ${FEATURE_MAP_FILE} to ${_cli_conf_dir_}/${_tem_feature_map_file_}"
+    abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+fi
+
+$CHOWN ${_sysuser_}:${_sysgrp_} ${_cli_conf_dir_}/${_tem_feature_map_file_}
+if [ $? -ne 0 ]; then
+    _err_msg_="Error setting ownership of ${_cli_conf_dir_}/${_tem_feature_map_file_} to ${_sysuser_}:${_sysgrp_}"
+    abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+fi
+
+log_msg -l ${LOGFILE} -q -s "Copying ${FEATURE_INPUT_FILE} to ${_cli_conf_dir_}/${_tem_feature_input_file_}"
+$CP ${FEATURE_INPUT_FILE} ${_cli_conf_dir_}/${_tem_feature_input_file_}
+if [ $? -ne 0 ]; then
+    _err_msg_="Error copying ${FEATURE_INPUT_FILE} to ${_cli_conf_dir_}/${_tem_feature_input_file_}"
+    abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+fi
+$CHOWN ${_sysuser_}:${_sysgrp_} ${_cli_conf_dir_}/${_tem_feature_input_file_}
+if [ $? -ne 0 ]; then
+    _err_msg_="Error setting ownership of ${_cli_conf_dir_}/${_tem_feature_input_file_} to ${_sysuser_}:${_sysgrp_}"
+    abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+fi
+
+log_msg -l ${LOGFILE} -q -s "Copying ${FEATURE_REPORTS_FILE} to ${_cli_conf_dir_}/${_tem_feature_report_file_}" 
+$CP ${FEATURE_REPORTS_FILE} ${_cli_conf_dir_}/${_tem_feature_report_file_}
+if [ $? -ne 0 ]; then
+    _err_msg_="Error copying ${FEATURE_REPORTS_FILE} to ${_cli_conf_dir_}/${_tem_feature_report_file_}"
+    abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+fi
+$CHOWN ${_sysuser_}:${_sysgrp_} ${_cli_conf_dir_}/${_tem_feature_report_file_}
+if [ $? -ne 0 ]; then
+    _err_msg_="Error setting ownership of ${_cli_conf_dir_}/${_tem_feature_report_file_} to ${_sysuser_}:${_sysgrp_}"
+    abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+fi
+fi
+
+if [ -f "${NO_FEATURE_SELECTED}" ]; then
+exit 0
+fi
+
+}
+
+### Function: get_absolute_path ###
+#
+# Determine absolute path to software
+#
+# Arguments:
+#	none
+# Return Values:
+#	none
+get_absolute_path() 
+{
+_dir_=`$DIRNAME $0`
+SCRIPTHOME=`cd $_dir_ 2>/dev/null && pwd || $ECHO $_dir_`
+}
+### Function: get_service_details ###
+#
+# This function will update the service names
+# file with the required service
+#
+# Arguments:
+#       $1 : Service name running
+#       $2 : Service name file
+# Return Values:
+#       : details of Service
+get_service_details()
+{
+local _servicename_=$1
+local _service_file_=$2
+
+if [ ! "${_servicename_}" -o ! "${_service_file_}" ]; then
+	abort_script "Incorrect arguments passed to get_service_details function"
+fi
+
+if [ -s ${_service_file_} ]; then
+	local _service_line_=`$CAT ${_service_file_} | $EGREP -v "^[[:blank:]]*#" | $EGREP ".*::.*::${_servicename_}$"`
+	if [ ! "${_service_line_}" ]; then
+		_err_msg_="Could not find ${_servicename_} in ${_service_file_}"
+	    abort_script "$_err_msg_"
+	fi
+else
+	_err_msg_="${_service_file_} does not exist"
+	abort_script "$_err_msg_"
+fi
+
+$ECHO ${_service_line_}
+}
+
+
+
+
+
+### Function: setup_env ###
+#
+# Setup up path environment etc
+#
+# Arguments:
+#    none
+# Return Values:
+#    none
+setup_env()
+{
+if [ ! "${ENIQ_BASE_DIR}" ]; then
+    ENIQ_BASE_DIR=${ENIQ_ROOT_DIR}
+fi
+
+ENIQ_CONF_DIR=${ENIQ_BASE_DIR}/installation/config
+if [ ! -s ${ENIQ_CONF_DIR}/SunOS.ini ]; then
+    _err_msg_="Could not locate file ${ENIQ_CONF_DIR}/SunOS.ini"
+    abort_script "$_err_msg_"
+fi
+
+CLI_CONF_DIR=${ENIQ_BASE_DIR}/sw/conf
+if [ ! -s ${CLI_CONF_DIR}/niq.ini ]; then
+    _err_msg_="Could not locate file ${CLI_CONF_DIR}/niq.ini"
+    abort_script "$_err_msg_"
+fi
+
+# Main Directory for the Core Installation SW
+ENIQ_INST_DIR=`$DIRNAME ${SCRIPTHOME}`
+
+# Sentinel Stuff
+ENIQ_SENTINEL_DIR=${ENIQ_BASE_DIR}/sentinel
+ENIQ_SENTINEL_BIN_DIR=${ENIQ_SENTINEL_DIR}/bin
+ENIQ_SENTINEL_ENV=${ENIQ_SENTINEL_DIR}/etc/sentinel.env
+
+# Admin directory in the ENIQ filesystem
+ENIQ_ADMIN_DIR=${ENIQ_ROOT_DIR}/admin
+
+# Installer directory in the ENIQ filesystem
+ENIQ_INSTALLER_DIR=${ENIQ_ROOT_DIR}/sw/installer
+
+# TP Install program
+TP_INSTALLER="tp_installer"
+
+# Admin dir
+ENIQ_ADMIN_BIN_DIR=${ENIQ_ADMIN_DIR}/bin
+ENIQ_ADMIN_ETC_DIR=${ENIQ_ADMIN_DIR}/etc
+
+# Core install bin dir
+ENIQ_CORE_BIN_DIR=${ENIQ_BASE_DIR}/installation/core_install/bin
+ENIQ_CORE_ETC_DIR=${ENIQ_BASE_DIR}/installation/core_install/etc
+
+# Connectd dir
+ENIQ_CONNECTD_DIR=${ENIQ_BASE_DIR}/connectd
+
+# Name of file containing List of used OSS reference names
+OSS_REF_NAME_FILE=${CLI_CONF_DIR}/.oss_ref_name_file
+
+#Mediation Inter directory
+MEDIATION_INTER=${ENIQ_BASE_DIR}/mediation_inter
+
+# Mediation Inter bin directory
+MEDIATION_INTER_BIN=${ENIQ_BASE_DIR}/mediation_inter/bin
+
+CURR_SERVER_TYPE=`$CAT $ENIQ_CONF_DIR/installed_server_type | $EGREP -v '^[[:blank:]]*#' | $SED -e 's/ //g'`
+if [ ! "${CURR_SERVER_TYPE}" ]; then
+	_err_msg_="Could not determine which server type this is"
+    abort_script "$_err_msg_"
+fi
+
+# File containing the type of OSS installation. Eg. statistics
+INST_TYPE_FILE=${ENIQ_CONF_DIR}/ericsson_use_config
+if [ ! -s "${INST_TYPE_FILE}" ]; then
+    _err_msg_="ENIQ install type not defined in ${INST_TYPE_FILE}"
+    abort_script "$_err_msg_"  "${EXEC_SHELL_CMD}"
+fi
+# Read the installation type - should be "stats"
+INSTALL_TYPE=`$CAT ${INST_TYPE_FILE} | $AWK -F\= '{print $2}'`
+
+#Eniq_core_install directory
+ENIQ_CORE_DIR=${ENIQ_BASE_DIR}/installation/core_install
+
+#hostname of local host
+HNAME=`${MYHOSTNAME}`
+
+# Set temporary upgrade directory
+VAR_TMP_DIR=/var/tmp
+
+#IP of local host
+HOST_IP=`$GETENT hosts ${HNAME} | $AWK '{print $1}' | $HEAD -1`
+
+# Set the log directory
+LOGFILE_DIR="$ENIQ_BASE_DIR/log/feature_management_log"
+
+# Set the back file for the engine entry in the service_names file
+ENGINE_SERVICE_NAME_BACKUP=${CLI_CONF_DIR}/service_names_engine_backup
+
+# Host file
+ETC_HOST="/etc/hosts"
+
+# Get the System User
+_sysuser_=`iniget ENIQ_INSTALL_CONFIG -f ${ENIQ_CONF_DIR}/${SUNOS_INI} -v ENIQ_SYSUSER`
+if [ ! "${_sysuser_}" ]; then
+    _err_msg_="Could not read parameter ENIQ_SYSUSER from file ${ENIQ_CONF_DIR}/${SUNOS_INI}"
+    abort_script "$_err_msg_" "${EXEC_SHELL_CMD}"
+fi
+
+_sysgrp_=`$ID ${_sysuser_} | $AWK '{print $2}' | $AWK -F\( '{print $2}' | $AWK -F\) '{print $1}'`
+if [ ! "${_sysgrp_}" ]; then
+    _err_msg_="Could not determine group ID of ${_sysuser_}"
+    abort_script "${_err_msg_}" 
+fi
+
+# Changing owner and group for ENIQ feature file
+if [ "${INSTALL}" ]; then
+    $CHOWN ${_sysuser_}:${_sysgrp_} ${ENIQ_FEATURE_FILE}
+fi
+
+GET_IP_ORDER_SCRIPT=${ENIQ_CORE_DIR}/lib/get_ip_order.pl
+if [ ! -s "${GET_IP_ORDER_SCRIPT}" ]; then
+	_err_msg_="Could not find script: ${GET_IP_ORDER_SCRIPT}"
+	abort_script "$_err_msg_" "${EXEC_SHELL_CMD}"
+fi
+
+if [ "${ENIQ_FEATURE_FILE}" -a "${FEATURE_ACTION}" == "add" ]; then
+    # Make this file available for tp_installer to allow it to update /eniq/admin/managed_oss/total_feature_install_list
+    # after installing a feature. This allows the new feature to be activated by tp_installer
+    TP_INSTALLER_FEATURE_FILE=/var/tmp/additional_features_to_install
+    $RM -f ${TP_INSTALLER_FEATURE_FILE}
+    $CP -p ${ENIQ_FEATURE_FILE} ${TP_INSTALLER_FEATURE_FILE}
+fi
+
+#Set the repdb directory
+REP_DB_DIR="${ENIQ_BASE_DIR}/database/rep_main"
+
+## Adding as a part of repdb monitoring script
+ENIQ_BIN="/eniq/admin/bin"
+BACKUP_PATH="/eniq/backup"
+MONITOR_SCRIPT="repdb_monitor.bsh"
+CRON_FILE_PATH="/var/spool/cron/root"
+
+# Read the storage type
+if [ -s ${ENIQ_CONF_DIR}/${SUNOS_INI} ]; then
+    STORAGE_TYPE=`iniget STOR_TYPE -f ${ENIQ_CONF_DIR}/${SUNOS_INI} -v STORAGE_TYPE`
+else
+    if [ -s ${ENIQ_CONF_DIR}/san_details ]; then
+        STORAGE_TYPE=`$CAT ${ENIQ_CONF_DIR}/san_details | $EGREP "^STORAGE_TYPE=" | $AWK -F\= '{print $2}'`
+    fi
+fi
+
+if [ ! "${STORAGE_TYPE}" ]; then
+    _err_msg_="Could not read STORAGE_TYPE param "
+    abort_script "$_err_msg_" "${EXEC_SHELL_CMD}"
+fi
+
+# Flag to check if features are selected or not
+NO_FEATURE_SELECTED=${VAR_TMP_DIR}/no_features
+}
+
+### Function: setup_repdb_connection ###
+#
+# Update the connection parameter from -gm 250 to -gm 400 in repdb.cfg file.
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+setup_repdb_connection()
+{
+# Make a backup of repdb.cfg
+if [ -f ${REP_DB_DIR}/repdb.cfg ]; then
+	log_msg -s "Backing up original ${REP_DB_DIR}/repdb.cfg file to ${REP_DB_DIR}/repdb.cfg_${RUN_TIME}" -l ${LOGFILE}
+	$CP -p ${REP_DB_DIR}/repdb.cfg ${REP_DB_DIR}/repdb.cfg_${RUN_TIME}
+	if [ $? -ne 0 ]; then
+		_err_msg_="Could not copy ${REP_DB_DIR}/repdb.cfg to ${REP_DB_DIR}/repdb.cfg_${RUN_TIME}"
+		abort_script "$_err_msg_"
+	fi
+else
+	_err_msg_="Unable to find ${REP_DB_DIR}/repdb.cfg"
+	abort_script "$_err_msg_"
+fi
+
+#Update repdb.cfg with new no. of connections value.
+_tmp_upgrade_cfg_=${REP_DB_DIR}/repdb_upgrade_tmp.cfg
+_no_connections_=400
+		
+log_msg -s "Updating connection parameter from -gm 250 to -gm 400 in ${REP_DB_DIR}/repdb.cfg file" -l ${LOGFILE}
+
+$CAT ${REP_DB_DIR}/repdb.cfg | $SED -e "s|^-gm .*|-gm ${_no_connections_}|g" > ${_tmp_upgrade_cfg_}
+if [ $? -ne 0 ]; then
+	_err_msg_="Could not update ${_tmp_upgrade_cfg_} with Number Of Connections(-gm ${_no_connections_})"
+	abort_script "$_err_msg_"
+fi
+			
+$CP -p ${_tmp_upgrade_cfg_} ${REP_DB_DIR}/repdb.cfg
+if [ $? -ne 0 ]; then
+	_err_msg_="Could not copy ${_tmp_upgrade_cfg_} to ${REP_DB_DIR}/repdb.cfg"
+	abort_script "$_err_msg_"
+else
+	$RM -rf ${_tmp_upgrade_cfg_}
+fi
+
+_repdb_systemctl_=`$SYSTEMCTL show eniq-repdb -p LoadState | $AWK -F "=" '{print $2}'`
+
+log_msg -l ${LOGFILE} -s "\nTrying to restart repdb ENIQ services"
+if [ "${_repdb_systemctl_}" != "loaded" ]; then
+		log_msg -l ${LOGFILE} -s "Stopping repdb..."
+		$SU - ${_sysuser_} -c "${ENIQ_ADMIN_BIN_DIR}/repdb stop"
+		if [ $? -ne 0 ] ; then
+			_err_msg_="repdb database failed to stop"
+			abort_script "${_err_msg_}"
+		fi
+		#Checking to see if repdb is still active, do not continue until it is inactive
+		db_service_state=true
+		while [ ${db_service_state} == 'true' ]; do
+			$PS -ef | $EGREP "repdb" | $EGREP "\/dbsrv" | $EGREP -v "grep"  >> /dev/null 2>&1
+			if [ $? -eq 0 ] ; then
+				log_msg -l ${LOGFILE} -s "Waiting until repdb is inactive before continuing"
+				$SLEEP 10
+			else
+				db_service_state=false
+			fi
+		done
+
+		log_msg -l ${LOGFILE} -s "Starting repdb..."
+		$SU - ${_sysuser_} -c "${ENIQ_ADMIN_BIN_DIR}/repdb start"
+		if [ $? -ne 0 ] ; then
+			_err_msg_="repdb database failed to start"
+			abort_script "${_err_msg_}"
+		fi
+		#Checking to see if repdb is active
+		db_service_state=true
+		while [ ${db_service_state} == 'true' ]; do
+			$PS -ef | $EGREP "repdb" | $EGREP "\/dbsrv" | $EGREP -v "grep"  >> /dev/null 2>&1
+			if [ $? -eq 0 ] ; then
+				log_msg -l ${LOGFILE} -s "repdb is active continuing"
+				db_service_state=false
+			else
+				log_msg -l ${LOGFILE} -s "Waiting until repdb is active before continuing"
+				$SLEEP 10
+			fi
+		done
+else
+		$BASH ${ENIQ_ADMIN_BIN_DIR}/manage_eniq_services.bsh -a restart -s repdb -N | $TEE -a ${LOGFILE}
+		_rc_repdb_restart_=`$ECHO ${PIPESTATUS[0]}`
+		if [ ${_rc_repdb_restart_} -ne 0 ]; then
+				abort_script "Failed to restart repdb service\nExiting...." "${EXEC_SHELL_CMD}"
+		fi
+fi
+
+log_msg -s "Successfully updated the connection parameter from -gm 250 to -gm 400 in ${REP_DB_DIR}/repdb.cfg file" -l ${LOGFILE}
+}
+
+### Function: setup_update_disp_file ###
+#
+# Set up a file to display out for update details
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+setup_update_disp_file()
+{
+# Set up a file to display out
+$RM -f ${TEM_DIR}/disp_file
+
+_update_=0
+
+if [ -s ${ENIQ_CORE_ETC_DIR}/features_to_be_managed ]; then
+    $ECHO "\nENIQ Features" >> ${TEM_DIR}/disp_file
+    $ECHO "=============" >> ${TEM_DIR}/disp_file
+    $CAT ${TEM_DIR}/feature_output_list2 >> ${TEM_DIR}/disp_file
+      
+    $ECHO "\nDo you wish to continue to update the features above (Yy/Nn)\n" >> ${TEM_DIR}/disp_file    
+    _update_=1
+fi
+
+# If there is nothing to upgrade then delete the disp file
+if [ ${_update_} -eq 0 ]; then
+    $RM -f ${TEM_DIR}/disp_file
+fi
+}
+
+### Function: start_services ###
+#
+# start the required eniq services after the sybase cache update
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+start_services()
+{
+if [ ! "${INSTALL}" ]; then
+	if [ "${CURR_SERVER_TYPE}" == "stats_coordinator" -a "${FEATURE_ACTION}" == "add" ]; then
+		log_msg -l ${LOGFILE} -s "\nTrying to start all ENIQ services"
+		$BASH ${ENIQ_ADMIN_BIN_DIR}/manage_deployment_services.bsh -a start -s ALL -N
+		if [ $? -ne 0 ]; then
+			abort_script "Failed to start all ENIQ services\nExiting...." "${EXEC_SHELL_CMD}"
+		fi
+	else
+		log_msg -l ${LOGFILE} -s "\nTrying to start dwhdb,engine,scheduler services $1"
+		/usr/bin/bash ${ENIQ_ADMIN_BIN_DIR}/manage_eniq_services.bsh -a start -s repdb,dwhdb,engine,scheduler -N -l ${LOGFILE}
+		#added repdb to list of services to start as engine has a dependency on it
+		if [ $? -ne 0 ]; then
+			abort_script "Failed to start dwhdb,engine,scheduler\nExiting...." "${EXEC_SHELL_CMD}"
+		fi
+	fi
+else
+	# It's an install check if service is there lets use it
+	_service_check_=`$SYSTEMCTL show eniq-dwhdb -p LoadState | $AWK -F "=" '{print $2}'`
+	if [ ${_service_check_} == "loaded" ]; then
+		## lets use service
+		log_msg -l ${LOGFILE} -s "\nTrying to start all ENIQ services"
+		$BASH ${ENIQ_ADMIN_BIN_DIR}/manage_deployment_services.bsh -a start -s ALL -N
+		if [ $? -ne 0 ]; then
+			abort_script "Failed to start all ENIQ services\nExiting...." "${EXEC_SHELL_CMD}"
+		fi
+	else
+
+	log_msg -l ${LOGFILE} -s "Starting dwhdb..."
+	$SU - ${_sysuser_} -c "${ENIQ_ADMIN_BIN_DIR}/dwhdb start"
+	if [ $? -ne 0 ] ; then
+		_err_msg_="dwhdb database failed to start"
+		abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+	fi
+	#Checking to see if dwhdb is active
+	db_service_state=true
+	while [ $db_service_state == 'true' ]; do
+		$PS -ef | $EGREP "dwhdb" | $EGREP "\/iqsrv" | $EGREP -v "grep"  >> /dev/null 2>&1
+		if [ $? -eq 0 ] ; then
+			log_msg -l ${LOGFILE} -s "dwhdb is active continuing"
+			db_service_state=false 
+		else
+			log_msg -l ${LOGFILE} -s "Waiting until dwhdb is active before continuing"
+			sleep 10
+		fi     
+	done
+	
+	log_msg -l ${LOGFILE} -s "Starting engine..."
+	$SU - ${_sysuser_} -c "${ENIQ_ADMIN_BIN_DIR}/engine start"
+	if [ $? -ne 0 ] ; then
+			_err_msg_="engine failed to start"
+		abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+	fi
+	
+	log_msg -l ${LOGFILE} -s "Starting scheduler..."
+	$SU - ${_sysuser_} -c "${ENIQ_ADMIN_BIN_DIR}/scheduler start"
+	if [ $? -ne 0 ] ; then
+			_err_msg_="scheduler failed to start"
+			abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+		fi
+	fi
+fi
+}
+
+### Function: stop_services ###
+#
+# stop the eniq services after the sybase cache update
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+stop_services()
+{
+if [ ! "${INSTALL}" ]; then
+	if [ "${CURR_SERVER_TYPE}" == "stats_coordinator" -a "${FEATURE_ACTION}" == "add" ]; then
+		log_msg -l ${LOGFILE} -s "\nTrying to stop all ENIQ services"
+		$BASH ${ENIQ_ADMIN_BIN_DIR}/manage_deployment_services.bsh -a stop -s ALL -N
+		if [ $? -ne 0 ]; then
+			abort_script "Failed to stop all ENIQ services\nExiting...." "${EXEC_SHELL_CMD}"
+		fi
+	else
+		log_msg -l ${LOGFILE} -s "\nTrying to stop scheduler,engine,dwhdb services $1"
+		/usr/bin/bash ${ENIQ_ADMIN_BIN_DIR}/manage_eniq_services.bsh -a stop -s scheduler,engine,dwhdb -N -l ${LOGFILE}
+		if [ $? -ne 0 ]; then
+				abort_script "Failed to stop scheduler,engine,dwhdb\nExiting...." "${EXEC_SHELL_CMD}"
+		fi
+	fi
+else
+	# It's an install is Service there
+	_service_check_=`$SYSTEMCTL show eniq-dwhdb -p LoadState | $AWK -F "=" '{print $2}'`
+	if [ ${_service_check_} == "loaded" ]; then
+		## lets use service
+		log_msg -l ${LOGFILE} -s "\nTrying to stop all ENIQ services"
+		$BASH ${ENIQ_ADMIN_BIN_DIR}/manage_deployment_services.bsh -a stop -s ALL -N
+		if [ $? -ne 0 ]; then
+				abort_script "Failed to stop all ENIQ services\nExiting...." "${EXEC_SHELL_CMD}"
+		fi
+	else
+	log_msg -l ${LOGFILE} -s "Stopping scheduler..."
+	$SU - ${_sysuser_} -c "${ENIQ_ADMIN_BIN_DIR}/scheduler stop"
+	if [ $? -ne 0 ] ; then
+		_err_msg_="scheduler failed to stop"
+		abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+	fi
+	
+	log_msg -l ${LOGFILE} -s "Stopping engine..."
+	$SU - ${_sysuser_} -c "${ENIQ_ADMIN_BIN_DIR}/engine stop"
+	if [ $? -ne 0 ] ; then
+		_err_msg_="engine failed to stop"
+		abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+	fi
+	
+	log_msg -l ${LOGFILE} -s "Stopping dwhdb..."
+	$SU - ${_sysuser_} -c "${ENIQ_ADMIN_BIN_DIR}/dwhdb stop"
+	if [ $? -ne 0 ] ; then
+		_err_msg_="dwhdb database failed to stop"
+		abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+	fi
+	#Checking to see if dwhdb is still active, do not continue untill it is inactive
+	db_service_state=true
+	while [ $db_service_state == 'true' ]; do
+		$PS -ef | $EGREP "dwhdb" | $EGREP "\/iqsrv" | $EGREP -v "grep"  >> /dev/null 2>&1
+		if [ $? -eq 0 ] ; then
+			log_msg -l ${LOGFILE} -s "Waiting until dwhdb is inactive before continuing"
+			sleep 10 
+		else
+			db_service_state=false
+		fi     
+	done
+fi
+fi
+
+}
+
+### Function: update_features ###
+#
+# Update the ENIQ Feature(s)
+#
+# Arguments:
+#	none
+# Return Values:
+#	none
+update_features() 
+{
+log_msg -t -l ${LOGFILE} -q -s "Starting feature upgrade"
+
+# STATS would use Rolling upgrade by default.
+UPGRADE_TYPE="Rolling" 
+log_msg -l ${LOGFILE} -s "Upgrade type will be ${UPGRADE_TYPE}" 
+
+if [ "${UPGRADE_TYPE}" == "Standard" ] ; then
+	TPI_SMF_TYPE="-N"
+elif [ "${UPGRADE_TYPE}" == "Rolling" ] ; then
+	TPI_SMF_TYPE=""
+fi
+
+#If we are NOT doing rolling upgrade, remove the list of features that may have been selected in a prior 
+#run of the script (a failed run)
+if [ "${UPGRADE_TYPE}" != "Rolling" ] ; then
+	if [ -f ${FEATURES_TO_BE_INSTALLED_FILE} ]; then
+		$ECHO "Removing ${FEATURES_TO_BE_INSTALLED_FILE} file..."
+		$RM -f ${FEATURES_TO_BE_INSTALLED_FILE} #CXC nums of features
+	fi
+	if [ -f ${FEATURES_NAME_TO_BE_INSTALLED_FILE} ]; then
+		$ECHO "Removing ${FEATURES_NAME_TO_BE_INSTALLED_FILE} file..."
+		$RM -f ${FEATURES_NAME_TO_BE_INSTALLED_FILE} #Feature names
+	fi
+fi
+
+#If there is a list of features left over from a prior run of script & last run started tp_installer..
+if [[ -s ${FEATURES_TO_BE_INSTALLED_FILE} && -s /tmp/_upgrade_last_feature ]] ; then
+	#..then set a flag to indicate this, and copy the features to the tmp dir of this run of script
+	_features_file_already_exists_=1
+	$CP ${FEATURES_TO_BE_INSTALLED_FILE} ${TEM_DIR}/_upgrade_features_to_be_installed #CXC nums of features
+	    if [ $? -ne 0 ]; then
+			_err_msg_="Could not copy ${FEATURES_TO_BE_INSTALLED_FILE} to ${TEM_DIR}/_upgrade_features_to_be_installed"
+			abort_script "$_err_msg_" 
+		fi
+	
+	$CP ${FEATURES_NAME_TO_BE_INSTALLED_FILE} ${TEM_DIR}/_upgrade_features_name_to_be_installed #Feature names
+	    if [ $? -ne 0 ]; then
+			_err_msg_="Could not copy ${FEATURES_NAME_TO_BE_INSTALLED_FILE} to ${TEM_DIR}/_upgrade_features_name_to_be_installed}"
+			abort_script "$_err_msg_" 
+		fi
+	# Make sure the copy of the feature CXC nums was successfull (the names are not necessary - they only for display)
+	if [ ! -s ${TEM_DIR}/_upgrade_features_to_be_installed ] ; then
+		_err_msg_="Failed to copy ${FEATURES_TO_BE_INSTALLED_FILE} to ${TEM_DIR}/_upgrade_features_to_be_installed"
+		abort_script "$_err_msg_"
+	fi
+fi
+	
+# If there is a feature list left over from prior run..
+if [ "${_features_file_already_exists_}" = 1 ]; then
+	#..do nothing
+	log_msg -l ${LOGFILE} -s "${TEM_DIR}/_upgrade_features_to_be_installed already exists, skipping user feature selection.\n"
+else
+	if [ "${GET_FEATURE_LIST}" != "NO" ]; then
+		#..otherwise get the user to choose list of features to be upgraded, and then stop all eniq services:
+		
+		#Ask the user what features are to be upgraded
+		get_eniq_upgrade_feature_list
+	
+		if [ $? == 99 -a "${INSTALL_TYPE}" == "stats" ]; then
+				# Cleanup from the acivites in setup_manage_features
+				cleanup_manage_features
+	
+				# Set engine to Normal profile
+				set_engine
+	
+				# Cleanup
+				$RM -rf ${TEM_DIR}
+	
+				exit 0
+		fi
+	
+
+        #Check a flag to see if user is to be prompted for confirmation of feature selection
+	if [ -z "${NO_CONFIRM}" ]; then
+		#Confirmation is to be done
+	
+		setup_update_disp_file
+	
+		# If there is no file then there is nothing to update
+		if [ -s  ${TEM_DIR}/disp_file ]; then
+		
+			# Confirm that the User still wants to add the OSS
+			confirm_user_input ${TEM_DIR}/disp_file
+			if [ "${USER_CONF}" == "N" -o "${USER_CONF}" == "n" ]; then
+				#Cleanup_manage_features if its a stats coordinator, because we changed it earlier in the setup_manage_features.
+        		#This is done so the engine is only running, on the engine blade, for stats multiblade deployments,
+				if [ "${CURR_SERVER_TYPE}" == "stats_coordinator" ]; then
+					cleanup_manage_features    
+				fi
+                $RM -rf ${TEM_DIR}
+				$ECHO "\n\n"
+				exit 0
+			fi
+			log_msg -l ${LOGFILE} -q -s "The following features will be updated"
+			log_msg -l ${LOGFILE} -q -s "======================================"
+			$CAT ${TEM_DIR}/feature_output_list2 | $AWK -F"::" '{print $1}' >> ${LOGFILE}
+		else
+			$CLEAR
+                        #Cleanup_manage_features if its a stats coordinator, because we changed it earlier in the setup_manage_features.
+                        #This is done so the engine is only running, on the engine blade, for stats multiblade deployments,
+                        
+                        if [ "${CURR_SERVER_TYPE}" == "stats_coordinator" ]; then
+                                cleanup_manage_features
+                        fi
+			log_msg -t -l ${LOGFILE} -s "No Features to Update....exiting\n"
+			$RM -rf ${TEM_DIR}
+			exit 0
+		fi
+	fi
+	
+	# Stop only running eniq services
+	log_msg -l ${LOGFILE} -s "Stopping all ENIQ services ..."
+	$BASH ${ENIQ_ADMIN_BIN_DIR}/manage_deployment_services.bsh -a stop -s ALL -N
+	if [ $? -ne 0 ]; then
+		_err_msg_="Failed to stop ENIQ services"
+		abort_script "$_err_msg_"
+	fi
+fi
+fi
+
+
+
+#If the user has selected features in this run of script, OR there is a list left over from a prior (failed) run of this script..
+if [[ -s ${ENIQ_CORE_ETC_DIR}/features_to_be_managed ||  "${_features_file_already_exists_}" = 1 ]] ; then
+    # then upgrade the Features
+    add_features
+	
+	# If it is NOT STATS server and we are NOT doing rolling upgrade..
+    if [ "${INSTALL_TYPE}" != "es" -a "${UPGRADE_TYPE}" != "Rolling" ]; then
+		# ..and, if ref name file is present (indicates STATS is connected to OSS)
+	    if [ -s ${OSS_REF_NAME_FILE} -o "${INSTALL_TYPE}" == "stats" ]; then
+			# ..then reactivate the features that were upgraded
+	    	activate_features
+	    fi
+	fi
+	
+	#Upgrade has completed without error. Lets remove the list of features upgraded. This is not done in 
+	#cleanup function because the cleanup is called by abort function, and we do not want these files to be removed 
+	#in an abort (so that they can be re-used when script runs again)
+	if [ -f ${FEATURES_TO_BE_INSTALLED_FILE} ]; then
+		$ECHO "Removing ${FEATURES_TO_BE_INSTALLED_FILE} file..."
+		$RM -f ${FEATURES_TO_BE_INSTALLED_FILE} #CXC nums of features
+	fi
+	if [ -f ${FEATURES_NAME_TO_BE_INSTALLED_FILE} ]; then
+		$ECHO "Removing ${FEATURES_NAME_TO_BE_INSTALLED_FILE} file..."
+		$RM -f ${FEATURES_NAME_TO_BE_INSTALLED_FILE} #Feature names
+	fi
+    log_msg -l ${LOGFILE} -s "\nFeatures updated correctly"
+    log_msg -t -l ${LOGFILE} -q -s "Feature upgrade completed"
+else
+	log_msg -l ${LOGFILE} -q -s "Couldn't find ${ENIQ_CORE_ETC_DIR}/features_to_be_managed file"
+fi
+}
+
+### Function: update_smf_contract_config###
+#
+# This function will update the smf_contract_config
+# file with the following format
+##<server_type>::<SMF_contract>::<Y/N/X>
+# Arguments:
+#       $1 : _smf_contract_config file_
+#       $2 : _server_type_
+#       $3 : _service_type_
+#       $4 : _smf_contract_
+#       $5 : _smf_contract_value_	(options are <Y/N/X>)
+
+# Return Values:
+#       : details of Service
+update_smf_contract_config()
+{
+local _smf_contract_config_=$1
+local _server_type_=$2
+local _service_type_=$3
+local _smf_contract_=$4
+local _smf_contract_value_=$5
+
+local _smf_server_contract_="${_server_type_}::${_service_type_}::${_smf_contract_}::"
+if [ ! "${_smf_contract_config_}" -o ! "${_server_type_}" -o ! "${_service_type_}" -o ! "${_smf_contract_}" -o ! "${_smf_contract_value_}" ]; then
+    abort_script "Incorrect arguments passed to update_smf_contract_config function"
+    exit 1
+fi
+
+if [ -s ${_smf_contract_config_} ]; then
+	local _tmp_smf_file_=${TEM_DIR}/smf_contract_config.$$.$$
+	$CAT ${_smf_contract_config_} | $SED -e "s/${_smf_server_contract_}.*/${_smf_server_contract_}${_smf_contract_value_}/g" > ${_tmp_smf_file_}
+	if [ -s ${_tmp_smf_file_} ]; then
+		$CP ${_tmp_smf_file_} ${_smf_contract_config_}
+		if [ $? -ne 0 ]; then
+			_err_msg_="Could not copy ${_tmp_smf_file_} to ${_smf_contract_config_}"
+			abort_script "$_err_msg_"
+		fi
+	else
+		_err_msg_="Could not update  ${_smf_contract_config_} with $_smf_server_contract_} ${smf_contract_value}"
+	    abort_script "$_err_msg_"
+	fi
+else
+	_err_msg_="${_smf_contract_config_} does not exist"
+	abort_script "$_err_msg_"
+fi
+}
+
+### Function: recompile_invalid_views ###
+#
+# Recompile Invalid Views
+#
+# Arguments:
+#    none
+# Return Values:
+#    none
+recompile_invalid_views()
+{
+log_msg -q -s "\nStarting to run $SU - ${SYSUSER} -c '$BASH ${ENIQ_INSTALLER_DIR}/recompile_invalid_views.bsh -l ${LOGFILE}'\n" -l ${LOGFILE}
+$SU - ${SYSUSER} -c "$BASH ${ENIQ_INSTALLER_DIR}/recompile_invalid_views.bsh -l ${LOGFILE}" >> /dev/null 2>&1
+if [ $? -ne 0 ]; then
+    log_msg -q -s "\nError running script ${ENIQ_INSTALLER_DIR}/recompile_invalid_views.bsh. Please refer logs \n"
+fi
+}
+
+### Function: revert_repdb_connection ###
+#
+# Revert repdb.cfg connection parameter from -gm 400 to -gm 250.
+#
+# Arguments:
+#    none
+# Return Values:
+#    none
+revert_repdb_connection()
+{
+if [ -f ${REP_DB_DIR}/repdb.cfg_${RUN_TIME} ]; then
+        log_msg -s "Restoring original ${REP_DB_DIR}/repdb.cfg_${RUN_TIME} file to ${REP_DB_DIR}/repdb.cfg" -l ${LOGFILE}
+        $CP -p ${REP_DB_DIR}/repdb.cfg_${RUN_TIME} ${REP_DB_DIR}/repdb.cfg
+        if [ $? -ne 0 ]; then
+                _err_msg_="Could not copy ${REP_DB_DIR}/repdb.cfg_${RUN_TIME} to ${REP_DB_DIR}/repdb.cfg"
+                abort_script "$_err_msg_"
+        fi
+
+        $RM -f ${REP_DB_DIR}/repdb.cfg_${RUN_TIME}
+
+        _repdb_systemctl_=`$SYSTEMCTL list-units --type service |$GREP -i repdb|$WC -l`
+
+        log_msg -l ${LOGFILE} -s "\nRestarting repdb services"
+        if [ ${_repdb_systemctl_} -eq 0 ]; then
+			log_msg -l ${LOGFILE} -s "Stopping repdb..."
+			$SU - ${_sysuser_} -c "${ENIQ_ADMIN_BIN_DIR}/repdb stop"
+			if [ $? -ne 0 ] ; then
+				_err_msg_="repdb database failed to stop"
+				abort_script "${_err_msg_}"
+			fi
+			#Checking to see if repdb is still active, do not continue until it is inactive
+			db_service_state=true
+			while [ ${db_service_state} == 'true' ]; do
+				$PS -ef | $EGREP "repdb" | $EGREP "\/dbsrv" | $EGREP -v "grep"  >> /dev/null 2>&1
+				if [ $? -eq 0 ] ; then
+					log_msg -l ${LOGFILE} -s "Waiting until repdb is inactive before continuing"
+					$SLEEP 10
+				else
+					db_service_state=false
+				fi
+			done
+
+			log_msg -l ${LOGFILE} -s "Starting repdb..."
+			$SU - ${_sysuser_} -c "${ENIQ_ADMIN_BIN_DIR}/repdb start"
+			if [ $? -ne 0 ] ; then
+				_err_msg_="repdb database failed to start"
+				abort_script "${_err_msg_}"
+			fi
+			#Checking to see if repdb is active
+			db_service_state=true
+			while [ ${db_service_state} == 'true' ]; do
+				$PS -ef | $EGREP "repdb" | $EGREP "\/dbsrv" | $EGREP -v "grep"  >> /dev/null 2>&1
+				if [ $? -eq 0 ] ; then
+					log_msg -l ${LOGFILE} -s "repdb is active continuing"
+					db_service_state=false
+				else
+					log_msg -l ${LOGFILE} -s "Waiting until repdb is active before continuing"
+					$SLEEP 10
+				fi
+			done
+		else
+			$BASH ${ENIQ_ADMIN_BIN_DIR}/manage_eniq_services.bsh -a restart -s repdb -N | $TEE -a ${LOGFILE}
+			_rc_repdb_restart_=`$ECHO ${PIPESTATUS[0]}`
+			if [ ${_rc_repdb_restart_} -ne 0 ]; then
+				abort_script "Failed to start repdb services\nExiting...." "${EXEC_SHELL_CMD}"
+			fi
+		fi
+fi
+}
+
+### Function: usage_msg ###
+#
+#   Print out the usage message
+#
+# Arguments:
+#	none
+# Return Values:
+#	none
+usage_msg() 
+{
+$CLEAR
+$ECHO "
+Usage: `$BASENAME $0` -a { add -F <feature_file> | update [ -F <feature_file> -f <list_of_features> ] }  
+                      -d <eniq_sw_dir> [ -b <eniq_base_dir> ] [ -l <path_to_logfile> ]
+                      
+options:
+
+-a  : Feature Action. Must be either 
+              add      --> Add specified Features(s)
+              update   --> Update LTE and NON LTE Features(s)
+              feature_update   --> Update only LTE Feature(s)
+
+-b  : Optional parameter specifying the full path to where the ENIQ
+      BASEDIR directory is (eg. /eniq). If not specified, then the 
+      script will assume the the base directory is /eniq
+
+-d  : Parameter specifying the full path to the directory 
+      containing the ENIQ BASE SW directory structure. Under this
+      directory, script will locate a file that contains a list of 
+      features available for installation/activation. 
+      EG. <path_feature_dir_sw>/eniq_techpacks/feature_descriptions
+-m  : Parameter specifying the full path to the directory 
+      containing the FEATURE SW directory structure. 
+      EG. <path_base_dir_sw>/eniq_techpacks/
+-F  : Full Path to file containing list of features to be installed
+      Must be in the format of one Features per line E.g CXC12345679
+
+-f  : Comma delimited (no space) list of ENIQ features. Must be in 
+      the following format e.g -f CXC12345679,CXC987654321,CXC24681357
+
+      If all installed features are to be upgraded, then the keyword
+      'ALL' can be used e.g. -f ALL
+
+-l  : Optional parameter specifying the full path to logfile. If not specified, a 
+      logfile will be created in ${LOGFILE_DIR}
+
+-X  : Optional parameter to only be used during installation or upgrade. If specified
+      tp_installer will presume engine/scheduler are not started under Service control
+      and are running on the same host as the installation is being done on.
+
+      If the -X argument is NOT specified, tp_installer will lookup the service_names
+      file to determine the host that it should call the Service commands on.
+	  
+-O  : Optional argument to skip platform upgrade
+	 
+-R	: Optional argument to use rolling upgrade/install of features."
+}
+
+# ********************************************************************
+#
+# 	Main body of program
+#
+# ********************************************************************
+#
+RUN_TIME=`$DATE '+%Y-%b-%d_%H.%M.%S'`
+
+
+# Determine absolute path to software
+get_absolute_path
+
+# Check that the effective id of the user is root
+check_id $DEFAULT_USER
+
+
+
+while getopts ":a:Bb:d:m:f:F:Il:sNXORPG" arg; do
+  case $arg in
+    a) FEATURE_ACTION="$OPTARG" 
+       ;;
+    b) ENIQ_BASE_DIR="$OPTARG" 
+       ;;
+    d) BASE_SW_DIR="$OPTARG" 
+       ;;
+    m) OLD_SW_DIR="$OPTARG"
+       ;;
+    F) ENIQ_FEATURE_FILE="$OPTARG" 
+       ;;
+    f) ENIQ_FEATURE="$OPTARG" 
+       ;;
+    I) INSTALL="YES" 
+       ;;
+    l) LOGFILE="$OPTARG" 
+       ;;
+    s) OPTIMIZED_INSTALLATION="YES"
+       ;;
+    N) NO_CONFIRM="YES"
+       ;;
+    X) TPI_SMF_TYPE="-N"
+       ;;
+	O) NO_PF_UG="YES"
+       ;;
+	R) UPGRADE_TYPE="Rolling"
+       ;;
+	P) NO_PROVISIONING="-X"
+       ;;
+	G) GET_FEATURE_LIST="NO"
+       ;;
+   \?) usage_msg
+       exit 1
+       ;;
+  esac
+done
+shift `expr $OPTIND - 1`
+
+# Source the common functions
+if [ -s ${ENIQ_ROOT_DIR}/admin/lib/common_functions.lib ]; then
+    . ${ENIQ_ROOT_DIR}/admin/lib/common_functions.lib
+else
+    _err_msg_="File ${ENIQ_ROOT_DIR}/admin/lib/common_functions.lib not found"
+    abort_script "$_err_msg_"
+fi
+
+# Setup up path environment etc
+setup_env
+
+if [ ! "${LOGFILE}" ]; then
+    LOGFILE=${LOGFILE_DIR}/manage_features.log
+fi
+
+if [ ! -s ${ENIQ_ADMIN_BIN_DIR}/manage_eniq_services.bsh ]; then
+    _err_msg_="Failed to locate ENIQ service manager script - ${ENIQ_ADMIN_BIN_DIR}/manage_eniq_services.bsh"
+    abort_script "$_err_msg_"
+fi
+
+
+# Check/Create Logfile
+chk_create_logfile
+
+
+log_msg -h -t -l ${LOGFILE} -q -s "Starting to execute manage_features.bsh"
+
+
+#clean temp directory
+$RM -rf ${TEM_DIR}
+$MKDIR -p ${TEM_DIR}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not create directory ${TEM_DIR}"
+    abort_script "$_err_msg_"
+fi
+
+# Check the Input Parameters. I should have -a and -d
+check_input_params
+
+no_of_repdb_connections=`$CAT /eniq/database/rep_main/repdb.cfg | $GREP 'gm' | $CUT -d ' ' -f2`
+
+setup_repdb_connection
+
+trap ' abort_script "Signal Trapped, Cleaning up" ' SIGHUP SIGINT SIGTERM SIGABRT SIGQUIT SIGTSTP SIGUSR1 SIGUSR2
+
+case "${FEATURE_ACTION}" in
+    activate) activate_features
+        	  ;;
+    	 add) add_features
+        	  ;;
+      update) update_features
+        	  ;;
+    	   *) : # SHOULD NOT GET HERE
+       		  ;;
+esac
+
+# Cleanup from the acivites in setup_manage_features
+cleanup_manage_features
+
+no_of_repdb_connections=`$CAT /eniq/database/rep_main/repdb.cfg | $GREP 'gm' | $CUT -d ' ' -f2`
+
+# Set enigne profile to Normal
+set_engine
+
+# Recompiling invalid views
+recompile_invalid_views
+
+#Removing service restart flag
+$RM -rf ${ENIQ_CORE_ETC_DIR}/service_restart
+
+$RM -rf ${TEM_DIR}
+
+exit 0

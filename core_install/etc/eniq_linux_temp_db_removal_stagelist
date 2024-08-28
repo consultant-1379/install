@@ -1,0 +1,6 @@
+change_perm_to_readonly
+drop_temp_db
+unlink_db_sym_links
+update_config_files
+reregister_raw_device
+cleanup

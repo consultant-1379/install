@@ -1,0 +1,21 @@
+[Unit]
+Description=ENIQ DataWarehouse Reader Service
+After=eniq-esm.service NAS-online.service
+Requires=NAS-online.service
+
+[Service]
+Type=forking
+User=dcuser
+Group=dc5000
+ExecStart=/eniq/smf/bin/eniq_smf_start_stop.sh -a start -s dwh_reader
+ExecStop=/eniq/smf/bin/eniq_smf_start_stop.sh -a stop -s dwh_reader
+Restart=always
+RestartSec=15
+StartLimitInterval=100
+StartLimitBurst=3
+TimeoutStartSec=0
+TimeoutStopSec=300
+
+[Install]
+WantedBy=multi-user.target NAS-online.service
+

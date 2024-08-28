@@ -1,0 +1,525 @@
+#!/bin/bash
+# ********************************************************************
+# Ericsson Radio Systems AB                                     SCRIPT
+# ********************************************************************
+#
+#
+# (c) Ericsson Radio Systems AB 2020 - All rights reserved.
+#
+# The copyright to the computer program(s) herein is the property
+# of Ericsson Radio Systems AB, Sweden. The programs may be used 
+# and/or copied only with the written permission from Ericsson Radio 
+# Systems AB or in accordance with the terms and conditions stipulated 
+# in the agreement/contract under which the program(s) have been 
+# supplied.
+#
+# ********************************************************************
+# Name    : tablelist_perfeature.bsh 
+# Date    : 29/01/2020
+# Revision: \main\7
+# Purpose : To derive list of tables as per feature argument passed 
+#           
+#             
+#    
+# Usage   :  bash tablelist_perfature.bsh -f <feature1, feature2>
+#
+# ********************************************************************
+#
+#     Command Section
+#
+# ********************************************************************
+AWK=/usr/bin/awk
+BASENAME=/usr/bin/basename
+CAT=/usr/bin/cat
+CHMOD=/usr/bin/chmod
+CHOWN=/usr/bin/chown
+DATE=/usr/bin/date
+DIRNAME=/usr/bin/dirname
+ECHO=/usr/bin/echo
+EGREP=/usr/bin/egrep
+EXPR=/usr/bin/expr
+GREP=/usr/bin/grep
+ID=/usr/bin/id
+MKDIR=/usr/bin/mkdir
+RM=/usr/bin/rm
+SED=/usr/bin/sed
+TOUCH=/usr/bin/touch
+
+# ********************************************************************
+#
+#       Configuration Section
+#
+# ********************************************************************
+# Name of SunOS & ENIQ ini Files
+ENIQ_ENV=niq.rc
+ENIQ_INI=niq.ini
+SUNOS_INI=SunOS.ini
+SYM_INI=sym_links.ini
+# ********************************************************************
+#
+#   functions
+#
+# ********************************************************************
+### Function: abort_script ###
+#
+#   This will is called if the script is aborted thru an error
+#   error signal sent by the kernel such as CTRL-C or if a serious
+#   error is encountered during runtime
+#
+# Arguments:
+#       $1 - Error message from part of program (Not always used)
+# Return Values:
+#       none
+abort_script()
+{
+if [ "$1" ]; then
+    _err_msg_=$1
+else
+    _err_msg_="Script aborted.......\n"    
+fi
+
+$ECHO "\n$_err_msg_\n" >> ${LOGFILE}
+
+
+if [ "$2" ]; then
+    exit ${2}
+else
+   exit 1
+fi
+
+}
+
+
+
+### Function: check_id ###
+#
+#   Check that the effective id of the user is correct
+#   If not print error msg and exit.
+#
+# Arguments:
+#       $1 : User ID name
+# Return Values:
+#       none
+check_id()
+{
+_check_id_=`$ID  | $AWK -F\( '{print $2}' | $AWK -F\) '{print $1}'`
+if [ "$_check_id_" != "$1" ]; then
+    _err_msg_="You must be $1 to execute this script."
+    abort_script "$_err_msg_"
+fi
+}
+
+### Function: usage_msg ###
+#
+#   Print out the usage message
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+usage_msg() 
+{
+$CLEAR
+$ECHO "
+Usage: `$BASENAME $0` 
+
+"
+}
+
+
+### Function: setup_env ###
+#
+# Setup up path environment etc
+#
+# Arguments:
+#    none
+# Return Values:
+#    DWH_port,DWH_eng and DBA password
+
+setup_env()
+{
+ENIQ_BASE_DIR=/eniq
+ENIQ_ADMIN_ETC=${ENIQ_BASE_DIR}/admin/etc
+ENIQ_SW_DIR=${ENIQ_BASE_DIR}/sw
+ENIQ_BKUPSW_DIR=${ENIQ_BASE_DIR}/bkup_sw
+ENIQ_CONF_DIR=${ENIQ_BASE_DIR}/installation/config
+CLI_CONF_DIR=${ENIQ_BASE_DIR}/sw/conf
+ENIQ_CORE_BIN_DIR=${ENIQ_BASE_DIR}/installation/core_install/bin/
+MAXNUMLOG=4
+
+# DB Extract env file
+DBEXTRACT_ENV_FILE=${ENIQ_ADMIN_ETC}/dbextract_load.env
+if [ ! ${DBEXTRACT_ENV_FILE} ]; then
+                _err_msg_="${DBEXTRACT_ENV_FILE} does not exists"
+                abort_script ${_err_msg_}
+fi
+
+RESULTSDIR=`$CAT ${DBEXTRACT_ENV_FILE} | $GREP "RESULTSDIR=" | $GREP -v "^#" | $AWK -F"=" '{print $2}'`
+if [ ! "${RESULTSDIR}" ]; then
+        _err_msg_="Could not find RESULTSDIR value from file ${DBEXTRACT_ENV_FILE}"
+        abort_script "$_err_msg_"
+fi
+
+RUNNUMBER=`$CAT ${DBEXTRACT_ENV_FILE} | $GREP "RUNNUMBER=" | $GREP -v "^#" | $AWK -F"=" '{print $2}'`
+if [ ! "${RUNNUMBER}" ]; then
+        _err_msg_="Could not find RUNNUMBER value from file ${DBEXTRACT_ENV_FILE}"
+        abort_script "$_err_msg_"
+fi
+
+
+
+if [ ! -s ${ENIQ_CONF_DIR}/${SUNOS_INI} ]; then
+    _err_msg_="Could not locate file ${ENIQ_CONF_DIR}/SunOS.ini"
+    abort_script "$_err_msg_"
+fi
+
+# Source the common functions
+if [ -s ${ENIQ_BASE_DIR}/admin/lib/common_functions.lib ]; then
+    . ${ENIQ_BASE_DIR}/admin/lib/common_functions.lib
+else
+    _err_msg_="File ${ENIQ_BASE_DIR}/admin/lib/common_functions.lib not found"
+    abort_script "$_err_msg_"
+fi
+
+if [ ! -s ${ENIQ_CORE_BIN_DIR}/set_core_memcache.bsh ]; then
+        _err_msg_="Failed to locate script ${ENIQ_CORE_BIN_DIR}/set_core_memcache.bsh"
+        abort_script "$_err_msg_" "${EXEC_SHELL_CMD}"
+fi
+
+# Get the System User/Group. All directories are owned by this
+SYSUSER=`iniget ENIQ_INSTALL_CONFIG -f ${ENIQ_CONF_DIR}/${SUNOS_INI} -v ENIQ_SYSUSER`
+if [ ! "${SYSUSER}" ]; then
+    _err_msg_="Could not read SYSUSER param from ${ENIQ_CONF_DIR}/${SUNOS_INI}"
+    abort_script "$_err_msg_"
+fi
+
+    
+DWH_PORT=`iniget DWH -v PortNumber -f ${CLI_CONF_DIR}/niq.ini`
+DWH_ENG=`iniget DWH -v ServerName -f ${CLI_CONF_DIR}/niq.ini`
+if [ ! "${DWH_PORT}" -o ! "${DWH_ENG}" ]; then
+        _err_msg_="Could not read db values from ${CLI_CONF_DIR}/${ENIQ_INI}"
+        abort_script "$_err_msg_"
+fi
+
+DBA_PASSWORD=`inigetpassword DB -f ${CLI_CONF_DIR}/${ENIQ_INI} -v DBAPassword`
+if [ ! ${DBA_PASSWORD} ]; then
+  if [ -f ${ENIQ_BASE_DIR}/sw/installer/dbusers ]; then
+            DBA_PASSWORD=`${ENIQ_BASE_DIR}/sw/installer/dbusers dba dwh`
+     if [ ! "${DBA_PASSWORD}" ] ; then
+                _err_msg_="Could not get dwhdb DBA Password"
+                abort_script "$_err_msg_"
+     fi
+   fi
+fi
+
+#Initialising the connection string for dwhdb
+dwh_connection_string="-nogui -onerror exit -c \"eng=${DWH_ENG};links=tcpip{host=localhost;port=${DWH_PORT}};uid=dba;pwd=${DBA_PASSWORD}\""
+
+
+REP_PORT=`iniget REP -v PortNumber -f ${CLI_CONF_DIR}/niq.ini`
+REP_ENG=`iniget REP -v ServerName -f ${CLI_CONF_DIR}/niq.ini`
+if [ ! "${REP_PORT}" -o ! "${REP_ENG}" ]; then
+        _err_msg_="Could not read db values from ${CLI_CONF_DIR}/${ENIQ_INI}"
+        abort_script "$_err_msg_"
+fi
+
+#Initialising the connection string for dwhdb
+rep_connection_string="-nogui -onerror exit -c \"eng=${REP_ENG};links=tcpip{host=localhost;port=${REP_PORT}};uid=dba;pwd=${DBA_PASSWORD}\""
+
+. /eniq/sybase_iq/IQ-*/IQ-*.sh >> /dev/null
+sybase_env_variables_ec=$?
+if [ $sybase_env_variables_ec -ne 0 ]; then
+    _err_msg_="Could not source sybase environment"
+    abort_script "$_err_msg_"
+fi
+
+
+CURR_SERVER_TYPE=`$CAT $ENIQ_CONF_DIR/installed_server_type | $EGREP -v '^[[:blank:]]*#' | $SED -e 's/ //g'`
+if [ ! "${CURR_SERVER_TYPE}" ]; then
+    _err_msg_="Could not determine which server type this is"
+    abort_script "$_err_msg_"
+fi
+
+
+if [ ! -s ${CLI_CONF_DIR}/${ENIQ_ENV} ]; then
+    _err_msg_="Could not locate file ${CLI_CONF_DIR}/${ENIQ_ENV}"
+    abort_script "$_err_msg_"
+else
+    . ${CLI_CONF_DIR}/niq.rc
+fi
+
+# Create a temporary Directory
+TEM_DIR=/tmp/Clean_FP_rollover_tmp.$$.$$
+$RM -rf ${TEM_DIR}
+$MKDIR -p ${TEM_DIR}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not create directory ${TEM_DIR}"
+    abort_script "$_err_msg_"
+fi  
+$CHMOD 777 ${TEM_DIR}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not update directory ${TEM_DIR} permissions"
+    abort_script "$_err_msg_"
+fi 
+}
+
+
+### Function: setup_sybase_env ###
+#
+# Set up Sybase environment
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+setup_sybase_env()
+{
+$ENV |$EGREP '^(SYBASE|ASDIR|IQDIR|ASALOGDIR|SQLANY)' > $TEM_DIR/sybase_det.$$ >> /dev/null 2>&1
+
+# Source the environment
+set -a
+. $TEM_DIR/sybase_det.$$ >> /dev/null 2>&1
+set +a
+
+if [ ! "${SYBASE}" ]; then 
+    _err_msg_="Could not determine Sybase environment variable \${SYBASE}"
+    abort_script "$_err_msg_"
+fi
+
+DBISQL="$(ls /eniq/sybase_iq/IQ-*/bin64/dbisql)"
+if [ ! -x "$DBISQL" ]; then
+    _err_msg_="$DBISQL commands not found or not executable."
+    abort_script "$_err_msg_"
+fi
+
+
+}
+
+### Function: get_absolute_path ###
+#
+# Determine absolute path to software
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+get_absolute_path()
+{
+    _dir_=`$DIRNAME $0`
+    SCRIPTHOME=`cd $_dir_ 2>/dev/null && pwd || $ECHO $_dir_`
+}
+
+### Function: usage_msg ###
+#
+#   Print out the usage message
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+usage_msg()
+{
+$ECHO "
+Usage: /usr/bin/bash `$BASENAME $0` -f <feature list>
+
+Compulsory:
+-f : Feature(s) for which the partition set(s) will be enable or disabled or status listed.
+
+"
+}
+
+# ********************************************************************
+#
+#     Main body of program
+#
+# ********************************************************************
+#
+# Determine absolute path to software
+get_absolute_path
+
+
+while getopts "f:edl" arg;
+do
+    case $arg in
+            f)     FeatureListTemp="$OPTARG"
+                    ;;
+            \?)     $ECHO "Invalid option(s) passed"
+                    usage_msg
+                    exit 1
+            ;;
+    esac
+done
+shift `$EXPR $OPTIND - 1`
+
+
+# Set up up path environment etc.
+setup_env
+setup_sybase_env
+
+#LOGFILE creation
+RUN_TIME=`$DATE '+%Y-%b-%d_%H.%M.%S'`
+LOGFILE=${RESULTSDIR}/`hostname`_tablelist_${RUN_TIME}.log
+$TOUCH ${LOGFILE}
+
+# Check that the effective id of the user is dcuser
+#check_id dcuser
+#check_id root
+OUTPUT_DIR=${RESULTSDIR}/tablelist_perfeature.txt
+$RM -f ${OUTPUT_DIR} >/dev/null 2>&1
+
+if [ ! -z "${FeatureListTemp}" ]; then
+
+    declare -a FeatureList
+    interFace=""
+
+    
+    IFS=',' read -ra FeatureList <<< "$FeatureListTemp"
+    for feature in "${FeatureList[@]}"; do
+        Version=$($CAT ${CLI_CONF_DIR}/feature_descriptions | $GREP "${feature}" | $AWK -F"::" '{print $1}')
+        if [ "${Version}" ]; then
+        interFace="$($CAT ${CLI_CONF_DIR}/feature_techpacks | $GREP "${Version}" | $SED "s/${Version}:://g")"
+        interFaces=$interFaces" "$interFace
+        if4q="('$($ECHO ${interFaces} | $SED "s/ /','/g")')"
+        else
+        $ECHO "No interFace found for feature ${feature}\n" >> ${LOGFILE}
+        fi
+    done
+else
+    _err_msg_="Feature List is empty. Please check if features are selected properly\n"
+    abort_script "${_err_msg_}"
+fi
+
+$ECHO "\n--------------------------------------------" >> ${LOGFILE}
+$ECHO "Preparing for Table list generation..." >> ${LOGFILE}
+$ECHO "--------------------------------------------\n" >> ${LOGFILE}
+
+$DBISQL ${dwh_connection_string} "IF (select count(*) from sysserver where srvname like 'remote_repdb') = 0
+BEGIN
+   create server remote_repdb class 'asaodbc' using 'Driver=libdbodbc16_r.so;CommLinks=tcpip(host=repdb:2641);ServerName=repdb;uid=dba;pwd=${DBA_PASSWORD}'
+END;
+
+IF (select count(*) from systab where table_name like 'remote_DWHPartition') = 0
+BEGIN
+        create existing table dc.remote_DWHPartition  at 'remote_repdb.repdb.dwhrep.DWHPartition'
+end;
+
+
+IF (select count(*) from systab where table_name like 'remote_DWHType') = 0
+BEGIN
+     create existing table dc.remote_DWHType at 'remote_repdb.repdb.dwhrep.DWHType'
+end;
+
+IF (select count(*) from systab where table_name like 'remote_InterfaceDependency') = 0
+BEGIN
+     create existing table dc.remote_InterfaceDependency at 'remote_repdb.repdb.dwhrep.InterfaceDependency'
+end;" >> /dev/null 2>&1
+if [ $? -eq 0 ]; then
+    $ECHO "Preparation complete." >> ${LOGFILE}
+fi
+
+$ECHO "\n--------------------------------------------" >> ${LOGFILE}
+$ECHO "Extracting Interface and Techpack details to derive table list..." >> ${LOGFILE}
+$ECHO "--------------------------------------------\n" >> ${LOGFILE}
+
+$DBISQL ${dwh_connection_string} "SELECT
+            u.user_name,tab.table_name,dwhT.TECHPACK_NAME
+        FROM
+            systab tab,
+            sysuser u,
+            sysdbspace dbs,
+            dc.remote_DWHType dwhT,
+            dc.remote_DWHPartition dwhp
+        WHERE
+            tab.table_type_str LIKE 'base'
+        AND u.user_name NOT LIKE 'sys'
+        AND u.user_id=tab.creator
+        AND dbs.dbspace_name LIKE 'IQ_MAIN'
+        AND tab.dbspace_id=dbs.dbspace_id
+        and dwht.STORAGEID=dwhp.STORAGEID
+        and dwhp.STORAGEID in (select STORAGEID from dc.remote_DWHType where TECHPACK_NAME in (select Distinct TECHPACKNAME from dc.remote_InterfaceDependency WHERE INTERFACENAME in ${if4q}))
+        and dwhp.tablename=tab.table_name
+union all
+        SELECT
+            u.user_name,LEFT(tab.table_name, LEN(tab.table_name) - 3)||'_CALC' as tablename,dwhT.TECHPACK_NAME
+        FROM
+            systab tab ,
+            sysuser u,
+            sysdbspace dbs,
+            dc.remote_DWHType dwhT,
+            dc.remote_DWHPartition dwhp
+        WHERE
+            tab.table_type_str LIKE 'base'
+        AND u.user_id=tab.creator
+        AND dbs.dbspace_name LIKE 'IQ_MAIN'
+        AND tab.dbspace_id=dbs.dbspace_id
+        and dwht.STORAGEID=dwhp.STORAGEID
+        and dwhp.tablename=tab.table_name
+        and dwhp.STORAGEID in (select STORAGEID from dc.remote_DWHType where TECHPACK_NAME in (select Distinct TECHPACKNAME from dc.remote_InterfaceDependency WHERE INTERFACENAME in ${if4q}))
+        and tab.table_name not like 'table_move_status'
+        and tab.table_name like '%|_DAYBH|_%' escape '|'
+        AND tab.table_name IN
+            (
+                SELECT
+                    tablename
+                FROM
+                    dc.remote_DWHPartition)
+        group by  u.user_name,tablename,dwhT.TECHPACK_NAME;
+        OUTPUT TO ${OUTPUT_DIR} APPEND HEXADECIMAL ASIS FORMAT TEXT ;"  >/dev/null 2>&1
+        
+        #need to confrim if dwh_monitor and dwh_base tp are required
+        $DBISQL ${dwh_connection_string} "SELECT
+            u.user_name,tab.table_name,dwhT.TECHPACK_NAME
+        FROM
+            systab tab,
+            sysuser u,
+            sysdbspace dbs,
+            dc.remote_DWHType dwhT,
+            dc.remote_DWHPartition dwhp
+        WHERE
+            tab.table_type_str LIKE 'base'
+        AND u.user_name NOT LIKE 'sys'
+        AND u.user_id=tab.creator
+        AND dbs.dbspace_name LIKE 'IQ_MAIN'
+        AND tab.dbspace_id=dbs.dbspace_id
+        and dwht.STORAGEID=dwhp.STORAGEID
+        and dwhp.STORAGEID in (select STORAGEID from dc.remote_DWHType where TECHPACK_NAME like 'DWH_MONItor')
+        and dwhp.tablename=tab.table_name;
+        OUTPUT TO ${OUTPUT_DIR} APPEND HEXADECIMAL ASIS FORMAT TEXT ;"  >/dev/null 2>&1
+
+$DBISQL ${dwh_connection_string} "IF (select count (*) from systab where table_name like 'remote_DWHPartition') = 1
+BEGIN
+drop table dc.remote_DWHPartition
+END;
+
+IF (select count (*) from systab where table_name like 'remote_DWHType') = 1
+BEGIN
+drop table dc.remote_DWHType
+END;
+
+IF (select count (*) from systab where table_name like 'remote_InterfaceDependency') = 1
+BEGIN
+drop table dc.remote_InterfaceDependency
+END;
+
+IF (select count (*) from sysserver where srvname like 'remote_repdb') = 1
+BEGIN
+drop server remote_repdb
+END;" >> /dev/null 2>&1
+if [ $? -ne 0 ]; then
+    $ECHO "WARNING: Unable to drop proxy tables and remote server in tablelist_perfature.bsh" >> ${LOGFILE}
+fi
+
+		
+if [ -s "${OUTPUT_DIR}" ]; then
+    $CAT ${OUTPUT_DIR} | $AWK -F"," '{print $1","$2}' > ${RESULTSDIR}/Extract_tables_${RUNNUMBER}.txt
+    if [ -s "${RESULTSDIR}/Extract_tables_${RUNNUMBER}.txt" ]; then
+        $CHOWN dcuser:dc5000 ${RESULTSDIR}/Extract_tables_${RUNNUMBER}.txt
+        $CHMOD 655 ${RESULTSDIR}/Extract_tables_${RUNNUMBER}.txt
+
+        $ECHO "\nCompleted tables list generation for selected features" >> ${LOGFILE}
+        $RM -rf ${OUTPUT_DIR} >> /dev/null 2>&1
+    fi
+else
+    _err_msg_="Unable to list tables for Extraction of data..!"
+    abort_script "$_err_msg_"
+fi

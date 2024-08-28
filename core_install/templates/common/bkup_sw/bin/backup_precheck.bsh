@@ -1,0 +1,644 @@
+#!/bin/bash
+# ********************************************************************
+# Ericsson Radio Systems AB                                     SCRIPT
+# ********************************************************************
+#
+#
+# (c) Ericsson Radio Systems AB 2020 - All rights reserved.
+#
+# The copyright to the computer program(s) herein is the property
+# of Ericsson Radio Systems AB, Sweden. The programs may be used
+# and/or copied only with the written permission from Ericsson Radio
+# Systems AB or in accordance with the terms and conditions stipulated
+# in the agreement/contract under which the program(s) have been
+# supplied.
+#
+# ********************************************************************
+#
+# Name    : backup_precheck.bsh
+# Date    : 09/10/2023
+# Revision: main\8
+# Purpose : This primary purpose of this script is to run backup_precheck steps for ENIQ backup.
+#
+#
+#
+#
+# **********************************************************************
+#
+#       Command Section
+#
+# *********************************************************************
+AWK=/usr/bin/awk
+CAT=/usr/bin/cat
+CP=/usr/bin/cp
+DATE=/usr/bin/date
+DF=/usr/bin/df
+DIRNAME=/usr/bin/dirname
+ECHO="/usr/bin/echo -e"
+EGREP=/usr/bin/egrep
+GREP=/usr/bin/grep
+HOSTNAME=/usr/bin/hostname
+ID=/usr/bin/id
+KILL=/usr/bin/kill
+LS=/usr/bin/ls
+MKDIR=/usr/bin/mkdir
+NSLOOKUP=/usr/bin/nslookup
+PERL=/usr/bin/perl
+PING=/usr/bin/ping
+PS=/usr/bin/ps
+PVS=/usr/sbin/pvs
+PWD=/usr/bin/pwd
+RM=/usr/bin/rm
+SLEEP=/usr/bin/sleep
+SSH=/usr/bin/ssh
+SVCS=/usr/bin/svcs
+SYSTEMCTL=usr/bin/systemctl
+TEE=/usr/bin/tee
+TIMEOUT=/usr/bin/timeout
+TOUCH=/usr/bin/touch
+UNAME=/usr/bin/uname
+
+
+
+
+# ********************************************************************
+#
+#       Configuration Section
+#
+# ***************************************
+
+# ********************************************************************
+#
+#       functions
+#
+# ********************************************************************
+### Function: abort_script ###
+#
+#   This will is called if the script is aborted thru an error
+#   error signal sent by the kernel such as CTRL-C or if a serious
+#   error is encountered during runtime
+#
+# Arguments:
+#       $1 - Error message from part of program (Not always used)
+# Return Values:
+#       none
+abort_script()
+{
+_err_time_=`$DATE '+%Y-%b-%d_%H.%M.%S'`
+
+if [ "$1" ]; then
+   _err_msg_="${_err_time_} - $1"
+else
+   _err_msg_="${_err_time_} - ERROR : Script aborted.......\n"
+fi
+
+if [ "${LOGFILE}" ]; then
+    $ECHO "\nERROR : ${_err_msg_}\n" | $TEE -a ${LOGFILE}
+else
+    $ECHO "\nERROR : ${_err_msg_}\n"
+fi
+
+if [ "$2" ]; then
+    ${2}
+else
+   exit 1
+fi
+
+}
+
+## Function: check_df_output ###
+#
+# Check df -hk command output
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+check_df_output()
+{
+$ECHO "-----------------------------------------------------------" >> ${LOGFILE}
+log_msg -s "\n==>> Checking df -hk output. " -l ${LOGFILE}
+
+df_out=`${TIMEOUT} 20 $DF -hk`
+if [ -z "${df_out}" ]; then
+    _err_msg_="df -hk is not working .Exiting.!!"
+    abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+fi
+ 
+log_msg -s "     df -hk is working." -l ${LOGFILE}
+}
+
+### Function: check_eniq_services ###
+#
+# Check all ENIQ services
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+check_eniq_services()
+{
+log_msg -l ${LOGFILE} -s "\n==>> Checking if ENIQ Services on $HOST_NAME are active."
+
+# Check for smf config file
+_smf_contract_file_=${ENIQ_ADMIN_DIR}/etc/smf_contract_config 
+if [ ! -s ${_smf_contract_file_} ]; then
+    _err_msg_="Could not find ${_smf_contract_file_} file, or it is empty"
+    abort_script "${_err_msg_}" 
+fi
+
+# Get Services list
+$CAT ${_smf_contract_file_} | $EGREP "${CURR_SERVER_TYPE}" | $EGREP "${MANAGED_STR}" > ${TEM_DIR}/server_type_contracts
+if [ ! -s ${TEM_DIR}/server_type_contracts ]; then
+    _err_msg_="Could not parse ${CURR_SERVER_TYPE} from ${_smf_contract_file_}"
+    abort_script "${_err_msg_}"
+fi
+
+# Create a list of services for this server type
+while read _line_; do
+    _service_name_=`$ECHO ${_line_} | $AWK -F"::" '{print $3}'`
+    _service_opt_=`$ECHO ${_line_} | $AWK -F"::" '{print $4}'`
+    if [ "${_service_opt_}" == "Y" ]; then
+        if [ ! "${_service_list_}" ]; then
+            _service_list_=${_service_name_}
+        else
+            _service_list_="${_service_list_} ${_service_name_}"
+        fi
+    fi
+done < ${TEM_DIR}/server_type_contracts
+
+# Checking all the ENIQ services
+for _service_ in ${_service_list_}; do
+    if [ ${_service_} == "fls" ]; then
+        if [ ! -s /eniq/installation/config/fls_conf ]; then
+        # Checking if FLS is configured or not
+          continue
+        fi
+    fi
+
+    local _service_state_=`$SYSTEMCTL show -p ActiveState ${SMF_ID_COMMON_STR}${_service_} | $AWK -F'=' '{print $2}'`
+    if [ "${_service_state_}" == "inactive" ]; then
+        _err_msg_="Could not start ${SMF_ID_COMMON_STR}${_service_}"
+        abort_script "${_err_msg_}" 
+    fi
+    
+done
+
+
+log_msg -l ${LOGFILE} -s "     ENIQ services on $HOST_NAME are active."
+}
+
+## Function: check_host_agent ###
+#
+# Checking Host agent is running 
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+check_host_agent()
+{
+# Read the SAN device type
+if [ "${STORAGE_TYPE}" = "raw" ]; then
+    _san_type_=`$CAT ${ENIQ_CONF_DIR}/${SUNOS_INI} | $GREP -w SAN_DEVICE | $CUT -d "=" -f2`
+    if [ "${_san_type_}" == "vnx" ];then
+        $ECHO "-----------------------------------------------------------" >> ${LOGFILE}
+        log_msg -s "\n==>> Checking host agent. " -l ${LOGFILE}
+        HOST_AGENT=/etc/Unisphere/agent.config
+        khostagent=/etc/rc0.d/K35hostagent
+        
+        $PS -ef | $EGREP -vw grep | $EGREP -w ${HOST_AGENT} >> ${LOGFILE}
+        if [ $? -ne 0 ]; then
+            _err_msg_="${HOST_AGENT} is not running. Exiting.!!"
+            abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+        fi
+        log_msg -s "     Host Agent is running " -l ${LOGFILE}
+    fi
+fi
+
+}
+
+### Function: check_id ###
+#
+#   Check that the effective id of the user is correct
+#   If not print error msg and exit.
+#
+# Arguments:
+#       $1 : User ID name
+# Return Values:
+#       none
+check_id()
+{
+_check_id_=`$ID  | $AWK -F\( '{print $2}' | $AWK -F\) '{print $1}'`
+if [ "$_check_id_" != "$1" ]; then
+    _err_msg_="You must be $1 to execute this script."
+    abort_script "$_err_msg_"
+fi
+}
+
+### Function: check_nas_online_service ###
+#
+# Check nas online service
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+check_nas_online_service()
+{
+# Check NAS_online service
+if [ "${STORAGE_TYPE}" = "raw" ]; then
+    $ECHO "-----------------------------------------------------------" >> ${LOGFILE}
+    log_msg -s "\n==>> Checking  ${NAS_online} Service. " -l ${LOGFILE}
+    local nasd_service_state_linux=`${SYSTEMCTL} show ${NAS_online} -p ActiveState | $AWK -F= '{print $2}'`
+    if [ "${nasd_service_state_linux}" == "inactive" ]; then
+        _err_msg_="NAS_online service is not active Exiting.!!"
+        abort_script "${_err_msg_}"
+    fi
+    log_msg -s "     ${NAS_online} Service is active." -l ${LOGFILE}
+fi
+
+}
+
+## Function: check_san_server ###
+#
+# Check SAN NAS and fs snapshot 
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+check_ombs_snapshot()
+{
+_snap_label_=omss
+
+$ECHO "-----------------------------------------------------------" >> ${LOGFILE}
+log_msg -s "\n==>>Checking for OMBS snapshots (NAS, SAN or FS) with label ${_snap_label_} on server ${HOST_NAME}." -l ${LOGFILE}
+
+server_type=`$CAT ${ENIQ_CONF_DIR}/installed_server_type`
+if [ -z "${server_type}" ]; then
+    _err_msg_="Could not get server_type from ${ENIQ_CONF_DIR}/installed_server_type file."
+    abort_script "${_err_msg_}" 
+fi
+
+if [ "${server_type}" == "stats_coordinator" -o "${server_type}" == "eniq_stats" ];then
+    if [ -f ${SCRIPTHOME}/manage_san_snapshots.bsh ]; then
+        $BASH ${SCRIPTHOME}/manage_san_snapshots.bsh -a list -f ALL -N | $GREP -w ${_snap_label_} >> /dev/null 2>&1
+        if [ $? -eq 0 ]; then
+            _err_msg_="\nSAN snapshots with label ${_snap_label_} present on server ${HOST_NAME}. Exiting.!!"
+            abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+        fi
+    fi
+    
+    
+    if [ -f ${SCRIPTHOME}/manage_nas_snapshots.bsh ]; then
+        $BASH ${SCRIPTHOME}/manage_nas_snapshots.bsh -a list -f ALL -N | $GREP -w ${_snap_label_} >> /dev/null 2>&1
+        if [ $? -eq 0 ]; then
+            _err_msg_="\nNAS snapshots with label ${_snap_label_} present on server ${HOST_NAME}. Exiting.!!"
+            abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+        fi
+    fi
+fi    
+
+if [ -f ${SCRIPTHOME}/manage_fs_snapshots.bsh ]; then
+    $BASH ${SCRIPTHOME}/manage_fs_snapshots.bsh -a list -f ALL -N | $GREP -w ${_snap_label_} >> /dev/null 2>&1
+    if [ $? -eq 0 ]; then
+        _err_msg_="\nFS snapshots with label ${_snap_label_} present on server ${HOST_NAME}. Exiting.!!"
+        abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+    fi
+fi
+
+log_msg -s "     No OMBS snapshot are present with label ${_snap_label_} on server ${HOST_NAME}." -l ${LOGFILE}
+}
+
+
+
+## Function: check_san_server ###
+#
+# Check SAN Server in online
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+check_san_server()
+{
+
+
+# Read the SAN device type
+if [ "${STORAGE_TYPE}" = "raw" ]; then
+    $ECHO "-----------------------------------------------------------" >> ${LOGFILE}
+    log_msg -s "\n==>> Checking SAN server is available. " -l ${LOGFILE}
+    if [ -s ${ENIQ_CONF_DIR}/${BLK_STOR_INI} ]; then
+        SAN_IP=`iniget BLK_STORAGE_DEV_DETAILS_1 -f ${ENIQ_CONF_DIR}/${BLK_STOR_INI} -v BLK_STORAGE_IP_SPA`
+        if [ -z "${SAN_IP}" ]; then
+             _err_msg_="Could not read BLK_STORAGE_IP_SPA."
+             abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+        fi
+    else
+        _err_msg_="Could not read BLK_STORAGE_IP_SPA."
+        abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+    fi
+
+    # Trying to communicate with SAN server
+    $PING -c 2 ${SAN_IP} >/dev/null 2>&1
+    if [ "$?" -ne 0 ];then
+        _err_msg_="Unable to communicate with SAN IP [ ${SAN_IP} ]. Exiting.!!"
+        abort_script "$_err_msg_"
+    fi
+   log_msg -s "     SAN server is available. " -l ${LOGFILE}
+fi
+
+}
+
+### Function: check_vlan_info ###
+#
+# Check the VLAN IP is configured in /etc/host 
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+check_vlan_info()
+{
+$ECHO "-----------------------------------------------------------" >> ${LOGFILE}
+
+server_type=`$CAT ${ENIQ_CONF_DIR}/installed_server_type`
+if [ -z "${server_type}" ]; then
+    _err_msg_="Could not get server_type from ${ENIQ_CONF_DIR}/installed_server_type file."
+    abort_script "${_err_msg_}" 
+fi
+
+if [ "${server_type}" == "stats_coordinator" -o "${server_type}" == "eniq_stats" ];then
+    log_msg -s "\n==>> Checking BACKUP VLAN IP in /etc/hosts file." -l ${LOGFILE}
+    RUN_HOST_CMD="${SSH} -o StrictHostKeyChecking=no -o BatchMode=yes"
+    backup_vlan_ip=`$CAT ${ETC_EXPORTS} | $GREP -w ${OMBS_CFG} | $AWK '{print $2}' | $AWK -F\( '{print $1}'`
+    if [ -z "${backup_vlan_ip}" ]; then
+        _err_msg_="Could not get backup vlan ip."
+        abort_script "${_err_msg_}" 
+    fi
+    if [ "${server_type}" == "stats_coordinator" ];then
+        $PERL ${ENIQ_CORE_INST_DIR}/lib/get_ip_order.pl -f ${VAR_TMP_DIR}/serverlist
+		
+        if [ "${_ip_type_}" == "IPv4" ]; then
+            $CAT ${VAR_TMP_DIR}/serverlist | $AWK -F"::" '{print $1}' >> ${VAR_TMP_DIR}/server_ip.txt
+        fi
+		
+		if [ "${_ip_type_}" == "IPv6" ]; then	
+			for _line_ in `$CAT ${VAR_TMP_DIR}/serverlist`; do
+				unset _ip_address_ _count_		
+				local _count_=`$ECHO "${_line_}" | grep -o "::" | wc -l`
+				if [ "${_count_}" == 3 ]; then
+					local _ip_address_=`$ECHO ${_line_} | grep -oE '([a-fA-F0-9]{1,4}::?){1,7}[a-fA-F0-9]{1,4}' | head -n 1 | awk -F "::" '{ print $1 "::" $2}'` 
+				else
+					local _ip_address_=`$ECHO ${_line_} | $AWK -F"::" '{print $1}'` 
+				fi	
+				$ECHO ${_ip_address_} >> ${VAR_TMP_DIR}/server_ip.txt
+			done
+		fi
+		
+		for _ip_address_ in `cat ${VAR_TMP_DIR}/server_ip.txt`;do
+            $RUN_HOST_CMD ${DEFAULT_USER}@${_ip_address_} $CAT ${ETC_HOST} |  $GREP -w ${backup_vlan_ip} >> /dev/null
+            if [ $? -ne 0 ]; then
+                log_msg -s "Could not get backup_vlan_ip in ${ETC_HOST} of server ${_ip_address_}" -l ${LOGFILE}
+                abort_script "${_err_msg_}" 
+           fi
+        done
+        
+        $RM -rf ${VAR_TMP_DIR}/server_ip.txt
+    else 
+        _ip_address=`$HOSTNAME -i | $AWK -F " " '{print $1}'`
+        if [ -z "${_ip_address}" ]; then
+            _err_msg_="Could not get _ip_address."
+            abort_script "${_err_msg_}" 
+        fi
+        $CAT ${ETC_HOST} |  $GREP -w ${backup_vlan_ip} >> /dev/null
+        if [ $? -ne 0 ]; then
+            log_msg -s "Could not get backup_vlan_ip in ${ETC_HOST} of server ${_ip_address}" -l ${LOGFILE}
+            abort_script "${_err_msg_}" 
+       fi
+    fi
+fi
+log_msg -s "     BACKUP_VLAN_IP is present /etc/hosts file." -l ${LOGFILE}
+}
+
+### Function: chk_create_logfile ###
+#
+# Check/Create Logfile
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+chk_create_logfile()
+{
+$MKDIR -p `$DIRNAME ${LOGFILE}`
+if [ $? -ne 0 ]; then
+    unset LOGFILE
+    _err_msg_="Could not create directory `$DIRNAME ${LOGFILE}`"
+     abort_script "$_err_msg_"
+fi
+
+$TOUCH -a ${LOGFILE}
+if [ $? -ne 0 ]; then
+    unset LOGFILE
+    _err_msg_="Could not write to file ${LOGFILE}"
+    abort_script "$_err_msg_"
+fi
+
+if [ -s ${LOGFILE} ]; then
+    $ECHO "\n\n" >> ${LOGFILE}
+fi
+
+$ECHO "================================================================" >> ${LOGFILE}
+$ECHO "ENIQ Backup-Precheck Started at `$DATE +%d.%m.%y_%H:%M:%S`\n" >> ${LOGFILE}
+}
+
+### Function: get_absolute_path ###
+#
+# Determine absolute path to software
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+get_absolute_path()
+{
+_dir_=`$DIRNAME $0`
+SCRIPTHOME=`cd $_dir_ 2>/dev/null && pwd || $ECHO $_dir_`
+}
+
+### Function: setup_script_env ###
+#
+# Setup up script environment etc
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+setup_script_env()
+{
+
+# Directory on the root filesystem
+ENIQ_BASE_DIR=/eniq
+
+# ENIQ Admin Directory
+ENIQ_ADMIN_DIR=${ENIQ_BASE_DIR}/admin
+
+# ENIQ Log Directory
+ENIQ_LOG_DIR=${ENIQ_BASE_DIR}/local_logs
+
+# ENIQ Admin Bin Directory
+ENIQ_ADMIN_BIN_DIR=${ENIQ_ADMIN_DIR}/bin
+
+# ENIQ SW conf
+CLI_CONF_DIR=${ENIQ_BASE_DIR}/sw/conf
+
+# Main Directory for the Core Installation SW
+ENIQ_INST_DIR=${ENIQ_BASE_DIR}/installation
+
+# Main Directory for the Core Installation SW
+ENIQ_CORE_INST_DIR=${ENIQ_INST_DIR}/core_install
+
+# Core bin dir
+ENIQ_CORE_BIN_DIR=${ENIQ_CORE_INST_DIR}/bin
+
+# Main Directory for the Core Installation etc SW
+ENIQ_CORE_ETC_DIR=${ENIQ_CORE_INST_DIR}/etc
+
+# ENIQ Config Directory
+ENIQ_CONF_DIR=${ENIQ_INST_DIR}/config
+
+# Name of block storage ini Files
+BLK_STOR_INI=block_storage.ini
+
+# Name of SunOS ini File
+SUNOS_INI=SunOS.ini
+
+
+# ETC File
+ETC_HOST=/etc/hosts
+
+#ETC Exports file
+ETC_EXPORTS="/etc/exports"
+
+# Source the common functions
+if [ -s ${ENIQ_CORE_INST_DIR}/lib/common_functions.lib ]; then
+    . ${ENIQ_CORE_INST_DIR}/lib/common_functions.lib
+else
+    _err_msg_="File ${ENIQ_CORE_INST_DIR}/lib/common_functions.lib not found"
+    abort_script "${_err_msg_}"
+fi
+
+
+# Determine the current server type
+CURR_SERVER_TYPE=`$CAT ${ENIQ_CONF_DIR}/installed_server_type | $EGREP -v '^[     ]*#' | $SED -e 's/ //g'`
+if [ -z "${CURR_SERVER_TYPE}" ]; then
+    _err_msg_="Could not determine the server type "
+    abort_script "${_err_msg_}"
+fi
+
+# Eniq service identifiers. STOP & START order
+MANAGED_STR="ENIQ"
+
+# service name together to give me the Systemd ID eg. eniq-dwhdb
+SMF_ID_COMMON_STR="eniq-"
+
+# Logfile
+LOGFILE=${ENIQ_LOG_DIR}/backup_logs/backup_precheck.log
+
+HOST_NAME=`hostname`
+
+NAS_online="NAS-online"
+
+VG_ROOT="vg_root"
+
+OMBS_CFG="/eniq/bkup_sw/ombs_cfg"
+
+
+if [ ! -s ${ENIQ_CONF_DIR}/installed_server_type ]; then
+    _err_msg_="Could not find ${${ENIQ_CONF_DIR}/installed_server_type} file."
+    abort_script "${_err_msg_}"
+fi
+
+# Read the storage type
+if [ -s ${ENIQ_CONF_DIR}/${SUNOS_INI} ]; then
+    STORAGE_TYPE=`iniget STOR_TYPE -f ${ENIQ_CONF_DIR}/${SUNOS_INI} -v STORAGE_TYPE`
+    if [ -z "${STORAGE_TYPE}" ]; then
+        _err_msg_="Could not read STORAGE_TYPE param."
+        abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+    fi
+fi
+
+#Fetching IP Type from IPMP_INI file.
+check_ip_type
+
+if [ ! "${_ip_type_}" ]; then
+    _err_msg_="Could not read parameter _IP_TYPE_ from file ${ENIQ_CONF_DIR}/${IPMP_INI}"
+    abort_script "$_err_msg_"
+fi
+}
+
+
+# ********************************************************************
+#
+#       Main body of program
+#
+# ********************************************************************
+#
+# Save the time of running. I do this here as I want all
+# dates and time to be the same
+DEFAULT_USER=root
+
+RUN_TIME=`$DATE '+%Y-%m-%d_%H.%M.%S'`
+
+# Determine absolute path to software
+get_absolute_path
+
+# Check that the effective id of the user is root
+check_id ${DEFAULT_USER}
+
+# Setup up path environment etc
+setup_script_env
+
+# Check/Create Logfile
+chk_create_logfile
+
+
+while getopts ":o" arg; do
+  case $arg in
+    o) OMBS_BACKUP="YES"
+       ;;
+  esac
+done
+shift `expr $OPTIND - 1`
+
+
+
+# Check ENIQ services are online
+#check_eniq_services
+
+# Check SAN server is connected
+check_san_server
+
+# Check NAS_online service
+check_nas_online_service
+
+if [ "${OMBS_BACKUP}" ]; then
+    
+    # Checking host agent is running or not 
+    check_host_agent
+
+    # Check VLAN_IP in etc host
+    check_vlan_info 
+
+    # Check OMBS snapshot 
+    check_ombs_snapshot
+fi
+
+# Check output of df -hk
+check_df_output
+
+log_msg -h -l ${LOGFILE} -t -s "Successfully completed backup precheck. Logfile: ${LOGFILE}"
+
+exit 0

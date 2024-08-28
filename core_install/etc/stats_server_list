@@ -1,0 +1,16 @@
+#
+# File containing the server type
+# that can be installed.
+#
+# Based on this selection, a different flow
+# of steps will be carried out during installation
+#
+# This file is ordered, and should not be altered
+#
+# File Format -	
+#	<server_type>::<description>
+#
+eniq_stats::ENIQ Stats (standalone)
+stats_coordinator::ENIQ Stats Coordinator Server
+stats_iqr::ENIQ Stats Reader Server
+stats_engine::ENIQ Stats Engine Server

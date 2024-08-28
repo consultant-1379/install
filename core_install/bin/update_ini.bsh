@@ -1,0 +1,596 @@
+#!/bin/bash
+# ********************************************************************
+# Ericsson Radio Systems AB                                     SCRIPT
+# ********************************************************************
+#
+#
+# (c) Ericsson Radio Systems AB 2012 - All rights reserved.
+#
+# The copyright to the computer program(s) herein is the property
+# of Ericsson Radio Systems AB, Sweden. The programs may be used
+# and/or copied only with the written permission from Ericsson Radio
+# Systems AB or in accordance with the terms and conditions stipulated
+# in the agreement/contract under which the program(s) have been
+# supplied.
+#
+# ********************************************************************
+# Name    : update_ini.bsh
+# Date    : 29/11/2018
+# Revision: B.1
+# Purpose : Script to make any required changes to ini file(s)
+#
+# ********************************************************************
+#
+#       Command Section
+#
+# ********************************************************************
+AWK=/usr/bin/awk
+BASENAME=/usr/bin/basename
+BC=/usr/bin/bc
+CAT=/usr/bin/cat
+CLEAR=/usr/bin/clear
+CP=/usr/bin/cp
+CUT=/usr/bin/cut
+DATE=/usr/bin/date
+DIRNAME=/usr/bin/dirname
+ECHO=/usr/bin/echo
+EGREP=/usr/bin/egrep
+ENV=/usr/bin/env
+EXPR=/usr/bin/expr
+FORMAT=/usr/sbin/format
+GREP=/usr/bin/grep
+HEAD=/usr/bin/head
+ID=/usr/bin/id
+LS=/usr/bin/ls
+MKDIR=/usr/bin/mkdir
+PWD=/usr/bin/pwd
+RM=/usr/bin/rm
+SED=/usr/bin/sed
+SU=/usr/bin/su
+TEE=/usr/bin/tee
+TOUCH=/usr/bin/touch
+TPUT=/usr/bin/tput
+
+# ********************************************************************
+#
+#       Configuration Section
+#
+# ********************************************************************
+# Name of SunOS & ENIQ ini Files
+DWH_INI=dwh.ini
+ENIQ_ENV=niq.rc
+NIQ_INI=niq.ini
+OUT_INI=niq.ini.out
+SUNOS_INI=SunOS.ini
+SYM_INI=sym_links.ini
+
+# ********************************************************************
+#
+#       Pre-execution Operations
+#
+# ********************************************************************
+
+
+# ********************************************************************
+#
+#       Functions
+#
+# ********************************************************************
+### Function: abort_script ###
+#
+#   This will is called if the script is aborted thru an error
+#   error signal sent by the kernel such as CTRL-C or if a serious
+#   error is encountered during runtime
+#
+# Arguments:
+#       $1 - Error message from part of program (Not always used)
+# Return Values:
+#       none
+abort_script()
+{
+if [ "$1" ]; then
+    _err_msg_=$1
+else
+    _err_msg_="Script aborted.......\n"
+fi
+
+if [ "${LOGFILE}" ]; then
+    $ECHO "\n$_err_msg_\n"|$TEE -a ${LOGFILE}
+else
+    $ECHO "\n$_err_msg_\n"
+fi
+
+cd $SCRIPTHOME
+
+$RM -rf ${TEM_DIR}
+
+if [ "$2" ]; then
+    ${2}
+else
+   exit 1
+fi
+}
+
+### Function: check_id ###
+#
+#   Check that the effective id of the user is correct
+#   If not print error msg and exit.
+#
+# Arguments:
+#       $1 : User ID name
+# Return Values:
+#       none
+check_id()
+{
+_check_id_=`$ID  | $AWK -F\( '{print $2}' | $AWK -F\) '{print $1}'`
+if [ "$_check_id_" != "$1" ]; then
+    _err_msg_="You must be $1 to execute this script."
+    abort_script "$_err_msg_"
+fi
+}
+
+### Function: chk_create_logfile ###
+#
+# Check/Create Logfile
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+chk_create_logfile()
+{
+$MKDIR -p `$DIRNAME ${LOGFILE}`
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not create directory `$DIRNAME ${LOGFILE}`"
+     abort_script "$_err_msg_"
+fi
+
+$TOUCH -a ${LOGFILE}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not write to file ${LOGFILE}"
+    abort_script "$_err_msg_"
+fi
+}
+
+### Function: get_absolute_path ###
+#
+# Determine absolute path to software
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+get_absolute_path()
+{
+_dir_=`$DIRNAME $0`
+SCRIPTHOME=`cd $_dir_ 2>/dev/null && pwd || $ECHO $_dir_`
+}
+
+### Function: setup_env ###
+#
+# Setup up path environment etc
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+setup_env()
+{
+if [ ! "${ENIQ_BASE_DIR}" ]; then
+    ENIQ_BASE_DIR=/eniq
+fi
+
+ENIQ_CORE_DIR=${ENIQ_BASE_DIR}/installation/core_install
+
+ENIQ_CONF_DIR=${ENIQ_BASE_DIR}/installation/config
+if [ ! -s ${ENIQ_CONF_DIR}/ericsson_use_config ]; then
+    _err_msg_="Could not locate file ${ENIQ_CONF_DIR}/ericsson_use_config"
+    abort_script "$_err_msg_"
+fi
+}
+
+### Function: merge_dwh_niq ###
+#
+#   Print out the usage message
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+merge_dwh_niq()
+{
+DWH_INI_LIST='ETLC DB WEBSERVER REP GLASSFISH_DB DWH_READER_SETTINGS DWH'
+
+for _item_ in ${DWH_INI_LIST}; do
+	$ECHO "\n Merging ${_item_} to ${TEM_DIR}/${NIQ_INI} from ${TEM_DIR}/${DWH_INI} "
+	merge_entries ${_item_} ${TEM_DIR}/${NIQ_INI} ${TEM_DIR}/${DWH_INI} ${TEM_DIR}/${OUT_INI}
+done
+}
+
+### Function: merge_dwh_niq_reader ###
+#
+#   Print out the usage message
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+merge_dwh_niq_reader()
+{
+READER_INI_LIST="DWH_READER"
+
+for _item_ in ${READER_INI_LIST}; do
+	if [ "${_item_}" == "DWH_READER" ]; then
+		_chk_=`iniget ${_item_} -f ${TEM_DIR}/${NIQ_INI} | $HEAD -1`
+		if [ ! "${_chk_}" ]; then
+            $ECHO "\n[${_item_}]" >> ${TEM_DIR}/${NIQ_INI}
+            
+            iniget ${_item_} -f ${TEM_DIR}/${DWH_INI} >> ${TEM_DIR}/${NIQ_INI}
+            $ECHO "\n" >> ${TEM_DIR}/${NIQ_INI}
+            LEAF=`iniget ${_item_} -f ${TEM_DIR}/${NIQ_INI}`
+            for _leaf_ in ${LEAF}; do
+                $ECHO "[${_leaf_}]" >> ${TEM_DIR}/${NIQ_INI}
+                SNAME=`iniget ${_leaf_} -f ${TEM_DIR}/${DWH_INI} -v Service_Name`
+                R_IP=`iniget ${_leaf_} -f ${TEM_DIR}/${DWH_INI} -v Reader_IP`
+                MCACHE=`iniget ${_leaf_} -f ${TEM_DIR}/${DWH_INI} -v MainCache`
+                TCACHE=`iniget ${_leaf_} -f ${TEM_DIR}/${DWH_INI} -v TempCache`
+
+                $ECHO "Service_Name=$SNAME" >> ${TEM_DIR}/${NIQ_INI}
+                $ECHO "Reader_IP=$R_IP" >> ${TEM_DIR}/${NIQ_INI}
+                $ECHO "MainCache=$MCACHE" >> ${TEM_DIR}/${NIQ_INI}
+                $ECHO "TempCache=$TCACHE\n" >> ${TEM_DIR}/${NIQ_INI}
+            done
+		fi
+	else
+		$ECHO "\nMerging ${_item_} to ${TEM_DIR}/${NIQ_INI} from ${TEM_DIR}/${DWH_INI}"
+		merge_entries ${_item_} ${TEM_DIR}/${NIQ_INI} ${TEM_DIR}/${DWH_INI} ${TEM_DIR}/${OUT_INI}
+	fi
+done
+}
+
+### Function: merge_dwh_sym_links ###
+#
+#   Print out the usage message
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+merge_dwh_sym_links()
+{
+SYM_LIST='DWH_DBSPACES_LOCATION DWH_SYSTEM_MAIN DWH_DBSPACES_MAIN NUMBER_MAIN_DBPSACES COORDINATOR_DBSPACES_TEMP NUMBER_TEMP_DBPSACES DWH_READER_1_DBSPACES_TEMP DWH_READER_2_DBSPACES_TEMP DWH_READER_3_DBSPACES_TEMP'
+##################################################################### DWH_DBSPACES_MAIN get a list of them... 
+##################################################################### COORDINATOR_DBSPACES_TEMP get a list of them... 
+
+for _item_ in ${SYM_LIST}; do
+	if [ "${_item_}" == "DWH_DBSPACES_MAIN" ]; then
+		_chk_=`iniget ${_item_} -f ${TEM_DIR}/${SYM_INI} |$HEAD -1`
+		if [ ! ${_chk_} ]; then
+			$ECHO ";--------------------------------------------------------------------------" >> ${TEM_DIR}/${SYM_INI}
+			$ECHO "; DWH MAIN DBSPACE information"  										>> ${TEM_DIR}/${SYM_INI}
+			$ECHO ";--------------------------------------------------------------------------" >> ${TEM_DIR}/${SYM_INI}
+			$ECHO "[${_item_}]" >> ${TEM_DIR}/${SYM_INI}
+			
+			iniget ${_item_} -f ${TEM_DIR}/${DWH_INI} >> ${TEM_DIR}/${SYM_INI}
+			$ECHO "\n" >> ${TEM_DIR}/${SYM_INI}
+			LEAF=`iniget ${_item_} -f ${TEM_DIR}/${DWH_INI}`
+			for _leaf_ in ${LEAF}; do
+				$ECHO "[${_leaf_}]" >> ${TEM_DIR}/${SYM_INI}
+				PATH=`iniget ${_leaf_} -f ${TEM_DIR}/${DWH_INI} -v DBfile`
+				LINK=`iniget ${_leaf_} -f ${TEM_DIR}/${DWH_INI} -v Raw_Device`
+				
+				$ECHO "Path=$PATH" >> ${TEM_DIR}/${SYM_INI}
+				$ECHO "Lun_ID=" >> ${TEM_DIR}/${SYM_INI}
+				$ECHO "Type=" >> ${TEM_DIR}/${SYM_INI}
+				$ECHO "Size=" >> ${TEM_DIR}/${SYM_INI}
+				$ECHO "Link=$LINK" >> ${TEM_DIR}/${SYM_INI}
+				$ECHO "\n " >> ${TEM_DIR}/${SYM_INI}
+			done
+		fi
+	elif  [ "${_item_}" == "COORDINATOR_DBSPACES_TEMP" ]; then
+		_chk_=`iniget ${_item_} -f ${TEM_DIR}/${SYM_INI} |$HEAD -1`
+		if [ ! ${_chk_} ]; then
+			$ECHO ";--------------------------------------------------------------------------" >> ${TEM_DIR}/${SYM_INI}
+			$ECHO "; DWH TMP DBSPACE information"  												>> ${TEM_DIR}/${SYM_INI}
+			$ECHO ";--------------------------------------------------------------------------" >> ${TEM_DIR}/${SYM_INI}
+			$ECHO "[DWH_DBSPACES_TEMP]" >> ${TEM_DIR}/${SYM_INI}
+			
+			iniget ${_item_} -f ${TEM_DIR}/${DWH_INI} | $AWK -F_ {'print "DWH_"$2"_"$3"_"$4'} >> ${TEM_DIR}/${SYM_INI}
+			$ECHO "\n" >> ${TEM_DIR}/${SYM_INI}
+			LEAF=`iniget ${_item_} -f ${TEM_DIR}/${DWH_INI}`
+			for _leaf_ in ${LEAF}; do
+				DWH_TEMP=`$ECHO ${_leaf_} | $AWK -F_ {'print "DWH_"$2"_"$3"_"$4'}`
+				$ECHO "[${DWH_TEMP}]" >> ${TEM_DIR}/${SYM_INI}
+				PATH=`iniget ${_leaf_} -f ${TEM_DIR}/${DWH_INI} -v DBfile`
+				LINK=`iniget ${_leaf_} -f ${TEM_DIR}/${DWH_INI} -v Raw_Device`
+				
+				$ECHO "Path=$PATH" >> ${TEM_DIR}/${SYM_INI}
+				$ECHO "Lun_ID=" >> ${TEM_DIR}/${SYM_INI}
+				$ECHO "Type=" >> ${TEM_DIR}/${SYM_INI}
+				$ECHO "Size=" >> ${TEM_DIR}/${SYM_INI}
+				$ECHO "Link=$LINK" >> ${TEM_DIR}/${SYM_INI}
+				$ECHO "\n " >> ${TEM_DIR}/${SYM_INI}
+			done
+		fi
+	elif  [ "${_item_}" == "DWH_SYSTEM_MAIN" ]; then
+		_chk_=`iniget ${_item_} -f ${TEM_DIR}/${SYM_INI} |$HEAD -1`
+		if [ ! ${_chk_} ]; then
+			$ECHO ";--------------------------------------------------------------------------" >> ${TEM_DIR}/${SYM_INI}
+			$ECHO "; DWH SYSTEM MAIN DBSPACE information"  										>> ${TEM_DIR}/${SYM_INI}
+			$ECHO ";--------------------------------------------------------------------------" >> ${TEM_DIR}/${SYM_INI}
+			PATH=`iniget ${_item_} -f ${TEM_DIR}/${DWH_INI} -v DBfile`
+			LINK=`iniget ${_item_} -f ${TEM_DIR}/${DWH_INI} -v Raw_Device`
+			
+			$ECHO "[${_item_}]" >> ${TEM_DIR}/${SYM_INI}
+			$ECHO "${_item_}_1\n" >> ${TEM_DIR}/${SYM_INI}	
+			$ECHO "[${_item_}_1]" >> ${TEM_DIR}/${SYM_INI}	
+			$ECHO "Path=$PATH" >> ${TEM_DIR}/${SYM_INI}
+			$ECHO "Lun_ID=" >> ${TEM_DIR}/${SYM_INI}
+			$ECHO "Type=" >> ${TEM_DIR}/${SYM_INI}
+			$ECHO "Size=" >> ${TEM_DIR}/${SYM_INI}
+			$ECHO "Link=$LINK" >> ${TEM_DIR}/${SYM_INI}
+			$ECHO "\n " >> ${TEM_DIR}/${SYM_INI}
+		fi
+	elif  [ "${_item_}" == "DWH_DBSPACES_LOCATION" ]; then
+		_chk_=`iniget ${_item_} -f ${TEM_DIR}/${SYM_INI} |$HEAD -1`
+		if [ ! ${_chk_} ]; then
+			$ECHO "[${_item_}]" >> ${TEM_DIR}/${SYM_INI}
+			iniget ${_item_} -f ${TEM_DIR}/${DWH_INI} >> ${TEM_DIR}/${SYM_INI}
+			_chk_=`iniget ${_item_} -f ${TEM_DIR}/${SYM_INI} -v DB_DIR_NAME_TEMPL`
+            if [ ! ${_chk_} ]; then
+                $ECHO "DB_DIR_NAME_TEMPL=dbspace_dir_\n" >> ${TEM_DIR}/${SYM_INI}
+            fi
+		fi
+    elif [ "${_item_}" == "DWH_READER_1_DBSPACES_TEMP" ]; then
+		_chk_=`iniget ${_item_} -f ${TEM_DIR}/${SYM_INI} |$HEAD -1`
+		if [ ! ${_chk_} ]; then
+			$ECHO "[${_item_}]" >> ${TEM_DIR}/${SYM_INI}
+			
+			iniget ${_item_} -f ${TEM_DIR}/${DWH_INI} >> ${TEM_DIR}/${SYM_INI}
+			$ECHO "\n" >> ${TEM_DIR}/${SYM_INI}
+			LEAF=`iniget ${_item_} -f ${TEM_DIR}/${DWH_INI}`
+			for _leaf_ in ${LEAF}; do
+				$ECHO "[${_leaf_}]" >> ${TEM_DIR}/${SYM_INI}
+				PATH=`iniget ${_leaf_} -f ${TEM_DIR}/${DWH_INI} -v DBfile`
+				LINK=`iniget ${_leaf_} -f ${TEM_DIR}/${DWH_INI} -v Raw_Device`
+				
+				$ECHO "Path=$PATH" >> ${TEM_DIR}/${SYM_INI}
+				$ECHO "Lun_ID=" >> ${TEM_DIR}/${SYM_INI}
+				$ECHO "Type=" >> ${TEM_DIR}/${SYM_INI}
+				$ECHO "Size=" >> ${TEM_DIR}/${SYM_INI}
+				$ECHO "Link=$LINK" >> ${TEM_DIR}/${SYM_INI}
+				$ECHO "\n " >> ${TEM_DIR}/${SYM_INI}
+			done
+		fi
+	elif [ "${_item_}" == "DWH_READER_2_DBSPACES_TEMP" ]; then
+		_chk_=`iniget ${_item_} -f ${TEM_DIR}/${SYM_INI} |$HEAD -1`
+		if [ ! ${_chk_} ]; then
+			$ECHO "[${_item_}]" >> ${TEM_DIR}/${SYM_INI}
+			
+			iniget ${_item_} -f ${TEM_DIR}/${DWH_INI} >> ${TEM_DIR}/${SYM_INI}
+			$ECHO "\n" >> ${TEM_DIR}/${SYM_INI}
+			LEAF=`iniget ${_item_} -f ${TEM_DIR}/${DWH_INI}`
+			for _leaf_ in ${LEAF}; do
+				$ECHO "[${_leaf_}]" >> ${TEM_DIR}/${SYM_INI}
+				PATH=`iniget ${_leaf_} -f ${TEM_DIR}/${DWH_INI} -v DBfile`
+				LINK=`iniget ${_leaf_} -f ${TEM_DIR}/${DWH_INI} -v Raw_Device`
+				
+				$ECHO "Path=$PATH" >> ${TEM_DIR}/${SYM_INI}
+				$ECHO "Lun_ID=" >> ${TEM_DIR}/${SYM_INI}
+				$ECHO "Type=" >> ${TEM_DIR}/${SYM_INI}
+				$ECHO "Size=" >> ${TEM_DIR}/${SYM_INI}
+				$ECHO "Link=$LINK" >> ${TEM_DIR}/${SYM_INI}
+				$ECHO "\n " >> ${TEM_DIR}/${SYM_INI}
+			done
+		fi
+	elif [ "${_item_}" == "DWH_READER_3_DBSPACES_TEMP" ]; then
+		_chk_=`iniget ${_item_} -f ${TEM_DIR}/${SYM_INI} |$HEAD -1`
+		if [ ! ${_chk_} ]; then
+			$ECHO "[${_item_}]" >> ${TEM_DIR}/${SYM_INI}
+			
+			iniget ${_item_} -f ${TEM_DIR}/${DWH_INI} >> ${TEM_DIR}/${SYM_INI}
+			$ECHO "\n" >> ${TEM_DIR}/${SYM_INI}
+			LEAF=`iniget ${_item_} -f ${TEM_DIR}/${DWH_INI}`
+			for _leaf_ in ${LEAF}; do
+				$ECHO "[${_leaf_}]" >> ${TEM_DIR}/${SYM_INI}
+				PATH=`iniget ${_leaf_} -f ${TEM_DIR}/${DWH_INI} -v DBfile`
+				LINK=`iniget ${_leaf_} -f ${TEM_DIR}/${DWH_INI} -v Raw_Device`
+				
+				$ECHO "Path=$PATH" >> ${TEM_DIR}/${SYM_INI}
+				$ECHO "Lun_ID=" >> ${TEM_DIR}/${SYM_INI}
+				$ECHO "Type=" >> ${TEM_DIR}/${SYM_INI}
+				$ECHO "Size=" >> ${TEM_DIR}/${SYM_INI}
+				$ECHO "Link=$LINK" >> ${TEM_DIR}/${SYM_INI}
+				$ECHO "\n " >> ${TEM_DIR}/${SYM_INI}
+			done
+		fi
+	else
+		$ECHO "\n Merging ${_item_} to ${TEM_DIR}/${SYM_INI} from ${TEM_DIR}/${DWH_INI} "
+		merge_entries ${_item_} ${TEM_DIR}/${SYM_INI} ${TEM_DIR}/${DWH_INI} ${TEM_DIR}/${OUT_INI}
+	fi
+done
+}
+
+### Function: merge_entries ###
+#
+# Merge the input paramter form the dwh.ini to the niq.ini.out 
+# if it does not already exist in the niq.ini
+#
+# Arguments:
+#       $1 = Parameter to merge fropm dwh.ini
+#		$2 = Full path to NIQ_INI file
+#		$3 = Full path to DWH_INI file
+#		$4 = Full path to OUTPUT file
+# Return Values:
+#       none
+merge_entries(){
+local T_HEADER=$1
+local T_NIQ_INI=$2
+local T_DWH_INI=$3
+local T_OUT_INI=$4
+
+_chk_=`iniget ${T_HEADER} -f ${T_NIQ_INI} |$HEAD -1`
+if [ ! ${_chk_} ]; then
+	## get the info that needs to be moved
+	iniget ${T_HEADER} -f ${T_DWH_INI} > ${TEM_DIR}/ins_det
+	#$ECHO " \n ins_det contains \n`$CAT ${TEM_DIR}/ins_det` \n "
+	
+	## add in the Header for the info to be moved
+	$CP ${T_NIQ_INI} ${T_OUT_INI}
+	$ECHO "" >> ${T_OUT_INI}
+	$ECHO "[${T_HEADER}]" >> ${T_OUT_INI}
+	
+	## add the info below the header
+	$CAT ${TEM_DIR}/ins_det >> ${T_OUT_INI}
+	$ECHO "" >> ${T_OUT_INI}
+	       
+	## copy the output to the input for next stage 
+	$CP ${T_OUT_INI} ${T_NIQ_INI}
+	$ECHO " ${T_NIQ_INI} Updated with ${T_HEADER} info"
+	
+	## Clean up
+	$RM ${T_OUT_INI}
+	$RM ${TEM_DIR}/ins_det
+fi
+}
+
+### Function: usage_msg ###
+#
+#   Print out the usage message
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+usage_msg()
+{
+$CLEAR
+$ECHO "
+Usage: `$BASENAME $0` [ -l <path_to_logfile> ]
+
+options:
+-f  : Final Destination Directory for niq.ini and sym_links.ini
+-l  : Optional parameter specifying the full path to logfile.
+"
+}
+
+# ********************************************************************
+#
+#       Main body of program
+#
+# ********************************************************************
+#
+RUN_TIME=`$DATE '+%Y-%b-%d_%H.%M.%S'`
+
+# Determine absolute path to software
+get_absolute_path
+
+# Check that the effective id of the user is root
+check_id root
+
+while getopts ":b:l:f:" arg; do
+  case $arg in
+    b) ENIQ_BASE_DIR="$OPTARG"
+       ;;
+    l) LOGFILE="$OPTARG"
+       ;;
+    f) FINAL_DEST="$OPTARG"
+       ;; 
+   \?) usage_msg
+       exit 1
+       ;;
+  esac
+done
+shift `expr $OPTIND - 1`
+
+# Check that we got the required params
+if [ ! "${FINAL_DEST}" ]; then
+	usage_msg
+	exit 1
+fi 
+
+# Setup up path environment etc
+setup_env
+
+if [ ! -f ${ENIQ_CONF_DIR}/${DWH_INI} ]; then
+   $ECHO "${ENIQ_CONF_DIR}/${DWH_INI} does not exits, no need to update niq.ini"
+   exit 0
+fi
+
+if [ ! -s ${ENIQ_CORE_DIR}/lib/common_functions.lib ]; then
+    _err_msg_="Cannot locate ${ENIQ_CORE_DIR}/lib/common_functions.lib"
+    abort_script "$_err_msg_"
+else
+   . ${ENIQ_CORE_DIR}/lib/common_functions.lib
+fi
+
+if [ ! -x ${ENIQ_CORE_DIR}/lib/iniadd.pl ]; then
+    _err_msg_="Cannot locate ${ENIQ_CORE_DIR}/lib/iniadd.pl"
+    abort_script "$_err_msg_"
+fi
+
+if [ "${LOGFILE}" ]; then
+    # Check/Create Logfile
+    chk_create_logfile
+fi
+
+# Create a temporary Directory
+TEM_DIR=/tmp/update_ini_files.$$.$$
+$RM -rf ${TEM_DIR}
+$ECHO "Making temp DIR ${TEM_DIR}"
+$MKDIR -p ${TEM_DIR}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not create directory ${TEM_DIR}"
+    abort_script "$_err_msg_"
+fi
+
+## copy the input files to a temp location for parsing
+$CP ${ENIQ_CONF_DIR}/${NIQ_INI} ${TEM_DIR}/${NIQ_INI}
+if [ $? -ne 0 ]; then
+    _err_msg_="Error copying ${ENIQ_CONF_DIR}/${NIQ_INI} to ${TEM_DIR}/${NIQ_INI}"
+    abort_script "$_err_msg_"
+fi
+$CP ${ENIQ_CONF_DIR}/${DWH_INI} ${TEM_DIR}/${DWH_INI}
+if [ $? -ne 0 ]; then
+    _err_msg_="Error copying ${ENIQ_CONF_DIR}/${DWH_INI} to ${TEM_DIR}/${DWH_INI}"
+    abort_script "$_err_msg_"
+fi
+
+$TOUCH ${TEM_DIR}/${SYM_INI}
+$ECHO ";------ Purpose -----------------------------------------------------------" > ${TEM_DIR}/${SYM_INI}
+$ECHO ";"																			>> ${TEM_DIR}/${SYM_INI}
+$ECHO ";   Name       : sym_links.ini"												>> ${TEM_DIR}/${SYM_INI}
+$ECHO ";"																			>> ${TEM_DIR}/${SYM_INI}
+$ECHO ";   Description: ENIQ database symbolic link file"							>> ${TEM_DIR}/${SYM_INI}
+$ECHO ";"																			>> ${TEM_DIR}/${SYM_INI}
+$ECHO ";   Limitation : All entered strings are case sensitive"						>> ${TEM_DIR}/${SYM_INI}
+$ECHO ";"																			>> ${TEM_DIR}/${SYM_INI}
+$ECHO ";--------------------------------------------------------------------------" >> ${TEM_DIR}/${SYM_INI}
+
+merge_dwh_niq
+
+merge_dwh_sym_links
+
+merge_dwh_niq_reader
+
+###### Copy to the files to the correct location 
+if [ ! -d ${FINAL_DEST} ]; then
+	$MKDIR -p ${FINAL_DEST}
+fi
+
+$CP ${TEM_DIR}/${NIQ_INI} ${FINAL_DEST}
+if [ $? -ne 0 ]; then
+    _err_msg_="Error copying ${TEM_DIR}/${NIQ_INI} to final location"
+    abort_script "$_err_msg_"
+fi
+
+$CP ${TEM_DIR}/${SYM_INI} ${FINAL_DEST}
+if [ $? -ne 0 ]; then
+    _err_msg_="Error copying ${TEM_DIR}/${SYM_INI} to final location"
+    abort_script "$_err_msg_"
+fi
+
+$ECHO "Removing temp directory ${TEM_DIR}"
+$RM -rf ${TEM_DIR}
+
+exit 0

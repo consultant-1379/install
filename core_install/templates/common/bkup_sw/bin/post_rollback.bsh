@@ -1,0 +1,669 @@
+#!/bin/bash
+# ********************************************************************
+# Ericsson Radio Systems AB                                     SCRIPT
+# ********************************************************************
+#
+#
+# (c) Ericsson Radio Systems AB 2001 - All rights reserved.
+#
+# The copyright to the computer program(s) herein is the property
+# of Ericsson Radio Systems AB, Sweden. The programs may be used
+# and/or copied only with the written permission from Ericsson Radio
+# Systems AB or in accordance with the terms and conditions stipulated
+# in the agreement/contract under which the program(s) have been
+# supplied.
+#
+# ********************************************************************
+# Name    : post_rollback.bsh
+# Date    : 07/11/2012
+# Revision: A.2
+# Purpose : This script will remove any zfs files systems which shouldnt be there after the rollback.
+#       
+#
+# Usage   : post_rollback.bsh [ -l <path_to_logfile> ] [ -N ] -q
+#
+#
+# ********************************************************************
+#
+#       Command Section
+#
+# ********************************************************************
+AWK=/usr/bin/awk
+BASENAME=/usr/bin/basename
+CAT=/usr/bin/cat
+CHMOD=/usr/bin/chmod
+CHOWN=/usr/bin/chown
+CLEAR=/usr/bin/clear
+CMP=/usr/bin/cmp
+CP=/usr/bin/cp
+CPIO=/usr/bin/cpio
+DATE=/usr/bin/date
+DIRNAME=/usr/bin/dirname
+DOMAINNAME=/usr/bin/domainname
+DTCONFIG=/usr/dt/bin/dtconfig
+ECHO=/usr/bin/echo
+EGREP=/usr/bin/egrep
+EJECT=/usr/bin/eject
+ENV=/usr/bin/env
+EXPR=/usr/bin/expr
+FIND=/usr/bin/find
+FLARCREATE=/usr/sbin/flarcreate
+FORMAT=/usr/sbin/format
+FUSER=/usr/sbin/fuser
+GEGREP=/usr/sfw/bin/gegrep
+GETENT=/usr/bin/getent
+GETTEXT=/usr/bin/gettext
+GREP=/usr/bin/grep
+GROUPADD=/usr/sbin/groupadd
+GTAR=/usr/sfw/bin/gtar
+GZCAT=/usr/bin/gzcat
+HEAD=/usr/bin/head
+HOSTNAME=/usr/bin/hostname
+ID=/usr/bin/id
+INIT=/usr/sbin/init
+LS=/usr/bin/ls
+MKDIR=/usr/bin/mkdir
+MORE=/usr/bin/more
+MOUNT=/usr/sbin/mount
+MV=/usr/bin/mv
+NAWK=/usr/bin/nawk
+PGREP=/usr/bin/pgrep
+PING=/usr/sbin/ping
+PKGADD=/usr/sbin/pkgadd
+PKGINFO=/usr/bin/pkginfo
+PRTCONF=/usr/sbin/prtconf
+PSRINFO=/usr/sbin/psrinfo
+PWD=/usr/bin/pwd
+RM=/usr/bin/rm
+RCP=/usr/bin/rcp
+RSH=/usr/bin/rsh
+SED=/usr/bin/sed
+SLEEP=/usr/bin/sleep
+SORT=/usr/bin/sort
+SPLIT=/usr/bin/split
+SU=/usr/bin/su
+SVCADM=/usr/sbin/svcadm
+SVCCFG=/usr/sbin/svccfg
+SVCS=usr/bin/svcs
+SWAP=/usr/sbin/swap
+SYNC=/usr/sbin/sync
+TAIL=/usr/bin/tail
+TEE=/usr/bin/tee
+TOUCH=/usr/bin/touch
+TPUT=/usr/bin/tput
+UADMIN=/usr/sbin/uadmin
+UNAME=/usr/bin/uname
+UNIQ=/usr/bin/uniq
+USERADD=/usr/sbin/useradd
+VOLD=/usr/sbin/vold
+WC=/usr/bin/wc
+XARGS=/usr/bin/xargs
+ZFS=/usr/sbin/zfs
+ZPOOL=/usr/sbin/zpool
+
+
+# ********************************************************************
+#
+#       Configuration Section
+#
+# ********************************************************************
+# Flag to determine whether to compress log or not (Must be y/n)
+COMPRESS_LOG=n
+
+# Name of SunOS & ENIQ ini Files
+ENIQ_ENV=niq.rc
+ENIQ_INI=niq.ini
+SUNOS_INI=SunOS.ini
+STORAGE_INI=storage.ini
+
+# NASd SERVICE
+NASd_SMF_ID="NASd.service"
+
+# NAS MILESTONE
+NAS_MILESTONE_SMF_ID="NAS-online.service"
+
+# Number of log files to keep
+NUM_LOGS=10
+
+# Size in kbytes that the log file is allowed to grow to
+SIZE_LOGS=204800
+
+
+# ********************************************************************
+#
+#       Pre-execution Operations
+#
+# ********************************************************************
+unset SNAP_QUIET
+
+# ********************************************************************
+#
+#       functions
+#
+# ********************************************************************
+### Function: abort_script ###
+#
+#   This will is called if the script is aborted thru an error
+#   error signal sent by the kernel such as CTRL-C or if a serious
+#   error is encountered during runtime
+#
+# Arguments:
+#       $1 - Error message from part of program (Not always used)
+# Return Values:
+#       none
+abort_script()
+{
+if [ "$1" ]; then
+    _err_msg_=$1
+else
+    _err_msg_="Script aborted.......\n"
+fi
+
+# Check if log_msg() is defined, else define log()
+type log_msg > /dev/null 2>&1
+if [ $? -gt 0 ]; then
+    if [ "${LOGFILE}" ]; then
+        if [ ! "${SNAP_QUIET}" ]; then
+            $ECHO "\n${_err_msg_}\n" |$TEE -a ${LOGFILE}
+        else
+            $ECHO "\n${_err_msg_}\n" >> ${LOGFILE}
+        fi
+    else
+        $ECHO "\n${_err_msg_}\n"
+    fi
+else
+    if [ "${LOGFILE}" ]; then
+        log_msg -s "\n${_err_msg_}\n" -l ${LOGFILE} ${SNAP_QUIET}
+    else
+        log_msg -s "\n${_err_msg_}\n" ${SNAP_QUIET}
+    fi
+fi
+
+cd $SCRIPTHOME
+
+$RM -rf  ${TEM_DIR}
+
+if [ "$2" ]; then
+    exit ${2}
+else
+   exit 1
+fi
+}
+
+### Function: build_current_nas_fs_list ###
+#
+# Get a list of current NAS FS
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+build_current_nas_fs_list()
+{
+$RM -rf ${TEM_DIR}/storage_ini_curr_fs_list
+
+$ECHO "Building NAS filesystem list from NAS pool ${_nas_pool_}" >> ${LOGFILE}
+
+# Get snapshot names, and exclude them from the FS list if they exist
+_snap_list_=`${_nascli_} list_snapshots - |  $NAWK '{print $1}' | $NAWK -F\/ '{print $NF}' | $SORT -u`
+if [ "${_snap_list_}" ]; then
+    _snap_regex_=`$ECHO ${_snap_list_} | $SED -e 's/ /\|/g'`
+    ${_nascli_} list_fs - | $EGREP -v ${_snap_regex_} | $SED -e "s|${_nas_pool_}\/||g" > ${TEM_DIR}/storage_nas_curr_fs_list
+else
+    ${_nascli_} list_fs - | $SED -e "s|${_nas_pool_}\/||g" > ${TEM_DIR}/storage_nas_curr_fs_list
+fi
+
+if [ ! -s ${TEM_DIR}/storage_nas_curr_fs_list ]; then
+    _err_msg_="Could not build FS list from NAS pool ${_nas_pool_}"
+    abort_script "$_err_msg_"
+fi
+}
+
+### Function: build_current_zfs_fs_list ###
+#
+# Get a list of current ZFS FS
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+build_current_zfs_fs_list()
+{
+$RM -rf ${TEM_DIR}/zfs_curr_fs_list
+
+$ECHO "Building ZFS filesystem list" >> ${LOGFILE}
+
+# Get snapshot names, and exclude them from the FS list if they exist
+_snap_list_=`$ZFS list -H -o name -t snapshot | $NAWK -F"@" '{print $NF}' | $SORT -u`
+if [ "${_snap_list_}" ]; then
+    _snap_regex_=`$ECHO ${_snap_list_} | $SED -e 's/ /\|/g'`
+fi
+
+$ZFS list -o name -Ht filesystem  | $NAWK -F"/" '{print $2}' > ${TEM_DIR}/zfs_curr_fs_list
+
+if [ ! -s ${TEM_DIR}/zfs_curr_fs_list ]; then
+    _err_msg_="Could not build FS list from NAS pool ${_nas_pool_}"
+    abort_script "$_err_msg_"
+fi
+}
+
+### Function: build_ini_nas_fs_list ###
+#
+# Get a list of new NAS FS in ini file
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+build_ini_nas_fs_list()
+{
+_err_=0
+$RM -rf ${TEM_DIR}/storage_ini.$$.$$ ${TEM_DIR}/storage_ini_fs_list
+
+$CAT ${ENIQ_CONF_DIR}/storage.ini | $EGREP "^FS_NAME" | $NAWK -F"=" '{print $NF}' > ${TEM_DIR}/storage_ini_fs_list
+if [ ! -s ${TEM_DIR}/storage_ini_fs_list ]; then
+        _err_msg_="Could not copy filter information from ${TEM_DIR}/storage_ini.$$.$$"
+        abort_script "$_err_msg_"
+fi
+}
+
+### Function: build_ini_zfs_fs_list ###
+#
+# Get a list of new NAS FS in ini file
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+build_ini_zfs_fs_list()
+{
+_err_=0
+$RM -rf  ${TEM_DIR}/sunos_ini_fs_list
+
+_zfs_block_list_=`iniget SunOS_ZFS_FS -f ${ENIQ_CONF_DIR}/${SUNOS_INI}`
+for _block_ in ${_zfs_block_list_}; do
+    _name_=`iniget ${_block_} -f ${ENIQ_CONF_DIR}/${SUNOS_INI} -v name`
+    _fs_name_=`$ECHO ${_name_} | $NAWK -F"/" '{print $2}'`
+    $ECHO ${_fs_name_} >> ${TEM_DIR}/sunos_ini_fs_list
+done
+
+if [ ! -s ${TEM_DIR}/sunos_ini_fs_list ]; then
+    _err_msg_="Could not copy filter information from ${TEM_DIR}/storage_ini.$$.$$"
+    abort_script "$_err_msg_"
+fi
+}
+
+### Function: check_id ###
+#
+#   Check that the effective id of the user is correct
+#   If not print error msg and exit.
+#
+# Arguments:
+#       $1 : User ID name
+# Return Values:
+#       none
+check_id()
+{
+_check_id_=`$ID  | $AWK -F\( '{print $2}' | $AWK -F\) '{print $1}'`
+if [ "$_check_id_" != "$1" ]; then
+    _err_msg_="You must be $1 to execute this script."
+    abort_script "$_err_msg_"
+fi
+}
+
+### Function: chk_create_logfile ###
+#
+# Check/Create Logfile
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+chk_create_logfile()
+{
+$MKDIR -p `$DIRNAME ${LOGFILE}`
+if [ $? -ne 0 ]; then
+    unset LOGFILE
+    _err_msg_="Could not create directory `$DIRNAME ${LOGFILE}`"
+     abort_script "$_err_msg_"
+fi
+
+$TOUCH -a ${LOGFILE}
+if [ $? -ne 0 ]; then
+    unset LOGFILE
+    _err_msg_="Could not write to file ${LOGFILE}"
+    abort_script "$_err_msg_"
+fi
+
+if [ -s ${LOGFILE} ]; then
+    $ECHO "\n\n" >> ${LOGFILE}
+fi
+
+log_msg -s "----------------------------------------------------------------" -l ${LOGFILE} ${SNAP_QUIET}
+log_msg -s "----------------------------------------------------------------" -l ${LOGFILE} ${SNAP_QUIET}
+log_msg -s "Post Rollback started at `$DATE +%d.%m.%y_%H:%M:%S`\n" -l ${LOGFILE} ${SNAP_QUIET}
+
+}
+
+### Function: delete_nas_fs ###
+#
+# delete nas fs
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+delete_nas_fs()
+{
+if [ ! -s ${TEM_DIR}/fs_delete_list ]; then
+    _err_msg_="Required files not found"
+    abort_script "$_err_msg_"
+fi
+
+while read _fs_name_; do
+    # Create the new FS
+    $ECHO "Deleting ${_fs_name_} on NFS" | $TEE -a ${LOGFILE}
+    ${_nascli_} delete_fs - ${_fs_name_}
+    if [ $? -ne 0 ]; then
+        _err_msg_="Could not delete NFS filesystem ${_fs_name_}"
+        abort_script "$_err_msg_"
+    fi
+done < ${TEM_DIR}/fs_delete_list
+
+}
+
+### Function: delete_zfs_fs ###
+#
+# delete nas fs
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+delete_zfs_fs()
+{
+if [ ! -s ${TEM_DIR}/fs_delete_list ]; then
+    _err_msg_="Required files not found"
+    abort_script "$_err_msg_"
+fi
+
+#remove blank lines from the file fs_delete_list
+#$SED  '/^$/d' ${TEM_DIR}/fs_delete_list > ${TEM_DIR}/fs_delete_list_orig
+
+while read _fs_; do
+    # Delete the new FS
+	if [ ${_fs_}  ]; then
+		_fs_name_=`zfs list -o name -Ht filesystem | $GREP -w ${_fs_}`
+		$ECHO "Deleting ${_fs_name_} on ZFS" | $TEE -a ${LOGFILE}
+		$ZFS destroy -f ${_fs_name_} >> /dev/null 2>&1
+		if [ $? -ne 0 ]; then
+			_err_msg_="Could not delete ZFS filesytem ${_fs_name_}"
+			abort_script "$_err_msg_"
+		fi
+	fi
+done < ${TEM_DIR}/fs_delete_list
+
+}
+
+### Function: get_absolute_path ###
+#
+# Determine absolute path to software
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+get_absolute_path()
+{
+_dir_=`$DIRNAME $0`
+SCRIPTHOME=`cd $_dir_ 2>/dev/null && pwd || $ECHO $_dir_`
+}
+
+### Function: get_fs_list ###
+#
+# Get a list of new NAS filesystems to delete
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+get_fs_delete_list()
+{
+_current_ini_list_=$1
+_current_fs_list_=$2
+
+$RM -rf ${TEM_DIR}/fs_delete_list
+
+while read _line_; do
+    $CAT ${_current_ini_list_} | $GEGREP -w ${_line_} >> /dev/null 2>&1
+    if [ $? -ne 0 ]; then
+        $ECHO ${_line_} >> ${TEM_DIR}/fs_delete_list
+    fi
+done < ${_current_fs_list_}
+
+#remove blank lines from the file fs_delete_list
+$SED  '/^$/d' ${TEM_DIR}/fs_delete_list > ${TEM_DIR}/fs_delete_list_temp
+mv ${TEM_DIR}/fs_delete_list_temp ${TEM_DIR}/fs_delete_list
+
+if [ -s ${TEM_DIR}/fs_delete_list ]; then
+    return 0
+else
+    return 1
+fi
+}
+
+### Function: setup_env ###
+#
+# Setup up path environment etc
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+setup_env()
+{
+ENIQ_BASE_DIR=/eniq
+
+ADMIN_BIN=${ENIQ_BASE_DIR}/admin/bin
+
+ADMIN_SQL=${ENIQ_BASE_DIR}/admin/sql
+
+CONF_DIR=${ENIQ_BASE_DIR}/sw/conf
+
+ENIQ_CONF_DIR=${ENIQ_BASE_DIR}/installation/config
+
+# ENIQ Log Directory
+ENIQ_LOG_DIR=${ENIQ_BASE_DIR}/local_logs
+
+# Source the common functions
+if [ -s ${ENIQ_BASE_DIR}/admin/lib/common_functions.lib ]; then
+    . ${ENIQ_BASE_DIR}/admin/lib/common_functions.lib
+else
+    _err_msg_="File ${ENIQ_BASE_DIR}/admin/lib/common_functions.lib not found"
+    abort_script "$_err_msg_"
+fi
+
+#_nas_sw_target_dir_=`iniget NAS_STORAGE_API -f ${ENIQ_CONF_DIR}/${SUNOS_INI} -v NAS_API_TARGET_DIR`
+#if [ ! "${_nas_sw_target_dir_}" ]; then
+#        _err_msg_="Failed to get NAS API target dir information from ${ENIQ_CONF_DIR}/${SUNOS_INI}"
+#        abort_script "$_err_msg_" "${EXEC_SHELL_CMD}"
+#fi
+
+#_nascli_=${_nas_sw_target_dir_}/bin/nascli
+#if [ ! -s ${_nascli_} ]; then
+#        _err_msg_="${_nascli_} not found"
+#        abort_script "$_err_msg_" "${EXEC_SHELL_CMD}"
+#fi
+
+# Get the pool name
+#_nas_pool_=`iniget NAS_DETAILS -f ${ENIQ_CONF_DIR}/${SUNOS_INI} -v NAS_Primary_Storage_Pool`
+#if [ ! "${_nas_pool_}" ]; then
+#       _err_msg_="Failed to get NAS primary pool name from ${ENIQ_CONF_DIR}/${SUNOS_INI}"
+#        abort_script "$_err_msg_"
+#fi
+
+# Get the System User/Group. All directories are owned by this
+SYSUSER=`iniget ENIQ_INSTALL_CONFIG -f ${ENIQ_CONF_DIR}/${SUNOS_INI} -v ENIQ_SYSUSER`
+if [ ! "${SYSUSER}" ]; then
+    _err_msg_="Could not read parameter ENIQ_SYSUSER from file ${ENIQ_CONF_DIR}/${SUNOS_INI}"
+    abort_script "$_err_msg_" "${EXEC_SHELL_CMD}"
+fi
+
+_sysgrp_=`$ID ${SYSUSER} | $NAWK '{print $2}' | $NAWK -F\( '{print $2}' | $NAWK -F\) '{print $1}'`
+if [ ! "${_sysgrp_}" ]; then
+    _err_msg_="Could not determine group ID of ${_sysgrp_}"
+    abort_script "$_err_msg_" "${EXEC_SHELL_CMD}"
+fi
+}
+
+### Function: usage_msg ###
+#
+#   Print out the usage message
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+usage_msg()
+{
+$ECHO "
+Usage: `$BASENAME $0` [ -l <logfile> ]
+
+options:
+
+-l      : Optional parameter specifying logfile where the script output will be appended to.
+"
+}
+
+### Function: user_confirm ###
+#
+# Get confirmation from user to proceed with snapshot action
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+user_confirm()
+{
+while :; do
+    unset USER_CONF
+    $CLEAR
+    $CAT ${TEM_DIR}/fs_delete_list
+    $ECHO "\nAre you sure you wish to ${1} above"
+    $ECHO "Enter [Yes | No] (case sensitive) : \c"
+
+    read USER_CONF
+    if [ "$USER_CONF" == "Yes" -o "$USER_CONF" == "No" ]; then
+        break
+    fi
+done
+}
+
+# ********************************************************************
+#
+#       Main body of program
+#
+# ********************************************************************
+#
+# Save the time of running. I do this here as I want all
+# dates and time to be the same
+RUN_TIME=`$DATE '+%Y-%m-%d_%H.%M.%S'`
+
+# Determine absolute path to softwarea
+get_absolute_path
+
+# Check that the effective id of the user is root
+check_id root
+
+while getopts ":l:f:Nq" arg; do
+  case $arg in
+    l) LOGFILE="$OPTARG"
+       ;;
+    N) NO_CONFIRM="YES"
+       ;;
+    q) SNAP_QUIET="-q"
+       ;;
+   \?) usage_msg
+       exit 1
+       ;;
+  esac
+done
+shift `expr $OPTIND - 1`
+
+# Setup up path environment etc
+setup_env
+
+# Default Logfile location
+DEF_LOGFILE="${ENIQ_LOG_DIR}/rollback/post_rollback.log"
+
+# Set up default logfile if required
+if [ ! "${LOGFILE}" ]; then
+    LOGFILE="${DEF_LOGFILE}"
+fi
+
+# Check/Create Logfile
+chk_create_logfile
+
+# Create a temporary Directory
+TEM_DIR=/tmp/post_rollback.$$.$$
+$RM -rf ${TEM_DIR}
+$MKDIR -p ${TEM_DIR}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not create directory ${TEM_DIR}"
+    abort_script "$_err_msg_"
+fi
+
+# Get a list of NAS filesystems from the upgrade SW
+#build_ini_nas_fs_list
+
+# Get a list of ZFS filesystems from the upgrade SW
+build_ini_zfs_fs_list
+
+# Get a list of the existing NAS filesystems
+#build_current_nas_fs_list
+
+# Get a list of the existing NAS filesystems
+build_current_zfs_fs_list
+
+#get_fs_delete_list  ${TEM_DIR}/storage_ini_fs_list ${TEM_DIR}/storage_nas_curr_fs_list
+#if [ $? -eq 0 ]; then
+#    if [ ! "$NO_CONFIRM" ]; then
+#       user_confirm "delete the NAS filesystems"
+#        if [ $USER_CONF == No ]; then
+#            $RM -rf ${TEM_DIR}
+#           exit 0
+#        fi
+#    fi
+#    delete_nas_fs
+#else
+#    $ECHO "No NAS filesystems need to be deleted" | $TEE -a ${LOGFILE}
+#fi
+
+unset USER_CONF
+
+get_fs_delete_list ${TEM_DIR}/sunos_ini_fs_list ${TEM_DIR}/zfs_curr_fs_list
+if [ $? -eq 0 ]; then
+    if [ ! "$NO_CONFIRM" ]; then
+        user_confirm "delete the ZFS filesystems"
+        if [ $USER_CONF == No ]; then
+            $RM -rf ${TEM_DIR}
+            exit 0
+        fi
+    fi
+    delete_zfs_fs
+else
+    $ECHO "No ZFS filesystems need to be deleted" | $TEE -a ${LOGFILE}
+fi
+
+log_msg -s "\nPost Rollback finished at `$DATE +%d.%m.%y_%H:%M:%S`" -l ${LOGFILE} ${SNAP_QUIET}
+log_msg -s "----------------------------------------------------------------" -l ${LOGFILE} ${SNAP_QUIET}
+log_msg -s "----------------------------------------------------------------" -l ${LOGFILE} ${SNAP_QUIET}
+
+
+
+# Rotate and compress the logs if necessary
+rotate_compress_logs ${LOGFILE} ${NUM_LOGS} ${SIZE_LOGS} ${COMPRESS_LOG}
+
+#$RM -rf ${INPUT_LIST}
+$RM -rf ${TEM_DIR}
+exit 0

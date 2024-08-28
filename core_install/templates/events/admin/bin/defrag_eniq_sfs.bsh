@@ -1,0 +1,312 @@
+#!/bin/bash
+# ********************************************************************
+# Ericsson Radio Systems AB                                     SCRIPT
+# ********************************************************************
+#
+#
+# (c) Ericsson Radio Systems AB 2019 - All rights reserved.
+#
+# The copyright to the computer program(s) herein is the property
+# of Ericsson Radio Systems AB, Sweden. The programs may be used 
+# and/or copied only with the written permission from Ericsson Radio 
+# Systems AB or in accordance with the terms and conditions stipulated 
+# in the agreement/contract under which the program(s) have been 
+# supplied.
+#
+# ********************************************************************
+# Name    : defrag_eniq_sfs.bsh
+# Date    : 30/01/2019
+# Revision: \main\13
+# Purpose : Script to defrag an sfs
+#           
+#
+# Usage   : defrag_eniq_sfs.bsh
+#
+# ********************************************************************
+#
+#   Command Section
+#
+# ********************************************************************
+AWK=/usr/bin/awk
+BASENAME=/usr/bin/basename
+BASH=/usr/bin/bash
+CAT=/usr/bin/cat
+CHOWN=/usr/bin/chown
+CLEAR=/usr/bin/clear
+CP=/usr/bin/cp
+DATE=/usr/bin/date
+DIRNAME=/usr/bin/dirname
+ECHO=/usr/bin/echo
+EGREP=/usr/bin/egrep
+GREP=/usr/bin/grep
+ID=/usr/bin/id
+MORE=/usr/bin/more
+MOUNT=/usr/sbin/mount
+MV=/usr/bin/mv
+NSLOOKUP=/usr/sbin/nslookup
+PING=/usr/sbin/ping
+RM=/usr/bin/rm
+SED=/usr/bin/sed
+SU=/usr/bin/su
+TAIL=/usr/bin/tail
+VOLD=/usr/sbin/vold
+WC=/usr/bin/wc
+YES=/usr/bin/yes
+
+
+# ********************************************************************
+#
+#       Configuration Section
+#
+# ********************************************************************
+
+# Default user
+DEFAULT_USER=storadm
+
+NAS_ADDR=nasconsole
+NAS_SUPP_USR=support
+
+STORAGE_INI=storage.ini
+# ********************************************************************
+#
+#   Functions
+#
+# ********************************************************************
+### Function: abort_script ###
+#
+#   This will is called if the script is aborted thru an error
+#   signal sent by the kernel such as CTRL-C or if a serious
+#   error is encountered during runtime
+#
+# Arguments:
+#       $1 - Error message from part of program (Not always used)
+# Return Values:
+#       none
+abort_script()
+{
+_err_time_=`$DATE '+%Y-%b-%d_%H.%M.%S'`
+
+if [ "$1" ]; then
+    _err_msg_="${_err_time_} - $1"
+else
+    _err_msg_="${_err_time_} - ERROR : Script aborted.......\n"
+fi
+
+if [ "${LOGFILE}" ]; then
+    $ECHO "\nERROR : $_err_msg_\n" | $TEE -a ${LOGFILE}
+else
+    $ECHO "\nERROR : $_err_msg_\n"
+fi
+
+cd $SCRIPTHOME
+$RM -rf ${TEM_DIR}
+
+if [ "$2" ]; then
+    if [ ! "${UPGRADE}" -a ! "${RESTORE}" ]; then
+    	${2}    	
+    fi
+    exit 1
+else
+   exit 1
+fi
+}
+
+### Function: check_id ###
+#
+#   Check that the effective id of the user is correct
+#   If not print error msg and exit.
+#
+# Arguments:
+#       $1 : User ID name
+# Return Values:
+#       none
+check_id()
+{
+_check_id_=`$ID | $AWK -F\( '{print $2}' | $AWK -F\) '{print $1}'`
+if [ "$_check_id_" != "$1" ]; then
+    _err_msg_="You must be $1 to execute this script."
+    abort_script "$_err_msg_" "${EXEC_SHELL_CMD}"
+fi
+}
+
+### Function: get_absolute_path ###
+#
+# Determine absolute path to software
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+get_absolute_path()
+{
+_dir_=`$DIRNAME $0`
+SCRIPTHOME=`cd $_dir_ 2>/dev/null && pwd || $ECHO $_dir_`
+}
+
+
+### Function: setup_env ###
+#
+# Set up environment variables for script.
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+setup_env()
+{
+if [ ! "${ENIQ_BASE_DIR}" ]; then
+    # Directory on the root filesystem
+    ENIQ_BASE_DIR=/eniq
+fi
+
+# Main Directory for the Core Installation SW
+ENIQ_INST_DIR=${ENIQ_BASE_DIR}/installation
+
+# Main Directory for the Core Installation SW
+ENIQ_CORE_INST_DIR=${ENIQ_INST_DIR}/core_install
+
+# LIB Directory for the Core Installation SW
+ENIQ_CORE_INST_LIB_DIR=${ENIQ_INST_DIR}/core_install/lib
+
+# ENIQ Config Directory
+ENIQ_CONF_DIR=${ENIQ_INST_DIR}/config
+
+# Source the common functions
+if [ -s ${ENIQ_CORE_INST_LIB_DIR}/common_functions.lib ]; then
+    . ${ENIQ_CORE_INST_LIB_DIR}/common_functions.lib
+else
+    _err_msg_="File ${ENIQ_CORE_INST_LIB_DIR}/common_functions.lib not found"
+    abort_script "$_err_msg_" 
+fi
+
+if [ -s ${ENIQ_CORE_INST_LIB_DIR}/common_core_install_functions.lib ]; then
+    . ${ENIQ_CORE_INST_LIB_DIR}/common_core_install_functions.lib
+else
+    _err_msg_="File ${ENIQ_CORE_INST_LIB_DIR}/common_core_install_functions.lib not found"
+    abort_script "$_err_msg_"
+fi
+
+if [ -s ${ENIQ_CORE_INST_LIB_DIR}/common_inirator_functions.lib ]; then
+    . ${ENIQ_CORE_INST_LIB_DIR}/common_inirator_functions.lib
+else
+    _err_msg_="File ${ENIQ_CORE_INST_LIB_DIR}/common_inirator_functions.lib not found"
+    abort_script "$_err_msg_"
+fi
+
+PORT_PING=${ENIQ_CORE_INST_DIR}/lib/port_ping.pl
+if [ ! -x $PORT_PING ]; then
+    _err_msg_="$PORT_PING not found or not executable"
+    abort_script "$_err_msg_" "${EXEC_SHELL_CMD}"
+fi
+
+}
+### Function: usage_msg ###
+#
+#   Print out the usage message
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+usage_msg()
+{
+$CLEAR
+$ECHO "
+Usage: `$BASENAME $0` [ -r ]
+
+options:
+
+-r  : Parameter specifying to actually run the defrag cmds
+
+"
+}
+
+
+# ********************************************************************
+#
+#   Main body of program
+#
+# ********************************************************************
+#
+time_start=`$DATE '+%Y-%b-%d_%H.%M.%S'`
+
+# Determine absolute path to software
+get_absolute_path
+
+# Check that the effective id of the user is root
+check_id $DEFAULT_USER
+
+while getopts ":r" arg; do
+  case $arg in
+    r) RUN_SHARE_CMDS="YES"
+       ;;	
+   \?) usage_msg
+       exit 1
+       ;;
+  esac
+done
+shift `expr $OPTIND - 1`
+
+if [ ! "${RUN_SHARE_CMDS}" ]; then
+    usage_msg
+    exit 1
+fi
+
+# Set up environment variables for script.
+setup_env
+
+${PORT_PING} ${NAS_ADDR} >> /dev/null 2>&1
+if [ $? -ne 0 ]; then
+    _err_msg_="${NAS_ADDR} is not alive"
+    abort_script "$_err_msg_" 
+fi
+
+_nas_sysid_=`iniget Storage_NAS_GENERAL -f ${ENIQ_CONF_DIR}/${STORAGE_INI} -v SYS_ID`
+if [ ! "${_nas_sysid_}" ]; then
+    _err_msg_="Could not get NAS sysid value from ${ENIQ_CONF_DIR}/${STORAGE_INI}"
+    abort_script "$_err_msg_"
+fi
+
+# Determine the server type
+CURR_SERVER_TYPE=`$CAT $ENIQ_CONF_DIR/installed_server_type `
+if [ ! "${CURR_SERVER_TYPE}" ]; then
+    _err_msg_="Could not determine which server type this is"
+    abort_script "$_err_msg_" "${EXEC_SHELL_CMD}"
+fi
+
+#Checks to see if this is running for Stats coord, if not then exit immediately
+if [ "${CURR_SERVER_TYPE}" != "stats_coordinator"  -a "${CURR_SERVER_TYPE}" != "eniq_stats"  ]; then
+	exit 0
+fi
+
+$ECHO "Defrag script start time : {$time_start}"
+
+# Create a temporary Directory
+TEM_DIR=/tmp/defrag_eniq_sfs.$$.$$
+$RM -rf ${TEM_DIR}
+$MKDIR -p ${TEM_DIR}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not create directory $TEM_DIR"
+    abort_script "$_err_msg_"
+fi
+
+$SSH -q -o BatchMode=yes -o StrictHostKeyChecking=no -n ${NAS_SUPP_USR}@${NAS_ADDR} \"mount\" | $AWK '{print $3}' | $EGREP "^/vx/${_nas_sysid_}" > ${TEM_DIR}/mount_show
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not get a list of mounted filesystems from ${NAS_SUPP_USR}@${NAS_ADDR}"
+    abort_script "$_err_msg_"
+fi
+
+if [ ! -s ${TEM_DIR}/mount_show ]; then
+    _err_msg_="No list of mounted filesystems returned from ${NAS_SUPP_USR}@${NAS_ADDR}"
+    abort_script "$_err_msg_"
+fi
+
+for _fs_ in `$CAT ${TEM_DIR}/mount_show`; do
+	$SSH -q -o BatchMode=yes -o StrictHostKeyChecking=no -n ${NAS_SUPP_USR}@${NAS_ADDR} "/opt/VRTS/bin/fsadm -d ${_fs_}"
+done
+$RM -rf ${TEM_DIR}
+
+time_end=`$DATE '+%Y-%b-%d_%H.%M.%S'`
+$ECHO "Defrag script end time : {$time_end}"
+
+exit 0

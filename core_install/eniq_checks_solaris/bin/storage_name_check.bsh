@@ -1,0 +1,343 @@
+#!/bin/bash
+# ********************************************************************
+# Ericsson Radio Systems AB                                     SCRIPT
+# ********************************************************************
+#
+#
+# (c) Ericsson Radio Systems AB 2022 - All rights reserved.
+#
+# The copyright to the computer program(s) herein is the property
+# of Ericsson Radio Systems AB, Sweden. The programs may be used
+# and/or copied only with the written permission from Ericsson Radio
+# Systems AB or in accordance with the terms and conditions stipulated
+# in the agreement/contract under which the program(s) have been
+# supplied.
+#
+# ********************************************************************
+# Name    : storage_name_check.bsh
+# Date    : 22/04/2022
+# Revision: \main\Statistics_20.4_20.4.9\3
+# Purpose : This script is to check the if blade have same storage name in config files.
+#
+# Usage   : storage_name_check.bsh
+# Exit Values:
+#     SUCCESS=0
+#     FAILED=1 
+#     NORUN=16 
+# ********************************************************************
+#
+#   Command Section
+#
+# ********************************************************************
+CAT=/usr/bin/cat
+ECHO=/usr/bin/echo
+MYHOSTNAME=/usr/bin/hostname
+MKDIR=/usr/bin/mkdir
+NAWK=/usr/bin/nawk
+RM=/usr/bin/rm
+DATE=/usr/bin/date
+DIRNAME=/usr/bin/dirname
+GREP=/usr/bin/grep
+ID=/usr/bin/id
+TEE=/usr/bin/tee
+TOUCH=/usr/bin/touch
+HEAD=/usr/bin/head
+PERL=usr/bin/perl
+### Function: abort_script 
+#                                                                     
+#   This will be called if the script is aborted through an error     
+#   signal sent by the kernel such as CTRL-C or if a serious          
+#   error is encountered during runtime                               
+#                                                                     
+# Arguments:                                                          
+#       $1 - Error message from part of program (Not always used)     
+# Return Values:                                                      
+#       none                                                          
+abort_script()
+{
+    _err_time_=`$DATE '+%Y-%b-%d_%H.%M.%S'`
+
+    if [ "$1" ]; then
+        _err_msg_="${_err_time_} - $1"
+    else
+        _err_msg_="${_err_time_} - ERROR : Script aborted.......\n"
+    fi
+    if [ "${LOGFILE}" ]; then
+        $ECHO "\nERROR : ${_err_msg_}\n" | $TEE -a ${LOGFILE}
+    else
+        $ECHO "\nERROR : ${_err_msg_}\n"
+    fi
+    $RM -rf ${TEM_DIR}
+    exit 
+}
+
+### Function: check_id ###
+#
+#   Check that the effective id of the user is correct
+#   If not print error msg and exit.
+#
+# Arguments:
+#       $1 : User ID name
+# Return Values:
+#       none
+check_id()
+{
+local _check_id_=`$ID  | $NAWK -F\( '{print $2}' | $NAWK -F\) '{print $1}'`
+
+if [ "$_check_id_" != "$1" ]; then
+    _err_msg_="You must be $1 to execute this script."
+    abort_script "$_err_msg_"
+fi
+}
+
+### Function: chk_logfile ###
+#
+# Check Logfile
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+
+chk_logfile()
+{
+
+if [ ! -d $ENIQ_PRECHECK_LOG_DIR  ]
+    then
+    $MKDIR -p $ENIQ_PRECHECK_LOG_DIR
+    if [ $? -ne 0 ]; then
+    _err_msg_="Could not create directory `$ENIQ_PRECHECK_LOG_DIR`"
+    abort_script "${_err_msg_}" 
+    fi
+ fi
+ 
+ if [ -s $LOGFILE  ]
+    then
+    $RM -rf $LOGFILE 
+    if [ -s $LOGFILE  ]
+    then
+        _err_msg_="Warning : Could not remove older ${LOGFILE}"
+        abort_script "$_err_msg_"
+    fi
+ fi
+ 
+$TOUCH -a ${LOGFILE}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not write to file ${LOGFILE}"
+    abort_script "${_err_msg_}" 
+fi
+
+$CHMOD 777 ${LOGFILE}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not change the permissions of the ${LOGFILE}"
+    abort_script "$_err_msg_"
+fi
+}
+
+### Function: cleanup ###
+#
+# Cleanup of temporary directory
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+cleanup()
+{
+if [ -f "$LOGFILE" ] ;then
+    $ECHO "Cleaning up the temporary directory" >> $LOGFILE
+fi
+$RM -rf ${TEM_DIR}
+}
+
+### Function: storage_name_check ###
+#
+# Check if all blade deployment have same storage name
+# 
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+storage_name_check()
+{
+    _san_storage_name_=`$CAT ${ERICSSON_STOR_CONF_DIR}/storage.conf | $GREP -w "plugin" | $NAWK -F\= '{print $2}'`
+    if [ -z ${_san_storage_name_} ]; then
+        log_msg -t -l ${LOGFILE} -s "Could not get SAN storage plugin from - ${ERICSSON_STOR_CONF_DIR}/storage.conf file."
+    fi
+    
+    _stor_name_blkcli_=`${ERICSSON_STOR_DIR}/san/bin/blkcli --action listluns | $HEAD -1 | $NAWK '{print $NF}'`
+    if [ -z ${_stor_name_blkcli_} ]; then
+        log_msg -t -l ${LOGFILE} -s "Could not get storage name of vnx from - ${ERICSSON_STOR_DIR}/san/bin/blkcli --action listluns "
+    fi
+    
+    _stor_name_block_=`$CAT ${ENIQ_CONF_DIR}/block_storage.ini | $GREP BLK_STORAGE_NAME | $NAWK -F"=" '{print $2}'` 
+    if [ -z ${_stor_name_block_} ]; then
+        log_msg -t -l ${LOGFILE} -s "Could not get storage name of vnx from - ${ENIQ_CONF_DIR}/block_storage.ini"
+    fi
+
+    if [ "${_stor_name_blkcli_}" == "${_stor_name_block_}" ]; then
+        log_msg -t -l ${LOGFILE} -s  "Storage name of vnx from ${ERICSSON_STOR_DIR}/san/bin/blkcli matching with ${ENIQ_CONF_DIR}/block_storage.ini on blade ${HNAME}"
+        RET_CODE1=0
+    else
+        log_msg -l ${LOGFILE} -t -s "Storage name of vnx from ${ERICSSON_STOR_DIR}/san/bin/blkcli is  not matching with ${ENIQ_CONF_DIR}/block_storage.ini on blade ${HNAME} "
+        RET_CODE1=1
+    fi
+	
+    if [ "${_san_storage_name_}" == "${SAN_DEVICE}" ]; then
+        log_msg -t -l ${LOGFILE} -s  "SAN storage plugin from ${ERICSSON_STOR_CONF_DIR}/storage.conf matching with ${ENIQ_CONF_DIR}/san_details on blade ${HNAME} "
+        RET_CODE2=0
+        stor_name_clarrion=`$CAT ${ERICSSON_SAN_PLUGINS_DIR}/${SAN_DEVICE}/etc/clariion.conf | $GREP ${_stor_name_block_} | $SED -e "s/[' => {]//g"`
+        if [ $? -ne 0  ]; then
+            log_msg -t -l ${LOGFILE} -s "Could not get storage name of vnx from - ${ERICSSON_SAN_PLUGINS_DIR}/${SAN_DEVICE}/clariion.conf"
+            RET_CODE2=1
+        fi
+    else
+        log_msg -t -l ${LOGFILE} -s "SAN storage plugin from ${ERICSSON_STOR_CONF_DIR}/storage.conf is not matching with ${ENIQ_CONF_DIR}/san_details on blade ${HNAME} "
+        RET_CODE2=1
+    fi
+	
+    if [ $RET_CODE1 == 0 ] && [ $RET_CODE2 == 0 ]; then
+	RET_CODE=0
+    else
+	RET_CODE=1
+    fi
+
+return $RET_CODE
+
+}
+
+### Function: setup_env ###
+#
+# Setup up path environment
+# Imports the common lib files which imports common functions 
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+
+setup_env()
+{
+if [ ! "${ENIQ_BASE_DIR}" ]; then
+    ENIQ_BASE_DIR=/eniq
+fi
+
+# Main Directory for the Core Installation SW
+ENIQ_INST_DIR=${ENIQ_BASE_DIR}/installation
+
+# Installation lib directory
+ENIQ_LIB_DIR=${ENIQ_INST_DIR}/core_install/lib/
+
+# ENIQ LIB Directory
+LIB_DIR=/lib
+
+# Installation config directory
+ENIQ_CONF_DIR=${ENIQ_INST_DIR}/config
+
+# Common function directory
+COMMON_FUNCS_LIB=${ENIQ_LIB_DIR}/common_functions.lib
+
+# Local logs directory
+ENIQ_PRECHECK_LOG_DIR=${ENIQ_BASE_DIR}/local_logs/precheck_logs/
+
+# Eniq core install directory
+ENIQ_CORE_INST_DIR=${ENIQ_INST_DIR}/core_install
+
+#Ericsson directory
+ERICSSON_DIR=/ericsson
+ERICSSON_STOR_DIR=${ERICSSON_DIR}/storage
+ERICSSON_STOR_CONF_DIR=${ERICSSON_DIR}/storage/san/etc
+ERICSSON_SAN_PLUGINS_DIR=${ERICSSON_STOR_DIR}/san/plugins
+
+
+# Source the common functions
+if [ -s ${ENIQ_CORE_INST_DIR}/${LIB_DIR}/common_functions.lib ]; then
+    . ${ENIQ_CORE_INST_DIR}/${LIB_DIR}/common_functions.lib
+else
+    _err_msg_="File ${ENIQ_CORE_INST_DIR}/${LIB_DIR}/common_functions.lib not found"
+    abort_script "${_err_msg_}"
+fi
+
+if [ -s ${ENIQ_CORE_INST_DIR}/${LIB_DIR}/common_core_install_functions.lib ]; then
+    . ${ENIQ_CORE_INST_DIR}/${LIB_DIR}/common_core_install_functions.lib
+else
+    _err_msg_="File ${ENIQ_CORE_INST_DIR}/${LIB_DIR}/common_core_install_functions.lib not found"
+    abort_script "${_err_msg_}"
+fi
+
+if [ -s ${ENIQ_CORE_INST_DIR}/${LIB_DIR}/common_inirator_functions.lib ]; then
+    . ${ENIQ_CORE_INST_DIR}/${LIB_DIR}/common_inirator_functions.lib
+else
+    _err_msg_="File ${ENIQ_CORE_INST_DIR}/${LIB_DIR}/common_inirator_functions.lib not found"
+    abort_script "${_err_msg_}"
+fi
+
+HNAME=`${MYHOSTNAME}`
+HOST_IP=`$GETENT hosts ${HNAME} | $NAWK '{print $1}' | $HEAD -1`
+}
+
+
+# ********************************************************************
+#
+#       Main body of program
+#
+# ********************************************************************
+#
+
+# Default user
+DEFAULT_USER=root
+
+# Check that the effective id of the user is root
+check_id $DEFAULT_USER
+
+# Set up environment variables for script.
+setup_env
+
+# Logfile path
+LOGFILE=${ENIQ_PRECHECK_LOG_DIR}storage_name_check.log
+
+# Return code declaration
+RET_CODE=0
+
+STORAGE_TYPE=`$CAT ${ENIQ_CONF_DIR}/san_details | $GREP "^STORAGE_TYPE=" | $NAWK -F\= '{print $2}'`
+if [ "${STORAGE_TYPE}" == "zfs" ];then
+    log_msg -l ${LOGFILE} -t -s "This check is not applicable for RACK servers."
+    cleanup
+    exit 16
+else 
+    SAN_DEVICE=`$CAT ${ENIQ_CONF_DIR}/san_details | $GREP "^SAN_DEVICE=" | $NAWK -F\= '{print $2}'`
+    if [ ! "${SAN_DEVICE}" ]; then
+        _err_msg_="Could not read SAN_DEVICE type from ${ENIQ_CONF_DIR}/san_details."
+        abort_script "${_err_msg_}"
+    fi
+fi
+
+# Check Logfile
+chk_logfile
+
+#Create a temporary Directory
+TEM_DIR=/tmp/storage_name_check.$$.$$
+
+$MKDIR -p ${TEM_DIR}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not create directory ${TEM_DIR}"
+    abort_script "${_err_msg_}"
+fi
+
+log_msg -l ${LOGFILE} -t -s "Executing to check storage check"
+
+# storage name check blades 
+storage_name_check
+
+$RM -rf ${TEM_DIR}
+if [ -s ${TEM_DIR} ]; then
+    _err_msg_="Could not remove ${TEM_DIR}"
+    abort_script "$_err_msg_"
+fi
+
+log_msg -t -s "Storage Check Completed" -l ${LOGFILE}
+log_msg -t -s "Check log $LOGFILE\n"
+
+exit $RET_CODE
+

@@ -1,0 +1,600 @@
+#!/bin/bash
+# ********************************************************************
+# Ericsson Radio Systems AB                                     SCRIPT
+# ********************************************************************
+#
+#
+# (c) Ericsson Radio Systems AB 2013 - All rights reserved.
+#
+# The copyright to the computer program(s) herein is the property
+# of Ericsson Radio Systems AB, Sweden. The programs may be used
+# and/or copied only with the written permission from Ericsson Radio
+# Systems AB or in accordance with the terms and conditions stipulated
+# in the agreement/contract under which the program(s) have been
+# supplied.
+#
+# ********************************************************************
+# Name    : fix_sym_links.bsh
+# Date    : 15/05/2019
+# Revision: main\8
+# Purpose : Fix the Sym_links Path values in the sym_links.ini file
+#
+# Usage   : fix_sym_links.bsh [-l <logfile>]
+#
+# ********************************************************************
+#
+#       Command Section
+#
+# ********************************************************************
+
+# ********************************************************************
+#
+#       Configuration Section
+#
+#*********************************************************************
+MAIN_DB_PATH=/eniq/database/dwh_main_dbspace
+TEMP_DB_PATH=/eniq/database/dwh_temp_dbspace
+DB_DIR_NAME_TEMPL=dbspace_dir_
+_fix_sy_link_err_=0
+
+
+# ********************************************************************
+#
+#       Pre-execution Operations
+#
+# ******************************************************************** 
+
+
+
+# ********************************************************************
+#
+#       Functions
+#
+# ********************************************************************
+### Function: abort_script ###
+#
+#   This will is called if the script is aborted through an error
+#   signal sent by the kernel such as CTRL-C or if a serious
+#   error is encountered during runtime
+#
+# Arguments:
+#       $1 - Error message from part of program (Not always used)
+# Return Values:
+#       none
+abort_script()
+{
+_err_time_=`$DATE '+%Y-%b-%d_%H.%M.%S'`
+
+if [ "$1" ]; then
+    _err_msg_="${_err_time_} - $1"
+else
+    _err_msg_="${_err_time_} - ERROR : Script aborted.......\n"
+fi
+
+if [ "${LOGFILE}" ]; then
+    $ECHO "\nERROR : $_err_msg_\n" | $TEE -a ${LOGFILE}
+else
+    $ECHO "\nERROR : $_err_msg_\n"
+fi
+
+cd $SCRIPTHOME
+$RM -rf ${TEM_DIR}
+if [ "$2" ]; then
+    ${2}
+    exit 1
+else
+    exit 1
+fi
+}
+
+### Function: fix_dwh_main_sym_links ###
+#
+# Update the sym_links file for DWH_DBSPACES_MAIN entries
+# Arguments:
+#       none
+# Return Values:
+#       none
+fix_dwh_main_sym_links()
+{
+_sym_list_='DWH_DBSPACES_MAIN'
+_dwh_main_db_space_string_="\/eniq\/database\/dwh_main_dbspace\/dbspace_dir_"
+_dwh_main_db_space_="$MAIN_DB_PATH/$DB_DIR_NAME_TEMPL"
+log_msg -h -l ${LOGFILE} -s "Updating PATH values for $_sym_list_"
+
+# Get the children of [DWH_DBSPACES_MAIN] e.g. DWH_DBSPACES_MAIN_1 DWH_DBSPACES_MAIN_2 
+_leaf_list_=`iniget ${_sym_list_} -f ${TEM_DIR}/${SYM_INI}` >> /dev/null 2>&1
+if [ ! "${_leaf_list_}" ]; then
+    _err_msg_="Failed to read values $_sym_list_ from ${TEM_DIR}/${SYM_INI}"
+    abort_script "$_err_msg_"
+fi
+ 
+# For each of these e.g. e.g. DWH_DBSPACES_MAIN_1 DWH_DBSPACES_MAIN_2 
+# Check the Path value 
+for _leaf_ in ${_leaf_list_}; do
+    _sym_path_=`iniget ${_leaf_} -f ${TEM_DIR}/${SYM_INI} -v Path` >> /dev/null 2>&1
+    if [ ! "${_sym_path_}" ]; then
+        _err_msg_="Failed to read parameter Path from ${TEM_DIR}/${SYM_INI}"
+        abort_script "$_err_msg_"
+    fi
+ 
+    # Check if we need to update the file for this path entry
+    $ECHO $_sym_path_ | $EGREP $_dwh_main_db_space_string_ >> /dev/null 2>&1
+    if [ $? -ne 0 ]; then 
+        # Get the main iq number e.g.
+        # echo /eniq/database/dwh_main_dbspace/dbspace_dir_2/main_12.iq |nawk -F\_ '{print $NF}' |nawk -F\. '{print $1}'
+        # 12
+        _iq_num_=`$ECHO $_sym_path_ |$AWK -F\_ '{print $NF}' |$AWK -F\. '{print $1}'` >> /dev/null 2>&1
+        # Get the last digit e.g. 
+        # _iq_num_=12; echo ${_iq_num_: -1}
+        # 2
+        _last_dig_=`$ECHO ${_iq_num_: -1}`
+        # If the last digit is 0 set the dir number to 10, otherwise the last digit will be the dir number
+        if [ ${_last_dig_} -eq 0 ]; then
+            _dir_num_=10
+        else
+            _dir_num_=${_last_dig_}
+        fi
+			
+        # Set the new Path value, So for _iq_num_ 12, the dir number will be 2
+        _new_sym_path_=$_dwh_main_db_space_${_dir_num_}/main_${_iq_num_}.iq
+        # Check if it is a link
+        $LS -L $_new_sym_path_ >> /dev/null 2>&1
+        if [ $? -eq 0 ]; then
+            # Issue with the /'s, so we need to do this \/, so we can insert it
+            _new_sym_path_string_="$_dwh_main_db_space_string_${_dir_num_}\/main_${_iq_num_}.iq"
+            # Add _new_sym_path_string_ to the Path
+            log_msg -l ${LOGFILE} -s "Updating Sym Links ini file with PATH : $_new_sym_path_"
+            # Should update this with an iniset and test it
+            $CAT ${TEM_DIR}/${SYM_INI} | $SED -e "s|$_sym_path_|$_new_sym_path_string_|" > ${TEM_DIR}/${SYM_INI}.updated
+            if [ $? -ne 0 ]; then
+                _err_msg_="Failed to update ${SYM_INI}"
+                abort_script "$_err_msg_"
+            fi
+            # Use the updated file for the next loop so the final file has all the updates
+            $CP ${TEM_DIR}/${SYM_INI}.updated ${TEM_DIR}/${SYM_INI}
+            if [ $? -ne 0 ]; then
+                _err_msg_="Could not updated ${TEM_DIR}/${SYM_INI} to ${TEM_DIR}/${SYM_INI}"
+                abort_script "$_err_msg_"
+            fi
+					
+        else
+            log_msg -l ${LOGFILE} -s "ERROR Link does not exist for $_new_sym_path_"
+            _fix_sy_link_err_=1
+        fi
+    else
+        log_msg -l ${LOGFILE} -s "No main sym link update required"
+    fi
+done
+    
+log_msg -h -l ${LOGFILE} -s "Finished updating PATH values for $_sym_list_"
+}
+
+### Function: fix_dwh_temp_sym_links ###
+#
+# Update the sym_links file for DWH_DBSPACES_TEMP entries
+# Arguments:
+#       none
+# Return Values:
+#       none
+fix_dwh_temp_sym_links()
+{
+_sym_list_='DWH_DBSPACES_TEMP'
+_dwh_temp_db_space_string_="\/eniq\/database\/dwh_temp_dbspace\/dbspace_dir_"
+_dwh_temp_db_space_="$TEMP_DB_PATH/$DB_DIR_NAME_TEMPL"
+log_msg -h -l ${LOGFILE} -s "Updating PATH values for $_sym_list_"
+
+# Get the children of [DWH_DBSPACES_TEMP]
+_leaf_list_=`iniget ${_sym_list_} -f ${TEM_DIR}/${SYM_INI}` >> /dev/null 2>&1
+if [ ! "${_leaf_list_}" ]; then
+    _err_msg_="Failed to read values $_sym_list_ from ${TEM_DIR}/${SYM_INI}"
+    abort_script "$_err_msg_"
+fi 
+for _leaf_ in ${_leaf_list_}; do
+    # For each of these get the Path value
+    _sym_path_=`iniget ${_leaf_} -f ${TEM_DIR}/${SYM_INI} -v Path` >> /dev/null 2>&1
+    if [ ! "${_sym_path_}" ]; then
+        _err_msg_="Failed to read parameter Path from ${TEM_DIR}/${SYM_INI}"
+        abort_script "$_err_msg_"
+    fi 
+
+    # Check if we need to update the file for this path entry
+    $ECHO $_sym_path_ | $EGREP $_dwh_temp_db_space_string_ >> /dev/null 2>&1
+    if [ $? -ne 0 ]; then 
+        # Get the iq number e.g. echo /eniq/database/dwh_temp_dbspace/dbspace_dir_1/temp_1.iqtmp |nawk -F\_ '{print $NF}' |nawk -F\. '{print $1}'
+        # 1
+        _iq_num_=`$ECHO $_sym_path_ |$AWK -F\_ '{print $NF}' |$AWK -F\. '{print $1}'` >> /dev/null 2>&1
+				
+        # Get the last digit
+        _last_dig_=`$ECHO ${_iq_num_: -1}`
+        case ${_last_dig_} in
+            1|6) _dir_num_=1
+                     ;;
+            2|7) _dir_num_=2
+                     ;;
+            3|8) _dir_num_=3
+                     ;;
+            4|9) _dir_num_=4
+                     ;;
+            5|0) _dir_num_=5
+                     ;;
+        esac
+
+        # Set the dir number 1-5 for the temp luns 6.iqtmp go into dir_num 1 etc				
+        _new_sym_path_=$_dwh_temp_db_space_${_dir_num_}/temp_${_iq_num_}.iqtmp
+        # Check if it is a link
+        $LS -L $_new_sym_path_ >> /dev/null 2>&1
+        if [ $? -eq 0 ]; then
+            # Issue with the /'s, so we need to do this \/, so we can insert it
+            _new_sym_path_string_="$_dwh_temp_db_space_string_${_dir_num_}\/temp_${_iq_num_}.iqtmp"
+            # Add dbspace_dir_${_dir_num_} to the Path
+            log_msg -l ${LOGFILE} -s "Updating Sym Links ini file with PATH : $_new_sym_path_"
+            # Should update this with an iniset and test it
+            $CAT ${TEM_DIR}/${SYM_INI} | $SED -e "s|$_sym_path_|$ _new_sym_path_string_|" > ${TEM_DIR}/${SYM_INI}.updated
+            if [ $? -ne 0 ]; then
+                _err_msg_="Failed to update ${SYM_INI}"
+                abort_script "$_err_msg_"
+            fi
+            # Use the updated file for the next loop so the final file has all the updates
+            $CP ${TEM_DIR}/${SYM_INI}.updated ${TEM_DIR}/${SYM_INI}
+            if [ $? -ne 0 ]; then
+                _err_msg_="Could not updated ${TEM_DIR}/${SYM_INI} to ${TEM_DIR}/${SYM_INI}"
+                abort_script "$_err_msg_"
+            fi
+					
+        else
+            log_msg -l ${LOGFILE} -s "ERROR Link does not exist for $_new_sym_path_"
+            _fix_sy_link_err_=1
+        fi
+    else
+        log_msg -l ${LOGFILE} -s "No temp sym link update required"
+    fi
+done
+
+log_msg -h -l ${LOGFILE} -s "Finished updating PATH values for $_sym_list_"
+}
+
+### Function: fix_db_disk_alloc_sym_ini ###
+#
+# Updating DB_DISK_ALLOC values for sym_links.ini
+# Arguments:
+#       none
+# Return Values:
+#       none
+fix_db_disk_alloc_sym_ini()
+{
+log_msg -h -l ${LOGFILE} -s "Updating DB_DISK_ALLOC values for sym_links.ini" 
+_template_attribs_sym_=`iniget DB_DISK_ALLOC -f ${TEM_DIR}/${SYM_INI}`
+if [ ! "${_template_attribs_sym_}" ]; then
+    if [ -f ${ENIQ_CONF_DIR}/${ENIQ_INI} ]; then 
+        _template_attribs_=`iniget DB_DISK_ALLOC -f ${ENIQ_CONF_DIR}/${ENIQ_INI}`
+        if [ "${_template_attribs_}" ]; then
+            for _name_value_ in ${_template_attribs_}; do
+                iniset DB_DISK_ALLOC -f ${TEM_DIR}/${SYM_INI} ${_name_value_}
+                if [ $? -ne 0 ]; then
+                     _err_msg_="Could not set DB_DISK_ALLOC from ENIQ_INI to SYM_INI."
+                     abort_script "$_err_msg_"
+                fi
+            done
+            log_msg -l ${LOGFILE} -s "$SYM_INI is updated with DB_DISK_ALLOC"
+        else 
+            log_msg -l ${LOGFILE} -s "ERROR DB_DISK_ALLOC does not exists in niq.ini and sym_links.ini"
+            _fix_sy_link_err_=1   
+        fi
+    else
+        log_msg -l ${LOGFILE} -s "ERROR $ENIQ_INI file does not exists"
+        _fix_sy_link_err_=1
+    fi
+else
+    log_msg -l ${LOGFILE} -s "No sym link update required"
+fi
+log_msg -h -l ${LOGFILE} -s "Finished updating DB_DISK_ALLOC values for sym_links.ini"
+}
+
+### Function: dwh_reader_update ###
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+dwh_reader_update() 
+{
+_update_string_=$1
+_block_list_=$2
+_leaf_list_=`iniget ${_block_list_} -f ${TEM_DIR}/${SYM_INI}` >> /dev/null 2>&1
+if [ ! "${_leaf_list_}" ]; then
+    _err_msg_="Failed to read values _block_list_ from ${TEM_DIR}/${SYM_INI}"
+    abort_script "$_err_msg_"
+fi 
+for _leaf_ in ${_leaf_list_}; do
+    _sym_path_=`iniget ${_leaf_} -f ${TEM_DIR}/${SYM_INI} -v Path` >> /dev/null 2>&1
+    if [ ! "${_sym_path_}" ]; then
+        _err_msg_="Failed to read parameter Path from ${TEM_DIR}/${SYM_INI}"
+        abort_script "$_err_msg_"
+    fi 
+    $ECHO $_sym_path_ | $EGREP $_dwh_temp_db_space_string_ >> /dev/null 2>&1
+    if [ $? -ne 0 ]; then 
+       	_iq_num_=`$ECHO $_sym_path_ |$AWK -F\_ '{print $NF}' |$AWK -F\. '{print $1}'` >> /dev/null 2>&1
+				
+        # Get the last digit.
+        _last_dig_=`$ECHO ${_iq_num_: -1}`
+        case ${_last_dig_} in
+            1|6) _dir_num_=1
+                    ;;
+            2|7) _dir_num_=2
+                    ;;
+            3|8) _dir_num_=3
+                    ;;
+            4|9) _dir_num_=4
+                    ;;
+            5|0) _dir_num_=5
+                    ;;
+        esac
+				
+        _new_sym_path_=$_dwh_temp_db_space_${_dir_num_}/${_update_string_}${_iq_num_}.iqtmp
+        $LS -L $_new_sym_path_ >> /dev/null 2>&1
+        if [ $? -eq 0 ]; then
+            _new_sym_path_string_="$_dwh_temp_db_space_string_${_dir_num_}\/${_update_string_}${_iq_num_}.iqtmp"
+            # Add dbspace_dir_${_dir_num_} to the Path
+            log_msg -l ${LOGFILE} -s "Updating Sym Links ini file with PATH : $_new_sym_path_"
+            $CAT ${TEM_DIR}/${SYM_INI} | $SED -e "s|$_sym_path_|$_new_sym_path_string_|" > ${TEM_DIR}/${SYM_INI}.updated
+            if [ $? -ne 0 ]; then
+                _err_msg_="Failed to update ${SYM_INI}"
+                abort_script "$_err_msg_"
+            fi
+            # Use the updated file for the next loop so the final file has all the updates
+            $CP ${TEM_DIR}/${SYM_INI}.updated ${TEM_DIR}/${SYM_INI}
+            if [ $? -ne 0 ]; then
+                _err_msg_="Could not updated ${TEM_DIR}/${SYM_INI} to ${TEM_DIR}/${SYM_INI}"
+                abort_script "$_err_msg_"
+            fi
+        else
+            log_msg -l ${LOGFILE} -s "ERROR Link does not exist for $_new_sym_path_"
+            _fix_sy_link_err_=1
+        fi
+    else
+        log_msg -l ${LOGFILE} -s "No reader temp sym link update required"
+    fi
+done
+}
+### Function: fix_dwh_reader_temp_sym_links ###
+#
+# Updating PATH values for $SYM_LIST
+# Arguments:
+#       none
+# Return Values:
+#       none
+fix_dwh_reader_temp_sym_links()
+{
+_sym_list_='DWH_READER_1_DBSPACES_TEMP DWH_READER_2_DBSPACES_TEMP DWH_READER_3_DBSPACES_TEMP DWH_READER_4_DBSPACES_TEMP'
+_dwh_temp_db_space_string_="\/eniq\/database\/dwh_temp_dbspace\/dbspace_dir_"
+_dwh_temp_db_space_="$TEMP_DB_PATH/$DB_DIR_NAME_TEMPL"
+log_msg -h -l ${LOGFILE} -s "Updating PATH values for $_sym_list_"
+
+for _item_ in ${_sym_list_}; do
+    if [ "${_item_}" == "DWH_READER_1_DBSPACES_TEMP" ]; then
+        dwh_reader_update dwh_reader_1_temp_ ${_item_}
+    elif  [ "${_item_}" == "DWH_READER_2_DBSPACES_TEMP" ]; then
+        dwh_reader_update dwh_reader_2_temp_ ${_item_}	
+    elif  [ "${_item_}" == "DWH_READER_3_DBSPACES_TEMP" ]; then
+        dwh_reader_update dwh_reader_3_temp_ ${_item_}
+    elif  [ "${_item_}" == "DWH_READER_4_DBSPACES_TEMP" ]; then
+        dwh_reader_update dwh_reader_4_temp_ ${_item_}
+    fi
+done
+log_msg -h -l ${LOGFILE} -s "Finished updating PATH values for $_sym_list_"
+}
+
+### Function: fix_dwh_reader_temp_sym_links ###
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+fix_dwh_reader_temp_sym_links()
+{
+# Updated to make it generic
+_sym_list_num_=`$CAT ${TEM_DIR}/${SYM_INI} | $GREP "\[DWH_READER_" |$GREP "_DBSPACES_TEMP\]" | $AWK -F_ '{print $3}'`
+if [ ! "${_sym_list_num_}" ]; then
+    _err_msg_="Could not determine _sym_list_num_ value"
+    abort_script "$_err_msg_"
+fi
+_dwh_temp_db_space_string_="\/eniq\/database\/dwh_temp_dbspace\/dbspace_dir_"
+_dwh_temp_db_space_="$TEMP_DB_PATH/$DB_DIR_NAME_TEMPL"
+
+for _num_ in ${_sym_list_num_}; do
+    _item_="DWH_READER_"$_num_"_DBSPACES_TEMP"
+    dwh_reader_update "dwh_reader_"$_num_"_temp_" ${_item_}
+done
+}
+ 
+# chk_create_logfile ###
+#
+# Check/Create Logfile
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+chk_create_logfile()
+{
+$MKDIR -p `$DIRNAME ${LOGFILE}`
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not create directory `$DIRNAME ${LOGFILE}`"
+    abort_script "$_err_msg_"
+fi
+
+$TOUCH -a ${LOGFILE}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not write to file ${LOGFILE}"
+    abort_script "$_err_msg_"
+fi
+}
+
+### Function:  setup_environment ###
+#
+# Setup path environment etc
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+setup_environment()
+{
+# Name of all ini Files
+ENIQ_INI=niq.ini
+SUNOS_INI=SunOS.ini
+SYM_INI=sym_links.ini
+COORD_INI=coordinator_sym_links.ini
+ 
+if [ ! "${ENIQ_BASE_DIR}" ]; then
+    ENIQ_BASE_DIR=/eniq
+fi
+ 
+# Main Directory for the Core Installation SW
+ENIQ_INST_DIR=${ENIQ_BASE_DIR}/installation
+
+# Installation config directory
+ENIQ_CONF_DIR=${ENIQ_INST_DIR}/config
+CLI_CONF_DIR=${ENIQ_BASE_DIR}/sw/conf
+ 
+# Core install directory that contains scripts
+ENIQ_CORE_DIR=${ENIQ_INST_DIR}/core_install
+ 
+# Source the common functions
+. ${ENIQ_CORE_DIR}/lib/common_functions.lib
+if [ $? -ne 0 ]; then
+    _err_msg_="Error: sourcing the file: ${ENIQ_CORE_DIR}/lib/common_functions.lib"
+    abort_script "$_err_msg_"
+    exit 1
+fi
+
+# Create a temporary Directory
+TEM_DIR=/tmp/update_path_sym_ini_file.$$.$$
+$RM -rf ${TEM_DIR}
+$MKDIR -p ${TEM_DIR}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not create directory ${TEM_DIR}"
+    abort_script "$_err_msg_"
+fi
+
+
+# Copy the input files to a temp location for parsing
+if [ -f ${ENIQ_CONF_DIR}/${SYM_INI} ]; then
+    $CP ${ENIQ_CONF_DIR}/${SYM_INI} ${TEM_DIR}/${SYM_INI}
+    if [ $? -ne 0 ]; then
+        _err_msg_="Could not copy ${ENIQ_CONF_DIR}/${SYM_INI} to ${TEM_DIR}/${SYM_INI}"
+        abort_script "$_err_msg_"
+    fi
+else 
+    _err_msg_="${ENIQ_CONF_DIR}/${SYM_INI}  file does not exists"
+    abort_script "$_err_msg_"
+fi
+
+CURR_SERVER_TYPE=`$CAT $ENIQ_CONF_DIR/installed_server_type | $EGREP -v '^[[:blank:]]*#' | $SED -e 's/ //g'`
+if [ ! "${CURR_SERVER_TYPE}" ]; then
+    _err_msg_="Could not determine which server type this is"
+    abort_script "$_err_msg_"
+fi
+
+# Only applicable to RAW installs
+# Read the storage type
+if [ -s ${ENIQ_CONF_DIR}/${SUNOS_INI} ]; then
+    STORAGE_TYPE=`iniget STOR_TYPE -f ${ENIQ_CONF_DIR}/${SUNOS_INI} -v STORAGE_TYPE`
+    if [ ! "${STORAGE_TYPE}" ]; then
+        _err_msg_="Failed to read parameter STORAGE_TYPE from ${ENIQ_CONF_DIR}/${SUNOS_INI}"
+        abort_script "$_err_msg_"
+    fi
+fi
+
+# Determine storage type
+if [ ! "${STORAGE_TYPE}" ]; then
+    _err_msg_="Could not read STORAGE_TYPE param "
+    abort_script "$_err_msg_"
+fi
+}
+
+
+# ********************************************************************
+# 
+#       Main body of program
+#
+# ********************************************************************
+# Set up for the main script
+# Determine the current server type
+
+while getopts ":l:" arg; do
+  case $arg in
+    l) LOGFILE="$OPTARG"
+       ;;
+  esac
+done
+
+shift `expr $OPTIND - 1`
+
+# Setup up path environment
+setup_environment
+
+if [ ! ${LOGFILE} ]; then
+    LOGFILE="${ENIQ_BASE_DIR}/local_logs/fix_sym_links/fix_sym_links.log"
+fi
+
+# Checking and creating log directory and file
+chk_create_logfile
+
+if [ "${STORAGE_TYPE}" == "fs" ]; then
+    _err_msg_="Sym Links ini file does not need to be update on this system type: ${STORAGE_TYPE}"
+    abort_script "$_err_msg_"
+    exit 0
+fi
+
+if [ "${CURR_SERVER_TYPE}" == "eniq_events" -o "${CURR_SERVER_TYPE}" == "eniq_coordinator" -o "${CURR_SERVER_TYPE}" == "eniq_iqr" -o "${CURR_SERVER_TYPE}" == "stats_coordinator" -o "${CURR_SERVER_TYPE}" == "eniq_stats" ]; then
+                          
+    if [ "${CURR_SERVER_TYPE}" == "eniq_events" -o "${CURR_SERVER_TYPE}" == "eniq_coordinator" ]; then
+        # Need to check these if this is a problem on server types as well ( i hope not..)
+        # -o "${CURR_SERVER_TYPE}" == "son_coordinator" -o "${CURR_SERVER_TYPE}" == "stats_coordinator" -o "${CURR_SERVER_TYPE}" == "eniq_stats"
+        fix_dwh_main_sym_links
+        fix_dwh_temp_sym_links
+    fi
+
+    if [ "${CURR_SERVER_TYPE}" == "eniq_iqr"  ]; then
+        fix_dwh_reader_temp_sym_links
+    fi
+
+    if [ "${CURR_SERVER_TYPE}" == "stats_coordinator" -o "${CURR_SERVER_TYPE}" == "eniq_stats" ]; then
+        fix_db_disk_alloc_sym_ini
+    fi
+
+else
+    _msg_="No updated required for ${CURR_SERVER_TYPE}"
+    log_msg -l ${LOGFILE} -s "$_msg_"
+    exit 0
+fi
+
+$CP ${TEM_DIR}/${SYM_INI} $ENIQ_CONF_DIR
+if [ $? -ne 0 ]; then
+    _err_msg_="Error copying ${TEM_DIR}/${SYM_INI} to $ENIQ_CONF_DIR"
+    abort_script "$_err_msg_"
+fi
+
+if [ "${CURR_SERVER_TYPE}" == "eniq_coordinator" -o "${CURR_SERVER_TYPE}" == "stats_coordinator" ]; then
+    $CP ${TEM_DIR}/${SYM_INI} $CLI_CONF_DIR/coordinator_sym_links.ini
+    if [ $? -ne 0 ]; then
+        _err_msg_="Error copying ${TEM_DIR}/${SYM_INI} to $CLI_CONF_DIR/coordinator_sym_links.ini"
+        abort_script "$_err_msg_"
+    fi
+    $CP ${TEM_DIR}/${SYM_INI} $ENIQ_CONF_DIR/coordinator_sym_links.ini
+    if [ $? -ne 0 ]; then
+        _err_msg_="Error copying ${TEM_DIR}/${SYM_INI} to $ENIQ_CONF_DIR/coordinator_sym_links.ini"
+        abort_script "$_err_msg_"
+    fi
+fi
+
+$RM -rf ${TEM_DIR}
+if [ ${_fix_sy_link_err_} == 1 ]; then
+     _err_msg_="Error Occurred during the execution of the script"
+     abort_script "$_err_msg_"
+     exit 1
+else
+     exit 0
+fi
+

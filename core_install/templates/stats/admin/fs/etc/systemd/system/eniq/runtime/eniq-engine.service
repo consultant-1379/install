@@ -1,0 +1,20 @@
+[Unit]
+Description=The Eniq Engine Service
+Requires=eniq-rmiregistry.service eniq-lwphelper.service
+After=eniq-licmgr.service eniq-lwphelper.service
+
+[Service]
+Type=forking
+User=dcuser
+Group=dc5000
+ExecStart=/eniq/smf/bin/eniq_smf_start_stop.sh -a start -s engine
+ExecStop=/eniq/smf/bin/eniq_smf_start_stop.sh -a stop -s engine
+Restart=always
+RestartSec=15
+StartLimitInterval=400
+StartLimitBurst=3
+TimeoutStartSec=0
+TimeoutStopSec=150
+
+[Install]
+WantedBy=multi-user.target eniq-rmiregistry.service eniq-lwphelper.service

@@ -1,0 +1,1617 @@
+#!/bin/bash
+# ********************************************************************
+# Ericsson Radio Systems AB                                     SCRIPT
+# ********************************************************************
+#
+# (c) Ericsson Radio Systems AB 2022- All rights reserved.
+#
+# The copyright to the computer program(s) herein is the property
+# of Ericsson Radio Systems AB, Sweden. The programs may be used
+# and/or copied only with the written permission from Ericsson Radio
+# Systems AB or in accordance with the terms and conditions stipulated
+# in the agreement/contract under which the program(s) have been
+# supplied.
+#
+# ********************************************************************
+#
+# Name    : eniq_linux_rack_replacement.bsh
+# Date    : 09/10/2023
+# Revision: \main\09
+# Purpose : 1.This script will support rack pre-replacement procedure. 
+#           2.This script will support the rack-replacement procedure for hardware replacement
+# Usage   : eniq_linux_rack_replacement.bsh -a <action> [-R] [-l <logfile>]
+#
+# ********************************************************************
+#
+#   Command Section
+#
+# ********************************************************************
+AWK=/usr/bin/awk
+BASENAME=/usr/bin/basename
+BASH=/usr/bin/bash
+BC=/usr/bin/bc
+CAT=/usr/bin/cat
+CHMOD=/usr/bin/chmod
+CHOWN=/usr/bin/chown
+CLEAR=/usr/bin/clear
+CUT=/usr/bin/cut
+DATE=/usr/bin/date
+DIRNAME=/usr/bin/dirname
+DMIDECODE=/usr/sbin/dmidecode
+ECHO='/usr/bin/echo -e'
+EGREP=/usr/bin/egrep
+EXPECT=/usr/bin/expect
+EXPR=/usr/bin/expr
+ENV=/usr/bin/env
+FIND=/usr/bin/find
+GETENT=/usr/bin/getent
+GREP=/usr/bin/grep
+HEAD=/usr/bin/head
+ID=/usr/bin/id
+LS=/usr/bin/ls
+LVCREATE=/usr/sbin/lvcreate
+MKDIR=/usr/bin/mkdir
+MYHOSTNAME=/usr/bin/hostname
+OPENSSL=/usr/bin/openssl
+PERL=/usr/bin/perl
+PRINTF=/usr/bin/printf
+RSYNC=/usr/bin/rsync
+RM=/usr/bin/rm
+SCP='/usr/bin/scp -o StrictHostKeyChecking=no'
+SED=/usr/bin/sed
+SLEEP=/usr/bin/sleep
+SU=/usr/bin/su
+SUDO=/usr/bin/sudo
+TAIL=/usr/bin/tail
+TEE=/usr/bin/tee
+TOUCH=/usr/bin/touch
+UNIQ=/usr/bin/uniq
+VGS=/usr/sbin/vgs
+YES=/usr/bin/yes
+HOST=/usr/sbin/host
+LVS=/usr/sbin/lvs
+MKFS_EXT4=/usr/sbin/mkfs.ext4
+MOUNT=/usr/bin/mount
+PING=/usr/sbin/ping
+PWD=/usr/bin/pwd
+SERVICES=/usr/bin/services
+SORT=/usr/bin/sort
+TR=/usr/bin/tr
+UMOUNT=/usr/bin/umount
+
+
+# ********************************************************************
+#
+#       Configuration Section
+#
+# ********************************************************************
+
+# Default user
+# DEFAULT_USER=root
+
+# Cmd to exec a shell and drop user to it in case of an error
+EXEC_SHELL_CMD="exec /bin/bash -o emacs"
+
+# Name of the ini Files
+ENIQ_INI=niq.ini
+SUNOS_INI=SunOS.ini
+
+# ********************************************************************
+#
+#   Functions
+#
+# ********************************************************************
+### Function: abort_script ###
+#
+#   This will be called if the script is aborted by an error
+#   which is encountered during runtime
+#
+# Arguments:
+#       $1 - Error message from part of program (Not always used)
+# Return Values:
+#       none
+abort_script()
+{
+_err_time_=`$DATE '+%Y-%b-%d_%H.%M.%S'`
+
+if [ "$1" ]; then
+    _err_msg_="${_err_time_} - $1"
+else
+    _err_msg_="${_err_time_} - ERROR : Script aborted.......\n"
+fi
+
+if [ "${LOGFILE}" ]; then
+    $ECHO "\nERROR : ${_err_msg_}\n" | $TEE -a ${LOGFILE}
+else
+    $ECHO "\nERROR : ${_err_msg_}\n"
+fi
+
+$RM -rf ${TEM_DIR}
+$RM -rf ${CONN_STR_USER_DBA_ENC}
+$RM -rf ${dwh_connection_string_enc}
+
+if [ "$2" ]; then
+    if [ ! "${CONTINUE}" ]; then 
+        ${2}
+    fi
+    exit 1
+else
+   exit 1
+fi
+}
+
+### Function: add_fls_service ###
+#
+# Updates services_names file with fls
+#
+# Arguments: none
+#
+# Return Values: none
+add_fls_service()
+{
+# Keeping backup of service_names file
+$CP ${CLI_CONF_DIR}/service_names ${VAR_TMP_REPLACEMENT}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not copy  ${CLI_CONF_DIR}/service_names file to ${VAR_TMP_REPLACEMENT}."
+    abort_script "${_err_msg_}"
+fi
+
+#Add fls entry to services_names
+check_fls_service_names=`$CAT ${CLI_CONF_DIR}/service_names | $EGREP -w fls`
+if [ -z "${check_fls_service_names}" ]; then
+    log_msg -s "adding fls entry in service_names file." -l ${LOGFILE}
+    $CAT ${CLI_CONF_DIR}/service_names | $EGREP -w engine | $SED 's/engine/fls/g' >> ${CLI_CONF_DIR}/service_names
+    if [ $? -ne 0 ]; then
+        _err_msg_="Could not add fls to ${CLI_CONF_DIR}/service_names file."
+        abort_script "${_err_msg_}"
+    fi
+fi
+
+}
+
+### Function: check_absolute_path ###
+#
+# Determine absolute path to software
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+check_absolute_path()
+{
+_dir_=`$DIRNAME $0`
+SCRIPTHOME=`cd $_dir_ 2>/dev/null && pwd || $ECHO $_dir_`
+
+}
+
+### Function: check_engine_service ###
+#
+# Checks the engine service
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+check_engine_service()
+{
+insert_header_footer head "Entering ${ACTION_TYPE} stage - ${NEXT_STAGE}" ${LOGFILE}
+
+# Get engine status
+_engine_status_=`$SU - ${SYSUSER} -c "engine status | $GREP -i "engine is running OK"" | $TAIL -1`
+if [ "${_engine_status_}" == "engine is running OK" ]; then
+    $SU - ${SYSUSER} -c "engine -e changeProfile 'NoLoads'"
+    _engine_profile_=`$SU - ${SYSUSER} -c "engine -e getCurrentProfile" | $TAIL -1`
+    if [ "${_engine_profile_}" == "NoLoads" ]; then
+       $ECHO "Engine profile successfully set to NoLoads" | $TEE -a ${LOGFILE}
+    else
+       _err_msg_="Failed to set Engine profile to NoLoads"
+       abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+    fi
+fi    
+
+# To check the execution slots are empty of Loader and Aggregation sets.
+log_msg -s "\nChecking the execution slots\n " -l ${LOGFILE}
+_timeout_=0
+while true ;do
+    _command_="engine -e showSetsInExecutionSlots | $EGREP 'Count|Loader'"
+    $SU - $SYSUSER -c "${_command_}"  >> /dev/null 2>&1
+    if [ $? -eq 0 ];then
+        log_msg -s "Waiting for execution slots to get empty of Loader and Aggregation sets" -l ${LOGFILE}
+        $SLEEP 5
+        (( _timeout_ = _timeout_ + 5 ))
+        if [ ${_timeout_} -eq 120 ]; then
+            _err_msg_="Failed to put the engine in noload mode, timeout"
+            abort_script "${_err_msg_}"
+            break
+        else
+            continue
+        fi
+    else
+        log_msg -s "\nExecution slots are empty of Loader and Aggregation sets" -l ${LOGFILE}
+        break
+    fi
+done
+
+# Commit and checkpoint transactions running on dwhdb 
+$SU - ${SYSUSER} -c "$DBISQL @${dwh_connection_string_enc} \"commit; checkpoint;checkpoint;checkpoint;\""
+if [ $? -ne 0 ]; then
+    _err_msg_="Failed to commit and checkpoint transactions."
+    abort_script "$_err_msg_"
+fi
+    
+insert_header_footer foot "Successfully completed stage - ${NEXT_STAGE}" ${LOGFILE}
+set_next_stage `$EXPR ${ARRAY_ELEM}+1`
+}
+
+### Function: check_for_file ###
+#
+# To check whether file or directory exist or not and to test the basic file operations.
+# 
+# Arguments: 
+#       $1 : File operations
+#        $2 : File qualified path
+# Return Values:
+#         none
+check_for_file()
+{
+if [ ! $1 $2 ]; then
+    _err_msg_="$2 does not exist"
+    abort_script "$_err_msg_"
+fi
+} 
+
+### Function: check_id ###
+#
+#   Check that the effective id of the user is correct
+#   If not print error msg and exit.
+#
+# Arguments:
+#       $1 : User ID name
+# Return Values:
+#       none
+check_id()
+{
+_get_id_=`$ENV |$GREP -w SUDO_USER | $EGREP "^[[:blank:]]*SUDO_USER="|$AWK -F\= '{print $2}'|$SED -e 's|"||g'`
+_check_id_=`$ID | $AWK -F\( '{print $2}' | $AWK -F\) '{print $1}'`
+_check_group_=`$ID $_get_id_ | $AWK -F\( '{print $3}' | $AWK -F\) '{print $1}'`
+    if [ "${_get_id_}" == "" ]; then
+        if [ "${_check_id_}" == "root" ]; then
+           # Set 1 for true
+           _user_root=1
+        else
+           _err_msg_="You must be root or admin to execute this script."
+           abort_script "${_err_msg_}"
+        fi
+          else
+            if [ "${_check_group_}" == "ENIQ_ADMIN_ROLE" ]; then
+               # Set 0 for false
+               _user_root=0
+            else
+               _err_msg_="You must be root or admin to execute this script." 
+               abort_script "${_err_msg_}"
+            fi
+    fi
+}
+
+### Function: check_params ###
+#
+# Check Input Params
+#
+# Arguments:
+#    none
+# Return Values:
+#    none
+check_params()
+{
+# Check that we got the required action type
+if [ ! "${ACTION_TYPE}" ]; then
+    $ECHO "\nERROR: Required parameters not passed."
+    usage_msg
+    exit 1
+fi
+
+if [ "${ACTION_TYPE}" != "prereplacement" -a "${ACTION_TYPE}" != "replacement" -a "${ACTION_TYPE}" != "cleanup" ]; then
+    $ECHO "\nERROR: Not a valid action type"
+    usage_msg
+    exit 1
+fi
+
+case $ACTION_TYPE in
+  prereplacement) STOP_STAGE="cleanup_prereplacement"
+                ACTIVITY="Pre-Replacement procedure for Rack Hardware replacement"          
+     ;;
+
+  replacement) STOP_STAGE="cleanup_replacement"
+                ACTIVITY="Replacement procedure for Rack Hardware replacement"          
+     ;;
+  cleanup) ACTIVITY="procedure to clean temporary files/directories"
+     ;;
+  \?) $ECHO "Invalid action type"
+     usage_msg
+     exit 1
+     ;;
+esac
+
+}
+
+### Function: check_scheduler_service ###
+#
+#   Check if scheduler service is online
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+check_scheduler_service()
+{
+insert_header_footer head "Entering ${ACTION_TYPE} stage - ${NEXT_STAGE}" ${LOGFILE}
+# To check if scheduler is running ok. And to put it on hold.
+_scheduler_status_=`$SU - ${SYSUSER} -c "scheduler status | $GREP -i "running OK"" | $TAIL -1`
+if [ "${_scheduler_status_}" == "scheduler is running OK" ]; then
+    $SU - ${SYSUSER} -c "scheduler hold"
+    if [ $? -ne 0 ]; then
+        _err_msg_="Could not set scheduler to hold"
+        abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+    fi
+fi
+
+insert_header_footer foot "Successfully completed stage - ${NEXT_STAGE}" ${LOGFILE}
+set_next_stage `$EXPR ${ARRAY_ELEM}+1`
+}
+
+### Function: check_user_input ###
+#
+#Getting inputs from user
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+check_user_input()
+{
+input_msg="$1"
+while :; do
+    $ECHO "${input_msg}"
+
+     if [ "$2" == "BACK_SERVER_PASS" -o "$2" == "CON_BACK_SERVER_PASS" ]
+    then
+        _user_input_=$(/usr/bin/perl -e 'system ("stty -echo");my $_temp_password_1 =<STDIN>;print $_temp_password_1; system ("stty echo");')
+    else
+        read _user_input_
+    fi
+
+    if [ -z "${_user_input_}" ]; then
+        continue
+    fi
+        break
+done
+eval "$2='${_user_input_}'"
+}
+
+
+### Function: cleanup_prereplacement ###
+#
+#   Cleanup prereplacement data
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+cleanup_prereplacement()
+{
+insert_header_footer head "Entering Linux ${ACTION_TYPE} stage - ${NEXT_STAGE}" ${LOGFILE}
+# Cleaning up all temporary files.
+log_msg -s "Cleaning up temporary directories used for prereplacement." -l ${LOGFILE}
+$RM -rf ${TEM_DIR} >> /dev/null 2>&1
+
+# Cleaning up replacement progress flag.
+log_msg -s "Cleaning up flag ${REPL_PROGRESS} used for prereplacement." -l ${LOGFILE}
+$RM -rf ${REPL_PROGRESS} >> /dev/null 2>&1
+
+
+$TOUCH ${REPL_SUCCESS}
+
+
+insert_header_footer foot "Successfully completed stage - ${NEXT_STAGE}" ${LOGFILE}
+
+}
+
+### Function: cleanup_replacement ###
+#
+#   Cleanup replacement flags
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+cleanup_replacement()
+{
+insert_header_footer head "Entering Linux ${ACTION_TYPE} stage - ${NEXT_STAGE}" ${LOGFILE}
+
+# Clean-up Flag files
+log_msg -t -s "Cleaning up flag ${REPL_PROGRESS} used for replacement." -l ${LOGFILE}
+$RM -rf ${REPL_PROGRESS} >> /dev/null 2>&1
+
+# Touch the success flag
+$TOUCH ${REPL_SUCCESS}
+if [ ! -f "${REPL_SUCCESS}" ];then
+    _err_msg_="Could not create ${REPL_SUCCESS} during ${ACTION_TYPE}."
+    abort_script "${_err_msg_}"
+fi
+
+log_msg -s "Cleaning up temporary directory used for replacement." -l ${LOGFILE}
+$RM -rf ${TEM_DIR} >> /dev/null 2>&1
+
+insert_header_footer foot "Successfully completed - ${NEXT_STAGE}" ${LOGFILE}
+}
+
+
+### Function: clear_data ###
+#
+#   Clear replacement
+#   Files/Directories and Flags from server
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+clear_data()
+{ 
+
+log_msg -s "\nChecking for unnecessary files/directories to be cleaned up.\n" -l ${LOGFILE}
+
+_flag_list_=`$LS -1 ${VAR_TMP_DIR}/Linux_rack_replacement_success 2>/dev/null`
+
+# Remove flag files
+if [ "${_flag_list_}" ]; then
+    log_msg -s "\nRemoving flags used for replacement." -l ${LOGFILE}
+    $RM -rf ${_flag_list_} >> /dev/null 2>&1
+    if [ ! -f "${_flag_}" ]; then
+       log_msg -s "Successfully removed ${_flag_list_} file." -l ${LOGFILE}
+    fi
+	$RM -rf ${VAR_TMP_DIR}/iq_file_added >> /dev/null 2>&1
+	$RM -rf ${VAR_TMP_DIR}/iq_file_removed >> /dev/null 2>&1
+fi
+
+#Cleaning up temporary backup files
+for _tmp_file_ in `cat ${ENIQ_REP_CLEANUP_LIST}`; do
+    log_msg -s "\nRemoving ${_tmp_file_} used for migration." -l ${LOGFILE}
+    if [ -e "${_tmp_file_}" ]; then
+        log_msg -t -q -s "Deleting ${_tmp_file_} file" -l ${LOGFILE}
+        $RM -rf ${_tmp_file_} >> /dev/null 2>&1
+        if [ ! -f "${_tmp_file_}" ]; then
+           log_msg -s "Successfully removed ${_tmp_file_} file." -l ${LOGFILE}
+        else
+           log_msg -s "Remove ${_tmp_file_} file manually." -l ${LOGFILE}
+        fi
+    fi
+done
+
+#Removing backup directory
+if [ -d ${VAR_TMP_REPLACEMENT} ]; then
+   log_msg -s "\nRemoving directory ${VAR_TMP_REPLACEMENT} used for replacement." -l ${LOGFILE}
+   $RM -rf ${VAR_TMP_REPLACEMENT} >> /dev/null 2>&1
+   if [ ! -d "${VAR_TMP_REPLACEMENT}" ]; then
+       log_msg -s "Successfully removed ${VAR_TMP_REPLACEMENT} directory." -l ${LOGFILE}
+   fi
+fi
+
+log_msg -s "Starting roll-snap service\n" -l ${LOGFILE}
+$BASH ${ENIQ_ADMIN_BIN_DIR}/manage_deployment_services.bsh -a start -s roll-snap -N >> /dev/null 2>&1
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not start roll-snap service."
+    abort_script "${_err_msg_}"
+fi
+
+}
+
+### Function: commit_and_checkpoint ###
+#
+#       ensuring that the nodes are up to date with
+#       the latest TLV log
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+commit_and_checkpoint()
+{
+insert_header_footer head "Entering Linux ${ACTION_TYPE} stage - ${NEXT_STAGE}" ${LOGFILE}
+
+log_msg -l ${LOGFILE} -t -s "Performing commit and checkpoints"
+
+$SU - $SYSUSER -c "$DBISQL -nogui -onerror exit @${CONN_STR_USER_DBA_ENC} \"COMMIT; BEGIN TRANSACTION;CHECKPOINT\""
+if [ $? -ne 0 ];then
+        _err_msg_="Could not commit and checkpoint transactions"
+        abort_script "${_err_msg_}"
+fi
+
+insert_header_footer foot "Successfully completed stage - ${NEXT_STAGE}" ${LOGFILE}
+set_next_stage `$EXPR ${ARRAY_ELEM}+1`
+
+}
+
+
+### Function: create_enm_fls_lvm ###
+#
+# Arguments:
+#   $1 : file system name present in fls_conf file
+# Return Values:
+#   none
+create_enm_fls_lvm()
+{
+
+_fs_name_=$1
+if [ -z ${_fs_name_} ]; then
+   _err_msg_="No parameter passed."
+   abort_script "${_err_msg_}"
+fi
+
+# Make a backup of fstab file
+if [ -f "${ETC_DIR}/${FSTAB}" ]; then
+log_msg -s "Backing up original ${ETC_DIR}/${FSTAB} file to ${ETC_DIR}/${FSTAB}_org" -l ${LOGFILE}
+   $CP -p ${ETC_DIR}/${FSTAB} ${ETC_DIR}/${FSTAB}_org
+   if [ $? -ne 0 ]; then
+      _err_msg_="Could not copy ${ETC_DIR}/${FSTAB} to ${ETC_DIR}/${FSTAB}_org"
+      abort_script "${_err_msg_}"
+   fi
+   $ECHO "${ETC_DIR}/${FSTAB}_org" >> ${ENIQ_REP_CLEANUP_LIST}
+
+	#Initialize no of stripes
+	_NO_OF_STRIPES_=0
+	
+	_pool_list_=`iniget SunOS_FS_POOL -f ${ENIQ_CONF_DIR}/${SUNOS_INI}`
+	_pool_disk_layout_=`iniget ${_pool_list_} -f ${ENIQ_CONF_DIR}/${SUNOS_INI} -v disk_layout`
+	_pool_name_=`iniget ${_pool_list_} -f ${ENIQ_CONF_DIR}/${SUNOS_INI} -v name`
+	if [ ! "${_pool_disk_layout_}" ]; then
+	_err_msg_="Could not get FS pool disk layout"
+	abort_script "${_err_msg_}"
+	fi
+
+for _disk_ in ${_pool_disk_layout_}; do
+    #Update no of stripes used in filesystem creation
+    _NO_OF_STRIPES_=`$ECHO " ${_NO_OF_STRIPES_} + 1 " | $BC`
+done
+
+$LVS | $EGREP ${_fs_name_}
+if [ $? -ne 0 ]; then
+   log_msg -s "\nCreating logical volume ${_pool_name_}-${_fs_name_}" -l ${LOGFILE}
+   $LVCREATE -y --stripes ${_NO_OF_STRIPES_} -L ${_size_of_fls_fs_}G -n ${_fs_name_} ${_pool_name_} >> /dev/null 2>&1
+   if [ $? -ne 0 ]; then
+      _err_msg_="Could not create logical volume  - ${_fs_name_}"
+      abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+   fi
+fi
+
+_mount_point_=`$CAT ${ENIQ_CONF_DIR}/${SUNOS_INI} | $EGREP /${_fs_name_} | $AWK -F = '{print $2}'| uniq`
+$UMOUNT -l ${_mount_point_} >> /dev/null 2>&1
+
+# Creating EXT4 File system
+   log_msg -s "\nCreating EXT4 File system" -l ${LOGFILE}
+   $MKFS_EXT4 /dev/mapper/${_pool_name_}-${_fs_name_} >> /dev/null 2>&1
+   if [ $? -ne 0 ]; then
+      _err_msg_="Could not create EXT4 FS" 
+      abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}" 
+   fi
+
+log_msg -s "Creating Mount Point" -l ${LOGFILE}
+$MKDIR -p ${_mount_point_}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not create Mount Point"
+    abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+fi
+
+$CAT  ${ETC_DIR}/${FSTAB} | $GREP ${_pool_name_}-${_fs_name_} > /dev/null
+if [ $? -ne 0 ]; then
+    log_msg -s "Updating ${ETC_DIR}/${FSTAB} file with filesystem `$BASENAME ${_fs_name_}` on ${_mount_point_}\n" -l ${LOGFILE}
+    $ECHO "/dev/mapper/${_pool_name_}-${_fs_name_} ${_mount_point_}                   ${FS_TYPE}    defaults,x-systemd.device-timeout=300s        0 2" >> ${ETC_DIR}/${FSTAB}
+    if [ $? -ne 0 ]; then
+        _err_msg_="Could not Update ${ETC_DIR}/${FSTAB} file with filesystem `$BASENAME ${_fs_name_}` on ${_mount_point_} and Reverting back to original fstab file"
+        #Reverting back to original fstab file
+        $MV ${ETC_DIR}/${FSTAB}_org ${ETC_DIR}/${FSTAB}
+        abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+    fi
+fi
+
+$MOUNT -a >> /dev/null 2>&1
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not mount filesystem"
+    abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+fi
+
+log_msg -l ${LOGFILE} -s "changing ownership of ${_mount_point_}\n"
+$CHOWN ${SYSUSER}:${SYSGRP} ${_mount_point_}
+if [ $? -ne 0 ]; then
+  _err_msg_="Could not change ownership of ${_mount_point_}"
+  abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+fi
+fi
+}
+
+### Function: create_fls_fs ###
+#
+# Create fls filesystem
+#
+# Arguments:
+#
+#
+# Return Values:
+#   none
+create_fls_fs()
+{
+insert_header_footer head "Entering ${ACTION_TYPE} stage - ${NEXT_STAGE}" ${LOGFILE}
+
+if [ -s /eniq/installation/config/fls_conf ];then
+	while read _line_; do
+	## Get the size for creating FLS File system
+	get_fls_fs_size
+	
+	_free_space_=`$VGS ${_pool_name_} -o vg_free --noheading --units G |$AWK -F" " '{print $1}' | $SED 's/G//g'`
+	if [ ! "${_free_space_}" ]; then
+		_err_msg_="Could not get free space for ${_pool_name_}"
+		abort_script "${_err_msg_}"
+	fi
+		
+	# Comparing free space of eniq_stats_pool with space required to create new LVM File system
+	if [ "$($ECHO ${_size_of_fls_fs_} '<=' ${_free_space_} | $BC -l)" -eq 1 ]; then
+	create_enm_fls_lvm ${_line_}
+	else
+	_err_msg_="New filesystem cannot be created , required size $_size_of_fls_fs_ is greater than available size $_free_space_ " 
+	abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+	fi
+	done < /eniq/installation/config/fls_conf
+fi
+
+insert_header_footer foot "Successfully completed - ${NEXT_STAGE}" ${LOGFILE}
+
+set_next_stage `$EXPR ${ARRAY_ELEM}+1`
+}
+
+### Function: create_snapshots ###
+#
+# To create FS Snapshots
+#
+# Arguments:
+#    none
+# Return Values:
+#     none
+create_snapshots()
+{
+insert_header_footer head "Entering ${ACTION_TYPE} stage - ${NEXT_STAGE}" ${LOGFILE}
+
+local _check_command_="${ENIQ_BKUP_SW_BIN_DIR}/prep_eniq_snapshots.bsh"
+check_for_file -s ${_check_command_}
+
+log_msg -q -s "\nStarting to run $BASH ${ENIQ_BKUP_SW_BIN_DIR}/prep_eniq_snapshots.bsh -N" -l ${LOGFILE}
+
+$BASH ${ENIQ_BKUP_SW_BIN_DIR}/prep_eniq_snapshots.bsh -N
+if [ $? -ne 0 ]; then
+    _err_msg_="Exiting... Unable to  create snapshots. Please refer logfile: ${SNAPSHOT_LOGFILE}. \n"
+    abort_script "${_err_msg_}"
+fi
+
+insert_header_footer foot "Successfully created Snapshots." ${LOGFILE}
+
+log_msg -s "\nLog file for the stage - ${NEXT_STAGE}: ${SNAPSHOT_LOGFILE}" -l ${LOGFILE}
+set_next_stage `$EXPR ${ARRAY_ELEM}+1`
+}
+
+### Function: db_expansion  ###
+#
+#
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+db_expansion()
+{
+insert_header_footer head "Entering ${ACTION_TYPE} stage - ${NEXT_STAGE}" ${LOGFILE}
+
+log_msg -s "\nUpdating sym_links.ini file with the calculated size available size and also expanding SYSMAIN .\n" -l ${LOGFILE}
+
+if [ ! -f ${ENIQ_ADMIN_BIN}/rack_exp_in_progress ]; then
+    #Update syminks file with the expanded size of dbspaces
+    if [ -f ${ENIQ_ADMIN_BIN_DIR}/update_cell_node_count_rack.bsh ]; then
+        $BASH ${ENIQ_ADMIN_BIN_DIR}/update_cell_node_count_rack.bsh
+        if [ $? -ne 0 ]; then
+          err_msg_="Failed to run the update_cell_node_count_rack script"
+            abort_script "${_err_msg_}"
+        fi
+    else   
+         err_msg_="${ENIQ_ADMIN_BIN_DIR}/update_cell_node_count_rack.bsh File not found."
+         abort_script "${_err_msg_}"
+    fi
+fi
+
+log_msg -s "\nAdding more dbspaces.\n" -l ${LOGFILE}
+#Adding additional dbspaces
+if [ -f ${ENIQ_ADMIN_BIN_DIR}/resizedb ];then 
+    $SU - ${SYSUSER} -c "$BASH ${ENIQ_ADMIN_BIN_DIR}/resizedb"
+    if [ $? -ne 0 ]; then
+         _err_msg_="Failed to run the resizedb script"
+        abort_script "${_err_msg_}"
+    fi
+else
+       _err_msg_="${ENIQ_ADMIN_BIN_DIR}/resizedb File not found."
+        abort_script "${_err_msg_}"
+fi
+log_msg -s "\nSuccessfully added dbspaces.\n" -l ${LOGFILE}
+
+log_msg -s "\nStarting Eniq Services  \n" -l ${LOGFILE}
+start_eniq_services
+
+insert_header_footer foot "Successfully completed - ${NEXT_STAGE}" ${LOGFILE}
+
+set_next_stage `$EXPR ${ARRAY_ELEM}+1`
+
+}
+
+### Function: enable_oss_mounts ###
+#
+#   Deletes disable_OSS for each oss mounts
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+enable_oss_mounts()
+{
+log_msg -s "\nChecking for OSS mount info directories." -l ${LOGFILE}
+_oss_mount_dir_="${ENIQ_BASE_DIR}/connectd/mount_info"
+if [ ! -d ${_oss_mount_dir_} ];then
+    _err_msg_="Couldn't find ${_oss_mount_dir_} directory."
+    abort_script "${_err_msg_}"
+fi
+_oss_list_=`$LS -1 ${_oss_mount_dir_} 2> /dev/null`
+
+if [ "${_oss_list_}" ];then
+    for _dir_ in ${_oss_list_}
+    do
+        log_msg -q -s "\nRemoving disable_OSS file from ${_oss_mount_dir_}/${_dir_}" -l ${LOGFILE}
+        $RM -f ${_oss_mount_dir_}/${_dir_}/disable_OSS
+    done
+else
+    log_msg -s "\nNo OSS mount present to enable on ${HNAME}" -l ${LOGFILE}
+fi
+}
+
+### Function: generate_dirchecker  ###
+#
+#
+#
+# Arguments:
+#   none
+# Return Values:
+generate_dirchecker()
+{
+log_msg -l ${LOGFILE} -s "Recreating eltdata and pmdata directories "
+
+if [ ! -e ${ENIQ_SW_BIN_DIR}/generate_dirchecker_sch_commands.bsh ]; then
+    _err_msg_="generate_dirchecker_sch_commands.bsh file is not present"
+    abort_script "${_err_msg_}"
+fi
+
+log_msg -l ${LOGFILE} -s "Executing generate_dirchecker_sch_commands.bsh command."
+ $SU - ${SYSUSER} -c "$BASH ${ENIQ_SW_BIN_DIR}/generate_dirchecker_sch_commands.bsh -f"
+ if [ $? -ne 0 ]; then
+    _err_msg_="Failed to run the generate_dirchecker_sch_commands.bsh"
+    abort_script "${_err_msg_}"
+ fi
+}
+
+### Function: get_array_element ###
+#
+# Get the current array element number
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+get_array_element()
+{
+_num_elements_=${#ENIQ_CORE_STAGES[*]}
+_array_length_=`${EXPR} ${_num_elements_} - 1`
+
+for (( _elem_=0; _elem_<=${_array_length_}; _elem_++ )); do
+    $ECHO ${ENIQ_CORE_STAGES[${_elem_}]} | $GREP -w ${NEXT_STAGE} >> /dev/null 2>&1
+    if [ $? -eq 0 ]; then
+        ARRAY_ELEM=${_elem_}
+        break
+    fi
+done
+}
+
+### Function: get_fls_fs_size ###
+#
+# Get the available pool space for creating FLS File system
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+get_fls_fs_size()
+{
+_fls_fs_size_tag_="eniq_stats_fls_fs_size"
+_fls_fs_aval_size_tag_="eniq_stats_fls_available_size"
+_gen_detail_=`$DMIDECODE | $GREP -i "Product Name" | $AWK -F ":" '{print $2}' | $AWK -F " " '{print $3}' | $HEAD -1`
+_fs_size_=`iniget ${_fls_fs_size_tag_} -f ${ENIQ_CONF_DIR}/${SUNOS_INI} -v ${_gen_detail_}_eniq_oss | $AWK -F ":" '{print $1}'`
+    if [ ! "${_fs_size_}" ]; then
+        _err_msg_="Could not read FLS FS parameter from ${ENIQ_CONF_DIR}/${SUNOS_INI}"
+        abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+    fi
+
+_final_fs_size_=`$ECHO "scale=5; ${_fs_size_}/100" | $BC`
+
+_avail_disk_size_=`iniget ${_fls_fs_aval_size_tag_} -f ${ENIQ_CONF_DIR}/${SUNOS_INI} | $AWK -F "=" '{print $2}'`
+    if [ ! "${_avail_disk_size_}" ]; then
+        _err_msg_="Could not read FLS FS parameter from ${ENIQ_CONF_DIR}/${SUNOS_INI}"
+        abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+    fi
+
+_size_of_fls_fs_=`$AWK -v _disk_size_=${_avail_disk_size_} -v _final_size_=${_final_fs_size_} 'BEGIN {print _disk_size_ * _final_size_}'`
+    if [ ! "${_size_of_fls_fs_}"  ]; then
+        _err_msg_="Could not determine fs size of ${line}"
+        abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+    fi
+
+}
+
+### Function: get_next_stage ###
+#
+# Get the stage to be run
+#
+# Arguments:
+#   $1 : Stage to be set to. Either numeric value or 'done'
+# Return Values:
+#   none
+get_next_stage()
+{
+ARRAY_ELEM=0
+
+if [ -s $STAGEFILE ]; then
+
+    NEXT_STAGE=`$CAT $STAGEFILE | $EGREP -v '^[[:blank:]]*#' | $SED -e 's| ||g'`
+
+    if [ ! "${NEXT_STAGE}" ]; then
+        _err_msg_="Failed to read stage from ${STAGEFILE}, exiting."
+        abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+    fi
+
+    if [ "${NEXT_STAGE}" == "${STOP_STAGE}" ]; then
+        return 0
+    else
+        $ECHO ${ENIQ_CORE_STAGES[*]} | $GREP -w ${NEXT_STAGE} >> /dev/null 2>&1
+        if [ $? -ne 0 ]; then
+            _err_msg_="Specified stage ${NEXT_STAGE} is not a valid stage"
+            abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+        fi
+    fi
+
+    # Get the element number so we can move along the array
+    get_array_element
+else
+    $MKDIR -p `$DIRNAME $STAGEFILE`
+    if [ $? -ne 0 ]; then
+        _err_msg_="Failed to create directory `$DIRNAME ${STAGEFILE}`, exiting."
+        abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+    fi
+
+    NEXT_STAGE=${ENIQ_CORE_STAGES[${ARRAY_ELEM}]}
+fi
+}
+
+
+
+### Function: insert_header_footer ###
+#
+#   Insert a stage header/footer message
+#
+# Arguments:
+#   $1 : head/foot
+#   $2 : Message
+#   $3 : Logfile
+# Return Values:
+#   none
+insert_header_footer()
+{
+if [ $# -ne 3 ]; then
+    _err_msg_="3 Parameters must be passed to header/footer function"
+    abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+fi
+
+if [ "$1" != "head" -a "$1" != "foot" ]; then
+    _err_msg_="Only Param of head/foot is allowed...exiting!"
+    abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+fi
+_type_=$1
+
+_msg_=$2
+
+_logfile_=$3
+$MKDIR -p `$DIRNAME ${_logfile_}`
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not create directory `$DIRNAME ${_logfile_}`"
+    abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+fi
+
+$TOUCH -a ${_logfile_}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not write to file ${_logfile_}"
+    abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+fi
+
+_time_=`$DATE '+%Y-%b-%d_%H.%M.%S'`
+if [ "$_type_" == "head" ]; then
+    $ECHO "\n=====================================================" | $TEE -a ${_logfile_}
+    $ECHO "-----------------------------------------------------" | $TEE -a ${_logfile_}
+    $ECHO "$_time_ : $_msg_" | $TEE -a ${_logfile_}
+    $ECHO "-----------------------------------------------------" | $TEE -a ${_logfile_}
+fi
+
+if [ "$_type_" == "foot" ]; then
+    $ECHO "\n-----------------------------------------------------" | $TEE -a ${_logfile_}
+    $ECHO "$_time_ : $_msg_" | $TEE -a ${_logfile_}
+    $ECHO "-----------------------------------------------------" | $TEE -a ${_logfile_}
+    $ECHO "=====================================================\n" | $TEE -a ${_logfile_}
+fi
+}
+
+### Function: post_configuration ###
+#
+#
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+post_configuration()
+{
+insert_header_footer head "Entering ${ACTION_TYPE} stage - ${NEXT_STAGE}" ${LOGFILE}
+
+
+log_msg -t -s "Updating eniq_status file" -l ${LOGFILE}
+
+# Check the required scripts exist or not
+_manage_eniq_status_script_="${ENIQ_ADMIN_BIN_DIR}/manage_eniq_status.bsh"
+if [ ! -s "${_manage_eniq_status_script_}" ];then
+    _err_msg_="Could not find ${_manage_eniq_status_script_}."
+    abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+fi 
+
+log_msg -q -s "\nStarting to run $BASH ${_manage_eniq_status_script_} -d ${BASE_SW_DIR} " -l ${LOGFILE}
+$BASH ${_manage_eniq_status_script_} -d ${BASE_SW_DIR} -l ${LOGFILE}
+if [ $? -ne 0 ]; then
+    _err_msg_="Failed to update eniq_status file\n"
+    abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+fi
+
+# clean up disable flag for oss mounts.
+enable_oss_mounts
+
+
+#Starting Eniq services
+start_eniq_services
+
+#Create pmdata and etldata directories 
+generate_dirchecker
+
+insert_header_footer foot "Successfully completed - ${NEXT_STAGE}" ${LOGFILE}
+
+set_next_stage `$EXPR ${ARRAY_ELEM}+1`
+
+}
+
+### Function: restore_iq_file ###
+#
+#
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+restore_iq_file()
+{
+insert_header_footer head "Entering ${ACTION_TYPE} stage - ${NEXT_STAGE}" ${LOGFILE}
+
+if [ -e ${VAR_TMP_REPLACEMENT}/sysmain_main_temp_db_restore ]; then
+    insert_header_footer foot " TEMP_DB exist - Skipping restore_iq_file stage - ${NEXT_STAGE} " ${LOGFILE}
+    set_next_stage `$EXPR ${ARRAY_ELEM}+1`
+else
+
+    if [ ! -d  ${ENIQ_BACKUP_DIR}/iq_virtual_bkup ]; then
+        _err_msg_="${ENIQ_BACKUP_DIR}/iq_virtual_bkup directory is not present "
+        abort_script "${_err_msg_}"
+    fi
+    
+    if [ ! -e  ${ENIQ_BKUP_SW_DIR}/bin/recover_iq.bsh ]; then
+        _err_msg_="recover_iq.bsh script is not present "
+        abort_script "${_err_msg_}"
+    fi
+    
+    $BASH ${ENIQ_BASE_DIR}/bkup_sw/bin/recover_iq.bsh -N
+    if [ $? -ne 0 ]; then
+        _err_msg_="Execution of /eniq/bkup_sw/bin/recover_iq.bsh failed"
+        abort_script "${_err_msg_}"
+    fi
+
+fi
+insert_header_footer foot "Successfully completed - ${NEXT_STAGE}" ${LOGFILE}
+
+set_next_stage `$EXPR ${ARRAY_ELEM}+1`
+}
+
+### Function: restore_logs ###
+#
+#  restore the migrated logs to their actual locations
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+restore_logs()
+{
+
+insert_header_footer head "Entering ${ACTION_TYPE} stage - ${NEXT_STAGE}" ${LOGFILE}
+
+#Copy the log Data in the new folder
+if [ ! -d ${ENIQ_REPL_LOG_DIR} ]; then
+    _err_msg_="Restore Log directory is not present or empty"
+    abort_script "${_err_msg_}"
+else
+    
+    $YES | $CP -rp ${ENIQ_REPL_LOG_DIR}/sw_log/* /eniq/log/sw_log/
+    if [ $? -ne 0 ]; then
+        _err_msg_="could not copy the log data in ${ENIQ_LOG_DIR}/log_replaced directory"
+        abort_script "${_err_msg_}"
+    fi
+    log_msg -l ${LOGFILE} -s "Coping directory ${ENIQ_REPL_LOG_DIR}/sw_log/  ${ENIQ_LOG_DIR}/sw_log/"
+fi
+insert_header_footer foot "Successfully completed - ${NEXT_STAGE}" ${LOGFILE}
+
+set_next_stage `$EXPR ${ARRAY_ELEM}+1`
+
+}
+
+
+### Function: setup_env ###
+#
+# Set up environment variables for script.
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+setup_env()
+{
+# Define root user's home
+ROOT_HOME=/root/
+
+# Setting the env HOME to /root for console run
+export HOME=/root
+
+# var directory
+VAR_DIR=/var
+
+#Temp directory.
+TEM=/tmp
+
+# var tmp directory
+VAR_TMP_DIR=${VAR_DIR}/tmp
+
+# ENIQ replacement directory
+VAR_TMP_REPLACEMENT=${VAR_TMP_DIR}/replacement
+ENIQ_REP_CLEANUP_LIST=${VAR_TMP_REPLACEMENT}/cleanup_list.txt
+
+# Unpacked Core Software directory for replacement
+VAR_TMP_UPGRADE=${VAR_DIR}/tmp/upgrade/
+
+# Configuration files
+ETC_DIR=/etc
+HOSTS=hosts
+FSTAB=fstab
+
+#cron directory
+CRON_DIR=/var/spool/cron/
+
+#OPT directory 
+OPT_DIR=/opt
+
+#ENIQ Zpool
+ENIQ_POOL=eniq_stats_pool
+
+# ENIQ DCUSER Directory
+DCUSER=/eniq/home/dcuser/
+
+#String denoting the filesystem type
+FS_TYPE=ext4
+
+# VAR Directory
+VAR=/var
+VAR_TMP=${VAR}/tmp
+
+# Hostname Information
+HNAME=`${MYHOSTNAME}`
+HOST_IP=`$MYHOSTNAME -i | $AWK '{print $1}' | $HEAD -1`
+
+# ENIQ Directories
+if [ ! "${ENIQ_BASE_DIR}" ]; then
+    # Directory on the root filesystem
+    ENIQ_BASE_DIR=/eniq
+fi
+
+ENIQ_INST_DIR=${ENIQ_BASE_DIR}/installation
+ENIQ_CORE_INST_DIR=${ENIQ_INST_DIR}/core_install
+ENIQ_LOG_DIR=${ENIQ_BASE_DIR}/log
+ENIQ_LOC_LOG_DIR=${ENIQ_BASE_DIR}/local_logs
+ENIQ_REPL_LOG_DIR=${ENIQ_LOG_DIR}/replaced_log
+ENIQ_CONF_DIR=${ENIQ_INST_DIR}/config
+ENIQ_SW_CONF=${ENIQ_BASE_DIR}/sw/conf
+ENIQ_SW=${ENIQ_BASE_DIR}/sw
+ENIQ_SW_BIN_DIR=${ENIQ_BASE_DIR}/sw/bin
+DEPLOYMENT=/extra_params/deployment
+
+# ENIQ Template directory
+ENIQ_TEMPL_DIR="${ENIQ_CORE_INST_DIR}/templates/stats"
+
+# Core etc dir
+ENIQ_CORE_ETC_DIR=${ENIQ_CORE_INST_DIR}/etc
+
+# ENIQ Admin Directory
+ENIQ_ADMIN_DIR=${ENIQ_BASE_DIR}/admin
+ENIQ_SENTINEL_DIR=${ENIQ_BASE_DIR}/sentinel
+ENIQ_BACKUP_DIR=${ENIQ_BASE_DIR}/backup
+ENIQ_CONNECTD_DIR=${ENIQ_BASE_DIR}/connectd
+
+#Eniq Database Directory
+ENIQ_DATABASE_DIR=${ENIQ_BASE_DIR}/database
+
+#Eniq Database Directory
+ENIQ_DATA_DIR=${ENIQ_BASE_DIR}/data
+
+# Admin bin dir
+ENIQ_ADMIN_BIN_DIR=${ENIQ_ADMIN_DIR}/bin
+
+# ENIQ SW PF directory
+ENIQ_SW_RUNTIME_DIR=${ENIQ_BASE_DIR}/sw/runtime
+
+# ENIQ database check script
+ENIQ_DB_CHECK=${ENIQ_ADMIN_BIN_DIR}/DbCheck.bsh
+
+# ENIQ SW conf directory
+CLI_CONF_DIR=${ENIQ_BASE_DIR}/sw/conf
+
+# ENIQ Bkup SW dir 
+ENIQ_BKUP_SW_DIR=${ENIQ_BASE_DIR}/bkup_sw 
+ENIQ_BKUP_SW_BIN_DIR=${ENIQ_BKUP_SW_DIR}/bin
+
+# ENIQ SW PF directory
+ENIQ_SW_PF_DIR=${ENIQ_BASE_DIR}/sw/platform
+
+#File containing password information
+PWD_INFO=${VAR_TMP_REPLACEMENT}/pwd_info.txt
+
+# REPLACEMENT Directories
+REPLACEMENT_CORE=`$DIRNAME ${SCRIPTHOME}`
+if [ "${ACTION_TYPE}" != "prereplacement" -a "${ACTION_TYPE}" != "recovery" ]; then
+    REPLACEMENT_CORE=${ENIQ_CORE_INST_DIR}
+fi
+REPLACEMENT_HOME=`$DIRNAME ${REPLACEMENT_CORE}`
+REPLACEMENT_LIB=${ENIQ_CORE_INST_DIR}/lib
+REPLACEMENT_BIN=${REPLACEMENT_CORE}/bin
+REPLACEMENT_ETC=${REPLACEMENT_CORE}/etc
+
+# Set the log for Create Snapshots stage
+SNAPSHOT_LOGFILE_DIR=${SW_LOG_DIR}/rolling_snapshot_logs
+SNAPSHOT_LOGFILE=${SNAPSHOT_LOGFILE_DIR}/prep_eniq_snapshots.log
+
+# Hostname Information
+HNAME=`${MYHOSTNAME}`
+HOST_IP=`$MYHOSTNAME -i | $AWK '{print $1}' | $HEAD -1`
+
+# Source the common functions
+_common_functions_list_="common_functions.lib common_core_install_functions.lib"
+for lib_file in ${_common_functions_list_}; do
+    if [ -s ${REPLACEMENT_LIB}/${lib_file} ]; then
+        . ${REPLACEMENT_LIB}/${lib_file}
+    else
+        _err_msg_="File ${REPLACEMENT_LIB}/${lib_file} not found"
+        abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+    fi
+done
+
+# File to hold stage information
+if [ "${ACTION_TYPE}" == "prereplacement" ]; then
+    STAGEFILE=${REPLACEMENT_ETC}/eniq_linux_prerepl_stage
+else
+   STAGEFILE=${REPLACEMENT_ETC}/eniq_linux_repl_stage
+fi
+
+# Replacement status files
+REPL_PROGRESS=${VAR_DIR}/tmp/Linux_rack_${ACTION_TYPE}_in_progress
+REPL_SUCCESS=${VAR_DIR}/tmp/Linux_rack_${ACTION_TYPE}_success 
+
+# Check config dir is present
+if [ ! -d "${ENIQ_CONF_DIR}" ]; then
+    _err_msg_="${ENIQ_CONF_DIR} is required for $ACTIVITY"
+    abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+fi
+
+# Get current server type
+CURR_SERVER_TYPE=`$CAT ${ENIQ_CONF_DIR}/installed_server_type | $EGREP -v  '^[[:blank:]]*#' | $SED -e 's/ //g'`
+if [ ! "${CURR_SERVER_TYPE}" ]; then
+    _err_msg_="Could not determine which server type this is"
+    abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+fi
+
+# Get the System User
+SYSUSER=`iniget ENIQ_INSTALL_CONFIG -f ${ENIQ_CONF_DIR}/${SUNOS_INI} -v ENIQ_SYSUSER`
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not read SYSUSER param from ${ENIQ_CONF_DIR}/${SUNOS_INI}"
+    abort_script "$_err_msg_"
+fi
+
+#Fetching group name for dcuser.
+SYSGRP=`$ID ${SYSUSER}|$AWK '{print $2}'|$AWK -F\( '{print $2}'|$AWK -F\) '{print $1}'`
+if [ ! "${SYSGRP}" ]; then
+    _err_msg_="Could not read SYSGRP param from ${ENIQ_CONF_DIR}/${SUNOS_INI}"
+    abort_script "$_err_msg_" "${EXEC_SHELL_CMD}"
+fi
+
+# Get the eniq pool
+_pool_name_=`iniget SunOS_FS_POOL_1 -f ${ENIQ_CONF_DIR}/${SUNOS_INI} -v name`
+
+# Get the dbisql command
+DBISQL="$(ls /eniq/sybase_iq/IQ-*/bin64/dbisql)"
+if [ ! -x "$DBISQL" ]; then
+    _err_msg_="$DBISQL commands not found or not executable."
+    abort_script "$_err_msg_"
+fi
+
+# To get dwhdb port and servername    
+DWH_PORT=`iniget DWH -v PortNumber -f ${CLI_CONF_DIR}/${ENIQ_INI}`
+DWH_ENG=`iniget DWH -v ServerName -f ${CLI_CONF_DIR}/${ENIQ_INI}`
+if [ ! "${DWH_PORT}" -o ! "${DWH_ENG}" ]; then
+    _err_msg_="Could not read db values from ${CLI_CONF_DIR}/${ENIQ_INI}"
+    abort_script "$_err_msg_"
+fi
+
+# To get repdb port and servername
+REP_PORT=`iniget REP -v PortNumber -f ${CLI_CONF_DIR}/${ENIQ_INI}`
+REP_ENG=`iniget REP -v ServerName -f ${CLI_CONF_DIR}/${ENIQ_INI}`
+if [ ! "${REP_PORT}" -o ! "${REP_ENG}" ]; then
+        _err_msg_="Could not read db values from ${CLI_CONF_DIR}/${ENIQ_INI}"
+        abort_script "$_err_msg_"
+fi
+
+# To get DB password    
+DBA_PASSWORD=`inigetpassword DB -f ${CLI_CONF_DIR}/${ENIQ_INI} -v DBAPassword`
+if [ ! ${DBA_PASSWORD} ]; then
+    _err_msg_="Could not get dwhdb DBA Password"
+    abort_script "$_err_msg_"
+fi
+
+
+
+
+# Database String 
+CONN_STR_USER_DBA="-c \"uid=dba;pwd=${DBA_PASSWORD};eng=${DWH_ENG};links=tcpip{host=${DWH_ENG};port=${DWH_PORT};dobroadcast=no;verify=no}\""
+CONN_STR_USER_DBA_ENC=${TEM}/conn_str_rack_encrypt.txt.`uuidgen`
+
+# encrypt the connection string.
+get_encrypt_file "${CONN_STR_USER_DBA}" "${CONN_STR_USER_DBA_ENC}"
+
+
+
+#Initialising the connection string for dwhdb
+dwh_connection_string="-nogui -onerror exit -c \"eng=${DWH_ENG};links=tcpip{host=${DWH_ENG};port=${DWH_PORT}};uid=dba;pwd=${DBA_PASSWORD}\""
+dwh_connection_string_enc=${TEM}/con_str_rack_encrypt.txt.`uuidgen`
+
+# encrypt the connection string.
+get_encrypt_file "${dwh_connection_string}" "${dwh_connection_string_enc}"
+
+
+#Initialising the connection string for dwhdb
+rep_connection_string="-nogui -onerror exit -c \"eng=${REP_ENG};links=tcpip{host=localhost;port=${REP_PORT}};uid=dba;pwd=${DBA_PASSWORD}\""
+  
+}
+
+### Function: set_next_stage ###
+#
+# Set up the stage to be run
+#
+# Arguments:
+#   $1 : Stage to be set to. Either numeric value or last stage of stagefile
+# Return Values:
+#   none
+set_next_stage()
+{
+# Do I have to reset stage
+if [ "${USER_STAGE}" -a "${NO_RESET_STAGE}" ]; then
+    return 0
+fi
+
+_stage_time_=`$DATE '+%Y-%b-%d_%H.%M.%S'`
+$ECHO "# Setting new stage at $_stage_time_" > ${STAGEFILE} | $TEE -a ${LOGFILE}
+$ECHO "${ENIQ_CORE_STAGES[$1]} " >> ${STAGEFILE} | $TEE -a ${LOGFILE}
+}
+
+### Function: start_eniq_services ###
+#
+# Start all ENIQ services
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+start_eniq_services()
+{
+
+# Enable all the ENIQ services
+log_msg -l ${LOGFILE} -s "Starting the ENIQ services on $HNAME. Please wait..."
+$BASH ${ENIQ_ADMIN_DIR}/bin/manage_eniq_services.bsh -a start -s ALL -N >> ${LOGFILE}
+if [ $? -ne 0 ]; then
+    $SLEEP 120
+    $BASH ${ENIQ_ADMIN_DIR}/bin/manage_eniq_services.bsh -a start -s ALL -N >> ${LOGFILE}
+    if [ $? -ne 0 ]; then
+        _err_msg_="Failed to start ENIQ services."
+        abort_script "${_err_msg_}"
+    fi
+fi
+
+}
+
+### Function: user_confirm ###
+#
+#   Take user confirmation
+#
+# Arguments:
+#   $1 : User display message
+# Return Values:
+#   User response : YES/NO
+user_confirm()
+{
+_usr_msg_="\n\nDo you want to proceed? (Yy/Nn)"
+unset _response_
+
+while [ 1 ]
+do
+    $ECHO ${_usr_msg_}
+    read ans
+    case $ans in
+       Y|y|YES|Yes|yes) _response_="YES"
+                        break
+                        ;;
+      N|n|NO|No|no) _response_="NO"
+                    break
+                    ;;
+     *) $ECHO "Invalid input. Enter again."
+        ;;
+    esac
+done
+
+}
+
+### Function: usage_msg ###
+#
+#   Print out the usage message
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+usage_msg()
+{
+$CLEAR
+$ECHO "
+Usage: 
+
+`$BASENAME $0` -a <replacement action> 
+
+Optional: [ -l <path_to_logfile> ] 
+
+-a  : Mandatory parameter specifying the replacement action type. Should be either of the following:
+      prereplacement : To backup the necessary files.
+	  replacement    : To perform the hardware replacement procedure.
+      cleanup        : To clear temporary directories/files.
+    
+-d  : Mandatory parameter for Base software directory 
+
+-l  : Optional parameter specifying the full path to logfile. If not specified, a
+    logfile will be created in /eniq/local_logs/replacement
+     
+-c	: Optional parameter to perform checksums on the LUNS to be migrated (by default checksums are not performed)
+"
+}
+
+# ********************************************************************
+#
+#   Main body of program
+#
+# ********************************************************************
+
+RUN_TIME=`$DATE '+%Y-%b-%d_%H:%M:%S'`
+
+# Check that the effective id of the user is root
+check_id 
+
+
+while getopts ":a:l:d:c:NBnoC:s:R" arg; do
+    case $arg in
+    a) ACTION_TYPE="$OPTARG"
+       ;;
+    b) ENIQ_BASE_DIR="$OPTARG"
+       ;;
+    d) BASE_SW_DIR="$OPTARG"
+       ;;
+    I) INITIATE="YES"
+       ;;
+    l) LOGFILE="$OPTARG"
+       ;;
+    N) NO_CONFIRM="YES"
+       ;;
+    n) NO_RESET_STAGE="YES"
+       ;;
+    o) OM_SW_DIR="$OPTARG"
+       ;;
+	c) CHECKSUM="$OPTARG"
+	   ;;
+    C) CONTINUE="YES"
+       ;;
+    R) REPLACEMENT="YES"
+       ;;
+    s) USER_STAGE="$OPTARG"
+       ;;
+    B) BACKUP="YES"
+       ;;
+   \?) _err_msg_="`$BASENAME $0` -s <stage>"
+        abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+        ;;
+  esac
+done
+shift `$EXPR $OPTIND - 1`
+
+# Check Input Params
+check_params
+
+# Determine absolute path to software
+check_absolute_path
+
+# Set up environment variables for script.
+setup_env
+
+if [ "${ACTION_TYPE}" != "cleanup" ]; then
+    #Rack replacement flag
+    $TOUCH ${REPL_PROGRESS}
+    if [ $? -ne 0 ]; then
+        _err_msg_="Could not create ${REPL_PROGRESS}"
+        abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+    fi
+fi
+
+# Log file
+if [ ! "${LOGFILE}" ]; then
+    $MKDIR -p ${ENIQ_LOC_LOG_DIR}/rack_replacement
+    LOGFILE="${ENIQ_LOC_LOG_DIR}/rack_replacement/eniq_linux_rack_${ACTION_TYPE}_`$DATE '+%Y-%b-%d'`.log"
+fi
+
+# Create a temporary Directory
+TEM_DIR=/tmp/rack_replacement.$$.$$
+$RM -rf ${TEM_DIR}
+$MKDIR -p ${TEM_DIR}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not create directory ${TEM_DIR}"
+    abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+fi
+
+# Call function if cleanup is called
+if [ "${ACTION_TYPE}" == "cleanup" ]; then
+    # Check if any activity is ongoing
+    _flag_list_=`$LS -1 ${REPL_PROGRESS} 2>/dev/null`
+    if [ "${_flag_list_}" ]; then
+        _err_msg_="Replacement Activity is in progress. Can not run \"cleanup\" now."
+        log_msg -s "Progress files detected: " -l ${LOGFILE}
+        for _flag_ in ${_flag_list_}; do
+            log_msg -s "`basename ${_flag_}`" -l ${LOGFILE}
+        done
+        abort_script "${_err_msg_}"
+    fi
+
+    log_msg -h -l ${LOGFILE} -s "Starting ${ACTION_TYPE} activity."
+
+    clear_data
+
+    log_msg -h -l ${LOGFILE} -t -s "Successfully completed ${ACTIVITY}."
+    $RM -rf ${TEM_DIR}
+
+    exit 0
+fi
+
+# Ask confirmation for the first time
+if [ ! -f "${REPL_PROGRESS}" -a ! -f "${REPL_SUCCESS}" ];then
+    log_msg -h -l ${LOGFILE} -s "Starting ${ACTION_TYPE} activity."
+    
+
+    # Creating progress flag file
+    $TOUCH ${REPL_PROGRESS}
+    
+    if [ ! "${NO_CONFIRM}" ];then
+        $ECHO "\nINFO: You are about to start ${ACTIVITY}."
+        user_confirm
+        if [ "${_response_}" != "YES" ];then
+            $RM -rf ${TEM_DIR} >> /dev/null 2>&1
+            $RM -rf ${REPL_PROGRESS} >> /dev/null 2>&1
+            log_msg -s "\nExiting from script as user selected NOT to proceed." -l ${LOGFILE}
+            exit 0
+        fi
+    fi
+fi
+
+log_msg -h -l ${LOGFILE} -t -s "Entering $ACTIVITY."
+
+# Create a stage array
+core_install_build_stage_array ${LOGFILE} ${TEM_DIR} eniq_linux_fs ${ACTION_TYPE} ${REPLACEMENT_CORE}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not build a stage array for ${ACTION_TYPE}"
+    abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+fi
+
+# If stage specified, make sure it is in the stage list for this server type
+if [ "$USER_STAGE" ]; then
+    core_install_check_user_stage ${LOGFILE} ${TEM_DIR} ${USER_STAGE}
+    if [ $? -ne 0 ]; then
+       _err_msg_="The specified stage ${USER_STAGE} is not in the stage list for ${ACTION_TYPE}"
+       abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+    fi
+fi
+
+if [ "$USER_STAGE" ]; then
+    NEXT_STAGE="${USER_STAGE}"
+    # Get the element number so we can move along the array
+    get_array_element
+else
+    get_next_stage
+fi
+
+# If we read last stage from the stagefile
+if [ "$NEXT_STAGE" == "${STOP_STAGE}" ]; then
+    # We exit unless the user specified that the stage be run again
+    if [ ! "$USER_STAGE" ]; then
+        _completion_date_=""
+        _completion_date_=`$LS -l ${VAR_DIR}/tmp/Linux_${ACTION_TYPE}_success | \
+                           $AWK '{print " on " $6, $7, "at " $8}' 2> /dev/null`
+        log_msg -s "\nAll Stages of ${ACTION_TYPE} are already completed${_completion_date_}." -l ${LOGFILE}
+        exit 0
+    fi
+fi
+
+# Loop through the stages from stage list 
+while :; do
+    _nxt_stage_="${NEXT_STAGE}"
+    $_nxt_stage_
+    if [ $? -ne 0 ]; then
+        _err_msg_="Error in Stage ${NEXT_STAGE}"
+        abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+    fi
+
+    # Exit if the user specified to run a specific stage only
+    if [ "$USER_STAGE" ]; then
+        break
+    fi
+
+    # If we read ${STOP_STAGE} from the stagefile
+    if [ "$NEXT_STAGE" == "${STOP_STAGE}" ]; then
+        break
+    fi
+    get_next_stage
+done
+
+log_msg -h -l ${LOGFILE} -t -s "Successfully completed $ACTIVITY. Logfile: ${LOGFILE}" 
+
+$RM -rf ${TEM_DIR} >> /dev/null 2>&1
+
+$RM -rf ${CONN_STR_USER_DBA_ENC}
+$RM -rf ${dwh_connection_string_enc}
+
+
+exit 0

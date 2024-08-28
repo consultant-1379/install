@@ -1,0 +1,1748 @@
+#!/bin/bash
+# ********************************************************************
+# Ericsson Radio Systems AB                                     SCRIPT
+# ********************************************************************
+#
+#
+# (c) Ericsson Radio Systems AB 2023 - All rights reserved.
+#
+# The copyright to the computer program(s) herein is the property
+# of Ericsson Radio Systems AB, Sweden. The programs may be used
+# and/or copied only with the written permission from Ericsson Radio
+# Systems AB or in accordance with the terms and conditions stipulated
+# in the agreement/contract under which the program(s) have been
+# supplied.
+#
+# ********************************************************************
+# Name    : common_core_install_functions.lib
+# Date    : 26/10/2023
+# Revision: main/58
+# Purpose : Main library file holding the core install common functions
+#
+# Usage   : common_core_install_functions.lib
+#
+# ********************************************************************
+#
+#   Command Section
+#
+# ********************************************************************
+AWK=/usr/bin/awk
+BASENAME=/usr/bin/basename
+BC=/usr/bin/bc
+CAT=/usr/bin/cat
+CHMOD=/usr/bin/chmod
+CHOWN=/usr/bin/chown
+CLEAR=/usr/bin/clear
+CMP=/usr/bin/cmp
+CP=/usr/bin/cp
+DATE=/usr/bin/date
+DIRNAME=/usr/bin/dirname
+ECHO='/usr/bin/echo -e'
+EGREP=/usr/bin/egrep
+ENV=/usr/bin/env
+EXPR=/usr/bin/expr
+FIND=/usr/bin/find
+GETENT=/usr/bin/getent
+GREP=/usr/bin/grep
+HEAD=/usr/bin/head
+HOSTNAME=/usr/bin/hostname
+ID=/usr/bin/id
+IFCONFIG=/usr/sbin/ifconfig
+IP=/usr/sbin/ip
+LN=/usr/bin/ln
+LS=/usr/bin/ls
+MKDIR=/usr/bin/mkdir
+MORE=/usr/bin/more
+MV=/usr/bin/mv
+NETADM=/usr/sbin/netadm
+NMCLI=/usr/bin/nmcli
+PING=/usr/bin/ping
+PWD=/usr/bin/pwd
+REBOOT=/usr/sbin/reboot
+RM=/usr/bin/rm
+RCP=/usr/bin/rcp
+RPM=/usr/bin/rpm
+SED=/usr/bin/sed
+SLEEP=/usr/bin/sleep
+SORT=/usr/bin/sort
+SU=/usr/bin/su
+SYSTEMCTL=/usr/bin/systemctl
+TAIL=/usr/bin/tail
+TEE=/usr/bin/tee
+TOUCH=/usr/bin/touch
+TR=/usr/bin/tr
+UNAME=/usr/bin/uname
+USERADD=/usr/sbin/useradd
+WC=/usr/bin/wc
+
+
+# ********************************************************************
+#
+#       Configuration Section
+#
+# ********************************************************************
+# SET THE RUN TIME
+COM_RUN_TIME=`$DATE '+%Y-%b-%d_%H.%M.%S'`
+
+# Determine RHEL OS version
+unset RHEL7_4
+OS_VERSION=`$UNAME -r`
+if [ "${OS_VERSION}" == "3.10.0-693.el7.x86_64" ]; then
+    RHEL7_4=YES
+fi
+
+INTF_DIR="/etc/sysconfig/network-scripts"
+NETWORK_SERVICE=network.service
+DNS_FILE="/etc/resolv.conf"
+ENIQ_CONF_DIR1="/eniq/installation/config"
+ENIQ_INTF_DIR="${ENIQ_CONF_DIR1}/intf_files_org"
+IP_TYPE=ip_type
+
+#create the new interface directory to store the original interface files
+$MKDIR -p ${ENIQ_INTF_DIR}
+if [ $? -ne 0 ]; then
+    log_msg -l ${_logfile_} -s "Could not get the create the interface directory"
+fi
+
+if [ -f ${ENIQ_CONF_DIR1}/${IP_TYPE} ]; then
+    #get ip type from ip_type file
+    _ip_type_=`$CAT ${ENIQ_CONF_DIR1}/${IP_TYPE} | ${AWK} '{print $1}' | ${HEAD} -1`
+    if [ $? -ne 0 ]; then
+        _err_msg_="Could not read IP Type from ${ENIQ_CONF_DIR1}/${IP_TYPE} file"
+        abort_script "$_err_msg_"
+    fi
+fi
+
+# ********************************************************************
+#
+#    Functions
+#
+# ********************************************************************
+### Function: check_function_dr ###
+#
+# Ensures all functions have the min. required inputs
+#
+# Arguments:
+#   $1 : logfile
+#   $2 : Temp directory
+# Return Values:
+#   0 : Success
+#   1 : Fail
+check_function_dr()
+{
+if [ $# -lt 2 ]; then
+	$ECHO " Arguments: \n "
+	$ECHO "	$1 : logfile \n "
+	$ECHO " $2 : temp dir \n "
+	return 1
+fi
+
+_logfile_=$1
+if [ ! -f $_logfile_ ]; then
+	$ECHO "_logfile_ not set"   
+	return 1
+fi
+
+_temp_dir_=$2
+if [ ! -d $_temp_dir_ ]; then
+	$ECHO "_temp_dir_not set"
+	return 1
+fi
+}
+
+### Function: core_install_allow_root_ftp ###
+#
+# Updates to allow root to ftp
+#
+# Arguments:
+#   $1 : logfile
+#   $2 : Temp directory
+# Return Values:
+#   0 : Success
+#   1 : Fail
+core_install_allow_root_ftp()
+{
+check_function_dr $*
+if [ $? -ne 0 ]; then
+	$ECHO "Could not get the logfile or temp dir" | $TEE -a ${_logfile_}
+	return 1
+fi
+
+_update_ftp_=1
+$CAT /etc/vsftpd/ftpusers | $EGREP -v "^[[:blank:]]*# | $GREP -w root" >> /dev/null 2>&1
+if [ $? -ne 0 ]; then
+    _update_ftp_=0
+fi
+
+if [ ${_update_ftp_} -eq 1 ]; then
+	$ECHO "Enabling ftp access for root" >> ${_logfile_}
+    if [ ! -f /etc/vsftpd/ftpusers.orig ]; then
+        $CP -p /etc/vsftpd/ftpusers /etc/vsftpd/ftpusers.orig >> /dev/null 2>&1
+        if [ $? -ne 0 ]; then
+        	$ECHO "Could not make backup of /etc/vsftpd/ftpusers" | $TEE -a ${_logfile_}
+            return 1
+        fi
+    fi
+
+    $CAT /etc/vsftpd/ftpusers | $EGREP -v "^[[:blank:]]*root[[:blank:]]*$" > ${_temp_dir_}/ftpusers
+	$ECHO "Updating /etc/vsftpd/ftpusers file" >> ${_logfile_}
+    $CP ${_temp_dir_}/ftpusers /etc/vsftpd/ftpusers >> /dev/null 2>&1
+    if [ $? -ne 0 ]; then
+    	$ECHO "Could not update /etc/ftpd/ftpusers" | $TEE -a ${_logfile_}
+        return 1
+    fi
+else
+	$ECHO "No updates required to /etc/vsftpd/ftpusers file" >> ${_logfile_}
+fi
+
+_update_ftp_userlist_=1
+$CAT /etc/vsftpd/user_list | $EGREP -v "^[[:blank:]]*# | $GREP -w root" >> /dev/null 2>&1
+if [ $? -ne 0 ]; then
+    _update_ftp_userlist_=0
+fi
+
+if [ ${_update_ftp_userlist_} -eq 1 ]; then
+	$ECHO "Enabling ftp access for root" >> ${_logfile_}
+    if [ ! -f /etc/vsftpd/user_list.orig ]; then
+        $CP -p /etc/vsftpd/user_list /etc/vsftpd/user_list.orig >> /dev/null 2>&1
+        if [ $? -ne 0 ]; then
+        	$ECHO "Could not make backup of /etc/vsftpd/user_list" | $TEE -a ${_logfile_}
+            return 1
+        fi
+    fi
+
+    $CAT /etc/vsftpd/user_list | $EGREP -v "^[[:blank:]]*root[[:blank:]]*$" > ${_temp_dir_}/user_list
+	$ECHO "Updating /etc/vsftpd/user_list file" >> ${_logfile_}
+    $CP ${_temp_dir_}/user_list /etc/vsftpd/user_list >> /dev/null 2>&1
+    if [ $? -ne 0 ]; then
+    	$ECHO "Could not update /etc/ftpd/user_list" | $TEE -a ${_logfile_}
+        return 1
+    fi
+else
+	$ECHO "No updates required to /etc/vsftpd/user_list file" >> ${_logfile_}
+fi
+
+return 0
+}
+
+### Function: core_install_allow_root_telnet ###
+#
+# Updates to allow root to telnet
+#
+# Arguments:
+#   $1 : logfile
+#   $2 : Temp directory
+# Return Values:
+#   0 : Success
+#   1 : Fail
+core_install_allow_root_telnet()
+{
+check_function_dr $*
+if [ $? -ne 0 ]; then
+    $ECHO "Could not get the logfile or temp dir" | $TEE -a ${_logfile_}
+    return 1
+fi
+
+_update_login_=1
+
+$CAT /etc/securetty | $EGREP "^[[:blank:]]*pts/0[[:blank:]]*$" >> /dev/null 2>&1
+if [ $? -eq 0 ]; then
+    _update_login_=0
+fi
+
+
+if [ ${_update_login_} -eq 1 ]; then
+    $ECHO "Enabling telnet access for root" >> ${_logfile_}
+    if [ ! -f /etc/securetty.orig ]; then
+        $CP -p /etc/securetty /etc/securetty.orig >> /dev/null 2>&1
+        if [ $? -ne 0 ]; then
+            $ECHO "Could not make backup of /etc/securetty" | $TEE -a ${_logfile_}
+            return 1
+        fi
+    fi
+
+    $ECHO "Updating /etc/securetty file" >> ${_logfile_}
+    echo -e "pts/0\npts/1\npts/2\npts/3\npts/4\npts/5\npts/6\npts/7\npts/8\npts/9" >> /etc/securetty
+    if [ $? -ne 0 ]; then
+        $ECHO "Could not update /etc/securetty" | $TEE -a ${_logfile_}
+        return 1
+    fi
+else
+    $ECHO "No updates required to /etc/securetty file" >> ${_logfile_}
+fi
+}
+
+### Function: core_install_bond_file_create ###
+#
+# Create the bond file for VLAN group
+#
+# Arguments:
+#   $1 : Bond Interface Tag
+# Return Values:
+#   0 : Success
+#   1 : Fail
+core_install_bond_file_create()
+{
+local _ipmp_det_=$1
+local _dns_ip_=$2
+local _domain_name_=$3
+
+#To get the vlan group from ipmp.ini file for each vlan
+_vlan_group_=`iniget ${_ipmp_det_} -f ${_ipmp_ini_file_} -v IPMP_VLAN_Group_Name`
+if [ ! "${_vlan_group_}" ]; then
+    log_msg -l ${_logfile_} -s "Failed to get vlan group name"
+    return 1
+fi
+
+#To get the IP from ipmp.ini file for each vlan
+_client_ip_=`iniget ${_ipmp_det_} -f ${_ipmp_ini_file_} -v IPMP_Group_IP`
+if [ ! "${_client_ip_}" ]; then
+    log_msg -l ${_logfile_} -s "Failed to get client ip address"
+    return 1
+fi
+
+#To get the netmask from ipmp.ini file for each vlan
+if [ "${_ip_type_}" == "IPv6" -a "${_vlan_group_}" == "PM Services Group" ]; then
+   echo "Skipping client netmask details for IPv6" >> /dev/null 2>&1
+else
+   _client_netmask_=`iniget ${_ipmp_det_} -f ${_ipmp_ini_file_} -v IPMP_Group_Netmask`
+    if [ ! "${_client_netmask_}" ]; then
+        log_msg -l ${_logfile_} -s "Failed to get client netmask"
+        return 1
+    fi
+fi
+
+#To get the arp-ip from ipmp.ini file for each vlan
+_client_arp_target_=`iniget ${_ipmp_det_} -f ${_ipmp_ini_file_} -v ARP_IP_TARGET`
+if [ ! "${_client_arp_target_}" ]; then
+    log_msg -l ${_logfile_} -s "Failed to get arp-ip-target"
+    return 1
+fi
+
+#To calculate the subnet from netmask
+if [ "${_ip_type_}" == "IPv6" -a "${_vlan_group_}" == "PM Services Group" ]; then
+    HNAME=`${HOSTNAME}`
+    _netmask_subnet_=`$CAT ${ENIQ_CONF_DIR1}/${HNAME}/${HNAME}_ks_cfg.txt | $GREP CLIENT_IP_ADDR_V6 | $AWK -F"=" '{ print $2 }' | $AWK -F"/" '{print $2}'`    
+	if [ ! "${_netmask_subnet_}" ]; then
+      log_msg -l ${_logfile_} -s "Failed to get subnet"
+      return 1
+    fi
+else
+    _netmask_subnet_=`get_network_from_netmask ${_client_netmask_}`
+    if [ ! "${_netmask_subnet_}" ]; then
+      log_msg -l ${_logfile_} -s "Failed to get subnet"
+      return 1
+    fi
+fi
+
+#To get the mode from ipmp.ini file
+_mode_group_=`iniget BOND_PARAMETER -f ${_ipmp_ini_file_} -v MODE`
+if [ ! "${_mode_group_}" ]; then
+    log_msg -l ${_logfile_} -s "Failed to get mode"
+    return 1
+fi
+
+#To get the arp-interval from ipmp.ini file
+_arp_interval_group_=`iniget BOND_PARAMETER -f ${_ipmp_ini_file_} -v ARP_INTERVAL`
+if [ ! "${_arp_interval_group_}" ]; then
+    log_msg -l ${_logfile_} -s "Failed to get arp-interval"
+    return 1
+fi
+
+#To get the gateway ip from ipmp.ini file for each vlan
+_gateway_=`iniget ${_ipmp_det_} -f ${_ipmp_ini_file_} -v IPMP_Group_Gateway`
+if [ ! "${_gateway_}" ]; then
+    log_msg -l ${_logfile_} -s "Failed to get Gateway"
+    return 1
+fi
+
+#To get the bond name for each vlan
+_bond_tag_=`get_next_bond`
+if [ ! "${_bond_tag_}" ]; then
+    log_msg -l ${_logfile_} -s "Failed to next bond count"
+    return 1
+fi
+
+#get the primary interface from ipmp.ini for each vlan
+_primary_intf_=`iniget ${_ipmp_det_} -f ${_ipmp_ini_file_} -v IPMP_Group_Intf | $AWK '{print $1}'`
+if [ ! "${_primary_intf_}" ]; then
+    log_msg -l ${_logfile_} -s "Could not read primary interface"
+    return 1
+fi
+
+#get the selected interfaces from ipmp.ini
+_ethernet_list_=`iniget ${_ipmp_det_} -f ${_ipmp_ini_file_} -v IPMP_Group_Intf`
+if [ ! "${_ethernet_list_}" ]; then
+    log_msg -l ${_logfile_} -s "Could not selected interfaces"
+    return 1
+fi
+
+#Move the interface configuration files
+for _ethernet_det_ in ${_ethernet_list_}; do
+    $MV ${INTF_DIR}/ifcfg-${_ethernet_det_} ${ENIQ_INTF_DIR}
+    if [ $? -ne 0 ]; then
+        log_msg -l ${_logfile_} -s "Copied the original interface file"
+        return 1
+    fi
+done
+
+
+if [ "${_ip_type_}" == "IPv4" ]; then
+
+#configure bond file for each vlan 
+if [  "${_vlan_group_}" == "PM Services Group" ]; then
+    $NMCLI con add type bond \
+    con-name ${_bond_tag_} \
+    ifname ${_bond_tag_} \
+    mode ${_mode_group_} \
+    ip4 ${_client_ip_}/${_netmask_subnet_} \
+    ipv4.dns "${_dns_ip_}" \
+    ipv4.dns-search "${_domain_name_}" \
+    gw4 ${_gateway_} \
+    arp-interval ${_arp_interval_group_} \
+    arp-ip-target ${_client_arp_target_} \
+    primary ${_primary_intf_} | $TEE -a ${_logfile_}
+else
+    $NMCLI con add type bond \
+    con-name ${_bond_tag_} \
+    ifname ${_bond_tag_} \
+    mode ${_mode_group_} \
+    ip4 ${_client_ip_}/${_netmask_subnet_} \
+    ipv4.never-default true \
+    ipv4.dns "${_dns_ip_}" \
+    arp-interval ${_arp_interval_group_} \
+    arp-ip-target ${_client_arp_target_} \
+    primary ${_primary_intf_} | $TEE -a ${_logfile_}
+fi
+
+elif [ "${_ip_type_}" == "IPv6" ]; then
+
+#configure bond file for each vlan 
+if [  "${_vlan_group_}" == "PM Services Group" ]; then
+    $NMCLI con add type bond \
+    con-name ${_bond_tag_} \
+    ifname ${_bond_tag_} \
+    mode ${_mode_group_} \
+    miimon "2000" \
+    ipv4.method disabled \
+    ipv6.method manual \
+    ipv6.addresses ${_client_ip_}/${_netmask_subnet_} \
+    ipv6.dns "${_dns_ip_}" \
+    ipv6.dns-search "${_domain_name_}" \
+    ipv6.gateway ${_gateway_} \
+    primary ${_primary_intf_} | $TEE -a ${_logfile_}
+else
+    $NMCLI con add type bond \
+    con-name ${_bond_tag_} \
+    ifname ${_bond_tag_} \
+    mode ${_mode_group_} \
+    ip4 ${_client_ip_}/${_netmask_subnet_} \
+    ipv4.never-default true \
+    arp-interval ${_arp_interval_group_} \
+    arp-ip-target ${_client_arp_target_} \
+    primary ${_primary_intf_} | $TEE -a ${_logfile_}
+fi
+
+else
+  _err_msg_="Unable to fetch IP type value"
+  abort_script "$_err_msg_"  
+fi
+
+if [ $? -ne 0 ]; then
+    log_msg -l ${_logfile_} -s "Could not Create bond file for ${_vlan_group_}"
+    return 1
+else
+    log_msg -l ${_logfile_} -s "Successfully created bond file ifcfg-${_bond_tag_} for ${_vlan_group_} \n"
+fi
+
+#configure bond-slave file
+for _ethernet_det_ in ${_ethernet_list_}; do
+    $NMCLI con add type bond-slave ifname ${_ethernet_det_} master ${_bond_tag_} | $TEE -a ${_logfile_}
+	status=(${PIPESTATUS[@]})
+    pipe_status0=${status[0]}
+    pipe_status1=${status[1]}
+    if [ "${pipe_status0}" -ne 0 ]; then
+        log_msg -l ${_logfile_} -s "Could not create bond-salve file for ${_ethernet_det_}"
+        return 1
+    else
+        log_msg -l ${_logfile_} -s "Successfully created bond-slave file ifcfg-bond-slave-${_ethernet_det_} for ${_ethernet_det_} \n"
+    fi
+    $NMCLI connection up bond-slave-${_ethernet_det_} | $TEE -a ${_logfile_}
+	status=(${PIPESTATUS[@]})
+    pipe_status0=${status[0]}
+    pipe_status1=${status[1]}
+    if [ "${pipe_status0}" -ne 0 ]; then
+        log_msg -l ${_logfile_} -s "Unable to make up bond-slave for ${_ethernet_det_}"
+        return 1
+    else
+        log_msg -l ${_logfile_} -s "Successfully activated ifcfg-bond-slave-${_ethernet_det_} for ${_ethernet_det_} \n"
+    fi
+done
+
+#bring the connection up
+$NMCLI connection up ${_bond_tag_} | $TEE -a ${_logfile_}
+status=(${PIPESTATUS[@]})
+pipe_status0=${status[0]}
+pipe_status1=${status[1]}
+if [ "${pipe_status0}" -ne 0 ]; then
+    log_msg -l ${_logfile_} -s "Unable to make up ${_bond_tag_}"
+    return 1
+else
+    log_msg -l ${_logfile_} -s "Successfully activated bond ifcfg-${_bond_tag_} for ${_vlan_group_} \n\n"
+fi
+
+}
+
+### Function: core_install_build_stage_array ###
+#
+# Build a stage array using the stage file
+#
+# Arguments:
+#   $1 : logfile
+#   $2 : Temp directory
+#   $3 : Eniq type stats or events
+#   $4 : Server type
+#   $5 : Stage file Location
+# Return Values:
+#   0 : Success
+#   1 : Fail
+core_install_build_stage_array()
+{
+check_function_dr $*
+if [ $? -ne 0 ]; then
+    $ECHO "Could not get the logfile or temp dir" | $TEE -a ${_logfile_}
+    return 1
+fi
+
+if [ ! $3 ]; then
+    $ECHO "ERROR: Eniq type not set, exiting"
+    return 1
+else
+   _eniq_type_=$3
+fi
+
+if [ ! $4 ]; then
+    $ECHO "ERROR: Server type not set, exiting"
+    return 1
+else
+    _current_server_type=$4
+fi
+
+if [ ! $5 ]; then
+    $ECHO "ERROR: Stage file Location not set, exiting"
+    return 1
+else
+    _stage_file_loc_=$5
+fi
+    
+$ECHO "Determining which stage file to use" | $TEE -a ${_logfile_}
+_stage_file_=${_stage_file_loc_}/etc/${_eniq_type_}_${_current_server_type}_stagelist
+if [ ! -s ${_stage_file_} ]; then
+    $ECHO "Could not find ${_stage_file_} file, or it is empty" | $TEE -a ${_logfile_}
+    return 1
+fi
+$ECHO "Building stage list from ${_stage_file_}\n" | $TEE -a ${_logfile_}
+
+# Remove stages that are commented out
+$RM -rf ${_temp_dir_}/stage_list_file
+$CAT ${_stage_file_} | $EGREP -v '^[     ]*#' | $SED -e 's/ //g' > ${_temp_dir_}/stage_list_file
+if [ $? -ne 0 ]; then
+    $ECHO "Could not remove comments from ${_stage_file_} file" | $TEE -a ${_logfile_}
+    return 1
+fi
+
+_cnt_=0
+while read _line_; do
+    _inst_stage_=`$ECHO ${_line_} | $AWK '{print $1}' | $SED -e 's/ //g'`
+    
+    # Store the details in an array
+    ENIQ_CORE_STAGES[${_cnt_}]=${_inst_stage_}
+    
+    let _cnt_=_cnt_+1
+done < ${_temp_dir_}/stage_list_file
+}
+
+### Function: core_install_change_base_info ###
+#
+# Changes files that have the <CHANGE><ENIQ_BASE_DIR>
+# tag in them
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+core_install_change_base_info()
+{
+check_function_dr $*
+if [ $? -ne 0 ]; then
+    $ECHO "Could not get the logfile or temp dir" | $TEE -a ${_logfile_}
+    return 1
+fi
+
+if [ ! $3 ]; then
+    $ECHO "ERROR: ENIQ base dir not set, exiting"
+    return 1
+else
+   _eniq_base_dir_=$3
+fi
+
+if [ ! $4 ]; then
+    $ECHO "ERROR: Directory to be updated not set, exiting"
+    return 1
+else
+    _dir_to_change_=$4
+fi
+
+_tem_file_=${_temp_dir_}/tem_file
+for _file_ in `$FIND ${_temp_dir_}/${_dir_to_change_} -type f | $EGREP -v ".bsh$"`; do
+    $RM -f ${_tem_file_}
+    $CAT ${_file_} | $SED -e "s|<CHANGE><ENIQ_BASE_DIR>|${_eniq_base_dir_}|g" > ${_tem_file_}
+    $CP ${_tem_file_} ${_file_}
+    if [ $? -ne 0 ]; then
+        $ECHO "Failed to copy ${_tem_file_} to ${_file_}" | $TEE -a ${_logfile_}
+        return 1
+    fi
+done
+}
+
+### Function: core_install_check_templates_dir ###
+#
+# Check that I have a templates directory associated with
+# my installation type
+#
+# Arguments:
+#   $1 : logfile
+#   $2 : Temp directory
+#   $3 : Template dir
+# Return Values:
+#   0 : Success
+#   1 : Fail
+core_install_check_templates_dir()
+{
+check_function_dr $* 
+if [ $? -ne 0 ]; then
+    $ECHO "Could not get the logfile or temp dir" | $TEE -a ${_logfile_}
+    return 1
+fi
+
+if [ ! $3 ]; then
+    $ECHO "ERROR: Template dir not set, exiting"
+    return 1
+else
+    _template_dir_=$3
+fi
+    
+$ECHO "Checking files in template directory" >> ${_logfile_}
+    
+# Do we have a templates dir for the install type
+if [ ! -d ${_template_dir_} ]; then
+    $ECHO "Template directory ${_template_dir_} not found" | $TEE -a ${_logfile_}
+    return 1
+fi
+
+$LS ${_template_dir_}/*.ini >> /dev/null 2>&1
+if [ $? -ne 0 ]; then
+    $ECHO "Template directory ${_template_dir_} contains no ini template files" | $TEE -a ${_logfile_}
+    return 1
+fi
+}
+
+### Function: core_install_check_user_stage ###
+#
+# Check specified stage is valid
+#
+# Arguments:
+#   $1 : logfile
+#   $2 : Temp directory
+#   $3 : User stage
+# Return Values:
+#   0 : Success
+#   1 : Fail
+core_install_check_user_stage()
+{
+check_function_dr $*
+if [ $? -ne 0 ]; then
+        log_msg -s "Could not get the logfile or temp dir" -l ${LOGFILE}
+  return 1
+fi
+if [ ! $3 ]; then
+   $ECHO "ERROR: User stage not set, exiting"
+   return 1
+else
+   _user_stage_=$3
+fi
+    
+if [ "${_user_stage_}" == "cleanup" ]; then
+    return 0
+fi
+
+log_msg -s "Checking if user specified stage - ${_user_stage_} - is valid" -l ${LOGFILE}
+$ECHO ${ENIQ_CORE_STAGES[*]} | $GREP -w ${_user_stage_} >> /dev/null 2>&1
+if [ $? -ne 0 ]; then
+    log_msg -s "Specified stage ${_user_stage_} not a valid installation stage" -l ${LOGFILE}
+    return 1
+else
+        log_msg -s "Specified stage ${_user_stage_} is a valid installation stage" -l ${LOGFILE}
+fi
+}
+
+### Function: core_install_get_server_type ###
+#
+# Get the server type being installed
+#
+# Arguments:
+#   $1 : logfile
+#   $2 : Temp directory
+#   $3 : Server Type List File
+#   $4 : Conf Dir
+# Return Values:
+#   0 : Success
+#   1 : Fail
+core_install_get_server_type()
+{
+check_function_dr $*
+if [ $? -ne 0 ]; then
+    $ECHO "Could not get the logfile or temp dir" | $TEE -a ${_logfile_}
+  return 1
+fi
+if [ ! $3 ]; then
+   $ECHO "ERROR: Server type List File not set, exiting"
+   return 1
+else
+   _server_type_list_file_=$3
+fi
+
+if [ ! $4 ]; then
+   $ECHO "ERROR: Conf Dir not set, exiting"
+   return 1
+else
+   _eniq_conf_dir_=$4
+fi
+    
+# Find the server_type file. If its not there then exit
+if [ ! -s ${_server_type_list_file_} ]; then
+    $ECHO "Could not find ${_server_type_list_file_} file, or it is empty" | $TEE -a ${_logfile_}
+    return 1
+fi
+
+if [ ! -s ${_eniq_conf_dir_}/installed_server_type ]; then
+    $RM -rf ${_eniq_conf_dir_}/installed_server_type
+    # Remove any lines that are commented out
+    # We'll use this new file to manipulate the data
+    $CAT ${_server_type_list_file_} | $EGREP -v '^[     ]*#' >> ${_temp_dir_}/server_list
+    if [ $? -ne 0 ]; then
+        $ECHO "Could not create ${_temp_dir_}/server_list" | $TEE -a ${_logfile_}
+        return 1
+    fi
+    
+    unset _server_type_
+    
+    # Create 2 arrays with the contents. 1 array will hold the server type
+    # while the second array holds the description
+    _cnt_=1
+    while read _line_; do
+        _serv_type_=`$ECHO ${_line_} | $AWK -F"::" '{print $1}'`
+        _serv_type_desc_=`$ECHO ${_line_} | $AWK -F"::" '{print $2}'`
+        
+        # Store the details in 2 arrays
+        _type_array_[${_cnt_}]=${_serv_type_}
+        _desc_array_[${_cnt_}]=${_serv_type_desc_}
+        
+        let _cnt_=_cnt_+1
+    done < ${_temp_dir_}/server_list
+    
+    # Build a display file for the user to select which server type this is
+    $RM -rf ${_temp_dir_}/server_list_file
+    $ECHO "\nAvailable server types\n======================" >> ${_temp_dir_}/server_list_file
+             
+    for (( i=1; i<${_cnt_}; i++ )); do
+        $ECHO "[${i}]  ${_desc_array_[${i}]}" >> ${_temp_dir_}/server_list_file
+    done
+    $ECHO "\nSelect the server type you wish to install" >> ${_temp_dir_}/server_list_file
+    
+    # Make the user decide what machine this is.
+    # Ensure that they can only select a number in the range
+    # of available server types
+    while :; do
+        $CLEAR
+    
+        $CAT ${_temp_dir_}/server_list_file
+        read _num_
+    
+        if [ ! "${_num_}" ]; then
+            continue
+        fi
+    
+        _numerror_=0
+        $ECHO ${_num_} | $EGREP '^[0-9]+$' >> /dev/null 2>&1
+        if [ $? -ne 0 ]; then
+            _numerror_=1
+        fi
+        if [ ${_num_} -lt 1 -o ${_num_} -gt ${_cnt_} ]; then
+            _numerror_=1
+        fi
+    
+        if [ ${_numerror_} -eq 0 ]; then
+            _server_type_=${_type_array_[${_num_}]}
+            break
+        fi
+    done
+    
+    # Store the server type in /eniq/installation/config
+    # This will be used for determining the stages to run, and what node hardening profile to use
+    $ECHO "Updating ${_eniq_conf_dir_}/installed_server_type file with ${_server_type_}\n" >> ${_logfile_}
+    $ECHO "${_server_type_}" > ${_eniq_conf_dir_}/installed_server_type
+fi
+}
+
+### Function: core_install_ip_assign_intf ###
+#
+# Assign the ip with interface for VLAN group
+#
+# Arguments:
+#   $1 : Interface Tag
+# Return Values:
+#   0 : Success
+#   1 : Fail
+core_install_ip_assign_intf()
+{
+local _ipmp_det_=$1
+local _ipmp_ini_file_=$2
+
+#ip address of each vlan
+_client_ip_=`iniget ${_ipmp_det_} -f ${_ipmp_ini_file_} -v Backup_Group_IP`
+if [ ! "${_client_ip_}" ]; then
+    $ECHO "Failed to get client IP address"
+    return 1   
+fi
+
+#gateway of each vlan
+_client_gateway_=`iniget ${_ipmp_det_} -f ${_ipmp_ini_file_} -v Backup_Group_Gateway`
+if [ ! "${_client_gateway_}" ]; then
+    $ECHO "Failed to get client gateway"
+    return 1
+fi
+
+#netmask of each vlan
+_client_netmask_=`iniget ${_ipmp_det_} -f ${_ipmp_ini_file_} -v Backup_Group_Netmask`
+if [ ! "${_client_netmask_}" ]; then
+    $ECHO "Failed to get client netmask"
+    return 1
+fi
+
+#subnet of each vlan
+_netmask_subnet_=`get_network_from_netmask ${_client_netmask_}`
+if [ ! "${_netmask_subnet_}" ]; then
+    $ECHO "Failed to calculate the subnet from netmask"
+    return 1
+fi
+
+#primary interface that has been selected on ipmp.ini 
+_primary_intf_=`iniget ${_ipmp_det_} -f ${_ipmp_ini_file_} -v Backup_Group_Intf`
+
+#If the IP has already assigned to any interface 
+_ip_plumb_exists_=`$IP addr show | $GREP -w ${_client_ip_} | $AWK '{print $NF}'`
+
+#delete the interface if it has the assigned with ip
+if [ ${_ip_plumb_exists_} ]; then
+    $NMCLI con del ${_ip_plumb_exists_} >> /dev/null 2>&1
+    if [ $? -ne 0 ]; then
+        log_msg -l ${_logfile_} -s "Could not delete the IP assigned interface ${_ip_plumb_exists_}"
+        return 1
+    fi
+    log_msg -l ${_logfile_} -s "Successfully deleted the IP assigned interface ${_ip_plumb_exists_}"
+
+    $NMCLI con add type ethernet \
+        ifname ${_ip_plumb_exists_} \
+        con-name ${_ip_plumb_exists_} \
+        connection.autoconnect no >> /dev/null 2>&1
+    if [ $? -ne 0 ]; then
+        log_msg -l ${_logfile_} -s "Could not re-create the interface ${_ip_plumb_exists_}"
+        return 1
+    fi
+    log_msg -l ${_logfile_} -s "Successfully re-created the interface ${_ip_plumb_exists_} without IP"
+fi
+
+#update the ip address and gateway for interface (update the configuration file with interface, IP of vlan, gateway IP, subnet)
+$NMCLI con mod ${_primary_intf_} \
+    ipv4.method manual \
+    ipv4.addr ${_client_ip_}/${_netmask_subnet_} \
+    ipv4.never-default true \
+    connection.autoconnect yes >> /dev/null 2>&1
+if [ $? -ne 0 ]; then
+    log_msg -l ${_logfile_} -s "Could not configure the interface ${_primary_intf_}"
+    return 1
+fi
+log_msg -l ${_logfile_} -s "Successfully assigned the interface ${_primary_intf_} with configuration file"
+
+$SYSTEMCTL restart ${NETWORK_SERVICE}
+}
+
+### Function: core_install_ip_assign_intf_enm ###
+#
+# Assign the ip with interface for VLAN group
+#
+# Arguments:
+#   $1 : Interface Tag
+# Return Values:
+#   0 : Success
+#   1 : Fail
+core_install_ip_assign_intf_enm()
+{
+
+local _ipmp_det_=$1
+local _ipmp_ini_file_=$2
+local _logfile_=$3
+
+#ip address of each vlan
+_client_ip_=$(iniget "${_ipmp_det_}" -f "${_ipmp_ini_file_}" -v ENM_Group_IP)
+if [ ! "${_client_ip_}" ]; then
+    $ECHO "Failed to get client IP address"
+    return 1
+fi
+
+#gateway of each vlan
+_client_gateway_=$(iniget "${_ipmp_det_}" -f "${_ipmp_ini_file_}" -v ENM_Group_Gateway)
+if [ ! "${_client_gateway_}" ]; then
+    $ECHO "Failed to get client gateway"
+    return 1
+fi
+
+#netmask of each vlan
+_client_netmask_=$(iniget "${_ipmp_det_}" -f "${_ipmp_ini_file_}" -v ENM_Group_Netmask)
+if [ ! "${_client_netmask_}" ]; then
+    $ECHO "Failed to get client netmask"
+    return 1
+fi
+
+#subnet of each vlan
+_netmask_subnet_=$(get_network_from_netmask "${_client_netmask_}")
+if [ ! "${_netmask_subnet_}" ]; then
+    $ECHO "Failed to calculate the subnet from netmask"
+    return 1
+fi
+
+#primary interface that has been selected on ipmp.ini
+_primary_intf_=$(iniget "${_ipmp_det_}" -f "${_ipmp_ini_file_}" -v ENM_Group_Intf)
+
+#If the IP has already assigned to any interface
+_ip_plumb_exists_=$($IP addr show | $GREP -w "${_client_ip_}" | $AWK '{print $NF}')
+
+#delete the interface if it has the assigned with ip
+if [ "${_ip_plumb_exists_}" ]; then
+    $NMCLI con del "${_ip_plumb_exists_}" >> /dev/null 2>&1
+    _con_del_stat_=$?
+    if [ "${_con_del_stat_}" -ne 0 ]; then
+        log_msg -l "${_logfile_}" -s "Could not delete the IP assigned interface ${_ip_plumb_exists_}"
+        return 1
+    fi
+    log_msg -l "${_logfile_}" -s "Successfully deleted the IP assigned interface ${_ip_plumb_exists_}"
+
+    $NMCLI con add type ethernet \
+        ifname "${_ip_plumb_exists_}" \
+        con-name "${_ip_plumb_exists_}" \
+        connection.autoconnect no >> /dev/null 2>&1
+    _con_add_stat_=$?
+    if [ "${_con_add_stat_}" -ne 0 ]; then
+        log_msg -l "${_logfile_}" -s "Could not re-create the interface ${_ip_plumb_exists_}"
+        return 1
+    fi
+    log_msg -l "${_logfile_}" -s "Successfully re-created the interface ${_ip_plumb_exists_} without IP"
+fi
+
+#update the ip address and gateway for interface (update the configuration file with interface, IP of vlan, gateway IP, subnet)
+$NMCLI con mod "${_primary_intf_}" \
+    ipv4.method manual \
+    ipv4.addr "${_client_ip_}/${_netmask_subnet_}" \
+    ipv4.never-default true \
+    connection.autoconnect yes >> /dev/null 2>&1
+_con_mod_stat_=$?
+if [ "${_con_mod_stat_}" -ne 0 ]; then
+    log_msg -l "${_logfile_}" -s "Could not configure the interface ${_primary_intf_}"
+    return 1
+fi
+log_msg -l "${_logfile_}" -s "Successfully assigned the interface ${_primary_intf_} with configuration file"
+
+$SYSTEMCTL restart "${NETWORK_SERVICE}"
+
+}
+
+### Function: core_install_nas_api ###
+#
+# Installs the NAS API files
+#
+# Arguments:
+#   $1 : logfile
+#   $2 : Temp directory
+#   $3 : SunOs.ini
+#   $4 : Sw Dir
+# Return Values:
+#   0 : Success
+#   1 : Fail
+core_install_nas_api()
+{
+check_function_dr $*
+if [ $? -ne 0 ]; then
+    $ECHO "Could not get the logfile or temp dir" | $TEE -a ${_logfile_}
+  return 1
+fi
+if [ ! $3 ]; then
+   $ECHO "ERROR: SunOs.ini not set, exiting"
+   return 1
+else
+   _sunos_ini_=$3
+fi
+
+if [ ! $4 ]; then
+   $ECHO "ERROR: SW Dir not set, exiting"
+   return 1
+else
+   _sw_dir_=$4
+fi
+
+_nas_api_loc_=`iniget NAS_STORAGE_API -f ${_sunos_ini_} -v NAS_API_SOURCE_DIR`
+_nas_api_pkg_=`iniget NAS_STORAGE_API -f ${_sunos_ini_} -v NAS_API_PKG`
+_nas_api_pluggin_=`iniget NAS_STORAGE_API -f ${_sunos_ini_} -v NAS_PLUGGIN_PKG`
+if [ ! "${_nas_api_loc_}" -o ! "${_nas_api_pkg_}" -o ! "${_nas_api_pluggin_}" ]; then
+    $ECHO "Failed to get NAS API information from ${_sunos_ini_}" | $TEE -a ${_logfile_}
+    return 1
+fi
+
+for _pkg_ in ${_nas_api_pkg_} ${_nas_api_pluggin_}; do
+    # confirm we can see the package
+    _rpm_name_=`$LS ${_sw_dir_}/${_nas_api_loc_}/ | $GREP ${_pkg_}`
+    if [ ! ${_rpm_name_} ]; then
+                $ECHO "${_sw_dir_}/${_nas_api_loc_}/${_pkg_} does not exist, or is empty" | $TEE -a ${_logfile_}
+                return 1
+    fi
+
+    $ECHO "\nChecking if ${_pkg_} is already installed" | $TEE -a ${_logfile_}
+    $RPM -qa| $GREP ${_pkg_} 2>/dev/null
+    if [ $? -eq 0 ]; then
+        $ECHO "Package ${_rpm_name_} already installed. Removing this package....." | $TEE -a ${_logfile_}
+        $RPM -evh ${_pkg_}
+        if [ $? -ne 0 ]; then
+            $ECHO "Failed to remove package ${_rpm_name_}" | $TEE -a ${_logfile_}
+            return 1
+        fi
+    fi
+
+    $ECHO "Installing ${_rpm_name_} package.....\n" | $TEE -a ${_logfile_}
+    $ECHO "${RPM} -ivh ${_sw_dir_}/${_nas_api_loc_}/${_rpm_name_}" | $TEE -a ${_logfile_}
+    $RPM -ivh ${_sw_dir_}/${_nas_api_loc_}/${_rpm_name_} 2>/dev/null | $TEE -a ${_logfile_}
+    _rpm_install_status_=`$ECHO ${PIPESTATUS[0]}`
+    if [ ${_rpm_install_status_} -ne 0 ]; then
+        $ECHO "Failed to add new package ${_rpm_name_}" | $TEE -a ${_logfile_}
+        return 1
+    fi
+    $ECHO "\nSuccessfully Installed new package ${_rpm_name_}.\n" | $TEE -a ${_logfile_}
+done
+}
+
+### Function: core_install_patches ###
+#
+# Updates roots .profile file
+#
+# Arguments:
+#   $1 : logfile
+#   $2 : Temp directory
+#   $3 : Sw Dir
+#   $4 : Patches log file
+#   $5 : reboot file
+# Return Values:
+#   0 : Success
+#   1 : Fail
+core_install_patches()
+{
+check_function_dr $*
+if [ $? -ne 0 ]; then
+    $ECHO "Could not get the logfile or temp dir" | $TEE -a ${_logfile_}
+  return 1
+fi
+if [ ! $3 ]; then
+   $ECHO "ERROR: Sw Dir not set, exiting"
+   return 1
+else
+   _sw_dir_=$3
+fi
+
+if [ ! $4 ]; then
+   $ECHO "ERROR: Patches Log not set, exiting"
+   return 1
+else
+   _patches_log_=$4
+fi
+
+if [ ! $5 ]; then
+   $ECHO "ERROR: reboot file not set, exiting"
+   return 1
+else
+   _reboot_file_=$5
+fi
+
+_arch_=`$UNAME -p`
+_eniq_sunos_patch_dir_=${_sw_dir_}/Patches/${_arch_}/SunOS
+
+# Check that the bundle exists
+if [ ! -d ${_eniq_sunos_patch_dir_} ]; then
+    $ECHO "Failed to find ENIQ SunOS Patch Directory\n${_eniq_sunos_patch_dir_}" | $TEE -a ${_logfile_}
+    return 1
+fi
+
+_patch_script_=${_sw_dir_}/Patches/SUN_INST_PATCH.sh
+if [ ! -s ${_patch_script_} ]; then
+    $ECHO "Failed to find ENIQ SunOS Patch Script - ${_patch_script_}" | $TEE -a ${_logfile_}
+    return 1
+fi
+
+$ECHO "\nDetails regarding system patching can be found\nin the following logfile - ${_patches_log_}\n" | $TEE -a ${_logfile_}
+
+# Install the Patches
+$ECHO "\nRunning patch installation using the folllowing command:" >> ${_logfile_}
+$ECHO "/bin/sh ${_patch_script_} -d ${_eniq_sunos_patch_dir_} -R ${_reboot_file_} -l ${_patches_log_}" | $TEE -a ${_logfile_}
+/bin/sh ${_patch_script_} -d ${_eniq_sunos_patch_dir_} -R ${_reboot_file_} -l ${_patches_log_}
+if [ $? -ne 0 ]; then
+    $ECHO "Error encountered while running - ${_patch_script_}" | $TEE -a ${_logfile_}
+    return 1
+fi
+
+_run_time_=`$DATE '+%Y-%b-%d_%H.%M.%S'`
+
+$ECHO "\n-------------------------------------------------------" >> ${_patches_log_}
+$ECHO "${_run_time_} - Completed patching of Solaris" >> ${_patches_log_}
+$ECHO "-------------------------------------------------------\n" >> ${_patches_log_}
+}
+
+### Function: core_install_set_stripe_width ###
+#
+# Get the server type being installed
+#
+# Arguments:
+#   $1 : logfile
+#   $2 : Temp directory
+#   $3 : Stripe Width
+#   $4 : Nas Plugin Dir
+# Return Values:
+#   0 : Success
+#   1 : Fail
+core_install_set_stripe_width()
+{
+check_function_dr $*
+if [ $? -ne 0 ]; then
+    $ECHO "Could not get the logfile or temp dir" | $TEE -a ${_logfile_}
+  return 1
+fi
+if [ ! $3 ]; then
+   $ECHO "ERROR: Stripe Width not set, exiting"
+   return 1
+else
+   _stripe_width_=$3
+fi
+
+if [ ! $4 ]; then
+   $ECHO "ERROR: NAS Plugin Dir not set, exiting"
+   return 1
+else
+   _nas_plugin_dir_=$4
+fi
+
+$ECHO "\nSetting NAS_NCOLS value to ${_stripe_width_}" >> ${_logfile_}
+$ECHO "NAS_NCOLS=${_stripe_width_}" >> ${_nas_plugin_dir_}/plugins/nas/etc/nasplugin.conf_template
+if [ $? -ne 0 ]; then
+    $ECHO "Could not update NAS_NCOLS in ${_nas_plugin_dir_}/plugins/nas/etc/nasplugin.conf_template" | $TEE -a ${_logfile_}
+    return 1
+fi
+
+$ECHO "Setting NAS_STRIPEUNIT value to 512" >> ${_logfile_}
+$ECHO "NAS_STRIPEUNIT=512" >> ${_nas_plugin_dir_}/plugins/nas/etc/nasplugin.conf_template
+if [ $? -ne 0 ]; then
+    $ECHO "Could not update NAS_STRIPEUNIT in ${_nas_plugin_dir_}/plugins/nas/etc/nasplugin.conf_template" | $TEE -a ${_logfile_}
+    return 1
+fi
+}
+
+### Function: core_install_setup_ipmp ###
+#
+#  setup the interface configuration
+#
+# Arguments:
+#   $1 : IPMP ini file
+#   $2 : logfile
+# Return Values:
+#   0 : Success
+#   1 : Fail
+core_install_setup_ipmp()
+{
+check_function_dr $*
+if [ $? -ne 0 ]; then
+    log_msg -l ${_logfile_} -s "Could not get the logfile or temp dir"
+    return 1
+fi
+
+local TEM_DIR=$2
+local _ipmp_ini_file_=$3
+local _enm_ipmp_="IPMP_INTF_4"
+local _deployment_=$4
+local _san_device_=$5
+local ipv6_upgrade_flag=$7
+local _storage_type_=$6
+
+_bond_exist_=`$LS ${INTF_DIR}/*bond* 2> /dev/null`
+
+if [ "${_bond_exist_}" ]; then
+
+    log_msg -l ${_logfile_} -s "Moving all interface configuration files to ${INTF_DIR}"
+    $MV ${ENIQ_INTF_DIR}/ifcfg-* ${INTF_DIR}/
+    if [ $? -ne 0 ]; then
+        _err_msg_="Could not move the interface files to ${INTF_DIR} directory"
+        abort_script "${_err_msg_}"
+    fi
+
+    log_msg -l ${_logfile_} -s "Deleting bond configuration file(s)"
+    $RM -rf ${_bond_exist_}
+
+$SYSTEMCTL restart ${NETWORK_SERVICE}
+    if [ $? -ne 0 ]; then
+        log_msg -l ${_logfile_} -s "Network service not restarted successfully"
+        return 1
+    fi
+fi
+
+#get the dns IP
+_dns_ip_=`$GREP -w "nameserver" ${DNS_FILE} | $AWK '{print $2}' | $TR '\n' ' '`
+if [ ! "${_dns_ip_}" ]; then
+    log_msg -l ${_logfile_} -s "Could not read the dns ip"
+    return 1
+fi
+
+# Get domain name
+if [ -s /etc/resolv.conf ]; then
+    _domain_name_=`$EGREP -w 'search|domain' ${DNS_FILE} | $AWK '{print $2}'`
+        if [ ! "${_domain_name_}" ]; then
+        log_msg -l ${_logfile_} -s "Could not get the domain name from resolv.conf file"
+        return 1
+    fi
+else
+    log_msg -l ${_logfile_} -s "Could not get the resolv.conf file"
+    return 1
+fi
+
+#number of vlan has to be confiogured
+_ipmp_config_list_=`iniget IPMP -f ${_ipmp_ini_file_}`
+    if [ ! "${_ipmp_config_list_}" ]; then
+        _err_msg_="Could not build a interface list blocks from ${_ipmp_ini_file_}"
+        abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+    fi
+#create bond file as per the ipmp configuration
+for _ipmp_det_ in ${_ipmp_config_list_}; do
+    if [ ${_ipmp_det_} == "IPMP_INTF_1" ];then
+        core_install_bond_file_create ${_ipmp_det_} ${_dns_ip_} ${_domain_name_}
+    else
+        #verify the vlan configuration
+        _ipmp_enabled_=`iniget ${_ipmp_det_} -f ${_ipmp_ini_file_} -v BONDING_ENABLE`
+        if [ ! "${_ipmp_enabled_}" ]; then
+            _err_msg_="Could not read ${_vlan_type_} ENABLE Y/N from ${_ipmp_ini_file_}"
+            abort_script "${_err_msg_}"
+        fi
+        if [ ${_ipmp_enabled_} == "Y" ]; then
+            if [ "${_storage_type_}" == "fs" -o "${_san_device_}" == "unityXT" ]; then
+                 core_install_vlan_tag_file_create ${_ipmp_det_}
+            else
+                 core_install_bond_file_create ${_ipmp_det_} ${_dns_ip_} ${_domain_name_}
+            fi
+        fi
+    fi
+done
+}
+
+### Function: core_install_update_root_profile ###
+#
+# Updates roots .profile file
+#
+# Arguments:
+#   $1 : logfile
+#   $2 : Temp directory
+# Return Values:
+#   0 : Success
+#   1 : Fail
+core_install_update_root_profile()
+{
+check_function_dr $*
+if [ $? -ne 0 ]; then
+    $ECHO "Could not get the logfile or temp dir" | $TEE -a ${_logfile_}
+  return 1
+fi
+
+ROOT_HOME=/root/
+
+
+if [ -f ${ROOT_HOME}.bash_profile ]; then
+    $CP ${ROOT_HOME}.bash_profile ${_temp_dir_}/bash_profile.$$.$$
+    if [ $? -ne 0 ]; then
+        $ECHO "Could not copy ${ROOT_HOME}.bash_profile to ${_temp_dir_}/bash_profile.$$.$$" | $TEE -a ${_logfile_}
+        return 1
+    fi
+else
+    $TOUCH ${_temp_dir_}/bash_profile.$$.$$
+    if [ $? -ne 0 ]; then
+        $ECHO "Could not create ${_temp_dir_}/bash_profile.$$.$$" | $TEE -a ${_logfile_}
+        return 1
+    fi
+fi
+
+local _upd_=0
+if [ "$3" ]; then
+    $CAT ${_temp_dir_}/bash_profile.$$.$$ | $GREP "_server_type_=" >> /dev/null 2>&1
+    if [ $? -ne 0 ]; then
+        $CAT ${_temp_dir_}/bash_profile.$$.$$ | $GREP -v "PS1" >> ${_temp_dir_}/profileinter.$$.$$
+        $CP ${_temp_dir_}/profileinter.$$.$$ ${_temp_dir_}/bash_profile.$$.$$
+        $ECHO "_server_type_=`$CAT /eniq/installation/config/installed_server_type`" >> ${_temp_dir_}/bash_profile.$$.$$
+        $ECHO "PS1=`uname -n`'[`cat /eniq/installation/config/installed_server_type`] '\{`/usr/bin/whoami`\}' #: '" >> ${_temp_dir_}/bash_profile.$$.$$
+        $ECHO "export PS1\n" >> ${_temp_dir_}/bash_profile.$$.$$
+        _upd_=1
+    fi
+else
+    # Set up the .bash_profile file to display
+    # hostname(user)#: as the command prompt
+    $ECHO "# Set up the shell variables:\n" >> ${_temp_dir_}/bash_profile.$$.$$
+    $ECHO "EDITOR=vi" >> ${_temp_dir_}/bash_profile.$$.$$
+    $ECHO "export EDITOR\n" >> ${_temp_dir_}/bash_profile.$$.$$
+    $ECHO "umask 022\n" >> ${_temp_dir_}/bash_profile.$$.$$
+    $ECHO "_server_type_=`$CAT /eniq/installation/config/installed_server_type`" >> ${_temp_dir_}/bash_profile.$$.$$
+    $ECHO "PS1=`uname -n`'[`cat /eniq/installation/config/installed_server_type`] '\{`/usr/bin/whoami`\}' #: '" >> ${_temp_dir_}/bash_profile.$$.$$
+    $ECHO "export PS1\n" >> ${_temp_dir_}/bash_profile.$$.$$
+    _upd_=1
+fi
+
+if [ ${_upd_} -eq 1 ]; then
+    $ECHO "Updating ${ROOT_HOME}.bash_profile file\n" >> ${_logfile_}
+    $CP ${_temp_dir_}/bash_profile.$$.$$ ${ROOT_HOME}.bash_profile
+    if [ $? -ne 0 ]; then
+        $ECHO "Could not copy ${_temp_dir_}/bash_profile.$$.$$ to ${ROOT_HOME}.bash_profile" | $TEE -a ${_logfile_}
+        return 1
+    fi
+fi
+
+#Alias creation for list_services.bsh
+if [ ! -f /etc/profile.d/eniq.sh ]; then
+
+    $ECHO "alias services='/eniq/installation/core_install/bin/list_services.bsh'" > /etc/profile.d/eniq.sh
+   
+fi
+
+}
+
+### Function: core_install_update_resolv_conf ###
+#
+# Updates the resolv.conf file
+#
+# Arguments:
+#   $1 : logfile
+#    $2 : Temp directory
+#    $3 : DNS Server
+#    $4 : DNS Domain
+#    $5 : Update DNS Server
+#    $6 : Update DNS Domain
+# Return Values:
+#   0 : Success
+#     1 : Fail
+core_install_update_resolv_conf()
+{
+check_function_dr $*
+if [ $? -ne 0 ]; then
+    $ECHO "Could not get the logfile or temp dir" | $TEE -a ${_logfile_}
+    return 1
+fi
+
+if [ ! $3 ]; then
+    $ECHO "ERROR: DNS Server not set, exiting" | $TEE -a ${_logfile_}
+    return 1
+else
+    _dns_server_=$3
+fi
+
+if [ ! $4 ]; then
+    $ECHO "ERROR: DNS Domain not set, exiting" | $TEE -a ${_logfile_}
+    return 1
+else
+    _dns_domain_=$4
+fi
+
+if [ ! $5 ]; then
+    $ECHO "ERROR: DNS Domain not set, exiting" | $TEE -a ${_logfile_}
+    return 1
+else
+    _update_dnssrv_=$5
+fi
+
+if [ ! $6 ]; then
+    $ECHO "ERROR: DNS Domain not set, exiting" | $TEE -a ${_logfile_}
+    return 1
+else
+    _update_dnsdom_=$6
+fi
+
+unset _server_list_
+
+if [ -s /etc/resolv.conf ]; then
+    $CAT /etc/resolv.conf | $EGREP "^[[:blank:]]*domain[[:blank:]]+${_dnsdomain_}[[:blank:]]*$|^[[:blank:]]*search[[:blank:]]+${_dnsdomain_}[[:blank:]]*$" >> /dev/null 2>&1
+    if [ $? -eq 0 ]; then
+        _update_dnsdom_=0
+    fi
+
+    # Check if all specified DNS servers are already in the file
+    for _srv_ in `$ECHO ${_dns_server_} | $SED -e 's|:| |'`; do
+        $CAT /etc/resolv.conf | $EGREP "^[[:blank:]]*nameserver[[:blank:]]+${_srv_}[[:blank:]]*$" >> /dev/null 2>&1
+        if [ $? -ne 0 ]; then
+            if [ ! "${_server_list_}" ]; then
+                _server_list_=${_srv_}
+            else
+                _server_list_="${_server_list_} ${_srv_}"
+            fi
+            _update_dnssrv_=1
+        fi
+    done
+fi
+
+if [ -s /etc/resolv.conf ]; then
+    if [ ! -f /etc/resolv.conf.orig ]; then
+        $CP -p /etc/resolv.conf /etc/resolv.conf.orig >> /dev/null 2>&1
+        if [ $? -ne 0 ]; then
+            $ECHO "Could not make backup of /etc/resolv.conf" | $TEE -a ${_logfile_}
+            return 1
+        fi
+    fi
+
+    # Add new domain to file if necessary otherwise restore old one.
+    if [ ${_update_dnsdom_} -eq 1 ]; then
+        $ECHO "search ${_dns_domain_}" > ${_temp_dir_}/resolv
+    else
+        $CAT /etc/resolv.conf | $EGREP "^[[:blank:]]*search[[:blank:]]+|NetworkManager" > ${_temp_dir_}/resolv
+    fi
+
+    # Add new dns server if required
+    if [ ${_update_dnssrv_} -eq 1 ]; then
+        for _srv_ in ${_server_list_}; do
+            $ECHO "nameserver ${_srv_}" >> ${_temp_dir_}/resolv
+        done
+    fi
+
+    # Reassemble the file
+    $CAT /etc/resolv.conf | $EGREP -v "^[[:blank:]]*search[[:blank:]]+|NetworkManager" >> ${_temp_dir_}/resolv
+
+    # Update the resolv.conf
+    $CP ${_temp_dir_}/resolv /etc/resolv.conf >> /dev/null 2>&1
+    if [ $? -ne 0 ]; then
+        $ECHO "Could not update /etc/resolv.conf" | $TEE -a ${_logfile_}
+        return 1
+    fi
+else
+    $ECHO "search ${_dns_domain_}" > /etc/resolv.conf
+    if [ $? -ne 0 ]; then
+        $ECHO "Could not create /etc/resolv.conf" | $TEE -a ${_logfile_}
+        return 1
+    fi
+    
+    for _srv_ in `$ECHO ${_dns_server_}|$SED -e 's|:| |g'`; do
+        $ECHO "nameserver ${_srv_}" >> /etc/resolv.conf
+        if [ $? -ne 0 ]; then
+            $ECHO "Could not create /etc/resolv.conf" | $TEE -a ${_logfile_}
+            return 1
+        fi
+    done
+fi
+}
+
+
+### Function: core_install_update_nsswitch_conf ###
+#
+# Updates the nsswitch.conf file
+#
+# Arguments:
+#   $1 : logfile
+#   $2 : Temp directory
+# Return Values:
+#   0 : Success
+#   1 : Fail
+core_install_update_nsswitch_conf()
+{
+check_function_dr $*
+if [ $? -ne 0 ]; then
+    $ECHO "Could not get the logfile or temp dir" | $TEE -a ${_logfile_}
+  return 1
+fi
+
+if [ -s /etc/resolv.conf ]; then
+    $CAT /etc/nsswitch.conf | $EGREP '^hosts:' | $GREP -w dns >> /dev/null 2>&1
+    if [ $? -ne 0 ]; then
+        _update_nss_=1
+    fi
+fi
+
+if [ ${_update_nss_} -eq 1 ]; then
+    if [ ! -f /etc/nsswitch.conf.orig ]; then
+        $CP -p /etc/nsswitch.conf /etc/nsswitch.conf.orig >> /dev/null 2>&1
+        if [ $? -ne 0 ]; then
+            $ECHO "Could not make backup of /etc/nsswitch.conf" | $TEE -a ${_logfile_}
+            return 1
+        fi
+    fi
+    $CAT /etc/nsswitch.conf | $SED -e 's|^\(hosts:\)\(.*\)\(files\)\(.*\)|\1\2\3 dns \4|' > ${_temp_dir_}/nssconf
+    $ECHO "Updating /etc/nsswitch.conf file with DNS information" >> ${_logfile_}
+    $CP ${_temp_dir_}/nssconf /etc/nsswitch.conf >> /dev/null 2>&1
+    if [ $? -ne 0 ]; then
+        $ECHO "Could not update /etc/nsswitch.conf" | $TEE -a ${_logfile_}
+        return 1
+    fi
+fi
+}
+
+### Function: core_install_vlan_tag_file_create ###
+#
+# Create the vlan tag file for VLAN group
+#
+# Arguments:
+#   $1 : Bond Interface Tag
+# Return Values:
+#   0 : Success
+#   1 : Fail
+core_install_vlan_tag_file_create()
+{
+
+if [ $# -lt 3 ]; then
+     local _ipmp_det_=$1
+else
+     local _ipmp_det_=$1
+     local _ipmp_ini_file_=$2
+     local _logfile_=$3
+fi
+
+#To get the vlan group from ipmp.ini file for each vlan
+_vlan_group_=`iniget ${_ipmp_det_} -f ${_ipmp_ini_file_} -v IPMP_VLAN_Group_Name`
+if [ ! "${_vlan_group_}" ]; then
+    log_msg -l ${_logfile_} -s "Failed to get vlan group name"
+    return 1
+fi
+
+#To get the IP from ipmp.ini file for each vlan
+_client_ip_=`iniget ${_ipmp_det_} -f ${_ipmp_ini_file_} -v IPMP_Group_IP`
+if [ ! "${_client_ip_}" ]; then
+    log_msg -l ${_logfile_} -s "Failed to get client ip address"
+    return 1
+fi
+
+#To get the netmask from ipmp.ini file for each vlan
+_client_netmask_=`iniget ${_ipmp_det_} -f ${_ipmp_ini_file_} -v IPMP_Group_Netmask`
+if [ ! "${_client_netmask_}" ]; then
+    log_msg -l ${_logfile_} -s "Failed to get client netmask"
+    return 1
+fi
+
+#To calculate the subnet from netmask
+if [ "${_ip_type_}" == "IPv6" -a "${_vlan_group_}" == "PM Services Group" ]; then
+    HNAME=`${HOSTNAME}`
+    _netmask_subnet_=`$CAT ${ENIQ_CONF_DIR1}/${HNAME}/${HNAME}_ks_cfg.txt | $GREP CLIENT_IP_ADDR_V6 | $AWK -F"=" '{ print $2 }' | $AWK -F"/" '{print $2}'`   
+	if [ ! "${_netmask_subnet_}" ]; then
+      log_msg -l ${_logfile_} -s "Failed to get subnet"
+      return 1
+    fi
+else
+    _netmask_subnet_=`get_network_from_netmask ${_client_netmask_}`
+    if [ ! "${_netmask_subnet_}" ]; then
+      log_msg -l ${_logfile_} -s "Failed to get subnet"
+      return 1
+    fi
+fi
+
+#To get the gateway ip from ipmp.ini file for each vlan
+_gateway_=`iniget ${_ipmp_det_} -f ${_ipmp_ini_file_} -v IPMP_Group_Gateway`
+if [ ! "${_gateway_}" ]; then
+    log_msg -l ${_logfile_} -s "Failed to get Gateway"
+    return 1
+fi
+
+
+#get the primary interface from ipmp.ini for each vlan
+_primary_intf_=`iniget ${_ipmp_det_} -f ${_ipmp_ini_file_} -v IPMP_Group_Intf | $AWK '{print $1}'`
+if [ ! "${_primary_intf_}" ]; then
+    log_msg -l ${_logfile_} -s "Could not read primary interface"
+    return 1
+fi
+
+
+#To get the VLAN id from ipmp.ini file for each vlan
+_vlan_id_=`iniget ${_ipmp_det_} -f ${_ipmp_ini_file_} -v IPMP_VLAN_Group_ID`
+if [ ! "${_vlan_id_}" ]; then
+    log_msg -l ${_logfile_} -s "Failed to get Gateway"
+    return 1
+fi
+
+_bond_tag_=${_primary_intf_}.${_vlan_id_}
+
+if [ ! "${_bond_tag_}" ]; then
+    log_msg -l ${_logfile_} -s "Failed to set VLAN tag file name"
+    return 1
+fi
+
+#configure VLAN tag file
+
+
+if [ "${_ip_type_}" == "IPv4" ]; then
+
+#configure bond file for each vlan 
+    $NMCLI con add type vlan \
+    con-name ${_bond_tag_} \
+    dev ${_primary_intf_} \
+    id ${_vlan_id_} \
+    ip4 ${_client_ip_}/${_netmask_subnet_} \
+    ipv4.never-default true \
+    gw4 ${_gateway_} | $TEE -a ${_logfile_}
+
+elif [ "${_ip_type_}" == "IPv6" ]; then
+
+#configure bond file for each vlan
+if [  "${_vlan_group_}" == "PM Services Group" ]; then
+    $NMCLI con add type vlan \
+    con-name ${_bond_tag_} \
+    dev ${_primary_intf_} \
+    id ${_vlan_id_} \
+    ipv4.method disabled \
+    ipv6.method manual \
+    ipv6.addresses ${_client_ip_}/${_netmask_subnet_} \
+    ipv6.never-default true \
+    ipv6.gateway ${_gateway_} | $TEE -a ${_logfile_}
+else
+    $NMCLI con add type vlan \
+    con-name ${_bond_tag_} \
+    dev ${_primary_intf_} \
+    id ${_vlan_id_} \
+    ip4 ${_client_ip_}/${_netmask_subnet_} \
+    ipv4.never-default true \
+    gw4 ${_gateway_} | $TEE -a ${_logfile_}
+fi
+else
+  _err_msg_="Unable to fetch IP type value"
+  abort_script "$_err_msg_" 
+fi
+
+
+if [ $? -ne 0 ]; then
+    log_msg -l ${_logfile_} -s "Could not Create VLAN tag file for ${_vlan_group_}"
+    return 1
+else
+    log_msg -l ${_logfile_} -s "Successfully created VLAN tag file ifcfg-${_bond_tag_} for ${_vlan_group_} \n"
+fi
+
+
+#bring the connection up
+$NMCLI connection up ${_bond_tag_} | $TEE -a ${_logfile_}
+if [ $? -ne 0 ]; then
+    log_msg -l ${_logfile_} -s "Unable to make up ${_bond_tag_}"
+    return 1
+else
+    log_msg -l ${_logfile_} -s "Successfully activated VLAN tag ifcfg-${_bond_tag_} for ${_vlan_group_} \n\n"
+fi
+}
+
+### Function: get_next_bond ###
+#
+# To get the bond count
+#
+# Arguments:
+#   None
+# Return Values:
+#   0 : bond number
+get_next_bond()
+{
+_next_bond_=`$LS -rt ${INTF_DIR}/ifcfg-bond[0-9] 2> /dev/null | $TAIL -1`
+
+if [ ! ${_next_bond_} ]; then
+    _next_bond_="bond0"
+else
+    _bond_count_=`$ECHO ${_next_bond_: -1}`
+
+    # Increase count
+    _bond_count_=`$EXPR ${_bond_count_} + 1`
+    _next_bond_="bond${_bond_count_}"
+fi
+
+$ECHO ${_next_bond_}
+}
+
+### Function: common_get_windows_server_info ###
+#
+# To get windows server IPs
+#
+# Arguments:
+#   $1 : Logfile
+# Return Values:
+#    none
+common_get_windows_server_info()
+{
+_logfile_=$1
+
+$ECHO "\nStarting to run "$BASH ${ENIQ_CORE_INST_DIR}/bin/manage_windows_server.bsh"\n" >> ${_logfile_}
+
+if [ -f "${ENIQ_CORE_INST_DIR}/bin/manage_windows_server.bsh" ]; then
+    $BASH ${ENIQ_CORE_INST_DIR}/bin/manage_windows_server.bsh -l ${_logfile_}
+    if [ $? -ne 0 ]; then
+        $ECHO "\nWarning : Failed to execute script ${ENIQ_CORE_INST_DIR}/bin/manage_windows_server.bsh. \n"
+		$ECHO "\nPlease execute section 'User Input for Windows Server IP' manually after Initial Installation from respective deployment's Initial installation document. \n"
+    fi
+else
+    $ECHO "\nWarning : ${ENIQ_CORE_INST_DIR}/bin/manage_windows_server.bsh script not found \n"
+fi
+}
+
+
+### Function: remove_telnet_ftp_packages ###
+#
+# To remove telnet and ftp packages.
+#
+# Arguments:
+#    $1 - server name
+# Return Values:
+#     none
+remove_telnet_ftp_packages()
+{
+
+_hostname_=$1
+
+# Stopping telnet.socket service if exists
+$SYSTEMCTL list-units | $GREP telnet.socket >> /dev/null 2>&1
+if [ $? -eq 0 ]; then
+    $SYSTEMCTL stop telnet.socket
+    _service_state=`$SYSTEMCTL show telnet.socket -p ActiveState | $AWK -F"=" '{print $2}'`
+    if [ "${_service_state}" == "active" ] ; then
+        _err_msg_="Could not stop telnet.socket"
+        abort_script "${_err_msg_}"
+    fi
+fi
+
+# List of packages to be removed
+_packages_to_be_removed_="ftp telnet-server telnet"
+    
+for _package_ in `$ECHO ${_packages_to_be_removed_}`; do
+        
+    $ECHO "\nRemoving ${_package_} package if package is already installed on ${_hostname_}" | $TEE -a ${_logfile_}
+        
+    $RPM -qa | $GREP -w ${_package_} >> /dev/null 2>&1
+    if [ $? -eq 0 ]; then
+        $RPM -ev ${_package_} >> /dev/null 2>&1
+        if [ $? -eq 0 ]; then
+            $RPM -qa | $GREP -w ${_package_} >> /dev/null 2>&1
+            if [ $? -ne 0 ]; then
+                $ECHO "\nSuccessfully removed ${_package_} package on ${_hostname_}" | $TEE -a ${_logfile_}
+            else
+                $ECHO "\nFailed to remove ${_package_} package on ${_hostname_}" | $TEE -a ${_logfile_}
+                return 1
+            fi
+        fi
+    else
+        $ECHO "\n${_package_} package is not installed on ${_hostname_}" | $TEE -a ${_logfile_}
+    fi
+done
+}
+
+
+

@@ -1,0 +1,771 @@
+#!/bin/bash
+# ********************************************************************
+# Ericsson Radio Systems AB                                     SCRIPT
+# ********************************************************************
+#
+#
+# (c) Ericsson Radio Systems AB 2019 - All rights reserved.
+#
+# The copyright to the computer program(s) herein is the property
+# of Ericsson Radio Systems AB, Sweden. The programs may be used
+# and/or copied only with the written permission from Ericsson Radio
+# Systems AB or in accordance with the terms and conditions stipulated
+# in the agreement/contract under which the program(s) have been
+# supplied.
+#
+# ********************************************************************
+# Name    : recreate_root_disk_layout.bsh
+# Date    : 09/10/2023
+# Revision: \main\13
+# Purpose : It collects the lvm dump of root filesystem          
+#
+#
+# Usage   : recreate_root_disk_layout.bsh [ directory name ] 
+#
+# ********************************************************************
+#
+#       Command Section
+#
+# ********************************************************************
+CAT=/bin/cat
+PARTED=/sbin/parted
+PVCREATE=/sbin/pvcreate
+VGCFGRESTORE=/sbin/vgcfgrestore
+VGREMOVE=/sbin/vgremove
+VGCHANGE=/sbin/vgchange
+VGDISPLAY=/sbin/vgdisplay
+VGREDUCE=/sbin/vgreduce
+DD=/bin/dd
+SWAPOFF=/sbin/swapoff
+SWAPON=/sbin/swapon
+MKSWAP=/sbin/mkswap
+UDEVADM=/sbin/udevadm
+PARTX=/sbin/partx
+LVSCAN=/sbin/lvscan
+VGS=/sbin/vgs
+PVREMOVE=/sbin/pvremove
+PVS=/sbin/pvs
+VGS=/sbin/vgs
+WIPEFS=/usr/sbin/wipefs
+LVS=/sbin/lvs
+LSBLK=/bin/lsblk
+MKFS=/sbin/mkfs
+MKTEMP=/bin/mktemp
+MDADM=/usr/sbin/mdadm
+
+#-----------------------OTHER VAR----------------------------
+SCRIPT_NAME=$(basename "$0")
+declare -a LVM
+declare -a RAID
+LOCKFILE=/tmp/${SCRIPT_NAME}.lockfile
+SEP="----------------------------------------------------------"
+#ROOT_LVM_PARTITION=/dev/sda2
+ROOT_MIRROR_DEVICE=/dev/md0
+
+# ********************************************************************
+#
+#       functions
+#
+# ********************************************************************
+### Function: abort_script ###
+#
+#   This will is called if the script is aborted thru an error
+#   error signal sent by the kernel such as CTRL-C or if a serious
+#   error is encountered during runtime
+#
+# Arguments:
+#       $1 - Error message from part of program (Not always used)
+# Return Values:
+#       none
+abort()
+{
+    echo $@
+    echo "${SCRIPT_NAME} FAILED, exiting."
+    ${UDEVADM} control --start-exec-queue
+    ${UDEVADM} trigger
+    rm -f "${LOCKFILE}"
+    exit 1
+}
+### Function: warn ###
+#
+# give warning to user
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+warn()
+{
+    echo WARNING: $@
+}
+
+### Function: warn ###
+#
+# give warning to user
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+run_cmd()
+{
+    local err ret
+    echo "Running: $@"
+
+    # Suppress stderr unless command exits non zero as some commands report
+    # errors even when ok which would make the logs confusing
+    err=$(${MKTEMP} /tmp/${SCRIPT_NAME}.XXXX.err)
+
+    $@ 2> ${err}
+    ret=$?
+
+    if [[ ${ret} -ne 0 ]]
+    then
+        ${CAT} ${err}
+    fi
+    rm -f ${err}
+    return ${ret}
+}
+### Function: warn ###
+#
+# give warning to user
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+udev_settle_and_stop()
+{
+    echo Running: ${FUNCNAME}
+    ${UDEVADM} trigger
+    ${UDEVADM} settle
+    ${UDEVADM} control --stop-exec-queue
+}
+### Function: warn ###
+#
+# give warning to user
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+udev_start_queue()
+{
+    echo Running: ${FUNCNAME}
+    ${UDEVADM} control --start-exec-queue
+    ${UDEVADM} trigger
+}
+### Function: warn ###
+#
+# give warning to user
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+disk_info()
+{
+    run_cmd ${LSBLK} -o NAME,TYPE,FSTYPE,SIZE,LABEL,UUID
+
+    echo
+    run_cmd ${PVS}
+    echo
+    run_cmd ${VGS}
+    echo
+    run_cmd ${LVS}
+    echo  ${SEP}
+}
+### Function: check_configuration ###
+#
+# check backup disk configuration
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+check_configuration()
+{
+    local file
+
+    echo ">>> Entered Function: ${FUNCNAME}"
+    echo "Checking backup disk configuration is okay to proceed with"
+    echo "Checking scheme files in ${DRV_BACKUP_DIR}:"
+
+    run_cmd ls ${DRV_BACKUP_DIR}/*.scheme &> /dev/null || abort "No scheme file found in ${DRV_BACKUP_DIR}"
+    echo "Found scheme file: " $(ls ${DRV_BACKUP_DIR}/*.scheme)
+
+    run_cmd egrep -q "lvm|raid" ${DRV_BACKUP_DIR}/*.scheme || abort "No LVM/RAID partition found in scheme files"
+    echo "Found LVM partition in scheme file"
+
+    run_cmd grep -q boot ${DRV_BACKUP_DIR}/*.scheme || abort "No boot partition found in scheme files"
+    echo "Found boot partition in scheme file"
+
+
+    echo "Checking LVM configuration files in ${LVM_BACKUP_DIR}:"
+    run_cmd ls ${LVM_BACKUP_DIR}/* &> /dev/null || abort "No LVM configuration file found in ${LVM_BACKUP_DIR}"
+    echo "Found LVM configuration file: " $(ls ${LVM_BACKUP_DIR}/* )
+
+    for file in $(ls ${LVM_BACKUP_DIR}/*)
+    do
+        echo Checking valid info in ${file}
+        grep  -B 1  device ${file} | grep -q id || abort "No id found in ${file}"
+        echo "Found ID entry in ${file}"
+    done
+    echo "Configuration looks OK"
+    echo ">>> Leaving Function: ${FUNCNAME}" ; echo ${SEP} ; echo
+}
+### Function: remove_existing_disk_info ###
+#
+# removes existing disk info
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+remove_existing_disk_info()
+{
+    local vg vglist pv pvlist device part disk pv_count vg_count lv_count
+
+    echo ">>> Entered Function: ${FUNCNAME}"
+    echo "Initial Disk Layout:"
+    disk_info
+
+    # Get lists of VGs & PV
+    vglist=$(${VGS} --noheadings 2>/dev/null | awk ' { print $1 } ')
+    pvlist=$(${PVS} --noheadings 2>/dev/null | awk ' { print $1 } ')
+
+    # Remove any 'missing' disks from each VG, then remove each VG & associated LVs
+    echo "VGs for removal: ${vglist:-None}"
+    echo
+    for vg in ${vglist}
+    do
+        run_cmd ${VGREDUCE} --removemissing --force ${vg} || warn Failed to remove missing volumes from ${vg}
+        run_cmd ${VGREMOVE} -ff -y ${vg} || warn Failed to remove volume group ${vg}
+    done
+
+    # Remove PVs
+    echo
+    echo "PVs for removal: ${pvlist:-None}"
+    echo
+    for pv in ${pvlist}
+    do
+        run_cmd ${PVREMOVE} -ff -y ${pv} || warn Failed to remove physical volume ${pv}
+    done
+    echo ${SEP}
+
+    # Find disk devices and remove any partitions from them
+    for disk in $(ls /dev/sd*[a-z] 2>/dev/null)
+    do
+        for part in $(${PARTED} -s ${disk} print -m 2>/dev/null | grep ^[0-9]| cut -d: -f -1 )
+        do
+           if [ "${reader_blade}" != "stats_iqr" ]; then
+            run_cmd ${WIPEFS} -a ${disk}${part} || warn Failed to remove signature from ${disk}${part}
+            run_cmd ${PARTED} -s ${disk} rm ${part} || warn Failed to remove partition ${part} from ${disk}
+            run_cmd ${PARTX} -d ${disk} || warn ${PARTX} exited non zero
+           fi
+        done
+    done
+    echo ${SEP}
+
+
+    # To be sure, DD any partitions still showing to erase LV information
+    if [ "${reader_blade}" != "stats_iqr"  ]; then
+       for part in $(ls /dev/sd*[0-9] 2>/dev/null)
+       do
+          run_cmd ${DD} if=/dev/zero of=${part} bs=512 count=10 || warn ${DD} failed wipe partition ${part}
+       done
+
+
+        # DD any disks to wipe partition table info
+        for disk in $(ls /dev/sd*[a-z])
+        do
+           run_cmd ${DD} if=/dev/zero of=${disk} bs=512 count=10 || warn ${DD} failed to wipe partition table for ${disk}
+        done
+    else
+        while read disk; do
+        run_cmd ${DD} if=/dev/zero of=/dev/${disk} bs=512 count=10 || warn ${DD} failed to wipe partition table for ${disk}
+        done < /tmp/disk_file
+    fi
+
+    # Remove any mapper files that might be hanging around
+    for device in $(ls /dev/mapper/* | grep -vw control |grep -vw live)
+    do
+        run_cmd dmsetup remove ${device} || warn Failed to remove mapper file ${device}
+    done
+
+    # Re-read LV information into cache
+    run_cmd pvscan --cache &>/dev/null
+    run_cmd vgscan --cache &>/dev/null
+    run_cmd lvscan --cache &>/dev/null
+
+    echo ${SEP}
+    echo "Disk Layout After Cleanup:"
+    disk_info
+
+    pv_count=$(${PVS} 2>/dev/null | wc -l)
+    vg_count=$(${VGS} 2>/dev/null | wc -l)
+    lv_count=$(${LVS} 2>/dev/null | wc -l)
+
+    [[ ${pv_count} -gt 0 ]] && abort "PVs not removed"
+    [[ ${vg_count} -gt 0 ]] && abort "VGs not removed"
+    [[ ${lv_count} -gt 0 ]] && abort "LVs not removed"
+
+    echo "Disk layout cleaned up successfully"
+    echo ">>> Leaving Function: ${FUNCNAME}" ; echo ${SEP} ; echo
+}
+
+### Function: create_partition ###
+#
+# create partition on root disk
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+create_partition()
+{
+    echo ">>> Entered Function: ${FUNCNAME} with $1"
+    local uuid part_type parted_opts device
+    local partition_file=$1
+    local next_line="units"
+    local null path table_type begin end fs flags
+    echo "Using scheme file: ${partition_file}"
+    echo "Contents:"
+    ${CAT} ${partition_file}
+
+    while read line
+    do
+        line=${line%;}
+        echo "Read line from scheme file: ${line}"
+
+        if [[ "${line}" == "BYT" ]]; then
+            echo ${SEP}
+            next_line="disk"
+            continue
+        fi
+
+        if [[ ${next_line} == "disk" ]]; then
+            echo "Line is disk entry, need to DD and label the disk."
+            IFS=':' read path null null null null table_type null <<< "${line}"
+
+            echo "Checking available root disk ${restore_disk}"
+            if [[ ${backup_disk} != ${restore_disk} ]]; then
+               path1=${root_disk}
+            else
+               path1=${path}
+            fi
+
+            run_cmd ${DD} if=/dev/zero of=${path1} bs=512 count=1 ||
+                                                    warn ${DD} exited non zero
+            run_cmd ${PARTED} -s ${path1} mklabel ${table_type} ||
+                                                    abort ${PARTED} exited non zero
+            next_line="partition"
+            device=${path1}
+            echo
+
+        elif [[ ${next_line} == "partition" ]]; then
+            echo "Line is partition entry, need to create partition with defined flags."
+            IFS=':' read partition begin end null fs null flags <<< "${line}"
+
+            part_type="primary"
+            if [[ -n ${partition} ]] && [[ ${partition} -eq 4 ]] && [[ ${flags} =~ "*lba*" ]]; then
+                part_type="extended"
+            fi
+
+            parted_opts="-s -a optimal ${device} unit MB mkpart ${part_type} ${begin} ${end}"
+
+            if [[ -n ${flags} ]]; then
+                parted_opts="${parted_opts} set ${partition} ${flags} on"
+                if $(echo ${flags} | grep -q "raid") ; then
+                     echo "RAID flag found for ${device}${partition} (number ${count}), \
+                                          create_raid() will create root mirrored device md0."
+                     RAID[${count}]=${device}${partition} && count=$((count+1))
+                fi
+
+                if $(echo ${flags} | grep -q "lvm") ; then
+                    echo "LVM flag found for ${device}${partition} (number ${count}), \
+                                        create_lvm() will setup LVM layout for this later."
+                    LVM[${count}]=${device}${partition} && count=$((count+1))
+                fi
+            fi
+
+            run_cmd ${PARTED} -s ${parted_opts} || warn ${PARTED} exited non zero
+            run_cmd ${PARTX} -a ${device} || warn ${PARTX} exited non zero
+
+            # If file system defined (e.g. ext4) or swap
+            if [[ -n ${fs}  ]]; then
+                udev_settle_and_stop
+                uuid=$(grep ${path}${partition} ${BLKID_FILE} | tr -d "\"" | awk '{print $2}' | cut -d'=' -f2)
+
+                if [[ -z ${uuid} ]] ; then
+                    abort "UUID for ${path}${partition} not retrieved from ${BLIKD_FILE}"
+                fi
+
+                if [[ ${fs} =~ "swap" ]]; then
+                    run_cmd ${MKSWAP} -U ${uuid} ${device}${partition} || abort Failed to ${MKSWAP} for ${device}${partition}
+				elif [[ ${fs} =~ "fat32" ]]; then
+					_efi_uuid_=`echo ${uuid} | tr -d "-"`
+                    run_cmd ${MKFS}.vfat -i ${_efi_uuid_} ${device}${partition} ||  abort Failed to ${MKFS} for ${device}${partition}
+                else
+                    run_cmd ${MKFS}.${fs} -q -U ${uuid} ${device}${partition} ||  abort Failed to ${MKFS} for ${device}${partition}
+                fi
+                udev_start_queue
+            else
+                echo "No file system or swap defined in scheme file for this partition."
+            fi
+            echo
+        fi
+    done < ${partition_file}
+    echo "Finished creating partitions"
+    echo ">>> Leaving Function: ${FUNCNAME}" ; echo ${SEP} ; echo
+}
+### Function: create_raid ###
+#
+#Create raid1 mirrored root device md0
+#
+# Arguments:
+#
+# Return Values:
+#       none
+create_raid()
+{
+    echo ">>> Entered Function: ${FUNCNAME}"
+    local _cnt_=1
+    echo "Creating mirrored device md0 for ${RAID[@]}"
+
+    echo "y" | $MDADM  --create ${ROOT_MIRROR_DEVICE} --level mirror --raid-devices=2 ${RAID[@]} || abort "Failed to create md0 for ${RAID[@]}"
+
+    LVM[${_cnt_}]=${ROOT_MIRROR_DEVICE}  
+
+}
+### Function: create_lvm ###
+#
+# create root lvm structure
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+create_lvm()
+{
+    local dev uuid restorefile dev lvfile vgname snaps snap
+    echo ">>> Entered Function: ${FUNCNAME}"
+    echo "Need to create LVM layout for: ${LVM[@]}"
+    
+    for dev in ${LVM[@]}
+    do
+        echo "Looking for restore file for device ${dev}"
+        lvm=`cat ${BLKID_FILE} | grep "LVM2_member" | grep ${backup_disk} | tr -d ":" | awk '{print $1}'`
+        uuid=$(grep ${lvm} ${BLKID_FILE} | tr -d "\"" | awk '{print $2}' | cut -d'=' -f2)
+
+        if [[ -z ${uuid} ]] ; then
+            abort "UUID for ${dev} not retrieved from ${BLIKD_FILE}"
+        fi
+
+        restorefile=$(grep -RB1 "device = \"${lvm}\"" ${LVM_BACKUP_DIR} | grep "id =") && restorefile=${restorefile%%-*id*}
+
+        if [[ -z ${restorefile} ]] ; then
+            abort "Unable to find restorefile in ${LVM_BACKUP_DIR} for device ${dev}"
+        fi
+        echo "Found restore file for ${PVCREATE}: ${restorefile}"
+
+        while ! [[ -b ${dev} ]]
+        do
+          ${UDEVADM} trigger
+          ${UDEVADM} settle
+        done
+        udev_settle_and_stop
+
+        run_cmd ${PVCREATE} -y -ff -u ${uuid} --restorefile=$restorefile ${dev}  || abort "Failed to create PV for ${dev}"
+
+        udev_start_queue
+        echo
+    done
+    echo "Finished PV Creation."
+    echo ${SEP}
+
+    echo "Need to restore $(ls $LVM_BACKUP_DIR |grep -w vg_root)"
+    for lvfile in $(ls $LVM_BACKUP_DIR/*| grep -w vg_root)
+    do
+        vgname=${lvfile##*/}
+        echo "Attempting to restore ${vgname} using restore file, ${lvfile}"
+
+        run_cmd ${VGCFGRESTORE} -f ${lvfile} ${vgname}  || abort "Failed to recreate ${vgname} using ${lvfile}"
+        echo "Completed ${VGCFGRESTORE} with ${lvfile} and ${vgname}"
+    done
+    echo "Finished VG Cfg Restore."
+    echo ${SEP}
+
+    snaps=$(${LVSCAN} | grep -iw snapshot | sed -e "s/ .*'\(\/.*\)'.*/\1/")
+    echo "LV Snapshots to remove: ${snaps:-None}"
+    for snap in ${snaps}
+    do
+        run_cmd lvremove ${snap} -f  || warn "Failed to remove LV snapshot ${snap}"
+    done
+
+    echo "Activating VGs"
+    run_cmd ${VGCHANGE} -a y  || abort "Failed to activate VGs"
+
+    echo "LVM Restore completed successfully"
+    echo ">>> Leaving Function: ${FUNCNAME}" ; echo ${SEP} ; echo
+}
+### Function: create_fs_for_lvms ###
+#
+# create fs for root lvm
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+create_fs_for_lvms()
+{
+    local fs uuid vg vgname lv devpath
+    echo ">>> Entered Function: ${FUNCNAME}"
+    echo "Creating file systems for LVs, using ${BLKID_FILE}"
+
+    for vg in $(ls $LVM_BACKUP_DIR/* |grep -w vg_root)
+    do
+        vgname=${vg##*/}
+        echo "Working with VG ${vgname} which has LVs: " $(ls /dev/${vgname}/)
+
+        for lv in $(ls /dev/${vgname}/*)
+        do
+            lv=${lv##*/}
+            echo "Getting file sytem and UUID for ${vgname} ${lv}"
+
+            # Assuming entry where lv name is prefixed with vgname
+            fs=$(grep "/${vgname}-$lv<" ${BLKID_FILE} | tr -d "\"" | grep -o "TYPE=[a-zA-Z0-9]*" | cut -d'=' -f2|head -1)
+            uuid=$(grep "/${vgname}-$lv<" ${BLKID_FILE} | tr -d "\"" | grep -o "UUID=[a-zA-Z0-9-]*" | cut -d'=' -f2|head -1)
+
+            # If lv name is not found with vgname prefix then look for lvname directly
+            if [[ ${#fs} -eq 0 ]]
+            then
+                echo "File system not found, Using alternative file system & UUID lookup"
+                fs=$(grep "/${lv}</device>"  ${BLKID_FILE} | tr -d "\"" | grep -o "TYPE=[a-zA-Z0-9]*" | cut -d'=' -f2|head -1)
+                uuid=$(grep "/${lv}</device>" ${BLKID_FILE} | tr -d "\"" | grep -o "UUID=[a-zA-Z0-9-]*" | cut -d'=' -f2|head -1)
+            fi
+
+            if [[ -z ${fs} ]] ; then
+                echo "No file system information for ${lv}"
+                continue
+            fi
+            echo "Retrieved file system=${fs} and UUID=${uuid}"
+
+            udev_settle_and_stop
+
+            devpath=/dev/${vgname}/${lv}
+            if [ ${fs} == "swap" ]
+            then
+                run_cmd ${MKSWAP} -U ${uuid} ${devpath} || abort "Failed to create swap partition on ${devpath}"
+                echo "Swap partition created"
+            else
+                run_cmd ${MKFS}.${fs} -q -U ${uuid} ${devpath}  || abort "Failed to create file system ${fs} on ${devpath}"
+                echo "File system created"
+            fi
+            udev_start_queue
+            echo ${SEP}
+
+        done
+    done
+    echo "File systems created successfully"
+    echo ">>> Leaving Function: ${FUNCNAME}" ; echo ${SEP} ; echo
+}
+
+### Function: root_cleanup ###
+#
+# removes existing vg_root
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+root_cleanup()
+{
+# Get lists of VGs & PV
+vg_list=`${VGS} --noheadings 2>/dev/null | awk '{ print $1 }'`
+pv_list=`${PVS} --noheadings 2>/dev/null | awk '{ print $1 }'`
+lv_list=`$LVS --noheading -o lv_name`
+
+# Removing existing LVM if any
+for lv in ${lv_list}
+do
+    run_cmd ${LVREMOVE} -y $lv || abort Failed to remove LVM $lv
+done
+	
+# Remove VG if any
+for vg in ${vg_list}
+do
+    run_cmd ${VGREMOVE} -ff -y ${vg} || abort Failed to remove volume group ${vg}
+done
+
+# Remove PVs if any
+for pv in ${pvlist}
+do
+    run_cmd ${PVREMOVE} -ff -y ${pv} || abort Failed to remove physical volume ${pv}
+done
+
+pv_cnt=`${PVS} 2>/dev/null | wc -l`
+vg_cnt=`${VGS} 2>/dev/null | wc -l`
+lv_cnt=`${LVS} 2>/dev/null | wc -l`
+
+[[ ${pv_cnt} -gt 0 ]] && abort "PVs not removed"
+[[ ${vg_cnt} -gt 0 ]] && abort "VGs not removed"
+[[ ${lv_cnt} -gt 0 ]] && abort "LVs not removed"
+}
+
+### Function: set_fs_mount_options ###
+#
+# set fs mount options
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+set_fs_mount_options()
+{
+    echo "Setting default mount options for MS file systems"
+    mount_options_file=${CONF_ROOT}/ms_mount_options
+    cp -pr ${CONF_ROOT}/ms_mount_options ${CONF_ROOT}/ms_mount_options_orig
+    sed -i '$d' ${CONF_ROOT}/ms_mount_options
+
+    while read device mount_options
+    do
+        mount_options=$(echo ${mount_options}| sed 's/\s/,/g')
+        [[ -z ${device} ]] && continue
+        echo "Setting mount options: tune2fs -c0 -i0 -o ${mount_options} ${device}"
+        tune2fs -c0 -i0 -o ${mount_options} ${device} || warn "Mount options ${mount_options} were not set on ${device}."
+    done<${mount_options_file}
+
+    echo "Setting default mount options for disk"
+    disk_mount_options=`cat ${CONF_ROOT}/ms_mount_options | awk '{print $2, $3}' | head -1 | sed 's/\s/,/g'`
+    disk_mount_device=`/sbin/blkid | grep -w ext4 | grep ${restore_disk} | tr -d ":" | awk '{print $1}'`
+    echo "Setting mount options: tune2fs -c0 -i0 -o ${disk_mount_options} ${disk_mount_device}"
+    tune2fs -c0 -i0 -o ${disk_mount_options} ${disk_mount_device} || warn "Mount options ${mount_options} were not set on ${device}."
+    mv ${CONF_ROOT}/ms_mount_options_orig ${CONF_ROOT}/ms_mount_options
+}
+
+### Function: stop_mirr_device ##
+#
+# set fs mount options
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+stop_mirr_device()
+{
+if [ -b /dev/md0 ]; then
+    echo "Removing block device /dev/md0"
+	run_cmd $MDADM --stop /dev/md0 || abort Failed to disable mirrored device
+fi
+
+if [ -b /dev/md127 ]; then
+    echo "Removing block device /dev/md127"
+	run_cmd $MDADM --stop /dev/md127 || abort Failed to disable mirrored device
+fi
+}
+
+# ********************************************************************
+#
+#       Main body of program
+#
+# ********************************************************************
+
+echo ${SCRIPT_NAME} started with args: $@
+
+if [ $# -lt 1 ]; then
+    echo "$0 Invalid number of arguments! Source root dir must be given!"
+    exit 1
+fi
+
+#?CONF_ROOT=$1/backup/config
+CONF_ROOT=$1/config
+LVM_BACKUP_DIR=$CONF_ROOT/lvm/lvm/backup/
+BLKID_FILE=$CONF_ROOT/drv_schemes/blkid/blkid.tab
+DRV_BACKUP_DIR=$CONF_ROOT/drv_schemes/
+SERVER_TYPE=/tmp/bmr/installation/config/installed_server_type
+
+#Check the backup root disk first
+echo ">>> Find the backup root disk label"
+backup_disk=`cat ${DRV_BACKUP_DIR}*.scheme | grep "/dev/"  | cut -d':' -f1 | cut -d'/' -f3`
+echo "Backup root disk: ${backup_disk}"
+
+#Check the root disk available after BMR
+echo ">>> Find the restore root disk label"
+$LSBLK -d -e 7 -o NAME,ROTA,DISC-MAX,MODEL | grep -w "LOGICAL VOLUME" | awk '{print $1}' > /tmp/disk_file
+
+    restore_disk=`cat /tmp/disk_file | grep ${backup_disk}`
+    if [ $? -eq 0 ]; then
+        restore_disk=${backup_disk}
+    else
+        restore_disk=`cat /tmp/disk_file | sort -n | head -1`
+    fi
+echo "Restore root disk: ${restore_disk}"
+root_disk=/dev/${restore_disk}
+
+echo "Recreating root disk structure using: ${root_disk}"
+
+reader_blade=`cat ${SERVER_TYPE}`
+
+if ! ( set -C ; echo "$$" > "${LOCKFILE}" ) 2>/dev/null; then
+    echo "Lockfile ${LOCKFILE} found"
+    echo "Only one execution of $0 script allowed"
+    exit 1
+fi
+
+
+for disk in $(ls ${DRV_BACKUP_DIR}/*.scheme )
+do
+    ROOT_PARTITION_SCHEMA=`cat $disk | grep /dev/ | awk -F ":" '{print $1}'`
+    if [ "${ROOT_PARTITION}" == "" ]; then
+        ROOT_PARTITION="${ROOT_PARTITION_SCHEMA}"
+    else
+        ROOT_PARTITION="${ROOT_PARTITION} ${ROOT_PARTITION_SCHEMA}"
+    fi
+done
+
+check_configuration
+echo "Removing old disk information"
+remove_existing_disk_info
+
+
+echo "Creating root drive partition layout"
+
+# Disabling mirror device if any
+stop_mirr_device
+
+count=1
+for DRV in $(ls ${DRV_BACKUP_DIR}/*.scheme )
+do
+    create_partition $DRV
+echo
+done
+
+if [ ${#RAID[@]} -gt 0 ] ; then
+
+    # Removing older PV, VG and LVs if present
+    root_cleanup
+	  
+    # Disable mirror device if any
+    stop_mirr_device
+	  
+    # Creating mirro device /dev/md0
+    create_raid
+fi
+
+if [ ${#LVM[@]} -gt 0 ] ; then
+    create_lvm
+    create_fs_for_lvms
+else
+    echo "No LVM creation required"
+fi
+
+set_fs_mount_options
+
+rm -f "${LOCKFILE}"
+
+
+echo "Disk Layout After Restore:"
+disk_info
+echo "Restore Disk Layout Script completed"
+

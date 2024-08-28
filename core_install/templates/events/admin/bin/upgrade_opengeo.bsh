@@ -1,0 +1,349 @@
+#!/bin/bash
+# ********************************************************************
+# Ericsson Radio Systems AB                                     SCRIPT
+# ********************************************************************
+#
+# (c) Ericsson Radio Systems AB 2014 - All rights reserved.
+#
+# The copyright to the computer program(s) herein is the property
+# of Ericsson Radio Systems AB, Sweden. The programs may be used
+# and/or copied only with the written permission from Ericsson Radio
+# Systems AB or in accordance with the terms and conditions stipulated
+# in the agreement/contract under which the program(s) have been
+# supplied.
+#
+# ********************************************************************
+# Name    : upgrade_opengeo.bsh
+# Date    : 27/02/2014
+# Revision: main/4
+# Purpose : Wrapper script handling the installation of Glassfish during
+#           upgrade. It will call all necessary scripts to complete the 
+#	    opengeo installation and configuration.
+#
+# Usage   : upgrade_opengeo.bsh -d <eniq_sw_dir> [ -b <eniq_base_dir> ] [ -l <path_to_logfile> ]
+#
+# ********************************************************************
+#
+#       Command Section
+#
+# ********************************************************************
+AWK=/usr/bin/awk
+BASENAME=/usr/bin/basename
+BASH=/usr/bin/bash
+CAT=/usr/bin/cat
+CLEAR=/usr/bin/clear
+DATE=/usr/bin/date
+DIRNAME=/usr/bin/dirname
+ECHO=/usr/bin/echo
+EGREP=/usr/bin/egrep
+GEGREP=/usr/sfw/bin/gegrep
+ID=/usr/bin/id
+MKDIR=/usr/bin/mkdir
+MYHOSTNAME=/usr/bin/hostname
+RM=/usr/bin/rm
+SED=/usr/bin/sed
+SVCS=/usr/bin/svcs
+TEE=/usr/bin/tee
+TOUCH=/usr/bin/touch
+
+# ********************************************************************
+#
+#       Configuration Section
+#
+# ********************************************************************
+
+# Default user
+DEFAULT_USER=root
+
+# Directory on the root filesystem
+ENIQ_ROOT_DIR=/eniq
+
+# Install/Upgrade platform stage
+PLATFORM_STAGE="install_opengeo
+configure_opengeo"
+
+### Function: abort_script ###
+#
+#   This will is called if the script is aborted thru an error
+#   signal sent by the kernel such as CTRL-C or if a serious
+#   error is encountered during runtime
+#
+# Arguments:
+#       $1 - Error message from part of program (Not always used)
+# Return Values:
+#       none
+abort_script()
+{
+_err_time_=`$DATE '+%Y-%b-%d_%H.%M.%S'`
+
+if [ "$1" ]; then
+    _err_msg_="${_err_time_} - $1"
+else
+    _err_msg_="${_err_time_} - ERROR : Script aborted.......\n"
+fi
+
+if [ "${LOGFILE}" ]; then
+    $ECHO "\nERROR : ${_err_msg_}\n" | $TEE -a ${LOGFILE}
+else
+    $ECHO "\nERROR : ${_err_msg_}\n"
+fi
+
+exit 1
+}
+
+### Function: chk_create_logfile ###
+#
+# Check/Create Logfile
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+chk_create_logfile()
+{
+if [ ! -s ${LOGFILE} ]; then
+    $MKDIR -p `$DIRNAME ${LOGFILE}`
+    if [ $? -ne 0 ]; then
+        _err_msg_="Could not create directory `$DIRNAME ${LOGFILE}`"
+        abort_script "$_err_msg_"
+    fi
+
+    $TOUCH -a ${LOGFILE}
+    if [ $? -ne 0 ]; then
+        _err_msg_="Could not write to file ${LOGFILE}"
+        abort_script "$_err_msg_"
+    fi
+fi
+}
+
+
+### Function: check_id ###
+#
+#   Check that the effective id of the user is correct
+#   If not print error msg and exit.
+#
+# Arguments:
+#       $1 : User ID name
+# Return Values:
+#       none
+check_id()
+{
+_check_id_=`$ID  | $AWK -F\( '{print $2}' | $AWK -F\) '{print $1}'`
+if [ "$_check_id_" != "$1" ]; then
+    _err_msg_="You must be $1 to execute this script."
+    abort_script "$_err_msg_"
+fi
+}
+
+### Function: check_params ###
+#
+# Check Input Params
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+check_params()
+{
+# Check that we got the required params
+if [ ! "${BASE_SW_DIR}" ]; then
+    usage_msg
+    exit 1
+fi
+}
+
+
+### Function: get_absolute_path ###
+#
+# Determine absolute path to software
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+get_absolute_path()
+{
+_dir_=`$DIRNAME $0`
+SCRIPTHOME=`cd $_dir_ 2>/dev/null && pwd || $ECHO $_dir_`
+}
+
+### Function: install_config_opengeo ###
+#
+# Install and configure opengeo
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+install_config_opengeo()
+{
+if [ ! -s ${ENIQ_CORE_BIN_DIR}/eniq_core_install.bsh ]; then
+    _err_msg_="Could not locate ${ENIQ_CORE_BIN_DIR}/eniq_core_install.bsh script"
+    abort_script "$_err_msg_"
+fi
+
+# Upgrade the platform
+
+for _stage_ in ${PLATFORM_STAGE}; do
+    log_msg -q -l ${LOGFILE} -s "Executing ${_stage_} stage of eniq_core_install.bsh script."	
+    /usr/bin/bash ${ENIQ_CORE_BIN_DIR}/eniq_core_install.bsh -s ${_stage_} -n -d $BASE_SW_DIR -u -l ${LOGFILE}
+    if [ $? -ne 0 ]; then
+        _err_msg_="Failed in core install stage ${_stage_}"
+        abort_script "$_err_msg_"
+    fi
+done
+
+}
+
+### Function: setup_env ###
+#
+# Setup up path environment etc
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+setup_env()
+{
+if [ ! "${ENIQ_BASE_DIR}" ]; then
+    ENIQ_BASE_DIR=${ENIQ_ROOT_DIR}
+fi
+
+# Core install bin dir
+ENIQ_CORE_BIN_DIR=${ENIQ_BASE_DIR}/installation/core_install/bin
+
+if [ ! "${LOGFILE}" ]; then
+    # Set the log directory
+    LOGFILE_DIR="$ENIQ_BASE_DIR/log/feature_management_log"
+    LOGFILE=${LOGFILE_DIR}/upgrade_opengeo.log
+fi
+
+# Source the common functions
+if [ -s ${ENIQ_ROOT_DIR}/admin/lib/common_functions.lib ]; then
+    . ${ENIQ_ROOT_DIR}/admin/lib/common_functions.lib
+else
+    _err_msg_="File ${ENIQ_ROOT_DIR}/admin/lib/common_functions.lib not found"
+    abort_script "$_err_msg_"
+fi
+
+# Admin directory in the ENIQ filesystem
+ENIQ_ADMIN_DIR=${ENIQ_ROOT_DIR}/admin
+
+# Admin dir
+ENIQ_ADMIN_BIN_DIR=${ENIQ_ADMIN_DIR}/bin
+
+# ENIQ config directory
+ENIQ_CONF_DIR=${ENIQ_BASE_DIR}/installation/config
+
+CURR_SERVER_TYPE=`$CAT $ENIQ_CONF_DIR/installed_server_type | $GEGREP -v '^[[:blank:]]*#' | $SED -e 's/ //g'`
+if [ ! "${CURR_SERVER_TYPE}" ]; then
+        _err_msg_="Could not determine which server type this is"
+    abort_script "$_err_msg_"
+fi
+
+
+}
+
+### Function: stop_start_glassfish_service ###
+#
+#   Stop/start glassfish service
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+stop_start_glassfish_service()
+{
+_status_=$1
+log_msg -t -l ${LOGFILE} -s "Glassfish service is going to ${_status_}."
+/usr/bin/bash ${ENIQ_ADMIN_BIN_DIR}/manage_eniq_services.bsh -a ${_status_} -s glassfish -N -l ${LOGFILE}
+if [ $? -ne 0 ]; then
+    _err_msg_="Unable to stop glassfish service"
+    abort_script "$_err_msg_"
+fi
+}
+
+### Function: usage_msg ###
+#
+#   Print out the usage message
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+usage_msg()
+{
+$CLEAR
+$ECHO "
+Usage: `$BASENAME $0` -d <eniq_sw_dir> [ -b <eniq_base_dir> ] [ -l <path_to_logfile> ]
+
+options:
+
+-b  : Optional parameter specifying the full path to where the ENIQ
+      BASEDIR directory is (eg. /eniq). If not specified, then the
+      script will assume the the base directory is /eniq
+
+-d  : Parameter specifying the full path to the directory
+      containing the ENIQ BASE SW directory structure.
+
+-l  : Optional parameter specifying the full path to logfile.
+"
+}
+
+# ********************************************************************
+#
+#       Main body of program
+#
+# ********************************************************************
+#
+
+# Determine absolute path to software
+get_absolute_path
+
+# Check that the effective id of the user is root
+check_id $DEFAULT_USER
+
+while getopts ":b:d:l:" arg; do
+  case $arg in
+    b) ENIQ_BASE_DIR="$OPTARG"
+       ;;
+    d) BASE_SW_DIR="$OPTARG"
+       ;;
+    l) LOGFILE="$OPTARG"
+       ;;
+   \?) usage_msg
+       exit 1
+       ;;
+  esac
+done
+
+shift `expr $OPTIND - 1`
+
+# Check Input Params
+check_params
+
+# Setup up path environment etc
+setup_env
+
+# Check/Create Logfile
+chk_create_logfile
+
+log_msg -h -t -s "Starting executing script upgrade_opengeo.bsh" -l ${LOGFILE}
+
+if [ "${CURR_SERVER_TYPE}" == "eniq_ui" -o "${CURR_SERVER_TYPE}" == "eniq_events" ]; then
+    # Stopping glassfish service
+    stop_start_glassfish_service stop
+
+    # Install and configure opengeo
+    install_config_opengeo
+
+    # Restarting glassfish service
+    stop_start_glassfish_service restart
+else
+    _err_msg_="You must be on presentation/standalone server to execute this script." 
+    abort_script "$_err_msg_"
+fi
+
+log_msg -t -h -s "upgrade_opengeo.bsh has been executed successfully." -l ${LOGFILE}
+
+exit 0

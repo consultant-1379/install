@@ -1,0 +1,826 @@
+#!/bin/bash
+# ********************************************************************
+# Ericsson Radio Systems AB                                     SCRIPT
+# ********************************************************************
+#
+#
+# (c) Ericsson Radio Systems AB 2018 - All rights reserved.
+#
+# The copyright to the computer program(s) herein is the property
+# of Ericsson Radio Systems AB, Sweden. The programs may be used 
+# and/or copied only with the written permission from Ericsson Radio 
+# Systems AB or in accordance with the terms and conditions stipulated 
+# in the agreement/contract under which the program(s) have been 
+# supplied.
+#
+# ********************************************************************
+# Name    : manage_deployment_services.bsh
+# Date    : 28/09/2023
+# Revision: main\16
+# Purpose : ENIQ script that will start and stop ENIQ services
+#           in the correct order across all nodes in the deployment.
+#
+# Usage   : manage_deployment_services.bsh -a <service_action> 
+#               -s [ALL|roll-snap] [ -b <base_sw_dir> ] [ -N ]
+#										
+#
+# ********************************************************************
+#
+# 	Command Section
+#
+# ********************************************************************
+
+AWK=/usr/bin/awk
+BASENAME=/usr/bin/basename
+CAT=/usr/bin/cat
+CP=/usr/bin/cp
+DATE=/usr/bin/date
+DIRNAME=/usr/bin/dirname
+ECHO="/usr/bin/echo -e"
+ENV=/usr/bin/env
+EGREP=/usr/bin/egrep
+GAWK=/usr/bin/gawk
+GETENT=/usr/bin/getent
+GREP=/usr/bin/grep
+HEAD=/usr/bin/head
+HOSTNAME=/usr/bin/hostname
+ID=/usr/bin/id
+LS=/usr/bin/ls
+MKDIR=/usr/bin/mkdir
+MV=/usr/bin/mv
+PERL=/usr/bin/perl
+PRINTF=/usr/bin/printf
+PWD=/usr/bin/pwd
+RM=/usr/bin/rm
+ROLES=/usr/bin/roles
+SED=/usr/bin/sed
+SUDO=/usr/bin/sudo
+TAC=/usr/bin/tac
+TEE=/usr/bin/tee
+TOUCH=/usr/bin/touch
+WC=/usr/bin/wc
+
+# ********************************************************************
+#
+#       Configuration Section
+#
+# ********************************************************************
+
+# Default user
+DEFAULT_USER=root
+
+# Coordinator server list
+CO_SERVER_TYPE="eniq_coordinator|stats_coordinator|eniq_events|eniq_stats|eniq_iqw|son_coordinator|eniq_es"
+
+# ********************************************************************
+#
+#       Pre-execution Operations
+#
+# ********************************************************************
+
+
+# ********************************************************************
+#
+# 	Functions
+#
+# ********************************************************************
+### Function: abort_script ###
+#
+#   This is called if the script is aborted through an error
+#   signal sent by the kernel such as CTRL-C or if a serious
+#   error is encountered during runtime
+#
+# Arguments:
+#       $1 - Error message from part of program (Not always used)
+# Return Values:
+#       none
+abort_script()
+{
+_err_time_=`$DATE '+%Y-%b-%d_%H.%M.%S'`	
+
+if [ "$1" ]; then
+    _err_msg_="${_err_time_} - $1"
+else
+    _err_msg_="${_err_time_} - Script aborted.......\n"    
+fi
+if [ "${LOGFILE}" ]; then
+    $ECHO "\nERROR : ${_err_msg_}\n" | $TEE -a ${LOGFILE}
+else
+    $ECHO "\nERROR : ${_err_msg_}\n"
+fi
+
+cd $SCRIPTHOME
+$RM -rf ${TEM_DIR}
+
+if [ "$2" ]; then
+    ${2}
+else
+   exit 1
+fi
+}
+
+### Function: build_service_command ###
+#
+# Builds the service command string for local/remote
+#
+# Arguments:
+#	none
+# Return Values:
+#	none
+build_service_command()
+{
+local _srv_cmd_=$1
+
+# If the roll-snap service is to be included,
+# we better let the service script know
+local _include_roll_snap_=""
+local _upg_flag_=""
+
+#if [ "${INCLUDE_ROLLSNAP}" ]; then
+#	_include_roll_snap_="-R"
+#fi
+
+if [ "${SRVC_NAME}" != "roll-snap" ]; then
+	_upg_flag_="-u"
+fi
+
+SERVICE_COMMAND="$BASH ${ENIQ_ADMIN_DIR}/bin/manage_eniq_services.bsh -a ${_srv_cmd_} -s ${SRVC_NAME} -l ${LOGFILE} -N ${_upg_flag_} ${_include_roll_snap_}"
+}
+
+### Function: check_files_scripts ###
+#
+# Check all required files and scripts exist
+#
+# Arguments:
+#	none
+# Return Values:
+#	none
+check_files_scripts()
+{
+if [ ! -s ${ENIQ_ADMIN_DIR}/bin/manage_eniq_services.bsh ]; then
+	_err_msg_="${ENIQ_ADMIN_DIR}/bin/manage_eniq_services.bsh script not found"
+	abort_script "${_err_msg_}"
+fi
+
+if [ ! -s ${ENIQ_CORE_INST_DIR}/lib/get_ip_order.pl ]; then
+	_err_msg_="${ENIQ_CORE_INST_DIR}/lib/get_ip_order.pl script not found"
+	abort_script "${_err_msg_}"
+fi
+
+if [ ! -s ${ENIQ_CORE_INST_DIR}/etc/${INSTALL_TYPE}_server_list ]; then
+	_err_msg_="${ENIQ_CORE_INST_DIR}/etc/${INSTALL_TYPE}_server_list file not found, or is empty"
+    abort_script "${_err_msg_}"
+fi
+
+if [ ! -s ${SVC_CONTRACT_INFO} ]; then
+    _err_msg_="Could not find ${SVC_CONTRACT_INFO} file, or it is empty"
+    abort_script "${_err_msg_}" 
+fi
+
+if [ ! -s ${SERVER_TYPES_FILE} ]; then
+    _err_msg_="Could not find ${SERVER_TYPES_FILE} file, or it is empty"
+    abort_script "${_err_msg_}" 
+fi
+
+if [ ! -s ${SERVICE_NAMES_FILE} ]; then
+    _err_msg_="Could not find ${SERVICE_NAMES_FILE} file, or it is empty"
+    abort_script "${_err_msg_}" 
+fi
+}
+
+### Function: check_params ###
+#
+# Check Input Params
+#
+# Arguments:
+#	none
+# Return Values:
+#	none
+check_params()
+{
+if [ ! "${SRVC_ACTION}" -o ! "${SRVC_NAME}" ]; then
+    usage_msg
+    exit 1
+fi
+
+if [ "${SRVC_NAME}" != "ALL" -a "${SRVC_NAME}" != "roll-snap" ]; then
+    usage_msg
+    exit 1
+fi
+
+case "${SRVC_ACTION}" in
+     list)  PRINT_MSG="Listing"
+            ;;
+    start)  PRINT_MSG="Starting"
+            ;;
+     stop)  PRINT_MSG="Stopping"
+            ;;
+  restart)  PRINT_MSG="Restarting"
+            ;;
+        *)  usage_msg
+            exit 1
+            ;;
+esac
+}
+
+### Function: chk_create_logfile ###
+#
+# Check/Create Logfile
+#
+# Arguments:
+#	none
+# Return Values:
+#	none
+chk_create_logfile()
+{
+$MKDIR -p `$DIRNAME ${LOGFILE}`
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not create directory `$DIRNAME ${LOGFILE}`"
+     abort_script "${_err_msg_}"
+fi	
+
+# The LOGFILE is set by default, and cannot be overwritten
+# This is a design decision so that the logs are centrally
+# controlled for this script
+$TOUCH -a ${LOGFILE}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not write to file ${LOGFILE}"
+    abort_script "${_err_msg_}"
+fi	
+}
+
+### Function: check_id ###
+#
+#   Check that the effective id of the user is correct
+#   If not print error msg and exit.
+#
+# Arguments:
+#       $1 : User ID name
+# Return Values:
+#       none
+check_id()
+{
+_get_id_=`$ENV |$GREP -w SUDO_USER | $EGREP "^[[:blank:]]*SUDO_USER="|$AWK -F\= '{print $2}'|$SED -e 's|"||g'`
+
+_check_id_=`$ID | $AWK -F\( '{print $2}' | $AWK -F\) '{print $1}'`
+
+_check_group_=`$ID $_get_id_ | $AWK -F\( '{print $3}' | $AWK -F\) '{print $1}'`
+
+
+    if [ "${_get_id_}" == "" ]; then
+
+        if [ "${_check_id_}" == "root" ]; then
+           # Set 1 for true
+           _user_root=1
+
+        else
+           _err_msg_="You must be root or admin to execute this script."
+           abort_script "${_err_msg_}"
+        fi
+    else
+        if [ "${_check_group_}" == "ENIQ_ADMIN_ROLE" ]; then
+           # Set 0 for false
+           _user_root=0
+
+        else
+            _err_msg_="You must be root or admin to execute this script." 
+            abort_script "${_err_msg_}"
+        fi
+    fi
+
+}
+
+
+### Function: clear ###
+#
+# Clears the terminal screen
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+clear()
+{
+# Clearing the screen without removing scrollback buffer
+$PRINTF '\33[H\33[2J'
+}
+
+
+### Function: get_absolute_path ###
+#
+# Determine absolute path to software
+#
+# Arguments:
+#	none
+# Return Values:
+#	none
+get_absolute_path() 
+{
+_dir_=`$DIRNAME $0`
+SCRIPTHOME=`cd $_dir_ 2>/dev/null && pwd || $ECHO $_dir_`
+}
+
+### Function: get_deployment_order ###
+#
+# Get the order of the deployment
+# for starting and stopping services
+#
+# Arguments:
+#	none
+# Return Values:
+#	none
+get_deployment_order()
+{
+$RM -rf ${TEM_DIR}/server_order_list ${TEM_DIR}/service_start_order ${TEM_DIR}/service_stop_order
+
+# Get an ordered list of servers based on the server_list file
+$PERL ${ENIQ_CORE_INST_DIR}/lib/get_ip_order.pl -f ${TEM_DIR}/service_start_order
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not get an ordered list of servers"
+    abort_script "${_err_msg_}"
+fi
+
+# Reverse the created file for the stop order
+$TAC ${TEM_DIR}/service_start_order > ${TEM_DIR}/service_stop_order
+}
+
+### Function: list_eniq_services ###
+#
+# List Services across deployment
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+list_eniq_services()
+{
+local _server_det_file_=$1
+
+# Build up the command to use for listing the services
+build_service_command "list"
+
+for _line_ in `$CAT ${_server_det_file_}`; do
+
+	local _count_=`$ECHO "${_line_}" | $GREP -o "::" | $WC -l`
+	if [ "${_ip_type_}" == "IPv6" -a "${_count_}" == 3 ]; then
+		local _ip_address_=`$ECHO ${_line_} | $GREP -oE '([a-fA-F0-9]{1,4}::?){1,7}[a-fA-F0-9]{1,4}' | $HEAD -n 1 | $AWK -F "::" '{ print $1 "::" $2}'`
+		local _serv_hostname_=`$ECHO ${_line_} | $AWK -F"::" '{print $3}'`
+		local _serv_type_=`$ECHO ${_line_} | $AWK -F"::" '{print $4}'`
+	else
+		local _ip_address_=`$ECHO ${_line_} | $AWK -F"::" '{print $1}'`
+		local _serv_hostname_=`$ECHO ${_line_} | $AWK -F"::" '{print $2}'`
+		local _serv_type_=`$ECHO ${_line_} | $AWK -F"::" '{print $3}'`
+
+	fi
+
+        if [ ! "${_ip_address_}" -o ! "${_serv_hostname_}" ]; then
+                _err_msg_="Could not read required info from ${_server_det_file_}"
+                abort_script "${_err_msg_}"
+        fi
+
+        # If the IP found in the order file matches my IP,
+        # then I better run the command locally - no need to ssh
+        log_msg -s "${PRINT_MSG} services on ${_serv_hostname_}" -l $LOGFILE -h
+        if [ "${_ip_address_}" == "${HOST_IP}" ]; then
+                ${SERVICE_COMMAND}
+                if [ $? -ne 0 ]; then
+                        _err_msg_="Could not list services on ${HNAME}"
+                        abort_script "${_err_msg_}"
+                fi
+        else
+		
+		if [ "${_user_root}" == 1 ]; then
+        
+        # Execute Root command
+        run_remote_cmd "${_serv_hostname_}" "${SERVICE_COMMAND}" "$LOGFILE"   
+        if [ $? -ne 0 ]; then
+            _err_msg_="Could not list all required services on ${_serv_hostname_}"
+            abort_script "${_err_msg_}"
+        fi
+         else
+            # Execute non root admin user command
+            run_remote_cmd "${_serv_hostname_}" "$SUDO ${SERVICE_COMMAND}" "$LOGFILE" "$_get_id_"
+        if [ $? -ne 0 ]; then
+            _err_msg_="Could not list all required services on ${_serv_hostname_}"
+            abort_script "${_err_msg_}"
+        fi            
+		fi
+		
+    fi
+done
+}
+
+### Function: restart_eniq_services ###
+#
+# Restart the ENIQ services in the deployment
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+restart_eniq_services()
+{
+local _stop_det_file_=$1
+local _start_det_file_=$2
+
+if [ ! "${NO_CONFIRM}" ]; then
+     user_confirm "${SRVC_ACTION} the services" "${_stop_det_file_}"
+     if [ "$USER_CONF" == "No" ]; then
+         $RM -rf ${TEM_DIR}
+         exit 0
+     fi    
+fi
+    
+# Stop the services
+NO_CONFIRM="YES" 
+PRINT_MSG="Stopping"
+stop_eniq_services ${_stop_det_file_}
+
+# Start the services
+NO_CONFIRM="YES" 
+PRINT_MSG="Starting"
+start_eniq_services ${_start_det_file_}
+}
+
+### Function: setup_env ###
+#
+# Set up environment variables for script.
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+setup_env()
+{
+if [ ! "${ENIQ_BASE_DIR}" ]; then
+    # Directory on the root filesystem
+    ENIQ_BASE_DIR=/eniq
+fi
+
+# ENIQ Log Directory
+ENIQ_LOG_DIR=${ENIQ_BASE_DIR}/log
+LOGFILE_DIR="${ENIQ_LOG_DIR}/deployment_services_log"
+
+# Main Directory for the Core Installation SW
+ENIQ_INST_DIR=${ENIQ_BASE_DIR}/installation
+
+# Main Directory for the Core Installation SW
+ENIQ_CORE_INST_DIR=${ENIQ_INST_DIR}/core_install
+
+# ENIQ Config Directory
+ENIQ_CONF_DIR=${ENIQ_INST_DIR}/config
+
+# ENIQ Admin Directory
+ENIQ_ADMIN_DIR=${ENIQ_BASE_DIR}/admin
+
+# SW conf dir
+CLI_CONF_DIR=${ENIQ_BASE_DIR}/sw/conf
+
+# Source the common functions
+if [ -s ${ENIQ_ADMIN_DIR}/lib/common_functions.lib ]; then
+    . ${ENIQ_ADMIN_DIR}/lib/common_functions.lib
+else
+    _err_msg_="File ${ENIQ_ADMIN_DIR}/lib/common_functions.lib not found"
+    abort_script "${_err_msg_}"
+fi
+
+# Get server type
+CURR_SERVER_TYPE=`$CAT $ENIQ_CONF_DIR/installed_server_type`
+if [ ! "${CURR_SERVER_TYPE}" ]; then
+    _err_msg_="Could not read $ENIQ_CONF_DIR/installed_server_type"
+    abort_script "${_err_msg_}" 
+fi
+
+$ECHO "${CURR_SERVER_TYPE}" | $EGREP -w "${CO_SERVER_TYPE}" >> /dev/null 2>&1
+if [ $? -eq 0 ]; then
+	SERVER_TYPE="CO"
+else
+	SERVER_TYPE="${CURR_SERVER_TYPE}"
+fi
+
+# File containing the type of OSS installation. Eg. oss or single
+INST_TYPE_FILE=${ENIQ_CONF_DIR}/ericsson_use_config
+if [ ! -s "${INST_TYPE_FILE}" ]; then
+    _err_msg_="ENIQ install type not defined in ${INST_TYPE_FILE}"
+    abort_script "${_err_msg_}"
+fi
+# Read the installation type
+INSTALL_TYPE=`$CAT ${INST_TYPE_FILE} | $GAWK -F\= '{print $2}'`
+
+# Contract file containing the service info
+SVC_CONTRACT_INFO=${ENIQ_ADMIN_DIR}/etc/smf_contract_config
+
+# File containing the servers installed
+SERVER_TYPES_FILE=${CLI_CONF_DIR}/server_types
+
+# Service names file
+SERVICE_NAMES_FILE=${CLI_CONF_DIR}/service_names 
+
+HNAME=`${HOSTNAME} -s`
+HOST_IP=`$HOSTNAME -i | $AWK '{print $1}' | $HEAD -1`
+
+#Check IP Type
+check_ip_type
+}
+
+### Function: start_eniq_services ###
+#
+# Start the ENIQ services in the deployment
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+start_eniq_services()
+{
+local _server_det_file_=$1
+
+if [ ! "${NO_CONFIRM}" ]; then
+     user_confirm "start the services" "${_server_det_file_}"
+     if [ "$USER_CONF" == "No" ]; then
+         $RM -rf ${TEM_DIR}
+         exit 0
+     fi    
+fi
+
+# Build up the command to use for stopping the services
+build_service_command "start"
+
+for _line_ in `$CAT ${_server_det_file_}`; do
+
+	local _count_=`$ECHO "${_line_}" | $GREP -o "::" | $WC -l`
+	if [ "${_ip_type_}" == "IPv6" -a "${_count_}" == 3 ]; then
+		local _ip_address_=`$ECHO ${_line_} | $GREP -oE '([a-fA-F0-9]{1,4}::?){1,7}[a-fA-F0-9]{1,4}' | $HEAD -n 1 | $AWK -F "::" '{ print $1 "::" $2}'`
+		local _serv_hostname_=`$ECHO ${_line_} | $AWK -F"::" '{print $3}'`
+		local _serv_type_=`$ECHO ${_line_} | $AWK -F"::" '{print $4}'`
+	else
+		local _ip_address_=`$ECHO ${_line_} | $AWK -F"::" '{print $1}'`
+		local _serv_hostname_=`$ECHO ${_line_} | $AWK -F"::" '{print $2}'`
+		local _serv_type_=`$ECHO ${_line_} | $AWK -F"::" '{print $3}'`
+
+	fi
+
+	if [ ! "${_ip_address_}" -o ! "${_serv_hostname_}" ]; then
+		_err_msg_="Could not read required info from ${_server_det_file_}"
+		abort_script "${_err_msg_}"
+	fi
+	
+	# If the IP found in the order file matches my IP,
+	# then I better run the command locally - no need to ssh
+	log_msg -s "${PRINT_MSG} services on ${_serv_hostname_}" -l $LOGFILE -h
+	if [ "${_ip_address_}" == "${HOST_IP}" ]; then
+		${SERVICE_COMMAND}
+		if [ $? -ne 0 ]; then
+			_err_msg_="Could not start services on ${HNAME}"
+			abort_script "${_err_msg_}"
+		fi
+	else
+	
+	if [ "${_user_root}" == 1 ]; then
+        
+        # Execute Root command
+        run_remote_cmd "${_serv_hostname_}" "${SERVICE_COMMAND}" "$LOGFILE"   
+        if [ $? -ne 0 ]; then
+            _err_msg_="Could not list all required services on ${_serv_hostname_}"
+            abort_script "${_err_msg_}"
+        fi
+         else
+            # Execute non root admin user command
+            run_remote_cmd "${_serv_hostname_}" "$SUDO ${SERVICE_COMMAND}" "$LOGFILE" "$_get_id_"
+        if [ $? -ne 0 ]; then
+            _err_msg_="Could not list all required services on ${_serv_hostname_}"
+            abort_script "${_err_msg_}"
+        fi            
+	fi
+	
+	fi
+done
+
+# Update timestamp in Sybase version files.
+$BASH ${ENIQ_CORE_INST_DIR}/bin/update_sybase_iq_timestamp.bsh &>/dev/null
+
+}
+
+### Function: stop_eniq_services ###
+#
+# Stop the ENIQ services in the deployment
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+stop_eniq_services()
+{
+local _server_det_file_=$1
+
+if [ ! "${NO_CONFIRM}" ]; then
+     user_confirm "${SRVC_ACTION} the services" "${_server_det_file_}"
+     if [ "$USER_CONF" == "No" ]; then
+         $RM -rf ${TEM_DIR}
+         exit 0
+     fi    
+fi
+
+# Build up the command to use for stopping the services
+build_service_command "stop"
+
+for _line_ in `$CAT ${_server_det_file_}`; do
+
+	local _count_=`$ECHO "${_line_}" | $GREP -o "::" | $WC -l`
+	if [ "${_ip_type_}" == "IPv6" -a "${_count_}" == 3 ]; then
+		local _ip_address_=`$ECHO ${_line_} | $GREP -oE '([a-fA-F0-9]{1,4}::?){1,7}[a-fA-F0-9]{1,4}' | $HEAD -n 1 | $AWK -F "::" '{ print $1 "::" $2}'`
+		local _serv_hostname_=`$ECHO ${_line_} | $AWK -F"::" '{print $3}'`
+		local _serv_type_=`$ECHO ${_line_} | $AWK -F"::" '{print $4}'`
+	else
+		local _ip_address_=`$ECHO ${_line_} | $AWK -F"::" '{print $1}'`
+		local _serv_hostname_=`$ECHO ${_line_} | $AWK -F"::" '{print $2}'`
+		local _serv_type_=`$ECHO ${_line_} | $AWK -F"::" '{print $3}'`
+
+	fi
+
+	if [ ! "${_ip_address_}" -o ! "${_serv_hostname_}" ]; then
+		_err_msg_="Could not read required info from ${_reversed_server_det_file_}"
+		abort_script "${_err_msg_}"
+	fi
+
+	# If the IP found in the order file matches my IP,
+	# then I better run the command locally - no need to ssh
+	log_msg -s "${PRINT_MSG} services on ${_serv_hostname_}" -l $LOGFILE -h
+	if [ "${_ip_address_}" == "${HOST_IP}" ]; then
+		${SERVICE_COMMAND}
+		if [ $? -ne 0 ]; then
+			_err_msg_="Could not stop services on ${HNAME}"
+			abort_script "${_err_msg_}"
+		fi
+	else
+	
+	if [ "${_user_root}" == 1 ]; then
+        
+        # Execute Root command
+        run_remote_cmd "${_serv_hostname_}" "${SERVICE_COMMAND}" "$LOGFILE"   
+        if [ $? -ne 0 ]; then
+            _err_msg_="Could not list all required services on ${_serv_hostname_}"
+            abort_script "${_err_msg_}"
+        fi
+         else
+            # Execute non root admin user command
+            run_remote_cmd "${_serv_hostname_}" "$SUDO ${SERVICE_COMMAND}" "$LOGFILE" "$_get_id_"
+        if [ $? -ne 0 ]; then
+            _err_msg_="Could not list all required services on ${_serv_hostname_}"
+            abort_script "${_err_msg_}"
+        fi            
+	fi
+	
+	fi
+done 
+}
+
+
+### Function: usage_msg ###
+#
+#   Print out the usage message
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+usage_msg()
+{
+clear
+$ECHO "
+Usage: `$BASENAME $0` -a <service_action> -s <ALL|roll-snap> 
+
+options:
+    
+-a:	Service Action. Must be either 
+		list	--> List the ENIQ services in the deployment
+		stop	--> Stop the ENIQ services in the deployment
+		start	--> Start the ENIQ services in the deployment
+		restart	--> Restart the ENIQ services in the deployment
+
+-s:	Parameter specifying the service(s) you wish to start/stop.
+		ALL		--> Manage the ENIQ services and DDC
+		roll-snap	--> Manage the rolling snapshot service
+"
+}
+
+### Function: user_confirm ###
+#
+# Get confirmation from user to proceed with snapshot action
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+user_confirm()
+{
+local _conf_msg_=$1
+local _server_det_file_=$2
+	
+while :; do
+    unset USER_CONF
+    clear
+    $ECHO "\nDeployed Servers\n================"
+    #$CAT ${_server_det_file_} | $GAWK -F"::" '{print $2}'
+	for _line_ in `$CAT ${_server_det_file_}`; do
+        local _count_=`$ECHO "${_line_}" | $GREP -o "::" | $WC -l`
+        if [ "${_ip_type_}" == "IPv6" -a "${_count_}" == 3 ]; then
+            $CAT ${_server_det_file_} | $GAWK -F"::" '{print $3}'
+            break
+        else
+           $CAT ${_server_det_file_} | $GAWK -F"::" '{print $2}'
+           break
+        fi
+    done
+	
+    $ECHO "\nAre you sure you wish to ${_conf_msg_} on the above servers?"
+    $ECHO "Enter [Yes | No] (case sensitive) : \c"
+    read USER_CONF
+    if [ "$USER_CONF" == "Yes" -o "$USER_CONF" == "No" ]; then
+         break
+    fi
+done
+}
+
+# ********************************************************************
+#
+# 	Main body of program
+#
+# ********************************************************************
+#
+# Determine absolute path to software
+get_absolute_path
+
+# Check that the effective id of the user is root or admin
+check_id
+
+while getopts ":a:b:Ns:" arg; do
+  case $arg in
+    a) SRVC_ACTION="$OPTARG" 
+       ;;
+    b) ENIQ_BASE_DIR="$OPTARG"
+       ;;
+    N) NO_CONFIRM="YES" 
+       ;;
+    s) SRVC_NAME="$OPTARG" 
+       ;;
+   \?) usage_msg 
+       exit 1
+       ;;
+  esac
+done
+shift `expr $OPTIND - 1`
+
+# Set up environment variables for script.
+setup_env
+
+# Check Input Params
+check_params 
+
+# Only run on the coordinator
+if [ "${SERVER_TYPE}" != "CO" ]; then
+	_err_msg_="$0 can not be executed on ${SERVER_TYPE} server types"
+    abort_script "${_err_msg_}"
+fi
+
+# Check/Create Logfile
+LOGFILE=${LOGFILE_DIR}/manage_deployment_services.log
+chk_create_logfile
+
+# Create a temporary directory
+TEM_DIR=/tmp/manage_deployment_services.$$.$$
+$RM -rf ${TEM_DIR}
+$MKDIR -p ${TEM_DIR}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not create directory ${TEM_DIR}"
+    abort_script "${_err_msg_}"
+fi
+
+# Check all required files and scripts exist
+check_files_scripts
+
+# Get the order to start and stop services
+get_deployment_order
+
+clear
+
+case "${SRVC_ACTION}" in
+	 list) 		list_eniq_services ${TEM_DIR}/service_start_order
+		;;
+	start)		start_eniq_services ${TEM_DIR}/service_start_order
+		;;
+	stop) 		stop_eniq_services ${TEM_DIR}/service_stop_order
+		;;
+	restart) 	restart_eniq_services ${TEM_DIR}/service_stop_order ${TEM_DIR}/service_start_order
+		;;           	
+	*)		: # SHOULD NOT GET HERE
+		;;
+esac
+
+if [ ! "${NO_CONFIRM}" ]; then
+	$ECHO "\nLOGFILE: $LOGFILE\n\n"
+fi
+
+$RM -rf ${TEM_DIR}
+
+exit 0

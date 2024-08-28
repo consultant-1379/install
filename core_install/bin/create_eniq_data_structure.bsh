@@ -1,0 +1,177 @@
+#!/bin/bash
+
+# Rev D
+
+####
+# Function to write the logs to file
+####
+TIMESTAMP=`date +%y.%m.%d_%H:%M:%S`
+
+
+
+
+
+
+
+LOG_FILE=/eniq/log/sw_log/engine/dir_checker_${TIMESTAMP}.log
+ENIQ_BASE_DIR=/eniq
+ENIQ_SW_DIR=${ENIQ_BASE_DIR}/sw/bin
+
+
+_echo()
+{
+	echo ${*} >> $LOG_FILE
+}
+
+_echo "Directory Checker Logs:"
+_echo "-----------------------"
+_echo ""
+
+####
+# Function to run Directory checker only on Blade/MultiBlade servers
+####
+directoryChecker()
+{
+        . ${CONF_DIR}/niq.rc
+        . /eniq/installation/core_install/lib/common_functions.lib
+        ini_file="${CONF_DIR}/niq.ini"
+        if [ -f "${CONF_DIR}/dwh.ini" ] ; then
+        ini_file="${CONF_DIR}/dwh.ini"
+        fi
+
+        dbusers="${INSTALLER_DIR}/dbusers"
+        dbisqlc="/eniq/sql_anywhere/bin64/dbisqlc"
+        etlrep_usr="etlrep"
+        repdb_name=$(iniget REP -v ServerName -f ${ini_file})
+        repdb_port=$(iniget REP -v PortNumber -f ${ini_file})
+        etlrep_pwd=$(${dbusers} ${etlrep_usr} ${etlrep_usr})
+        repdb_url="con=${repdb_name};eng=${repdb_name};uid=${etlrep_usr};pwd=${etlrep_pwd};links=tcpip(host=localhost;port=${repdb_port})"
+		repdb_url_enc=/tmp/conn_str_data_structure.`uuidgen`				
+
+		# encrypt the connection string.
+		get_encrypt_file "${repdb_url}" "${repdb_url_enc}"										   
+		
+        output="$HOME/query_results"
+        rm -rf "${output}"
+        kicker_script="${ENIQ_SW_DIR}/dir_checker_kicker.bsh"
+        rm -rf "${kicker_script}"
+
+        get_dir_set_sql="
+        SELECT
+                mcs.COLLECTION_SET_NAME
+                ,mc.COLLECTION_NAME
+        FROM
+                META_COLLECTION_SETS mcs,
+                META_COLLECTIONS mc
+        WHERE
+                mcs.ENABLED_FLAG = 'Y'
+        AND mcs.COLLECTION_SET_ID = mc.COLLECTION_SET_ID
+        AND mc.COLLECTION_NAME LIKE 'Directory_Checker_%'"
+
+        ${dbisqlc} -q -c @${repdb_url_enc} "${get_dir_set_sql};OUTPUT TO ${output} FORMAT FIXED;"
+        exit_code=$?
+        if [ -f "${output}" ] ; then
+                echo "#!/bin/bash" > ${kicker_script}
+                echo "#Function to save LOG file." >> ${kicker_script}
+                echo "TIMESTAMP=\`date +%y.%m.%d_%H:%M:%S\`" >> ${kicker_script}
+                echo "LOG_FILE=$LOG_FILE" >> ${kicker_script}
+                echo "_echo(){" >> ${kicker_script}
+                echo "  echo \${*} >> \$LOG_FILE" >> ${kicker_script}
+                echo "}" >> ${kicker_script}
+                echo "_echo \"Start Time = \`date\` \" "  >> ${kicker_script}
+                awk '{print "_echo \"Scheduling "$1" Set "$2"\"\nengine -e startAndWaitSet "$1" "$2" >> $LOG_FILE"}' "${output}" >> ${kicker_script}
+                echo "_echo \"End Time = \`date\` \" "  >> ${kicker_script}
+                chmod +x ${kicker_script}
+                echo "Run ${kicker_script} to rescheduler DirectoryChecker Sets"
+
+                bash ${kicker_script}
+                rm -rf "${output}"
+                echo "Execution done successfully"
+        else
+                echo "Error running sql!"
+        fi
+}
+
+#########
+#Function to Check whether rack or blade server.
+#########
+run_script()
+{ 
+    #To run the script if we upgrade from < S13A track.
+    eniq_ver=`cat /eniq/admin/version/eniq_status | grep -i shipment | cut -d" " -f2 | cut -d"_" -f4 | cut -d"." -f1`
+    eniq_ver=`expr $eniq_ver + 0`
+    if [ $eniq_ver -lt 13 ]
+    then
+        _echo "Exiting...."
+		$RM -rf ${repdb_url_enc}				  
+        exit 4;
+    else
+        #Run the directory checker script.
+        _echo "Running Directory Checker script..."
+        directoryChecker
+
+    fi
+}
+
+#####
+# Check whether server is jumpstarted or upgraded.
+#####
+server_type()
+{
+if [ -s /eniq/admin/version/eniq_status ]; then
+	_echo "You are upgrading your server."
+	run_script
+else
+	_echo "Directory checker set will not run. File size of eniq_status is zero(0)."
+	_echo "Exiting...."
+	$RM -rf ${repdb_url_enc}					 
+	exit 3;
+fi
+}
+
+#######
+# Script Usage
+#######
+usage()
+{
+	_echo "Print usage as arguments are improper."
+	echo ""
+	echo "Usage:	`basename $0` <option>"
+	echo "Option:"
+	echo "	-f	: To run the script forcefully."
+	echo ""
+}
+	
+
+#######
+# Check for OMBS
+#######
+
+#type=`cat /eniq/installation/config/san_details | grep -i STORAGE_TYPE | awk -F"=" '{print $2}'`
+#if [ "$type" == "raw" ]
+#then
+	#_echo "This is a Blade/MultiBlade Server."
+	if [ $# -ne 0 ] 
+	then
+		_echo "Checking for OMBS...."
+		if [ $# -eq 1 -a $1 == "-f" ]
+		then
+			_echo "Run Directory Checker..."
+			directoryChecker
+		else
+			usage
+			$RM -rf ${repdb_url_enc}
+			exit 2;
+		fi
+	else
+		# Check for upgrade/jumpstart.
+		_echo "Checking for upgrade/jumpstart"
+		server_type
+	fi
+#else
+	#_echo "This is not a Blade/MultiBlade server. Directory checker will not run..."
+	#_echo "Exiting...."
+	#exit 1;
+#fi
+$RM -rf ${repdb_url_enc}
+exit 0

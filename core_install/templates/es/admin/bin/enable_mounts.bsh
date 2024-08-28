@@ -1,0 +1,227 @@
+#!/bin/bash
+# ********************************************************************
+# Ericsson Radio Systems AB                                     SCRIPT
+# ********************************************************************
+#
+#
+# (c) Ericsson Radio Systems AB 2013 - All rights reserved.
+#
+# The copyright to the computer program(s) herein is the property
+# of Ericsson Radio Systems AB, Sweden. The programs may be used 
+# and/or copied only with the written permission from Ericsson Radio 
+# Systems AB or in accordance with the terms and conditions stipulated 
+# in the agreement/contract under which the program(s) have been 
+# supplied.
+#
+# ********************************************************************
+# Name    : enable_mounts.bsh
+# Date    : 16/01/2014
+# Revision: \main\7
+# Purpose : Enable ENIQ mounts so that processing can happen during 
+#			rolling upgrade.
+#
+# Usage   : enable_mounts.bsh [ -l <path_to_logfile> ]
+#
+# ********************************************************************
+#
+# 	Command Section
+#
+# ********************************************************************
+AWK=/usr/bin/awk
+DATE=/usr/bin/date
+ECHO=/usr/bin/echo
+
+# ********************************************************************
+#
+#       Configuration Section
+#
+# ********************************************************************
+# Directory on the root filesystem
+ENIQ_ROOT_DIR=/eniq
+
+COMMON_FUNCTIONS=/eniq/installation/core_install/lib/common_functions.lib
+NIQ_INI=$CONF_DIR/niq.ini
+
+if [ ! "${ENIQ_BASE_DIR}" ]; then
+    ENIQ_BASE_DIR=${ENIQ_ROOT_DIR}
+fi
+
+# Setup the log file:
+LOGFILE_DIR="$ENIQ_BASE_DIR/log/feature_management_log"
+RUN_TIME=`$DATE '+%Y-%b-%d_%H.%M.%S'`
+LOGFILE=${LOGFILE_DIR}/${RUN_TIME}_enable_mounts.log
+
+# ********************************************************************
+#
+#       Pre-execution Operations
+#
+# ********************************************************************
+
+
+# ********************************************************************
+#
+# 	Functions
+#
+# ********************************************************************
+### Function: abort_script ###
+#
+#   This will is called if the script is aborted thru an error
+#   error signal sent by the kernel such as CTRL-C or if a serious
+#   error is encountered during runtime
+#
+# Arguments:
+#       $1 - Error message from part of program (Not always used)
+# Return Values:
+#       none
+abort_script()
+{
+_err_time_=`$DATE '+%Y-%b-%d_%H.%M.%S'`
+
+if [ "$1" ]; then
+    _err_msg_="${_err_time_} - $1"
+else
+    _err_msg_="${_err_time_} - ERROR : Script aborted.......\n"
+fi
+
+if [ "${LOGFILE}" ]; then
+    log_msg -l ${LOGFILE} -s "$_err_msg_\n"
+else
+    $ECHO "\nERROR : $_err_msg_\n"
+fi
+
+exit 1
+}
+
+### Function: enable_mounts ###
+#
+#   Print out the usage message
+#
+# Arguments:
+#	none
+# Return Values:
+#	none
+enable_mounts() {
+OSS_REF_NAME_FILE=.oss_ref_name_file
+ENIQ_CONNECTD_DIR=/eniq/connectd/mount_info
+
+if [ ! -f $ENIQ_CONNECTD_DIR/$OSS_REF_NAME_FILE ]; then
+	abort_script "Couldn't find $ENIQ_CONNECTD_DIR/$OSS_REF_NAME_FILE, OSS mounts might not be set up"
+fi
+
+# Get the eniq_aliases from .oss_ref_name_file
+eniq_aliases=`$AWK '{print $1}' $ENIQ_CONNECTD_DIR/$OSS_REF_NAME_FILE`
+if [ ! "$eniq_aliases" ]; then
+	# If there are no aliases or there was a problem getting them, abort:
+	abort_script "Couldn't re-enable OSS mounts: failed to get list of ENIQ aliases from $ENIQ_CONNECTD_DIR/$OSS_REF_NAME_FILE"
+fi
+
+# Loop through each alias
+for alias in ${eniq_aliases}
+do
+	# Check the format of the OSS alias:
+	if [[ ! $alias =~ ^eniq_events_.*$ ]] && [[ ! $alias =~ ^events_oss_.*$ ]] && [[ ! $alias =~ ^eniq_oss_.*$ ]]; then
+		log_msg -t -l ${LOGFILE} -s "WARNING: invalid OSS alias read from $ENIQ_CONNECTD_DIR/$OSS_REF_NAME_FILE file: $alias"
+    fi
+		
+	if [ ! -d "${ENIQ_CONNECTD_DIR}/$alias" ]; then
+		# Check if the eniq_oss_1 directory is there. If it's not, OSS might not have been mounted:
+		log_msg -t -l ${LOGFILE} -s "WARNING: couldn't find ${ENIQ_CONNECTD_DIR}/${alias} directory, OSS mounts might not be set up"
+	fi
+	
+	# If disable_oss file exists in /eniq/connectd/mount_info/eniq_oss_1/, remove it
+	# Do case insensitive check:
+	local _found="false"
+    for file in `find $ENIQ_CONNECTD_DIR/$alias/ | grep -i "disable_oss"`; do
+		_found="true"
+		$RM -f ${file}
+		if [ $? -eq 0 ]; then
+			log_msg -t -l ${LOGFILE} -s "enable_mounts: Re-enabled mount for $alias"
+		else
+			log_msg -t -l ${LOGFILE} -s "Manually re-enable mount for $alias"
+		fi
+	done
+	
+	if [ ${_found} == "false" ]; then
+		# Couldn't find the disable_oss file with ls command:
+		log_msg -t -l ${LOGFILE} -s "Couldn't find $ENIQ_CONNECTD_DIR/$alias/disable_oss file"
+		log_msg -t -l ${LOGFILE} -s "Filesystem for $alias may be already mounted"
+	fi
+done
+}
+
+### Function: usage_msg ###
+#
+#   Print out the usage message
+#
+# Arguments:
+#	none
+# Return Values:
+#	none
+usage_msg() 
+{
+$ECHO "
+Usage: `$BASENAME $0` [ -l <path_to_logfile> ]
+                      
+options:
+
+-l  : Optional parameter specifying the full path to logfile. If not specified, a 
+      logfile will be created in ${LOGFILE_DIR}"
+}
+
+### Function: setup_logfile ###
+#
+# Make sure the log file is created.
+#
+# Arguments:
+#   $1 : Log file
+# Return Values:
+#	none
+setup_logfile() 
+{
+local _log_file_=$1
+
+$MKDIR -p `$DIRNAME ${_log_file_}`
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not create directory for logfile: `$DIRNAME ${_log_file_}`"
+     abort_script "$_err_msg_"
+fi
+
+if [ ! -f "${_log_file_}" ]; then
+    $TOUCH -a ${_log_file_}
+	if [ $? -ne 0 ]; then
+		_err_msg_="Could not write to file ${_log_file_}"
+		abort_script "$_err_msg_"
+	fi
+fi
+}
+
+# ********************************************************************
+#
+# 	Main body of program
+#
+# ********************************************************************
+#
+# Source the common functions
+if [ -s ${ENIQ_ROOT_DIR}/admin/lib/common_functions.lib ]; then
+    . ${ENIQ_ROOT_DIR}/admin/lib/common_functions.lib
+else
+    _err_msg_="File ${ENIQ_ROOT_DIR}/admin/lib/common_functions.lib not found"
+    abort_script "$_err_msg_"
+fi
+
+while getopts "l:" arg; do
+  case $arg in
+  l) LOGFILE="$OPTARG"
+       ;;
+  \?) usage_msg
+       exit 1
+       ;;
+  esac
+done
+  
+setup_logfile ${LOGFILE}
+
+# Enable the mounts
+enable_mounts
+
+

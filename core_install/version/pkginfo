@@ -1,0 +1,5 @@
+PKGINST=eniq_core_inst_sw_bundle.tar.gz
+NAME=ENIQ Merge Core Installation scripts
+ARCH=i386/sparc
+VERSION=R28J25
+PRODNUM=CXP9019948

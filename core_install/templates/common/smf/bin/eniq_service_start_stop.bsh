@@ -1,0 +1,306 @@
+#!/bin/bash
+# ********************************************************************
+# Ericsson Radio Systems AB                                     SCRIPT
+# ********************************************************************
+#
+#
+# (c) Ericsson Radio Systems AB 2018 - All rights reserved.
+#
+# The copyright to the computer program(s) herein is the property
+# of Ericsson Radio Systems AB, Sweden. The programs may be used 
+# and/or copied only with the written permission from Ericsson Radio 
+# Systems AB or in accordance with the terms and conditions stipulated 
+# in the agreement/contract under which the program(s) have been 
+# supplied.
+#
+# ********************************************************************
+# Name    : eniq_service_start_stop.bsh
+# Date    : 22/10/2018
+# Revision: 4
+# Purpose : Main wrapper script to manage the ENIQ services from dcuser.
+#           This script is called by the relevant service (e.g engine). 
+#
+# Usage   : eniq_service_start_stop.bsh
+#
+# ********************************************************************
+#
+# 	Command Section
+#
+# ********************************************************************
+AWK=/usr/bin/awk
+BASENAME=/usr/bin/basename
+DIRNAME=/usr/bin/dirname
+ECHO="/usr/bin/echo -e"
+GETENT=/usr/bin/getent
+GREP=/usr/bin/grep
+ID=/usr/bin/id
+PWD=/usr/bin/pwd
+RM=/usr/bin/rm
+ROLES=/usr/bin/roles
+SUDO=/usr/bin/sudo
+SYSTEMCTL=/usr/bin/systemctl
+TEE=/usr/bin/tee
+
+# ********************************************************************
+#
+#       Configuration Section
+#
+# ********************************************************************
+# Name of RBAC ROLE that current user is authorised to use
+RBAC_ROLE="eniq_adm"
+
+# This is the name of the ENIQ System User
+SYS_USER="dcuser"
+
+# String that is common to all ENIQ service IDs. I concatenate this and the
+# service name together to give me the service name eg. eniq-dwhdb
+SVC_ID_COMMON_STR=eniq-
+SENTINEL_ID_COMMON_STR=licensing-
+
+ENIQ_ADMIN_DIR=/eniq/admin/bin
+
+# ********************************************************************
+#
+#       Pre-execution Operations
+#
+# ********************************************************************
+
+
+# ********************************************************************
+#
+# 	functions
+#
+# ********************************************************************
+### Function: abort_script ###
+#
+#   This will be called if the script is aborted thru an error
+#   signal sent by the kernel such as CTRL-C or if a serious
+#   error is encountered during runtime
+#
+# Arguments:
+#       $1 - Error message from part of program (Not always used)
+# Return Values:
+#       none
+abort_script()
+{
+if [ "$1" ]; then
+    _err_msg_=$1
+else
+    _err_msg_="Script aborted.......\n"    
+fi
+if [ "${LOGFILE}" ]; then
+    $ECHO "\nERROR : $_err_msg_\n"|$TEE -a ${LOGFILE}
+else
+    $ECHO "\nERROR : $_err_msg_\n"
+fi
+
+cd $SCRIPTHOME
+$RM -rf ${TEM_DIR}
+
+if [ "$2" ]; then
+    ${2}
+else
+   exit 1
+fi
+}
+
+### Function: chk_get_sys_usr_env ###
+#
+# Check and get the System User environment
+#
+# Arguments:
+#       $1 : User ID name
+# Return Values:
+#       none
+chk_get_sys_usr_env()
+{
+$GETENT passwd ${SYS_USER} >> /dev/null 2>&1
+if [ $? -ne 0 ]; then
+    _err_msg_="No System User defined in password file"
+    abort_script "$_err_msg_"
+fi
+
+if [ ! "${CONF_DIR}" ]; then
+    _err_msg_="Could not determine ENIQ environment variable \${CONF_DIR}"
+    abort_script "$_err_msg_"
+fi
+}
+
+### Function: get_absolute_path ###
+#
+# Determine absolute path to software
+#
+# Arguments:
+#	none
+# Return Values:
+#	none
+get_absolute_path() 
+{
+_dir_=`$DIRNAME $0`
+SCRIPTHOME=`cd $_dir_ 2>/dev/null && pwd || $ECHO $_dir_`
+}
+
+### Function: manage_service_direct ###
+#
+# Manage Service directly via ENIQ script
+#
+# Arguments:
+#	none
+# Return Values:
+#	none
+manage_service_direct()
+{
+if [ "${ENIQ_ACTION}" == "clear" -o "${ENIQ_ACTION}" == "maint" ]; then
+    _err_msg_="Can only perform this action when service is managed by systemd."
+    abort_script "$_err_msg_"
+fi
+
+if [ "${ENIQ_ACTION}" != "start" -a "${ENIQ_ACTION}" != "stop" ]; then
+    _err_msg_="Action must be either start or stop"
+    abort_script "$_err_msg_"
+fi
+
+if [ ! -x ${ENIQ_ADMIN_DIR}/${ENIQ_SERVICE} ]; then
+    _err_msg_="Cannot locate the service script ${SCRIPTHOME}/${ENIQ_SERVICE}"
+    abort_script "$_err_msg_"
+fi
+
+# HP80776
+_action_msg_="${ENIQ_ACTION}ing"
+if [ "${ENIQ_ACTION}" == "stop" ] ; then
+	_action_msg_="${ENIQ_ACTION}ping"
+fi
+
+if [ "${LOGFILE}" ]; then
+    $ECHO "\n${_action_msg_} ENIQ service ${ENIQ_SERVICE}"|$TEE -a ${LOGFILE}
+else
+    $ECHO "\n${_action_msg_} ENIQ service ${ENIQ_SERVICE}"
+fi
+
+${ENIQ_ADMIN_DIR}/${ENIQ_SERVICE} ${ENIQ_ACTION}
+if [ $? -ne 0 ]; then
+    _err_msg_="Fault ${_action_msg_} ${ENIQ_SERVICE}"
+    abort_script "$_err_msg_"
+fi
+}
+
+### Function: manage_service_via_smf ###
+#
+# Manage Service via systemd
+#
+# Arguments:
+#	none
+# Return Values:
+#	none
+manage_service_via_smf()
+{
+case "${ENIQ_ACTION}" in
+    clear) ENIQ_OPT=reset-failed
+           _prt_str_="clearing state of"
+           $SYSTEMCTL show ${SVC_NAME} -p ActiveState | $GREP "failed"  >> /dev/null 2>&1
+           if [ $? -ne 0 ]; then
+               return 0
+           fi
+           ;;
+
+    start) ENIQ_OPT=start
+           _prt_str_="enabling"
+           ;;
+
+    stop)  ENIQ_OPT=stop
+           _prt_str_="stopping"
+           if [ "${ENIQ_ACTION_PERM}" ]; then
+               _prt_str_="stopping and disabling"
+           fi
+           ;;
+
+    *)  _err_msg_="Action must be clear/start/stop"
+        abort_script "$_err_msg_"
+        ;;
+esac
+
+# The RBAC changes regarding LINUX will be taken care in later sprints
+# by JIRA EQEV-51034. Accordingly this part will get handled.
+#$ROLES ${CURR_ID} | $GREP -w "${RBAC_ROLE}" >> /dev/null 2>&1
+#if [ $? -ne 0 ]; then
+#    _err_msg_="User ${CURR_ID} not authorised to use RBAC role ${RBAC_ROLE}" 
+#    abort_script "$_err_msg_"
+#fi
+
+if [ "${LOGFILE}" ]; then
+    $ECHO "\nService ${_prt_str_} ${SVC_NAME}"|$TEE -a ${LOGFILE}
+else
+    $ECHO "\nService ${_prt_str_} ${SVC_NAME}"
+fi
+
+# The RBAC changes regarding LINUX 
+$SUDO ${SYSTEMCTL} ${ENIQ_OPT} ${SVC_NAME} >> /dev/null 2>&1
+if [ $? -ne 0 ]; then
+    _err_msg_="Fault ${ENIQ_ACTION}ing ${SVC_NAME}"
+    abort_script "$_err_msg_"
+fi
+
+if [ "${ENIQ_ACTION_PERM}" ]; then
+    $SYSTEMCTL disable ${SVC_NAME} >> /dev/null 2>&1
+    if [ $? -ne 0 ]; then
+        _err_msg_="Fault disabling ${SVC_NAME}"
+        abort_script "$_err_msg_"
+    fi
+fi
+}
+
+# ********************************************************************
+#
+# 	Main body of program
+#
+# ********************************************************************
+#
+# Determine absolute path to software
+get_absolute_path
+
+# Get that the effective id of the user
+CURR_ID=`$ID | $AWK -F\( '{print $2}' | $AWK -F\) '{print $1}'`
+
+while getopts ":a:s:P" arg; do
+  case $arg in
+    a) ENIQ_ACTION="$OPTARG" 
+       ;;
+    P) ENIQ_ACTION_PERM="YES"
+       ;;
+    s) ENIQ_SERVICE="$OPTARG" 
+       ;;
+   \?) _err_msg_="`$BASENAME $0` -s <service-identifier> -a {clear|start|stop}"
+       abort_script "$_err_msg_"
+       ;;
+  esac
+done
+shift `expr $OPTIND - 1`
+
+if [ ! "${ENIQ_ACTION}" -o ! "${ENIQ_SERVICE}" ]; then
+    _err_msg_="`$BASENAME $0` -s <service-identifier> -a {clear|start|stop}"
+    abort_script "$_err_msg_"
+fi
+
+if [ ! "${SYS_USER}" ]; then
+    _err_msg_="No System User defined in `$BASENAME $0`"
+    abort_script "$_err_msg_"
+fi
+
+# Check and get the System User environment
+chk_get_sys_usr_env
+
+# Set the service name
+if [ "${ENIQ_SERVICE}" == "sentinel" ]; then
+    SVC_NAME="${SENTINEL_ID_COMMON_STR}${ENIQ_SERVICE}"
+else
+    SVC_NAME="${SVC_ID_COMMON_STR}${ENIQ_SERVICE}"
+fi
+
+$SYSTEMCTL show ${SVC_NAME} -p LoadState | $GREP "loaded" >> /dev/null 2>&1
+if [ $? -eq 0 ]; then
+    manage_service_via_smf
+else
+    manage_service_direct
+fi
+
+exit 0

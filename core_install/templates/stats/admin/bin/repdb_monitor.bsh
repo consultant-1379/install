@@ -1,0 +1,6 @@
+#!/bin/bash
+for i in {1..12}
+do
+su - dcuser -c "/eniq/sybase_iq/IQ-16_0/bin64/dbisql -nogui -c \"eng=repdb;links=tcpip{host=localhost;port=2641};uid=dba;pwd=sql\" 'select getdate(), Number, Name, Userid, LastReqTime, CommLink, NodeAddr from sa_conn_info();' >> /eniq/backup/repdb_bkup/repdb_conn_monitor.log 2>&1"
+sleep 5
+done

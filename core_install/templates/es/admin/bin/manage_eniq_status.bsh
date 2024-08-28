@@ -1,0 +1,375 @@
+#!/bin/bash
+# ********************************************************************
+# Ericsson Radio Systems AB                                     SCRIPT
+# ********************************************************************
+#
+#
+# (c) Ericsson Radio Systems AB 2007 - All rights reserved.
+#
+# The copyright to the computer program(s) herein is the property
+# of Ericsson Radio Systems AB, Sweden. The programs may be used 
+# and/or copied only with the written permission from Ericsson Radio 
+# Systems AB or in accordance with the terms and conditions stipulated 
+# in the agreement/contract under which the program(s) have been 
+# supplied.
+#
+# ********************************************************************
+# Name    : manage_eniq_status.bsh
+# Date    : 04/02/2010
+# Revision: A
+# Purpose : Main script that will manage the version of ENIQ on the system
+#
+# Usage   : manage_eniq_status.bsh
+#										
+#
+# ********************************************************************
+#
+# 	Command Section
+#
+# ********************************************************************
+AWK=/usr/bin/awk
+BASENAME=/usr/bin/basename
+CAT=/usr/bin/cat
+CHMOD=/usr/bin/chmod
+CHOWN=/usr/bin/chown
+CLEAR=/usr/bin/clear
+CP=/usr/bin/cp
+DATE=/usr/bin/date
+DIRNAME=/usr/bin/dirname
+DOMAINNAME=/usr/bin/domainname
+DTCONFIG=/usr/dt/bin/dtconfig
+ECHO=/usr/bin/echo
+EGREP=/usr/bin/egrep
+EJECT=/usr/bin/eject
+ENV=/usr/bin/env
+EXPR=/usr/bin/expr
+FIND=/usr/bin/find
+FORMAT=/usr/sbin/format
+FUSER=/usr/sbin/fuser
+GETENT=/usr/bin/getent
+GETTEXT=/usr/bin/gettext
+GREP=/usr/bin/grep
+GROUPADD=/usr/sbin/groupadd
+GTAR=/usr/sfw/bin/gtar
+GZCAT=/usr/bin/gzcat
+HEAD=/usr/bin/head
+HOSTNAME=/usr/bin/hostname
+ID=/usr/bin/id
+INIT=/usr/sbin/init
+LS=/usr/bin/ls
+MKDIR=/usr/bin/mkdir
+MORE=/usr/bin/more
+MV=/usr/bin/mv
+NAWK=/usr/bin/nawk
+PGREP=/usr/bin/pgrep
+PING=/usr/sbin/ping
+PKGADD=/usr/sbin/pkgadd
+PKGINFO=/usr/bin/pkginfo
+PRTCONF=/usr/sbin/prtconf
+PWD=/usr/bin/pwd
+RM=/usr/bin/rm
+RCP=/usr/bin/rcp
+ROLES=/usr/bin/roles
+RSH=/usr/bin/rsh
+SED=/usr/bin/sed
+SLEEP=/usr/bin/sleep
+SORT=/usr/bin/sort
+SU=/usr/bin/su
+SVCADM=/usr/sbin/svcadm
+SVCCFG=/usr/sbin/svccfg
+SVCS=/usr/bin/svcs
+SYNC=/usr/sbin/sync
+TAIL=/usr/bin/tail
+TEE=/usr/bin/tee
+TOUCH=/usr/bin/touch
+TPUT=/usr/bin/tput
+UADMIN=/usr/sbin/uadmin
+UNAME=/usr/bin/uname
+USERADD=/usr/sbin/useradd
+VOLD=/usr/sbin/vold
+WC=/usr/bin/wc
+ZFS=/usr/sbin/zfs
+ZPOOL=/usr/sbin/zpool
+
+# ********************************************************************
+#
+#       Configuration Section
+#
+# ********************************************************************
+
+# Status file label
+ENIQ_VERSION_DIR="version"
+ENIQ_STATUS="eniq_status"
+ENIQ_HISTORY="eniq_history"
+
+# Default user
+DEFAULT_USER=root
+
+# ********************************************************************
+#
+#       Pre-execution Operations
+#
+# ********************************************************************
+
+
+# ********************************************************************
+#
+# 	functions
+#
+# ********************************************************************
+### Function: abort_script ###
+#
+#   This will be called if the script is aborted thru an error
+#   error signal sent by the kernel such as CTRL-C or if a serious
+#   error is encountered during runtime
+#
+# Arguments:
+#       $1 - Error message from part of program (Not always used)
+# Return Values:
+#       none
+abort_script()
+{
+if [ "$1" ]; then
+    _err_msg_=$1
+else
+    _err_msg_="Script aborted.......\n"    
+fi
+
+if [ "${LOGFILE}" ]; then
+    $ECHO "\nERROR : $_err_msg_\n" | $TEE -a ${LOGFILE}
+else
+    $ECHO "\nERROR : $_err_msg_\n"
+fi
+
+cd $SCRIPTHOME
+$RM -rf ${TEM_DIR}
+
+if [ "$2" ]; then
+    ${2}
+else
+   exit 1
+fi
+}
+
+### Function: chk_create_logfile ###
+#
+# Check/Create Logfile
+#
+# Arguments:
+#	none
+# Return Values:
+#	none
+chk_create_logfile()
+{
+$MKDIR -p `$DIRNAME ${LOGFILE}`
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not create directory `$DIRNAME ${LOGFILE}`"
+     abort_script "$_err_msg_"
+fi	
+
+$TOUCH -a ${LOGFILE}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not write to file ${LOGFILE}"
+    abort_script "$_err_msg_"
+fi	
+}
+
+### Function: check_id ###
+#
+#   Check that the effective id of the user is correct
+#   If not print error msg and exit.
+#
+# Arguments:
+#       $1 : User ID name
+# Return Values:
+#       none
+check_id()
+{
+_check_id_=`$ID  | $AWK -F\( '{print $2}' | $AWK -F\) '{print $1}'`
+if [ "$_check_id_" != "$1" ]; then
+    _err_msg_="You must be $1 to execute this script."
+    abort_script "$_err_msg_"
+fi
+}
+
+### Function: check_params ###
+#
+# Check Input Params
+#
+# Arguments:
+#	none
+# Return Values:
+#	none
+check_params()
+{
+if [ ! "${ENIQ_BASE_SW}" ]; then
+    usage_msg
+    exit 1
+fi
+}
+
+### Function: create_update_status ###
+#
+# Create/Update a version file in /eniq/admin
+# and creates/updates eniq_history file
+#
+# Arguments:
+#	none
+# Return Values:
+#	none
+create_update_status()
+{
+if [ ! -s ${ENIQ_BASE_SW}/${ENIQ_VERSION_DIR}/${ENIQ_STATUS} ]; then
+    _err_msg_="Could not find ${ENIQ_BASE_SW}/${ENIQ_VERSION_DIR}/${ENIQ_STATUS} file"
+    abort_script "$_err_msg_"
+fi
+
+$MKDIR -p ${VERSION_FILE_LOC}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not create ${VERSION_FILE_LOC} directory"
+    abort_script "$_err_msg_"
+fi
+
+$CP ${ENIQ_BASE_SW}/${ENIQ_VERSION_DIR}/${ENIQ_STATUS} ${ENIQ_STATUS_FILE}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not copy ${ENIQ_BASE_SW}/${ENIQ_STATUS} to ${ENIQ_STATUS_FILE}"
+    abort_script "$_err_msg_"
+fi
+
+RUN_TIME=`$DATE '+%Y-%b-%d_%H.%M.%S'`
+$ECHO "INST_DATE ${RUN_TIME}" >> ${ENIQ_STATUS_FILE}
+if [ $? -ne 0 ]; then
+    _err_msg_="Error adding installation date/time to ${ENIQ_STATUS_FILE}"
+    abort_script "$_err_msg_"
+fi
+
+if [ -s ${ENIQ_STATUS_FILE} ]; then
+    $ECHO "====================================" >> ${ENIQ_HISTORY_FILE}
+    $CAT ${ENIQ_STATUS_FILE} >> ${ENIQ_HISTORY_FILE}
+    if [ $? -ne 0 ]; then
+		_err_msg_="Could not copy eniq_status to ${ENIQ_HISTORY_FILE} file"
+		abort_script "$_err_msg_"
+    fi
+    $ECHO "====================================\n" >> ${ENIQ_HISTORY_FILE}
+    
+    $ECHO "\n${ENIQ_HISTORY_FILE} file updated correctly" | $TEE -a ${LOGFILE}
+fi
+
+$ECHO "\n${ENIQ_STATUS_FILE} file updated correctly" | $TEE -a ${LOGFILE}
+}
+
+### Function: get_absolute_path ###
+#
+# Determine absolute path to software
+#
+# Arguments:
+#	none
+# Return Values:
+#	none
+get_absolute_path() 
+{
+_dir_=`$DIRNAME $0`
+SCRIPTHOME=`cd $_dir_ 2>/dev/null && pwd || $ECHO $_dir_`
+}
+
+### Function: setup_env ###
+#
+# Set up environment variables for script. 
+#
+# Arguments:
+#	none
+# Return Values:
+#	none
+setup_env()
+{	
+if [ ! "${ENIQ_BASE_DIR}" ]; then
+    # Directory on the root filesystem
+    ENIQ_BASE_DIR=/eniq
+fi
+
+# ENIQ Admin Directory
+ENIQ_ADMIN_DIR=${ENIQ_BASE_DIR}/admin
+
+VERSION_FILE_LOC=${ENIQ_ADMIN_DIR}/${ENIQ_VERSION_DIR}
+
+ENIQ_HISTORY_FILE=${VERSION_FILE_LOC}/${ENIQ_HISTORY}
+ENIQ_STATUS_FILE=${VERSION_FILE_LOC}/${ENIQ_STATUS}
+}
+
+### Function: usage_msg ###
+#
+#   Print out the usage message
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+usage_msg()
+{
+$CLEAR
+$ECHO "
+Usage: `$BASENAME $0` -d <eniq_base_sw>  [ -l <logfile> ]
+
+options:
+	
+-d	: Path to eniq_base_sw
+	
+-l	: Optional parameter specifying logfile where the script output will be appended to.
+	
+"
+}
+
+# ********************************************************************
+#
+# 	Main body of program
+#
+# ********************************************************************
+#
+# Determine absolute path to software
+get_absolute_path
+
+# Check that the effective id of the user is root
+check_id $DEFAULT_USER
+
+while getopts ":b:d:l:" arg; do
+  case $arg in
+    b) ENIQ_BASE_DIR="$OPTARG" 
+       ;;
+    d) ENIQ_BASE_SW="$OPTARG"
+       ;;
+    l) LOGFILE="$OPTARG"
+       ;;
+   \?) usage_msg 
+       exit 1
+       ;;
+  esac
+done
+shift `expr $OPTIND - 1`
+
+# Check Input Params
+check_params 
+
+# Set up environment variables
+setup_env
+
+if [ "${LOGFILE}" ]; then
+    # Check/Create Logfile
+    chk_create_logfile
+fi
+
+# Create a temporary Directory
+TEM_DIR=/tmp/$0.$$.$$
+$RM -rf ${TEM_DIR}
+$MKDIR -p ${TEM_DIR}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not create directory ${TEM_DIR}"
+    abort_script "$_err_msg_"
+fi	
+
+# Create/Update a version file in /eniq/admin
+# and creates/updates eniq_history file
+create_update_status
+
+$RM -rf ${TEM_DIR}
+
+exit 0

@@ -1,0 +1,442 @@
+#!/bin/bash
+# ********************************************************************
+# Ericsson Radio Systems AB                                     SCRIPT
+# ********************************************************************
+#
+#
+# (c) Ericsson Radio Systems AB 2018 - All rights reserved.
+#
+# The copyright to the computer program(s) herein is the property
+# of Ericsson Radio Systems AB, Sweden. The programs may be used 
+# and/or copied only with the written permission from Ericsson Radio 
+# Systems AB or in accordance with the terms and conditions stipulated 
+# in the agreement/contract under which the program(s) have been 
+# supplied.
+#
+# ********************************************************************
+# Name    : generate_ssh_key.bsh
+# Date    : 28/09/2018
+# Revision: main\4
+# Purpose : Script to create ssh keys for ssh tunnel between ENIQ and OSS
+#           It must be run as root but will generate keys for specified user.
+#
+# Usage   : generate_ssh_key.bsh [ -c "comment" ] [ -l <path_to_logfile>] 
+#									[-d <YES|NO>] [ -u <user> ] [ -U ]
+#
+# ********************************************************************
+#
+# 	Command Section
+#
+# ********************************************************************
+AWK=/usr/bin/awk
+BASENAME=/usr/bin/basename
+CHMOD=/usr/bin/chmod
+CHOWN=/usr/bin/chown
+CLEAR=/usr/bin/clear
+CP=/usr/bin/cp
+DATE=/usr/bin/date
+DIRNAME=/usr/bin/dirname
+ECHO='/usr/bin/echo -e'
+GETENT=/usr/bin/getent
+HOSTNAME=/usr/bin/hostname
+ID=/usr/bin/id
+MKDIR=/usr/bin/mkdir
+RM=/usr/bin/rm
+SED=/usr/bin/sed
+SSH_KEYGEN=/usr/bin/ssh-keygen
+TEE=/usr/bin/tee
+TOUCH=/usr/bin/touch
+
+# ********************************************************************
+#
+#       Configuration Section
+#
+# ********************************************************************
+# 
+# Default user, if none specified as a parameter
+DEF_USER=dcuser		
+
+KEY_FILE=id_rsa
+DELETE_EXISTING_KEYS=no
+
+# ********************************************************************
+#
+# 	functions
+#
+# ********************************************************************
+
+### Function: abort_script ###
+#
+#   This will is called if the script is aborted through an error
+#   error signal sent by the kernel such as CTRL-C or if a serious
+#   error is encountered during runtime
+#
+# Arguments:
+#       $1 - Error message from part of program (Not always used)
+# Return Values:
+#       none
+abort_script()
+{
+_err_time_=`$DATE '+%Y-%b-%d_%H.%M.%S'`
+	
+if [ "$1" ]; then
+    _err_msg_="${_err_time_} - $1"
+else
+    _err_msg_="${_err_time_} - ERROR : generate_ssh_key.bsh script aborted.......\n"    
+fi
+
+if [ "${LOGFILE}" ]; then
+    $ECHO "\nERROR : ${_err_msg_}\n"|$TEE -a ${LOGFILE}
+else
+    $ECHO "\nERROR : ${_err_msg_}\n"
+fi
+
+cd $SCRIPTHOME
+$RM -rf ${TEM_DIR}
+
+if [ "$2" ]; then
+    ${2}
+else
+   exit 1
+fi
+}
+
+### Function: chk_create_logfile ###
+#
+# Check/Create Logfile
+#
+# Arguments:
+#   none
+# Return Values:
+#   0 : Success
+#	1 : Failure
+chk_create_logfile()
+{
+$MKDIR -p `$DIRNAME ${LOGFILE}`
+if [ $? -ne 0 ]; then
+	$ECHO "Could not create directory `$DIRNAME ${LOGFILE}`" | $TEE -a ${LOGFILE}
+	return 1
+fi
+
+$TOUCH -a ${LOGFILE}
+if [ $? -ne 0 ]; then
+	$ECHO "Could not write to file ${LOGFILE}" | $TEE -a ${LOGFILE}
+	return 1
+fi
+
+return 0
+}
+
+### Function: check_for_keys ###
+#
+# If keys already exist and parameter -d has not been used then abort.
+# Else Delete the keys if parameter -d has been used and $DELETE_EXISTING_KEYS=YES
+#
+# Arguments:  None
+# Return Values:
+#       none
+check_for_keys()
+{
+if [ -s ${KEY_LOCATION}/${KEY_FILE} ]; then
+    if [ "$DELETE_EXISTING_KEYS" == "YES" ]; then
+        remove_old_keys
+    else
+    	if [ ! "${UPGRADE}" ]; then
+			return 1
+		fi
+    fi
+fi
+}
+
+### Function: check_id ###
+#
+#   Check that the effective id of the user is correct
+#   If not print error message and exit.
+#
+# Arguments:
+#       $1 : User ID name
+# Return Values:
+#       none
+check_id()
+{
+_check_id_=`$ID  | $AWK -F\( '{print $2}' | $AWK -F\) '{print $1}'`
+if [ "${_check_id_}" != "$1" ]; then
+    _err_msg_="You must be $1 to execute this script"
+    abort_script "${_err_msg_}"
+fi
+}
+
+### Function: create_keys ###
+#
+# Creates the ssh key . changes ownership of key to ${SSH_USER}
+# And copies key to ${SSH_USER} home directory
+#
+# Arguments:
+#	none
+# Return Values:
+#	none
+create_keys()
+{
+$ECHO "\nCreating ${KEY_LOCATION}" | $TEE -a ${LOGFILE}	
+$MKDIR -p ${KEY_LOCATION}
+if [ $? -ne 0 ]; then 
+    _err_msg_="Could not create directory ${KEY_LOCATION}"
+    abort_script "${_err_msg_}"
+fi
+
+$ECHO "Changing ownership of ${KEY_LOCATION} to ${SSH_USER}" | $TEE -a ${LOGFILE}	
+$CHOWN -f ${SSH_USER} ${KEY_LOCATION}
+if [ $? -ne 0 ]; then 
+    _err_msg_="Could not change ownership of ${KEY_LOCATION}"
+    abort_script "${_err_msg_}"
+fi
+
+$ECHO "Generating ssh keys" | $TEE -a ${LOGFILE}
+$ECHO "using command: \"$SSH_KEYGEN -t rsa -f ${KEY_LOCATION}/${KEY_FILE} -N \"\" -C \"${COMMENT}\"" >> ${LOGFILE}
+$SSH_KEYGEN -t rsa -f ${KEY_LOCATION}/${KEY_FILE} -N "" -C "${COMMENT}"
+if [ $? -ne 0 ]; then
+    $RM -f ${KEY_LOCATION}/${KEY_FILE} ${KEY_LOCATION}/${KEY_FILE}.pub
+    _err_msg_="Failed to generate ssh keys"
+    abort_script "${_err_msg_}"
+fi
+
+$ECHO "Changing ownership of ${KEY_LOCATION}/${KEY_FILE} to ${SSH_USER}" | $TEE -a ${LOGFILE}
+$CHOWN -f ${SSH_USER} ${KEY_LOCATION}/${KEY_FILE}
+if [ $? -ne 0 ]; then 
+    _err_msg_="Could not change ownership of ${KEY_LOCATION}/${KEY_FILE}"
+    abort_script "${_err_msg_}"
+fi
+
+$ECHO "Changing ownership of ${KEY_LOCATION}/${KEY_FILE}.pub to ${SSH_USER}" | $TEE -a ${LOGFILE}
+$CHOWN -f ${SSH_USER} ${KEY_LOCATION}/${KEY_FILE}.pub
+if [ $? -ne 0 ]; then 
+    _err_msg_="Could not change ownership of ${KEY_LOCATION}/${KEY_FILE}.pub"
+    abort_script "${_err_msg_}"
+fi
+}
+
+### Function: get_absolute_path ###
+#
+# Determine absolute path to software
+#
+# Arguments:
+#	none
+# Return Values:
+#	none
+get_absolute_path() 
+{
+_dir_=`$DIRNAME $0`
+SCRIPTHOME=`cd $_dir_ 2>/dev/null && pwd || $ECHO $_dir_`
+}
+
+### Function: remove_old_keys ###
+#
+# Creates a new hidden directory called old_keys within the KEY_LOCATION
+# directory, if it does not already exist.
+# Appends the date to the old keys and moves the old keys into
+# this directory.
+#
+# Arguments:
+#	none
+# Return Values:
+#	none
+remove_old_keys() 
+{
+if [ ! -d ${KEY_LOCATION}/.old_keys ]; then	
+	$ECHO "\nCreating ${KEY_LOCATION}/.old_keys" >> ${LOGFILE}
+    $MKDIR -p ${KEY_LOCATION}/.old_keys
+    if [ $? -ne 0 ]; then 
+        _err_msg_="Could not create directory ${KEY_LOCATION}/.old_keys"
+        abort_script "${_err_msg_}"
+    fi
+    
+    $ECHO "Changing ownership of ${KEY_LOCATION}/.old_keys to ${SSH_USER}" >> ${LOGFILE}
+    $CHOWN -f ${SSH_USER} ${KEY_LOCATION}/.old_keys
+    if [ $? -ne 0 ]; then 
+        _err_msg_="Could not change ownership of ${KEY_LOCATION}/.old_keys"
+        abort_script "${_err_msg_}"	    
+    fi
+    
+    $ECHO "Changing permissions of ${KEY_LOCATION}/.old_keys to -rwx------" >> ${LOGFILE}
+    $CHMOD 700 ${KEY_LOCATION}/.old_keys
+    if [ $? -ne 0 ]; then 
+        _err_msg_="Could not change permissions on ${KEY_LOCATION}/.old_keys to 700"
+        abort_script "${_err_msg_}"
+    fi
+fi
+
+_exec_time_=`$DATE '+%Y-%b-%d_%H.%M.%S'`
+
+$ECHO "Creating a copy of${KEY_LOCATION}/${KEY_FILE} in ${KEY_LOCATION}/.old_keys/${KEY_FILE}.${_exec_time_}" >> ${LOGFILE}
+$CP ${KEY_LOCATION}/${KEY_FILE} ${KEY_LOCATION}/.old_keys/${KEY_FILE}.${_exec_time_}
+if [ $? -ne 0 ]; then 
+    _err_msg_="Could not copy ${KEY_LOCATION}/${KEY_FILE} ${KEY_LOCATION}/.old_keys/${KEY_FILE}.${_exec_time_}"
+    abort_script "${_err_msg_}"
+fi
+
+$ECHO "Creating a copy of ${KEY_LOCATION}/${KEY_FILE}.pub in ${KEY_LOCATION}/.old_keys/${KEY_FILE}.pub.${_exec_time_}" >> ${LOGFILE}
+$CP ${KEY_LOCATION}/${KEY_FILE}.pub ${KEY_LOCATION}/.old_keys/${KEY_FILE}.pub.${_exec_time_}
+if [ $? -ne 0 ]; then 
+    _err_msg_="Could not copy ${KEY_LOCATION}/${KEY_FILE}.pub ${KEY_LOCATION}/.old_keys/${KEY_FILE}.pub.${_exec_time_}"
+    abort_script "${_err_msg_}"
+fi
+
+$ECHO "Removing ${KEY_LOCATION}/${KEY_FILE} and ${KEY_LOCATION}/${KEY_FILE}.pub files" >> ${LOGFILE}
+$RM -f ${KEY_LOCATION}/${KEY_FILE} ${KEY_LOCATION}/${KEY_FILE}.pub
+if [ $? -ne 0 ]; then 
+    _err_msg_="Could not delete old keys"
+    abort_script "${_err_msg_}"
+fi
+}
+
+### Function: setup_user_configuration ###
+#
+# Check user exists and set users home directory
+# and ssh key files location.
+#
+# Arguments:
+#	none
+# Return Values:
+#	none
+setup_user_configuration()
+{
+USER_EXISTS=`$GETENT passwd ${SSH_USER}`
+if [ ! "${USER_EXISTS}" ]; then
+    _err_msg_="${SSH_USER} does not exist"
+    abort_script "${_err_msg_}"
+fi	
+
+USER_HOME_DIR=`$GETENT passwd ${SSH_USER} | $AWK -F\: '{print $6}' | $SED 's/\/[\/]*/\//g'`
+if [ ! "${USER_HOME_DIR}" ]; then
+    _err_msg_="Could not read ${SSH_USER} home directory"
+    abort_script "${_err_msg_}"
+fi
+
+if [ "${SSH_USER}" != "root" ]; then
+	if [ "${USER_HOME_DIR}" == "/" ]; then
+	    _err_msg_="${SSH_USER} home directory must not be /"
+	    abort_script "${_err_msg_}"
+	fi
+fi
+
+if [ ! -d "${USER_HOME_DIR}" ]; then
+    _err_msg_="${SSH_USER} home directory ${USER_HOME_DIR} not found"
+    abort_script "${_err_msg_}"
+fi
+
+$ECHO "\n${SSH_USER} home directory set to ${USER_HOME_DIR}" >> ${LOGFILE}
+
+KEY_LOCATION=${USER_HOME_DIR}/.ssh
+$ECHO "${SSH_USER} key location set to ${KEY_LOCATION}" | $TEE -a ${LOGFILE}
+}
+
+### Function: usage_msg ###
+#
+#   Print out the usage message
+#
+# Arguments:
+#	none
+# Return Values:
+#	none
+usage_msg() 
+{
+$CLEAR
+$ECHO "
+Usage: `$BASENAME $0` [ -b <eniq_base_dir> ] [ -c "comment" ] [ -d YES ] [ -l logfile ] [ -u <user> ]
+                      
+options:
+
+-b  : Optional parameter specifying the full path to where the ENIQ
+	  BASEDIR directory is (eg. /eniq). If not specified, then the 
+	  script will assume the base directory is /eniq
+
+-c  : Optional parameter for a comment that will be added to the public key file
+
+-d  : Optional Parameter: Deletes existing keys. If keys already exist this
+      script will not create new keys. Creating new keys means the existing
+      public key is obsolete and the new public key will have to be copied 
+      to all OSS servers again. Only say YES if you want to force the script
+      to delete existing keys and create new ones.
+      
+-l  : Optional Parameter: Path to logfile, to log errors.     
+
+-u  : The user that we create the ssh keys for.
+"
+}
+
+# *************************************************************************
+#
+# 	Main body of program
+#
+# *************************************************************************
+# Determine absolute path to software
+get_absolute_path
+
+while getopts ":b:c:d:l:u:U" arg; do
+  case $arg in
+    b) ENIQ_BASE_DIR="$OPTARG" 
+       ;;
+    c) COMMENT="$OPTARG" 
+       ;;
+    d) DELETE_EXISTING_KEYS="$OPTARG" 
+       ;;
+    l) LOGFILE="$OPTARG"
+       ;;
+    u) SSH_USER="$OPTARG"
+       ;;
+    U) UPGRADE="YES"
+       ;;
+   \?) usage_msg
+       exit 1
+       ;;
+  esac
+done
+shift `expr $OPTIND - 1`
+
+# Check that the effective id of the user is root
+check_id root
+if [ ! "${SSH_USER}" ]; then
+    SSH_USER=${DEF_USER}
+fi
+
+COMMENT="ssh key for ${SSH_USER} on ENIQ server `${HOSTNAME}`"
+
+if [ ! "${ENIQ_BASE_DIR}" ]; then
+	ENIQ_BASE_DIR=/eniq
+fi
+
+if [ ! "${LOGFILE}" ]; then
+    LOGFILE=${ENIQ_BASE_DIR}/local_logs/connectd/generate_ssh_key.log
+fi	
+  
+# Check/Create Logfile
+chk_create_logfile
+if [ $? -ne 0 ]; then
+    _err_msg_="Problem encountered creating ${LOGFILE}"
+    abort_script "${_err_msg_}"
+fi
+
+# Check user exists and set users home directory
+setup_user_configuration
+
+# If keys already exist and parameter -d has not been used then abort.
+# Else Delete the keys if parameter -d has been used and $DELETE_EXISTING_KEYS=YES
+check_for_keys
+if [ $? -ne 0 ]; then
+    _err_msg_="ssh keys already exist.....aborting"
+    abort_script "${_err_msg_}"
+fi
+
+# Create ssh keys (if ssh keys do not exist)
+if [ -s ${KEY_LOCATION}/${KEY_FILE} ]; then
+	if [ ! "${UPGRADE}" ]; then
+	    _err_msg_="ssh keys already exist"
+	    abort_script "${_err_msg_}"
+	else
+		$ECHO "ssh keys already setup" | $TEE -a $LOGFILE
+	fi
+else
+    create_keys
+fi
+
+exit 0

@@ -1,0 +1,2557 @@
+#!/bin/bash
+# ********************************************************************
+# Ericsson Radio Systems AB                                     SCRIPT
+# ********************************************************************
+#
+#
+# (c) Ericsson Radio Systems AB 2022 - All rights reserved.
+#
+# The copyright to the computer program(s) herein is the property
+# of Ericsson Radio Systems AB, Sweden. The programs may be used
+# and/or copied only with the written permission from Ericsson Radio
+# Systems AB or in accordance with the terms and conditions stipulated
+# in the agreement/contract under which the program(s) have been
+# supplied.
+#
+# ********************************************************************
+# Name    : common_inirator_functions.lib
+# Date    : 26/10/2023
+# Revision: \main\68
+# Purpose : Main library file holding the inirator common functions
+#
+# Usage   : common_inirator_functions.lib
+#
+# ********************************************************************
+#
+#   Command Section
+#
+# ********************************************************************
+AWK=/usr/bin/awk
+BASENAME=/usr/bin/basename
+BASH=/usr/bin/bash
+BC=/usr/bin/bc
+CAT=/usr/bin/cat
+CHMOD=/usr/bin/chmod
+CHOWN=/usr/bin/chown
+CLEAR=/usr/bin/clear
+CMP=/usr/bin/cmp
+CP=/usr/bin/cp
+CPIO=/usr/bin/cpio
+DATE=/usr/bin/date
+DIRNAME=/usr/bin/dirname
+DOMAINNAME=/usr/bin/domainname
+ECHO='/usr/bin/echo -e'
+EGREP=/usr/bin/egrep
+ENV=/usr/bin/env
+EXPR=/usr/bin/expr
+FIND=/usr/bin/find
+FREE=/usr/bin/free
+GETENT=/usr/bin/getent
+GREP=/usr/bin/grep
+GROUPADD=/usr/sbin/groupadd
+HEAD=/usr/bin/head
+MYHOSTNAME=/usr/bin/hostname
+HOSTID=/usr/bin/hostid
+ID=/usr/bin/id
+IFCONFIG=/usr/sbin/ifconfig
+EXPECT=/usr/bin/expect  
+LN=/usr/bin/ln
+LS=/usr/bin/ls
+MKDIR=/usr/bin/mkdir
+MORE=/usr/bin/more
+MOUNT=/usr/bin/mount
+MV=/usr/bin/mv
+NSLOOKUP=/usr/sbin/nslookup
+PING=/usr/bin/ping
+PRINTF=/usr/bin/printf
+PWD=/usr/bin/pwd
+REBOOT=/usr/sbin/reboot
+RM=/usr/bin/rm
+SED=/usr/bin/sed
+SLEEP=/usr/bin/sleep
+SORT=/usr/bin/sort
+SU=/usr/bin/su
+TAIL=/usr/bin/tail
+TAR=/usr/bin/tar
+TEE=/usr/bin/tee
+TOUCH=/usr/bin/touch
+TR=/usr/bin/tr
+UMOUNT=/usr/bin/umount
+UNAME=/usr/bin/uname
+USERADD=/usr/sbin/useradd
+WC=/usr/bin/wc
+UEMCLI=/usr/bin/uemcli
+
+
+
+# ********************************************************************
+#
+#   Functions
+#
+# ********************************************************************
+### Function: common_check_inirator_scripts ###
+#
+# Check all inirator scripts exist
+#
+# Arguments:
+#   $1 : logfile
+#   $2 : existing router value
+# Return Values:
+#   0 : Success
+#   1 : Fail
+common_check_inirator_scripts()
+{
+local _logfile_=$1
+local _admin_dir_=$2
+local core_install_dir_=$3
+local _sentinel_bin_dir_=$4
+
+if [ ! -s ${core_install_dir_}/bin/get_disk_info.bsh ]; then
+    $ECHO "Cannot locate ${core_install_dir_}/bin/get_disk_info.bsh" | $TEE -a ${_logfile_}
+    return 1
+fi	
+
+if [ ! -s ${core_install_dir_}/bin/manage_cep_mediation.bsh ]; then
+    $ECHO "Cannot locate ${core_install_dir_}/bin/manage_cep_mediation.bsh" | $TEE -a ${_logfile_}
+    return 1
+fi
+
+if [ "${CURR_SERVER_TYPE}" == "eniq_coordinator"  -o "${CURR_SERVER_TYPE}" == "eniq_stats" ]; then
+    # Does the sentinel lsmon binary exist?
+    if [ ! -x ${_sentinel_bin_dir_}/lsmon ]; then
+        _err_msg_="${_sentinel_bin_dir_}/lsmon not found or not executable"
+        abort_script "$_err_msg_"
+    fi
+fi
+}
+
+
+### Function: common_confirm_user_nas_input ###
+#
+# Confirm with user that NAS values entered are correct
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+common_confirm_user_nas_input()
+{
+local _install_type_=$1
+local _temp_dir_=$2
+local _storage_type_=$3
+
+_disp_file_=${_temp_dir_}/disp_file
+$RM -f ${_disp_file_}
+
+$ECHO "\nUSER NAS VALUE CONFIRMATION" >> ${_disp_file_}
+$ECHO "=======================" >> ${_disp_file_}
+
+if [ "${SAN_DEVICE}" != "unityXT" ]; then
+	if [ "${NAS_CONSOLE_IP}" ]; then
+			$ECHO "\nNAS Console IP\t: ${NAS_CONSOLE_IP}" >> ${_disp_file_}
+	fi
+fi
+
+if [ "${VIRTUAL_NAS_IP_LIST}" ]; then
+    if [ "${SAN_DEVICE}" != "unityXT" ]; then
+        $ECHO "\nVirtual NAS IPs\t: ${VIRTUAL_NAS_IP_LIST}" >> ${_disp_file_}
+    else
+        $ECHO "\nNAS IPs\t: ${VIRTUAL_NAS_IP_LIST}" >> ${_disp_file_}
+    fi    
+fi
+
+if [ "${NAS_POOL}" ]; then
+	$ECHO "\nPrimary NAS Pool Name\t: ${NAS_POOL}" >> ${_disp_file_}
+fi
+
+if [ "${SEC_NAS_POOL}" ]; then
+    $ECHO "\nSecondary NAS Pool Name\t: ${SEC_NAS_POOL}" >> ${_disp_file_}
+fi
+
+while :; do
+    $CLEAR
+    $CAT ${_disp_file_}
+
+    $ECHO "\n\nAre the values above correct (Yes/No)"
+    read USER_CNF
+
+    # Check we have a response
+    if [ ! "${USER_CNF}" ]; then
+        continue
+    fi
+
+    # Did the user input (Y/y)
+
+    if [ "${USER_CNF}" == "Yes" -o "${USER_CNF}" == "No" ]; then
+        break
+    else
+        :
+    fi
+done
+
+export USER_CNF
+
+}
+
+### Function: common_confirm_user_input ###
+#
+# Confirm with user that values entered are correct
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+common_confirm_user_input()
+{
+local _install_type_=$1
+local _temp_dir_=$2
+local _storage_type_=$3
+
+_disp_file_=${_temp_dir_}/disp_file
+$RM -f ${_disp_file_}
+
+$ECHO "\nUSER VALUE CONFIRMATION" >> ${_disp_file_}
+$ECHO "=======================" >> ${_disp_file_}
+
+if [ "${_install_type_}" == "stats" ]; then
+	# Get display data from file
+	if [ -s ${_temp_dir_}/global_data ]; then
+	    CORE_COUNT=`$CAT ${_temp_dir_}/global_data | $GREP "CORE_COUNT" | $AWK -F\= '{print $2}'`
+	    GRAN_COUNT=`$CAT ${_temp_dir_}/global_data | $GREP "GRAN_COUNT" | $AWK -F\= '{print $2}'`
+	    WRAN_COUNT=`$CAT ${_temp_dir_}/global_data | $GREP "WRAN_COUNT" | $AWK -F\= '{print $2}'`
+	    ZPOOLMIRROR=`$CAT ${_temp_dir_}/global_data | $GREP "ZPOOLMIRROR" | $AWK -F\= '{print $2}'`
+	    if [ "$ZONE" != "yes" ]; then
+		    if [ "${ZPOOLMIRROR}" == "yes" ]; then
+		        STRIPE_1=`$CAT ${_temp_dir_}/global_data | $GREP "MIRROR_STRIPE_1" | $AWK -F\= '{print $2}'`
+		        STRIPE_2=`$CAT ${_temp_dir_}/global_data | $GREP "MIRROR_STRIPE_2" | $AWK -F\= '{print $2}'`
+		    else
+		        ZFS_DISK_LIST_CMD=`$CAT ${_temp_dir_}/global_data | $GREP "ZFS_STRIPE" | $AWK -F\= '{print $2}'`
+		    fi
+	    fi
+	fi
+	
+	if [ "${CORE_COUNT}" ]; then
+	    $ECHO "Managed CORE Nodes\t: ${CORE_COUNT}" >> ${_disp_file_}
+	fi
+	
+	if [ "${GRAN_COUNT}" ]; then
+	    $ECHO "Managed GRAN Cells\t: ${GRAN_COUNT}" >> ${_disp_file_}
+	fi
+	
+	if [ "${WRAN_COUNT}" ]; then
+	    $ECHO "Managed WRAN Cells\t: ${WRAN_COUNT}" >> ${_disp_file_}
+	fi
+	
+	if [ "$ZONE" != "yes" -a "${_storage_type_}" == "fs" ]; then
+		$ECHO "\nZFS DATA MIRRORED\t: ${ZPOOLMIRROR}" >> ${_disp_file_}
+		if [ "${ZPOOLMIRROR}" == "yes" ]; then
+		    $ECHO "ZFS MIRRORED-STRIPE 1 : `$ECHO ${STRIPE_1}`" >> ${_disp_file_}
+		    $ECHO "ZFS MIRRORED-STRIPE 2 : `$ECHO ${STRIPE_2}`" >> ${_disp_file_}
+		else
+		    $ECHO "ZFS STRIPE  : ${ZFS_DISK_LIST_CMD}" >> ${_disp_file_}
+		fi
+	fi
+fi
+
+if [ "${DEFAULTROUTER}" ]; then
+    $ECHO "\nDefault Router\t: ${DEFAULTROUTER}" >> ${_disp_file_}
+else
+    if [ ! ${RESTORE} ]; then
+	$ECHO "\nDefault Router\t: none" >> ${_disp_file_}
+    fi
+fi
+
+#if [ "${DNSSERVERS}" ]; then
+#    $ECHO "\nDNS Server\t: ${DNSSERVERS}" >> ${_disp_file_}
+#    $ECHO "DNS Domain\t: ${DNSDOMAIN}" >> ${_disp_file_}
+#else
+#    if [ ! ${RESTORE} ]; then
+#	$ECHO "\nDNS Server\t: none" >> ${_disp_file_}
+#    fi
+#fi
+
+if [ "${TIMEZONE}" ]; then
+    $ECHO "\nTimezone\t: ${TIMEZONE}" >> ${_disp_file_}
+else
+    if [ ! ${RESTORE} ]; then
+	$ECHO "\nTimezone\t: none" >> ${_disp_file_}
+    fi
+fi
+
+if [ "${SHARED_MEM}" ]; then
+    $ECHO "\nShared Memory\t: ${SHARED_MEM} MBytes" >> ${_disp_file_}
+fi
+
+if [ "${PLAN}" ]; then
+    $ECHO "\nPartition plan\t: ${PLAN}" >> ${_disp_file_}
+fi
+
+
+if [ "${OSS_SRV_IP}" ]; then
+    $ECHO "\nOSS Server IP\t: ${OSS_SRV_IP}" >> ${_disp_file_}
+fi
+
+if [ -s ${_temp_dir_}/feature_output_list ]; then
+    $ECHO "\nENIQ Features to be installed\n-----------------------------" >> ${_disp_file_}
+    while read _feat_detail_; do
+        $ECHO ${_feat_detail_} | $AWK -F"::" '{print $2}' >> ${_disp_file_}
+    done < ${_temp_dir_}/feature_output_list
+fi
+
+while :; do
+    $CLEAR
+    $CAT ${_disp_file_}
+
+    _chk_=0
+    # Not supported way of updating
+    if [ -f ${ENIQ_CONF_DIR}/${SUNOS_INI} -o -f ${ENIQ_CONF_DIR}/${RBAC_INI} -o -f ${ENIQ_CONF_DIR}/${ENIQ_INI} -o -f ${CLI_CONF_DIR}/${ENIQ_INI} ]; then
+        _chk_=1
+        $ECHO "\nAt least one of the following files already exists:"
+        $ECHO "${ENIQ_CONF_DIR}/${SUNOS_INI}"
+        $ECHO "${ENIQ_CONF_DIR}/${RBAC_INI}"
+        $ECHO "${ENIQ_CONF_DIR}/${ENIQ_INI}"
+        $ECHO "${CLI_CONF_DIR}/${ENIQ_INI}\n"
+        $ECHO "This indicates that the ini files are being created again outside of an"
+        $ECHO "initial install. This is not a normal scenario and can have unexpected results\n"
+        $ECHO "A backup copy of each ini file will be saved in ${ENIQ_CONF_DIR}/backup."
+        $ECHO "If resultant values in ini files are incorrect, please use backup files"
+        $ECHO "to remedy the scenario. If this is an a normal initial installation, then"
+        $ECHO "select (Yes) to proceed"
+    fi
+
+    if [ ${_chk_} -eq 0 ]; then
+        $ECHO "\n\nAre the values above correct (Yes/No)"
+    else
+        $ECHO "\n\nAre you sure you wish to re-create existing ini files with values above (Yes/No)"
+    fi
+	read USER_CONF
+	
+    # Check we have a response
+    if [ ! "${USER_CONF}" ]; then
+        continue
+    fi
+
+    # Did the user input (Y/y)
+    if [ "${USER_CONF}" == "Yes" ]; then
+        break
+    elif [ "${USER_CONF}" == "No" ]; then
+        if [ ${_chk_} -eq 0 ]; then
+            break
+        else
+            $RM -rf ${_temp_dir_} 
+            exit 99
+        fi
+    else
+        :
+    fi
+done
+
+export USER_CONF
+}
+
+### Function: common_get_database_user_password ###
+#
+# Check all inirator scripts exist
+#
+# Arguments:
+#   $1 : default database password 
+#   $2 : database user name
+# Return Values:
+#   0 : Success
+#   1 : Fail
+common_get_database_user_password()
+{
+local _dbuser_=$1
+
+
+while :; do
+    $CLEAR
+    unset DBPASSWORD
+
+    $ECHO "Password Policies:
+
+    ** Minimum password length 5 characters.
+    ** Maximum password length 30 characters.
+    ** All alphanumeric characters allowed.
+    ** The following special characters are allowed # % ~ _ + @ : ! * = { } , . /
+    ** Must contain an uppercase letter, a lowercase letter, a number and a special character.
+    ** No spaces allowed.
+    "
+    
+    $ECHO "\n\nEnter password for ${_dbuser_}"
+    read -s _password_
+
+    local _password_length_=${#_password_}
+    
+    if  [ -z "${_password_}" ] ; then
+        log_msg -s "\nThe new password cannot be empty."
+        continue
+    fi
+    if ! [[ "${_password_}" =~ [A-Z] ]] ; then
+        log_msg -s "\nThe new password entered is not compliant with the Password Policies must contain a uppercase letter."
+        continue
+    fi
+    if ! [[ "${_password_}" =~ [a-z] ]] ; then
+        log_msg -s "\nThe new password entered is not compliant with the Password Policies must contain a lowercase letter."
+        continue
+    fi
+    if ! [[ "${_password_}" =~ [0-9] ]] ; then
+        log_msg -s "\nThe new password entered is not compliant with the Password Policies must contain a number."
+        continue
+    fi
+    if  [[ "${_password_}" != *['!'@#%~={},./@:*_+]* ]] ; then
+        log_msg -s "\nThe new password entered is not compliant with the Password Policies must contain a special character."
+        continue
+    fi
+	
+    if  [[ "${_password_}" == *[\`\$\^\&\(\)\-\[\]\\\|\;\'\"\<\>\?]* ]] ; then
+        log_msg -s "\nThe new password entered is not compliant with the Password Policies must contain a allowed special character."
+        continue
+    fi
+
+    if [ ${_password_length_} -lt 5 ] || [ ${_password_length_} -gt 30 ]; then
+        log_msg -s "\nThe new password length should be not less than 5 characters or greater than 30 characters."
+        continue
+    fi
+
+    $ECHO "\nRe-Enter password for ${_dbuser_}"
+    read -s _password1_
+    if [ "${_password_}" == "${_password1_}" ]; then
+        DBPASSWORD=`$ECHO ${_password_}| /usr/bin/openssl enc -base64`
+        break
+    else
+        $ECHO "password mismatch. Try again..."
+        $SLEEP 2
+        continue
+    fi
+done  
+
+export DBPASSWORD
+}
+
+
+
+### Function: common_get_mws_password ###
+#
+# Check all inirator scripts exist
+#
+# Arguments:
+#   None
+# Return Values:
+#   0 : Success
+#   1 : Fail
+common_get_mws_password()
+{
+
+  if [ -f /eniq/installation/config/strong_passphrase ]; then
+    passwd_key=`$CAT /eniq/installation/config/strong_passphrase`
+  else
+    if [ -f /eniq/sw/conf/strong_passphrase ]; then
+        passwd_key=`$CAT /eniq/sw/conf/strong_passphrase`
+    else
+        log_msg -s "\nThe strong_passphrase is not present."
+        exit 1
+    fi
+  fi
+
+  while :; do
+    $CLEAR
+    unset MWSPASSWORD
+    
+    $ECHO "\n\nEnter MWS password"
+    read -s _password_
+
+    local _password_length_=${#_password_}
+    
+    if  [ -z "${_password_}" ] ; then
+        log_msg -s "\nPassword cannot be empty."
+        continue
+    fi
+   
+    MWS_host=`cat /eniq/installation/config/om_sw_locate  | awk -F"@" '{print $1}'` 
+    $ECHO "\nRe-Enter password for MWS"
+    read -s _password1_
+	$ECHO "\nPlease wait, while the MWS Password is being updated."
+    if [ "${_password_}" == "${_password1_}" ]; then
+        #MWSPASSWORD=`$ECHO ${_password_}| /usr/bin/openssl enc -aes-256-ctr -md sha512 -a -salt -pass pass:${passwd_key}`
+        #break
+PASSWD_LOGFILE=/var/tmp/ssh_logfile
+        #password=EniqMws@123
+        $EXPECT <<EOF >${PASSWD_LOGFILE} 2>&1
+        set timeout 20
+        spawn ssh root@${MWS_host}
+        expect {
+        "*(yes/no)?" {send -- "yes\r";exp_continue}
+        "*assword:" {send -- "${_password_}\r"}
+        }
+        expect {
+        "*denied*" { exit 8 }
+        "*invalid*" { exit 8 }
+        }
+        expect eof
+EOF
+
+        ssh_staus=$?
+#echo "status="$ssh_staus
+if [ $ssh_staus -eq 0 ]; then
+      MWSPASSWORD=`$ECHO ${_password_}| /usr/bin/openssl enc -aes-256-ctr -md sha512 -a -salt -pass pass:${passwd_key}`
+              break
+else
+      $ECHO "Incorrect password. Enter valid password..."
+              $SLEEP 2
+              continue
+fi
+    else
+        $ECHO "password mismatch. Try again..."
+        $SLEEP 2
+        continue
+    fi
+done  
+
+export MWSPASSWORD
+
+
+}
+
+
+
+### Function: common_get_dcuser_password ###
+#
+# Check all inirator scripts exist
+#
+# Arguments:
+#   $1 : default user password 
+#   $2 : user name
+# Return Values:
+#   0 : Success
+#   1 : Fail
+common_get_dcuser_password()
+{
+local _dcuser_=$1
+if [ -f /eniq/installation/config/strong_passphrase ]; then
+    passphrase=`$CAT /eniq/installation/config/strong_passphrase`
+else
+    if [ -f /eniq/sw/conf/strong_passphrase ]; then
+        passphrase=`$CAT /eniq/sw/conf/strong_passphrase`
+    else
+        log_msg -s "\nThe strong_passphrase is not present."
+        exit 1
+    fi
+fi
+
+while :; do
+    $CLEAR
+    unset DCPASSWORD
+    $ECHO "Password Policies:
+    ** Minimum password length 9 characters.
+    ** Maximum password length 30 characters.
+    ** All alphanumeric characters allowed.
+    ** The following special characters are allowed  % ~ _ + : ! * = , . /
+    ** Must contain an uppercase letter, a lowercase letter, a number and a special character.
+    ** No spaces allowed.
+    ** Dictionary words are not allowed.
+    "
+    
+    $ECHO "\n\nEnter password for ${_dcuser_}"
+    read -s _password_
+    local _password_length_=${#_password_}
+    
+    if  [ -z "${_password_}" ] ; then
+        log_msg -s "\nThe new password cannot be empty."
+        continue
+    fi
+    if ! [[ "${_password_}" =~ [A-Z] ]] ; then
+        log_msg -s "\nThe new password entered is not compliant with the Password Policies must contain a uppercase letter."
+        continue
+    fi
+    if ! [[ "${_password_}" =~ [a-z] ]] ; then
+        log_msg -s "\nThe new password entered is not compliant with the Password Policies must contain a lowercase letter."
+        continue
+    fi
+    if ! [[ "${_password_}" =~ [0-9] ]] ; then
+        log_msg -s "\nThe new password entered is not compliant with the Password Policies must contain a number."
+        continue
+    fi
+    if  [[ "${_password_}" != *['!'%~=,./:*_+]* ]] ; then
+        log_msg -s "\nThe new password entered is not compliant with the Password Policies must contain a special character."
+        continue
+    fi
+	
+    if  [[ "${_password_}" == *[\`\@\#\{\}\$\^\&\(\)\-\[\]\\\|\;\'\"\<\>\?]* ]] ; then
+        log_msg -s "\nThe new password entered is not compliant with the Password Policies must contain a allowed special character."
+        continue
+    fi
+	
+    if [ ${_password_length_} -lt 9 ] || [ ${_password_length_} -gt 30 ]; then
+        log_msg -s "\nThe new password length should be not less than 9 characters or greater than 30 characters."
+        continue
+    fi
+    $ECHO "\nRe-Enter password for ${_dcuser_}"
+    read -s _password1_
+    if [ "${_password_}" == "${_password1_}" ]; then
+        if [ -f "/tmp/os_post_upgrade" ];then 
+            log_msg -s "\nSetting the password in OS Level."
+            $EXPECT <<EOF
+set timeout 60
+spawn su root -c "passwd dcuser"
+expect {
+"New password:" {send -- "${_password_}\r";exp_continue}
+"Retype new password:" {send -- "${_password_}\r"}
+"passwd:" {send_user "\nERROR: The new password entered is not compliant with the Password Policies\n"; exit 1}
+timeout {send user "\nTIMEOUT\n"; exit 9}
+}
+expect eof
+EOF
+
+        dcuser_password_status=$?
+        if [ ${dcuser_password_status} -ne 0 ];then
+            continue
+        fi
+    fi
+        
+        DCPASSWORD=`$ECHO ${_password_}| /usr/bin/openssl enc -aes-256-ctr -md sha512 -a -salt -pass pass:${passphrase}`
+        break
+    else
+        $ECHO "password mismatch. Try again..."
+        $SLEEP 2
+        continue
+    fi
+done  
+export DCPASSWORD
+}
+
+
+### Function: common_get_admin_password ###
+#
+# Check all inirator scripts exist
+#
+# Arguments:
+#   $1 : default admin user password 
+#   $2 : admin user name
+# Return Values:
+#   0 : Success
+#   1 : Fail
+common_get_admin_password()
+{
+#set -x
+local _user_=$1
+while :; do
+    unset USERPASSWORD
+    $ECHO "Password Policies:
+    ** Minimum password length 9 characters.
+    ** Maximum password length 30 characters.
+    ** All alphanumeric characters allowed.
+    ** The following special characters are allowed  % ~ _ + : ! * = , . /
+    ** Must contain an uppercase letter, a lowercase letter, a number and a special character
+    ** No spaces allowed.
+    ** Dictionary words are not allowed.
+    "
+    
+    $ECHO "\n\nEnter password for ${_user_}"
+    read -s GET_USER_PASS_1
+    local _password_length_=${#GET_USER_PASS_1}
+    
+    if  [ -z "${GET_USER_PASS_1}" ] ; then
+        log_msg -s "\nThe new password cannot be empty."
+        continue
+    fi
+    if ! [[ "${GET_USER_PASS_1}" =~ [A-Z] ]] ; then
+        log_msg -s "\nThe new password entered is not compliant with the Password Policies must contain a uppercase letter."
+        continue
+    fi
+    if ! [[ "${GET_USER_PASS_1}" =~ [a-z] ]] ; then
+        log_msg -s "\nThe new password entered is not compliant with the Password Policies must contain a lowercase letter."
+        continue
+    fi
+    if ! [[ "${GET_USER_PASS_1}" =~ [0-9] ]] ; then
+        log_msg -s "\nThe new password entered is not compliant with the Password Policies must contain a number."
+        continue
+    fi
+    if  [[ "${GET_USER_PASS_1}" != *['!'%~=,./:*_+]* ]] ; then
+        log_msg -s "\nThe new password entered is not compliant with the Password Policies must contain a special character ."
+        continue
+    fi
+    if  [[ "${GET_USER_PASS_1}" == *[\`\@\#\{\}\$\^\&\(\)\-\[\]\\\|\;\'\"\<\>\?]* ]] ; then
+        log_msg -s "\nThe new password entered is not compliant with the Password Policies must contain a allowed special character ."
+        continue
+    fi
+
+    if [ ${_password_length_} -lt 9 ] || [ ${_password_length_} -gt 30 ]; then
+        log_msg -s "\nThe new password length should not be less than 9 characters or greater than 30 characters."
+        continue
+    fi
+
+    $ECHO "\nRe-Enter password for ${_user_}"
+    read -s GET_USER_PASS_2
+
+        if [ "${GET_USER_PASS_1}" != "${GET_USER_PASS_2}" ]; then
+                $ECHO "password mismatch. Try again..."
+                $SLEEP 2
+                continue
+    else
+                #$ECHO "\nPassword set for ${_user_}"
+                #log_msg -s "\nPassword set for ${_user_}" | $TEE -a ${LOGFILE}
+                log_msg -l ${LOGFILE} -s "\nPassword set for ${_user_}"
+                USERPASSWORD=${GET_USER_PASS_1}
+                break
+        fi
+               
+ done 
+ export USERPASSWORD
+
+}
+
+
+
+
+### Function: common_get_dns_domain ###
+#
+# Check all inirator scripts exist
+#
+# Arguments:
+#   $1 : default dns domain
+# Return Values:
+#   0 : Success
+#   1 : Fail
+common_get_dns_domain()
+{
+local _default_dns_domain_=$1
+
+while :; do
+	$CLEAR
+	unset DNSDOMAIN
+    
+	$ECHO "\n\nEnter DNS domain name"
+    if [ "${_default_dns_domain_}" ]; then
+        $ECHO "Hit enter for (${_default_dns_domain_})"
+    fi
+    read _dom_
+
+    # If the User hit nothing No router required
+    if [ ! "${_dom_}" ]; then
+        if [ "${_default_dns_domain_}" ]; then
+            DNSDOMAIN=${_default_dns_domain_}
+            break
+        fi
+        continue
+    fi
+    DNSDOMAIN=${_dom_}
+    break
+done  
+
+export DNSDOMAIN
+}
+
+### Function: common_get_dns_serv ###
+#
+# Check all inirator scripts exist
+#
+# Arguments:
+#   $1 : default dns
+# Return Values:
+#   0 : Success
+#   1 : Fail
+common_get_dns_serv()
+{
+local _default_dns_=$1
+
+while :; do
+	$CLEAR
+	unset DNSSERVERS
+
+	$ECHO "\n\nEnter IP address of DNS SERVER(s)"
+    if [ "${_default_dns_}" ]; then
+        $ECHO "Hit enter for (${_default_dns_}) or (none) for no DNS"
+    else
+        $ECHO "Enter (none) for no DNS"
+    fi
+    read _dns_
+
+    # If the User hit nothing No router required
+    if [ ! "${_dns_}" ]; then
+        if [ "${_default_dns_}" ]; then
+            DNSSERVERS=${_default_dns_}
+            break
+        fi
+        continue
+    fi
+
+     # If the User entered none. No router required
+    if [ "${_dns_}" == "none" ]; then
+        DNSSERVERS=${_dns_}
+        break
+    fi
+	
+    validate_ip ${_dns_}
+    if [ $? -ne 0 ]; then
+        continue
+    fi
+
+    if [ "${_dns_}" ]; then
+        DNSSERVERS=${_dns_}
+        break
+    fi
+done
+
+export DNSSERVERS
+}
+
+### Function: common_get_cep_med_details ###
+#
+# Get the CEP Mediation information
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+common_get_cep_med_details()
+{
+while :; do
+	$CLEAR
+	unset CEP_MED_NUM_SRVRS
+	
+	$ECHO "How many CEP Mediation servers will be installed?"
+	read CEP_MED_NUM_SRVRS
+
+	#if user enter nothing loop
+	if [ ! "${CEP_MED_NUM_SRVRS}" ]; then
+		continue
+	fi
+	
+	#must enter a number if not loop
+	$ECHO "${CEP_MED_NUM_SRVRS}" | $EGREP '^[0-9]+$' >> /dev/null 2>&1
+	if [ $? -ne 0 ]; then
+        continue  
+    fi
+	#if they enter 0 no cep servers to install so break out and set CEP_MED_USR_CHOICE to No for ini file
+    #else they've entered a num greater than 0 so set CEP_MED_USR_CHOICE to Yes for ini file
+    if [ ${CEP_MED_NUM_SRVRS} -eq 0 ]; then
+		CEP_MED_USR_CHOICE="No"
+		break
+	else
+		CEP_MED_USR_CHOICE="Yes"
+	fi
+    
+    break
+done
+
+export CEP_MED_NUM_SRVRS
+export CEP_MED_USR_CHOICE
+
+}
+
+### Function: common_get_feature_choice ###
+#
+# Get the list of features to install
+#
+# Arguments:
+#   $1 : default dns
+# Return Values:
+#   none
+#
+common_get_feature_choice()
+{
+local _display_file_=$1
+local _unlicenced_features_=$2
+local _temp_dir_=$3	
+
+# Get todays date
+local _now_date_=`$DATE '+%Y%m%d'`
+	
+$RM -f ${_display_file_} ${_unlicenced_features_}
+
+$ECHO "\nAvailable ENIQ features" >> ${_display_file_}
+$ECHO "-----------------------" >> ${_display_file_}
+
+_cnt_=${#FEATURE_ARRAY[@]}
+_menu_opt_=0
+for (( i=1; i<=${_cnt_}; i++)); do
+    unset _exp_ _nol_
+    if [ ${START_DATE_ARRAY[${i}]} -gt ${_now_date_} -o ${END_DATE_ARRAY[${i}]} -lt ${_now_date_} ]; then
+		$ECHO "[N/A]  ${DESC_ARRAY[${i}]}  (E)" >> ${_unlicenced_features_}
+    else
+		let _menu_opt_=_menu_opt_+1
+		VALID_FEATURE_ARRAY[${_menu_opt_}]=${FEATURE_ARRAY[${i}]}
+		VALID_DESC_ARRAY[${_menu_opt_}]=${DESC_ARRAY[${i}]}
+		$ECHO "[${_menu_opt_}]  ${DESC_ARRAY[${i}]}" >> ${_display_file_}
+    fi
+done
+$ECHO "\nSelect Range of ENIQ Features to be installed using the format [n,n,n-n,n...n]" >> ${_display_file_}
+$ECHO "\tE.G. 1,2,3-8,9,10 (E) means license for feature has expired" >> ${_display_file_}
+
+while :; do
+    $CLEAR
+    $CAT ${_display_file_}
+    $ECHO "\n\nSelect the ENIQ Features numbers you wish to"
+    $ECHO "Install & Activate for ${OSS_REF_NAME}"
+    read _opt_
+
+    # If the User hit nothing and there is a default. that will do
+    if [ ! "${_opt_}" ]; then
+        continue
+    fi
+
+    $RM -f ${_temp_dir_}/feature_output_list1 ${_temp_dir_}/feature_selection
+    _numerror_=0
+
+    # Where user wants no features, do not create a feature_selection file
+    if [[ "${_opt_}" == 'None' ||  "${_opt_}" == 'none'  ]]; then
+        $TOUCH /var/tmp/no_features
+        break
+    fi
+
+    for _num_ in `$ECHO ${_opt_} | $SED -e 's| ||g' -e 's|,| |g'`; do
+        $ECHO ${_num_} | $EGREP '-' >> /dev/null 2>&1
+        if [ $? -eq 0 ]; then
+            _start_=`$ECHO ${_num_} | $AWK -F\- '{print $1}'`
+            if [ ! "${_start_}" ]; then
+                continue
+            fi
+            _end_=`$ECHO ${_num_} | $AWK -F\- '{print $2}'`
+            for (( _sel_=${_start_}; _sel_<=${_end_}; _sel_++ )); do
+                $ECHO ${_sel_} | $EGREP '^[0-9]+$' >> /dev/null 2>&1
+                if [ $? -ne 0 ]; then
+                    _numerror_=1
+                    break
+                fi
+                if [ ${_sel_} -lt 1 -o ${_sel_} -gt ${_menu_opt_} ]; then
+                    _numerror_=1
+                    break
+                fi
+                $ECHO ${_sel_} >> ${_temp_dir_}/feature_selection
+            done
+        else
+            $ECHO ${_num_} | $EGREP '^[0-9]+$' >> /dev/null 2>&1
+            if [ $? -ne 0 ]; then
+                _numerror_=1
+                break
+            fi
+            if [ ${_num_} -lt 1 -o ${_num_} -gt ${_menu_opt_} ]; then
+                _numerror_=1
+                break
+            fi
+            $ECHO ${_num_} >> ${_temp_dir_}/feature_selection
+        fi
+    done
+
+    # Okay I should have a valid choice now in the ${_temp_dir_}/feature_selection
+    # file, however it may need to be sorted and to remove duplicate numbers if
+    # the user entered duplicate values. Output deails to output file. I will
+    # output the desc as well as I might show the user
+    for i in `$CAT ${_temp_dir_}/feature_selection | $SORT -u`; do
+        $ECHO "${VALID_FEATURE_ARRAY[${i}]}::${VALID_DESC_ARRAY[${i}]}::${OSS_REF_NAME}" >> ${_temp_dir_}/feature_output_list1
+    done
+
+    if [ ${_numerror_} -eq 0 ]; then
+        break
+    fi
+done
+}
+
+### Function: common_get_intf_names ###
+#
+# Check all inirator scripts exist
+#
+# Arguments:
+#   $1 : bond group name
+#	$2 : temp directory
+#	$3 : exclude list
+# Return Values:
+#   none
+#
+common_get_intf_names()
+{
+local _ipmp_grp_name_=$1
+local _tmp_directory_=$2
+local _intf_list_file_=$3
+local _ipmp_enabled_=$4
+
+_disp_file_=${_tmp_directory_}/intf_display_file
+$RM -rf ${_disp_file_} ${_tmp_directory_}/upd_intf_list
+
+if [ "${IPMP_INTERFACE_VALUES}" == "" ]; then
+    $CAT ${_intf_list_file_} > ${_tmp_directory_}/upd_intf_list
+	_unused_inf_list_=`$CAT ${_intf_list_file_}`
+else
+    _intf_used_list_=`$ECHO ${IPMP_INTERFACE_VALUES}`
+	$ECHO ${_intf_used_list_} >> ${_tmp_directory_}/usd_intf_list
+	_intf_used_list_=`$CAT ${_tmp_directory_}/usd_intf_list | $SED -e 's/ /\|/g'`
+	_unused_inf_list_=`$CAT ${_intf_list_file_} | $EGREP -v "${_intf_used_list_}"`
+    $CAT ${_intf_list_file_} | $EGREP -v "${_intf_used_list_}" > ${_tmp_directory_}/upd_intf_list
+fi
+unset IPMP_INTERFACE_VALUES
+
+$ECHO "\nAvailable Interfaces for ${_ipmp_grp_name_}" >> ${_disp_file_}
+$ECHO "-------------------------------------------" >> ${_disp_file_}
+
+while read _line_; do
+	_mac_addr_=`$IFCONFIG ${_line_} 2> /dev/null | $EGREP -w "ether" | $AWK '{print $2}'`
+	$ECHO "${_line_} ${_mac_addr_}" >> ${_disp_file_}
+done < ${_tmp_directory_}/upd_intf_list
+
+$ECHO "Select two group interfaces from the list above separated by a space (Example :<Interface_1> <Interface_2>)" >> ${_disp_file_}
+_num_required_intf=2
+
+while :; do
+	printf '\33[H\33[2J'
+
+	$CAT ${_disp_file_}
+	read _opt_
+	
+	if [ ! "${_opt_}" ]; then
+		continue
+	fi
+	
+	_num_choice_=`$ECHO ${_opt_} | $WC -w`
+	
+	_opt_arr_=(${_opt_})
+	
+	if [ ${_num_choice_} -eq ${_num_required_intf} ]; then
+		if [ ${_opt_arr_[0]} == ${_opt_arr_[1]} ]; then
+			$ECHO "Invalid interfaces selected, press <enter> to continue"
+			read _wait_
+			continue
+		fi
+	
+		_input_err_=0
+		for _choice_ in ${_opt_}; do
+			_choice_intf_=`$CAT ${_tmp_directory_}/upd_intf_list | $GREP ${_choice_}`
+			if [ "${_choice_intf_}" != "${_choice_}" ]; then
+				_input_err_=1
+			fi
+		done
+		if [ ${_input_err_} -eq 1 ]; then
+			$ECHO "Incorrect interfaces name selected, press <enter> to continue"
+			read _wait_
+			continue
+		fi
+
+	elif [ ${_num_choice_} -ne ${_num_required_intf} ]; then
+		$ECHO "Incorrect format entered, press <enter> to continue"
+		read _wait_
+		continue
+	fi
+	
+	IPMP_INTERFACE_VALUES=${_opt_}
+	break
+done
+export IPMP_INTERFACE_VALUES
+}
+
+### Function: common_get_ldap_domain ###
+#
+# Check all inirator scripts exist
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+#
+common_get_ldap_domain()
+{
+while :; do
+	$CLEAR
+	unset LDAPDOMAIN
+	
+	$ECHO "\n\nEnter LDAP domain name"
+	read _ldap_dom_
+
+    # If the User hit nothing, loop
+    if [ ! "${_ldap_dom_}" ]; then
+        continue
+    fi
+
+    LDAPDOMAIN=${_ldap_dom_}    
+    break
+done
+
+export LDAPDOMAIN
+}
+
+### Function: common_get_ldap_server_name ###
+#
+# Check all inirator scripts exist
+#
+# Arguments:
+#   1 : default hostname
+# Return Values:
+#   none
+#
+common_get_ldap_server_name()
+{
+local _default_ldap_host_=$1	
+
+while :; do
+	$CLEAR
+	
+	unset _ldap_hostname_ LDAP_HOST
+	
+	$ECHO "\nEnter the hostname of the LDAP server"
+	if [ "${_default_ldap_host_}" ]; then
+		$ECHO "Hit enter for (${_default_ldap_host_})"
+	fi
+	read _ldap_hostname_
+		
+	if [ ! "${_ldap_hostname_}" ]; then
+		if [ "${_default_ldap_host_}" ]; then
+			LDAP_HOST="${_default_ldap_host_}"
+			break
+		fi
+		continue
+	fi
+	
+    LDAP_HOST="${_ldap_hostname_}"
+   	break
+done
+
+export LDAP_HOST
+}
+
+### Function: common_get_ldap_ip_addr ###
+#
+# Check all inirator scripts exist
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+#
+common_get_ldap_ip_addr()
+{
+# Get an IP from the user and validate it
+while :; do
+	$CLEAR
+	
+	unset _ldap_ip_ LDAP_IP
+	
+	$ECHO "\nEnter the IP address of the LDAP server"
+	read _ldap_ip_
+	
+	if [ ! "${_ldap_ip_}" ]; then
+		continue
+	fi
+	
+	validate_ip ${_ldap_ip_}
+    if [ $? -ne 0 ]; then
+        continue
+    fi
+
+    LDAP_IP="${_ldap_ip_}"
+   	break
+done
+
+export LDAP_IP
+}
+
+### Function: common_get_netmask_info ###
+#
+# Get the netmask information
+#
+# Arguments:
+#   $1 : Output Message String
+#   $2 : Optional Default Netmask details
+# Return Values:
+#   0 : Success
+#   1 : Fail
+common_get_netmask_info()
+{
+if [ ! "${1}" ]; then
+    $ECHO "OUtput Message sting must be provided to common_get_netmask_info function"
+    return 1
+fi
+local _out_msg_="${1}"
+
+if [ "${2}" ]; then
+    local _default_netmask_="${2}"
+fi
+
+while :; do
+    $PRINTF '\33[H\33[2J'
+    
+    $ECHO "\n\n${_out_msg_}"
+    if [ "${_default_netmask_}" ]; then
+	$ECHO "Hit enter for (${_default_netmask_})"
+    fi
+    read _netmask_
+
+    # If the User hit nothing No router required
+    if [ ! "${_netmask_}" ]; then
+        if [ "${_default_netmask_}" ]; then
+            NETMASK_INFO=${_default_netmask_}
+            break
+        fi
+        continue
+    fi
+
+    _net_=`$ECHO ${_netmask_} | $AWK -F\: '{print $1}'`
+    _mask_=`$ECHO ${_netmask_} | $AWK -F\: '{print $2}'`
+    
+    validate_ip ${_net_}
+    if [ $? -ne 0 ]; then
+        continue
+    fi
+    
+    validate_ip ${_mask_}
+    if [ $? -ne 0 ]; then
+        continue
+    fi
+    
+    NETMASK_INFO=${_netmask_}
+
+    break
+done
+
+export NETMASK_INFO
+}
+
+### Function: common_get_num_subscribers ###
+#
+# Get the number of network subscribers
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+#
+common_get_num_subscribers()
+{
+while :; do
+	$CLEAR
+	unset NETWORK_USERS
+    	
+	$ECHO "\nEnter the number of subscribers on the network"
+    read _net_users_
+
+    # If the User hit nothing No router required
+    if [ ! "${_net_users_}" ]; then
+        continue
+    fi
+    
+    $ECHO "${_net_users_}" | $EGREP '^[0-9]+$' >> /dev/null 2>&1
+	if [ $? -ne 0 ]; then
+		continue
+	fi
+
+    NETWORK_USERS=${_net_users_}
+    break
+done
+
+export NETWORK_USERS
+}
+
+### Function: common_get_partition_plan ###
+#
+# Get the partition plan
+#
+# Arguments:
+#   $1 : file containing list of available plans
+#	$2 : display file
+# Return Values:
+#   none
+#
+common_get_partition_plan()
+{
+local _temp_plan_file_=$1
+local _display_file_=$2
+
+# Build an array to store the names of the available partition plans
+_cnt_=1
+while read _partition_detail_; do
+    # Store the details in the array
+    _plan_array_[${_cnt_}]=${_partition_detail_}
+    let _cnt_=_cnt_+1
+done < ${_temp_plan_file_}
+
+_cnt_=${#_plan_array_[@]}
+
+# Create the Display file
+$RM -f ${_display_file_}
+
+$ECHO "\n\nAvailable partitions:" >> ${_display_file_}
+for (( i=1; i<=${_cnt_}; i++ )); do
+    $ECHO "[${i}]  ${_plan_array_[${i}]}" >> ${_display_file_}
+done
+$ECHO "\nSelect the partition plan you wish to install" >> ${_display_file_}
+
+while :; do
+    $CLEAR
+    unset PLAN
+    
+	$CAT ${_display_file_}
+	read _num_
+
+    if [ ! "${_num_}" ]; then
+        continue
+    fi
+
+    _numerror_=0
+
+    $ECHO ${_num_} | $EGREP '^[0-9]+$' >> /dev/null 2>&1
+    if [ $? -ne 0 ]; then
+        _numerror_=1
+    fi
+    if [ ${_num_} -lt 1 -o ${_num_} -gt ${_cnt_} ]; then
+        _numerror_=1
+    fi
+
+    if [ ${_numerror_} -eq 0 ]; then
+        _plan_=${_plan_array_[${_num_}]}
+        _partition_plan_=`$ECHO ${_plan_} | $TR '[:upper:]' '[:lower:]'`
+		PLAN=${_partition_plan_}_plan
+        break
+    fi
+done
+
+export PLAN
+}
+
+### Function: common_get_router ###
+#
+# Get the number of system users
+#
+# Arguments:
+#   $1 : max number of users
+# Return Values:
+#   none
+#
+common_get_num_users()
+{
+local _max_num_users_=$1
+
+while :; do
+	$CLEAR
+	unset END_USERS
+	
+	$ECHO "\nEnter the number of end-users that will use the system (max. 150)"
+	read _end_users_
+
+    # If the User hit nothing No router required
+    if [ ! "${_end_users_}" ]; then
+        continue
+    fi
+    
+    $ECHO "${_end_users_}" | $EGREP '^[0-9]+$' >> /dev/null 2>&1
+	if [ $? -ne 0 ]; then
+		continue
+	fi
+	
+	if [ ${_end_users_} -gt ${_max_num_users_} ]; then
+		continue
+	fi
+
+    END_USERS=${_end_users_}
+    break
+done
+
+export END_USERS
+}
+
+### Function: common_get_repdb_user_password ###
+#
+# Check all inirator scripts exist
+#
+# Arguments:
+#   $1 : default database password 
+#   $2 : database user name
+# Return Values:
+#   0 : Success
+#   1 : Fail
+common_get_repdb_user_password()
+{
+local _dbuser_=$1
+
+
+while :; do
+    $CLEAR
+    unset DBPASSWORD
+
+    $ECHO "Password Policies:
+
+    ** Minimum password length 5 characters.
+    ** Maximum password length 30 characters.
+    ** All alphanumeric characters allowed.
+    ** The following special characters are allowed # % ~ _ + @ : * = { } , .
+    ** Must contain an uppercase letter, a lowercase letter, a number and a special character.
+    ** No spaces allowed.
+    "
+    
+    $ECHO "\n\nEnter password for ${_dbuser_}"
+    read -s _password_
+
+    local _password_length_=${#_password_}
+    
+    if  [ -z "${_password_}" ] ; then
+        log_msg -s "\nThe new password cannot be empty."
+        continue
+    fi
+    if ! [[ "${_password_}" =~ [A-Z] ]] ; then
+        log_msg -s "\nThe new password entered is not compliant with the Password Policies must contain a uppercase letter."
+        continue
+    fi
+    if ! [[ "${_password_}" =~ [a-z] ]] ; then
+        log_msg -s "\nThe new password entered is not compliant with the Password Policies must contain a lowercase letter."
+        continue
+    fi
+    if ! [[ "${_password_}" =~ [0-9] ]] ; then
+        log_msg -s "\nThe new password entered is not compliant with the Password Policies must contain a number."
+        continue
+    fi
+    if  [[ "${_password_}" != *[@#%~={},.@:*_+]* ]] ; then
+        log_msg -s "\nThe new password entered is not compliant with the Password Policies must contain a special character."
+        continue
+    fi
+	
+    if  [[ "${_password_}" == *[\`\!\/\$\^\&\(\)\-\[\]\\\|\;\'\"\<\>\?]* ]] ; then
+        log_msg -s "\nThe new password entered is not compliant with the Password Policies must contain a allowed special character."
+        continue
+    fi
+
+    if [ "${_password_length_}" -lt "5" ] || [ "${_password_length_}" -gt "30" ]; then
+        log_msg -s "\nThe new password length should be not less than 5 characters or greater than 30 characters."
+        continue
+    fi
+
+    $ECHO "\nRe-Enter password for ${_dbuser_}"
+    read -s _password1_
+    if [ "${_password_}" == "${_password1_}" ]; then
+        DBPASSWORD=`$ECHO ${_password_}| /usr/bin/openssl enc -base64`
+        break
+    else
+        $ECHO "password mismatch. Try again..."
+        $SLEEP 2
+        continue
+    fi
+done  
+
+export DBPASSWORD
+}
+
+### Function: common_get_router ###
+#
+# Get the default router
+#
+# Arguments:
+#   $1 : logfile
+#   $2 : existing router value
+# Return Values:
+#   0 : Success
+#   1 : Fail
+common_get_router()
+{
+local _logfile_=$1
+local _default_router_=$2
+local _curr_router_=$3
+
+unset DEFAULTROUTER
+
+while :; do
+	$CLEAR
+	
+	$ECHO "\n\nEnter IP address of Defaultrouter"
+    if [ "${_default_router_}" ]; then
+        $ECHO "Hit enter for (${_default_router_}) or (none) for no router"
+    else
+        $ECHO "Enter (none) for no router"
+    fi
+    read _router_
+
+    # If the User hit nothing - no router required
+    if [ ! "${_router_}" ]; then
+        if [ "${_default_router_}" ]; then
+            DEFAULTROUTER=${_default_router_}
+            break
+        fi
+        continue
+    fi
+
+    # If the User entered none. No router required
+    if [ "${_router_}" == "none" ]; then
+        break
+    fi
+	
+    validate_ip ${_router_}
+    if [ $? -ne 0 ]; then
+        continue
+    fi
+
+    if [ ! "${_curr_router_}" ]; then
+        $ROUTE add net default $_router_ >> /dev/null 2>&1
+        if [ $? -eq 0 ]; then
+            DEFAULTROUTER=${_router_}
+            break
+        fi
+    fi
+
+    if [ "${_curr_router_}" != "${_router_}" ]; then
+        $ROUTE delete default $_curr_router_ >> /dev/null 2>&1
+        $ROUTE add net default $_router_ >> /dev/null 2>&1
+        if [ $? -eq 0 ]; then
+            DEFAULTROUTER=${_router_}
+            break
+        else
+            $ROUTE add net default $_curr_router_ >> /dev/null 2>&1
+            $ECHO "Error setting default router to ${_router_}\n\n" | $TEE -a ${_logfile_}
+       fi
+    else
+    	DEFAULTROUTER=${_router_}
+        break
+    fi
+done
+
+export DEFAULTROUTER
+}
+
+### Function: common_get_nas_console_ip ###
+#
+# Get the NAS console IP
+#
+# Arguments:
+#   none
+# Return Values:
+#   0 : Success
+#   1 : Fail
+common_get_nas_console_ip()
+{
+$CLEAR
+
+# Get an IP from the user and validate it
+while :; do
+	unset _nas_ip_
+	
+	$ECHO "\nEnter the console IP address of the NAS"
+	read _nas_ip_
+	
+	if [ ! "${_nas_ip_}" ]; then
+		continue
+	fi
+	
+	validate_ip ${_nas_ip_}
+    if [ $? -ne 0 ]; then
+        continue
+    fi
+
+    NAS_CONSOLE_IP="${_nas_ip_}"
+   	break
+done
+
+export NAS_CONSOLE_IP
+}
+
+### Function: common_get_nas_mas_password ###
+#
+# Get the NAS password
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+common_get_nas_mas_password()
+{
+$CLEAR
+
+while :; do
+    unset _nas_mas_password_ _nas_mas_password1_
+
+    $ECHO "\nEnter the password for user 'master' in the NAS system:"
+    _nas_mas_password_=$(/usr/bin/perl -e 'system ("stty -echo");my $_temp_password_nas_ =<STDIN>; print $_temp_password_nas_; system ("stty echo");')
+
+    $ECHO "\nRe-Enter the password for user 'master' in the NAS system:"
+    _nas_mas_password1_=$(/usr/bin/perl -e 'system ("stty -echo");my $_temp_password_nas_1 =<STDIN>;print $_temp_password_nas_1; system ("stty echo");')
+    if [ "${_nas_mas_password_}" == "${_nas_mas_password1_}" ]; then
+        NAS_MAS_PASSWORD="${_nas_mas_password_}"
+        break
+    else
+        $ECHO "password mismatch. Try again..."
+        $SLEEP 2
+        continue
+    fi
+done
+
+export NAS_MAS_PASSWORD
+}
+
+### Function: common_get_nas_sup_password ###
+#
+# Get the NAS password
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+common_get_nas_sup_password()
+{
+$CLEAR
+
+while :; do
+    unset _nas_sup_password_ _nas_sup_password1_
+
+    $ECHO "\nEnter the password for user 'support' in the NAS system:"
+    _nas_sup_password_=$(/usr/bin/perl -e 'system ("stty -echo");my $_temp_password_support_ =<STDIN>; print $_temp_password_support_; system ("stty echo");')
+
+    $ECHO "\nRe-Enter the password for user 'support' in the NAS system:"
+    _nas_sup_password1_=$(/usr/bin/perl -e 'system ("stty -echo");my $_temp_password_support_1 =<STDIN>; print $_temp_password_support_1; system ("stty echo");')
+    if [ "${_nas_sup_password_}" == "${_nas_sup_password1_}" ]; then
+        NAS_SUP_PASSWORD="${_nas_sup_password_}"
+        break
+    else
+        $ECHO "password mismatch. Try again..."
+        $SLEEP 2
+        continue
+    fi
+done
+
+export NAS_SUP_PASSWORD
+}
+
+### Function: common_get_nas_virtual_ip ###
+#
+# Get the NAS console IP
+#
+# Arguments:
+#   1 : Number of virtual IPs
+# Return Values:
+#   0 : Success
+#   1 : Fail
+common_get_nas_virtual_ip()
+{
+_num_virt_ips_=$1
+	
+VIRTUAL_NAS_IP_LIST=""
+
+$CLEAR
+
+# Get the NAS IPs
+
+for (( j=1; j<=${_num_virt_ips_}; j++ )); do
+     # Get an IP from the user and validate it
+     while :; do
+                unset _nas_ip_
+                if [ "${SAN_DEVICE}" != "unityXT" ]; then
+		    $ECHO "\nEnter the virtual IP address for nas${j} ($j of ${_num_virt_ips_})"
+                else
+                    $ECHO "\nEnter the NAS IP address for nas${j} ($j of ${_num_virt_ips_})"
+                fi
+	        read _nas_ip_
+		
+		if [ ! "${_nas_ip_}" ]; then
+		    continue
+		fi
+		
+		validate_ip ${_nas_ip_}
+		if [ $? -ne 0 ]; then
+		    continue
+		else
+		    if [ "${VIRTUAL_NAS_IP_LIST}" == "" ]; then
+				VIRTUAL_NAS_IP_LIST="${_nas_ip_}"
+		    else
+				VIRTUAL_NAS_IP_LIST="${VIRTUAL_NAS_IP_LIST} ${_nas_ip_}"
+		    fi
+		    break
+		fi
+    done
+done
+
+
+export VIRTUAL_NAS_IP_LIST
+}
+
+### Function: common_get_num_vips ###
+#
+# Get the NAS primary pool
+#
+# Arguments:
+#   $1 : SunOS.ini file with location
+#	$2 : temp display file
+# Return Values:
+#   0 : Success
+#   1 : Fail
+common_get_num_vips()
+{
+$CLEAR
+local _sunos_ini_vips_=$1
+local _display_file_=$2
+_available_vips_=`iniget NAS_DETAILS -f ${_sunos_ini_vips_} -v Available_VIPs`
+    if [ ! "${_available_vips_}" ]; then
+		$ECHO "Could not read Available_VIPs value for NAS_DETAILS in ${_sunos_ini_vips_}" | $TEE -a ${_logfile_}
+		return 1
+    fi
+	
+#Build an array to store the names of the available VIPs
+_cnt_=1
+for  _number_ in `$ECHO ${_available_vips_} | $SED -e 's|,| |g' `; do 
+    # Store the details in the array
+    _number_array_[${_cnt_}]=${_number_}
+    let _cnt_=_cnt_+1
+done 
+
+_cnt_=${#_number_array_[@]}
+
+# Create the Display file
+$RM -f ${_display_file_}
+
+$ECHO "\n\nAvailable VIPs:" >> ${_display_file_}
+$ECHO "=====================" >> ${_display_file_}
+for (( i=1; i<=${_cnt_}; i++ )); do
+    $ECHO "[${i}]  ${_number_array_[${i}]} VIPs" >> ${_display_file_}
+done
+$ECHO "\nSelect the number of virtual IPs available in SFS" >> ${_display_file_}
+
+while :; do
+    $CLEAR
+    unset _number_virt_nas_ips_
+	$CAT ${_display_file_}
+	read _num_
+    if [ ! "${_num_}" ]; then
+        continue
+    fi
+    _numerror_=0
+    $ECHO ${_num_} | $EGREP '^[0-9]+$' >> /dev/null 2>&1
+    if [ $? -ne 0 ]; then
+        _numerror_=1
+    fi
+    if [ ${_num_} -lt 1 -o ${_num_} -gt ${_cnt_} ]; then
+        _numerror_=1
+    fi
+
+    if [ ${_numerror_} -eq 0 ]; then
+        _number_virt_nas_ips_=${_number_array_[${_num_}]}
+		Number_Virt_NAS_IPs="${_number_virt_nas_ips_}"
+        break
+    fi
+done
+export Number_Virt_NAS_IPs
+
+}
+
+
+### Function: common_get_pri_pool ###
+#
+# Get the NAS primary pool
+#
+# Arguments:
+#   none
+# Return Values:
+#   0 : Success
+#   1 : Fail
+common_get_pri_pool()
+{
+$CLEAR
+
+while :; do
+	unset _nas_pool_name_
+	
+	$ECHO "\nEnter the name of the primary NAS storage pool (max. 7 characters)"
+	read _nas_pool_name_
+	
+	if [ ! "${_nas_pool_name_}" ]; then
+		continue
+	fi
+	
+	_str_length_=`$ECHO ${_nas_pool_name_} | $WC -c`
+	if [ ${_str_length_} -gt 8 ]; then
+		continue
+	fi
+	
+    NAS_POOL="${_nas_pool_name_}"
+   	break
+done
+
+export NAS_POOL
+}
+
+### Function: common_get_reader_details ###
+#
+# Get the NAS primary pool
+#
+# Arguments:
+#   none
+# Return Values:
+#   0 : Success
+#   1 : Fail
+common_get_reader_details()
+{
+local _reader_string_=$1
+local _host_ip_=$2
+local _temp_dir_=$3
+	
+unset READER_ALIAS READER_IP
+
+while :; do
+	unset _reader_alias_
+	$CLEAR
+	
+	$ECHO "\nEnter the alias for this IQ instance"
+	$ECHO "Value must be in the form - ${_reader_string_}<n>"
+	read _reader_alias_
+	
+	if [ ! "${_reader_alias_}" ]; then
+		continue
+	fi
+	
+	$ECHO ${_reader_alias_} | $EGREP "^${_reader_string_}[1-9][0-9]*$" >> /dev/null 2>&1
+	if [ $? -ne 0 ]; then
+	    $ECHO "\nSpecified entry ${_reader_alias_} not in the correct format\nPress (enter) to continue"
+	    read _any_
+	    continue
+	else
+		READER_ALIAS=${_reader_alias_}
+		READER_IP=${_host_ip_}
+		break
+	fi
+done
+	
+export READER_ALIAS READER_IP
+}
+
+### Function: common_get_shared_files ###
+#
+# Mount the shared area to get LUN ids
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+common_get_shared_files()
+{
+local _server_type_=$1
+local _sunos_ini_=$2
+local _storage_ini_=$3
+local _ipmp_ini_=$4
+local _lun_id_file_=$5
+local _conf_dir_=$6
+local _logfile_=$7
+	
+if [ "${_server_type_}" != "CO" ]; then
+    _nas_sw_target_dir_=`iniget NAS_STORAGE_API -f ${_sunos_ini_} -v NAS_API_TARGET_DIR`
+    if [ ! "${_nas_sw_target_dir_}" ]; then
+	$ECHO "Failed to get NAS API target dir information from ${_sunos_ini_}" | $TEE -a ${_logfile_}
+	return 1
+    fi
+    
+    if [ "${SAN_DEVICE}" != "unityXT" ]; then
+	_nascli_=${_nas_sw_target_dir_}/bin/nascli
+	if [ ! -s ${_nascli_} ]; then
+	    $ECHO "${_nascli_} not found" | $TEE -a ${_logfile_}
+	    return 1
+	fi
+    fi
+
+    _intf_list_=`iniget IPMP -f ${_ipmp_ini_}`
+    if [ ! "${_intf_list_}" ]; then
+	$ECHO "Could not get list of IPMP interfaces" | $TEE -a ${_logfile_}
+	return 1
+    fi
+    
+    _virt_nas_list_=`iniget NAS_DETAILS -f ${_sunos_ini_} -v Virtual_NAS_IP_List`
+    if [ ! "${_virt_nas_list_}" ]; then
+	$ECHO "Could not read Virtual_NAS_IP_List value for NAS_DETAILS in ${_sunos_ini_}" | $TEE -a ${_logfile_}
+	return 1
+    fi
+    
+    # Get the first virtual IP for mounting, and the filesystem name
+    _nas1_ip_=`iniget Storage_NAS_SW -f ${_storage_ini_} -v NFS_HOST`
+    _nas_dir_=`iniget Storage_NAS_SW -f ${_storage_ini_} -v SHARE_PATH`
+    _nas_fs_name_=`iniget Storage_NAS_SW -f ${_storage_ini_} -v FS_NAME`
+    if [ ! "${_nas1_ip_}" -o ! "${_nas_dir_}" -o ! "${_nas_fs_name_}" ]; then
+	$ECHO "Could not get required info for mounting" | $TEE -a ${_logfile_}
+	return 1
+    fi
+
+    # Create a temporary Directory
+    _tem_mt_dir_=/tmp/mount_nas_dir.$$.$$
+    while :; do
+	$LS ${_tem_mt_dir_} >> /dev/null 2>&1
+	if [ $? -ne 0 ]; then
+	    break
+	fi
+	_tem_mt_dir_=${_tem_mt_dir_}.$$
+    done
+    $MKDIR -p ${_tem_mt_dir_}
+    if [ $? -ne 0 ]; then
+	_err_msg_="Could not create temporary NAS mount directory ${_tem_mt_dir_}"
+	abort_script "$_err_msg_"
+    fi
+
+    $ECHO "Mounting ${_nas1_ip_}:${_nas_dir_} on ${_tem_mt_dir_}" | $TEE -a ${_logfile_}
+    $MOUNT -t nfs -o proto=tcp,soft,ro ${_nas1_ip_}:${_nas_dir_} ${_tem_mt_dir_} >> /dev/null 2>&1
+    if [ $? -ne 0 ]; then
+	$ECHO "Could not mount ${_nas1_ip_}:${_nas_dir_} on ${_tem_mt_dir_}" | $TEE -a ${_logfile_}
+	return 1
+    fi
+
+    $CP -p ${_tem_mt_dir_}/conf/dcuser_password_file ${ENIQ_CONF_DIR} >> /dev/null 2>&1
+
+    if [ ! -s ${_tem_mt_dir_}/${_lun_id_file_} ]; then
+	$UMOUNT -f ${_tem_mt_dir_} >> /dev/null 2>&1
+	$ECHO "Could not find ${_tem_mt_dir_}/${_lun_id_file_}" | $TEE -a ${_logfile_}
+	return 1
+    fi
+
+    # Create a local copy of the file
+    $ECHO "Creating a copy of ${_lun_id_file_} in ${_conf_dir_}" | $TEE -a ${_logfile_}
+    $CP ${_tem_mt_dir_}/${_lun_id_file_} ${_conf_dir_}
+    if [ $? -ne 0 ]; then
+	$UMOUNT -f ${_tem_mt_dir_} >> /dev/null 2>&1
+	$ECHO "Could not copy ${_lun_id_file_} to ${_conf_dir_}" | $TEE -a ${_logfile_}
+	return 1
+    fi
+
+    $ECHO "Creating a copy of ${_tem_mt_dir_}/strong_passphrase  in ${_conf_dir_}" | $TEE -a ${_logfile_}
+    $CP -p ${_tem_mt_dir_}/conf/strong_passphrase ${ENIQ_CONF_DIR} >> /dev/null 2>&1
+
+    if [ ! -s ${ENIQ_CONF_DIR}/strong_passphrase ]; then
+        $UMOUNT -f ${_tem_mt_dir_} >> /dev/null 2>&1
+        $ECHO "Could not find ${ENIQ_CONF_DIR}/strong_passphrase" | $TEE -a ${_logfile_}
+        return 1
+    fi
+   
+    # Unmount the filesystem again
+    $UMOUNT -f ${_tem_mt_dir_} >> /dev/null 2>&1
+    if [ $? -ne 0 ]; then
+	$ECHO "Could not unmount ${_tem_mt_dir_}" | $TEE -a ${_logfile_}
+	return 1
+    fi
+
+    $RM -rf ${_tem_mt_dir_}
+fi
+}
+
+
+### Function: common_get_timezone ###
+#
+# Get the timezone
+#
+# Arguments:
+#   none
+# Return Values:
+#   0 : Success
+#   1 : Fail
+common_get_timezone()
+{
+local _default_timezone_=$1
+	
+while :; do
+    $CLEAR
+    
+    unset TIMEZONE
+
+    $ECHO "\n\nEnter TIMEZONE"
+    if [ "${_default_timezone_}" ]; then
+        $ECHO "Hit enter for (${_default_timezone_})"
+    fi
+    read _tz_
+
+    # If the User hit nothing No router required
+    if [ ! "${_tz_}" ]; then
+        if [ "${_default_timezone_}" ]; then
+            if [ -d /usr/share/zoneinfo/${_default_timezone_} ]; then
+		        _def_timezone_=`$TIMEDATECTL |$EGREP -w "Time zone" | $AWK '{print $3}'`
+                TIMEZONE=${_def_timezone_}
+                break
+	        elif [ -f /usr/share/zoneinfo/${_default_timezone_} ]; then
+	            TIMEZONE=${_default_timezone_}
+                break
+            fi
+        fi
+        continue
+    fi
+    if [ -d /usr/share/zoneinfo/${_tz_} ]; then
+	    _def_timezone_=`$TIMEDATECTL |$EGREP "Time zone" | $AWK '{print $3}'`
+        TIMEZONE=${_def_timezone_}
+        break
+	elif [ -f /usr/share/zoneinfo/${_tz_} ]; then
+	    TIMEZONE=${_tz_}
+        break
+    fi
+done
+
+export TIMEZONE
+}
+
+### Function: common_get_vlan_arp ###
+#
+# inirator question to get the highly available server IP
+#
+# Arguments:
+#   $1 : bond group name
+# Return Values:
+#   none
+#
+common_get_vlan_arp()
+{
+local _ipmp_grp_name_=$1
+
+while :; do
+    $PRINTF '\33[H\33[2J'
+    unset _ipmp_arp_value_ IPMP_ARP _invalid_ip_
+
+    $ECHO "\nEnter the IP address of at least one highly available servers in the same subnet as ${_ipmp_grp_name_}"
+    case "${_ipmp_grp_name_}" in
+        "PM Services Group") _ip_type_="MWS Server IP"
+            ;;
+        "Storage Group") _ip_type_="NAS Console IP"
+            ;;
+        "Backup Group") _ip_type_="OMBS Server IP"
+            ;;
+    esac
+    $ECHO "(${_ip_type_} Should be given as mandatory entry)"
+    $ECHO "If there are multiple IP addresses to be entered, then they should be separated by comma"
+    read _ipmp_arp_value_
+
+    _ipmp_arp_values_=`$ECHO ${_ipmp_arp_value_} | $SED -e 's/ //g'`
+
+    _arp_list_=`$ECHO ${_ipmp_arp_values_} | $TR ',' ' '`
+
+    _number_arp_=`$ECHO ${_arp_list_} | $WC -w`
+
+    if [ ${_number_arp_} -lt 1 ]; then
+        $ECHO "Please enter at-least one IP which are in same subnet, press <enter> to continue"
+        read _wait_
+        continue
+    fi
+
+    check_ip_type
+    for i in ${_arp_list_}; do
+        valid_ip_var=0
+        if [ "${_ip_type_}" == "IPv6" -a  "${_ipmp_grp_name_}" == "PM Services Group" ]; then
+                if ipcalc -s -6 -c ${i}; then
+                    $ECHO "valid IPv6"
+                else
+                    $ECHO "Entered IP is not valid IPv6 IP. Please enter valid IPv6 IP"
+                    valid_ip_var=1
+                    break
+                fi
+        else
+                if ipcalc -s -4 -c ${i}; then
+                    $ECHO "valid IPv4"
+                else
+                    $ECHO "Entered IP is not valid IPv4 IP. Please enter valid IPv4 IP"
+                    valid_ip_var=1
+                    break
+                fi
+        fi
+        #validate_ip ${i}
+        #if [ $? -ne 0 ]; then
+        #    _invalid_ip_="Y"
+        #fi
+    done
+    if [ "${valid_ip_var}" == 1 ]; then
+        continue
+    fi 
+    if [ "${_invalid_ip_}" == "Y" ]; then
+        continue
+    fi
+
+    IPMP_ARP="${_ipmp_arp_values_}"
+    break
+done
+
+export IPMP_ARP
+}
+
+### Function: common_get_vlan_gateway ###
+#
+# inirator question to get the gateway IP
+#
+# Arguments:
+#   $1 : bond group name
+# Return Values:
+#   none
+#
+common_get_vlan_gateway()
+{
+local _ipmp_grp_name_=$1
+
+while :; do
+    $PRINTF '\33[H\33[2J'
+    unset _ipmp_gateway_value_ IPMP_GATEWAY
+    check_ip_type
+    $ECHO "\nEnter the Gateway IP address of the ${_ipmp_grp_name_}"
+    read _ipmp_gateway_value_
+
+    if [ ! "${_ipmp_gateway_value_}" ]; then
+        continue
+    fi
+    if [ "${_ip_type_}" == "IPv6"  -a  "${_ipmp_grp_name_}" == "PM Services Group" ]; then
+      ipcalc -s -6 -c ${_ipmp_gateway_value_}
+      if [ $? -ne 0 ]; then
+         continue
+      fi
+
+    else
+      #validate_ip ${_ipmp_gateway_value_}
+      ipcalc -s -4 -c ${_ipmp_gateway_value_}
+      if [ $? -ne 0 ]; then
+        continue
+      fi
+    fi
+
+    IPMP_GATEWAY="${_ipmp_gateway_value_}"
+    break
+done
+
+export IPMP_GATEWAY
+}
+
+### Function: common_get_vlan_id ###
+#
+# inirator question to get the VLAN ID
+#
+# Arguments:
+#   $1 : bond group name
+# Return Values:
+#   none
+#
+common_get_vlan_id()
+{
+local _ipmp_grp_name_=$1
+
+while :; do
+    $PRINTF '\33[H\33[2J'
+    unset _ipmp_vlan_id_ ID_VLAN
+
+    $ECHO "\nEnter the VLAN id of the ${_ipmp_grp_name_}"
+    read _ipmp_vlan_id_
+
+    if [ ! "${_ipmp_vlan_id_}" ]; then
+        continue
+    fi
+
+    ID_VLAN="${_ipmp_vlan_id_}"
+    break
+done
+
+export ID_VLAN
+}
+
+### Function: common_get_vlan_ipmp_ip ###
+#
+# Check all inirator scripts exist
+#
+# Arguments:
+#   $1 : bond group name
+# Return Values:
+#   none
+#
+common_get_vlan_ipmp_ip()
+{
+local _ipmp_grp_name_=$1
+
+while :; do
+    $PRINTF '\33[H\33[2J'
+    unset _ipmp_ip_value_ IPMP_IPS
+    check_ip_type
+    $ECHO "\nEnter the IP address of the ${_ipmp_grp_name_}"
+    read _ipmp_ip_value_
+	
+    if [ ! "${_ipmp_ip_value_}" ]; then
+       continue
+    fi
+	
+    if [ "${_ip_type_}" == "IPv6"  -a  "${_ipmp_grp_name_}" == "PM Services Group" ]; then
+      ipcalc -s -6 -c ${_ipmp_ip_value_}    
+      if [ $? -ne 0 ]; then
+         continue
+      fi
+
+    else
+       ipcalc -s -4 -c ${_ipmp_ip_value_}
+       #validate_ip ${_ipmp_ip_value_}
+       if [ $? -ne 0 ]; then
+         continue
+       fi
+    fi
+	 
+    IPMP_IPS="${_ipmp_ip_value_}"
+    break
+done
+
+export IPMP_IPS
+}
+
+### Function: common_get_vlan_ipmp_netmask ###
+#
+# Check all inirator scripts exist
+#
+# Arguments:
+#   $1 : bond group name
+# Return Values:
+#   none
+#
+common_get_vlan_ipmp_netmask()
+{
+local _ipmp_grp_name_=$1
+
+while :; do
+    $PRINTF '\33[H\33[2J'
+    unset _ipmp_netmask_value_ IPMP_NETMASKS
+    check_ip_type
+    $ECHO "\nEnter the netmask address for the ${_ipmp_grp_name_}"
+    read _ipmp_netmask_value_
+	
+    if [ ! "${_ipmp_netmask_value_}" ]; then
+	continue
+    fi
+	
+if [ "${_ip_type_}" == "IPv6"  -a  "${_ipmp_grp_name_}" == "PM Services Group" ]; then
+      ipcalc -s -6 -c ${_ipmp_netmask_value_}
+      if [ $? -ne 0 ]; then
+         continue
+      fi
+
+else
+      ipcalc -s -4 -c ${_ipmp_netmask_value_}
+      #validate_ip ${_ipmp_netmask_value_}
+      if [ $? -ne 0 ]; then
+        continue
+      fi
+fi
+	
+    IPMP_NETMASKS="${_ipmp_netmask_value_}"
+    break
+done
+
+export IPMP_NETMASKS
+}
+
+### Function: common_get_vlan_ipv6_netmask ###
+#
+# Check all inirator scripts exist
+#
+# Arguments:
+#   $1 : IPMP group name
+# Return Values:
+#   none
+#
+common_get_vlan_ipv6_netmask()
+{
+local _ipmp_grp_name_=$1
+
+while :; do
+    $CLEAR
+    unset _ipv6_netmask_value_ IPv6_NETMASKS
+	
+    $ECHO "\nEnter the IPv6  netmask address for the ${_ipmp_grp_name_}"
+    read _ipv6_netmask_value_
+	
+    if [ ! "${_ipv6_netmask_value_}" ]; then
+	continue
+    fi
+
+    # Validates the subnet prefix of IPV6 
+    if [[ ${_ipv6_netmask_value_} =~ ^\s*[0-9]+\s*$ ]] ; then
+        if [[ ${_ipv6_netmask_value_} -lt 1 || ${_ipv6_netmask_value_} -gt 128 ]] ; then
+            $ECHO -ne "\nIPv6 subnet prefix validation failed. Please enter valid subnet prefix [1-128]\n\n" 
+            continue
+        fi
+    fi
+	
+    IPv6_NETMASKS="${_ipv6_netmask_value_}"
+    break
+done
+
+export IPv6_NETMASKS
+}
+
+
+### Function: common_set_unique_id ###
+#
+# Generate a Unique ID and store it.
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+common_set_unique_id()
+{
+local _temp_sunos_ini_=$1
+	
+_hname_=`${MYHOSTNAME}`
+_hid_=`${HOSTID}`
+_unique_id_="${_hname_}_${_hid_}_iq_server"
+
+iniset ENIQ_INSTALL_CONFIG -f ${_temp_sunos_ini_} ENIQ_UNIQ_ID=${_unique_id_}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not update ${_temp_sunos_ini_} ENIQ_UNIQ_ID=${_unique_id_}"
+    abort_script "$_err_msg_"
+fi
+}
+
+### Function: common_setup_nas_filestore ###
+#
+# Set up the NAS server, and its local users
+#
+# Arguments:
+#   $1 : SunOS ini file
+# Return Values:
+#   none
+common_setup_nas_filestore()
+{
+local _ini_file_="${1}"
+local _ssh_input_file_="${2}"
+local _ipmp_ini_="${3}"
+local _storage_ini_="${4}"
+local _logfile_="${5}"
+
+_nas_sysid_=`iniget Storage_NAS_GENERAL -f ${_storage_ini_} -v SYS_ID`
+if [ ! "${_nas_sysid_}" ]; then
+    $ECHO "Could not get NAS sysid value from ${_storage_ini_}"
+    return 1
+fi
+
+_nas_sw_target_dir_=`iniget NAS_STORAGE_API -f ${_ini_file_} -v NAS_API_TARGET_DIR`
+if [ ! "${_nas_sw_target_dir_}" ]; then
+    $ECHO "Failed to get NAS API target dir information from ${_ini_file_}"
+    return 1
+fi
+
+_nas_fs_name_=`iniget Storage_NAS_SW -f ${_storage_ini_} -v FS_NAME`
+if [ ! "${_nas_fs_name_}" ]; then
+    $ECHO "Could not get Storage_NAS_SW FS_NAME value from ${_storage_ini_}"
+    return 1
+fi
+
+_nas_share_options_=`iniget Storage_NAS_SW -f ${_storage_ini_} -v NFS_SHARE_OPTIONS`
+if [ ! "${_nas_share_options_}" ]; then
+    $ECHO "Could not get Storage_NAS_SW NFS_SHARE_OPTIONS value from ${_storage_ini_}"
+    return 1
+fi
+
+
+# Check required files and scripts exist
+if [ ! -s ${_nas_sw_target_dir_}/bin/setup_ssh_FileStore.sh ]; then
+    $ECHO "File ${_nas_sw_target_dir_}/bin/setup_ssh_FileStore.sh not found"
+    return 1
+fi
+
+if [ ! -s ${_ssh_input_file_} ]; then
+    $ECHO "File ${_ssh_input_file_} not found"
+    return 1
+fi
+
+_nas_sw_target_dir_=`iniget NAS_STORAGE_API -f ${_ini_file_} -v NAS_API_TARGET_DIR`
+if [ ! "${_nas_sw_target_dir_}" ]; then
+    $ECHO "Failed to get NAS API target dir information from ${_ini_file_}"
+    return 1
+fi
+
+_nascli_=${_nas_sw_target_dir_}/bin/nascli
+if [ ! -s ${_nascli_} ]; then
+	$ECHO "${_nascli_} not found"
+	return 1
+fi
+	
+$ECHO "Setting up ssh connectivity for NAS" |$TEE -a ${_logfile_}
+$ECHO "${_nas_sw_target_dir_}/bin/setup_ssh_FileStore.sh ${_ssh_input_file_}" >> ${_logfile_}
+${_nas_sw_target_dir_}/bin/setup_ssh_FileStore.sh ${_ssh_input_file_} >> ${_logfile_}
+if [ $? -ne 0 ]; then
+	$ECHO "${_nas_sw_target_dir_}/bin/setup_ssh_FileStore.sh exited due to an error"
+	return 1
+fi
+
+if [ ! "${UPGRADE}" ]; then
+    if [ "${CURR_SERVER_TYPE}" == "eniq_ui" -o "${CURR_SERVER_TYPE}" == "eniq_iqr" -o "${CURR_SERVER_TYPE}" == "eniq_mz" -o "${CURR_SERVER_TYPE}" == "stats_iqr" -o "${CURR_SERVER_TYPE}" == "stats_engine" ]; then
+        if [ -s ${ENIQ_CONF_DIR}/extra_params/deployment ]; then
+            _deployment_=`$CAT ${ENIQ_CONF_DIR}/extra_params/deployment`
+        else
+            _err_msg_="Parameter \"deployment\" incorrectly specified, or is missing from boot command"
+            abort_script "$_err_msg_" "${EXEC_SHELL_CMD}"
+        fi
+
+        if [ "${_deployment_}" == "ft" ]; then
+            # we only configure 1 vlan i.e. the oss services vlan
+            $ECHO "deployment = ft"
+            _intf_list_=`iniget IPMP -f ${_ipmp_ini_} | $HEAD -1`
+            if [ ! "${_intf_list_}" ]; then
+                $ECHO "Could not get list of IPMP interfaces"
+                    return 1
+            fi
+        else
+            # we configure both services and storage vlans
+            _intf_list_=`iniget IPMP -f ${_ipmp_ini_}`
+            if [ ! "${_intf_list_}" ]; then
+                $ECHO "Could not get list of IPMP interfaces"
+                return 1
+            fi
+        fi
+        
+        for _intf_ in ${_intf_list_}; do
+            _vlan_name_=`iniget ${_intf_} -f ${_ipmp_ini_} -v IPMP_Group_Name`
+            if [ ! "${_vlan_name_}" ]; then
+                $ECHO "Could not read IPMP_Group_Name for ${_intf_} in ${_ipmp_ini_}"
+                return 1
+            fi
+            
+            if [ "${_vlan_name_}" != "stor_grp" -a  "${_deployment_}" != "ft" ]; then
+                continue
+            else
+                _intf_ip_=`iniget ${_intf_} -f ${_ipmp_ini_} -v IPMP_Group_IP`
+                if [ ! "${_intf_ip_}" ]; then
+                    $ECHO "Could not read IPMP_Group_IP value for ${_intf_} in ${_ipmp_ini_}"
+                    return 1
+                fi
+                
+                $ECHO "Adding ${_intf_ip_} as a client of NAS" | $TEE -a ${_logfile_}
+                ${_nascli_} -s add_client ${_nas_sysid_} ${_intf_ip_} ${_nas_share_options_} ${_nas_fs_name_} 
+                if [ $? -ne 0 ]; then
+                    $ECHO "Problem encountered adding ${_intf_ip_} as a client of NAS"
+                    return 1
+                fi
+            fi
+        done
+    fi
+fi
+
+}
+
+### Function: common_setup_unity_filestore ###
+#
+# Set up the NAS server, and its local users
+#
+# Arguments:
+#   $1 : SunOS ini file
+# Return Values:
+#   none
+common_setup_unity_filestore()
+{
+local _ini_file_="${1}"
+local _ssh_input_file_="${2}"
+local _ipmp_ini_="${3}"
+local _storage_ini_="${4}"
+local _logfile_="${5}"
+
+_spa_ip_=`iniget BLK_STORAGE_DEV_DETAILS_1 -f ${ENIQ_CONF_DIR}/${BLK_STOR_INI} -v BLK_STORAGE_IP_SPA`
+if [ -z "${_spa_ip_}" ]; then
+    _err_msg_="Failed to get BLK_STORAGE_IP_SPA information from ${ENIQ_CONF_DIR}/${BLK_STOR_INI}"
+    abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+fi
+
+_pool_name_=`iniget Storage_NAS_GENERAL -f ${_storage_ini_} -v SYS_ID`
+if [ ! "${_pool_name_}" ]; then
+    $ECHO "Could not get POOL_NAME sysid value from ${_storage_ini_}"
+    return 1
+fi
+
+_fs_name_=`iniget Storage_NAS_SW -f ${_storage_ini_} -v FS_NAME`
+if [ ! "${_fs_name_}" ]; then
+    $ECHO "Could not get Storage_NAS_SW FS_NAME value from ${_storage_ini_}"
+    return 1
+fi
+
+_nfs_=`$UEMCLI -d ${_spa_ip_} -noHeader /stor/prov/fs/nfs show -filter "Root hosts" -output csv | $TAIL -n +2 | $SED 's/"//g' | $HEAD -1`
+
+if [ ! "${UPGRADE}" ]; then
+    if [ "${CURR_SERVER_TYPE}" == "eniq_ui" -o "${CURR_SERVER_TYPE}" == "eniq_iqr" -o "${CURR_SERVER_TYPE}" == "eniq_mz" -o "${CURR_SERVER_TYPE}" == "stats_iqr" -o "${CURR_SERVER_TYPE}" == "stats_engine" ]; then
+        if [ -s ${ENIQ_CONF_DIR}/extra_params/deployment ]; then
+            _deployment_=`$CAT ${ENIQ_CONF_DIR}/extra_params/deployment`
+        else
+            _err_msg_="Parameter \"deployment\" incorrectly specified, or is missing from boot command"
+            abort_script "$_err_msg_" "${EXEC_SHELL_CMD}"
+        fi
+
+        if [ "${_deployment_}" == "ft" ]; then
+            # we only configure 1 vlan i.e. the oss services vlan
+            $ECHO "deployment = ft"
+            _intf_list_=`iniget IPMP -f ${_ipmp_ini_} | $HEAD -1`
+            if [ ! "${_intf_list_}" ]; then
+                $ECHO "Could not get list of IPMP interfaces"
+                    return 1
+            fi
+        else
+            # we configure both services and storage vlans
+            _intf_list_=`iniget IPMP -f ${_ipmp_ini_}`
+            if [ ! "${_intf_list_}" ]; then
+                $ECHO "Could not get list of IPMP interfaces"
+                return 1
+            fi
+        fi
+        
+        for _intf_ in ${_intf_list_}; do
+            _vlan_name_=`iniget ${_intf_} -f ${_ipmp_ini_} -v IPMP_Group_Name`
+            if [ ! "${_vlan_name_}" ]; then
+                $ECHO "Could not read IPMP_Group_Name for ${_intf_} in ${_ipmp_ini_}"
+                return 1
+            fi
+            
+            if [ "${_vlan_name_}" != "stor_grp" -a  "${_deployment_}" != "ft" ]; then
+                continue
+            else
+                _intf_ip_=`iniget ${_intf_} -f ${_ipmp_ini_} -v IPMP_Group_IP`
+                if [ ! "${_intf_ip_}" ]; then
+                    $ECHO "Could not read IPMP_Group_IP value for ${_intf_} in ${_ipmp_ini_}"
+                    return 1
+                fi
+                
+                $ECHO "Adding ${_intf_ip_} as a client of NFS" | $TEE -a ${_logfile_}
+                $UEMCLI -d ${_spa_ip_} /stor/prov/fs/nfs -name ${_pool_name_}-${_fs_name_} set -async -advHostMgmtEnabled no -rootHosts ${_nfs_},${_intf_ip_} 
+                if [ $? -ne 0 ]; then
+                    $ECHO "Problem encountered adding ${_intf_ip_} as a client of NAS"
+                    return 1
+                fi
+            fi
+        done
+    fi
+fi
+
+}
+
+### Function: common_store_new_inis ###
+#
+# Copy files from localtion to final locations
+#
+# Arguments:
+#       $1 : Source directory 
+#       $2 : Destination directory where files will be stored
+#       $3 : Absolute path of log file
+#       Then single space seperated file's name which needs to be copied from source directory to destination directory 
+# Return Values:
+#   0 : Success
+#   1 : Fail
+common_store_new_inis()
+{
+local _source_dir_=$1
+local _destination_dir_=$2
+local _logfile_=$3
+shift 3
+
+local _run_time_=`$DATE '+%Y-%b-%d_%H.%M.%S'`
+
+# Create a directory for ini file backups
+$MKDIR -p ${_destination_dir_}/backup
+
+# Make a backup copy of ini files if some exist already
+$ECHO "\nCreating ini file backups if required in ${_destination_dir_}/backup" >> ${_logfile_}
+$ECHO "Saving updated ini files in ${_destination_dir_}" >> ${_logfile_}
+
+for _file_ in "$@"; do
+    # Checking if file to be copied, is already present in destination directory. If so
+    # then taking backup of that file
+    if [ -f ${_destination_dir_}/${_file_} ]; then
+        $CP ${_destination_dir_}/${_file_} ${_destination_dir_}/backup/${_file_}.${_run_time_}     
+        if [ $? -ne 0 ]; then
+	    $ECHO "Could not copy ${_destination_dir_}/${_file_} to ${_destination_dir_}/backup/${_file_}.${_run_time_}" | $TEE -a ${_logfile_}
+            return 1
+        fi
+    fi
+    
+    # copying file from source directory to destination directory
+    if [ -f ${_source_dir_}/${_file_} ]; then
+        $ECHO "Copying ${_source_dir_}/${_file_} to ${_destination_dir_}/${_file_}" >> ${_logfile_}
+        $CP ${_source_dir_}/${_file_} ${_destination_dir_}/${_file_}
+        if [ $? -ne 0 ]; then
+	    $ECHO "Could not copy ${_source_dir_}/${_file_} to ${_destination_dir_}/${_file_}" | $TEE -a ${_logfile_}
+	    return 1
+        fi
+       
+	# Applying permission 644 on the recently copied file
+        $CHMOD 644 ${_destination_dir_}/${_file_}
+        if [ $? -ne 0 ]; then
+            $ECHO "Could not change permissions of ${_destination_dir_}/${_file_} to -rw-r--r--" | $TEE -a ${_logfile_}
+            return 1
+         fi
+
+    fi
+
+done
+
+}

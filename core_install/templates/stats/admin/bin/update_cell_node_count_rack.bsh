@@ -1,0 +1,544 @@
+#!/bin/bash
+# ********************************************************************
+# Ericsson Radio Systems AB                                     SCRIPT
+# ********************************************************************
+#
+#
+# (c) Ericsson Radio Systems AB 2019 - All rights reserved.
+#
+# The copyright to the computer program(s) herein is the property
+# of Ericsson Radio Systems AB, Sweden. The programs may be used
+# and/or copied only with the written permission from Ericsson Radio
+# Systems AB or in accordance with the terms and conditions stipulated
+# in the agreement/contract under which the program(s) have been
+# supplied.
+#
+# ********************************************************************
+# Name    : update_cell_node_count_rack.bsh
+# Date    : 19/12/2019
+# Revision: main\8
+# Purpose : Script to calculate size available and to update sym_links.ini file
+#           with calculated size. Later it will expand SYSMAIN.
+#
+# Usage   : update_cell_node_count_rack.bsh
+#
+# ********************************************************************
+#
+#     Command Section
+#
+# ********************************************************************
+AWK=/usr/bin/awk
+BC=/usr/bin/bc
+CAT=/usr/bin/cat
+CP=/usr/bin/cp
+DF=/usr/bin/df
+ECHO="/usr/bin/echo -e"
+EXPR=/usr/bin/expr
+GREP=/usr/bin/grep
+HEAD=/usr/bin/head
+MKDIR=/usr/bin/mkdir
+RM=/usr/bin/rm
+SED=/usr/bin/sed
+TAIL=/usr/bin/tail
+TEE=/usr/bin/tee
+TOUCH=/usr/bin/touch
+TR=/usr/bin/tr
+YES=/usr/bin/yes
+
+# ********************************************************************
+#
+#       Configuration Section
+#
+# ********************************************************************
+# Name of ini Files
+SYM_INI=sym_links.ini
+ENIQ_INI=niq.ini
+SUNOS_INI=SunOS.ini
+
+# ********************************************************************
+#
+#       Pre-execution Operations
+#
+# ********************************************************************
+
+# ********************************************************************
+#
+#     Functions
+#
+# ********************************************************************
+### Function: abort_script ###
+#
+#   This will is called if the script is aborted thru an error
+#   error signal sent by the kernel such as CTRL-C or if a serious
+#   error is encountered during runtime
+#
+# Arguments:
+#       $1 - Error message from part of program (Not always used)
+# Return Values:
+#       none
+abort_script()
+{
+if [ "$1" ]; then
+    _err_msg_=$1
+else
+    _err_msg_="Script aborted.......\n"
+fi
+
+# Check if log_msg() is defined
+type log_msg > /dev/null 2>&1
+if [ $? -gt 0 ]; then
+    if [ "${LOGFILE}" ]; then
+        $ECHO "\n${_err_msg_}\n" | $TEE -a ${LOGFILE}
+    else
+        $ECHO "\n${_err_msg_}\n"
+    fi
+else
+    if [ "${LOGFILE}" ]; then
+        log_msg -s "\n${_err_msg_}\n" -l ${LOGFILE}
+    else
+        log_msg -s "\n${_err_msg_}\n" -l ${LOGFILE}
+    fi
+fi
+
+$RM -rf ${TEM_DIR}
+
+if [ "$2" ]; then
+    ${2}
+else
+    exit 1
+fi
+}
+
+### Function: setup_env ###
+#
+# Setup up path environment etc
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+setup_env()
+{
+if [ ! "${ENIQ_BASE_DIR}" ]; then
+    ENIQ_BASE_DIR=/eniq
+fi
+
+# ENIQ installation config directory
+ENIQ_CONF_DIR=${ENIQ_BASE_DIR}/installation/config
+
+# Main Directory for the Core Installation SW
+ENIQ_INST_DIR=${ENIQ_BASE_DIR}/installation/core_install
+
+# ENIQ admin bin directory
+ENIQ_ADMIN_BIN=${ENIQ_BASE_DIR}/admin/bin
+
+# ENIQ admin lib directory
+ENIQ_ADMIN_LIB=${ENIQ_BASE_DIR}/admin/lib
+
+# ENIQ sw conf directory
+ENIQ_SW_CONF=${ENIQ_BASE_DIR}/sw/conf/
+
+# ENIQ database directory 
+ENIQ_DATABASE_DIR=${ENIQ_BASE_DIR}/database
+
+# Check if sym_link ini file exists or not
+if [ ! -s ${ENIQ_CONF_DIR}/${SYM_INI} ]; then
+    _err_msg_="Could not locate file ${ENIQ_CONF_DIR}/${SYM_INI}"
+    abort_script "${_err_msg_}"
+fi
+
+# Check if sym_link ini file exists or not
+if [ ! -s ${ENIQ_CONF_DIR}/${ENIQ_INI} ]; then
+    _err_msg_="Could not locate file ${ENIQ_CONF_DIR}/${ENIQ_INI}"
+    abort_script "${_err_msg_}"
+fi
+
+# var tmp directory
+VAR_TMP_DIR=/var/tmp
+
+# Migration Temp directory 
+VAR_TMP_MIGRATION=${VAR_TMP_DIR}/
+
+# Source library file
+if [ ! -s ${ENIQ_INST_DIR}/lib/common_functions.lib ]; then
+    _err_msg_="Cannot locate ${ENIQ_INST_DIR}/lib/common_functions.lib"
+    abort_script "${_err_msg_}"
+else
+    . ${ENIQ_INST_DIR}/lib/common_functions.lib
+fi
+
+# Set the log directory
+LOG_DIR=`iniget LOG_FILE_DIR -f ${ENIQ_CONF_DIR}/${ENIQ_INI} -v Logfile_Location`
+LOGFILE_DIR="${LOG_DIR}/expansion_log"
+
+if [ ! "${LOGFILE}" ]; then
+    LOGFILE=${LOGFILE_DIR}/update_cell_node_count_rack.log
+fi
+
+# Creating Log directory
+$MKDIR -p `$DIRNAME ${LOGFILE}`
+if [ $? -ne 0 ]; then
+    unset LOGFILE
+    _err_msg_="Could not create directory `$DIRNAME ${LOGFILE}`"
+    abort_script "${_err_msg_}"
+fi
+
+# Creating Log file
+$TOUCH -a ${LOGFILE}
+if [ $? -ne 0 ]; then
+    unset LOGFILE
+    _err_msg_="Could not write to file ${LOGFILE}"
+    abort_script "${_err_msg_}"
+fi
+
+# Create a temporary Directory
+TEM_DIR=/tmp/update_cell_node_count_rack.$$
+$RM -rf ${TEM_DIR}
+$MKDIR -p ${TEM_DIR}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not create directory ${TEM_DIR}"
+    abort_script "${_err_msg_}"
+fi
+
+
+# Making copy of SYM_INI file
+$CP -p ${ENIQ_CONF_DIR}/${SYM_INI} ${TEM_DIR}/${SYM_INI}
+
+# Script to add new IQ file into database
+if [ ! -s ${ENIQ_INST_DIR}/bin/add_iq_sys_main_dbspaces.bsh ]; then
+    _err_msg_="${ENIQ_INST_DIR}/bin/add_iq_sys_main_dbspaces.bsh File not found"
+    abort_script "${_err_msg_}"
+fi
+
+# Script to drop existing IQ file from database
+if [ ! -s ${ENIQ_ADMIN_BIN}/remove_iq_sysmain.bsh ]; then
+    _err_msg_="${ENIQ_ADMIN_BIN}/remove_iq_sysmain.bsh File not found"
+    abort_script "${_err_msg_}"
+fi
+
+_sysuser_=`iniget ENIQ_INSTALL_CONFIG -f ${ENIQ_CONF_DIR}/${SUNOS_INI} -v ENIQ_SYSUSER`
+if [ ! "${_sysuser_}" ]; then
+    _err_msg_="Could not read parameter ENIQ_SYSUSER from file - ${ENIQ_CONF_DIR}/${SUNOS_INI}"
+    abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+fi
+
+# Create a flag file for rack expansion
+RACK_EXP_IN_PROGRESS=${ENIQ_ADMIN_BIN}/rack_exp_in_progress
+
+#Check available space
+_available_dwh_main_space_=`$DF -m /eniq/database/dwh_main_dbspace | $SED 1d |  $AWK '{print $4}'`
+
+}
+
+### Function: remove_space_from_filesystem ###
+#
+# Calculates space to remove from allocation prior
+#
+# Arguments:
+#       $1 : amount of space in GB to remove prior to allocation
+#       $2 : where we remove from
+#       $3 : amount of space in filesystem prior to removal
+# Return Values:
+#    none
+
+remove_space_from_filesystem()
+{
+    amount_of_space_to_remove_in_mb=$1
+    removing_from=$2
+    space_remaining_in_filesystem=$3
+
+    log_msg -q -s "\nSubtracting ${amount_of_space_to_remove_in_mb} MB from ${db}" -l ${LOGFILE}
+    amount_of_space_to_remove_in_mb=${amount_of_space_to_remove_in_mb}
+    allocation_to_use_in_mb=$($EXPR ${_avail_in_mbytes_} - ${amount_of_space_to_remove_in_mb})
+    log_msg -q -s "\nTotal Allocation for iq files after subtracting is ${allocation_to_use_in_mb} MB" -l ${LOGFILE}
+}
+
+
+### Function: add_files_in_symlinks ###
+#
+# Appends the sybase iq file information to the sym links file
+#
+# Arguments:
+#       $1 : amount of files
+#       $2 : file size
+#       $3 : database
+# Return Values:
+#    none
+add_files_in_symlinks()
+{
+    amount_of_files=$1
+    file_size=$2
+    db=$3
+    
+    unset _dir_count_
+    _dir_count_=1
+
+    new_content_for_symlinks_file=${TEM_DIR}/new_content_for_symlinks_file
+
+    if [ "${db}" == "SYSMAIN" ]
+    then
+        DB_STRING="DWH_SYSTEM_MAIN"
+        last_string=$($GREP ${DB_STRING}_ ${ENIQ_CONF_DIR}/${SYM_INI} | $GREP -v "\[" | $TAIL -1)
+        file_number=2
+        last_index_when_we_finish=2
+    else
+        DB_STRING="DWH_DBSPACES_${db}"
+        last_string=$($GREP ${DB_STRING}_ ${ENIQ_CONF_DIR}/${SYM_INI} | $GREP -v "\[" | $TAIL -1)
+        last_index_seen_in_file=$($ECHO ${last_string} | $TR -dc '0-9')
+        last_index_when_we_finish=$((${amount_of_files} + ${last_index_seen_in_file}))
+        file_number=$((${last_index_seen_in_file} + 1))
+    fi
+
+
+    if [ "${db}" == "SYSMAIN" ]
+    then
+        file_number=2
+        last_index_when_we_finish=2
+    else
+        file_number=$((${last_index_seen_in_file} + 1))
+    fi
+    
+
+    while [[ "${file_number}" -le "${last_index_when_we_finish}" ]]
+    do
+    new_content_for_symlinks_file=${TEM_DIR}/new_content_for_symlinks_file
+
+    $RM -rf ${new_content_for_symlinks_file}
+    $TOUCH ${new_content_for_symlinks_file}
+if [ "${db}" != "SYSMAIN" ]; then
+        $ECHO "[${DB_STRING}_${file_number}]" >> ${new_content_for_symlinks_file}
+        
+        if [ "${db}" == "MAIN" ]; then
+            _dir_num_=`$EXPR ${file_number} % 10 | $BC`
+            if [ "${_dir_num_}" == "0" ];then
+                $ECHO "Path=/eniq/database/dwh_main_dbspace/dbspace_dir_10/main_${file_number}.iq" >> ${new_content_for_symlinks_file}
+            else
+                $ECHO "Path=/eniq/database/dwh_main_dbspace/dbspace_dir_${_dir_num_}/main_${file_number}.iq" >> ${new_content_for_symlinks_file}
+            fi
+        else
+            _dir_num_=`$EXPR ${file_number} % 5 | $BC`
+            if [ "${_dir_num_}" == "0" ];then
+                $ECHO "Path=/eniq/database/dwh_temp_dbspace/dbspace_dir_5/temp_${file_number}.iqtmp" >> ${new_content_for_symlinks_file}
+            else
+                $ECHO "Path=/eniq/database/dwh_temp_dbspace/dbspace_dir_${_dir_num_}/temp_${file_number}.iqtmp" >> ${new_content_for_symlinks_file}
+            fi
+        fi
+        $ECHO "Lun_ID=" >> ${new_content_for_symlinks_file}
+        $ECHO "Size=${file_size}" >> ${new_content_for_symlinks_file}
+        $ECHO "Type=fs" >> ${new_content_for_symlinks_file}
+        $ECHO "Link=" >> ${new_content_for_symlinks_file}
+        $ECHO "Disk=" >> ${new_content_for_symlinks_file}
+        $ECHO "" >> ${new_content_for_symlinks_file}
+        $ECHO "" >> ${new_content_for_symlinks_file}
+        
+        $RM -f  ${TEM_DIR}/${SYM_INI}.tmp
+
+        ${ENIQ_ADMIN_LIB}/iniadd.pl -g ${DB_STRING} -p ${DB_STRING}_${file_number} -i ${TEM_DIR}/${SYM_INI} -d ${new_content_for_symlinks_file} -o ${TEM_DIR}/${SYM_INI}.tmp
+        file_number=$((${file_number} + 1))
+
+        $CP -p ${TEM_DIR}/${SYM_INI}.tmp ${TEM_DIR}/${SYM_INI}
+    else
+       break
+    fi
+    done
+    if [ "${db}" == "SYSMAIN" ]
+    then
+        file_size=$($EXPR $file_size / 1024 / 1024)
+        sysmain_content=${TEM_DIR}/sysmain_content
+        $RM -rf ${sysmain_content}
+        touch ${sysmain_content}
+        $ECHO "[DWH_SYSTEM_MAIN_2]" >> ${sysmain_content}
+        $ECHO "Path=/eniq/database/dwh_main_dbspace/iq_system_main_1.iq" >> ${sysmain_content}
+        $ECHO "Lun_ID=" >> ${sysmain_content}
+        $ECHO "Size=${file_size}" >> ${sysmain_content}
+        $ECHO "Type=fs" >> ${sysmain_content}
+        $ECHO "Link=" >> ${sysmain_content}
+        $ECHO "Disk=" >> ${sysmain_content}
+        $ECHO "" >> ${sysmain_content}
+        $ECHO "" >> ${sysmain_content}
+
+        $RM -f  ${TEM_DIR}/${SYM_INI}.tmp
+        ${ENIQ_ADMIN_LIB}/iniadd.pl -g DWH_SYSTEM_MAIN -p DWH_SYSTEM_MAIN_${file_number} -i ${TEM_DIR}/${SYM_INI} -d ${sysmain_content} -o ${TEM_DIR}/${SYM_INI}.tmp
+
+        $CP -p ${TEM_DIR}/${SYM_INI}.tmp ${TEM_DIR}/${SYM_INI}
+    fi
+
+    $RM -rf ${new_content_for_symlinks_file} ${sysmain_content} ${TEM_DIR}/${SYM_INI}.tmp
+}
+
+
+### Function: db_expansion ###
+#
+# Convert the output from ls -h command to get the MB total
+#
+# Arguments:
+#       $1 : command name
+#       $2 : space left in filesystem
+# Return Values:
+#    none
+db_expansion()
+{
+    amount_of_space_to_remove_in_mb=$1
+    removing_from=$2
+    upper_limit=$3
+    middle_limit=$4
+    lower_limit=$5
+    db=$6
+
+    log_msg -s "\nUpdating ${SYM_INI} file for ${db} dbspace\n" -l ${LOGFILE}
+    if [ "${db}" == "SYSMAIN" ]
+    then
+        _space_remaining_in_filesystem_=${amount_of_space_to_remove_in_mb}
+        file_size_in_bytes=$((${amount_of_space_to_remove_in_mb} * 1024 * 1024))
+        log_msg -q -s "\nAs the DB is SYSMAIN, creating one iq files of size ${file_size_in_bytes}" -l ${LOGFILE}
+        add_files_in_symlinks 1 ${file_size_in_bytes} ${db}
+        return
+    fi
+
+    _space_remaining_in_filesystem_=$($DF -lm ${ENIQ_DATABASE_DIR}/${removing_from} | $SED 1d | $AWK '{print $4}')
+    _avail_in_mbytes_=${_space_remaining_in_filesystem_}
+    remove_space_from_filesystem ${amount_of_space_to_remove_in_mb} ${removing_from} ${_space_remaining_in_filesystem_}
+    _size_of_migrated_iq_file_in_mb=$($GREP -A4 ${db} ${ENIQ_CONF_DIR}/${SYM_INI} | $GREP Size | $HEAD -1 | $AWK -F= '{print $2}')
+    log_msg -q -s "\nSize of migrated file is ${_size_of_migrated_iq_file_in_mb} MB" -l ${LOGFILE}
+    _size_of_migrated_iq_file_in_bytes=$((1024 * ${_size_of_migrated_iq_file_in_mb}))
+    _avail_in_bytes_=$((allocation_to_use_in_mb  * 1024))
+
+    log_msg -q -s "\nChecking how high a fraction the amount available (${_avail_in_bytes_}) is of the migrated file(${_size_of_migrated_iq_file_in_bytes})" -l ${LOGFILE}
+
+    percentage=$(echo "scale=10; ${_avail_in_bytes_} / ${_size_of_migrated_iq_file_in_bytes} " | $BC)
+    log_msg -s "\nChecking space is available for ${db} DB expansion" -l ${LOGFILE}
+    
+    if [ "${db}" == "MAIN" ]; then
+        if (( $(echo "${percentage} > 0.7" | $BC -l) )) 
+        then
+            _exp_req_="TRUE"
+        fi
+    elif [ "${db}" == "TEMP" ]; then
+        if (( $(echo "${percentage} > 0.5" | $BC -l) ))
+        then
+            _exp_req_="TRUE"
+        fi
+    fi
+
+    if [ "${_exp_req_}" ]
+    then
+        log_msg -q -s "\nSpace is available for ${db} dbspace expansion" -l ${LOGFILE}
+        value=$((${allocation_to_use_in_mb} / ${_size_of_migrated_iq_file_in_mb}))
+        if [ "${value}" -ge "${upper_limit}" ]
+        then
+            size_per_file=$((${allocation_to_use_in_mb} / ${upper_limit}))
+            log_msg -q -s "\nAs the value is > ${upper_limit}, we will create ${upper_limit} iq files of size ${size_per_file}" -l ${LOGFILE}
+            add_files_in_symlinks ${upper_limit} ${size_per_file} ${db}
+        elif [ ${value} -ge "${middle_limit}" ]
+        then
+            size_per_file=$((${allocation_to_use_in_mb} / ${value}))
+            log_msg -q -s "\nAs the value is between ${middle_limit} and ${upper_limit}, we will create ${value} iq files of size ${size_per_file}" -l ${LOGFILE}
+            add_files_in_symlinks ${value} ${size_per_file} ${db}
+        elif [ ${value} -gt ${lower_limit} ]
+        then
+            log_msg -q -s "\nAs the value is between ${lower_limit} and ${middle_limit}, we append create ${value} iq files of size ${_size_of_migrated_iq_file_in_mb}" -l ${LOGFILE}
+            add_files_in_symlinks ${value} ${_size_of_migrated_iq_file_in_mb} ${db}
+        fi
+        log_msg -s "\nSuccessfully updated ${SYM_INI} file.\n" -l ${LOGFILE}
+    else
+        log_msg -s "\nSpace is not available for ${db} DB expansion." -l ${LOGFILE}
+    fi
+}
+
+### Function: add_iq_file_db ###
+#
+# To add IQ file into database
+#
+# Arguments:
+#       none
+# Return Values:
+#    none
+add_iq_file_db()
+{
+log_msg -s "Expanding the IQ SYS Main DB spaces" -l ${LOGFILE}
+log_msg -q -s "\nStarting to execute $SU - ${_sysuser_} -c $BASH ${ENIQ_INST_DIR}/bin/add_iq_sys_main_dbspaces.bsh -c ${ENIQ_SW_CONF} -d ${ENIQ_SW_CONF}/${ENIQ_INI} -s ${ENIQ_CONF_DIR}/${SYM_INI}" -l ${LOGFILE}
+
+$SU - ${_sysuser_} -c "$BASH ${ENIQ_INST_DIR}/bin/add_iq_sys_main_dbspaces.bsh -c ${ENIQ_SW_CONF} -d ${ENIQ_SW_CONF}/${ENIQ_INI} -s ${ENIQ_CONF_DIR}/${SYM_INI}" 2>/dev/null
+if [ $? -ne 0 ] ; then
+    _err_msg_="Expanding the IQ SYS Main DB spaces"
+    abort_script "${_err_msg_}"
+fi
+
+$TOUCH ${VAR_TMP_MIGRATION}/iq_file_added
+if [ $? -ne 0 ]; then
+    _err_msg_="Failed to add iq file"
+    abort_script "${_err_msg_}"
+fi
+
+}
+
+### Function: remove_iq_file_db ###
+#
+# To remove IQ file into database
+#
+# Arguments:
+#       none
+# Return Values:
+#    none
+remove_iq_file_db()
+{
+log_msg -s "\nRemoving existing IQ file from DB" -l ${LOGFILE}
+log_msg -q -s "\nStarting to execute $BASH ${ENIQ_ADMIN_BIN}/remove_iq_sysmain.bsh -c ${ENIQ_SW_CONF} -d ${ENIQ_SW_CONF}/${ENIQ_INI}" -l ${LOGFILE}
+$BASH ${ENIQ_ADMIN_BIN}/remove_iq_sysmain.bsh -c ${ENIQ_SW_CONF} -d ${ENIQ_SW_CONF}/${ENIQ_INI} 2>/dev/null
+if [ $? -ne 0 ] ; then
+    _err_msg_="Failed to drop IQ file from DB"
+    abort_script "${_err_msg_}"
+fi
+
+$TOUCH ${VAR_TMP_MIGRATION}/iq_file_removed
+if [ $? -ne 0 ]; then
+    _err_msg_="Failed to add iq file"
+    abort_script "${_err_msg_}"
+fi
+}
+
+
+
+main()
+{
+    setup_env
+    _avail_in_mbytes_=${_available_dwh_main_space_}
+    _amt_of_space_to_remove_in_mb_=`expr 75 \* 1024`
+    if (( $($ECHO "${_avail_in_mbytes_} > ${_amt_of_space_to_remove_in_mb_}" | $BC -l) ))
+        then
+        db_expansion 76800 dwh_main_dbspace 1 1 1 SYSMAIN
+        ${YES} | $CP -p ${TEM_DIR}/${SYM_INI} ${ENIQ_CONF_DIR}/${SYM_INI}
+        if [ ${db} == "SYSMAIN" ]; then
+            if [ ! -f ${VAR_TMP_MIGRATION}/iq_file_added ]; then
+                    # Add new created IQ file for SYSMAIN into DB
+                    add_iq_file_db
+            fi
+    
+            if [ ! -f ${VAR_TMP_MIGRATION}/iq_file_removed ]; then
+            # Remove existing IQ file for SYSMAIN from DB
+            remove_iq_file_db
+            fi
+        fi
+        $RM -rf ${TEM_DIR}/${SYM_INI}
+    else
+        log_msg -s "\nSpace is not available for SYSMAIN DB expansion." -l ${LOGFILE}
+    fi
+
+    $CP -p ${ENIQ_CONF_DIR}/${SYM_INI} ${TEM_DIR}/${SYM_INI}
+    db_expansion 51200 dwh_main_dbspace 15 8 2 MAIN
+    db_expansion 30720 dwh_temp_dbspace 7 4 1 TEMP
+    $RM -rf ${ENIQ_CONF_DIR}/${SYM_INI}
+    ${YES}  | $CP -p ${TEM_DIR}/${SYM_INI} ${ENIQ_CONF_DIR}/${SYM_INI}
+
+    # Creating flag file after successfull sym_links.ini file updation
+    $TOUCH ${RACK_EXP_IN_PROGRESS}
+    if [ $? -ne 0 ]; then
+        _err_msg_="Failed to drop IQ file from DB"
+        abort_script "${_err_msg_}"
+    fi
+
+        $RM -rf ${TEM_DIR}
+
+}
+
+main

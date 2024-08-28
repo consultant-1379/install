@@ -1,0 +1,968 @@
+#!/bin/bash
+# ********************************************************************
+# Ericsson Radio Systems AB                                     SCRIPT
+# ********************************************************************
+#
+# (c) Ericsson Radio Systems AB 2020 - All rights reserved.
+#
+# The copyright to the computer program(s) herein is the property
+# of Ericsson Radio Systems AB, Sweden. The programs may be used
+# and/or copied only with the written permission from Ericsson Radio
+# Systems AB or in accordance with the terms and conditions stipulated
+# in the agreement/contract under which the program(s) have been
+# supplied.
+#
+# ********************************************************************
+# Name    : eniq_fs_expansion.bsh
+# Date    : 13/04/2023
+# Revision: \main\11
+# Purpose : This script expand the ENIQ FS LV partitions,All Partition can be expand at same time. 
+#           Only required partition can be expand by passing the argument -A <user argument>.
+#
+# Usage   : options:
+#          -A  : Parameter specifying the action type. Should be either of the following:
+#           full_expansion                  : To upgrade the system completely.
+#           partial_expansion               : To perform the partial expansion on the selective disk.
+#
+# ********************************************************************
+#
+#   Command Section
+#
+# ********************************************************************
+
+AWK=/usr/bin/awk
+BASENAME=/usr/bin/basename
+BASH=/usr/bin/bash
+BC=/usr/bin/bc
+CAT=/usr/bin/cat
+DATE=/usr/bin/date
+DF=/usr/bin/df
+DMIDECODE=/usr/sbin/dmidecode
+ECHO='/usr/bin/echo -e'
+ENV=/usr/bin/env
+EGREP=/usr/bin/egrep
+EXPR=/usr/bin/expr
+GREP=/usr/bin/grep
+MYHOSTNAME=/usr/bin/hostname
+ID=/usr/bin/id
+LVEXTEND=/usr/sbin/lvextend
+MKDIR=/usr/bin/mkdir
+RM=/usr/bin/rm
+SED=/usr/bin/sed
+SUDO=/usr/bin/sudo
+TEE=/usr/bin/tee
+VGS=/usr/sbin/vgs
+XARGS=/usr/bin/xargs
+
+# ********************************************************************
+#
+#       Configuration Section
+#
+# ********************************************************************
+
+# Default user
+DEFAULT_USER=root
+
+# Name of SunOS & ENIQ ini Files
+SUNOS_INI=SunOS.ini
+
+# Max size for FS swap partition in Gbytes
+MAX_16G_SWAP=16
+MAX_8G_SWAP=8
+
+#Set service flag
+_stop_service_=0
+
+# ********************************************************************
+#
+#   Functions
+#
+# ********************************************************************
+### Function: abort_script ###
+#
+#   This will is called if the script is aborted through an error
+#   signal sent by the kernel such as CTRL-C or if a serious
+#   error is encountered during runtime
+#
+# Arguments:
+#       $1 - Error message from part of program (Not always used)
+# Return Values:
+#       none
+abort_script()
+{
+_err_time_=`$DATE '+%Y-%b-%d_%H.%M.%S'`
+
+if [ "$1" ]; then
+    _err_msg_="${_err_time_} - $1"
+else
+    _err_msg_="${_err_time_} - ERROR : Script aborted.......\n"
+fi
+
+if [ "${LOGFILE}" ]; then
+    $ECHO -e "\nERROR : ${_err_msg_}\n" | $TEE -a ${LOGFILE}
+else
+    $ECHO -e "\nERROR : ${_err_msg_}\n"
+fi
+
+if [ ${_stop_service_} -eq 1 ]; then 
+    start_services
+fi
+
+cd $SCRIPTHOME
+$RM -rf ${TEM_DIR}
+
+if [ "$2" ]; then
+    if [ ! "${UPGRADE}" -a ! "${RESTORE}" -a ! "${MIGRATION}" ]; then
+        ${2}
+    fi
+    exit 1
+else
+   exit 1
+fi
+}
+
+### Function: check_id ###
+#
+#   Check that the effective id of the user is correct
+#   If not print error message and exit.
+#
+# Arguments:
+#       $1 : User ID name
+# Return Values:
+#       none
+check_id()
+{
+_get_id_=`$ENV |$GREP -w SUDO_USER | $EGREP "^[[:blank:]]*SUDO_USER="|$AWK -F\= '{print $2}'|$SED -e 's|"||g'`
+
+_check_id_=`$ID | $AWK -F\( '{print $2}' | $AWK -F\) '{print $1}'`
+
+_check_group_=`$ID $_get_id_ | $AWK -F\( '{print $3}' | $AWK -F\) '{print $1}'`
+
+
+    if [ "${_get_id_}" == "" ]; then
+
+        if [ "${_check_id_}" == "root" ]; then
+           # Set 1 for true
+           _user_root=1
+
+        else
+           _err_msg_="You must be root or admin to execute this script."
+           abort_script "${_err_msg_}"
+        fi
+    else
+        if [ "${_check_group_}" == "ENIQ_ADMIN_ROLE" ]; then
+           # Set 0 for false
+           _user_root=0
+
+        else
+            _err_msg_="You must be root or admin to execute this script." 
+            abort_script "${_err_msg_}"
+        fi
+    fi
+}
+
+### Function: check_for_file ###
+#
+# To check whether file or directory exist or not and to test the basic file operations.
+# 
+# Arguments: 
+#       $1 : File operations
+#        $2 : File qualified path
+# Return Values:
+#         none
+check_for_file()
+{
+if [ ! $1 $2 ]; then
+    _err_msg_="$2 does not exist"
+    abort_script "$_err_msg_"
+fi
+}
+
+## Function: check_params ###
+#
+# Check Input Params
+#
+# Arguments:
+#    none
+# Return Values:
+#    none
+check_params()
+{
+# Check that we got the required action type
+if [ -z "${ACTION_TYPE}" ]; then
+    usage_msg
+    $ECHO "\nERROR: Action type is not provided."
+    exit 1
+fi
+
+if [ "${ACTION_TYPE}" != "full_expansion" -a "${ACTION_TYPE}" != "partial_expansion"  ]; then
+    usage_msg
+    $ECHO "\nERROR: Not a valid action type"
+    exit 1
+fi
+}
+
+### Function: chk_create_logfile ###
+#
+# Check/Create Logfile
+#
+# Arguments:
+#    none
+# Return Values:
+#    none
+chk_create_logfile()
+{
+$MKDIR -p `$DIRNAME ${LOGFILE}`
+if [ $? -ne 0 ]; then
+    unset LOGFILE
+    _err_msg_="Could not create directory `$DIRNAME ${LOGFILE}`"
+    abort_script "$_err_msg_"
+fi    
+
+$TOUCH -a ${LOGFILE}
+if [ $? -ne 0 ]; then
+    unset LOGFILE
+    _err_msg_="Could not write to file ${LOGFILE}"
+    abort_script "$_err_msg_"
+fi
+
+if [ -s ${LOGFILE} ]; then
+    $ECHO "\n\n" >> ${LOGFILE}
+fi
+
+}
+
+### Function: del_snap ###
+#
+# Delete Snapshots
+#
+# Arguments:
+#    none
+# Return Values:
+#    none
+del_snap()
+{
+	_nas_snap_="/eniq/bkup_sw/bin/manage_nas_snapshots.bsh"
+	_fs_snap_="/eniq/bkup_sw/bin/manage_fs_snapshots.bsh"
+	_san_snap_="/eniq/bkup_sw/bin/manage_san_snapshots.bsh"
+	#NAS snapshots
+	$BASH ${_nas_snap_} -a list -f ALL -t
+	_skip_nas_snap_=$($BASH ${_nas_snap_} -a list -f ALL | $GREP "No NAS snapshots" | $AWK '{print $3}')
+	if [ "${_skip_nas_snap_}" == "No" ]; then
+		$ECHO "\nSkipping NAS snapshots deletion section as there are no snapshots.\n"
+	else
+		$ECHO "\nPlease enter the snapshot label(s) separated by a comma that needs to be deleted (Ex: snss1,snss2,..):\n"
+		read _nas_snap_labels
+		while [ "${_nas_snap_labels}" == "" ]
+		do
+			$ECHO "\nPlease enter the snapshot label(s) separated by a comma that needs to be deleted (Ex: snss1,snss2,..):\n"
+			read _nas_snap_labels
+		done
+		$ECHO "\nThe snapshot label(s) that needs to be deleted: ${_nas_snap_labels}\n"
+		a=1
+		_prev_nas_snap_label=snss
+		_nas_snap_label=$($ECHO "${_nas_snap_labels}" | cut -d "," -f ${a})
+		while [ "${_nas_snap_label}" != "" -a "${_nas_snap_label}" != "${_prev_nas_snap_label}" ]
+		do
+		$BASH ${_nas_snap_} -a delete -f ALL -n ${_nas_snap_label}
+		a=`expr ${a} + 1`
+		_prev_nas_snap_label="${_nas_snap_label}"
+		_nas_snap_label=$($ECHO "${_nas_snap_labels}" | cut -d "," -f ${a})
+		done
+	fi
+	#FS snapshots
+	$BASH ${_fs_snap_} -a list -f ALL -t
+	_skip_fs_snap_=$($BASH ${_fs_snap_} -a list -f ALL | $GREP "No Snapshot LVM" | $AWK '{print $3}')
+	if [ "${_skip_fs_snap_}" == "No" ]; then
+		$ECHO "\nSkipping FS snapshots deletion section as there are no snapshots.\n"
+	else
+		$ECHO "\nPlease enter the snapshot label(s) separated by a comma that needs to be deleted (Ex: snss1,snss2,..):\n"
+		read _fs_snap_labels
+		while [ "${_fs_snap_labels}" == "" ]
+		do
+			$ECHO "\nPlease enter the snapshot label(s) separated by a comma that needs to be deleted (Ex: snss1,snss2,..):\n"
+			read _fs_snap_labels
+		done
+		$ECHO "\nThe snapshot label(s) that needs to be deleted: ${_fs_snap_labels}\n"
+		a=1
+		_prev_fs_snap_label=snss
+		_fs_snap_label=$($ECHO "${_fs_snap_labels}" | cut -d "," -f ${a})
+		while [ "${_fs_snap_label}" != "" -a "${_fs_snap_label}" != "${_prev_fs_snap_label}" ]
+		do
+		$BASH ${_fs_snap_} -a delete -f ALL=${_fs_snap_label}
+		a=`expr ${a} + 1`
+		_prev_fs_snap_label="${_fs_snap_label}"
+		_fs_snap_label=$($ECHO "${_fs_snap_labels}" | cut -d "," -f ${a})
+		done
+	fi
+	#SAN snapshots
+	san_dev=$($CAT ${ENIQ_CONF_DIR}/${SUNOS_INI} | $GREP SAN_DEVICE)
+	if [ "${san_dev}" == "" ]; then
+        _err_msg_="Could not determine the storage type of server"
+        abort_script "${_err_msg_}"
+    fi
+	if [ "${san_dev}" == "SAN_DEVICE=vnx" ]; then
+		#vnx
+		$BASH ${_san_snap_} -a list -f ALL -t
+		_skip_san_snap_=$($BASH ${_san_snap_} -a list -f ALL | $GREP "No SAN Snapshots" | $AWK '{print $3}')
+		if [ "${_skip_san_snap_}" == "No" ]; then
+			$ECHO "\nSkipping SAN snapshots deletion section as there are no snapshots.\n"
+		else
+			$ECHO "\nPlease enter the snapshot label(s) separated by a comma that needs to be deleted (Ex: snss1,snss2,..):\n"
+			read _san_snap_labels
+			while [ "${_san_snap_labels}" == "" ]
+			do
+				$ECHO "\nPlease enter the snapshot label(s) separated by a comma that needs to be deleted (Ex: snss1,snss2,..):\n"
+				read _san_snap_labels
+			done
+			$ECHO "\nThe snapshot label(s) that needs to be deleted: ${_san_snap_labels}\n"
+			a=1
+			_prev_san_snap_label=snss
+			_san_snap_label=$($ECHO "${_san_snap_labels}" | cut -d "," -f ${a})
+			while [ "${_san_snap_label}" != "" -a "${_san_snap_label}" != "${_prev_san_snap_label}" ]
+			do
+			$BASH ${_san_snap_} -a delete -f ALL -n ${_san_snap_label}
+			a=`expr ${a} + 1`
+			_prev_san_snap_label="${_san_snap_label}"
+			_san_snap_label=$($ECHO "${_san_snap_labels}" | cut -d "," -f ${a})
+			done
+		fi
+	else
+		#unity
+		u_spa_ip=$($CAT /ericsson/storage/san/plugins/unity/etc/unity.conf | $GREP -w sp | $AWK '{print $3}' | cut -d "'" -f 2)
+		if [ "${u_spa_ip}" == "" ]; then
+			_err_msg_="Could not determine the Unity SPA IP"
+			abort_script "${_err_msg_}"
+		fi
+		cg_id=$($CAT /ericsson/storage/san/plugins/unity/etc/unity.conf | $GREP -w csgrpid | $AWK '{print $3}' | cut -d "'" -f 2)
+		if [ "${cg_id}" == "" ]; then
+			_err_msg_="Could not determine the Consistency Group ID"
+			abort_script "${_err_msg_}"
+		fi
+		/usr/bin/uemcli -d ${u_spa_ip} /prot/snap -source ${cg_id} show
+		_skip_unity_san_snap_=$(/usr/bin/uemcli -d ${u_spa_ip} /prot/snap -source ${cg_id} show | $GREP ${cg_id} | $AWK '{print $3}')
+		if [ "${_skip_unity_san_snap_}" == "${cg_id}" ]; then
+			$ECHO "\nPlease enter the ID shown above:\n"
+			read u_id
+			while [ "${u_id}" == "" ]
+			do
+				$ECHO "\nPlease enter the ID shown above:\n"
+				read u_id
+			done
+			/usr/bin/uemcli -d ${u_spa_ip} /prot/snap -id ${u_id} detach
+			detach_status=$?
+			if [ ${detach_status} -ne 0 ]; then
+				_err_msg_="Failed to detach host access to snapshots"
+				abort_script "${_err_msg_}"
+			fi
+			/usr/bin/uemcli -d ${u_spa_ip} /prot/snap -id ${u_id} delete
+			delete_status=$?
+			if [ ${delete_status} -ne 0 ]; then
+				_err_msg_="Failed to delete the snapshots"
+				abort_script "${_err_msg_}"
+			fi
+		else
+			$ECHO "\nSkipping SAN snapshots deletion section as there are no snapshots.\n"
+		fi
+	fi
+}
+
+### Function: fs_expansion ###
+#
+# Expanding the LVM FS partitioning.
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+fs_expansion()
+{
+#Check Storage Type
+read_storage_type
+
+#Getting the name of Volume Group
+_pool_disk_=`iniget SunOS_FS_POOL_1 -f ${ENIQ_CONF_DIR}/${SUNOS_INI} -v name`
+if [ ! "${_pool_disk_}" ]; then
+    _err_msg_="Could not determine disk ${_pool_disk_}"
+    abort_script "${_err_msg_}"
+fi
+
+if [ "${STORAGE_TYPE}" == "raw" ]; then
+
+    _disk_size_=`$VGS ${_pool_disk_} --noheading -o vg_size | $SED 's/[<,g,m,t]//g'`
+    if [ ! "${_disk_size_}" ]; then
+        _err_msg_="Could not determine available disk size for ${_pool_disk_}"
+        abort_script "${_err_msg_}"
+    fi
+
+    _disk_size_=`$ECHO " scale=4; ${_disk_size_}" | $BC`
+
+    if [  "${CURR_SERVER_TYPE}" == "stats_coordinator" -o "${CURR_SERVER_TYPE}" == "eniq_stats" ]; then
+        _avail_disk_size_=`$ECHO " scale=4; ${_disk_size_} - ${MAX_16G_SWAP}" | $BC`
+        if [ ! "${_avail_disk_size_}"  ]; then
+            _err_msg_="Could not determine avaialable disk size "
+            abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+        fi
+    else
+        _avail_disk_size_=`$ECHO " scale=4; ${_disk_size_} - ${MAX_8G_SWAP}" | $BC`
+        if [ ! "${_avail_disk_size_}"  ]; then
+            _err_msg_="Could not determine disk size available space of "
+            abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+        fi
+    fi
+
+    # Getting the tag for FS size based on server type
+    get_fs_size_tag
+
+    log_msg -s "Expanding list of file systems from ${ENIQ_CONF_DIR}/${SUNOS_INI}\n" -l ${LOGFILE}
+
+    _fs_list_=`iniget SunOS_ZFS_FS -f ${ENIQ_CONF_DIR}/${SUNOS_INI}`
+    for _fs_ in ${_fs_list_}; do
+        _fs_name_=`iniget ${_fs_} -f ${ENIQ_CONF_DIR}/${SUNOS_INI} -v name`
+        _fs_lv_=`$ECHO ${_fs_name_} | $AWK -F\- '{print $2}'`
+        _fs_size_=`iniget ${_fs_size_tag_} -f ${ENIQ_CONF_DIR}/${SUNOS_INI} -v "${_fs_lv_}" | $AWK -F ":" '{print $1}'`
+        if [ ! "${_fs_name_}" -o ! "${_fs_lv_}" -o ! "${_fs_size_}" ]; then
+            _err_msg_="Could not read FS parameters from ${ENIQ_CONF_DIR}/${SUNOS_INI}"
+            abort_script "${_err_msg_}"
+        fi
+
+        _final_fs_size_=`$ECHO "scale=2; ${_fs_size_}/100" | $BC`
+
+        _size_fs_=`$ECHO " scale=2; ${_avail_disk_size_}*${_final_fs_size_}" | $BC` 
+        if [ ! "${_size_fs_}"  ]; then
+            _err_msg_="Could not determine fs size of ${_fs_name_}"
+            abort_script "${_err_msg_}"
+        fi
+        
+        _current_size_=`$LVS ${_pool_disk_} | $AWK '{print $1,$4}' | $GREP -w ${_fs_lv_} | $AWK '{print $2}'| $SED -e 's/[<,m,g,t]//g'`
+        if [ ! "${_current_size_}"  ]; then
+            _err_msg_="Could not determine current fs size of ${_fs_name_}"
+            abort_script "${_err_msg_}"
+        fi
+        
+        #checking current size unit
+        _current_size_unit_=`$LVS ${_pool_disk_} --noheading | $GREP -w ${_fs_lv_} | $AWK '{print $4}'| $SED -e 's/[^a-z]//g'`
+        if [ ! "${_current_size_unit_}"  ]; then
+            _err_msg_="Could not determine current unit size"
+            abort_script "${_err_msg_}"
+        fi
+        
+        if [ "${_current_size_unit_}" == "t" ]; then
+            _current_size_=`$ECHO " scale=2; ${_current_size_}*1024" | $BC`
+        elif [ "${_current_size_unit_}" == "m" ]; then
+            _current_size_=`$ECHO " scale=2; ${_current_size_}/1024" | $BC`
+        fi
+        
+        if [ "$($ECHO ${_current_size_} '<=' ${_size_fs_} | bc -l)" -eq 1 ]; then
+            log_msg -s "Extending fileSystem `$BASENAME ${_fs_name_}`" -l ${LOGFILE}
+            $LVEXTEND -L ${_size_fs_}GB -r /dev/mapper/${_fs_name_} >> /dev/null 2>&1
+            if [ $? -ne 0 ]; then
+                _err_msg_="Could not Expand FS logical volume  - ${_fs_name_}"
+                abort_script "${_err_msg_}"
+            else
+                log_msg -s "Extended fileSystem `$BASENAME ${_fs_name_}` by ${_size_fs_}GB"  -l ${LOGFILE}
+            fi
+        else
+            log_msg -s "Skipping the expansion `$BASENAME ${_fs_name_}` extend size is less than current size"  -l ${LOGFILE}
+        fi
+    done
+else 
+    # Getting the size of Volume Group
+    _vg_size_=`$VGS ${_pool_disk_} --noheadings -o vg_size | $SED -e 's/[^0-9.]//g'`
+    if [ ! "${_vg_size_}" ]; then
+        _err_msg_="Could not determine Volume Group size"
+        abort_script "${_err_msg_}"
+    fi
+
+    _vg_size_unit_=`$VGS ${_pool_disk_} --noheadings -o vg_size | $SED -e 's/[^a-z]//g'`
+    if [ ! "${_vg_size_unit_}" ]; then
+        _err_msg_="Could not determine Volume Group size unit"
+        abort_script "${_err_msg_}"
+    fi
+
+    if [ "${_vg_size_unit_}" == "t" ]; then
+        _vg_size_=`$ECHO " scale=2; ${_vg_size_}*1024" | $BC`
+    fi  
+ 
+    #Getting Volume Group size excluding swap volume
+
+    _avail_pool_size_=`$ECHO " scale=2; ${_vg_size_} - ${MAX_16G_SWAP}" | $BC`
+    if [ ! "${_avail_pool_size_}"  ]; then
+        _err_msg_="Could not determine avaialable pool size in ${_pool_name_} "
+        abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+    fi      
+    
+    
+    # Getting the tag for FS size based on server type
+    get_fs_size_tag
+    
+    log_msg -s "Expanding list of file systems from ${ENIQ_CONF_DIR}/${SUNOS_INI}\n" -l ${LOGFILE}
+    
+    # Getting current hardware generation
+    _hard_gen_=`$DMIDECODE -s system-product-name | $AWK -F " " '{print $3}'`
+    if [ ! "${_hard_gen_}" ]; then
+         _err_msg_="Could not determine current hardware generation"
+         abort_script "${_err_msg_}"
+    fi
+
+    _fs_size_tag_=${_hard_gen_}_${_fs_size_tag_}
+    
+    
+    _fs_list_=`iniget SunOS_ZFS_FS -f ${ENIQ_CONF_DIR}/${SUNOS_INI}` 
+    for _fs_ in ${_fs_list_}; do
+        _fs_name_=`iniget ${_fs_} -f ${ENIQ_CONF_DIR}/${SUNOS_INI} -v name`
+        _fs_lv_=`$ECHO ${_fs_name_} | $AWK -F\- '{print $2}'`
+        _fs_size_=`iniget ${_fs_size_tag_} -f ${ENIQ_CONF_DIR}/${SUNOS_INI} -v "${_fs_lv_}" | $AWK -F ":" '{print $1}'`
+        if [ ! "${_fs_name_}" -o ! "${_fs_lv_}" -o ! "${_fs_size_}" ]; then
+            _err_msg_="Could not read FS parameters from ${ENIQ_CONF_DIR}/${SUNOS_INI}"
+            abort_script "${_err_msg_}"
+        fi
+
+        _final_fs_size_=`$ECHO "scale=2; ${_fs_size_}/100" | $BC`
+
+        _size_fs_=`$ECHO " scale=2; ${_avail_pool_size_}*${_final_fs_size_}" | $BC`
+        if [ ! "${_size_fs_}"  ]; then
+            _err_msg_="Could not determine fs size of ${_fs_name_}"
+            abort_script "${_err_msg_}"
+        fi
+
+        _current_size_=`$LVS ${_pool_disk_} | $AWK '{print $1,$4}' | $GREP -w ${_fs_lv_} | $AWK '{print $2}'| $SED -e 's/[<,m,g,t]//g'`
+        if [ ! "${_current_size_}"  ]; then
+            _err_msg_="Could not determine current fs size of ${_fs_name_}"
+            abort_script "${_err_msg_}"
+        fi
+        
+        #checking current size unit
+        _current_size_unit_=`$LVS ${_pool_disk_} --noheading | $GREP -w ${_fs_lv_} | $AWK '{print $4}'| $SED -e 's/[^a-z]//g'`
+        if [ ! "${_current_size_unit_}"  ]; then
+            _err_msg_="Could not determine current unit size"
+            abort_script "${_err_msg_}"
+        fi
+        
+        if [ "${_current_size_unit_}" == "t" ]; then
+            _current_size_=`$ECHO " scale=2; ${_current_size_}*1024" | $BC`
+        elif [ "${_current_size_unit_}" == "m" ]; then
+            _current_size_=`$ECHO " scale=2; ${_current_size_}/1024" | $BC`
+        fi
+        
+        if [ "$($ECHO ${_current_size_} '<=' ${_size_fs_} | bc -l)" -eq 1 ]; then
+            log_msg -s "Extending fileSystem `$BASENAME ${_fs_name_}`"  -l ${LOGFILE}
+            $LVEXTEND -L  ${_size_fs_}GB -r /dev/mapper/${_fs_name_}  >> /dev/null 2>&1
+            if [ $? -ne 0 ]; then
+                _err_msg_="Could not create FS logical volume  - ${_fs_name_}"
+                abort_script "${_err_msg_}"
+            else
+                log_msg -s "Extended fileSystem `$BASENAME ${_fs_name_}` by ${_size_fs_}GB"  -l ${LOGFILE}
+            fi
+        else 
+            log_msg -s "Skipping the expansion `$BASENAME ${_fs_name_}` extended size is less than current size"  -l ${LOGFILE}
+        fi
+    done
+fi
+}
+
+### Function: partial_expansion ###
+#
+# Expand the user input file system.
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+partial_expansion()
+{
+#get storage type
+read_storage_type
+
+$RM -rf ${TEM_DIR}/lvm_fs_list
+$RM -rf ${TEM_DIR}/lvm_fs_data_list
+
+#Create list of LVM
+$CAT /etc/fstab | $EGREP -w "${ENIQ_POOL}" | $EGREP -wv swap | $AWK -F "/" '{print $4}' | $AWK '{print $1}' > ${TEM_DIR}/lvm_list
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not create LVM list file for ${ENIQ_POOL}"
+    abort_script "${_err_msg_}"
+fi
+
+#Displaying the free space avaible in VG
+_vg_free_size=`$VGS ${ENIQ_POOL} --noheadings -o vg_free | $SED -e 's/<//g'`
+$ECHO "\nCurrent free size available in volume group ${_vg_free_size} \n"
+
+$CAT ${TEM_DIR}/lvm_list
+$ECHO "\nEnter the Filesystems to be expanded separated by comma\n"
+read _lvm_disk_
+    
+$ECHO ${_lvm_disk_} | $SED  -e 's/,/\n/g' | $SED -e 's/ //g' > ${TEM_DIR}/lvm_fs_list
+
+    
+while read lvm 
+do
+    _size_flag_=0
+    until [ ${_size_flag_} -ne 0 ]; do
+    $ECHO "\nEnter the size to be expanded for ${lvm}. Enter size unit in [m,M,g,G,t,T]"
+    read _lv_size_ </dev/tty 
+    
+    #Check if the input is valid
+    _size_lv_=`$ECHO ${_lv_size_} | $SED -e 's/[^0-9.]//g'`
+    if [ -z "${_size_lv_}" ]; then
+        $ECHO "input is not valid - ${lvm}"
+        continue
+    fi
+    
+    #Check the size unit is valid
+    _size_unit_=`$ECHO ${_lv_size_} | $SED -e 's/[^m,M,g,G,t,T]//g'`
+    if [ -z "${_size_unit_}" ]; then
+        $ECHO "No size unit in input, provide the m,M,g,G size unit"
+        continue
+    fi
+    
+    #Check the single unit is enter
+    _unit_length=`$ECHO ${_lv_size_} | $SED -e 's/[^a-z,A-Z]//g' | $XARGS $EXPR length `
+    if [ "${_unit_length}" -ne 1 ]; then
+        $ECHO "Size unit is not proper, provide single size unit"
+        continue
+    fi
+    _size_flag_=1
+    done
+    
+	$ECHO "${lvm} ${_lv_size_}" >> ${TEM_DIR}/lvm_fs_data_list
+	
+done < ${TEM_DIR}/lvm_fs_list
+
+#Stoping ENIQ services before expansion 
+stop_services
+	
+while read lvm_data
+do
+    _lvm_=`$ECHO ${lvm_data} | $AWK '{print $1}'`
+	if [ ! "${_lvm_}"  ]; then
+	      _err_msg_="Could not determine LVM Filesystem"
+          abort_script "${_err_msg_}" 
+    fi
+	
+    _lv_size_=`$ECHO ${lvm_data} | $AWK '{print $2}'`
+	if [ ! "${_lvm_}"  ]; then
+	      _err_msg_="Could not determine LVM Filesystem size"
+          abort_script "${_err_msg_}" 
+    fi
+	 
+	 _size_lv_=`$ECHO ${_lv_size_} | $SED -e 's/[^0-9.]//g'`
+	 
+	 _size_unit_=`$ECHO ${_lv_size_} | $SED -e 's/[^m,M,g,G,t,T]//g'`
+	 
+    #converting the size from Megabyte to Gigabyte 
+    if [ "${_size_unit_}" == "M" -o "${_size_unit_}" == "m" ]; then
+        _size_lv_=`$ECHO " scale=2; ${_size_lv_}/1024" | $BC`
+        if [ -z ${_size_lv_} ]; then
+            err_msg_="Could not calculate the LV size"
+            abort_script "${_err_msg_}"
+        fi
+    elif [ "${_size_unit_}" == "T" -o "${_size_unit_}" == "t" ]; then
+        _size_lv_=`$ECHO " scale=2; ${_size_lv_}*1024" | $BC`
+        if [ -z ${_size_lv_} ]; then
+            err_msg_="Could not calculate the LV size"
+            abort_script "${_err_msg_}"
+        fi
+    fi
+    
+    #extending the LVM partitions
+    $LVEXTEND -L +${_size_lv_}G -r /dev/mapper/${_lvm_}   >> /dev/null 2>&1
+    if [ $? -ne 0 ]; then
+        _err_msg_="Could not extend FS logical volume  - ${_lvm_}"
+        abort_script "${_err_msg_}"
+    else
+        log_msg -s "Extended fileSystem `$BASENAME ${_lvm_}` by ${_lv_size_}"  -l ${LOGFILE}
+    fi
+    
+done < ${TEM_DIR}/lvm_fs_data_list
+
+#Starting ENIQ services after expansion
+start_services
+}
+
+
+## Function: read_storage_type ###
+#
+# Arguments:
+#   none
+# Return Values:
+#   set varibale STORAGE_TYPE
+read_storage_type()
+{
+# Read the storage type
+if [ -s ${ENIQ_CONF_DIR}/${SUNOS_INI} ]; then
+    STORAGE_TYPE=`iniget STOR_TYPE -f ${ENIQ_CONF_DIR}/${SUNOS_INI} -v STORAGE_TYPE`
+else
+    if [ -s ${ENIQ_CONF_DIR}/san_details ]; then
+        STORAGE_TYPE=`$CAT ${ENIQ_CONF_DIR}/san_details | $EGREP "^STORAGE_TYPE=" | $AWK -F\= '{print $2}'`
+    fi
+fi
+
+if [ ! "${STORAGE_TYPE}" ]; then
+    _err_msg_="Could not read STORAGE_TYPE param "
+    abort_script "${_err_msg_}"
+fi
+
+# Read the SAN device type
+if [ "${STORAGE_TYPE}" = "raw" ]; then
+    if [ -s ${ENIQ_CONF_DIR}/${SUNOS_INI} ]; then
+        SAN_DEVICE=`iniget SAN_DEV -f ${ENIQ_CONF_DIR}/${SUNOS_INI} -v SAN_DEVICE`
+    else
+        if [ -s ${ENIQ_CONF_DIR}/san_details ]; then
+            SAN_DEVICE=`$CAT ${ENIQ_CONF_DIR}/san_details | $EGREP "^SAN_DEVICE=" | $AWK -F\= '{print $2}'`
+        fi
+    fi
+    
+    if [ "${SAN_DEVICE}" == "local" ]; then
+        SAN_DEVICE="vnx"
+        _san_device_="local"
+    fi
+else
+    if [ ${_deployment_} == "small" -o ${_deployment_} == "ft" ]; then
+        SAN_DEVICE="${STORAGE_TYPE}_compact"
+    else
+        SAN_DEVICE="${STORAGE_TYPE}"
+    fi
+    _san_device_="local"
+fi
+
+if [ ! "${SAN_DEVICE}" ]; then
+    _err_msg_="Could not read SAN_DEVICE param"
+    abort_script "${_err_msg_}"
+fi
+}
+
+
+### Function: setup_env ###
+#
+# Set up environment variables for script.
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+setup_env()
+{
+
+if [ ! "${ENIQ_BASE_DIR}" ]; then
+    # Directory on the root filesystem
+    ENIQ_BASE_DIR=/eniq
+fi
+
+# ENIQ Admin Directory
+ENIQ_ADMIN_DIR=${ENIQ_BASE_DIR}/admin
+
+# ENIQ Log Directory
+ENIQ_LOG_DIR=${ENIQ_BASE_DIR}/local_logs
+
+# ENIQ Admin Bin Directory
+ENIQ_ADMIN_BIN_DIR=${ENIQ_ADMIN_DIR}/bin
+
+# Main Directory for the Core Installation SW
+ENIQ_INST_DIR=${ENIQ_BASE_DIR}/installation
+
+# Main Directory for the Core Installation SW
+ENIQ_CORE_INST_DIR=${ENIQ_INST_DIR}/core_install
+
+# ENIQ Config Directory
+ENIQ_CONF_DIR=${ENIQ_INST_DIR}/config
+
+# ENIQ SCRIPTHOME
+SCRIPTHOME=${ENIQ_CORE_INST_DIR}/bin
+
+#read the deployment type
+_deployment_=`$CAT ${ENIQ_CONF_DIR}/extra_params/deployment`
+if [ ! "${_deployment_}" ]; then
+    _err_msg_="Could determine the deployment type from ${ENIQ_CONF_DIR}/extra_params/deployment"
+    abort_script "${_err_msg_}"
+fi
+
+# Source the common functions
+if [ -s ${SCRIPTHOME}/../lib/common_functions.lib ]; then
+    . ${SCRIPTHOME}/../lib/common_functions.lib
+else
+    _err_msg_="File ${SCRIPTHOME}/../lib/common_functions.lib not found"
+    abort_script "${_err_msg_}"
+fi
+
+if [ -s ${SCRIPTHOME}/../lib/common_core_install_functions.lib ]; then
+    . ${SCRIPTHOME}/../lib/common_core_install_functions.lib
+else
+    _err_msg_="File ${SCRIPTHOME}/../lib/common_core_install_functions.lib not found"
+    abort_script "${_err_msg_}"
+fi
+
+if [ -s ${SCRIPTHOME}/../lib/common_inirator_functions.lib ]; then
+    . ${SCRIPTHOME}/../lib/common_inirator_functions.lib
+else
+    _err_msg_="File ${SCRIPTHOME}/../lib/common_inirator_functions.lib not found"
+    abort_script "${_err_msg_}"
+fi
+
+# Hostname of the server
+HNAME=`${MYHOSTNAME}`
+
+# ENIQ FS POOL
+ENIQ_POOL=`iniget SunOS_FS_POOL_1 -f ${ENIQ_CONF_DIR}/${SUNOS_INI} -v name`
+
+CURR_SERVER_TYPE=`$CAT $ENIQ_CONF_DIR/installed_server_type | $EGREP -v  '^[[:blank:]]*#' | $SED -e 's/ //g'`
+if [ ! "${CURR_SERVER_TYPE}" ]; then
+    _err_msg_="Could not determine which server type this is"
+    abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+fi
+
+}
+
+### Function: start_services ###
+#
+# start the required eniq services after the sybase cache update
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+start_services()
+{
+log_msg -q -h -s "Starting ENIQ services" -l ${LOGFILE}
+local _check_script_="${ENIQ_ADMIN_BIN_DIR}/manage_deployment_services.bsh"
+check_for_file -s ${_check_script_}
+
+log_msg -q -s "Starting to run $BASH ${_check_script_} -a start -s ALL -N" -l ${LOGFILE}
+$BASH ${_check_script_} -a start -s ALL -N
+if [ $? -ne 0 ]; then
+    _err_msg_="Exiting... Unable to start services \n"
+    abort_script "${_err_msg_}"
+fi
+
+log_msg -q -s "Successfully started ENIQ services" -l ${LOGFILE}
+}
+
+### Function: stop_services ###
+#
+# stop the eniq services after the sybase cache update
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+stop_services()
+{
+log_msg -q -h -s "Stopping ENIQ services" -l ${LOGFILE}
+
+local _check_script_="${ENIQ_ADMIN_BIN_DIR}/manage_deployment_services.bsh"
+check_for_file -s ${_check_script_}
+
+log_msg -q -s "Starting to run $BASH ${_check_script_} -a stop -s ALL -N" -l ${LOGFILE}
+$BASH ${_check_script_} -a stop -s ALL -N
+if [ $? -ne 0 ]; then
+    _err_msg_="Exiting... Unable to stop services \n"
+    abort_script "${_err_msg_}"
+fi
+
+_stop_service_=1
+
+log_msg -q -s "Successfully stopped ENIQ services" -l ${LOGFILE}
+}
+
+### Function: usage_msg ###
+#
+#   Print out the usage message
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+usage_msg()
+{
+$CLEAR
+$ECHO "
+[ Usage: `$BASENAME $0` -A <action_type>  ]
+options:
+-A  : Parameter specifying the action type. Should be either of the following:
+      full_expansion                  : To upgrade the system completely.
+      partial_expansion               : To perform the partial expansion on the selective disk.
+"
+}
+
+# ********************************************************************
+#
+#   Main body of program
+#
+# ********************************************************************
+#
+RUN_TIME=`$DATE '+%Y-%b-%d_%H.%M.%S'`
+
+while getopts ":A:" arg; do
+  case $arg in
+    A) ACTION_TYPE="$OPTARG"
+        ;;
+   \?) _err_msg_="Invalid Argument passed"
+        usage_msg
+        abort_script "${_err_msg_}"
+        ;;
+  esac
+done
+shift `$EXPR $OPTIND - 1`
+
+# Check input parameters
+check_params
+
+# Check that the effective id of the user is root
+check_id
+
+# Set up environment variables for script.
+setup_env
+
+# Create a temporary directory
+TEM_DIR=/tmp/fs_expansion.$$.$$
+$RM -rf ${TEM_DIR}
+$MKDIR -p ${TEM_DIR}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not create directory ${TEM_DIR}"
+    abort_script "${_err_msg_}"
+fi
+
+#Defining Log Location
+LOGFILE="${ENIQ_LOG_DIR}/installation/${HNAME}_fs_expansion.log"
+
+# Check/Create Logfile
+chk_create_logfile
+
+
+$ECHO -e "\n=======================================================" >> ${LOGFILE}
+$ECHO "${RUN_TIME} - Starting FS Expansion" >> ${LOGFILE}
+$ECHO -e "=======================================================\n" >> ${LOGFILE}
+
+# Get server type
+if [ ! -s ${ENIQ_CONF_DIR}/installed_server_type ]; then
+    core_install_get_server_type ${LOGFILE} ${TEM_DIR} ${SERVER_TYPE_LIST_FILE} ${ENIQ_CONF_DIR}
+    if [ $? -ne 0 ]; then
+        _err_msg_="Could not determine the type of install profile to use"
+        abort_script "${_err_msg_}"
+    fi
+fi
+
+
+
+# Refer to the post_upgrade stagelist in case of post feature only upgrade and post platform only upgrade 
+if [ "${ACTION_TYPE}" == "full_expansion" ]; then
+	#Deleting NAS, FS & SAN snapshots before fs expansion
+	del_snap
+	
+    #Stoping ENIQ services before expansion 
+    stop_services
+	
+	fs_expansion
+	
+	#Starting ENIQ services after expansion
+	start_services
+elif [ "${ACTION_TYPE}" == "partial_expansion" ]; then    
+    partial_expansion
+fi
+
+
+
+
+$RM -rf ${TEM_DIR}
+
+exit 0

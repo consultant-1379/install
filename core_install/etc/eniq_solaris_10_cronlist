@@ -1,0 +1,9 @@
+/opt/hyperic-agent/ericsson/bin/autoAgentTroubleShoot.bash
+/opt/ERICddc/bin/ddc
+/usr/sbin/rtc
+/usr/sbin/logadm
+/usr/lib/fs/nfs/nfsfind
+/usr/lib/gss/gsscred_clean
+/usr/lib/update-refresh.sh
+/eniq/sw/bin/DiskManager_AllInterface.bsh 
+/eniq/admin/bin/wifipoller.bsh

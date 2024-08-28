@@ -1,0 +1,448 @@
+#!/bin/bash
+# ********************************************************************
+# Ericsson Radio Systems AB                                     SCRIPT
+# ********************************************************************
+#
+#
+# (c) Ericsson Radio Systems AB 2021 - All rights reserved.
+#
+# The copyright to the computer program(s) herein is the property
+# of Ericsson Radio Systems AB, Sweden. The programs may be used
+# and/or copied only with the written permission from Ericsson Radio
+# Systems AB or in accordance with the terms and conditions stipulated
+# in the agreement/contract under which the program(s) have been
+# supplied.
+#
+# ********************************************************************
+# Name    : repdb
+# Date    : 16/04/2021
+# Revision: /main/14
+# Purpose : repdb database control script for SMF to use
+#
+# ********************************************************************
+
+# ********************************************************************
+#
+#   Command Section
+#
+# ********************************************************************
+AWK=/usr/bin/awk
+CHMOD=/usr/bin/chmod
+DATE=/usr/bin/date
+DIRNAME=/usr/bin/dirname
+ECHO='/usr/bin/echo -e'
+EGREP=/usr/bin/egrep
+GREP=/usr/bin/grep
+KILL=/usr/bin/kill
+MKDIR=/usr/bin/mkdir
+RM=/usr/bin/rm
+PS=/usr/bin/ps
+SED=/usr/bin/sed
+SLEEP=/usr/bin/sleep
+SU=/usr/bin/su
+TEE=/usr/bin/tee
+
+# ********************************************************************
+#
+#       Configuration Section
+#
+# ********************************************************************
+# REGEX string to determine if IQ server process is running. Multiple strings can be
+# specified as long as they are separated by '|' with no space
+REP_PS_STR="asiqsrv12|dbsrv11|dbsrv16|dbsrv17"
+
+ENIQ_INI=niq.ini
+DCUSER_PROFILE=/eniq/home/dcuser/.profile
+
+# ********************************************************************
+#
+#   Functions
+#
+# ********************************************************************
+### Function: abort_script ###
+#
+#   This will is called if the script is aborted thru an error
+#   error signal sent by the kernel such as CTRL-C or if a serious
+#   error is encountered during runtime
+#
+# Arguments:
+#       $1 - Error message from part of program (Not always used)
+# Return Values:
+#       none
+abort_script()
+{
+_err_time_=`$DATE '+%Y-%b-%d_%H.%M.%S'`
+
+if [ "$1" ]; then
+    _err_msg_="${_err_time_} - $1"
+else
+    _err_msg_="${_err_time_} - Script aborted.......\n"
+fi
+
+$ECHO "\n$_err_msg_\n" | $TEE -a ${LOGFILE}
+
+cd $SCRIPTHOME
+$RM -rf ${TEM_DIR}
+$RM -rf ${conn_str_dbstop_enc}
+$RM -rf ${conn_str_dbping_enc}
+
+if [ "$2" ]; then
+	${2}
+else
+	exit 1
+fi
+}
+
+### Function: check_files_and_scripts ###
+#
+# Check the files and scripts
+#
+# Arguments:
+#       $1 : User ID name
+# Return Values:
+#       none
+check_files_and_scripts()
+{
+if [ -z "$CONF_DIR" ] ; then
+	_err_msg_="ERROR: CONF_DIR is not set"
+	abort_script "$_err_msg_"
+fi
+
+if [ ! -s ${CONF_DIR}/niq.ini ] ; then
+    _err_msg_="Configuration file niq.ini not found or empty"
+    abort_script "$_err_msg_"
+fi
+
+if [ ! -s ${CONF_DIR}/niq.rc ] ; then
+    _err_msg_="Configuration file niq.rc not found or empty"
+    abort_script "$_err_msg_"
+fi
+}	
+
+### Function: check_id ###
+#
+#   Check that the effective id of the user is correct
+#   If not print error msg and exit.
+#
+# Arguments:
+#       $1 : User ID name
+# Return Values:
+#       none
+check_id()
+{
+_check_id_=`$ID | $AWK -F\( '{print $2}' | $AWK -F\) '{print $1}'`
+if [ "$_check_id_" != "$1" ]; then
+	_err_msg_="You must be $1 to execute this script."
+	abort_script "$_err_msg_"
+fi
+}
+
+### Function: get_absolute_path ###
+#
+# Determine absolute path to software
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+get_absolute_path()
+{
+_dir_=`$DIRNAME $0`
+SCRIPTHOME=`cd $_dir_ 2>/dev/null && pwd || $ECHO $_dir_`
+}
+
+### Function: get_db_password ###
+#
+#   Stop the reader
+#
+# Arguments:
+#       none
+# Return Values:
+#
+get_db_password()
+{	
+DBA_PASSWORD=`inigetpassword DB -v DBAPassword -f ${CONF_DIR}/${ENIQ_INI}`
+if [ ! ${DBA_PASSWORD} ]; then
+    if [ -f ${ENIQ_BASE_DIR}/sw/installer/dbusers ]; then
+		DBA_PASSWORD=`${ENIQ_BASE_DIR}/sw/installer/dbusers dba dwhrep`
+		if [ ! "${DBA_PASSWORD}" ] ; then
+		    _err_msg_="Could not get DBA password from ${ENIQ_BASE_DIR}/sw/installer/dbusers script"
+		    abort_script "$_err_msg_"
+		fi
+    else
+		_err_msg_="Could not read dba password from ${CONF_DIR}/${ENIQ_INI}"
+		abort_script "$_err_msg_"
+    fi
+fi
+}
+
+### Function: setup_variables ###
+#
+#   Stop the reader
+#
+# Arguments:
+#       none
+# Return Values:
+# 
+setup_variables()
+{
+IQ_USER=`iniget DB -v IQUserName -f ${CONF_DIR}/${ENIQ_INI}`
+
+# Check that the effective id of the user is ${IQ_USER}
+check_id ${IQ_USER}
+
+#Temp directory.
+TEM=/tmp
+
+unalias stop 2> /dev/null
+
+. ${CONF_DIR}/niq.rc
+. ${IQ_DIR}/IQ.sh
+
+if [ -s ${ASA_DIR}/bin64/sa_config.sh ]; then
+	. ${ASA_DIR}/bin64/sa_config.sh >> /dev/null 2>&1
+else
+	_err_msg_="File ${ASA_DIR}/bin64/sa_config.sh not found or empty"
+	abort_script "$_err_msg_"
+fi
+
+if [ ! -d ${LOG_DIR}/asa ] ; then
+	$MKDIR -p ${LOG_DIR}/asa
+fi
+if [ "${SCRIPT_ACTION}" = "start" ]; then
+	LOGFILE=${LOG_DIR}/asa/start_repdb_`$DATE '+%y%m%d_%H%M%S'`.log
+else
+	LOGFILE=${LOG_DIR}/asa/stop_repdb_`$DATE '+%y%m%d_%H%M%S'`.log
+fi
+
+
+# Directory on the root filesystem
+if [ ! "${ENIQ_BASE_DIR}" ]; then
+	ENIQ_BASE_DIR=/eniq
+fi
+
+REP_PORT=`iniget REP -v PortNumber -f ${CONF_DIR}/${ENIQ_INI}`
+if [ ! ${REP_PORT} ]; then
+    _err_msg_="Could not read PortNumber param from ${CONF_DIR}/${ENIQ_INI}"
+    abort_script "$_err_msg_"
+fi
+
+REP_ENG=`iniget REP -v ServerName -f ${CONF_DIR}/${ENIQ_INI}`
+if [ ! ${REP_ENG} ]; then
+    _err_msg_="Could not read ServerName param from ${CONF_DIR}/${ENIQ_INI}"
+    abort_script "$_err_msg_"
+fi
+
+MAINCACHE=`iniget REP -v MainCache -f ${CONF_DIR}/${ENIQ_INI}`
+if [ ! ${MAINCACHE} ]; then
+    _err_msg_="Could not read MainCache param from ${CONF_DIR}/${ENIQ_INI}"
+    abort_script "$_err_msg_"
+fi
+
+TEMPCACHE=`iniget REP -v TempCache -f ${CONF_DIR}/${ENIQ_INI}`
+if [ ! ${TEMPCACHE} ]; then
+    _err_msg_="Could not read TempCache param from ${CONF_DIR}/${ENIQ_INI}"
+    abort_script "$_err_msg_"
+fi
+
+if [ "${SCRIPT_ACTION}" = "stop" ]; then
+    STOP_COUNT=`iniget REP -v StopCount -f ${CONF_DIR}/${ENIQ_INI}`
+    if [ ! ${STOP_COUNT} ]; then
+		_err_msg_="Could not read StopCount param from ${CONF_DIR}/${ENIQ_INI}"
+		abort_script "$_err_msg_"
+    fi
+
+    STOP_DELAY=`iniget REP -v StopDelay -f ${CONF_DIR}/${ENIQ_INI}`
+    if [ ! ${STOP_DELAY} ]; then
+		_err_msg_="Could not read StopDelay param from ${CONF_DIR}/${ENIQ_INI}"
+		abort_script "$_err_msg_"
+    fi
+fi
+}
+
+### Function: start_repdb ###
+#
+# Start the REP Sybase server
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+start_repdb()
+{
+$ECHO "Starting repdb..." > ${LOGFILE}
+
+cd ${REP_DIR} >> ${LOGFILE} 2>&1
+
+SATMP=${REP_TEMP_DIR}
+export SATMP
+
+# Start the REP server 
+
+if [ -f ${SQLANY}/bin64/dbsrv17 ] 
+then 
+    ${SQLANY}/bin64/dbspawn ${SQLANY}/bin64/dbsrv17  @${REP_DIR}/repdb.cfg -n ${REP_ENG} -x tcpip{port=${REP_PORT}} -dt ${REP_TEMP_DIR} ${REP_DIR}/repdb.db >> ${LOGFILE} 2>&1  
+else
+    ${SQLANY}/bin64/dbspawn ${SQLANY}/bin64/dbsrv16  @${REP_DIR}/repdb.cfg -n ${REP_ENG} -x tcpip{port=${REP_PORT}} -dt ${REP_TEMP_DIR} ${REP_DIR}/repdb.db >> ${LOGFILE} 2>&1
+fi
+	
+# Get the dba password either from niq.ini or dbusers
+get_db_password
+
+conn_str_dbping_dec="-c \"con=${REP_ENG};eng=${REP_ENG};links=tcpip{host=${REP_ENG};port=${REP_PORT}};uid=dba;pwd=${DBA_PASSWORD}\""
+conn_str_dbping_enc=${TEM}/conn_str_repdb_dbping.`uuidgen`
+
+# encrypt the connection string.
+get_encrypt_file "${conn_str_dbping_dec}" "${conn_str_dbping_enc}"
+
+# Check if server is up
+${SQLANY}/bin64/dbping -q -o ${LOGFILE} @${conn_str_dbping_enc}
+_start_res_=$?
+
+
+if [ ${_start_res_} -eq 0 ] ; then
+    log_msg -l ${LOGFILE} -q -s "Database ${REP_ENG} successfully started"
+else
+    _err_msg_="Database server ${REP_ENG} start failed"
+    abort_script "$_err_msg_"
+fi
+
+DIR_REP=/eniq/database/rep_temp/repdb
+if [ -d "${DIR_REP}" ]; then
+ $CHMOD 755 ${DIR_REP}
+ $CHMOD 755 ${DIR_REP}/*
+ $CHMOD 755 ${DIR_REP}/*/*
+ log_msg -q -s "permissions changed to 755 for ${DIR_REP},${DIR_REP}/* and ${DIR_REP}/*/*" -l ${LOGFILE}
+else
+ log_msg -q -s "${DIR_REP} Directory not found" -l ${LOGFILE}
+fi
+
+DIR_ANY=/eniq/sql_anywhere
+if [ -d "${DIR_ANY}" ]; then
+ $CHMOD 1777 ${DIR_ANY}
+ log_msg -q -s "permissions changed to 755 for ${DIR_ANY}" -l ${LOGFILE}
+else
+ log_msg -q -s "${DIR_ANY} Directory not found" -l ${LOGFILE}
+fi
+}
+
+### Function: stop_repdb ###
+#
+# Stop the REP Sybase server
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+stop_repdb()
+{
+$ECHO "Stopping repdb..." > ${LOGFILE}
+
+PID=`$PS -ef | $EGREP -w "(${REP_PS_STR})" | $EGREP -v grep| $EGREP -w ${REP_ENG} | $AWK '{print $2}'`
+if [ -z "${PID}" ] ; then
+    log_msg -l ${LOGFILE} -q -s "Can't find ${REP_ENG} process. Database not running."
+    return 0
+else
+    log_msg -l ${LOGFILE} -q -s "Database is running with PID ${PID}"
+fi
+
+# Get the dba password either from niq.ini or dbusers
+get_db_password
+
+conn_str_dbstop_dec="-c \"eng=${REP_ENG};dbn=${REP_ENG};uid=dba;pwd=${DBA_PASSWORD};links=tcpip(host=localhost;port=$REP_PORT)\""
+conn_str_dbstop_enc=${TEM}/conn_str_repdb_dbstop.`uuidgen`
+
+# encrypt the connection string.
+get_encrypt_file "${conn_str_dbstop_dec}" "${conn_str_dbstop_enc}"
+
+${SQLANY}/bin64/dbstop -y -q @${conn_str_dbstop_enc} &
+
+log_msg -l ${LOGFILE} -q -s "dbstop forked"
+
+cnt=0
+while [ ${cnt} -lt ${STOP_COUNT} ] ; do
+    $SLEEP ${STOP_DELAY}
+
+    PID=`$PS -ef | $EGREP -w "(${REP_PS_STR})" | $EGREP -v grep| $EGREP -w ${REP_ENG} | $AWK '{print $2}'`
+    if [ -z "${PID}" ] ; then
+		break
+    else
+        log_msg -l ${LOGFILE} -q -s "DB process ${REP_ENG} is still running on pid ${PID}"
+	let cnt=cnt+1
+    fi
+done
+
+PID=`$PS -ef | $EGREP -w "(${REP_PS_STR})" | $EGREP -v grep | $EGREP -w ${REP_ENG} | $AWK '{print $2}'`
+if [ -z "${PID}" ] ; then
+    log_msg -l ${LOGFILE} -q -s "Database is down"
+else
+    log_msg -l ${LOGFILE} -q -s "Database ${REP_ENG} refused to stop. Attempting to force kill it."
+    $KILL -9 ${PID} >> ${LOGFILE} 2>&1
+    if [ $? -ne 0 ]; then
+	_err_msg_="Could not kill IQ SERVER PID ${PID}"
+	abort_script "$_err_msg_"
+    fi
+    log_msg -l ${LOGFILE} -q -s "Database killed."
+fi
+}
+
+# ********************************************************************
+#
+#   Main body of program
+#
+# ********************************************************************
+#
+# Determine absolute path to software
+get_absolute_path
+
+if [ -s ${DCUSER_PROFILE} ]; then
+    . ${DCUSER_PROFILE}
+    if [ $? -ne 0 ]; then
+        _err_msg_="Unable to source dcuser Profile"
+        abort_script "$_err_msg_"
+    fi
+else
+    _err_msg_="dcuser profile not found or empty"
+    abort_script "$_err_msg_"
+fi
+
+if [ ! "$1" ]; then
+    _err_msg_="Usage: `$BASENAME $0` {start | stop}"
+    abort_script "$_err_msg_"
+fi
+SCRIPT_ACTION=$1
+
+if [ "${SCRIPT_ACTION}" != "start" -a "${SCRIPT_ACTION}" != "stop" ]; then
+    _err_msg_="Usage: `$BASENAME $0` {start | stop}"
+    abort_script "$_err_msg_"
+fi
+
+# Check all required files and scripts are available
+check_files_and_scripts
+
+if [ -s $SCRIPTHOME/../lib/common_functions.lib ]; then
+    . $SCRIPTHOME/../lib/common_functions.lib
+else
+    _err_msg_="$SCRIPTHOME/../lib/common_functions.lib not found or empty"
+    abort_script "$_err_msg_"
+fi
+
+# Set up variables
+setup_variables
+
+case "${SCRIPT_ACTION}" in
+start)
+      start_repdb
+      ;;
+stop)
+      stop_repdb
+      ;;
+*) 
+      :
+      ;;
+esac
+
+$RM -rf ${conn_str_dbstop_enc}
+$RM -rf ${conn_str_dbping_enc}
+
+exit 0

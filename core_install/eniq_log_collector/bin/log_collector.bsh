@@ -1,0 +1,1956 @@
+#!/bin/bash
+# ********************************************************************
+# Ericsson Radio Systems AB                                     SCRIPT
+# ********************************************************************
+# (c) Ericsson Radio Systems AB 2022 - All rights reserved.
+#
+# The copyright to the computer program(s) herein is the property
+# of Ericsson Radio Systems AB, Sweden. The programs may be used
+# and/or copied only with the written permission from Ericsson Radio
+# Systems AB or in accordance with the terms and conditions stipulated
+# in the agreement/contract under which the program(s) have been
+# supplied.
+#
+# ********************************************************************
+# Name    : log_collector.bsh
+# Date    : 09/10/2023
+# Revision: \main\19
+# Purpose : Script to collect log files of given date
+# Usage   : bash log_collector.bsh
+# Exit Values: 
+#     0   : Success
+#    
+# ********************************************************************
+#
+#   Command Section
+#
+# ********************************************************************
+AWK=/usr/bin/awk
+BASH=/usr/bin/bash
+BC=/usr/bin/bc
+CAT=/usr/bin/cat
+CD=/usr/bin/cd
+CUT=/usr/bin/cut
+CP=/usr/bin/cp
+CHMOD=/usr/bin/chmod
+DATE=/usr/bin/date
+ECHO='/usr/bin/echo -e'
+ENV=/usr/bin/env
+EGREP=/usr/bin/egrep
+FIND=/usr/bin/find
+GREP=/usr/bin/grep
+HEAD=/usr/bin/head
+HOSTNAME=/usr/bin/hostname
+ID=/usr/bin/id
+JOURNALCTL=/usr/bin/journalctl
+LS=/usr/bin/ls
+MKDIR=/usr/bin/mkdir
+MOUNT=/usr/bin/mount
+MV=/usr/bin/mv
+PERL=/usr/bin/perl
+PRINTF=/usr/bin/printf
+RM=/usr/bin/rm
+SED=/usr/bin/sed
+SUDO=/usr/bin/sudo
+TAIL=/usr/bin/tail
+TOUCH=/usr/bin/touch
+UMOUNT=/usr/bin/umount
+WC=/usr/bin/wc
+ZIP=/usr/bin/zip
+
+# ********************************************************************
+#                                                                    *
+#                     Functions                                      *
+#                                                                    *
+# ********************************************************************
+### Function: abort_script ###
+#
+#   This will is called if the script is aborted through an error
+#   signal sent by the kernel such as CTRL-C or if a serious
+#   error is encountered during runtime
+#
+# Arguments:
+#       $1 - Error message from part of program (Not always used)
+# Return Values:
+#       none
+abort_script()
+{
+_err_time_=`date '+%Y-%b-%d_%H.%M.%S'`
+
+if [ "$1" ]; then
+    _err_msg_="${_err_time_} - $1"
+else
+    _err_msg_="${_err_time_} - ERROR : Script aborted.......\n"
+fi
+if [ -s ${TEMP_LOG_LOCATION}/summary.log  ]; then
+    $ECHO "\nERROR : ${_err_msg_}\n" >> ${TEMP_LOG_LOCATION}/summary.log
+else
+    $ECHO "\nERROR : ${_err_msg_}\n"
+fi
+
+clean_up
+
+exit 1
+}
+### Function: call_log_required ###
+#
+# Selects specific logs to be called according to blade
+#
+# Arguments:
+#      none
+# Return Values:
+#       none
+#
+call_log_required()
+{
+_blade_type_server_=""
+_blade_type_file_=""
+_serial_number_=""
+_location_=""
+_date_pattern_=""
+_pattern_=""
+_time_stamp_pattern_=""
+
+if [ -s ${INSTALLED_SERVER_TYPE} ];then
+    _blade_type_server_=`$CAT ${INSTALLED_SERVER_TYPE}`
+
+    $CAT ${REGISTRY_FILE} | $GREP -v "#" > ${TEMP_DIR}/temp_conf.config
+    while read line
+    do
+         _serial_number_=`$ECHO ${line} | $AWK -F"::" '{print $1}'`
+         _location_=`$ECHO ${line} | $AWK -F"::" '{print $2}'`
+         _date_pattern_=`$ECHO ${line} | $AWK -F"::" '{print $3}'`
+         _pattern_=`$ECHO ${line} | $AWK -F"::" '{print $5}'`
+         _time_stamp_pattern_=`$ECHO ${line} | $AWK -F"::" '{print $6}'`
+         _blade_type_file_=`$ECHO ${line} | $AWK -F"::" '{print $4}'`
+
+         if [ \( "$_blade_type_file_" == "CO" \) -a \( "${_blade_type_server_}" == "stats_coordinator" -o "${_blade_type_server_}" == "eniq_coordinator" -o "${_blade_type_server_}" == "eniq_stats" -o "${_blade_type_server_}" == "eniq_events" \) ] ;then
+             disseminator "$_location_" "$_date_pattern_" "$_pattern_" "$_time_stamp_pattern_"
+         fi
+         if [ "$_blade_type_file_" == "ALL" ];then
+             disseminator "$_location_" "$_date_pattern_" "$_pattern_" "$_time_stamp_pattern_"
+         fi
+    done < ${TEMP_DIR}/temp_conf.config
+else
+    _err_msg_="File for installed server type not found"
+    abort_script "$_err_msg_"
+fi 
+}
+
+### Function: check_id ###
+#
+#   Check that the effective id of the user is correct
+#   If not print error msg and exit.
+#
+# Arguments:
+#       $1 : User ID name
+# Return Values:
+#       none
+#
+check_id()
+{
+
+_get_id_=`$ENV |$GREP -w SUDO_USER | $EGREP "^[[:blank:]]*SUDO_USER="|$AWK -F\= '{print $2}'|$SED -e 's|"||g'`
+
+_check_id_=`$ID | $AWK -F\( '{print $2}' | $AWK -F\) '{print $1}'`
+
+_check_group_=`$ID $_get_id_ | $AWK -F\( '{print $3}' | $AWK -F\) '{print $1}'`
+
+
+    if [ "${_get_id_}" == "" ]; then
+
+        if [ "${_check_id_}" == "root" ]; then
+           # Set 1 for true
+           _user_root=1
+
+        else
+           _err_msg_="You must be root or admin to execute this script."
+           abort_script "${_err_msg_}"
+        fi
+    else
+        if [ "${_check_group_}" == "ENIQ_ADMIN_ROLE" ]; then
+           # Set 0 for false
+           _user_root=0
+
+        else
+           _err_msg_="You must be root or admin to execute this script." 
+           abort_script "${_err_msg_}"
+        fi
+    fi
+}
+
+### Function: check_logfile ###
+#
+#   Check if the logs for date entered by user are present
+#   Accordingly shows the message on the console 
+#
+# Arguments:
+#        $1 : location
+#        $2 : Date Stamp Pattern
+#        $3 :Time Stamp Pattern 
+# Return Values:
+#       none
+#
+check_logfile(){
+flag=0
+flag_1=0
+if [ "$1" == "/eniq/log/sw_log/adminui/adminui.log.${yyyy}-${mm}-${dd}" ]; then
+        if [ ! -f $1 ]; then
+                flag_1=1
+                admin_log="/eniq/log/sw_log/adminui/adminui.log"
+                $LS -1 $admin_log > ${TEMP_DIR}/log_loop.txt 2> /dev/null
+                if [ $? -eq 0 ];then
+                   flag=1
+                fi
+                else
+                $LS -1 $1 > ${TEMP_DIR}/log_loop.txt 2> /dev/null 
+                if [ $? -eq 0 ];then
+                    flag=1
+                fi
+         fi
+else
+        $LS -1 $1 > ${TEMP_DIR}/log_loop.txt 2> /dev/null 
+        if [ $? -eq 0 ];then
+              flag=1
+        fi
+fi
+if [ $flag -eq 1 ]; then
+    while read line_file;
+    do  
+             _logfile_name_=`$ECHO $line_file |$AWK -F/ '{print $NF}'`
+        set_timestamp "$3"
+                if [ "$2" == "N/A" ]; then
+                        $CAT $line_file > ${LOG_DIRECTORY}/${_logfile_name_}
+                        log_msg -s "FOUND : $line_file" -l ${TEMP_LOG_LOCATION}/summary.log
+                        _log_count_=$((_log_count_+1))
+                        COUNT_LOGS_FOUND=$((COUNT_LOGS_FOUND + 1))
+                else
+                        _date_now_=$(eval $2)
+                        _start_line_=`$GREP -n "$_date_now_" $line_file | $CUT -d":" -f1 |$HEAD -1`
+                        _end_line_=`$GREP -n "$_date_now_" $line_file | $CUT -d":" -f1 |$TAIL -1`
+                        if [ ! -z $_start_line_ ] ||[ ! -z $_end_line_ ];then 
+                                if [ $_start_line_ -eq $_end_line_ ];then
+                                        _end_line_=$(($_start_line_ + 8))
+                                        $SED -n $_start_line_,$_end_line_\p $line_file > ${LOG_DIRECTORY}/${_logfile_name_}
+                                        log_msg -s "FOUND : $line_file" -l ${TEMP_LOG_LOCATION}/summary.log
+                                        _log_count_=$((_log_count_+1))
+                                        COUNT_LOGS_FOUND=$((COUNT_LOGS_FOUND + 1))
+                                else
+                                        _diff_start_end_=$(( $_end_line_ - $_start_line_ ))
+                                        if [ $_diff_start_end_ -ge $MAX_FILE_LINES ];then
+                                                   log_msg -s "Collecting $_logfile_name_. Please wait..." -l ${TEMP_LOG_LOCATION}/summary.log
+                                        fi
+                                        $SED -n $_start_line_,$_end_line_\p $line_file > ${LOG_DIRECTORY}/${_logfile_name_}
+                                        log_msg -s "FOUND : $line_file" -l ${TEMP_LOG_LOCATION}/summary.log
+                                        _log_count_=$((_log_count_+1))
+                                        COUNT_LOGS_FOUND=$((COUNT_LOGS_FOUND + 1))
+                               fi
+                        else
+                                log_msg -s "NOT_FOUND : $line_file found" -l ${TEMP_LOG_LOCATION}/summary.log
+                                _log_count_=$((_log_count_+1))
+                        fi
+                fi
+    done < ${TEMP_DIR}/log_loop.txt
+    $RM -r ${TEMP_DIR}/log_loop.txt
+else
+        if [ $flag_1 -eq 1 ]; then
+                log_msg -s "NOT_FOUND : $admin_log " -l ${TEMP_LOG_LOCATION}/summary.log
+                _log_count_=$((_log_count_+1))
+        else
+                log_msg -s "NOT_FOUND : $1 " -l ${TEMP_LOG_LOCATION}/summary.log
+                _log_count_=$((_log_count_+1))
+        fi
+fi
+}
+
+### Function: check_log_present ###
+#
+# Checks if the any logs are found on the server
+# If no logs are found then deletes the directory of the server 
+#
+# Arguments:
+#      none
+# Return Values:
+#       none
+#
+check_log_present(){
+if [ $COUNT_LOGS_FOUND -eq 0 ];then
+    if [ -d $LOG_DIRECTORY ];then
+        $RM -r $LOG_DIRECTORY 
+    fi
+fi
+}
+
+### Function: check_multiple_logfiles ###
+#
+#  Check mutiple log files with same pattern and date
+#   Eg: /eniq/local_logs/iq/dwhdb.*.srvlog
+#
+# Arguments:
+#        $1 : Absolute path of file 
+#        $2 : Date Stamp Pattern
+#        $3 : TimeStamp Pattern
+# Return Values:
+#       none
+#
+check_multiple_logfiles()
+{
+$LS  $1 >> ${TEMP_DIR}/log_loop1.txt 2> /dev/null 
+if [ $? -eq 0 ];then
+    while read line_file;
+    do
+      check_logfile "$line_file" "$2" "$3"
+    done < ${TEMP_DIR}/log_loop1.txt
+    $RM -r ${TEMP_DIR}/log_loop1.txt
+else
+    log_msg -s "NOT_FOUND : $1 " -l ${TEMP_LOG_LOCATION}/summary.log
+    _log_count_=$((_log_count_+1))
+fi
+}
+
+### Function: check_process_instance ##
+#
+#   Creates a lock file at the start of script execution
+#   Check if any instance of logcollect is running
+#   If yes then print error message and exit 
+#
+# Arguments:
+#       none 
+# Return Values:
+#       none
+#
+check_process_instance(){
+if [ -e /eniq/sw/installer/log_collector.lock ];then
+     _err_msg_="Another instance of log_collector.bsh is running"
+     abort_script "$_err_msg_" 
+else
+    $TOUCH /eniq/sw/installer/log_collector.lock
+    if [ $? -ne 0 ];then
+        _err_msg_= "Failed to create process instance"
+        abort_script "$_err_msg_" 
+    fi
+fi
+}
+
+### Function: clean_up ##
+#
+#   Removes temporary files when script is aborted
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+#
+clean_up(){
+
+cd ${CURR_DIR}
+
+REM_LIST=""
+        if [ -e /eniq/sw/installer/log_collector.lock ];then
+             REM_LIST+=" /eniq/sw/installer/log_collector.lock"
+        fi
+        if [ -d ${TEMP_LOG_LOCATION} ];then
+            REM_LIST+=" ${TEMP_LOG_LOCATION}"
+        fi
+        if [ -d ${TEMP_DIR} ]; then
+            REM_LIST+=" ${TEMP_DIR}"
+        fi
+        if [ -d ${TEMP_LOG_DIR} ];then
+            REM_LIST+=" ${TEMP_LOG_DIR}"
+        fi
+        if [ ${#REM_LIST} -ne 0 ];then
+            $RM -r ${REM_LIST}
+        fi 
+}
+
+### Function: collect_start_stop_log ###
+#
+#  Checks for logs which have date as well as time in the logfile name
+#
+# Arguments:
+#        $1 : Location 
+#        $2 : Timestamp Pattern 
+# Return Values:
+#       none
+#
+collect_start_stop_log(){
+_flag_tcdate_=0
+set_timestamp $2
+_req_log_=`$ECHO $1 | $AWK -F/ '{print $NF}' | cut -d"<" -f1`
+_path_req_=`$ECHO $1 | $AWK -F${_req_log_} '{print $1}'`
+if [ -d $_path_req_ ];then
+    $LS -1 $_path_req_ | $GREP $_req_log_ | $EGREP "$yyyy$mm$dd|$dd.$mm.$yyyy" > ${TEMP_DIR}/temp.txt 
+    if [ -s ${TEMP_DIR}/temp.txt ];then
+        while read line1
+        do
+            _flag_tcdate_=1
+            $CAT $_path_req_$line1 > ${LOG_DIRECTORY}/$line1
+        done < ${TEMP_DIR}/temp.txt
+        $RM -r ${TEMP_DIR}/temp.txt
+    fi
+else
+    _log_count_=$((_log_count_+1))
+    log_msg -s "NOT_FOUND : $_path_req_ " -l ${TEMP_LOG_LOCATION}/summary.log
+fi
+
+if [ $_flag_tcdate_ -eq 0 ];then
+        _log_count_=$((_log_count_+1))
+    log_msg -s "NOT_FOUND : $1 " -l ${TEMP_LOG_LOCATION}/summary.log
+else
+    log_msg -s "NOT_FOUND : $1 " -l ${TEMP_LOG_LOCATION}/summary.log
+        _log_count_=$((_log_count_+1))
+    COUNT_LOGS_FOUND=$((COUNT_LOGS_FOUND + 1))
+fi
+}
+
+### Function: copy_conf_file ###
+#
+#  To Copy Configuration Files from there absolute path  
+#   Eg: /eniq/sw/conf/static.properties
+#
+# Arguments:
+#        $1 : Absolute path of file 
+# Return Values:
+#       none
+#
+copy_conf_file()
+{
+$LS -1 $1* > ${TEMP_DIR}/conf_loop.txt 2> /dev/null
+if [ $? -eq 0 ];then
+    while read line_file; do
+        $CP $line_file ${LOG_DIRECTORY}/  2> /dev/null
+        if [ $? -eq 0 ]; then
+                  _log_count_=$((_log_count_+1))
+            COUNT_LOGS_FOUND=$((COUNT_LOGS_FOUND + 1))
+            log_msg -s "FOUND : $line_file "  -l ${TEMP_LOG_LOCATION}/summary.log
+        else
+                _log_count_=$((_log_count_+1))
+            log_msg -s "NOT_FOUND : $line_file " -l ${TEMP_LOG_LOCATION}/summary.log
+        fi
+    done < ${TEMP_DIR}/conf_loop.txt
+    $RM -r ${TEMP_DIR}/conf_loop.txt
+else
+    _log_count_=$((_log_count_+1))
+    log_msg -s "NOT_FOUND : $1 " -l ${TEMP_LOG_LOCATION}/summary.log
+fi
+}
+
+### Function: create_log_dir ###
+#
+#   Creates required directories 
+#   If not created then displays error msg and aborts.
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+#
+create_log_dir(){
+
+DIR_LIST=""
+
+if [ ! -d $TEMP_DIR ]; then
+     DIR_LIST+="  $TEMP_DIR"
+fi
+
+if [ ! -d $LOG_DIRECTORY ]; then
+     DIR_LIST+="  $LOG_DIRECTORY"
+fi
+
+if [ ! -d  ${FINAL_LOG_LOCATION} ]; then
+     DIR_LIST+="  $FINAL_LOG_LOCATION"
+fi
+if [ ! -d ${TEMP_LOG_LOCATION} ]; then
+     DIR_LIST+="  $TEMP_LOG_LOCATION"
+fi
+
+if [ ${#DIR_LIST} -ne 0 ];then
+    $MKDIR -p ${DIR_LIST}
+    if [ $? -ne 0 ]; then
+        _err_msg_="Failed create the required log dir"
+        abort_script "$_err_msg_"
+    fi
+fi
+}
+
+### Function: create_log_summary ###
+#
+# Prints a summary of number of Logs found 
+#
+# Arguments:
+#      none
+# Return Values:
+#       none
+#
+create_log_summary(){
+log_msg -s "\n************************************************LOG SUMMARY FOR $_server_name_*************************************************************" -l ${TEMP_LOG_LOCATION}/summary.log
+log_msg -s "\n          TOTAL NUMBER OF LOGS SEARCHED : ${_log_count_} " -l ${TEMP_LOG_LOCATION}/summary.log
+log_msg -s "\n          NUMBER OF LOG FILES FOUND     : $COUNT_LOGS_FOUND " -l ${TEMP_LOG_LOCATION}/summary.log
+log_msg -s "\n*******************************************************************************************************************************************\n" -l ${TEMP_LOG_LOCATION}/summary.log
+}
+
+### Function: create_zip_log_fs ###
+#
+#   Creates a zip of the logfiles collected when storage type is fs
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+#
+create_zip_log_fs(){
+
+_err_time_=`date '+%Y-%b-%d_%H.%M.%S'`
+_max_zip_size_mb_=0
+_max_zip_size_actual_fs=0
+_count_size_=0
+_current_size_=0
+_current_size_mb_=0
+
+$LS ${TEMP_LOG_LOCATION} > /dev/null 2>&1
+if [ $? -eq 0 ]; then
+#Counts the number of files/directories in temporary location 
+    _file_count_=`$LS -A ${TEMP_LOG_LOCATION} | $WC -l`
+
+#Checks if there are any other directories apart from summary file
+    if [ $_file_count_ -gt 1 ];then
+        log_msg -s "Creating ZIP file : ${FINAL_LOG_LOCATION}ENIQ_log_collector_${DATE_VAL:4:4}-${DATE_VAL:2:2}-${DATE_VAL:0:2}_${_zip_date_}.zip" -l ${TEMP_LOG_LOCATION}/summary.log
+        _current_dir_=`pwd`
+        cd ${TEMP_LOG_LOCATION}
+        #Unziping the zip file should give same directory name as the zip file 
+        cd ..
+        $MV ${TEMP_LOG_LOCATION} ENIQ_log_collector_${DATE_VAL:4:4}-${DATE_VAL:2:2}-${DATE_VAL:0:2}_${_zip_date_} 
+        $ZIP -rm ${FINAL_LOG_LOCATION}ENIQ_log_collector_${DATE_VAL:4:4}-${DATE_VAL:2:2}-${DATE_VAL:0:2}_${_zip_date_}.zip . > /dev/null 
+        
+			if [ $? == 0 ];then
+					_max_zip_size_mb_=`$ECHO $MAX_ZIP_SIZE_FS | $CUT -d"M" -f1`
+					_max_zip_size_actual_fs=`$ECHO "$_max_zip_size_mb_*1024*1000" | $BC`
+					_count_size_=`$WC -c ${FINAL_LOG_LOCATION}ENIQ_log_collector_${DATE_VAL:4:4}-${DATE_VAL:2:2}-${DATE_VAL:0:2}_${_zip_date_}.zip`
+					_current_size_=`$ECHO $_count_size_ | $CUT -d" " -f1`
+					_current_size_mb_=$(( _current_size_ / 1024000 )) 
+					if [ $_current_size_ -ge $_max_zip_size_actual_fs ];then
+						$ECHO "\nERROR : ${_err_time_} - Cannot create zip file as the size of zip file ENIQ_log_collector_${DATE_VAL:4:4}-${DATE_VAL:2:2}-${DATE_VAL:0:2}_${_zip_date_}.zip is $_current_size_mb_ MB \n                               Maximum Zip file size mentioned in the configuration file is $MAX_ZIP_SIZE_FS \n                               Please modify MAX_ZIP_SIZE_FS in the /eniq/installation/core_install/eniq_log_collector/config/log_collector.cfg"
+						$RM ${FINAL_LOG_LOCATION}ENIQ_log_collector_${DATE_VAL:4:4}-${DATE_VAL:2:2}-${DATE_VAL:0:2}_${_zip_date_}.zip
+						abort_script 
+					else
+						log_msg -s "\nZIP file created : ${FINAL_LOG_LOCATION}ENIQ_log_collector_${DATE_VAL:4:4}-${DATE_VAL:2:2}-${DATE_VAL:0:2}_${_zip_date_}.zip\n"
+					fi
+				fi
+		cd $_current_dir_
+    else
+        clean_up
+        log_msg -s "\nNOT_FOUND : for the date: $DATE_VAL on the deployment\n" 
+    fi
+fi
+zip_file_manager
+}
+
+
+
+
+
+
+### Function: create_zip_log_raw ###
+#
+#   Creates a zip of the logfiles collected when storage type is raw
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+#
+create_zip_log_raw(){
+
+_err_time_=`date '+%Y-%b-%d_%H.%M.%S'`
+_max_zip_size_mb_=0
+_max_zip_size_actual_raw=0
+_count_size_=0
+_current_size_=0
+_current_size_mb_=0
+
+$LS ${TEMP_LOG_LOCATION} > /dev/null 2>&1
+if [ $? -eq 0 ]; then
+#Counts the number of files/directories in temporary location 
+    _file_count_=`$LS -A ${TEMP_LOG_LOCATION} | $WC -l`
+
+#Checks if there are any other directories apart from summary file
+    if [ $_file_count_ -gt 1 ];then
+        log_msg -s "Creating ZIP file : ${FINAL_LOG_LOCATION}ENIQ_log_collector_${DATE_VAL:4:4}-${DATE_VAL:2:2}-${DATE_VAL:0:2}_${_zip_date_}.zip" -l ${TEMP_LOG_LOCATION}/summary.log
+        _current_dir_=`pwd`
+        cd ${TEMP_LOG_LOCATION}
+        #Unziping the zip file should give same directory name as the zip file 
+        cd ..
+        $MV ${TEMP_LOG_LOCATION} ENIQ_log_collector_${DATE_VAL:4:4}-${DATE_VAL:2:2}-${DATE_VAL:0:2}_${_zip_date_} 
+        $ZIP -rm ${FINAL_LOG_LOCATION}ENIQ_log_collector_${DATE_VAL:4:4}-${DATE_VAL:2:2}-${DATE_VAL:0:2}_${_zip_date_}.zip . > /dev/null 
+        
+			if [ $? == 0 ];then
+					_max_zip_size_mb_=`$ECHO $MAX_ZIP_SIZE_RAW | $CUT -d"M" -f1`
+					_max_zip_size_actual_raw=`$ECHO "$_max_zip_size_mb_*1024*1000" | $BC`
+					_count_size_=`$WC -c ${FINAL_LOG_LOCATION}ENIQ_log_collector_${DATE_VAL:4:4}-${DATE_VAL:2:2}-${DATE_VAL:0:2}_${_zip_date_}.zip`
+					_current_size_=`$ECHO $_count_size_ | $CUT -d" " -f1`
+					_current_size_mb_=$(( _current_size_ / 1024000 )) 
+					if [ $_current_size_ -ge $_max_zip_size_actual_raw ];then
+						$ECHO "\nERROR : ${_err_time_} - Cannot create zip file as the size of zip file ENIQ_log_collector_${DATE_VAL:4:4}-${DATE_VAL:2:2}-${DATE_VAL:0:2}_${_zip_date_}.zip is $_current_size_mb_ MB \n                               Maximum Zip file size mentioned in the configuration file is $MAX_ZIP_SIZE_RAW \n                               Please modify MAX_ZIP_SIZE_RAW in the /eniq/installation/core_install/eniq_log_collector/config/log_collector.cfg"
+						$RM ${FINAL_LOG_LOCATION}ENIQ_log_collector_${DATE_VAL:4:4}-${DATE_VAL:2:2}-${DATE_VAL:0:2}_${_zip_date_}.zip
+						abort_script 
+					else
+						log_msg -s "\nZIP file created : ${FINAL_LOG_LOCATION}ENIQ_log_collector_${DATE_VAL:4:4}-${DATE_VAL:2:2}-${DATE_VAL:0:2}_${_zip_date_}.zip\n"
+					fi
+				fi
+		cd $_current_dir_
+    else
+        clean_up
+        log_msg -s "\nNOT_FOUND : for the date: $DATE_VAL on the deployment\n" 
+    fi
+fi
+zip_file_manager
+}
+
+
+### Function: create_main_zip_file ###
+#
+#   Creates a zip of the logfiles collected
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+#
+create_main_zip_file(){
+    if [ -d ${FINAL_LOG_LOCATION} ]; then
+	   cd ${FINAL_LOG_LOCATION}
+	   $LS | $GREP -v "${_server_name_}" > ${TEMP_LOG_DIR}/files_to_zip.txt
+	   date=`date '+%Y-%m-%d'`
+	   #pwd
+	   #path=/eniq/log/log_collector
+	   $CAT ${TEMP_LOG_DIR}/files_to_zip.txt | $ZIP -rm@ ${FINAL_LOG_LOCATION}ENIQ_log_collector_${_server_name_}_${REQUIRED_DATE}_${_zip_date_}.zip >/dev/null
+	   #$ZIP -rm ${FINAL_LOG_LOCATION}${_server_name_}_ENIQ_log_collector_${REQUIRED_DATE}_${_zip_date_}.zip  ./* >/dev/null
+	   if [ $? -eq 0 ]; then
+	       log_msg -s "\n Created the zip file ENIQ_log_collector_${_server_name_}_${REQUIRED_DATE}_${_zip_date_}.zip" -l ${log_file_name}
+	   else
+	       log_msg -s "\n Failed to create the zip file ENIQ_log_collector_${_server_name_}_${REQUIRED_DATE}_${_zip_date_}.zip" -l ${log_file_name}
+	   fi
+	fi
+	
+}
+
+
+### Function: copy_logs_to_sftp_path ###
+#
+# copies main zip file created by collectinglogs to path /home/sftpuser
+#
+# Arguments:
+#       None
+# Return Values:
+#       None
+#     
+copy_logs_to_sftp_path()
+{
+    if [ $SFTP_PATH ]; then
+	  date=`date +%Y-%m-%d`
+	  flag=0
+      if [ -d $SFTP_PATH ]; then
+	      cd ${FINAL_LOG_LOCATION}
+	      file=`$LS -lrt| $GREP  "${date}" | $TAIL -1 | $AWK '{print $9}'`
+		  if [ ! $file ]; then
+			    _err_msg_="NOT_FOUND : for date $date. Please generate the log file first and then try to copy."
+                abort_script "$_err_msg_"
+		  fi
+		     log_msg -s "Copying file $file to $SFTP_PATH" -l ${log_file_name}
+		     $CP $file $SFTP_PATH >/dev/null
+			 if [ $? -eq 0 ]; then
+                             log_msg -s "\n Successfully copied log files to path $SFTP_PATH" -l ${log_file_name}
+			 fi
+      else
+          log_msg -s "$SFTP_PATH directory does't exists" -l ${log_file_name}
+      fi
+   fi
+}
+
+
+
+
+### Function: disseminator ###
+#
+# Assigns calls specific function according to logs
+#
+# Arguments:
+#       $1 : Location
+#       $2 : Date Pattern
+#       $3 : Function Pattern 
+#       $4 : Timestamp Pattern
+# Return Values:
+#       none
+#
+disseminator(){
+if [ ! -z "$1" ];then
+      if [ "$3" == "P2" ];then
+          collect_start_stop_log "$1" "$4"
+      fi
+      if [ "$3" == "P1" ];then
+          check_logfile "$1" "$2" "$4"
+      fi
+      if [ "$3" == "P3" ];then
+          set_timestamp "$4"
+          _location_=`$ECHO "$1"`
+          eval y=$_location_
+          check_logfile "$y" "$2" "$4"
+      fi
+      if [ "$3" == "P4" ];then
+          check_multiple_logfiles "$1" "$2" "$4"
+      fi
+      if [ "$3" == "P5" ];then
+          copy_conf_file "$1" 
+      fi
+fi
+
+}
+
+### Function: run_remote_exec ###
+#
+#  Remotely executes script on each blade in the deployment
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+#
+run_remote_exec(){
+$PERL ${ENIQ_LIB_DIR}/get_ip_order.pl -f ${TEMP_DIR}/perl.txt
+for line in `$CAT ${TEMP_DIR}/perl.txt`;do
+    local _count_=`$ECHO "${line}" | $GREP -o "::" | $WC -l`
+	if [ "${_ip_type_}" == "IPv6" -a "${_count_}" == 3 ]; then
+		local _ip_address_=`$ECHO ${line} | $GREP -oE '([a-fA-F0-9]{1,4}::?){1,7}[a-fA-F0-9]{1,4}' | $HEAD -n 1 | $AWK -F "::" '{ print $1 "::" $2}'`
+		local _server_name_=`$ECHO ${line} | $AWK -F"::" '{print $3}'`
+		local _server_type_=`$ECHO ${line} | $AWK -F"::" '{print $4}'`
+		_blade_type_server_=`$CAT ${INSTALLED_SERVER_TYPE}`
+	else
+		local _ip_address_=`$ECHO ${line} | $AWK -F"::" '{print $1}'`
+		local _server_name_=`$ECHO ${line} | $AWK -F"::" '{print $2}'`
+		local _server_type_=`$ECHO ${line} | $AWK -F"::" '{print $3}'`
+		_blade_type_server_=`$CAT ${INSTALLED_SERVER_TYPE}`
+	fi
+	
+    log_msg -s "\n=========================================== $_server_name_ =======================================================\n" -l ${TEMP_LOG_LOCATION}/summary.log
+    log_msg -s "\nSearching Logs for Date:$DATE_VAL\n" -l ${TEMP_LOG_LOCATION}/summary.log
+    if [ "$_server_type_" == "stats_coordinator" -o "$_server_type_" == "eniq_stats" ];then
+	  $ping_command -c1 ${_server_name_}
+	  if [ $? -eq 0 ];then
+			$BASH ${LOG_COLLECTOR}/bin/log_collector.bsh -r $DATE_VAL -e eniq 
+				if [ $? -ne 0 ];then
+					log_msg -s "Unable to execute the script log_collector.bsh " -l ${TEMP_LOG_LOCATION}/summary.log
+					break
+				fi
+	  else
+		log_msg -s "Ping failed to ${_server_name_}" -l ${TEMP_LOG_LOCATION}/summary.log
+	  fi
+	 
+		
+   else 
+        if [ "${_user_root}" == 1 ]; then
+        # Execute Root command
+		run_remote_cmd "${_server_name_}" "$ping_command -c1 ${_server_name_}" > /dev/null 2>&1
+	    if [ $? -eq 0 ];then
+			run_remote_cmd "${_server_name_}" "$BASH ${LOG_COLLECTOR}/bin/log_collector.bsh -r $DATE_VAL -e eniq" 
+			if [ $? -ne 0 ];then
+			  break
+			fi
+	    else
+			log_msg -s "Ping failed to ${_server_name_}" -l ${TEMP_LOG_LOCATION}/summary.log
+	    fi
+	    else
+        # Execute non root admin user command	
+		run_remote_cmd "${_server_name_}" "$ping_command -c1 ${_server_name_}" "" "$_get_id_"  > /dev/null 2>&1
+		if [ $? -eq 0 ];then
+		    run_remote_cmd "${_server_name_}" "$SUDO $BASH ${LOG_COLLECTOR}/bin/log_collector.bsh -r $DATE_VAL -e eniq" "" "$_get_id_" 
+		    if [ $? -ne 0 ];then
+			  break
+			fi
+		else
+			log_msg -s "Ping failed to ${_server_name_}" -l ${TEMP_LOG_LOCATION}/summary.log
+		fi
+	    fi 
+
+   fi
+done
+}
+
+### Function: set_timestamp ###
+#
+#  Sets the day according to the logfile
+#
+# Arguments:
+#       $
+# Return Values:
+#       none
+#
+set_timestamp(){
+
+dd=${DATE_VAL:0:2}
+mm=${DATE_VAL:2:2}
+yyyy=${DATE_VAL:4:4}
+
+case $mm in
+        01)mm="Jan"
+        ;;
+        02)mm="Feb"
+        ;;
+        03)mm="Mar"
+        ;;
+        04)mm="Apr"
+        ;;
+        05)mm="May"
+        ;;
+        06)mm="Jun"
+        ;;
+        07)mm="Jul"
+        ;;
+        08)mm="Aug"
+        ;;
+        09)mm="Sep"
+        ;;
+        10)mm="Oct"
+        ;;
+        11)mm="Nov"
+        ;;
+        12)mm="Dec"
+        ;;
+esac
+
+case $1 in
+     D1)dd=${DATE_VAL:0:2}
+        mm=${DATE_VAL:2:2}
+     ;;
+     D2)
+        case $dd in
+            01)dd=" 1"
+            ;;
+            02)dd=" 2"
+            ;;
+            03)dd=" 3"
+            ;;
+            04)dd=" 4"
+            ;;
+            05)dd=" 5"
+            ;;
+            06)dd=" 6"
+            ;;
+            07)dd=" 7"
+            ;;
+            08)dd=" 8"
+            ;;
+            09)dd=" 9"
+            ;;
+        esac
+     ;;
+     D3)dd=${DATE_VAL:0:2}
+     ;;
+     D4)dd=${DATE_VAL:0:2}
+        mm=${DATE_VAL:2:2}
+        yyyy=${DATE_VAL:6:2}
+     ;;
+esac
+}
+
+### Function: setup_env ###
+#
+# Setup path environment
+# Imports the common lib files which imports common functions 
+# 
+# Arguments:
+#   $DATE_VAL 
+# Return Values:
+#   none 
+#
+setup_env(){
+
+#COUNT OF THE LOGS SEARCHED ON THE SERVER
+_log_count_=0
+
+#COUNT OF THE LOGS FOUND ON THE SERVER
+COUNT_LOGS_FOUND=0
+
+#CURRENT WORKING DIRECTORY
+CURR_DIR=`pwd`
+
+#ENIQ BASE DIRECTORY
+ENIQ_BASE_DIR=/eniq
+
+# Main Directory for the Core Installation SW
+ENIQ_INST_DIR=${ENIQ_BASE_DIR}/installation
+
+#Config directory
+ENIQ_CONFIG_DIR=${ENIQ_INST_DIR}/config
+
+# ENIQ Core Installation SW
+ENIQ_CORE_INST_DIR=${ENIQ_INST_DIR}/core_install
+
+#ENIQ local log directory
+ENIQ_LOCAL_LOGS_DIR=${ENIQ_BASE_DIR}/local_logs
+
+#Configuration file location
+LOG_COLLECTOR=${ENIQ_CORE_INST_DIR}/eniq_log_collector
+
+#Log collector config file location
+LOG_COLLECTOR_CONFIG=${ENIQ_CORE_INST_DIR}/eniq_log_collector/config
+
+#Path for installed server type
+CURR_SERVER_TYPE=`$CAT $ENIQ_CONFIG_DIR/installed_server_type | $EGREP -v  '^[[:blank:]]*#' | $SED -e 's/ //g'`
+
+#Log collector deployment list file location
+DEPLOYMENT_TYPE_FILE=${LOG_COLLECTOR}/config/deployment_type.cfg
+
+#Configuration file declaration
+PARAMETER_CONFIG_FILE=${LOG_COLLECTOR}/config/log_collector.cfg
+if [ ! -s ${PARAMETER_CONFIG_FILE} ];then
+    _err_msg_="Input Configuration file not found"
+    abort_script "$_err_msg_"
+fi
+
+#journal_logs file creation
+JOURNAL_LOGS=/var/log/journalctl_logs
+
+#create journal log file
+$TOUCH ${JOURNAL_LOGS}
+
+#Registry File
+REGISTRY_FILE=${LOG_COLLECTOR}/config/registry_log_collector.cfg
+if [ ! -s ${REGISTRY_FILE} ];then
+    _err_msg_="Registry file not found"
+    abort_script "$_err_msg_"
+fi
+
+#Temporary Log Directory
+TEMP_LOG_DIR=${ENIQ_BASE_DIR}/log/logfilter
+
+#Temporary Log Location
+TEMP_LOG_LOCATION=${TEMP_LOG_DIR}/log_collector_temp
+
+#Temporary directory for files
+TEMP_DIR=/tmp/temp_dir
+
+#Final Zip Location
+FINAL_LOG_LOCATION=`$GREP -w FINAL_LOG_LOCATION $PARAMETER_CONFIG_FILE | $AWK -F:: '{print $2}'`
+
+#Max number of Zip files
+MAX_ZIP_NUMBER=`$GREP -w MAX_ZIP_NUMBER $PARAMETER_CONFIG_FILE | $AWK -F:: '{print $2}'`
+
+#Max number of Zip files for rack
+MAX_ZIP_SIZE_FS=`$GREP -w MAX_ZIP_SIZE_FS $PARAMETER_CONFIG_FILE | $AWK -F:: '{print $2}'`
+
+#Max number of Zip files for blade
+MAX_ZIP_SIZE_RAW=`$GREP -w MAX_ZIP_SIZE_RAW $PARAMETER_CONFIG_FILE | $AWK -F:: '{print $2}'`
+
+
+#Max file lines for the collecting message
+MAX_FILE_LINES=`$GREP -w MAX_FILE_LINES $PARAMETER_CONFIG_FILE | $AWK -F:: '{print $2}'`
+
+#Path for installed server type
+INSTALLED_SERVER_TYPE=${ENIQ_INST_DIR}/config/installed_server_type
+
+if [ -s ${INSTALLED_SERVER_TYPE} ];then
+    _blade_type_server_=`$CAT ${INSTALLED_SERVER_TYPE}`
+else
+    _err_msg_="File $INSTALLED_SERVER_TYPE not found"
+    abort_script "$_err_msg_"
+fi
+
+# Log Directory Declaration
+_server_name_=`$HOSTNAME`
+LOG_DIRECTORY=${TEMP_LOG_LOCATION}/$_server_name_
+
+#Installation lib directory
+ENIQ_LIB_DIR=${ENIQ_INST_DIR}/core_install/lib
+
+#Common function directory
+COMMON_FUNCS_LIB=${ENIQ_LIB_DIR}/common_functions.lib
+
+#storage_check directory
+STORAGE_TYPE=`$CAT /eniq/installation/config/san_details | $HEAD -1 | $AWK -F "=" '{print $2}'`
+
+#Individual windows file size limit in MB
+FILE_SIZE_LIMIT=200MB
+max_file_size_mb=`$ECHO $FILE_SIZE_LIMIT | $CUT -d"M" -f1`
+max_file_size_actual=`$ECHO "$max_file_size_mb*1024*1000" | $BC`
+
+#creating log directory and log file for deployment log collection
+LOG_DIR=${ENIQ_LOCAL_LOGS_DIR}/log_collector
+if [ ! -d $LOG_DIR ]; then
+   $MKDIR $LOG_DIR
+fi
+
+# Source the common functions
+if [ -s ${COMMON_FUNCS_LIB} ]; then
+    . ${COMMON_FUNCS_LIB}
+else
+    _err_msg_="File ${COMMON_FUNCS_LIB} not found"
+    abort_script "${_err_msg_}"
+fi
+
+#Check get_ip_prder.pl 
+if [ ! -s ${ENIQ_LIB_DIR}/get_ip_order.pl ];then
+    _err_msg_=" ${ENIQ_LIB_DIR}/get_ip_order.pl script not found"
+    abort_script "${_err_msg_}"
+fi
+
+#Check IP Type
+check_ip_type
+
+#Check Ping type
+ping_command=$( check_ping )
+}
+
+### Function: usage_msg ###
+#
+# Usage message for script
+# 
+# Arguments:
+#   none 
+# Return Values:
+#   none 
+#
+usage_msg(){
+$ECHO "Usage:"
+$ECHO "bash log_collector.bsh [ -t log_transfer ] [ -l <path_to_logfile> ] [ -s /home/sftpuser ]"
+$ECHO "-l : Optional parameter to generate the logfile"
+$ECHO "-t : Parameter to transfer logs to remote server"
+$ECHO "-s : Parameter to transfer logs to sftp directory"
+$ECHO "Script should be run from the co-ordinator"
+}
+
+### Function: validate_date ###
+#
+#   Check if the date entered by user is a valid date
+#   If not show error and prompt user to enter date again
+#
+# Arguments:
+#      $DATE_VAL
+# Return Values:
+#       none
+#
+validate_date(){
+count=1
+while [ 1 ];
+do
+    if [ $count -gt 3 ]; then 
+	    _err_msg_="Please enter date in DDMMYYYY format"
+        abort_script "$_err_msg_"
+	    #break
+	fi
+    DATE_VAL="`date +%d%m%Y`"
+    $PRINTF "\n"
+    read -p "Please enter date for which you wish to collect logs in ddmmyyyy format:" DATE_VAL
+
+# To check if date is integer
+
+    if [ "$DATE_VAL" -eq "$DATE_VAL" ]> /dev/null 2>&1;then
+        if [ ${#DATE_VAL} -eq 8 ];then
+            year=${DATE_VAL:4:4}
+            month=${DATE_VAL:2:2}
+            day=${DATE_VAL:0:2}
+            month30="04 06 09 11"
+            leapyear=$((year%4))
+            _current_year_=`date +%Y`
+            _previous_year_=$(($_current_year_-1))
+            if [ "$year" -eq "$_previous_year_" ] || [ "$year" -eq "$_current_year_" ];then
+                if [ "$month" -le 12 -a "$day" -le 31 -a "$day" -ge 1  -a "$month" -ge 1 ]; then
+                    if [ "$month" -eq 02 -a "$day" -gt 29 ] || [ "$leapyear" -ne 0 -a "$month" -eq 02 -a "$day" -gt 28 ]; then
+                        $ECHO "Date is out of range...try again"
+						let count=$count+1
+                        continue
+                    elif [[ "$month30" =~ "$month" ]] && [ "$day" -eq 31 ]; then
+                        $ECHO "Month $month cannot have 31 days...try again"
+						let count=$count+1
+                        continue
+                    else
+                        break
+                    fi
+                else
+                    $ECHO "Date is out of range...try again"
+					let count=$count+1
+                    continue
+                fi
+            else
+                $ECHO "Year entered should be $_current_year_ or $_previous_year_"
+				let count=$count+1
+                continue
+            fi
+        else
+            $ECHO "Date entered is not in the expected format...try again"
+			let count=$count+1
+            continue
+        fi
+    else
+        $ECHO "Date is not in integers...try again"
+		let count=$count+1
+        continue
+    fi
+done
+}
+### Function: zip_file_manager ###
+#
+#   Cleans up the zip file in zipped folder location
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+#
+zip_file_manager(){
+local n=0
+$LS -1t ${FINAL_LOG_LOCATION}*|
+while read file; do
+    n=$((n+1))
+    if [[ $n -gt $MAX_ZIP_NUMBER ]]; then
+        $RM -f "$file"
+    fi
+done
+}
+
+
+
+### Function: getWindowsDataMountedValue ###
+#
+# Mount directories from windows deployment server to ENIQ server
+# Returns value 1, if successfully mounted 
+# 
+# Arguments:
+#   none 
+# Return Values:
+#    1
+#
+getWindowsDataMountedValue() {
+    IP_ADDRESS=$1
+    MOUNT_PATH=$2
+    WINDOWS_SERVER_TYPE=$3
+
+    $GREP -w "${MOUNT_PATH}" /proc/mounts > /dev/null
+    $GREP -w "${MOUNT_PATH}" /etc/fstab > /dev/null
+    if [ $? -eq 0 ]; then
+        $SED "/${WINDOWS_SERVER_TYPE}/d" /etc/fstab  > /tmp/tmpfile && mv /tmp/tmpfile /etc/fstab
+    fi
+    WINDOWS_DATA_MOUNTED=0
+    if [ -d ${MOUNT_PATH} ]; then
+        if [ "${WINDOWS_SERVER_TYPE}" = "BIS" ] ; then
+		    if [ "${_ip_type_}" == "IPv4" ]; then
+		        $ECHO "Executing command : mount -t nfs -o ro,soft,nosuid,nodev,nordirplus ${IP_ADDRESS}:/Logs_Collector ${MOUNT_PATH}" >>${log_file_name}
+                $MOUNT -t nfs -o ro,soft,nosuid,nodev,nordirplus ${IP_ADDRESS}:/Logs_Collector ${MOUNT_PATH} >> /dev/null 2>&1
+			elif [ "${_ip_type_}" == "IPv6" ]; then	
+			    $ECHO "Executing command : mount -t nfs -o ro,soft,nosuid,nodev,nordirplus [${IP_ADDRESS}]:/Logs_Collector ${MOUNT_PATH}" >>${log_file_name}
+                $MOUNT -t nfs -o ro,soft,nosuid,nodev,nordirplus [${IP_ADDRESS}]:/Logs_Collector ${MOUNT_PATH} >> /dev/null 2>&1
+			else
+				_err_msg_="Unable to fetch IP type value"
+				abort_script "$_err_msg_"
+			fi	
+            if [ $? -eq 0 ] ; then
+                WINDOWS_DATA_MOUNTED=1
+			else
+			    if [ "${_ip_type_}" == "IPv4" ]; then
+			        $ECHO "Couldn't mount ${IP_ADDRESS}:/C:/NetAn_logs/Logs_Collector to ${MOUNT_PATH}" >>${log_file_name}
+				else
+				    $ECHO "Couldn't mount [${IP_ADDRESS}]:/C:/NetAn_logs/Logs_Collector to ${MOUNT_PATH}" >>${log_file_name}
+				fi
+            fi
+        elif [ "${WINDOWS_SERVER_TYPE}" = "netanserver" ]; then
+		    if [ "${_ip_type_}" == "IPv4" ]; then
+		        $ECHO "Executing command : mount -t nfs -o ro,soft,nosuid,nodev,nordirplus ${IP_ADDRESS}:/C:/NetAn_logs/Logs_Collector ${MOUNT_PATH}" >>${log_file_name}
+			    $MOUNT -t nfs -o ro,soft,nosuid,nodev,nordirplus ${IP_ADDRESS}:/C:/NetAn_logs/Logs_Collector ${MOUNT_PATH} >> /dev/null 2>&1
+			elif [ "${_ip_type_}" == "IPv6" ]; then			
+			    $ECHO "Executing command : mount -t nfs -o ro,soft,nosuid,nodev,nordirplus [${IP_ADDRESS}]:/C:/NetAn_logs/Logs_Collector ${MOUNT_PATH}" >>${log_file_name}
+                $MOUNT -t nfs -o ro,soft,nosuid,nodev,nordirplus [${IP_ADDRESS}]:/C:/NetAn_logs/Logs_Collector ${MOUNT_PATH} >> /dev/null 2>&1
+			else
+				_err_msg_="Unable to fetch IP type value"
+				abort_script "$_err_msg_"
+			fi					
+            if [ $? -eq 0 ] ; then
+                WINDOWS_DATA_MOUNTED=1
+			else
+			    if [ "${_ip_type_}" == "IPv4" ]; then
+			        $ECHO "Couldn't mount ${IP_ADDRESS}:/C:/NetAn_logs/Logs_Collector to ${MOUNT_PATH}" >>${log_file_name}
+				else
+				    $ECHO "Couldn't mount [${IP_ADDRESS}]:/C:/NetAn_logs/Logs_Collector to ${MOUNT_PATH}" >>${log_file_name}
+				fi	
+            fi
+        elif [ "${WINDOWS_SERVER_TYPE}" = "codeployed" ]; then
+		    if [ "${_ip_type_}" == "IPv4" ]; then
+		        $ECHO "Executing command: " mount -t nfs -o ro,soft,nosuid,nodev,nordirplus ${IP_ADDRESS}:/Logs_Collector  ${MOUNT_PATH} >>${log_file_name}
+                $MOUNT -t nfs -o ro,soft,nosuid,nodev,nordirplus ${IP_ADDRESS}:/Logs_Collector  ${MOUNT_PATH} >> /dev/null 2>&1
+			elif [ "${_ip_type_}" == "IPv6" ]; then
+			    $ECHO "Executing command: " mount -t nfs -o ro,soft,nosuid,nodev,nordirplus [${IP_ADDRESS}]:/Logs_Collector  ${MOUNT_PATH} >>${log_file_name}
+                $MOUNT -t nfs -o ro,soft,nosuid,nodev,nordirplus [${IP_ADDRESS}]:/Logs_Collector  ${MOUNT_PATH} >> /dev/null 2>&1
+			else
+				_err_msg_="Unable to fetch IP type value"
+				abort_script "$_err_msg_"
+			fi		
+            if [ $? -eq 0 ] ; then
+                WINDOWS_DATA_MOUNTED=1
+			else
+			    if [ "${_ip_type_}" == "IPv4" ]; then
+				    $ECHO "Couldn't mount ${IP_ADDRESS}:/Logs_Collector to ${MOUNT_PATH}" >>${log_file_name}
+				else
+                    $ECHO "Couldn't mount [${IP_ADDRESS}]:/Logs_Collector to ${MOUNT_PATH}" >>${log_file_name}   
+				fi	
+            fi
+		elif [ "${WINDOWS_SERVER_TYPE}" = "OCS-Without-Citrix" ]; then
+		    if [ "${_ip_type_}" == "IPv4" ]; then			    
+		        $ECHO "Executing command: " mount -t nfs -o ro,soft,nosuid,nodev,nordirplus ${IP_ADDRESS}:/C:/ebid/Logs_Collector  ${MOUNT_PATH} >>${log_file_name}
+                $MOUNT -t nfs -o ro,soft,nosuid,nodev,nordirplus ${IP_ADDRESS}:/C:/ebid/Logs_Collector  ${MOUNT_PATH} >> /dev/null 2>&1
+			elif [ "${_ip_type_}" == "IPv6" ]; then
+			    $ECHO "Executing command: " mount -t nfs -o ro,soft,nosuid,nodev,nordirplus [${IP_ADDRESS}]:/C:/ebid/Logs_Collector  ${MOUNT_PATH} >>${log_file_name}
+                $MOUNT -t nfs -o ro,soft,nosuid,nodev,nordirplus [${IP_ADDRESS}]:/C:/ebid/Logs_Collector  ${MOUNT_PATH} >> /dev/null 2>&1
+			else
+			    _err_msg_="Unable to fetch IP type value"
+				abort_script "$_err_msg_"
+			fi	
+            if [ $? -eq 0 ] ; then
+                WINDOWS_DATA_MOUNTED=1
+			else
+			    if [ "${_ip_type_}" == "IPv4" ]; then
+				    $ECHO "Couldn't mount ${IP_ADDRESS}:/C:/ebid/Logs_Collector to ${MOUNT_PATH}" >>${log_file_name}
+				else 
+				    $ECHO "Couldn't mount [${IP_ADDRESS}]:/C:/ebid/Logs_Collector to ${MOUNT_PATH}" >>${log_file_name}
+				fi			   
+            fi
+        fi
+    else
+        mkdir -p ${MOUNT_PATH}
+        if [ "${WINDOWS_SERVER_TYPE}" = "BIS" ] ; then
+		    if [ "${_ip_type_}" == "IPv4" ]; then
+		        $ECHO "Executing command : mount -t nfs -o ro,soft,nosuid,nodev,nordirplus ${IP_ADDRESS}:/Logs_Collector ${MOUNT_PATH}" >>${log_file_name}
+                $MOUNT -t nfs -o ro,soft,nosuid,nodev,nordirplus ${IP_ADDRESS}:/Logs_Collector ${MOUNT_PATH} >> /dev/null 2>&1
+			elif [ "${_ip_type_}" == "IPv6" ]; then
+			    $ECHO "Executing command : mount -t nfs -o ro,soft,nosuid,nodev,nordirplus [${IP_ADDRESS}]:/Logs_Collector ${MOUNT_PATH}" >>${log_file_name}
+                $MOUNT -t nfs -o ro,soft,nosuid,nodev,nordirplus [${IP_ADDRESS}]:/Logs_Collector ${MOUNT_PATH} >> /dev/null 2>&1
+			else
+			    _err_msg_="Unable to fetch IP type value"
+				abort_script "$_err_msg_"
+			fi		
+            if [ $? -eq 0 ] ; then
+                WINDOWS_DATA_MOUNTED=1
+			else
+			    if [ "${_ip_type_}" == "IPv4" ]; then
+			        $ECHO "Couldn't mount ${IP_ADDRESS}:/Logs_Collector to ${MOUNT_PATH}" >>${log_file_name}
+				else	
+				    $ECHO "Couldn't mount [${IP_ADDRESS}]:/Logs_Collector to ${MOUNT_PATH}" >>${log_file_name}
+				fi	
+            fi
+        elif [ "${WINDOWS_SERVER_TYPE}" = "netanserver" ]; then
+		    if [ "${_ip_type_}" == "IPv4" ]; then			
+		        $ECHO "Executing command : mount -t nfs -o ro,soft,nosuid,nodev,nordirplus ${IP_ADDRESS}:/C:/NetAn_logs/Logs_Collector ${MOUNT_PATH}" >>${log_file_name}
+                $MOUNT -t nfs -o ro,soft,nosuid,nodev,nordirplus ${IP_ADDRESS}:/C:/NetAn_logs/Logs_Collector ${MOUNT_PATH} >> /dev/null 2>&1
+			elif [ "${_ip_type_}" == "IPv6" ]; then
+			    $ECHO "Executing command : mount -t nfs -o ro,soft,nosuid,nodev,nordirplus [${IP_ADDRESS}]:/C:/NetAn_logs/Logs_Collector ${MOUNT_PATH}" >>${log_file_name}
+                $MOUNT -t nfs -o ro,soft,nosuid,nodev,nordirplus [${IP_ADDRESS}]:/C:/NetAn_logs/Logs_Collector ${MOUNT_PATH} >> /dev/null 2>&1
+			else
+			    _err_msg_="Unable to fetch IP type value"
+				abort_script "$_err_msg_"
+			fi	
+            if [ $? -eq 0 ] ; then
+                WINDOWS_DATA_MOUNTED=1
+			else
+			    if [ "${_ip_type_}" == "IPv4" ]; then
+			        $ECHO "Couldn't mount ${IP_ADDRESS}:/C:/NetAn_logs/Logs_Collector to ${MOUNT_PATH}" >>${log_file_name}
+				else
+				    $ECHO "Couldn't mount [${IP_ADDRESS}]:/C:/NetAn_logs/Logs_Collector to ${MOUNT_PATH}" >>${log_file_name}
+				fi	
+            fi
+        elif [ "${WINDOWS_SERVER_TYPE}" = "codeployed" ]; then
+		    if [ "${_ip_type_}" == "IPv4" ]; then
+		        $ECHO "Executing command : mount -t nfs -o ro,soft,nosuid,nodev,nordirplus ${IP_ADDRESS}:/Logs_Collector  ${MOUNT_PATH}" >>${log_file_name}
+                $MOUNT -t nfs -o ro,soft,nosuid,nodev,nordirplus ${IP_ADDRESS}:/Logs_Collector  ${MOUNT_PATH} >> /dev/null 2>&1
+			elif [ "${_ip_type_}" == "IPv6" ]; then
+			    $ECHO "Executing command : mount -t nfs -o ro,soft,nosuid,nodev,nordirplus [${IP_ADDRESS}]:/Logs_Collector  ${MOUNT_PATH}" >>${log_file_name}
+                $MOUNT -t nfs -o ro,soft,nosuid,nodev,nordirplus [${IP_ADDRESS}]:/Logs_Collector  ${MOUNT_PATH} >> /dev/null 2>&1
+			else
+			    _err_msg_="Unable to fetch IP type value"
+				abort_script "$_err_msg_"
+			fi	
+            if [ $? -eq 0 ] ; then
+                WINDOWS_DATA_MOUNTED=1
+			else
+			    if [ "${_ip_type_}" == "IPv4" ]; then
+			        $ECHO "Couldn't mount ${IP_ADDRESS}:/Logs_Collector to ${MOUNT_PATH}" >>${log_file_name}
+				else
+				    $ECHO "Couldn't mount [${IP_ADDRESS}]:/Logs_Collector to ${MOUNT_PATH}" >>${log_file_name}	
+				fi	
+            fi
+		elif [ "${WINDOWS_SERVER_TYPE}" = "OCS-Without-Citrix" ]; then
+		    if [ "${_ip_type_}" == "IPv4" ]; then
+		        $ECHO "Executing command: " mount -t nfs -o ro,soft,nosuid,nodev,nordirplus ${IP_ADDRESS}:/C:/ebid/Logs_Collector  ${MOUNT_PATH} >>${log_file_name}
+                $MOUNT -t nfs -o ro,soft,nosuid,nodev,nordirplus ${IP_ADDRESS}:/C:/ebid/Logs_Collector  ${MOUNT_PATH} >> /dev/null 2>&1
+			elif [ "${_ip_type_}" == "IPv6" ]; then
+			    $ECHO "Executing command: " mount -t nfs -o ro,soft,nosuid,nodev,nordirplus [${IP_ADDRESS}]:/C:/ebid/Logs_Collector  ${MOUNT_PATH} >>${log_file_name}
+                $MOUNT -t nfs -o ro,soft,nosuid,nodev,nordirplus [${IP_ADDRESS}]:/C:/ebid/Logs_Collector  ${MOUNT_PATH} >> /dev/null 2>&1
+			else
+			    _err_msg_="Unable to fetch IP type value"
+				abort_script "$_err_msg_"
+			fi		
+            if [ $? -eq 0 ] ; then
+                WINDOWS_DATA_MOUNTED=1
+			else
+			    if [ "${_ip_type_}" == "IPv4" ]; then
+			        $ECHO "Couldn't mount ${IP_ADDRESS}:/C:/ebid/Logs_Collector to ${MOUNT_PATH}" >>${log_file_name}
+				else
+				    $ECHO "Couldn't mount [${IP_ADDRESS}]:/C:/ebid/Logs_Collector to ${MOUNT_PATH}" >>${log_file_name}	
+				fi	
+            fi
+        fi
+    fi
+
+    $ECHO ${WINDOWS_DATA_MOUNTED}
+}
+
+
+
+
+### Function: collectBISLogs ###
+#
+# Copies BIS deployment log files from mounted location to final eniq log collector log location
+#  
+# 
+# Arguments:
+#   none 
+# Return Values:
+#    none
+#
+collectBISLogs() {
+    BIS_MOUNT_PATH=/eniq/BIS
+    WINDOWS_SERVER_TYPE=BIS
+    log_msg -s "\n==================================================================================================" -l ${log_file_name}
+    log_msg -s "\n $TIMESTAMP : Collecting logs for ${WINDOWS_SERVER_TYPE} deployment" -l ${log_file_name}
+    BIS_FILE=`ls -lrt /eniq/installation/config/windows_server_conf_files | grep "BIS" | tr -s ' ' | cut -d ' ' -f9`
+    if [ -z $BIS_FILE ]; then
+        log_msg -s "\n $TIMESTAMP : Couldn't collect logs. $WINDOWS_SERVER_TYPE is not configured on this server." -l ${log_file_name}
+    fi
+    BIS_IP_ADDRESS=`echo $BIS_FILE | awk -F "-" '{print $2}'`
+    if [ -n "${BIS_IP_ADDRESS}" ]; then
+        BIS_DATA_MOUNTED=`getWindowsDataMountedValue $BIS_IP_ADDRESS $BIS_MOUNT_PATH $WINDOWS_SERVER_TYPE`
+        if [ ${BIS_DATA_MOUNTED} -eq 1 ] ; then
+            BIS_LOG_FILE=$(find /eniq/BIS/ -name "*$REQUIRED_DATE*" )
+            if [ -n "${BIS_LOG_FILE}" ]; then
+                for LOG in ${BIS_LOG_FILE} ; do
+				    size=`$WC -c $LOG`
+                    file_size=`$ECHO $size | $CUT -d" " -f1`
+                    file_size_mb=$((file_size / 1024000 ))
+				    if [ $file_size -ge $max_file_size_actual ]; then
+					     log_msg -s "\n $TIMESTAMP : WARNING :Cannot copy the file as the size of file $LOG is $file_size_mb. Maximum zip file size should be $FILE_SIZE_LIMIT" -l ${log_file_name}
+					else
+					     cp $LOG ${FINAL_LOG_LOCATION}
+					     log_msg -s "\n Copying $LOG to ${FINAL_LOG_LOCATION}." -l ${log_file_name}
+					fi
+                done
+                $CHMOD 644 ${FINAL_LOG_LOCATION}/*
+                log_msg -s "\n $TIMESTAMP : Successfully collected logs from $WINDOWS_SERVER_TYPE server." -l ${log_file_name}
+                log_msg -s "\n==================================================================================================\n" -l ${log_file_name}
+			else
+			    log_msg -s "\n $TIMESTAMP : Logs for the date $REQUIRED_DATE are not present for BIS server" -l ${log_file_name}
+                        log_msg -s "\n==================================================================================================" -l ${log_file_name}
+            fi
+			$UMOUNT -l ${BIS_MOUNT_PATH} > /dev/null
+			if [ $? -ne 0 ]; then
+			    log_msg -s "\n $TIMESTAMP : Unable to mount path ${BIS_MOUNT_PATH}" -l ${log_file_name}
+			fi 
+        fi
+    fi
+}
+
+
+### Function: collectNetanServerLogs ###
+#
+# Copies NETAN deployment log files from mounted location to final eniq log collector log location
+#  
+# 
+# Arguments:
+#   none 
+# Return Values:
+#    none
+#
+collectNetanServerLogs() {
+    NETAN_MOUNT_PATH=/eniq/netanserver
+    WINDOWS_SERVER_TYPE=netanserver
+    log_msg -s "\n==================================================================================================" 
+    log_msg -s "\n $TIMESTAMP : Collecting logs for ${WINDOWS_SERVER_TYPE} deployment"
+    NETAN_FILE=`ls -lrt /eniq/installation/config/windows_server_conf_files | grep "NETAN" | tr -s ' ' | cut -d ' ' -f9`
+    if [ -z $NETAN_FILE ]; then
+                log_msg -s "\n $TIMESTAMP : Couldn't collect logs. $WINDOWS_SERVER_TYPE is not configured on this server." -l ${log_file_name}
+    fi
+    NETAN_IP_ADDRESS=`echo $NETAN_FILE | awk -F "-" '{print $2}'`
+    if [ -n "${NETAN_IP_ADDRESS}" ]; then
+        NETAN_DATA_MOUNTED=`getWindowsDataMountedValue $NETAN_IP_ADDRESS $NETAN_MOUNT_PATH $WINDOWS_SERVER_TYPE`
+        if [ ${NETAN_DATA_MOUNTED} -eq 1 ] ; then
+            NETANSERVER_LOG_FILE=$(find /eniq/netanserver -name "*$REQUIRED_DATE*" )
+            if [ -n "${NETANSERVER_LOG_FILE}" ]; then
+                for LOG in ${NETANSERVER_LOG_FILE} ; do
+				    size=`$WC -c $LOG`
+                    file_size=`$ECHO $size | $CUT -d" " -f1`
+                    file_size_mb=$((file_size / 1024000 ))
+				    if [ $file_size -ge $max_file_size_actual ]; then
+					     log_msg -s "\n $TIMESTAMP : WARNING :Cannot copy the file as the size of file $LOG is $file_size_mb. Maximum zip file size should be $FILE_SIZE_LIMIT" -l ${log_file_name}
+					else
+					     cp $LOG ${FINAL_LOG_LOCATION}
+					     log_msg -s "\n Copying $LOG to ${FINAL_LOG_LOCATION}." -l ${log_file_name}
+					fi
+                done
+                $CHMOD 644 ${FINAL_LOG_LOCATION}/*
+                log_msg -s "\n $TIMESTAMP : Successfully collected logs from $WINDOWS_SERVER_TYPE server." -l ${log_file_name}
+                log_msg -s "\n==================================================================================================\n" -l ${log_file_name}
+			else
+			    log_msg -s "\n $TIMESTAMP : Logs for the date $REQUIRED_DATE are not present for netanserver" -l ${log_file_name}
+                            log_msg -s "\n==================================================================================================" -l ${log_file_name}
+            fi
+            $UMOUNT -l ${NETAN_MOUNT_PATH} > /dev/null
+			if [ $? -ne 0 ]; then
+			    log_msg -s "\n $TIMESTAMP : Unable to mount path ${NETAN_MOUNT_PATH}" -l ${log_file_name}
+			fi
+        fi
+   fi
+}
+
+
+
+### Function: collect_OCS_ADDS_Logs ###
+#
+# Copies OCS-ADDS deployment log files from mounted location to final eniq log collector log location
+#  
+# 
+# Arguments:
+#   none 
+# Return Values:
+#    none
+#
+collect_OCS_ADDS_Logs() {
+    #REQUIRED_DATE=`echo ${year}"-"${month}"-"${day}`
+    OCS_ADDS_MOUNT_PATH=/eniq/OCS-ADDS
+    WINDOWS_SERVER_TYPE=OCS-ADDS
+    log_msg -s "\n==================================================================================================" -l ${log_file_name}
+    log_msg -s "\n $TIMESTAMP : Collecting logs for ${WINDOWS_SERVER_TYPE} deployment" -l ${log_file_name}
+    OCS_ADDS_FILE=`ls -lrt /eniq/installation/config/windows_server_conf_files | grep "OCS-ADDS" | tr -s ' ' | cut -d ' ' -f9`
+    if [ -z $OCS_ADDS_FILE ]; then
+            log_msg -s "\n $TIMESTAMP : Couldn't collect logs. $WINDOWS_SERVER_TYPE is not configured on this server." -l ${log_file_name}
+    fi
+    OCS_ADDS_IP_ADDRESS=`echo $OCS_ADDS_FILE | awk -F "-" '{print $3}'`
+    if [ -n "${OCS_ADDS_IP_ADDRESS}" ]; then
+        OCS_ADDS_IP_ADDRESS_DATA_MOUNTED=`getWindowsDataMountedValue $OCS_ADDS_IP_ADDRESS $OCS_ADDS_MOUNT_PATH $WINDOWS_SERVER_TYPE`
+        if [[ ${OCS_ADDS_IP_ADDRESS_DATA_MOUNTED} -eq 1 ]] ; then
+            OCS_ADDS_LOG_FILE=$(find /eniq/OCS-ADDS -name "*$REQUIRED_DATE*" )
+            if [ -n "${OCS_ADDS_LOG_FILE}" ]; then
+                for LOG in ${OCS_ADDS_LOG_FILE} ; do
+                    size=`$WC -c $LOG`
+                    file_size=`$ECHO $size | $CUT -d" " -f1`
+                    file_size_mb=$((file_size / 1024000 ))
+				    if [ $file_size -ge $max_file_size_actual ]; then
+					     log_msg -s "\n $TIMESTAMP : WARNING :Cannot copy the file as the size of file $LOG is $file_size_mb. Maximum zip file size should be $FILE_SIZE_LIMIT" -l ${log_file_name}
+					else
+					     cp $LOG ${FINAL_LOG_LOCATION}
+					     log_msg -s "\n Copying $LOG to ${FINAL_LOG_LOCATION}." -l ${log_file_name}
+					fi
+                done
+                $CHMOD 644 ${FINAL_LOG_LOCATION}/*
+                log_msg -s "\n $TIMESTAMP : Successfully collected logs from $WINDOWS_SERVER_TYPE server." -l ${log_file_name}
+                log_msg -s "\n==================================================================================================\n" -l ${log_file_name}
+            else
+			    log_msg -s "\n $TIMESTAMP : Logs for the date $REQUIRED_DATE are not present for OCS-ADDS server" -l ${log_file_name}
+                            log_msg -s "\n==================================================================================================" -l ${log_file_name}
+			fi
+            $UMOUNT -l ${OCS_ADDS_MOUNT_PATH} > /dev/null
+			if [ $? -ne 0 ]; then
+			    log_msg -s "\n $TIMESTAMP : Unable to mount path ${OCS_ADDS_MOUNT_PATH}" -l ${log_file_name}
+			fi
+        fi
+    fi
+
+}
+
+
+
+### Function: collect_OCS_CCS_Logs ###
+#
+# Copies OCS-CCS deployment log files from mounted location to final eniq log collector log location
+#  
+# 
+# Arguments:
+#   none 
+# Return Values:
+#    none
+#
+collect_OCS_CCS_Logs() {
+    #REQUIRED_DATE=`echo ${year}"-"${month}"-"${day}`
+    OCS_CCS_MOUNT_PATH=/eniq/OCS-CCS
+    WINDOWS_SERVER_TYPE=OCS-CCS
+    log_msg -s "\n==================================================================================================" -l ${log_file_name} 
+    log_msg -s "\n $TIMESTAMP : Collecting logs for ${WINDOWS_SERVER_TYPE} deployment" -l ${log_file_name}
+    OCS_CCS_FILE=`ls -lrt /eniq/installation/config/windows_server_conf_files | grep "OCS-CCS" | tr -s ' ' | cut -d ' ' -f9`
+    if [ -z $OCS_CCS_FILE ]; then
+            log_msg -s "\n $TIMESTAMP : Couldn't collect logs. $WINDOWS_SERVER_TYPE is not configured on this server." -l ${log_file_name}
+    fi
+    OCS_CCS_IP_ADDRESS=`echo $OCS_CCS_FILE | awk -F "-" '{print $3}'`
+    if [ -n "${OCS_CCS_IP_ADDRESS}" ]; then
+        OCS_CCS_IP_ADDRESS_DATA_MOUNTED=`getWindowsDataMountedValue $OCS_CCS_IP_ADDRESS $OCS_CCS_MOUNT_PATH $WINDOWS_SERVER_TYPE`
+        if [[ ${OCS_CCS_IP_ADDRESS_DATA_MOUNTED} -eq 1 ]] ; then
+            OCS_CCS_LOG_FILE=$(find /eniq/OCS-CCS -name "*$REQUIRED_DATE*" )
+            if [ -n "${OCS_CCS_LOG_FILE}" ]; then
+                for LOG in ${OCS_CCS_LOG_FILE} ; do
+                    size=`$WC -c $LOG`
+                    file_size=`$ECHO $size | $CUT -d" " -f1`
+                    file_size_mb=$((file_size / 1024000 ))
+				    if [ $file_size -ge $max_file_size_actual ]; then
+					     log_msg -s "\n $TIMESTAMP : WARNING :Cannot copy the file as the size of file $LOG is $file_size_mb. Maximum zip file size should be $FILE_SIZE_LIMIT" -l ${log_file_name}
+					else
+					     cp $LOG ${FINAL_LOG_LOCATION}
+					     log_msg -s "\n Copying $LOG to ${FINAL_LOG_LOCATION}." -l ${log_file_name}
+					fi
+                done
+                $CHMOD 644 ${FINAL_LOG_LOCATION}/*
+                log_msg -s "\n $TIMESTAMP : Successfully collected logs from $WINDOWS_SERVER_TYPE server." -l ${log_file_name} 
+                log_msg -s "\n==================================================================================================\n" -l ${log_file_name}
+			else
+			    log_msg -s "\n $TIMESTAMP : Logs for the date $REQUIRED_DATE are not present for OCS-CCS server" -l ${log_file_name}
+                            log_msg -s "\n==================================================================================================" -l ${log_file_name}
+            fi
+            $UMOUNT -l ${OCS_CCS_MOUNT_PATH} > /dev/null
+			if [ $? -ne 0 ]; then
+			    log_msg -s "\n $TIMESTAMP : Unable to mount path ${OCS_CCS_MOUNT_PATH}" -l ${log_file_name}
+			fi
+        fi
+    fi
+}
+
+
+
+### Function: collect_OCS_VDA_Logs ###
+#
+# Copies OCS-VDA deployment log files from mounted location to final eniq log collector log location
+#  
+# 
+# Arguments:
+#   none 
+# Return Values:
+#    none
+#
+collect_OCS_VDA_Logs() {
+    #REQUIRED_DATE=`echo ${year}"-"${month}"-"${day}`
+    OCS_VDA_MOUNT_PATH=/eniq/OCS-VDA
+    WINDOWS_SERVER_TYPE=OCS-VDA
+    log_msg -s "\n==================================================================================================" -l${log_file_name}
+    log_msg -s "\n $TIMESTAMP : Collecting logs for ${WINDOWS_SERVER_TYPE} deployment" -l ${log_file_name}
+    OCS_VDA_FILE=`ls -lrt /eniq/installation/config/windows_server_conf_files | grep "OCS-VDA" | tr -s ' ' | cut -d ' ' -f9`
+    if [ -z $OCS_VDA_FILE ]; then
+            log_msg -s "\n $TIMESTAMP : Couldn't collect logs. $WINDOWS_SERVER_TYPE is not configured on this server." -l ${log_file_name}
+    fi
+    OCS_VDA_IP_ADDRESS=`echo $OCS_VDA_FILE | awk -F "-" '{print $3}'`
+    if [ -n "${OCS_VDA_IP_ADDRESS}" ]; then
+        OCS_VDA_IP_ADDRESS_DATA_MOUNTED=`getWindowsDataMountedValue $OCS_VDA_IP_ADDRESS $OCS_VDA_MOUNT_PATH $WINDOWS_SERVER_TYPE`
+        if [[ ${OCS_VDA_IP_ADDRESS_DATA_MOUNTED} -eq 1 ]] ; then
+            OCS_VDA_LOG_FILE=$(find /eniq/OCS-VDA -name "*$REQUIRED_DATE*" )
+            if [ -n "${OCS_VDA_LOG_FILE}" ]; then
+                for LOG in ${OCS_VDA_LOG_FILE} ; do
+                    size=`$WC -c $LOG`
+                    file_size=`$ECHO $size | $CUT -d" " -f1`
+                    file_size_mb=$((file_size / 1024000 ))
+				    if [ $file_size -ge $max_file_size_actual ]; then
+					     log_msg -s "\n $TIMESTAMP : WARNING :Cannot copy the file as the size of file $LOG is $file_size_mb. Maximum zip file size should be $FILE_SIZE_LIMIT" -l ${log_file_name}
+					else
+					     cp $LOG ${FINAL_LOG_LOCATION}
+					     log_msg -s "\n Copying $LOG to ${FINAL_LOG_LOCATION}." -l ${log_file_name}
+					fi
+                done
+                $CHMOD 644 ${FINAL_LOG_LOCATION}/*
+                log_msg -s "\n $TIMESTAMP : Successfully collected logs from $WINDOWS_SERVER_TYPE server." -l ${log_file_name}
+                log_msg -s "\n==================================================================================================\n" -l ${log_file_name}
+			else
+			    log_msg -s "\n $TIMESTAMP : Logs for the date $REQUIRED_DATE are not present for OCS-VDA server" -l ${log_file_name}
+                            log_msg -s "\n==================================================================================================" -l ${log_file_name}
+            fi
+            $UMOUNT -l ${OCS_VDA_MOUNT_PATH} > /dev/null
+			if [ $? -ne 0 ]; then
+			    log_msg -s "\n $TIMESTAMP : Unable to mount path ${OCS_VDA_MOUNT_PATH}" -l ${log_file_name}
+			fi
+        fi
+    fi
+}
+
+
+### Function: collectOCSWithoutCitrixLogs ###
+#
+# Copies OCSWithoutCitrix deployment log files from mounted location to final eniq log collector log location
+#  
+# 
+# Arguments:
+#   none 
+# Return Values:
+#    none
+#
+collectOCSWithoutCitrixLogs() {
+    OCS_WITHOUT_CITRIX_MOUNT_PATH=/eniq/OCS-WITHOUT-CITRIX
+    WINDOWS_SERVER_TYPE=OCS-Without-Citrix
+	log_msg -s "\n==================================================================================================" -l${log_file_name}
+    log_msg -s "\n $TIMESTAMP : Collecting logs for ${WINDOWS_SERVER_TYPE} deployment" -l ${log_file_name}
+    OCS_WITHOUT_CITRIX_FILE=`ls -lrt /eniq/installation/config/windows_server_conf_files | grep "OCS-WITHOUT-CITRIX" | tr -s ' ' | cut -d ' ' -f9`
+	if [ -z $OCS_WITHOUT_CITRIX_FILE ]; then
+            log_msg -s "\n $TIMESTAMP : Couldn't collect logs. $WINDOWS_SERVER_TYPE is not configured on this server." -l ${log_file_name}
+    fi
+    OCS_WITHOUT_CITRIX_IP_ADDRESS=`echo $OCS_WITHOUT_CITRIX_FILE | awk -F "-" '{print $4}'`
+    if [ -n "${OCS_WITHOUT_CITRIX_IP_ADDRESS}" ]; then
+        OCS_WITHOUT_CITRIX_IP_ADDRESS_DATA_MOUNTED=`getWindowsDataMountedValue $OCS_WITHOUT_CITRIX_IP_ADDRESS $OCS_WITHOUT_CITRIX_MOUNT_PATH $WINDOWS_SERVER_TYPE`
+        if [[ ${OCS_WITHOUT_CITRIX_IP_ADDRESS_DATA_MOUNTED} -eq 1 ]] ; then
+            OCS_WITHOUT_CITRIX_LOG_FILE=$(find /eniq/OCS-WITHOUT-CITRIX -name "*$REQUIRED_DATE*" )
+            if [ -n "${OCS_WITHOUT_CITRIX_LOG_FILE}" ]; then
+                for LOG in ${OCS_WITHOUT_CITRIX_LOG_FILE} ; do
+                    size=`$WC -c $LOG`
+                    file_size=`$ECHO $size | $CUT -d" " -f1`
+                    file_size_mb=$((file_size / 1024000 ))
+				    if [ $file_size -ge $max_file_size_actual ]; then
+					     log_msg -s "\n $TIMESTAMP : WARNING :Cannot copy the file as the size of file $LOG is $file_size_mb. Maximum zip file size should be $FILE_SIZE_LIMIT" -l ${log_file_name}
+					else
+					     cp $LOG ${FINAL_LOG_LOCATION}
+					     log_msg -s "\n Copying $LOG to ${FINAL_LOG_LOCATION}." -l ${log_file_name}
+					fi
+                done
+                $CHMOD 644 ${FINAL_LOG_LOCATION}/*
+                log_msg -s "\n $TIMESTAMP : Successfully collected logs from $WINDOWS_SERVER_TYPE server." -l ${log_file_name}
+                log_msg -s "\n==================================================================================================\n" -l ${log_file_name}
+			else
+			    log_msg -s "\n $TIMESTAMP : Logs for the date $REQUIRED_DATE are not present for $WINDOWS_SERVER_TYPE server" -l ${log_file_name}
+                            log_msg -s "\n==================================================================================================" -l ${log_file_name}
+            fi
+            umount -l ${OCS_WITHOUT_CITRIX_MOUNT_PATH} > /dev/null
+			if [ $? -ne 0 ]; then
+			    log_msg -s "\n $TIMESTAMP : Unable to mount path ${OCS_WITHOUT_CITRIX_MOUNT_PATH}" -l ${log_file_name}
+			fi
+        fi
+    fi
+}
+
+
+
+### Function: collect_codeployed_ogs ###
+#
+# Copies codeployed deployment log files from mounted location to final eniq log collector log location
+#  
+# 
+# Arguments:
+#   none 
+# Return Values:
+#    none
+#
+collect_codeployed_logs(){
+    codeployed_MOUNT_PATH=/eniq/codeployed
+    WINDOWS_SERVER_TYPE=codeployed
+	log_msg -s "\n==================================================================================================" -l ${log_file_name}
+    log_msg -s "\n $TIMESTAMP : Collecting logs for ${WINDOWS_SERVER_TYPE} deployment" -l ${log_file_name}
+    NETAN_FILE=`ls -lrt /eniq/installation/config/windows_server_conf_files | grep "NETAN" | tr -s ' ' | cut -d ' ' -f9`
+    NETAN_IP_ADDRESS=`echo $NETAN_FILE | awk -F "-" '{print $2}'`
+    BIS_FILE=`ls -lrt /eniq/installation/config/windows_server_conf_files | grep "BIS" | tr -s ' ' | cut -d ' ' -f9`
+    BIS_IP_ADDRESS=`echo $BIS_FILE | awk -F "-" '{print $2}'`
+    if [ ${BIS_IP_ADDRESS} == ${NETAN_IP_ADDRESS} ]; then
+        codeployed_IP_ADDRESS_DATA_MOUNTED=`getWindowsDataMountedValue $BIS_IP_ADDRESS $codeployed_MOUNT_PATH $WINDOWS_SERVER_TYPE`
+        if [[ ${codeployed_IP_ADDRESS_DATA_MOUNTED} -eq 1 ]] ; then
+            codeployed_LOG_FILE=$(find /eniq/codeployed -name "EBID_NetAn_*" )
+            if [ -n "${codeployed_LOG_FILE}" ]; then
+                #if [ ! -d ${FINAL_LOG_LOCATION}/OCS_VDA ] ; then
+                    #mkdir ${FINAL_LOG_LOCATION}/OCS_VDA
+                #fi
+                #log "Collecting ocs_without_citrix system logs under plugin_data directory"
+                for LOG in ${codeployed_LOG_FILE} ; do
+                    size=`$WC -c $LOG`
+                    file_size=`$ECHO $size | $CUT -d" " -f1`
+                    file_size_mb=$((file_size / 1024000 ))
+				    if [ $file_size -ge $max_file_size_actual ]; then
+					     log_msg -s "\n $TIMESTAMP : WARNING :Cannot copy the file as the size of file $LOG is $file_size_mb. Maximum zip file size should be $FILE_SIZE_LIMIT" -l ${log_file_name}
+					else
+					     cp $LOG ${FINAL_LOG_LOCATION}
+					     log_msg -s "\n Copying $LOG to ${FINAL_LOG_LOCATION}." -l ${log_file_name}
+					fi
+                done
+                $CHMOD 644 ${FINAL_LOG_LOCATION}/*
+                log_msg -s "\n $TIMESTAMP : Successfully collected logs from $WINDOWS_SERVER_TYPE server." -l ${log_file_name}
+                log_msg -s "\n==================================================================================================\n" -l ${log_file_name}
+		    else
+			    log_msg -s "\n $TIMESTAMP : Log files for codeployed are not present" -l ${log_file_name}
+            fi
+            $UMOUNT -l ${codeployed_MOUNT_PATH} > /dev/null
+			if [ $? -ne 0 ]; then
+			    log_msg -s "\n $TIMESTAMP : Unable to mount path ${codeployed_MOUNT_PATH}" -l ${log_file_name}
+			fi
+        fi
+	 else 
+            log_msg -s "\n $TIMESTAMP : Couldn't collect logs. $WINDOWS_SERVER_TYPE is not configured on this server." -l ${log_file_name}
+            log_msg -s "\n==================================================================================================\n" -l ${log_file_name}
+     fi
+}
+
+### Function: collect_Security_audit_logs ###
+#
+# Collection and cleanup of security audit and secure logs present in /tmp directory
+#  
+# 
+# Arguments:
+#   none 
+# Return Values:
+#    none
+#
+collect_Security_audit_logs()
+{
+	dd=${DATE_VAL:0:2}
+	mm=${DATE_VAL:2:2}
+	yyyy=${DATE_VAL:4:4}
+	sec_log_col="/ericsson/security/audit/security_logcollector.py"
+	sec_log_date="${dd}${mm}${yyyy}"
+	${sec_log_col} ${sec_log_date}
+	sec_out_secure="/tmp/secure_${dd}${mm}${yyyy}.txt"
+	sec_out_audit="/tmp/audit_${dd}${mm}${yyyy}.txt"
+	if [ -f ${sec_out_secure} ]; then
+		$CP -pr ${sec_out_secure} ${LOG_DIRECTORY}
+		$RM -rf ${sec_out_secure}
+		log_msg -s "FOUND : ${sec_out_secure}" -l ${TEMP_LOG_LOCATION}/summary.log
+		COUNT_LOGS_FOUND=`expr ${COUNT_LOGS_FOUND} + 1`
+	else
+		log_msg -s "NOT_FOUND : ${sec_out_secure}" -l ${TEMP_LOG_LOCATION}/summary.log
+	fi
+	_log_count_=`expr ${_log_count_} + 1`
+	if [ -f ${sec_out_audit} ]; then
+		$CP -pr ${sec_out_audit} ${LOG_DIRECTORY}
+		$RM -rf ${sec_out_audit}
+		log_msg -s "FOUND : ${sec_out_audit}" -l ${TEMP_LOG_LOCATION}/summary.log
+		COUNT_LOGS_FOUND=`expr ${COUNT_LOGS_FOUND} + 1`
+	else
+		log_msg -s "NOT_FOUND : ${sec_out_audit}" -l ${TEMP_LOG_LOCATION}/summary.log
+	fi
+	_log_count_=`expr ${_log_count_} + 1`
+}
+
+
+
+collectENIQlogs()
+{
+    log_msg -s "\n==================================================================================================\n" -l ${log_file_name}
+    log_msg -s "\n $TIMESTAMP : Collecting logs for ENIQ deployment" -l ${log_file_name}
+    log_msg -s "\n==================================================================================================\n" -l ${log_file_name}
+            run_remote_exec
+            if [ $STORAGE_TYPE == "fs" ]; then
+                create_zip_log_fs
+            fi
+
+            if [ $STORAGE_TYPE == "raw" ]; then
+
+                create_zip_log_raw
+            fi
+
+            
+    log_msg -s "\n==================================================================================================\n" -l ${log_file_name}
+    log_msg -s "\n $TIMESTAMP : Successfully collected for ENIQ deployment" -l ${log_file_name}
+    log_msg -s "\n==================================================================================================\n" -l ${log_file_name}
+}
+
+
+
+
+###Function : get_deployment_type
+#
+#
+#
+#
+get_deployment()
+{
+    
+	year=${DATE_VAL:4:4}
+	month=${DATE_VAL:2:2}
+	day=${DATE_VAL:0:2}
+	REQUIRED_DATE="${year}-${month}-${day}"
+    if [ ! -s ${_server_type_list_file_} ]; then
+        $ECHO "Could not find ${_server_type_list_file_} file, or it is empty" | $TEE -a ${_logfile_}
+    fi
+	while read _line_; do
+        _serv_type_=`$ECHO ${_line_}`
+        # Store the details in array
+        _type_array_[${_cnt_}]=${_serv_type_}
+	    let _cnt_=_cnt_+1
+    done < ${DEPLOYMENT_TYPE_FILE}
+				
+	# Build a display file for the user to select which deployment type this is
+    $ECHO "\nAvailable Server Types for Log Collection\n====================================" >> ${TEMP_LOG_DIR}/server_list_file
+ 
+    for (( i=1; i<${_cnt_}; i++ )); do
+        $ECHO "[${i}]  ${_type_array_[${i}]}" >> ${TEMP_LOG_DIR}/server_list_file
+    done
+    $ECHO "\nSelect the server type for which you wish to collect the logs using the format [n,n,n OR n-n] E.G. 1,2,3 OR 1-3" >> ${TEMP_LOG_DIR}/server_list_file
+	# Make the user decide what machine this is.
+    # Ensure that they can only select a number in the range
+    # of available server types
+    while :; do
+        $CLEAR
+
+        $CAT ${TEMP_LOG_DIR}/server_list_file
+        read _num_
+		if [ ! "${_num_}" ]; then
+            continue
+        fi
+        $ECHO ${_num_} | $EGREP '-' >> /dev/null 2>&1
+        if [ $? -eq 0 ]; then
+            _start_=`$ECHO ${_num_} | $AWK -F\- '{print $1}'`
+			if [ ! "${_start_}" ]; then
+                continue
+            fi
+			_end_=`$ECHO ${_num_} | $AWK -F\- '{print $2}'`
+			for (( _sel_=${_start_}; _sel_<=${_end_}; _sel_++ )); do
+			    $ECHO "$_sel_ \n" >> ${TEMP_LOG_DIR}/server_type.txt
+			done
+        else
+            $ECHO $_num_ | $SED -n 1'p' | $TR ',' '\n' > ${TEMP_LOG_DIR}/server_type.txt 
+        fi		
+        _numerror_=0
+		for server_type in `$CAT ${TEMP_LOG_DIR}/server_type.txt`;do
+		      $ECHO $server_type | $EGREP '^[0-9]+$' > /dev/null 2>&1
+              if [ $? -ne 0 ]; then
+                   _numerror_=1
+				   break
+              fi
+              if [ ${server_type} -lt 1 -o ${server_type} -ge ${_cnt_} ];then
+                   _numerror_=1			  
+                   break
+              fi
+		done
+		if [ ${_numerror_} -eq 0 ]; then
+		     break
+		fi
+	done
+	
+		for server_type in `$CAT ${TEMP_LOG_DIR}/server_type.txt`;do
+		    case $server_type in
+		         1) collectENIQlogs    
+                    ;;
+                 2) collectBISLogs    
+                    ;;
+                 3) collectNetanServerLogs
+                    ;;
+                 #4) collect_OCS_ADDS_Logs
+                 #;;
+                 #5) collect_OCS_CCS_Logs
+                 #;;
+                 #6) collect_OCS_VDA_Logs     
+                 #;;
+                 4) collectOCSWithoutCitrixLogs
+                 ;;
+                 5)  collect_codeployed_logs
+                 ;;
+            esac
+        done
+
+}
+
+
+
+
+# ********************************************************************
+#
+#       Main body of program
+#
+# ********************************************************************
+
+
+# To check if user is root or admin
+check_id 
+
+# To set the name of zip file according to time stamp
+_zip_date_=`$DATE +%F_%T`
+
+# To trap CTRL + C
+_err_msg_="Script aborted by user" 
+trap 'abort_script "$_err_msg_"' SIGINT
+
+# To set up environment 
+setup_env
+
+# To check if required directories are created
+create_log_dir
+
+DATE_VAL=`date +%d%m%Y`
+
+TIMESTAMP=`date '+%Y-%b-%d_%H.%M.%S'`
+
+while getopts ":c:r:l:t:s:e:" arg; do
+  case $arg in
+    c) CRON="YES"
+       ;;
+    r) DATE_VAL=$OPTARG
+       REMOTE="YES"
+       ;;
+    l) LOGFILE=$OPTARG
+       ;;
+    t) TRANSFER=$OPTARG
+       ;;
+    s) SFTP_PATH=$OPTARG
+       ;;
+    e) ENIQ_LOG=$OPTARG
+       ;;
+   \?) usage_msg
+       exit 1
+       ;;
+  esac
+done
+shift `expr $OPTIND - 1`
+
+if [ ! $LOGFILE ] ; then
+    log_file_name=${LOG_DIR}/log_collector_$_zip_date_.log
+else
+    log_file_name=$LOGFILE
+fi
+
+if [ "$TRANSFER" != "" ]; then 
+    if [ "$TRANSFER" == "log_transfer"  ]; then
+        $ECHO "Executing script $LOG_COLLECTOR/eniq_log_collector/bin/log_transfer.bsh to transfer logs to remote server"
+        $BASH $LOG_COLLECTOR/bin/log_transfer.bsh 
+        exit 0
+        else
+        usage_msg
+        exit 1
+    fi
+fi
+
+if [ "$SFTP_PATH" != "" ]; then 
+    if [ "$SFTP_PATH" == "/home/sftpuser"  ]; then
+        copy_logs_to_sftp_path 
+        exit 0
+        else
+        usage_msg
+        exit 1
+    fi
+fi
+
+if [ ! $CRON ] && [ ! $REMOTE ]; then
+    check_process_instance
+    validate_date
+	#get_deployment
+fi
+
+
+#find out the day, month and year
+dd=${DATE_VAL:0:2}
+mm=${DATE_VAL:2:2}
+yyyy=${DATE_VAL:4:4}
+REQUIRED_DATE="${yyyy}-${mm}-${dd}"
+#$ECHO ${REQUIRED_DATE}
+
+#fetching the journalctl logs
+$JOURNALCTL --since "${yyyy}-${mm}-${dd} 00:00:00" --until "${yyyy}-${mm}-${dd} 23:59:59" > $JOURNAL_LOGS
+
+set_timestamp $DATE_VAL
+
+if [ "$ENIQ_LOG" != "" ]; then
+   if [ "$ENIQ_LOG" == "eniq"  ]; then
+       call_log_required
+	   collect_Security_audit_logs
+       create_log_summary
+       check_log_present
+       exit 0
+   fi
+fi
+
+if [ ! $REMOTE ]; then
+    get_deployment
+fi
+
+
+create_main_zip_file
+clean_up
+exit 0

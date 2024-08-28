@@ -1,0 +1,2294 @@
+#!/bin/bash
+# *********************************************************************
+# Ericsson Radio Systems AB                                     SCRIPT
+# *********************************************************************
+#
+#
+# (c) Ericsson Radio Systems AB 2022 - All rights reserved.
+#
+# The copyright to the computer program(s) herein is the property
+# of Ericsson Radio Systems AB, Sweden. The programs may be used 
+# and/or copied only with the written permission from Ericsson Radio 
+# Systems AB or in accordance with the terms and conditions stipulated 
+# in the agreement/contract under which the program(s) have been 
+# supplied.
+#
+# ********************************************************************
+# Name    : manage_privileged_users.bsh
+# Date    : 09/10/2023
+# Revision: main\12
+# Purpose : This file contains a set of functions that can be sourced from the bash
+#           shell. 
+#           NOTE : THESE FUNCTIONS ARE FOR ENIQ INSTALLATION ONLY AND THEREFORE IF 
+#                  THEY NEED TO BE CHANGED ONLY THE ENIQ INSTALLATION SCRIPTS WILL
+#                  BE CONSIDERED.
+#
+# Usage   : Eniq_Privileged_User_Support
+#
+# ********************************************************************
+#
+#     Command Section
+#
+# ********************************************************************
+AWK=/usr/bin/awk
+BASENAME=/usr/bin/basename
+BASH=/usr/bin/bash
+CAT=/usr/bin/cat
+CHMOD=/usr/bin/chmod
+CP=/usr/bin/cp
+CUT=/usr/bin/cut
+DATE=/usr/bin/date
+DIRNAME=/usr/bin/dirname
+ECHO='/usr/bin/echo -e'
+EGREP=/usr/bin/egrep
+GAWK=/usr/bin/gawk
+GETENT=/usr/bin/getent
+GPASSWD=/usr/bin/gpasswd
+GROUPADD=/usr/sbin/groupadd
+GROUPDEL=/usr/sbin/groupdel
+HEAD=/usr/bin/head
+GREP=/usr/bin/grep
+HOSTNAME=/usr/bin/hostname
+ID=/usr/bin/id
+MKDIR=/usr/bin/mkdir
+PERL=/usr/bin/perl
+PWD=/usr/bin/pwd
+PYTHON=/usr/bin/python
+RESTORECON=/usr/sbin/restorecon
+RM=/usr/bin/rm
+SED=/usr/bin/sed
+TEE=/usr/bin/tee
+TOUCH=/usr/bin/touch
+TR=/usr/bin/tr
+USERADD=/usr/sbin/useradd
+USERMOD=/usr/sbin/usermod
+UNAME=/usr/bin/uname
+WC=/usr/bin/wc
+
+# ********************************************************************
+#
+#       Configuration Section
+#
+# ********************************************************************
+
+# Default user
+DEFAULT_USER=root
+
+# Cmd to exec a shell and drop user to it in case of an error
+EXEC_SHELL_CMD="exec /bin/bash -o emacs"
+
+# Name of Files
+SUDOERS=/etc/sudoers
+ENIQ_BASE_DIR=/eniq
+
+# Name of SunOS & ENIQ ini Files
+SUNOS_INI=SunOS.ini
+IPMP_INI=ipmp.ini
+
+# ********************************************************************
+#
+#   Functions
+#
+# ********************************************************************
+### Function: abort_script ###
+#
+#   This will is called if the script is aborted thru an error
+#   signal sent by the kernel such as CTRL-C or if a serious
+#   error is encountered during runtime
+#
+# Arguments:
+#       $1 - Error message from part of program (Not always used)
+# Return Values:
+#       none
+abort_script()
+{
+_err_time_=`${DATE} '+%Y-%b-%d_%H.%M.%S'`
+
+if [ "$1" ]; then
+    _err_msg_="${_err_time_} - $1"
+else
+    _err_msg_="${_err_time_} - ERROR : Script aborted.......\n"
+fi
+
+if [ "${LOGFILE}" ]; then
+    $ECHO -e "\nERROR : ${_err_msg_}\n" | $TEE -a "${LOGFILE}"
+else
+    $ECHO -e "\nERROR : ${_err_msg_}\n"
+fi
+
+$RM -rf "${TEM_DIR}"
+
+exit 1
+
+}
+
+### Function: ask_for_input ###
+#
+#   Common function to ask for user input
+#   and stores user input in USER_VALUE
+#
+# Arguments:
+#       $1 : User message
+# Return Values:
+#       none
+ask_for_input()
+{
+_msg_=$*
+unset USER_VALUE
+
+while true ; do
+    log_msg -s  "\n\nPlease enter ${_msg_}" -l "${LOGFILE}" 
+    read -r USER_VALUE
+
+    if [ ! "${USER_VALUE}" ]; then
+        log_msg -s  "\nPlease enter a valid input" -l "${LOGFILE}"
+        continue
+    else
+        break
+    fi
+done
+}
+
+### Function: check_id ###
+#
+#   Check that the effective id of the user is correct
+#   If not print error msg and exit.
+#
+# Arguments:
+#       $1 : User ID name
+# Return Values:
+#       none
+check_id()
+{
+_check_id_=`$ID | $AWK -F\( '{print $2}' | $AWK -F\) '{print $1}'`
+if [ "$_check_id_" != "$1" ]; then
+    _err_msg_="You must be $1 to execute this script."
+    abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+fi
+}
+
+
+### Function: get_absolute_path ###
+#
+# Determine absolute path to software
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+get_absolute_path()
+{
+_dir_=`$DIRNAME $0`
+SCRIPTHOME=`cd $_dir_ 2>/dev/null && pwd || $ECHO $_dir_`
+}
+
+### Function: setup_env ###
+#
+# Set up environment variables for script.
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+
+setup_env()
+{
+# Templates Directory
+ENIQ_TEMPL_DIR="`$DIRNAME ${SCRIPTHOME}`/templates/${INSTALL_TYPE}"
+
+# Common SW directory
+ENIQ_COMMON_SW_DIR="`$DIRNAME ${SCRIPTHOME}`/templates/common"
+
+# Main Directory for the Core Installation SW
+ENIQ_INST_DIR=${ENIQ_BASE_DIR}/installation
+
+# Main Directory for the Core Installation SW
+ENIQ_CORE_INST_DIR=${ENIQ_INST_DIR}/core_install
+
+# ENIQ Admin Directory
+ENIQ_ADMIN_DIR=${ENIQ_BASE_DIR}/admin
+
+# Core bin dir
+ENIQ_CORE_BIN_DIR=${ENIQ_CORE_INST_DIR}/bin
+
+# ENIQ Config Directory
+ENIQ_CONF_DIR=${ENIQ_INST_DIR}/config
+
+
+# ENIQ Log Directory
+ENIQ_LOG_DIR=${ENIQ_BASE_DIR}/local_logs
+
+
+# ENIQ Library Directory
+ENIQ_LIB_DIR=${ENIQ_INST_DIR}/core_install/lib
+
+#Path for installed server type
+INSTALLED_SERVER_TYPE=${ENIQ_INST_DIR}/config/installed_server_type
+
+# Source the common functions
+if [ -s ${SCRIPTHOME}/../lib/common_functions.lib ]; then
+    . ${SCRIPTHOME}/../lib/common_functions.lib
+else
+    _err_msg_="File ${SCRIPTHOME}/../lib/common_functions.lib not found"
+    abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+fi
+
+if [ -s ${SCRIPTHOME}/../lib/common_core_install_functions.lib ]; then
+    . ${SCRIPTHOME}/../lib/common_core_install_functions.lib
+else
+    _err_msg_="File ${SCRIPTHOME}/../lib/common_core_install_functions.lib not found"
+    abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+fi
+
+if [ -s ${SCRIPTHOME}/../lib/common_inirator_functions.lib ]; then
+    . ${SCRIPTHOME}/../lib/common_inirator_functions.lib
+else
+    _err_msg_="File ${SCRIPTHOME}/../lib/common_inirator_functions.lib not found"
+    abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+fi
+
+# Get current server type
+CURR_SERVER_TYPE=`$CAT $ENIQ_CONF_DIR/installed_server_type | $EGREP -v  '^[[:blank:]]*#' | $SED -e 's/ //g'`
+if [ ! "${CURR_SERVER_TYPE}" ]; then
+    _err_msg_="Could not determine which server type this is"
+    abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+fi
+
+if [ "${CURR_SERVER_TYPE}" == "eniq_coordinator" -o "${CURR_SERVER_TYPE}" == "stats_coordinator"   \
+     -o "${CURR_SERVER_TYPE}" == "eniq_stats" -o "${CURR_SERVER_TYPE}" == "eniq_iqw"  ]; then
+    SERVER_TYPE="CO"
+else
+    SERVER_TYPE="${CURR_SERVER_TYPE}"
+fi
+
+HNAME=`${HOSTNAME} -s`
+HOST_IP=`$HOSTNAME -i | $AWK '{print $1}' | $HEAD -1`
+
+}
+
+
+### Function: insert_header_footer ###
+#
+#   Insert a stage header/footer message
+#
+# Arguments:
+#   $1 : head/foot
+#   $2 : Message
+#   $3 : Logfile
+# Return Values:
+#   none
+insert_header_footer()
+{
+#if [ $# -ne 3 ]; then
+#    _err_msg_="3 Parameters must be passed to header/footer function"
+#    abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+#fi
+
+if [ "$1" != "head" ] && [ "$1" != "foot" ]; then
+    _err_msg_="Only Param of head/foot is allowed...exiting!"
+    abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+fi
+_type_=$1
+
+_msg_=$2
+
+_logfile_=$3
+
+_time_=`$DATE '+%Y-%b-%d_%H.%M.%S'`
+if [ "$_type_" == "head" ]; then
+    log_msg -s "\n----------------------------------------------------------------------------" -l "${LOGFILE}"
+    log_msg -s "----------------------------------------------------------------------------" -l "${LOGFILE}"
+    log_msg -s "$_time_ : $_msg_" -l "${LOGFILE}"
+    log_msg -s "----------------------------------------------------------------------------" -l "${LOGFILE}"
+fi
+
+if [ "$_type_" == "foot" ]; then
+    log_msg -s "\n----------------------------------------------------------------------------" -l "${LOGFILE}"
+    log_msg -s "$_time_ : $_msg_" -l "${LOGFILE}"
+    log_msg -s "----------------------------------------------------------------------------" -l "${LOGFILE}"
+fi
+}
+
+## Function: read_storage_type ###
+#
+# Arguments:
+#   none
+# Return Values:
+#   set varibale STORAGE_TYPE
+read_storage_type()
+{
+# Read the storage type
+if [ -s ${ENIQ_CONF_DIR}/${SUNOS_INI} ]; then
+    STORAGE_TYPE=`iniget STOR_TYPE -f ${ENIQ_CONF_DIR}/${SUNOS_INI} -v STORAGE_TYPE`
+else
+    if [ -s ${ENIQ_CONF_DIR}/san_details ]; then
+        STORAGE_TYPE=`$CAT ${ENIQ_CONF_DIR}/san_details | $EGREP "^STORAGE_TYPE=" | $AWK -F\= '{print $2}'`
+    fi
+fi
+
+if [ ! "${STORAGE_TYPE}" ]; then
+    _err_msg_="Could not read STORAGE_TYPE param "
+    abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+fi
+
+}
+### Function: create_admin_group ###
+#
+# Creates Admin Group for Root Dependency Removal
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+create_admin_group()
+{
+insert_header_footer head "Entering Privileged Group Creation Stage\n" ${LOGFILE}
+
+if [ ! -f /etc/group.orig ]; then
+    $CP -p /etc/group /etc/group.orig
+fi
+
+_admin_grp_name_=ENIQ_ADMIN_ROLE
+_grp_check=0
+
+
+log_msg -l ${LOGFILE} -s "Checking whether ${_admin_grp_name_} group already created"
+$GETENT group ${_admin_grp_name_} >> /dev/null 2>&1
+    if [ $? -eq 0 ]; then
+_grp_check=1
+       $ECHO "Group ${_admin_grp_name_} already exists" 
+    else
+$ECHO "Group ${_admin_grp_name_} does not exists"
+$ECHO "Creating group ${_admin_grp_name_}"
+$GROUPADD ${_admin_grp_name_}
+if [ $? -eq 0 ]; then
+$ECHO "${_admin_grp_name_} group created successfully"
+else
+_err_msg_="Could not create group ${_admin_grp_name_}"
+abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+fi
+
+fi
+
+
+
+su_group=sugroup
+log_msg -l ${LOGFILE} -q -s "Checking whether ${su_group} group already created"
+$GETENT group ${su_group} >> /dev/null 2>&1
+if [ $? -eq 0 ]; then
+    log_msg -l ${LOGFILE} -q -s "Group ${su_group} already exists"
+else
+    log_msg -l ${LOGFILE} -q -s "Group ${su_group} does not exists"
+    log_msg -l ${LOGFILE} -q -s  "Creating group ${su_group}"
+    $GROUPADD ${su_group}
+    if [ $? -eq 0 ]; then
+       log_msg -l ${LOGFILE} -q -s "${su_group} group created successfully"
+    else
+       _err_msg_="Could not create group ${su_group}"
+       abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+    fi
+fi
+
+
+
+if [ ! -f /etc/sudoers.orig ]; then
+    $CP -p /etc/sudoers /etc/sudoers.orig
+fi
+
+_check_pattern_=`$GREP -w %wheel ${SUDOERS}|$GREP -w NOPASSWD`
+GROUP_ADD_SUDO="%${_admin_grp_name_}\tALL=(ALL)\tNOPASSWD: ALL , !/usr/bin/sudo,!/usr/bin/su$, !/usr/bin/su -, !/usr/bin/su - root, !/usr/bin/su root, !/usr/bin/passwd root"
+
+
+if [ ${_grp_check} -eq 1 ]; then
+	log_msg -l ${LOGFILE} -s "\n Checking whether Admin Privileges provided to group ${_admin_grp_name_}"
+	$GREP -w ${_admin_grp_name_} ${SUDOERS} >> /dev/null 2>&1
+	if [ $? -eq 0 ]; then
+		$ECHO "Admin Privileges already provided to group ${_admin_grp_name_} "
+	fi
+else
+	log_msg -l ${LOGFILE} -s "\nProviding Admin Privileges to ${_admin_grp_name_} group"
+	$SED -i "/$_check_pattern_/a $GROUP_ADD_SUDO" ${SUDOERS} 
+	if [ $? -eq 0 ]; then
+		$ECHO "Provided Admin Privileges to ${_admin_grp_name_} group"
+	else
+		_err_msg_="Could not provide Admin Privileges to ${_admin_grp_name_} "
+		abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+	fi
+fi
+
+_update_=1
+
+if [ ${_update_} -eq 1 ]; then
+    insert_header_footer foot "Successfully completed Privileged group creation stage" ${LOGFILE}
+fi
+
+}
+
+### Function: get_add_user_details ###
+#
+# Get number of user to be added to Admin group 
+#
+# Arguments:
+#    $1 : User Nos
+# Return Values:
+#    none
+get_add_user_details()
+{
+while :; do
+    #clear
+    unset ADM_USR_NUM
+
+$ECHO "\nHow many users to be added to Privileged group? (Minimum 1 user needs to be added)"
+    read ADM_USR_NUM
+
+#if user enter nothing loop
+    if [ ! "${ADM_USR_NUM}" ]; then
+        continue
+    fi
+
+   #must enter a number if not loop
+    $ECHO "${ADM_USR_NUM}" | $EGREP '[^1-9]' >> /dev/null 2>&1
+    if [ $? -eq 0 ]; then
+	    log_msg -s "\nMinimum one user must be created and added to Privileged group"
+        continue
+    fi
+    #User should enter atleast 1 as minimum 1 user to be created to add to Admin group
+    if [ ${ADM_USR_NUM} -lt 1 ] ; then
+
+        continue
+
+    fi
+
+    break
+done
+
+}
+
+
+### Function: get_delete_user_details ###
+#
+# Get number of users to be removed from Admin group 
+#
+# Arguments:
+#    $1 : User Nos
+# Return Values:
+#    none
+get_delete_user_details()
+{
+while :; do
+    #clear
+    unset ADM_USR_NUM
+
+$ECHO "\nHow many users to be removed from Privileged group? (Minimum 1 user needs to be removed from Privileged group)"
+    read ADM_USR_NUM
+
+#if user enter nothing loop
+    if [ ! "${ADM_USR_NUM}" ]; then
+        continue
+    fi
+
+   #must enter a number if not loop
+    $ECHO "${ADM_USR_NUM}" | $EGREP '[^1-9]' >> /dev/null 2>&1
+    if [ $? -eq 0 ]; then
+        continue
+    fi
+    #User should enter atleast 1 as minimum 1 user to be created to add to Admin group
+    if [ ${ADM_USR_NUM} -lt 1 ] ; then
+
+        continue
+
+    fi
+
+    break
+done
+}
+
+
+
+### Function: create_admin_user ###
+#
+# Creates Admin User and add to Admin Group for Root Dependency Removal
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+create_admin_user()
+{
+
+insert_header_footer head "Entering Privileged User Creation Stage" "${LOGFILE}"
+
+$RM -f ${TEM_DIR}/adm_user_details
+
+#$ECHO "Admin User details are " >> ${TEM_DIR}/adm_user_details
+
+if [ ! -f /etc/passwd.orig ]; then
+    $CP -p /etc/passwd /etc/passwd.orig
+fi
+
+if [ ! -f /etc/shadow.orig ]; then
+        $CP -p /etc/shadow /etc/shadow.orig
+fi
+
+if [ ! -d /home ]; then
+    $ECHO "Creating /home directory" | $TEE -a ${LOGFILE}
+    $MKDIR -p /home
+fi
+
+if [ ! -s ${ENIQ_COMMON_SW_DIR}/connectd/bin/generate_ssh_key.bsh ]; then
+    _err_msg_="Could not find ${ENIQ_COMMON_SW_DIR}/connectd/bin/generate_ssh_key.bsh script"
+    abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+fi
+
+read_storage_type
+
+#_user_check_=0
+unset _user_input_
+  
+    # Check if there is a skeleton directory for this user...
+    unset _user_skel_ _arch_
+    _arch_=`$UNAME -p`
+    if [ -d ${ENIQ_TEMPL_DIR}/${_arch_}/skel_dir ]; then
+        _user_skel_="-m -k ${ENIQ_TEMPL_DIR}/${_arch_}/skel_dir"
+    fi
+
+get_add_user_details
+
+for (( _user_num_=1; _user_num_<=${ADM_USR_NUM}; _user_num_++ )); do
+
+_user_check_=0
+count=${_user_num_}
+
+while :; do
+$ECHO "\n\nEnter username ${_user_num_} ( ${_user_num_} of ${ADM_USR_NUM})"
+read _user_input_
+local _user_length_=${#_user_input_}
+
+if  [ -z "${_user_input_}" ] ; then
+        log_msg -s "\nThe User Name cannot be empty."
+        continue
+    fi
+
+if  [[ "${_user_input_}" = *['!'%@~=,./:*_+]* ]] ; then
+        log_msg -s "\nThe User Name must not contain any special character ."
+        continue
+    fi
+
+if [ ${_user_length_} -lt 3 ] ; then
+        log_msg -s "\nThe User length should not be less than 3 characters "
+        continue
+
+    fi
+break
+done
+
+local _user_name_=${_user_input_}
+local _user_home_=/home/${_user_input_}
+local _user_shell_="/bin/bash"
+local _user_realname_=${_user_input_}
+
+#$ECHO "name${count}=${_user_name_}::home${count}=${_user_home_}" >> ${TEM_DIR}/adm_user_details
+
+log_msg -l ${LOGFILE}  -s "\nChecking whether ${_user_name_} user already exist"
+
+$GETENT passwd ${_user_name_} > /dev/null 2&>1
+    if [ $? -eq 0 ]; then
+	_user_check_=1
+        $ECHO "User ${_user_name_} already exist\n" | $TEE -a ${LOGFILE}
+    else   
+	$ECHO "User ${_user_name_} does not exist\n" | $TEE -a ${LOGFILE}
+    fi
+	
+
+password_check=0
+
+if [ ${_user_check_} == 1 ]; then
+    result=`passwd -S ${_user_name_}`
+    passwd_result=`$ECHO $result | $AWK -F " " '{print $2}'`
+    if [ ${passwd_result} == "PS" ]; then
+	   password_check=1
+    else
+       password_check=0
+    fi
+fi
+
+
+if [[ ${_user_check_} == 1 && ${password_check} == 0 ]]; then
+PASSWD_LOGFILE=${TEM_DIR}/passwd_logs.txt
+$ECHO "Password for ${_user_name_} does not exists"
+while :; do
+    #clear
+    unset USERPASSWORD
+    $ECHO "Password Policies:
+    ** Minimum password length 9 characters.
+    ** All alphanumeric characters allowed.
+    ** The following special characters are allowed   !  @  #  $  %  ^  &  *  (  )  _  +  |  :  <  >  ?  -  =  ;  '  ,  . /
+    ** Same characters (upper/lower/numeric/special) are not allowed to repeat consecutively more than two times.
+    ** Must contain an uppercase letter, a lowercase letter, a number and a special character.
+    "
+
+    $ECHO "\nEnter password for ${_user_name_}"
+    read -s USERPASSWORD
+
+#Store user data to file
+#$ECHO "name${count}=${_user_name_}::home${count}=${_user_home_}::password${count}=${USERPASSWORD}" >> ${TEM_DIR}/adm_user_details
+
+_USER_PASSWD_CRYPT_ENC_=`$ECHO ${USERPASSWORD} | openssl enc -base64`
+_USER_PASSWD_CRYPT_DEC_=`$ECHO ${_USER_PASSWD_CRYPT_ENC_} | openssl enc -base64 -d`
+
+
+$EXPECT <<EOF >${PASSWD_LOGFILE} 2>&1
+set timeout 20
+spawn su root -c "passwd ${_user_name_}"
+expect {
+"New password:" {send -- "${_USER_PASSWD_CRYPT_DEC_}\r";exp_continue}
+"Retype new password:" {send -- "${_USER_PASSWD_CRYPT_DEC_}\r"}
+timeout {send user "\nTIMEOUT\n"; exit 9}
+}
+expect eof
+EOF
+
+password_status=$?
+#$ECHO "password status=$password_status"
+
+    
+
+$ECHO "\nRe-Enter password for ${_user_name_}"
+read -s GET_USER_PASS_2
+
+    if [ "${USERPASSWORD}" != "${GET_USER_PASS_2}" ]; then
+                $ECHO "password mismatch. Try again..."
+                $SLEEP 2
+                continue
+    elif [ $password_status -eq 0 ]; then
+         log_msg -s "Successfully set the password for ${_user_name_}" -l "${LOGFILE}"
+         #Store user data to file
+         $ECHO "name${count}=${_user_name_}::home${count}=${_user_home_}::password${count}=${USERPASSWORD}" >> ${TEM_DIR}/adm_user_details
+         break
+    else
+         let counter=$counter+1
+         status=`$CAT ${PASSWD_LOGFILE} | $GREP BAD | $HEAD -1`
+         $ECHO "$status\n"
+         continue
+    fi
+
+
+done
+
+fi
+
+
+if [ ${_user_check_} -eq 0 ]; then
+
+	log_msg -l ${LOGFILE} -q -s "\nCreating home subdirectory ${_user_home_} for ${_user_name_}"
+
+	if [ ! -d "${_user_home_}" ]; then
+        	$MKDIR -p ${_user_home_}
+		if [ $? -eq 0 ]; then
+			log_msg -l ${LOGFILE} -q -s "User ${_user_name_} home directory ${_user_home_} created"
+		else
+			_err_msg_="Could not create ${_user_home_} directory"
+			abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+		fi
+	fi
+
+
+$USERADD -d ${_user_home_} -s ${_user_shell_} -c ${_user_realname_} ${_user_skel_} ${_user_name_} > /dev/null 2>&1
+	if [ $? -eq 0 ]; then
+		$ECHO -e "\nUser ${_user_name_} created" | $TEE -a ${LOGFILE}
+	else
+		_err_msg_="Could not create user ${_user_name_}"
+		abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+	fi
+
+
+#Set password for Admin User Created
+_user1_=${_user_name_}
+#common_get_admin_password ${_user1_}
+PASSWD_LOGFILE=${TEM_DIR}/passwd_logs.txt
+counter=1
+while :; do
+    #clear
+    unset USERPASSWORD
+    $ECHO "Password Policies:
+    ** Minimum password length 9 characters.
+    ** All alphanumeric characters allowed.
+    ** The following special characters are allowed   !  @  #  $  %  ^  &  *  (  )  _  +  |  :  <  >  ?  -  =  ;  '  ,  . /
+    ** Same characters (upper/lower/numeric/special) are not allowed to repeat consecutively more than two times.
+    ** Must contain an uppercase letter, a lowercase letter, a number and a special character.
+    "
+
+    $ECHO "\nEnter password for ${_user1_}"
+    read -s USERPASSWORD
+
+#Store user data to file
+#$ECHO "name${count}=${_user_name_}::home${count}=${_user_home_}::password${count}=${USERPASSWORD}" >> ${TEM_DIR}/adm_user_details
+
+_USER_PASSWD_CRYPT_ENC_=`$ECHO ${USERPASSWORD} | openssl enc -base64`
+_USER_PASSWD_CRYPT_DEC_=`$ECHO ${_USER_PASSWD_CRYPT_ENC_} | openssl enc -base64 -d`
+
+
+$EXPECT <<EOF >${PASSWD_LOGFILE} 2>&1
+set timeout 20
+spawn su root -c "passwd ${_user_name_}"
+expect {
+"New password:" {send -- "${_USER_PASSWD_CRYPT_DEC_}\r";exp_continue}
+"Retype new password:" {send -- "${_USER_PASSWD_CRYPT_DEC_}\r"}
+timeout {send user "\nTIMEOUT\n"; exit 9}
+}
+expect eof
+EOF
+
+password_status=$?
+#$ECHO "password status=$password_status"
+
+    
+
+$ECHO "\nRe-Enter password for ${_user1_}"
+read -s GET_USER_PASS_2
+
+    if [ "${USERPASSWORD}" != "${GET_USER_PASS_2}" ]; then
+                $ECHO "password mismatch. Try again..."
+                $SLEEP 2
+                continue
+    elif [ $password_status -eq 0 ]; then
+         log_msg -s "Successfully set the password for ${_user_name_}" -l "${LOGFILE}"
+         #Store user data to file
+         $ECHO "name${count}=${_user_name_}::home${count}=${_user_home_}::password${count}=${USERPASSWORD}" >> ${TEM_DIR}/adm_user_details
+         break
+    else
+         let counter=$counter+1
+         status=`$CAT ${PASSWD_LOGFILE} | $GREP BAD | $HEAD -1`
+         $ECHO "$status\n"
+         continue
+    fi
+
+
+done
+#$ECHO "RESULT=====$?"
+#log_msg -q -s "\nSuccessfully set the password for ${_user_name_}" -l "${LOGFILE}"
+
+
+$USERMOD -g ${_admin_grp_name_} ${_user_name_}
+$USERMOD -a -G dc5000,root,sugroup ${_user_name_}
+
+if [ $? -eq 0 ]; then
+	$ECHO -e "\nUser ${_user_name_} added to Privileged group" | $TEE -a ${LOGFILE}
+	#log_msg -s "\n User ${_user_name_} added to Admin group" -l ${LOGFILE}				
+else
+	_err_msg_="Could not add user ${_user_name_} to Privileged group"
+	abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+fi		
+
+
+	#$ECHO "Changing ${_user_home_} ownership to ${name}:${_admin_grp_name_}" | $TEE -a ${LOGFILE}
+	log_msg -l -q ${LOGFILE}  -s "Changing ${_user_home_} ownership to ${_user_name_}:${_admin_grp_name_}"
+	$CHOWN ${_user_name_}:${_admin_grp_name_} ${_user_home_}
+        	if [ $? -ne 0 ]; then
+            		_err_msg_="Could not change ownership of ${_user_home_} to ${_user_name_}:${_admin_grp_name_}"
+	                abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+	        fi
+    
+	# Change the permissions
+	log_msg -l -q ${LOGFILE}  -s "Changing ${_user_home_} permissions to -rwxr-x---"
+	#$ECHO "Changing ${home} permissions to -rwxr-x---" | $TEE -a ${LOGFILE}
+	$CHMOD 750 ${_user_home_}
+		if [ $? -ne 0 ]; then
+			_err_msg_="Could not change permissions of ${_user_home_} to -rwxr-x---"
+			abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+		fi
+
+fi
+
+if [ ${_user_check_} -eq 1 ]; then
+	#$ECHO "Checking user ${_user_name_} already part of Privileged group\n"
+        if [ ${password_check} == 1 ]; then
+            $ECHO "name${count}=${_user_name_}::home${count}=${_user_home_}::password${count}=NA" >> ${TEM_DIR}/adm_user_details
+        fi
+	log_msg -l ${LOGFILE} -s "Checking user ${_user_name_} already part of Privileged group"
+	_check_user_group_=`$ID ${_user_name_} | $AWK -F\( '{print $3}' | $AWK -F\) '{print $1}'`
+	if [ "${_check_user_group_}" == "ENIQ_ADMIN_ROLE" ]; then
+		$ECHO "User ${_user_name_} already part of Privileged Group"
+	else
+                 log_msg -l ${LOGFILE} -s "User ${_user_name_} is not part of Privileged group"
+                 log_msg -l ${LOGFILE} -s "Adding user ${_user_name_} to the Privileged group"
+		$USERMOD -g ${_admin_grp_name_} ${_user_name_}
+        $USERMOD -a -G dc5000,root,sugroup ${_user_name_}
+		if [ $? -eq 0 ]; then
+			$ECHO -e "User ${_user_name_} added to Privileged group\n" | $TEE -a ${LOGFILE}
+			#log_msg -s "\n User ${_user_name_} added to Privileged group" -l ${LOGFILE}
+		else
+			_err_msg_="Could not add user ${_user_name_} to Privileged group"
+			abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+		fi
+
+	fi
+
+fi
+
+update_user_profile ${_user_name_} ${_user_home_}
+
+done
+
+   if [ -d ${ENIQ_ADMIN_DIR}/etc ]; then
+log_msg -l ${LOGFILE} -q -s "Copying User details to shared area"
+    
+$CP ${TEM_DIR}/adm_user_details ${ENIQ_ADMIN_DIR}/etc/admin_user_list
+$CAT ${ENIQ_ADMIN_DIR}/etc/admin_user_list >> ${ENIQ_ADMIN_DIR}/etc/ADMIN_USER_DETAILS
+       if [ $? -ne 0 ]; then
+           _err_msg_="Could not copy user list file to shared area"
+           abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+       fi
+    else
+       _err_msg_="${ENIQ_ADMIN_DIR}/etc does not exist, or is not a directory"
+       abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+   fi
+
+insert_header_footer foot "Completed Privileged User Creation Stage" ${LOGFILE}
+
+}
+
+
+
+### Function: delete_admin_user ###
+#
+# Delete Admin User and remove from  Admin Group 
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+delete_admin_user()
+{
+
+insert_header_footer head "Entering User Privileges Removal Stage" "${LOGFILE}"
+
+if [ ! -f /etc/passwd.orig ]; then
+    $CP -p /etc/passwd /etc/passwd.orig
+fi
+
+if [ ! -f /etc/shadow.orig ]; then
+        $CP -p /etc/shadow /etc/shadow.orig
+fi
+
+read_storage_type
+
+_user_check_=0
+unset _user_input_
+
+get_delete_user_details
+
+for (( _user_num_=1; _user_num_<=${ADM_USR_NUM}; _user_num_++ )); do
+
+count=${_user_num_}
+
+while :; do
+$ECHO "\n\nEnter username ${_user_num_} ( ${_user_num_} of ${ADM_USR_NUM})"
+read _user_input_
+local _user_length_=${#_user_input_}
+
+if  [ -z "${_user_input_}" ] ; then
+        log_msg -s "\nThe User Name cannot be empty."
+        continue
+    fi
+
+if  [[ "${_user_input_}" = *['!'%@~=,./:*_+]* ]] ; then
+        log_msg -s "\nThe User Name must not contain any special character ."
+        continue
+    fi
+
+if [ ${_user_length_} -lt 3 ] ; then
+        log_msg -s "\nThe User length should not be less than 3 characters "
+        continue
+
+    fi
+break
+done
+
+
+echo $_user_input_ >>${ENIQ_ADMIN_DIR}/etc/user_removal_data.txt
+local _user_name_=${_user_input_}
+
+log_msg -l ${LOGFILE}  -s "\nChecking whether ${_user_name_} user exist"
+
+$GETENT passwd ${_user_name_} > /dev/null 2&>1
+if [ $? -eq 0 ]; then
+        _user_check_=1
+	$ECHO "User ${_user_name_} exist" | $TEE -a ${LOGFILE}
+else
+	_user_check_=0
+	$ECHO "User ${_user_name_} does not exist" | $TEE -a ${LOGFILE}
+fi
+
+if [ ${_user_check_} -eq 1 ]; then
+log_msg -l ${LOGFILE} -s "\nChecking whether user ${_user_name_} is part of Privileged group"
+_check_user_group_=`$ID ${_user_name_} | $AWK -F\( '{print $3}' | $AWK -F\) '{print $1}'` > /dev/null 2>&1
+if [ $? -ne 0 ]; then
+	$ECHO "Could not get user group details"
+fi	
+	if [ "${_check_user_group_}" == "ENIQ_ADMIN_ROLE" ]; then
+        	#$ECHO "User ${_user_name_} part of Admin Group\n"
+                log_msg -l ${LOGFILE} -s "User ${_user_name_} is part of Privileged Group"
+		$USERMOD -g ${_user_name_} ${_user_name_}
+                $GPASSWD -d ${_user_name_} root > /dev/null 2>&1
+                $GPASSWD -d ${_user_name_} dc5000 > /dev/null 2>&1
+				$GPASSWD -d ${_user_name_} sugroup > /dev/null 2>&1
+		if [ $? -eq 0 ]; then
+        		$ECHO -e "User ${_user_name_} removed from Privileged group\n" | $TEE -a ${LOGFILE}
+	        	#log_msg -s "\n User ${_user_name_} added to Admin group" -l ${LOGFILE}
+		else
+        		_err_msg_="Could not remove ${_user_name_} from Admin group"
+        		abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+		fi
+	else
+		$ECHO "User ${_user_name_} is not part of Privileged group"
+	fi
+fi
+done
+
+}
+
+
+
+### Function: generate_admin_user_keys ###
+#
+# Generate ssh keys for admin users for MB and MR
+#
+# Arguments:
+#    none
+# Return Values:
+#    none
+generate_admin_user_keys()
+{
+
+
+	insert_header_footer head "Generate ssh keys for Privileged users on $TYPE" "${LOGFILE}"
+
+
+
+
+if [ -f ${ENIQ_ADMIN_DIR}/etc/admin_user_list ]; then
+
+for line in `$CAT ${ENIQ_ADMIN_DIR}/etc/admin_user_list`; do
+ 
+ local _user_name_=`$ECHO ${line} |$AWK -F "::" '{print $1}' | $AWK -F "=" '{print $2}'`
+ local _user_home_=`$ECHO ${line} |$AWK -F "::" '{print $2}' | $AWK -F "=" '{print $2}'` 
+ local _user_shell_="/bin/bash"
+ local _user_realname_=${_user_name_}
+ 
+ if [ ! -d "${_user_home_}/.ssh/" ]; then
+ 	log_msg -s "\nCreating directory ${_user_home_}/.ssh/" -l ${LOGFILE}
+	$MKDIR -p ${_user_home_}/.ssh
+	if [ $? -ne 0 ]; then
+		_err_msg_="Could not create ${_user_home_}/.ssh/ directory"
+		abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+	fi
+            
+	$CHOWN ${_user_name_}:${_admin_grp_name_} ${_user_home_}/.ssh
+	 if [ $? -ne 0 ]; then
+         	_err_msg_="Could not change ownership of ${_user_home_}/.ssh"
+                 abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+         fi
+
+	#log_msg -s "Changing ${_user_home_}/.ssh permissions to -rwx------" -l ${LOGFILE}
+	$CHMOD 700 ${_user_home_}/.ssh
+	if [ $? -ne 0 ]; then
+		_err_msg_="Could not change permissions of ${_user_home_}/.ssh to -rwx------"
+		abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+	fi
+
+	$ECHO -e "Creating ssh keys for ${_user_name_}" | $TEE -a ${LOGFILE}
+        $BASH ${ENIQ_COMMON_SW_DIR}/connectd/bin/generate_ssh_key.bsh -u ${_user_name_} -l ${LOGFILE} > /dev/null 2>&1 
+        if [ $? -ne 0 ]; then
+        	_err_msg_="Could not generate ssh keys for ${_user_name_}"
+        	abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+        fi
+
+	# Extra check to ensure the public key is there
+	if [ ! -s ${_user_home_}/.ssh/id_rsa.pub ]; then
+		_err_msg_="${_user_home_}/.ssh/id_rsa.pub does not exist after key generation"
+		abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+	fi
+
+	if [ -s ${_user_home_}/.ssh/id_rsa.pub ]; then
+        	$ECHO "Updating ${_user_home_}/.ssh/authorized_keys file" | $TEE -a ${LOGFILE}
+                $CP ${_user_home_}/.ssh/id_rsa.pub ${_user_home_}/.ssh/authorized_keys
+                $CP ${_user_home_}/.ssh/id_rsa.pub ${ENIQ_ADMIN_DIR}/etc/${_user_name_}_id_rsa.pub
+                if [ $? -ne 0 ]; then
+                	_err_msg_="Could not copy ${_user_home_}/.ssh/id_rsa.pub to ${_user_home_}/.ssh/authorized_keys"
+                	abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+                fi
+        else
+                _err_msg_="${_user_home_}/.ssh/id_rsa.pub does not exist after key generation"
+                abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+        fi
+
+
+        $CHMOD 600 ${_user_home_}/.ssh/authorized_keys >> /dev/null 2>&1
+         if [ $? -ne 0 ]; then
+                _err_msg_="Could not change permissions of ${_user_home_}/.ssh/authorized_keys file"
+                abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+         fi
+
+        $CHOWN ${_user_name_}:${_admin_grp_name_} ${_user_home_}/.ssh/authorized_keys >> /dev/null 2>&1
+         if [ $? -ne 0 ]; then
+                _err_msg_="Could not change ownership of ${_user_home_}/.ssh/authorized_keys file"
+                abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+         fi
+
+        $RESTORECON ${_user_home_}/.ssh/authorized_keys >> /dev/null 2>&1
+         if [ $? -ne 0 ]; then
+                _err_msg_="Could not run restorecon on ${_user_home_}/.ssh/authorized_keys file"
+                abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+         fi
+    fi
+done 
+fi
+
+
+ 
+}
+
+
+
+
+
+
+
+### Function: check_remote_node_harden ###
+#
+# It will verify Node Hardening applied on Remote Server
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+check_remote_node_harden()
+{
+
+host=`$HOSTNAME`
+$PERL ${ENIQ_LIB_DIR}/get_ip_order.pl -f ${TEMP_DIR}/perl.txt
+for _line_ in `$CAT ${TEMP_DIR}/perl.txt`;do
+	local _count_=`$ECHO "${_line_}" | $GREP -o "::" | $WC -l`
+	if [ "${_ip_type_}" == "IPv6" -a "${_count_}" == 3 ]; then
+		local _ip_address_=`$ECHO ${_line_} | $GREP -oE '([a-fA-F0-9]{1,4}::?){1,7}[a-fA-F0-9]{1,4}' | $HEAD -n 1 | $AWK -F "::" '{ print $1 "::" $2}'`
+		local _server_name_=`$ECHO ${_line_} | $AWK -F"::" '{print $3}'`
+		local _server_type_=`$ECHO ${_line_} | $AWK -F"::" '{print $4}'`
+	else
+		local _ip_address_=`$ECHO ${_line_} | $AWK -F"::" '{print $1}'`
+		local _server_name_=`$ECHO ${_line_} | $AWK -F"::" '{print $2}'`
+		local _server_type_=`$ECHO ${_line_} | $AWK -F"::" '{print $3}'`
+	fi
+
+	if [ "${_ip_address_}" == "${HOST_IP}" ]; then
+                log_msg -s "\n==================== Checking Node Hardening Applied on ${_server_name_}-${_server_type_} ====================\n" -l ${TEMP_LOG_LOCATION}/summary.log		
+		$ping_command -c1 ${_ip_address_} > /dev/null 2>&1
+		   if [ $? -eq 0 ];then
+			check_node_harden	
+                       
+		log_msg -s "\n==================== Check completed for Server ${_server_name_}-${_server_type_} ====================\n" -l ${TEMP_LOG_LOCATION}/summary.log		
+        	    else
+                        #log_msg -s "Ping failed to ${_ip_address_}" -l ${TEMP_LOG_LOCATION}/summary.log
+                        _err_msg_="Ping failed to ${_ip_address_}"
+                        abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+
+            	   fi
+
+	else
+  		if [ "${_server_type_}" != "stats_coordinator" -o "${_server_type_}" != "eniq_stats" ];then
+	        log_msg -s "\n==================== Checking Node Hardening Applied on ${_server_name_}-${_server_type_} ====================\n" -l ${TEMP_LOG_LOCATION}/summary.log
+          	$ping_command -c1 ${_ip_address_} > /dev/null 2>&1
+            	if [ $? -eq 0 ];then                        
+                        run_remote_cmd "${_server_name_}" "bash $ENIQ_CORE_BIN_DIR/remote_privileged_users.bsh -v verify"
+                       
+            	else                        
+			_err_msg_="Ping failed to ${_ip_address_}"
+			abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"                        
+
+            	fi
+   log_msg -s "\n==================== Check completed Server ${_server_name_}-${_server_type_} ====================\n" -l ${TEMP_LOG_LOCATION}/summary.log
+
+   fi
+fi
+done
+
+harden_status=0
+for entry in `$CAT ${ENIQ_ADMIN_DIR}/etc/nh_status.txt`; do
+   host=`$ECHO $entry | $AWK -F "::" '{print $1}'`
+   value=`$ECHO $entry | $AWK -F "::" '{print $2}'`
+   if [ $value -eq 0 ]; then
+       harden_status=1
+       $ECHO $host>>/tmp/without_nh_server_list
+   fi
+done
+
+$RM -rf ${ENIQ_ADMIN_DIR}/etc/nh_status.txt
+if [ $harden_status -eq 1 ]; then
+   log_msg -s "Node hardening is not performed on below servers.." -l ${LOGFILE} 
+   $CAT /tmp/without_nh_server_list
+   $RM -rf /tmp/without_nh_server_list
+   _err_msg_="Node hardening is not applied on all servers, kindly check.."
+   abort_script "${_err_msg_}"
+fi
+
+#$RM -rf ${ENIQ_ADMIN_DIR}/etc/nh_status.txt
+#$RM -rf /tmp/without_nh_server_list
+}
+
+check_remote_feature_enable()
+{
+
+host=`$HOSTNAME`
+$PERL ${ENIQ_LIB_DIR}/get_ip_order.pl -f ${TEMP_DIR}/perl.txt
+for _line_ in `$CAT ${TEMP_DIR}/perl.txt`;do
+	local _count_=`$ECHO "${_line_}" | $GREP -o "::" | $WC -l`
+	if [ "${_ip_type_}" == "IPv6" -a "${_count_}" == 3 ]; then
+		local _ip_address_=`$ECHO ${_line_} | $GREP -oE '([a-fA-F0-9]{1,4}::?){1,7}[a-fA-F0-9]{1,4}' | $HEAD -n 1 | $AWK -F "::" '{ print $1 "::" $2}'`
+		local _server_name_=`$ECHO ${_line_} | $AWK -F"::" '{print $3}'`
+		local _server_type_=`$ECHO ${_line_} | $AWK -F"::" '{print $4}'`
+	else
+		local _ip_address_=`$ECHO ${_line_} | $AWK -F"::" '{print $1}'`
+		local _server_name_=`$ECHO ${_line_} | $AWK -F"::" '{print $2}'`
+		local _server_type_=`$ECHO ${_line_} | $AWK -F"::" '{print $3}'`
+	fi
+
+	if [ "${_ip_address_}" == "${HOST_IP}" ]; then
+                log_msg -s "\n==================== Checking whether Feature is Enabled on ${_server_name_}-${_server_type_} ====================\n" -l ${TEMP_LOG_LOCATION}/summary.log		
+		$ping_command -c1 ${_ip_address_} > /dev/null 2>&1
+		   if [ $? -eq 0 ];then
+			check_feature_enabling	
+                       
+		log_msg -s "\n==================== Check completed for Server ${_server_name_}-${_server_type_} ====================\n" -l ${TEMP_LOG_LOCATION}/summary.log		
+        	    else                        
+                        _err_msg_="Ping failed to ${_ip_address_}"
+                        abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+
+            	   fi
+
+	else  		
+		if [ "${_server_type_}" == "stats_engine" ] || [ "${_server_type_}" == "dwh_reader_1" ] || [ "${_server_type_}" == "dwh_reader_2" ]; then
+	        log_msg -s "\n==================== Checking whether Feature is Enabled on ${_server_name_}-${_server_type_} ====================\n" -l ${TEMP_LOG_LOCATION}/summary.log          	
+          	$ping_command -c1 ${_ip_address_} > /dev/null 2>&1
+            	if [ $? -eq 0 ];then                        
+                        run_remote_cmd "${_server_name_}" "bash $ENIQ_CORE_BIN_DIR/remote_privileged_users.bsh -f feature_enable"
+                       
+            	else                        
+			_err_msg_="Ping failed to ${_ip_address_}"
+			abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"                        
+
+            	fi
+   log_msg -s "\n==================== Check completed Server ${_server_name_}-${_server_type_} ====================\n" -l ${TEMP_LOG_LOCATION}/summary.log
+
+   fi
+fi
+done
+
+if [ "${CURR_SERVER_TYPE}" == "stats_coordinator" ]; then
+feature_enable_status=0
+for entry in `$CAT ${ENIQ_ADMIN_DIR}/etc/feature_enable_status.txt`; do
+   host=`$ECHO $entry | $AWK -F "::" '{print $1}'`
+   value=`$ECHO $entry | $AWK -F "::" '{print $2}'`
+   if [ $value -eq 1 ]; then
+       feature_enable_status=1
+       $ECHO $host>>/tmp/without_feature_enable_server_list
+   fi
+done
+
+$RM -rf ${ENIQ_ADMIN_DIR}/etc/feature_enable_status.txt
+if [ $feature_enable_status -eq 1 ]; then
+   log_msg -s "Feature is not enabled on below servers:" -l ${LOGFILE} 
+   $CAT /tmp/without_feature_enable_server_list
+   $RM -rf /tmp/without_feature_enable_server_list
+   _err_msg_="Kindly enable the feature first"
+   abort_script "${_err_msg_}"
+fi
+fi
+
+#$RM -rf ${ENIQ_ADMIN_DIR}/etc/nh_status.txt
+#$RM -rf /tmp/without_nh_server_list
+}
+
+
+### Function: create_remote_admin_users ###
+#
+# Create admin users on blades for MB and MR
+#
+# Arguments:
+#    none
+# Return Values:
+#    none
+create_remote_admin_users()
+{
+
+$PERL ${ENIQ_LIB_DIR}/get_ip_order.pl -f ${TEMP_DIR}/perl.txt
+host=`$HOSTNAME`
+for _line_ in `$CAT ${TEMP_DIR}/perl.txt | $GREP -v $host`;do
+    local _count_=`$ECHO "${_line_}" | $GREP -o "::" | $WC -l`
+	if [ "${_ip_type_}" == "IPv6" -a "${_count_}" == 3 ]; then
+	   local _ip_address_=`$ECHO ${_line_} | $GREP -oE '([a-fA-F0-9]{1,4}::?){1,7}[a-fA-F0-9]{1,4}' | $HEAD -n 1 | $AWK -F "::" '{ print $1 "::" $2}'`
+		local _server_name_=`$ECHO ${_line_} | $AWK -F"::" '{print $3}'`
+		local _server_type_=`$ECHO ${_line_} | $AWK -F"::" '{print $4}'`
+	else
+		local _ip_address_=`$ECHO ${_line_} | $AWK -F"::" '{print $1}'`
+		local _server_name_=`$ECHO ${_line_} | $AWK -F"::" '{print $2}'`
+		local _server_type_=`$ECHO ${_line_} | $AWK -F"::" '{print $3}'`
+	fi
+
+
+  #if [ "$_server_type_" != "stats_coordinator" -o "$_server_type_" != "eniq_stats" ];then
+  if [ "${_server_type_}" == "stats_engine" ] || [ "${_server_type_}" == "dwh_reader_1" ] || [ "${_server_type_}" == "dwh_reader_2" ]; then          
+          $ping_command -c1 ${_ip_address_} > /dev/null 2>&1
+            if [ $? -eq 0 ];then                        
+                        run_remote_cmd "${_server_name_}" "bash $ENIQ_CORE_BIN_DIR/remote_privileged_users.bsh -c create"
+                        if [ $? -ne 0 ];then
+                          break
+                          
+                        fi
+            else
+                        #log_msg -s "Ping failed to ${_ip_address_}" -l ${TEMP_LOG_LOCATION}/summary.log
+			_err_msg_="Ping failed to ${_ip_address_}"
+			abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+            fi
+   fi
+done
+
+
+$RM -rf ${ENIQ_ADMIN_DIR}/etc/admin_user_list
+
+}
+
+
+
+### Function: add_remote_admin_users ###
+#
+# Addadmin users on blades for MB and MR
+#
+# Arguments:
+#    none
+# Return Values:
+#    none
+add_remote_admin_users()
+{
+
+$PERL ${ENIQ_LIB_DIR}/get_ip_order.pl -f ${TEMP_DIR}/perl.txt
+host=`$HOSTNAME`
+for _line_ in `$CAT ${TEMP_DIR}/perl.txt | $GREP -v $host`;do
+	local _count_=`$ECHO "${_line_}" | $GREP -o "::" | $WC -l`
+	if [ "${_ip_type_}" == "IPv6" -a "${_count_}" == 3 ]; then
+		local _ip_address_=`$ECHO ${_line_} | $GREP -oE '([a-fA-F0-9]{1,4}::?){1,7}[a-fA-F0-9]{1,4}' | $HEAD -n 1 | $AWK -F "::" '{ print $1 "::" $2}'`
+		local _server_name_=`$ECHO ${_line_} | $AWK -F"::" '{print $3}'`
+		local _server_type_=`$ECHO ${_line_} | $AWK -F"::" '{print $4}'`
+	else
+		local _ip_address_=`$ECHO ${_line_} | $AWK -F"::" '{print $1}'`
+		local _server_name_=`$ECHO ${_line_} | $AWK -F"::" '{print $2}'`
+		local _server_type_=`$ECHO ${_line_} | $AWK -F"::" '{print $3}'`
+	fi
+
+  #if [ "$_server_type_" != "stats_coordinator" -o "$_server_type_" != "eniq_stats" ];then
+  if [ "${_server_type_}" == "stats_engine" ] || [ "${_server_type_}" == "dwh_reader_1" ] || [ "${_server_type_}" == "dwh_reader_2" ]; then
+          $ping_command -c1 ${_ip_address_} > /dev/null 2>&1
+            if [ $? -eq 0 ];then                        
+                        run_remote_cmd "${_server_name_}" "bash $ENIQ_CORE_BIN_DIR/remote_privileged_users.bsh -a add"
+                        if [ $? -ne 0 ];then
+                          break
+                          
+                        fi
+            else
+                        #log_msg -s "Ping failed to ${_ip_address_}" -l ${TEMP_LOG_LOCATION}/summary.log
+                        _err_msg_="Ping failed to ${_ip_address_}"
+                        abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+            fi
+   fi
+done
+
+
+$RM -rf ${ENIQ_ADMIN_DIR}/etc/admin_user_list
+
+}
+
+### Function: delete_remote_admin_users ###
+#
+# Create admin users on blades for MB and MR
+#
+# Arguments:
+#    none
+# Return Values:
+#    none
+delete_remote_admin_users()
+{
+
+$PERL ${ENIQ_LIB_DIR}/get_ip_order.pl -f ${TEMP_DIR}/perl.txt
+host=`$HOSTNAME`
+for _line_ in `$CAT ${TEMP_DIR}/perl.txt | grep -v $host`;do
+	local _count_=`$ECHO "${_line_}" | $GREP -o "::" | $WC -l`
+	if [ "${_ip_type_}" == "IPv6" -a "${_count_}" == 3 ]; then
+		local _ip_address_=`$ECHO ${_line_} | $GREP -oE '([a-fA-F0-9]{1,4}::?){1,7}[a-fA-F0-9]{1,4}' | $HEAD -n 1 | $AWK -F "::" '{ print $1 "::" $2}'`
+		local _server_name_=`$ECHO ${_line_} | $AWK -F"::" '{print $3}'`
+		local _server_type_=`$ECHO ${_line_} | $AWK -F"::" '{print $4}'`
+	else
+		local _ip_address_=`$ECHO ${_line_} | $AWK -F"::" '{print $1}'`
+		local _server_name_=`$ECHO ${_line_} | $AWK -F"::" '{print $2}'`
+		local _server_type_=`$ECHO ${_line_} | $AWK -F"::" '{print $3}'`
+	fi
+
+
+  #if [ "$_server_type_" != "stats_coordinator" -o "$_server_type_" != "eniq_stats" ];then
+  if [ "${_server_type_}" == "stats_engine" ] || [ "${_server_type_}" == "dwh_reader_1" ] || [ "${_server_type_}" == "dwh_reader_2" ]; then          
+          $ping_command -c1 ${_ip_address_} > /dev/null 2>&1
+            if [ $? -eq 0 ];then                        
+                        run_remote_cmd "${_server_name_}" "bash $ENIQ_CORE_BIN_DIR/remote_privileged_users.bsh -d delete"
+                        if [ $? -ne 0 ];then
+                          break
+                        fi
+            else
+                        #log_msg -s "Ping failed to ${_ip_address_}" -l ${TEMP_LOG_LOCATION}/summary.log
+			_err_msg_="Ping failed to ${_ip_address_}"
+                        abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+            fi
+   fi
+done
+
+
+}
+
+
+### Function: create_remote_admin_users_expansion ###
+#
+# Create admin users on all blades by referring to single blade in 
+# case of SB to MB expansion
+#
+# Arguments:
+#    none
+# Return Values:
+#    none
+create_remote_admin_users_expansion()
+{
+
+$PERL ${ENIQ_LIB_DIR}/get_ip_order.pl -f ${TEMP_DIR}/perl.txt
+host=`$HOSTNAME`
+for _line_ in `$CAT ${TEMP_DIR}/perl.txt | $GREP -v $host`;do
+		local _count_=`$ECHO "${_line_}" | $GREP -o "::" | $WC -l`
+	if [ "${_ip_type_}" == "IPv6" -a "${_count_}" == 3 ]; then
+		local _ip_address_=`$ECHO ${_line_} | $GREP -oE '([a-fA-F0-9]{1,4}::?){1,7}[a-fA-F0-9]{1,4}' | $HEAD -n 1 | $AWK -F "::" '{ print $1 "::" $2}'`
+		local _server_name_=`$ECHO ${_line_} | $AWK -F"::" '{print $3}'`
+		local _server_type_=`$ECHO ${_line_} | $AWK -F"::" '{print $4}'`
+	else
+		local _ip_address_=`$ECHO ${_line_} | $AWK -F"::" '{print $1}'`
+		local _server_name_=`$ECHO ${_line_} | $AWK -F"::" '{print $2}'`
+		local _server_type_=`$ECHO ${_line_} | $AWK -F"::" '{print $3}'`
+	fi
+
+  #if [ "$_server_type_" != "stats_coordinator" -o "$_server_type_" != "eniq_stats" ];then
+  if [ "${_server_type_}" == "stats_engine" ] || [ "${_server_type_}" == "dwh_reader_1" ] || [ "${_server_type_}" == "dwh_reader_2" ]; then          
+          $ping_command -c1 ${_ip_address_} > /dev/null 2>&1
+            if [ $? -eq 0 ];then                        
+                        run_remote_cmd "${_server_name_}" "bash $ENIQ_CORE_BIN_DIR/remote_privileged_users.bsh -e expansion"
+                        if [ $? -ne 0 ];then
+                          break
+                        fi
+            else
+                        log_msg -s "Ping failed to ${_ip_address_}" -l ${TEMP_LOG_LOCATION}/summary.log
+            fi
+   fi
+done
+
+
+$RM -rf ${ENIQ_ADMIN_DIR}/etc/admin_user_list
+
+}
+
+
+
+
+
+### Function: rollback_remote_admin_users ###
+#
+# Create admin users on blades for MB and MR
+#
+# Arguments:
+#    none
+# Return Values:
+#    none
+rollback_remote_admin_users()
+{
+
+$PERL ${ENIQ_LIB_DIR}/get_ip_order.pl -f ${TEMP_DIR}/perl.txt
+host=`$HOSTNAME`
+for _line_ in `$CAT ${TEMP_DIR}/perl.txt | $GREP -v $host`;do
+   	local _count_=`$ECHO "${_line_}" | $GREP -o "::" | $WC -l`
+	if [ "${_ip_type_}" == "IPv6" -a "${_count_}" == 3 ]; then
+		local _ip_address_=`$ECHO ${_line_} | $GREP -oE '([a-fA-F0-9]{1,4}::?){1,7}[a-fA-F0-9]{1,4}' | $HEAD -n 1 | $AWK -F "::" '{ print $1 "::" $2}'`
+		local _server_name_=`$ECHO ${_line_} | $AWK -F"::" '{print $3}'`
+		local _server_type_=`$ECHO ${_line_} | $AWK -F"::" '{print $4}'`
+	else
+		local _ip_address_=`$ECHO ${_line_} | $AWK -F"::" '{print $1}'`
+		local _server_name_=`$ECHO ${_line_} | $AWK -F"::" '{print $2}'`
+		local _server_type_=`$ECHO ${_line_} | $AWK -F"::" '{print $3}'`
+	fi
+
+  #if [ "$_server_type_" != "stats_coordinator" -o "$_server_type_" != "eniq_stats" ];then
+  if [ "${_server_type_}" == "stats_engine" ] || [ "${_server_type_}" == "dwh_reader_1" ] || [ "${_server_type_}" == "dwh_reader_2" ]; then          
+      $ping_command -c1 ${_ip_address_} > /dev/null 2>&1
+      if [ $? -eq 0 ];then
+          run_remote_cmd "${_server_name_}" "bash $ENIQ_CORE_BIN_DIR/remote_privileged_users.bsh -r rollback"
+          if [ $? -ne 0 ];then
+            break
+          fi
+      else
+		_err_msg_="Ping failed to ${_ip_address_}"
+		abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"                        
+            fi
+   fi
+done
+
+$RM -rf ${ENIQ_ADMIN_DIR}/etc/admin_user_list
+
+}
+
+
+### Function: check_node_harden ###
+#
+# It checks whether node hardening is applied on the server
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+check_node_harden()
+{
+
+#insert_header_footer head "Checking Node Hardening applied on ${hostname}" "${LOGFILE}"
+
+if [ ! -f /ericsson/security/bin/nh_verification.py ]; then
+        _err_msg_="Node Hardening script /ericsson/security/bin/nh_verification.py Not Found"
+        abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+fi
+
+if [ ! -f $ENIQ_CORE_INST_DIR/bin/eniq_nh_verify.py ]; then
+        _err_msg_="Node Hardening Verify Script $ENIQ_CORE_INST_DIR/bin/eniq_nh_verify.py Not Found."
+	abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+else
+        $PYTHON $ENIQ_CORE_INST_DIR/bin/eniq_nh_verify.py |grep Boolean > ${TEM_DIR}/nh_status
+if [ $? -ne 0 ]; then
+	_err_msg_="Error executing Node Hardening Verification script"
+	abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+fi
+        status=`$CAT ${TEM_DIR}/nh_status|$AWK '{print $3}'`
+        $ECHO $host::$status >>${ENIQ_ADMIN_DIR}/etc/nh_status.txt
+        if [ "${status}" == 1 ]; then
+        	$ECHO "Full Node Hardening is Applied on Server" | $TEE -a ${LOGFILE}
+        elif [ "${status}" == 0 ]; then
+        	_err_msg_="Full Node Hardening is not Applied on Server, please apply Full Node Hardening to proceed further..."
+        	abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+	else
+   		_err_msg_="Error executing Node Hardening Verification script"
+	        abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+        fi
+fi
+
+$RM -f ${TEM_DIR}/nh_status
+
+#insert_header_footer foot "Node Hardening Verification done on ${hostname}" ${LOGFILE}
+
+}
+
+### Function: admin_ssh_enable ###
+#
+# It provides ssh access to users which are part of Admin group
+# by adding users to AllowUsers list.
+# Arguments:
+#   none
+# Return Values:
+#   none
+admin_ssh_enable()
+{
+insert_header_footer head "Allow ssh access to Privileged users " "${LOGFILE}"
+
+if [ ! -f /ericsson/security/bin/enable_ssh_login.py ]; then
+        _err_msg_="Node Hardening script /ericsson/security/bin/enable_ssh_login.py Not Found."
+        abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+fi	
+
+if [ ! -f $ENIQ_CORE_INST_DIR/bin/eniq_enable_admin_ssh.py ]; then
+        _err_msg_="Enable Admin SSH Script $ENIQ_CORE_INST_DIR/bin/eniq_enable_admin_ssh.py Not Found."
+	abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+else
+        $PYTHON $ENIQ_CORE_INST_DIR/bin/eniq_enable_admin_ssh.py |grep Boolean > ${TEM_DIR}/nh_enable_admin_ssh
+if [ $? -ne 0 ]; then
+	_err_msg_="Error executing enable admin ssh script"
+	abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+fi
+        status=`$CAT ${TEM_DIR}/nh_enable_admin_ssh|$AWK '{print $3}'`
+        for line in `$CAT ${TEM_DIR}/adm_user_details`; do
+            $ECHO $line | $AWK -F "::" '{print $1}'| $AWK -F "=" '{print $2}' >> ${TEM_DIR}/USER_LIST
+        done
+        user_list=`$CAT ${TEM_DIR}/USER_LIST`
+        user_list=`$ECHO $user_list | $TR ' ' ','`
+        if [ "${status}" == 1 ]; then
+        	$ECHO "SSH access allowed to Privileged users: $user_list" | $TEE -a ${LOGFILE}
+	elif [ "${status}" == 0 ]; then
+   		_err_msg_="Failed to allow SSH to Privileged users"
+	        abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+        else
+	        _err_msg_="Error executing enable admin ssh script"
+           	abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+        fi
+fi
+
+$RM -f ${TEM_DIR}/nh_enable_admin_ssh
+
+}
+
+### Function: admin_ssh_disable ###
+#
+# It removes ssh access of users which were part of Admin group
+# by removing users from AllowUsers list.
+# Arguments:
+#   none
+# Return Values:
+#   none
+admin_ssh_disable()
+{
+insert_header_footer head "Remove SSH access of Privileged users " "${LOGFILE}"
+
+if [ ! -f /ericsson/security/bin/remove_privileged_ssh_access.py ]; then
+    _err_msg_="Node Hardening script /ericsson/security/bin/remove_privileged_ssh_access.py Not Found."
+    abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+fi
+
+if [ ! -f $ENIQ_CORE_INST_DIR/bin/eniq_disable_admin_ssh.py ]; then
+        _err_msg_="Disable Privilege User SSH Script $ENIQ_CORE_INST_DIR/bin/eniq_disable_admin_ssh.py Not Found."
+        abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+	else
+        $PYTHON $ENIQ_CORE_INST_DIR/bin/eniq_disable_admin_ssh.py |grep Boolean > ${TEM_DIR}/user_status
+	if [ $? -ne 0 ]; then
+        _err_msg_="Error executing disable privilege user SSH script"
+        abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+	fi
+        status=`$CAT ${TEM_DIR}/user_status|$AWK '{print $3}' | $CUT -c 1`
+		
+	user_list=`$CAT /eniq/admin/etc/user_removal_data.txt`
+	user_list=`$ECHO $user_list | $TR ' ' ','`
+
+if [ "${status}" == 1 ]; then
+                $ECHO "SSH Access Revoked of Privileged Users: $user_list" | $TEE -a ${LOGFILE}
+        elif [ "${status}" == 0 ]; then
+                _err_msg_="Unable to revoke Privileged User SSH Access"
+                abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+        else
+                _err_msg_="Error executing disable privilege user SSH script"
+                abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+        fi
+fi
+
+$RM -f ${TEM_DIR}/user_status
+}
+
+
+
+
+
+### Function: enable_internal_dcuser_ssh_access ###
+#
+# It enables dcuser ssh access internally within Blades
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+enable_internal_dcuser_ssh_access()
+{
+
+if [ "${CURR_SERVER_TYPE}" == "stats_coordinator" ]; then
+insert_header_footer head "Allow inter-server dcuser SSH Access" "${LOGFILE}"
+
+if [ ! -f /ericsson/security/bin/dcuser_ssh_login.py ]; then
+        _err_msg_="Node Hardening script /ericsson/security/bin/dcuser_ssh_login.py Not Found"
+        abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+fi
+
+if [ ! -f $ENIQ_CORE_INST_DIR/bin/eniq_dcuser_enable_ssh.py ]; then
+        _err_msg_="Dcuser SSH Access Script $ENIQ_CORE_INST_DIR/bin/eniq_dcuser_enable_ssh.py Not Found"
+	abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+else
+	$PYTHON $ENIQ_CORE_INST_DIR/bin/eniq_dcuser_enable_ssh.py
+	if [ $? -ne 0 ]; then
+		_err_msg_="Error executing dcuser enable ssh script"
+		abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+	fi
+fi
+fi
+
+}
+
+
+### Function: disable_ssh_access ###
+#
+# It will disable ssh to root and dcuser from External World
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+disable_ssh_access()
+{
+insert_header_footer head "Block SSH access for root and dcuser from external world" "${LOGFILE}"
+
+
+if [ ! -f /ericsson/security/bin/disable_ssh_login.py ]; then
+        _err_msg_="Node Hardening script /ericsson/security/bin/disable_ssh_login.py Not Found"
+        abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+fi
+
+if [ ! -f $ENIQ_CORE_INST_DIR/bin/eniq_disable_ssh_login.py ]; then
+        _err_msg_="No disable root ssh File Found."
+	abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+else
+	$PYTHON $ENIQ_CORE_INST_DIR/bin/eniq_disable_ssh_login.py
+	if [ $? -ne 0 ]; then
+		_err_msg_="Error executing disable root ssh script"
+		abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+	fi
+fi
+
+}
+
+
+### Function: inter_blade_root_ssh_access ###
+#
+# It will disable ssh to root and dcuser from External World
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+inter_blade_root_ssh_access()
+{
+
+
+if [ "${CURR_SERVER_TYPE}" == "stats_coordinator" ]; then
+
+	insert_header_footer head "Allow inter-server Root SSH Access" "${LOGFILE}"
+
+	if [ ! -f /ericsson/security/bin/inter_blade_access.py ]; then
+        	_err_msg_="Node Hardening script /ericsson/security/bin/inter_blade_access.py not found"
+	        abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+	fi
+
+
+	if [ ! -f $ENIQ_CORE_INST_DIR/bin/eniq_inter_blade_ssh.py ]; then
+        	_err_msg_="inter-server Root SSH script $ENIQ_CORE_INST_DIR/bin/eniq_inter_blade_ssh.py Not Found."
+		abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+	else
+		$PYTHON $ENIQ_CORE_INST_DIR/bin/eniq_inter_blade_ssh.py
+		if [ $? -ne 0 ]; then
+			_err_msg_="Error executing inter-server ssh enable script"
+			abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+		fi
+	fi
+fi
+	
+}
+
+### Function: sshd_service_restart ###
+#
+# It will restart sshd service
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+sshd_service_restart()
+{
+
+insert_header_footer head "Restarting SSHD service" "${LOGFILE}"
+if [ ! -f /ericsson/security/bin/sshd_service_restart.py ]; then
+                _err_msg_="Node Hardening SSH service restart script /ericsson/security/bin/sshd_service_restart.py not found"
+                abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+        else
+                $PYTHON /ericsson/security/bin/sshd_service_restart.py
+                if [ $? -ne 0 ]; then
+                        _err_msg_="Error executing SSH service restart script"
+                        abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+                fi
+        fi
+}
+
+
+### Function: rollback_admin_group ###
+#
+# Rollback Admin Group created for Root Dependency Removal
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+rollback_admin_group()
+{
+insert_header_footer head "Entering Rollback Admin Group Stage\n" ${LOGFILE}
+
+if [ ! -f /etc/group.rollbak ]; then
+    $CP -p /etc/group /etc/group.rollbak
+fi
+
+_admin_grp_name_=ENIQ_ADMIN_ROLE
+_grp_check=0
+
+
+log_msg -l ${LOGFILE} -s "Checking whether ${_admin_grp_name_} group present"
+$GETENT group ${_admin_grp_name_} >> /dev/null 2>&1
+    if [ $? -eq 0 ]; then
+	_grp_check=1
+        $ECHO "Group ${_admin_grp_name_} present" 
+    else
+	_err_msg_="No ${_admin_grp_name_} group found"
+	abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+    fi
+   
+
+
+
+if [ ! -f /etc/sudoers.rollbak ]; then
+    $CP -p /etc/sudoers /etc/sudoers.rollbak
+fi
+
+	if [ ${_grp_check} -eq 1 ]; then
+
+		log_msg -l ${LOGFILE} -s "\nChecking whether ${_admin_grp_name_} have Admin Privileges"
+		$GREP -w ${_admin_grp_name_} ${SUDOERS} >> /dev/null 2>&1
+		if [ $? -eq 0 ]; then 
+		    log_msg -l ${LOGFILE} -s "${_admin_grp_name_} have Admin Privileges"
+                	_check_pattern_=`$GREP -w ${_admin_grp_name_} ${SUDOERS}`
+			#$SED -i "/$_check_pattern_/d" ${SUDOERS}
+			$SED -i "/${_admin_grp_name_}/d" ${SUDOERS}
+                if [ $? -eq 0 ]; then
+                	log_msg -l ${LOGFILE} -s "\nRemoved Admin Privileges of ${_admin_grp_name_}"
+                fi
+	else
+		_err_msg_="${_admin_grp_name_} does not have Admin Privileges"
+		#abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+	fi
+fi
+
+#fi
+
+
+
+#Delete Admin group
+        if [ ${_grp_check} -eq 1 ]; then
+                $GROUPDEL ${_admin_grp_name_}
+                if [ $? -eq 0 ]; then
+                $ECHO -e "Removed ${_admin_grp_name_} group" | $TEE -a ${LOGFILE}
+        else
+                _err_msg_="Could not delete ${_admin_grp_name_} group"
+                abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+        fi
+fi
+
+	_update_=1
+
+if [ ${_update_} -eq 1 ]; then
+	insert_header_footer foot "Successfully completed Rollback Admin group stage" ${LOGFILE}
+fi
+
+}
+
+
+### Function: rollback_admin_user ###
+#
+# Rollback Admin users created for Root Dependency Removal
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+rollback_admin_user()
+{
+insert_header_footer head "Entering Rollback Privileged Users Stage\n" ${LOGFILE}
+
+
+	gid=`$CAT /etc/group | $GREP ENIQ_ADMIN_ROLE | $AWK -F":" '{print $3}'`
+	$CAT /etc/passwd | $GREP $gid >${TEM_DIR}/list.txt
+	for line in `$CAT ${TEM_DIR}/list.txt`; do
+	 $ECHO $line | $AWK -F ":" '{print $1}'>>${TEM_DIR}/users.txt
+	done
+
+
+
+for var in `$CAT ${TEM_DIR}/users.txt`; do
+
+	local _user_name_=$var
+	#$ECHO "Name is" ${_user_name_}
+
+	#log_msg -l ${LOGFILE}  -s "\nChecking ${_user_name_} user exist\n"
+	$GETENT passwd ${_user_name_} > /dev/null 2>&1
+    	if [ $? -eq 0 ]; then
+		_user_check_=1
+	        #$ECHO "User ${_user_name_} exist\n" | $TEE -a ${LOGFILE}
+       #else   
+		#$ECHO "User ${_user_name_} does not exist\n" | $TEE -a ${LOGFILE}
+	fi
+
+	if [ ${_user_check_} -eq 1 ]; then
+		$USERMOD -g ${_user_name_} ${_user_name_}
+                $GPASSWD -d ${_user_name_} root > /dev/null 2>&1
+                $GPASSWD -d ${_user_name_} dc5000 > /dev/null 2>&1
+				$GPASSWD -d ${_user_name_} sugroup > /dev/null 2>&1
+		if [ $? -ne 0 ]; then
+		   #$ECHO -e "\n User ${_user_name_} removed from Privileged group\n" | $TEE -a ${LOGFILE}
+		   #log_msg -s "\n User ${_user_name_} added to Admin group" -l ${LOGFILE}				
+	           #else
+		   _err_msg_="Could not remove ${_user_name_} from Privileged group"
+		   abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+        	fi		
+
+       fi
+
+
+done
+
+users=`$CAT ${TEM_DIR}/users.txt`
+users=`$ECHO $users | $TR ' ' ','`
+log_msg -s "\nPrivileged users removed from privileged group : $users" -l ${LOGFILE}
+
+insert_header_footer foot "Successfully completed Rollback Privileged Users stage" ${LOGFILE}
+
+}
+
+### Function: rollback_admin_ssh ###
+#
+# Rollback Admin ssh enabled for Root Dependency Removal
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+rollback_admin_ssh()
+{
+insert_header_footer head "Entering Rollback SSH access Stage\n" ${LOGFILE}
+
+
+if [ ! -f /ericsson/security/bin/ssh_rollback_adminrole.py ]; then
+        _err_msg_="Node Hardening script /ericsson/security/bin/ssh_rollback_adminrole.py Not Found"
+        abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+fi
+
+
+if [ ! -f ${ENIQ_CORE_INST_DIR}/bin/eniq_rollback_admin_ssh.py ]; then
+        _err_msg_="Rollback Admin SSH Script ${ENIQ_CORE_INST_DIR}/bin/eniq_rollback_admin_ssh.py Not Found."
+	abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+else
+        $PYTHON ${ENIQ_CORE_INST_DIR}/bin/eniq_rollback_admin_ssh.py |grep Boolean > /tmp/nh_rollback
+	if [ $? -ne 0 ]; then
+		_err_msg_="Error executing rollback admin ssh script"
+		abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+	fi
+        status=`$CAT /tmp/nh_rollback|$AWK '{print $3}'`
+        gid=`$CAT /etc/group | $GREP ENIQ_ADMIN_ROLE | $AWK -F":" '{print $3}'`
+        $CAT /etc/passwd | $GREP $gid >${TEM_DIR}/list.txt
+        for line in `$CAT ${TEM_DIR}/list.txt`; do
+         $ECHO $line | $AWK -F ":" '{print $1}'>>${TEM_DIR}/users_list_revoke.txt
+        done
+        users=`$CAT ${TEM_DIR}/users_list_revoke.txt`
+        users=`$ECHO $users | $TR ' ' ','`
+        if [ "${status}" == 1 ]; then
+        	$ECHO "Revoked SSH access for users : $users" | $TEE -a ${LOGFILE}
+   		$ECHO "Enabled SSH access for Root and dcuser" | $TEE -a ${LOGFILE}
+        elif [ "${status}" == 0 ]; then
+        	_err_msg_="Rollback SSH access failed"
+        	abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+	else
+   		_err_msg_="Error executing rollback admin ssh script"
+		abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+        fi
+fi
+
+$RM -rf /tmp/nh_rollback
+
+insert_header_footer head "Successfully completed Rollback SSH Access Stage\n" ${LOGFILE}
+
+}
+
+
+
+### Function: check users###
+#
+# Check existing users on SB in case of SB to MB expansion
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+check_users()
+{
+insert_header_footer head "Checking users on $HOST-$TYPE \n" ${LOGFILE}
+
+true >${ENIQ_ADMIN_DIR}/etc/SB_user_list
+
+gid=`$CAT /etc/group | $GREP "ENIQ_ADMIN_ROLE" | $AWK -F ":" '{print $3}'`
+#echo $a
+$CAT /etc/passwd | $GREP $gid >${TEM_DIR}/SB_list.txt
+for line in `$CAT ${TEM_DIR}/SB_list.txt`; do
+ $ECHO $line | $AWK -F ":" '{print $1}'>> ${TEM_DIR}/SB_users.txt
+done
+
+for var in `$CAT ${TEM_DIR}/SB_users.txt`; do
+    user_home=`$CAT /etc/passwd | $GREP -w $var | $AWK -F ":" '{print $6}'`
+    #log_msg -s "Confirming password for user $var "    
+    #log_msg -s "It is recommended to add same password as it exists for user $var on coordinator."
+    #common_get_admin_password ${var}
+    USERPASSWD=`$CAT /etc/shadow | $GREP -w $var | $AWK -F ":" '{print $2}'`
+    $ECHO "name=$var::home=$user_home::user_entry=${USERPASSWD}">>${ENIQ_ADMIN_DIR}/etc/SB_user_list
+
+   
+done
+
+log_msg -s "\nPrivileged users present on $HOST-$TYPE are :" -l ${LOGFILE}
+$CAT ${TEM_DIR}/SB_users.txt
+
+
+}
+
+
+check_feature_enabling()
+{
+
+  $CAT /etc/group | $GREP -w ENIQ_ADMIN_ROLE > /dev/null 2>&1 
+  if [ $? -eq 0 ]; then
+         log_msg -s "\nFeature is enabled on $HOST-$TYPE" -l ${LOGFILE} 
+  else
+     _err_msg_="Feature is not enabled on the server, please enable feature first....."
+     abort_script "${_err_msg_}"
+
+  fi
+
+}
+
+
+check_current_user()
+{
+    _check_id_=`$ID | $AWK -F\( '{print $2}' | $AWK -F\) '{print $1}'`
+	if [ "${_check_id_}" == "root" ]; then
+	     log_msg -s "\nWARNING : Rollback will remove all Admin Privileges and ssh access for the existing Privileged users" 
+		 #log_msg -s "Do you want to proceed with Rollback ENIQ Privileged User Support ? [Yy/Nn]"
+		 #read confirmation
+		 #if [ ${confirmation} == "N" -o ${confirmation} == "n" ]; then
+		    #exit 0
+	     #fi
+		 while :; do
+              clear
+              unset confirmation
+              $ECHO "\nDo you want to proceed with Rollback ENIQ Privileged User Support ? [Yy/Nn]"
+              read confirmation
+              #if user enter nothing loop
+              if [ ! "${confirmation}" ]; then
+                continue
+              fi
+              #must enter value from Y/y/N/n
+              if [ ${confirmation} == "N" ] || [ ${confirmation} == "n" ] || [ ${confirmation} == "Y" ] || [ ${confirmation} == "y" ]; then
+                 if [ ${confirmation} == "N" ] || [ ${confirmation} == "n" ]; then
+                     exit 0
+                 else
+				     break
+			     fi
+              else
+			     continue
+			  fi
+              
+             break
+         done
+	else
+	      _err_msg_="You must be root user to execute this script."
+          abort_script "${_err_msg_}"
+	fi
+
+
+}
+
+
+
+validate_user()
+{
+    _check_id_=`$ID | $AWK -F\( '{print $2}' | $AWK -F\) '{print $1}'`
+        if [ "${_check_id_}" != "root" ]; then
+          _err_msg_="You must be root user to execute this script."
+          abort_script "${_err_msg_}"
+        fi
+}
+
+
+
+### Function: update_user_profile ###
+#
+# Updates roots .profile file
+#
+# Arguments:
+#   $1 : username
+#   $2 : userhome
+# Return Values:
+#   0 : Success
+#   1 : Fail
+update_user_profile()
+{
+
+NAME=$1
+HOME="$2/"
+
+#HOME=/root/
+
+
+if [ -f ${HOME}.bash_profile ]; then
+    $CP ${HOME}.bash_profile ${TEM_DIR}/bash_profile.$$.$$
+    if [ $? -ne 0 ]; then
+        $ECHO "Could not copy ${HOME}.bash_profile to ${TEM_DIR}/bash_profile.$$.$$" | $TEE -a ${LOGFILE}
+        return 1
+    fi
+else
+    $TOUCH ${TEM_DIR}/bash_profile.$$.$$
+    if [ $? -ne 0 ]; then
+        $ECHO "Could not create ${TEM_DIR}/bash_profile.$$.$$" | $TEE -a ${LOGFILE}
+        return 1
+    fi
+fi
+
+local _upd_=0
+if [ "$3" ]; then
+    $CAT ${TEM_DIR}/bash_profile.$$.$$ | $GREP "_server_type_=" >> /dev/null 2>&1
+    if [ $? -ne 0 ]; then
+        $CAT ${TEM_DIR}/bash_profile.$$.$$ | $GREP -v "PS1" >> ${TEM_DIR}/profileinter.$$.$$
+        $CP ${TEM_DIR}/profileinter.$$.$$ ${TEM_DIR}/bash_profile.$$.$$
+        $ECHO "_server_type_=`$CAT /eniq/installation/config/installed_server_type`" >> ${TEM_DIR}/bash_profile.$$.$$
+        $ECHO "PS1=`uname -n`'[`cat /eniq/installation/config/installed_server_type`] '\{`/usr/bin/echo $NAME`\}' #: '" >> ${TEM_DIR}/bash_profile.$$.$$
+        $ECHO "export PS1\n" >> ${TEM_DIR}/bash_profile.$$.$$
+        _upd_=1
+    fi
+else
+    # Set up the .bash_profile file to 
+    # hostname(user)#: as the command prompt
+    $ECHO "# Set up the shell variables:\n" >> ${TEM_DIR}/bash_profile.$$.$$
+    $ECHO "EDITOR=vi" >> ${TEM_DIR}/bash_profile.$$.$$
+    $ECHO "export EDITOR\n" >> ${TEM_DIR}/bash_profile.$$.$$
+    $ECHO "umask 022\n" >> ${TEM_DIR}/bash_profile.$$.$$
+    $ECHO "_server_type_=`$CAT /eniq/installation/config/installed_server_type`" >> ${TEM_DIR}/bash_profile.$$.$$
+    $ECHO "PS1=`uname -n`'[`cat /eniq/installation/config/installed_server_type`] '\{`/usr/bin/echo $NAME`\}' #: '" >> ${TEM_DIR}/bash_profile.$$.$$
+    $ECHO "export PS1\n" >> ${TEM_DIR}/bash_profile.$$.$$
+    _upd_=1
+fi
+
+if [ ${_upd_} -eq 1 ]; then
+    $ECHO "Updating ${HOME}.bash_profile file\n" >> ${LOGFILE}
+    $CP ${TEM_DIR}/bash_profile.$$.$$ ${HOME}.bash_profile
+    if [ $? -ne 0 ]; then
+        $ECHO "Could not copy ${TEM_DIR}/bash_profile.$$.$$ to ${HOME}.bash_profile" | $TEE -a ${LOGFILE}
+        return 1
+    fi
+fi
+
+}
+
+# ********************************************************************
+#
+#   Main body of program
+#
+# ********************************************************************
+#
+
+# Determine absolute path to software
+get_absolute_path
+
+# Set up environment variables for script.
+setup_env
+
+# Check that the effective id of the user is root
+check_id $DEFAULT_USER
+
+#Check IP Type
+check_ip_type
+if [ ! "${_ip_type_}" ]; then
+    _err_msg_="Could not read parameter _ip_type_ from file ${ENIQ_CONF_DIR}/${IPMP_INI}"
+    abort_script "$_err_msg_"
+fi
+
+#Check Ping type
+ping_command=$( check_ping )
+
+TIMESTAMP=`date '+%Y-%b-%d_%H.%M.%S'`
+HOST=`hostname`
+TYPE=`$CAT $ENIQ_CONF_DIR/installed_server_type`
+
+while getopts ":l:a:" arg; do
+  case $arg in
+    l) LOGFILE="$OPTARG"
+       ;;
+    a) EXPANSION="$OPTARG"
+       ;;
+   \?) _err_msg_="`$BASENAME $0` -s <stage>"
+       abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+       ;;
+  esac
+done
+shift `expr $OPTIND - 1`
+
+# Log file
+if [ ! "${LOGFILE}" ]; then
+    $MKDIR -p ${ENIQ_LOG_DIR}/admin_creation
+    LOGFILE="${ENIQ_LOG_DIR}/admin_creation/${HNAME}_admin_create.log"
+fi
+# Create a temporary Directory
+TEM_DIR=/tmp/admin_create.$$.$$
+if [ -d ${TEM_DIR} ]; then
+    $RM -rf ${TEM_DIR}
+    if [ $? -ne 0 ]; then
+        _err_msg_="Could not delete directory $TEM_DIR. Please delete it manually."
+        abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+    fi
+fi
+$MKDIR -p ${TEM_DIR}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not create directory $TEM_DIR"
+    abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+fi
+
+
+if [ "$EXPANSION" != "" ]; then
+   if [ "$EXPANSION" == "expansion"  ]; then
+   log_msg -s "\n================= $TIMESTAMP-Starting ENIQ Privileged User Support feature expansion to Multiblade/Multirack on $HOST-$TYPE  ====================\n" -l ${LOGFILE}
+        check_feature_enabling
+        check_remote_node_harden
+        check_users
+        disable_ssh_access
+    enable_internal_dcuser_ssh_access
+    inter_blade_root_ssh_access
+    sshd_service_restart
+        create_remote_admin_users_expansion
+     log_msg -s "\n================= $TIMESTAMP-Completed ENIQ Privileged User Support feature expansion to Multiblade/Multirack on $HOST-$TYPE  ====================\n" -l ${LOGFILE}
+        exit 0
+fi
+fi
+
+_admin_grp_name_=ENIQ_ADMIN_ROLE
+
+while :; do
+
+#while getopts ":1:2:3:4:" arg; do
+$ECHO "\nAvailable action types\n======================" 
+$ECHO "\n [1]: Enable ENIQ Privileged User Support"
+$ECHO "\n [2]: Privileged User Addition"
+$ECHO "\n [3]: User Privileges Removal"
+$ECHO "\n [4]: Rollback ENIQ Privileged User Support"
+$ECHO "\n [5]: Exit"
+$ECHO "\nSelect the action from above list" 
+#$ECHO "\nEnter the Number from below"
+read _num_
+
+  case $_num_ in
+    1) 
+   $ECHO "\nEnable ENIQ Privileged User Support Selected\n"
+   break
+       ;;
+    2) 
+       $ECHO "\nPrivileged User Addition Selected"
+   break
+   ;;
+    3)
+       $ECHO "\nUser Privileges Removal Selected"
+   break
+   ;;
+    4) 
+   $ECHO "\nRollback ENIQ Privileged User Support Selected" 
+       break
+   ;;
+   5)
+        $ECHO "\nExit"
+   break
+   abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+   ;;
+?)
+$ECHO "\nInvalid Option,try agian" 
+continue
+#abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+   ;;
+*)
+  $ECHO "Invalid Option" 
+  continue
+      #abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+  ;;  
+  esac
+done
+
+if [ "${_num_}" == 1 ]; then
+	log_msg -s "\n================= $TIMESTAMP-Enabling ENIQ Privileged User Support feature on $HOST-$TYPE  ====================\n" -l ${LOGFILE}
+	check_remote_node_harden
+	create_admin_group
+	create_admin_user
+	generate_admin_user_keys
+    admin_ssh_enable
+    disable_ssh_access
+    enable_internal_dcuser_ssh_access
+    inter_blade_root_ssh_access
+    sshd_service_restart
+    log_msg -s "\n================= $TIMESTAMP-Successfully enabled ENIQ Privileged User Support feature on $HOST-$TYPE  ====================\n" -l ${LOGFILE}
+    create_remote_admin_users
+fi
+
+
+if [ "${_num_}" == 2 ]; then
+    log_msg -s "\n================= $TIMESTAMP-Starting Privileged User Addition on $HOST-$TYPE  ====================\n" -l ${LOGFILE}
+    #check_feature_enabling
+    check_remote_feature_enable
+	create_admin_user
+	generate_admin_user_keys
+    admin_ssh_enable
+    sshd_service_restart
+    log_msg -s "\n================= $TIMESTAMP-Successfully completed Privileged User Addition on $HOST-$TYPE  ====================\n" -l ${LOGFILE}
+    add_remote_admin_users
+	
+fi
+
+
+if [ "${_num_}" == 3 ]; then
+    log_msg -s "\n================= $TIMESTAMP-Starting User Privileges Removal on $HOST-$TYPE  ====================\n" -l ${LOGFILE}
+	#check_feature_enabling
+        check_remote_feature_enable
+	delete_admin_user
+	admin_ssh_disable
+	sshd_service_restart
+        log_msg -s "\n================= $TIMESTAMP-Successfully completed User Privileges Removal on $HOST-$TYPE  ====================\n" -l ${LOGFILE}
+	delete_remote_admin_users
+	$RM -rf ${ENIQ_ADMIN_DIR}/etc/user_removal_data.txt
+#exit 0
+fi
+
+
+if [ "${_num_}" == 4 ]; then
+    check_current_user
+    log_msg -s "\n================= $TIMESTAMP-Starting Rollback ENIQ Privileged User Support on $HOST-$TYPE  ====================\n" -l ${LOGFILE}
+    #check_current_user
+    #check_feature_enabling
+    check_remote_feature_enable
+    rollback_admin_ssh
+    rollback_admin_user
+    rollback_admin_group
+    sshd_service_restart
+    $RM -rf ${ENIQ_ADMIN_DIR}/etc/ADMIN_USER_DETAILS
+    log_msg -s "\n================= $TIMESTAMP-Successfully completed Rollback ENIQ Privileged User Support on $HOST-$TYPE  ====================\n" -l ${LOGFILE}	
+    rollback_remote_admin_users
+fi
+
+if [ "${_num_}" == 5 ]; then
+exit 0
+fi
+
+$RM -rf ${ENIQ_ADMIN_DIR}/etc/admin_user_list
+$RM -rf ${ENIQ_ADMIN_DIR}/admin/etc/SB_user_list
+$RM -rf ${TEM_DIR}
+
+
+exit 0
+
+
+
+
+
+
+

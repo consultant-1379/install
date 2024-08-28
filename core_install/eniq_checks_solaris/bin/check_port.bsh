@@ -1,0 +1,352 @@
+#!/bin/bash
+# ********************************************************************
+# Ericsson Radio Systems AB                                     SCRIPT
+# ********************************************************************
+# (c) Ericsson Radio Systems AB 2016 - All rights reserved.
+#
+# The copyright to the computer program(s) herein is the property
+# of Ericsson Radio Systems AB, Sweden. The programs may be used
+# and/or copied only with the written permission from Ericsson Radio
+# Systems AB or in accordance with the terms and conditions stipulated
+# in the agreement/contract under which the program(s) have been
+# supplied.
+#
+# ********************************************************************
+# Name    : check_port.bsh
+# Date    : 10/05/2016 
+# Revision: B 
+# Purpose : Script to check if Port is Established
+# Usage   : ./check_port.bsh
+# Exit Values: 
+#     0   : Success
+#     3   : Failure : Script Aborted
+#    15   : No Run  : Config file unavailable
+#   105   : Failure : Port not Established
+#   205   : Warning : Some Ports are not Established
+# ********************************************************************
+#
+#   Command Section
+#
+# ********************************************************************
+AWK=/usr/bin/awk
+CAT=/usr/bin/cat
+DATE=/usr/bin/date
+ECHO=/usr/bin/echo
+GREP=/usr/bin/grep
+EGREP=/usr/bin/egrep
+ID=/usr/bin/id
+MKDIR=/usr/bin/mkdir
+RM=/usr/bin/rm
+LS==/usr/bin/ls
+TEE=/usr/bin/tee
+TOUCH=/usr/bin/touch
+NETSTAT=/usr/bin/netstat
+# ********************************************************************
+#                                                                    *
+#                     Functions                                      *
+#                                                                    *
+# ********************************************************************
+### Function: abort_script 
+#                                                                     
+#   This will be called if the script is aborted through an error        
+#   encountered during runtime                               
+#                                                                     
+# Arguments:                                                          
+#       $1 - Error message from part of program     
+# Return Values:                                                      
+#       none                                                          
+#
+abort_script()
+{
+_err_time_=`$DATE '+%Y-%b-%d_%H.%M.%S'`
+
+if [ "$1" ]; then
+    _err_msg_="${_err_time_} - $1"
+else
+    _err_msg_="${_err_time_} - ERROR : Script aborted.......\n"
+fi
+if [ "${LOGFILE}" ]; then
+    $ECHO "\nERROR : ${_err_msg_}\n" | $TEE -a ${LOGFILE}
+else
+    $ECHO "\nERROR : ${_err_msg_}\n"
+fi
+exit 3 
+}
+### Function: check_id ###
+#
+#   Check that the effective id of the user is correct
+#   If not print error msg and exit.
+#
+# Arguments:
+#       $1 : User ID name
+# Return Values:
+#       none
+#
+check_id()
+{
+local _check_id_=`$ID  | $AWK -F\( '{print $2}' | $AWK -F\) '{print $1}'`
+
+if [ "$_check_id_" != "$1" ]; then
+    _err_msg_="You must be $1 to execute this script."
+    abort_script "$_err_msg_"
+fi
+}
+### Function: check_create_logfile ###
+#
+# Checks presence/creation of Logfile
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+#
+check_create_logfile()
+{
+if [ -s $LOGFILE ]; then
+    $RM -rf $LOGFILE
+    if [ -f $LOGFILE ]; then
+        _err_msg_="Warning : Could not remove older ${LOGFILE}"
+        abort_script "$_err_msg_"
+    fi
+fi
+
+if [ ! -d  ${ENIQ_PRECHECK_LOG_DIR} ]; then
+    ${MKDIR} -p ${ENIQ_PRECHECK_LOG_DIR}
+    if [ $? -ne 0 ]; then 
+        _err_msg_="Could not create ${ENIQ_PRECHECK_LOG_DIR}"
+        abort_script "$_err_msg_"
+    fi
+fi
+
+$TOUCH -a ${LOGFILE}
+if [ $? -ne 0 ]; then 
+    _err_msg_="Could not create ${LOGFILE}"
+    abort_script "$_err_msg_"
+fi
+
+$CHMOD 640 ${LOGFILE}
+if [ $? -ne 0 ]; then 
+    _err_msg_="Could not change the permissions of the ${LOGFILE}"
+    abort_script "$_err_msg_"
+fi
+
+}
+### Function: check_port ###
+#
+# Checks if Port is Established or not 
+#
+# Arguments:
+#       None
+#Return values:
+#    0     : All Ports are Established
+#    105   : Port is not Established
+#    205   : Some Ports are not Established
+#
+check_port()
+{
+if [ -f ${SCRIPT_PATH} ]; then
+_tmp_config_file=/tmp/config_check_port
+$CAT $SCRIPT_PATH | $GREP -v "^#" | $GREP ^CHECK_PORT >$_tmp_config_file
+#Flag to check Failure scenario for Port
+flag_1=0;
+#Flag to check Warning scenario for Port
+flag_2=0;
+
+log_msg -s "\n" -l ${LOGFILE}
+log_msg -s "-------------------------------------------------------------------------------------------\n" -l ${LOGFILE}
+
+while read -u10 line
+do
+   _parameter_=`$ECHO ${line} | $NAWK -F":" '{print $1}'`
+   _blade_type=`$ECHO ${line} | $NAWK -F":" '{print $2}'`
+   _port_name=`$ECHO ${line} | $NAWK -F":" '{print $3}'`
+   _port_number=`$ECHO ${line} | $NAWK -F":" '{print $4}'`
+      
+    if [ "${_blade_type}" == "Coordinator" ]; then
+       $NETSTAT -an | $GREP *.${_port_number} | $EGREP 'LISTEN|ESTABLISHED' 
+       if [ $? == 0 ]; then
+          log_msg -q -s "SUCCESS: "${_port_name}" Port ${_port_number} is in Established or Listening state on "${_blade_type}" blade " -l ${LOGFILE} 
+       else
+          if [ ${_port_name} == "MZ_GUI" -o ${_port_name} == "MZ_PLATFORM_MONITOR" ]; then
+             log_msg -q -s "WARNING: "${_port_name}" Port ${_port_number} is not Established on "${_blade_type}" blade " -l ${LOGFILE}
+             flag_2=1
+          else
+             log_msg -q -s "ERROR: "${_port_name}" Port ${_port_number} is not Established on "${_blade_type}" blade " -l ${LOGFILE}
+             flag_1=1
+          fi
+       fi
+   fi
+   if [ "${_blade_type}" == "Reader" ]; then
+      $LS /eniq/installation/config/ | $GREP installed_server_type >>/dev/null 2>&1
+      if [ $? == 0 ]; then
+         $CAT /eniq/installation/config/installed_server_type | $GREP _coordinator >>/dev/null 2>&1
+         if [ $? == 0 ]; then
+            _count=`$CAT /etc/hosts | $GREP dwh_reader_* | wc -l`
+            if [ _count == 0 ]; then
+               log_msg -q -s "INFO : Reader Blade is not configured" -l ${LOGFILE}
+            else
+               i=1;
+               while [ "$i" -le "$_count" ]; 
+               do
+               run_remote_cmd "dwh_reader_$i" "$NETSTAT -an | $GREP *.${_port_number} | $EGREP 'LISTEN|ESTABLISHED'"
+               if [ $? == 0 ]; then
+                  log_msg -q -s "SUCCESS: "${_port_name}" Port ${_port_number} is in Established or Listening state on "dwh_reader_$i" blade" -l ${LOGFILE}
+               else
+                  log_msg -q -s "WARNING: "${_port_name}" Port ${_port_number} is not Established on "dwh_reader_$i" blade" -l ${LOGFILE}
+                  flag_2=1
+               fi
+               i=$(($i+1))
+               done
+            fi
+         fi
+      else
+         log_msg -q -s "WARNING: "/eniq/installation/config/installed_server_type" file missing, this is required to check ${_port_name} Port ${_port_number}" -l ${LOGFILE}
+         flag_2=1
+      fi
+   fi   
+   if [ "${_blade_type}" == "Mediation" ]; then
+      _count=`$CAT /etc/hosts | $GREP ec_st_* | wc -l`
+      if [ _count == 0 ]; then
+         log_msg -q -s "INFO : Streaming Blade is not configured" -l ${LOGFILE}
+      else
+         i=1;
+         while [ "$i" -le "$_count" ]; 
+         do
+         $CAT /eniq/mediation_inter/M_E_CTRS/etc/ctrs.prop | $EGREP "ctr_ports_ec_st_$i|ctum_ports_ec_st_$i" | $GREP ${_port_number} >>/dev/null  2>&1
+         if [ $? == 0 ]; then
+            run_remote_cmd "ec_st_$i" "$NETSTAT -an | $GREP *.${_port_number} | $EGREP 'LISTEN|ESTABLISHED'"
+            if [ $? == 0 ]; then
+               log_msg -q -s "SUCCESS: "${_port_name}" Port ${_port_number} is in Established or Listening state on "${_blade_type}" blade having ec_st_$i" -l ${LOGFILE}
+            else
+               log_msg -q -s "WARNING: "${_port_name}" Port ${_port_number} is not Established on "${_blade_type}" blade having ec_st_$i" -l ${LOGFILE}
+               flag_2=1
+            fi
+         else
+            log_msg -q -s "INFO: "${_port_name}" Port ${_port_number} is not Configured on "${_blade_type}" blade having ec_st_$i" -l ${LOGFILE}
+         fi
+         i=$(($i+1))
+         done
+      fi
+   fi
+
+done 10< $_tmp_config_file 
+$RM -rf $_tmp_config_file 
+
+else
+  log_msg -s "WARNING: ${SCRIPT_PATH} file missing, this is required for this script!!!!" -l ${LOGFILE}
+  exit 15
+fi
+
+log_msg -s "\n" -l ${LOGFILE}
+log_msg -s "-------------------------------------------------------------------------------------------\n" -l ${LOGFILE}
+
+if [ ${flag_1} -ne 0 ]; then
+   RET_CODE=105
+elif
+   [ ${flag_2} -ne 0 ]; then
+   RET_CODE=205
+else
+   RET_CODE=0
+fi
+
+}
+### Function: setup_env ###
+#
+# Setup path environment
+# Imports the common lib files which imports common functions 
+# 
+# Arguments:
+#   none
+# Return Values:
+#   none
+#
+setup_env()
+{
+if [ ! "${ENIQ_BASE_DIR}" ]; then 
+   ENIQ_BASE_DIR=/eniq
+fi
+
+# Main Directory for the Core Installation SW
+ENIQ_INST_DIR=${ENIQ_BASE_DIR}/installation
+
+#Installation lib directory
+ENIQ_LIB_DIR=${ENIQ_INST_DIR}/core_install/lib
+
+#Common function directory
+COMMON_FUNCS_LIB=${ENIQ_LIB_DIR}/common_functions.lib
+
+# Precheck logs directory
+ENIQ_PRECHECK_LOG_DIR=${ENIQ_BASE_DIR}/local_logs/precheck_logs
+
+#ENIQ config directory
+ENIQ_CONF_DIR=/eniq/installation/config/
+
+# Ericsson config file path
+ERICSSON_USE_CONFIG=${ENIQ_CONF_DIR}/ericsson_use_config
+
+# Events_checks config file
+EVENTS_CHECK_CONFIG=${ENIQ_INST_DIR}/core_install/eniq_checks/config/precheck_events.cfg
+
+# Stats_checks config file
+STATS_CHECK_CONFIG=${ENIQ_INST_DIR}/core_install/eniq_checks/config/precheck_stats.cfg
+
+# Logfile path
+LOGFILE=${ENIQ_PRECHECK_LOG_DIR}/port_check.log
+
+# Return code declaration
+RET_CODE=0 
+
+#Imports the common library functions
+if [ ! -f "${COMMON_FUNCS_LIB}" ]; then
+    _err_msg_="${COMMON_FUNCS_LIB} missing, this is required for this script, exiting!!!!"
+    abort_script "${_err_msg_}"
+fi
+
+. ${COMMON_FUNCS_LIB}
+
+if [ $? -ne 0 ]; then
+    _err_msg_="Importing functions of ${COMMON_FUNCS_LIB} failed, exiting!!!!"
+    abort_script "${_err_msg_}"
+fi
+}
+#Check Server Type
+check_server_type()
+{
+if [ ! -f "${ERICSSON_USE_CONFIG}" ]; then
+   log_msg -s "WARNING: ${ERICSSON_USE_CONFIG} file missing, this is required for this script, exiting!!!!" -l ${LOGFILE}
+   exit 15
+fi
+
+server=`$CAT $ERICSSON_USE_CONFIG | $CUT -d "=" -f2`
+if [[ $server == "stats" ]]; then
+   SCRIPT_PATH="${STATS_CHECK_CONFIG}"
+ elif [[ $server == "events" ]]; then
+   SCRIPT_PATH=${EVENTS_CHECK_CONFIG}
+fi
+}
+# ********************************************************************
+#
+#       Main body of program
+#
+# ********************************************************************
+
+# Default user
+DEFAULT_USER=root
+
+# Check that the effective id of the user is root
+check_id $DEFAULT_USER
+
+# Set up environment variables for script.
+setup_env
+
+# Check/Create Logfile
+check_create_logfile
+
+#Set SCRIPT_PATH
+check_server_type
+
+#Check for the Port
+check_port
+log_msg -t -s "ENIQ check for Port completed" -l ${LOGFILE}
+log_msg -t -s "Check log $LOGFILE\n"
+exit $RET_CODE

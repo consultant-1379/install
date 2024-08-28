@@ -1,0 +1,1478 @@
+#!/bin/bash
+# ********************************************************************
+# Ericsson Radio Systems AB                                     SCRIPT
+# ********************************************************************
+# Ericsson Radio Systems AB 2020 - All rights reserved.
+#
+# The copyright to the computer program(s) herein is the property
+# of Ericsson Radio Systems AB, Sweden. The programs may be used
+# and/or copied only with the written permission from Ericsson Radio
+# Systems AB or in accordance with the terms and conditions stipulated
+# in the agreement/contract under which the program(s) have been
+# supplied.
+#
+# ********************************************************************
+#
+# Name    : temp_db_expansion.bsh
+# Date    : 15/07/2022
+# Revision: \main\7
+# Purpose : Main wrapper script handling the TEMP DB expansion/addition on RHEL
+# Usage   : temp_db_expansion.bsh
+#
+# ********************************************************************
+#
+#   Command Section
+#
+# ********************************************************************
+AWK=/usr/bin/awk
+BASENAME=/usr/bin/basename
+BASH=/usr/bin/bash
+CAT=/usr/bin/cat
+CHMOD=/usr/bin/chmod
+CHOWN=/usr/bin/chown
+CUT=/usr/bin/cut
+DATE=/usr/bin/date
+DIRNAME=/usr/bin/dirname
+ECHO='/usr/bin/echo -e'
+EGREP=/usr/bin/egrep
+EXPR=/usr/bin/expr
+GETENT=/usr/bin/getent
+GREP=/usr/bin/grep
+HEAD=/usr/bin/head
+ID=/usr/bin/id
+MYHOSTNAME=/usr/bin/hostname
+MKDIR=/usr/bin/mkdir
+PERL=/usr/bin/perl
+RM=/usr/bin/rm
+SED=/usr/bin/sed
+SORT=/usr/bin/sort
+WC=/usr/bin/wc
+# ********************************************************************
+#
+#       Configuration Section
+#
+# ********************************************************************
+
+# Default user
+DEFAULT_USER=root
+
+# Cmd to exec a shell and drop user to it in case of an error
+EXEC_SHELL_CMD="exec /bin/bash -o emacs"
+
+# Name of the ini Files
+SUNOS_INI=SunOS.ini
+ENIQ_INI=niq.ini
+SYM_LINKS_INI=sym_links.ini
+CO_SYM_LINKS_INI=coordinator_sym_links.ini
+LUN_MAP_INI=lun_map.ini
+
+# ********************************************************************
+#
+#   Functions
+#
+# ********************************************************************
+### Function: abort_script ###
+#
+#   This will be called if the script is aborted by an error
+#   which is encountered during runtime
+#
+# Arguments:
+#       $1 - Error message from part of program (Not always used)
+# Return Values:
+#       none
+abort_script()
+{
+_err_time_=`$DATE '+%Y-%b-%d_%H.%M.%S'`
+
+if [ "$1" ]; then
+    _err_msg_="${_err_time_} - $1"
+else
+    _err_msg_="${_err_time_} - ERROR : Script aborted.......\n"
+fi
+
+if [ "${LOGFILE}" ]; then
+    $ECHO "\nERROR : ${_err_msg_}\n" | $TEE -a ${LOGFILE}
+else
+    $ECHO "\nERROR : ${_err_msg_}\n"
+fi
+
+$RM -rf ${TEM_DIR}
+$RM -rf ${CONN_STR_USER_DBA_ENC_}
+$RM -rf ${_CONN_STR_USER_DBA_RD_ENC}
+
+#Restoring original the stagefile
+if [ -f ${ENIQ_CORE_INST_DIR}/etc/eniq_linux_temp_db_expansion_stagelist_orig ]; then
+    $MV ${ENIQ_CORE_INST_DIR}/etc/eniq_linux_temp_db_expansion_stagelist_orig ${ENIQ_CORE_INST_DIR}/etc/eniq_linux_temp_db_expansion_stagelist
+    if [ $? -ne 0 ]; then
+        _err_msg_="Failed to restore ${ENIQ_CORE_INST_DIR}/etc/eniq_linux_temp_db_expansion_stagelist"
+        abort_script "${_err_msg_}"
+    fi
+fi
+
+exit 1
+}
+
+### Function: add_device_to_IQ_CO ###
+#
+# Adds TEMP DB devices to SAP IQ on Standalone/CO
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+add_device_to_IQ_CO()
+{
+log_msg -t -s "Adding devices to SAP IQ on ${HNAME}" -l ${LOGFILE}
+log_msg -t -s "$SU - $SYSUSER -c \"bash ${ENIQ_CORE_INST_DIR}/bin/add_temp_dbspaces.bsh -c ${ENIQ_CONF_DIR} -d ${ENIQ_CONF_DIR}/${ENIQ_INI} -s ${ENIQ_CONF_DIR}/${SYM_LINKS_INI} -l ${LOGFILE}\"\n" -l ${LOGFILE}
+$SU - $SYSUSER -c "$BASH ${ENIQ_CORE_INST_DIR}/bin/add_temp_dbspaces.bsh -c ${ENIQ_CONF_DIR} -d ${ENIQ_CONF_DIR}/${ENIQ_INI} -s ${ENIQ_CONF_DIR}/${SYM_LINKS_INI} -l ${LOGFILE}"
+if [ $? -ne 0 ];then
+    _err_msg_="Failed to add devices to SAP IQ on ${HNAME}"
+    abort_script "${_err_msg_}"
+fi
+
+# Check if devices are added to SAP IQ
+log_msg -t -s "Getting path details for TEMP DBfiles from sym_links.ini file on ${HNAME}" -l ${LOGFILE}
+_TEMP_DBSPACE_=`iniget DWH_DBSPACES_TEMP -f ${ENIQ_CONF_DIR}/${SYM_LINKS_INI}`
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not read DWH_DBSPACES_TEMP from ${ENIQ_CONF_DIR}/${SYM_LINKS_INI}"
+    abort_script "${_err_msg_}"
+fi
+
+for _temp_db_ in ${_TEMP_DBSPACE_}; do 
+    iniget ${_temp_db_} -f ${ENIQ_CONF_DIR}/${SYM_LINKS_INI} -v Path >> ${VAR_TMP_DIR}/paths_of_temp_dbs_symlink_ini.txt
+    if [ $? -ne 0 ]; then
+        _err_msg_="Could not read TEMP DBspaces path details from ${ENIQ_CONF_DIR}/${SYM_LINKS_INI}"
+        abort_script "${_err_msg_}"
+    fi
+done
+
+log_msg -t -s "Getting path details for TEMP DBfiles from database on ${HNAME}" -l ${LOGFILE}
+$SU - $SYSUSER -c "${IQDIR}/bin64/dbisql -nogui -onerror exit @${CONN_STR_USER_DBA_ENC_} \"select Path from sp_iqfile() where DBSpaceName='IQ_SYSTEM_TEMP';OUTPUT TO ${VAR_TMP_DIR}/paths_of_temp_dbs_database.txt\"" >> ${LOGFILE}
+if [ $? -ne 0 ];then
+    _err_msg_="Failed to read path details for TEMP DBfiles from database on ${HNAME}"
+    abort_script "${_err_msg_}"
+fi
+$SED -i "s/'//g" ${VAR_TMP_DIR}/paths_of_temp_dbs_database.txt
+if [ $? -ne 0 ];then
+    _err_msg_="Failed to remove extra characters from ${VAR_TMP_DIR}/paths_of_temp_dbs_database.txt"
+    abort_script "${_err_msg_}"
+fi
+
+log_msg -t -s "Checking if TEMP DBfile is added to SAP IQ on ${HNAME}" -l ${LOGFILE}
+for _path_ in `$CAT ${VAR_TMP_DIR}/paths_of_temp_dbs_symlink_ini.txt`; do
+    $GREP -w ${_path_} ${VAR_TMP_DIR}/paths_of_temp_dbs_database.txt >> /dev/null 2>&1
+    if [ $? -ne 0 ];then
+        _err_msg_="TEMP DBfile - ${_path_} is not added to SAP IQ"
+        abort_script "${_err_msg_}"
+    fi
+done
+log_msg -t -s "TEMP DBfiles are added to SAP IQ on ${HNAME}" -l ${LOGFILE}
+}
+
+### Function: add_device_to_IQ_RD ###
+#
+# Adds TEMP DB devices to SAP IQ on Reader(s)
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+add_device_to_IQ_RD()
+{
+log_msg -t -s "Adding devices to SAP IQ on ${HNAME}" -l ${LOGFILE}
+log_msg -t -s "$SU - $SYSUSER -c \"bash ${ENIQ_CORE_INST_DIR}/bin/add_reader_temp_dbspace.bsh -c ${ENIQ_CONF_DIR} -d ${ENIQ_CONF_DIR}/${ENIQ_INI} -s ${ENIQ_CONF_DIR}/${SYM_LINKS_INI} -l ${LOGFILE}\"\n" -l ${LOGFILE}
+$SU - $SYSUSER -c "$BASH ${ENIQ_CORE_INST_DIR}/bin/add_reader_temp_dbspace.bsh -c ${ENIQ_CONF_DIR} -d ${ENIQ_CONF_DIR}/${ENIQ_INI} -s ${ENIQ_CONF_DIR}/${SYM_LINKS_INI} -l ${LOGFILE}"
+
+if [ $? -ne 0 ];then
+    _err_msg_="Failed to add devices to SAP IQ on ${HNAME}"
+    abort_script "${_err_msg_}"
+fi
+
+# Check if devices are added to SAP IQ
+log_msg -t -s "Getting path details for TEMP DBfiles from sym_links.ini file on ${HNAME}" -l ${LOGFILE}
+_TEMP_DBSPACE_=`iniget DWH_DBSPACES_TEMP -f ${ENIQ_CONF_DIR}/${SYM_LINKS_INI}`
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not read DWH_DBSPACES_TEMP from ${ENIQ_CONF_DIR}/${SYM_LINKS_INI}"
+    abort_script "${_err_msg_}"
+fi
+
+for _temp_db_ in ${_TEMP_DBSPACE_}; do 
+    iniget ${_temp_db_} -f ${ENIQ_CONF_DIR}/${SYM_LINKS_INI} -v Path >> ${VAR_TMP_DIR}/paths_of_temp_dbs_symlink_ini.txt
+    if [ $? -ne 0 ]; then
+        _err_msg_="Could not read TEMP DBspaces path details from ${ENIQ_CONF_DIR}/${SYM_LINKS_INI}"
+        abort_script "${_err_msg_}"
+    fi
+done
+
+log_msg -t -s "Getting path details for TEMP DBfiles from database on ${HNAME}" -l ${LOGFILE}
+$SU - $SYSUSER -c "${IQDIR}/bin64/dbisql -nogui -onerror exit @${_CONN_STR_USER_DBA_RD_ENC} \"select Path from sp_iqfile() where DBSpaceName='IQ_SYSTEM_TEMP';OUTPUT TO ${VAR_TMP_DIR}/paths_of_temp_dbs_database.txt\"" >> ${LOGFILE}
+if [ $? -ne 0 ];then
+    _err_msg_="Failed to read path details for TEMP DBfiles from database on ${HNAME}"
+    abort_script "${_err_msg_}"
+fi
+$SED -i "s/'//g" ${VAR_TMP_DIR}/paths_of_temp_dbs_database.txt
+if [ $? -ne 0 ];then
+    _err_msg_="Failed to remove extra characters from ${VAR_TMP_DIR}/paths_of_temp_dbs_database.txt"
+    abort_script "${_err_msg_}"
+fi
+
+log_msg -t -s "Checking if TEMP DBfile is added to SAP IQ on ${HNAME}" -l ${LOGFILE}
+for _path_ in `$CAT ${VAR_TMP_DIR}/paths_of_temp_dbs_symlink_ini.txt`; do
+    $GREP -w ${_path_} ${VAR_TMP_DIR}/paths_of_temp_dbs_database.txt >> /dev/null 2>&1
+    if [ $? -ne 0 ];then
+        _err_msg_="TEMP DBfiles - ${_path_} is not added to SAP IQ"
+        abort_script "${_err_msg_}"
+    fi
+done
+log_msg -t -s "TEMP DBfiles are added to SAP IQ on ${HNAME}" -l ${LOGFILE}
+}
+
+### Function: add_temp_luns ###
+#
+# Adds TEMP LUNs to the server
+#
+# Arguments: none
+#
+# Return Values: none
+add_temp_luns()
+{
+insert_header_footer head "Entering TEMP DB Expansion stage - ${NEXT_STAGE} on ${HNAME}" ${LOGFILE}
+if [ -s ${VAR_TMP_DIR}/${NEXT_STAGE}_no_disk_success -o -s ${VAR_TMP_DIR}/${NEXT_STAGE}_none_success ]; then
+    insert_header_footer foot "Skipping TEMP DB Expansion stage - ${NEXT_STAGE} as it is already completed on ${HNAME}" ${LOGFILE}
+    execute_stages_on_secondary_nodes "add_temp_luns update_symlinks_ini"
+    _skip_flag_=1
+    NEXT_STAGE="cleanup"
+    cleanup
+elif [ ! -s ${VAR_TMP_DIR}/${NEXT_STAGE}_success ]; then
+    if [ "${CO_SERVER}" == "YES" ]; then
+        # Stop all ENIQ services
+        start_stop_eniq_services "stop" "ALL"
+
+        # Start the DWHDB service
+        start_stop_eniq_services "start" "eniq-dwhdb"
+    fi
+
+    # Add TEMP LUNs to system files
+    log_msg -t -s "Adding TEMP LUNs to system files on ${HNAME}" -l ${LOGFILE}
+    log_msg -t -s "bash ${ENIQ_CORE_INST_DIR}/bin/get_disk_info.bsh -i stats -l ${LOGFILE} -t raw -e -T\n" -l ${LOGFILE}
+    $BASH ${ENIQ_CORE_INST_DIR}/bin/get_disk_info.bsh -i stats -l ${LOGFILE} -t raw -e -T
+    if [ $? -ne 0 ]; then
+        _err_msg_="Failed to add TEMP LUNs to system files on ${HNAME}"
+        abort_script "${_err_msg_}"
+    fi
+
+    if [ -f ${VAR_TMP_DIR}/selected_disks ]; then
+        _count_=`$CAT ${VAR_TMP_DIR}/selected_disks | $WC -l`
+        if [ $? -ne 0 ]; then
+            _err_msg_="Failed to get the count of TEMP DB disks selected for expansion/addition on ${HNAME}"
+            abort_script "${_err_msg_}"
+        fi
+    else
+        _err_msg_="Could not find the file ${VAR_TMP_DIR}/selected_disks on ${HNAME}"
+        abort_script "${_err_msg_}"
+    fi
+
+    if [ ${_count_} -eq 0 ]; then
+        while :; do
+            $ECHO "\n\nThere are no disks to select for TEMP DB addition on ${HNAME}"
+            $ECHO -e "Do you want to continue? (Yy/Nn)"
+            read _user_conf_
+        
+            # If the User hit nothing and there is a default. that will do
+            if [ ! "${_user_conf_}" ]; then
+                continue
+            fi
+        
+            # Did the user input (Y/y/N/n)
+            if [ "${_user_conf_}" == "Y" -o "${_user_conf_}" == "y" ]; then
+                break
+            elif [ "${_user_conf_}" == "N" -o "${_user_conf_}" == "n" ]; then
+                break
+            else
+                :
+            fi
+        done
+        if [ "${_user_conf_}" == "Y" -o "${_user_conf_}" == "y" ]; then
+            insert_header_footer foot "Successfully completed - ${NEXT_STAGE} on ${HNAME}" ${LOGFILE}
+            $ECHO "Successfully completed - ${NEXT_STAGE} on ${HNAME}" > ${VAR_TMP_DIR}/${NEXT_STAGE}_no_disk_success
+            execute_stages_on_secondary_nodes "add_temp_luns update_symlinks_ini"
+            _skip_flag_=1
+            NEXT_STAGE="cleanup"
+            cleanup
+        elif [ "${_user_conf_}" == "N" -o "${_user_conf_}" == "n" ]; then
+            $RM -rf ${STAGEFILE}
+            $RM -rf ${VAR_TMP_DIR}/prerequisites_vnx_to_unity_success
+            $RM -rf ${VAR_TMP_DIR}/partition_new_temp_luns_success
+            abort_script
+        fi
+    else
+        $CAT ${VAR_TMP_DIR}/selected_disks | $GREP -w "None" >> /dev/null 2>&1
+        if [ $? -eq 0 ]; then
+            log_msg -t -s "User has selected 'None' during TEMP DB disks selection. Skipping Temp DB addition" -l ${LOGFILE}
+            insert_header_footer foot "Successfully completed - ${NEXT_STAGE} on ${HNAME}" ${LOGFILE}
+            $ECHO "Successfully completed - ${NEXT_STAGE} on ${HNAME}" > ${VAR_TMP_DIR}/${NEXT_STAGE}_none_success
+            execute_stages_on_secondary_nodes "add_temp_luns update_symlinks_ini"
+            _skip_flag_=1
+            NEXT_STAGE="cleanup"
+            cleanup
+        else
+            insert_header_footer foot "Successfully completed - ${NEXT_STAGE} on ${HNAME}" ${LOGFILE}
+            $ECHO "Successfully completed - ${NEXT_STAGE} on ${HNAME}" > ${VAR_TMP_DIR}/${NEXT_STAGE}_success
+            set_next_stage `$EXPR ${ARRAY_ELEM}+1`
+        fi
+    fi
+else
+    insert_header_footer foot "Skipping TEMP DB Expansion stage - ${NEXT_STAGE} as it is already completed on ${HNAME}" ${LOGFILE}
+    set_next_stage `$EXPR ${ARRAY_ELEM}+1`
+fi
+}
+
+### Function: check_absolute_path ###
+#
+# Determine absolute path to software
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+check_absolute_path()
+{
+_dir_=`$DIRNAME $0`
+SCRIPTHOME=`cd ${_dir_} 2>/dev/null && pwd || $ECHO ${_dir_}`
+}
+
+### Function: check_id ###
+#
+#   Check that the effective id of the user is correct
+#   If not print error msg and exit.
+#
+# Arguments:
+#       $1 : User ID name
+# Return Values:
+#       none
+check_id()
+{
+_check_id_=`$ID | $AWK -F\( '{print $2}' | $AWK -F\) '{print $1}'`
+if [ "$_check_id_" != "$1" ]; then
+    _err_msg_="You must be $1 to execute this script."
+    abort_script "${_err_msg_}"
+fi
+}
+
+### Function: cleanup ###
+#
+# Final stage. Clean up
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+cleanup()
+{
+insert_header_footer head "Entering TEMP DB Expansion stage - ${NEXT_STAGE}" ${LOGFILE}
+# Cleaning up temp directory after successful execution
+$RM -rf ${TEM_DIR}
+
+# Cleaning up current stage file after successful execution
+$RM -rf ${STAGEFILE}
+
+# Cleaning up var/tmp directory after successful execution
+$RM -rf ${VAR_TMP_DIR}/paths_of_temp_dbs_symlink_ini.txt
+$RM -rf ${VAR_TMP_DIR}/paths_of_temp_dbs_database.txt
+$RM -rf ${VAR_TMP_DIR}/selected_disks
+
+#Restoring original the stagefile
+if [ -f ${ENIQ_CORE_INST_DIR}/etc/eniq_linux_temp_db_expansion_stagelist_orig ]; then
+    $MV ${ENIQ_CORE_INST_DIR}/etc/eniq_linux_temp_db_expansion_stagelist_orig ${ENIQ_CORE_INST_DIR}/etc/eniq_linux_temp_db_expansion_stagelist
+    if [ $? -ne 0 ]; then
+        _err_msg_="Failed to restore ${ENIQ_CORE_INST_DIR}/etc/eniq_linux_temp_db_expansion_stagelist"
+        abort_script "${_err_msg_}"
+    fi
+fi
+
+insert_header_footer foot "Successfully completed - ${NEXT_STAGE}" ${LOGFILE}
+}
+
+### Function: create_db_symlinks ###
+#
+# Creates database symlinks for newly added temp db LUNs
+#
+# Arguments: none
+#
+# Return Values: none
+create_db_symlinks()
+{
+if [ -s ${VAR_TMP_DIR}/add_temp_luns_no_disk_success -o -s ${VAR_TMP_DIR}/add_temp_luns_none_success ]; then
+log_msg -t -s "Existing...No disks are present/selected on ${HNAME}" -l ${LOGFILE}
+    exit 0
+fi
+insert_header_footer head "Entering TEMP DB Expansion stage - ${NEXT_STAGE}" ${LOGFILE}
+
+# Create database symlinks
+log_msg -t -s "Creating database symlinks on ${HNAME}" -l ${LOGFILE}
+log_msg -t -s "bash ${ENIQ_CORE_INST_SCRIPT} -s create_db_sym_links -n -l ${LOGFILE}\n" -l ${LOGFILE}
+$BASH ${ENIQ_CORE_INST_SCRIPT} -s create_db_sym_links -n -l ${LOGFILE}
+if [ $? -ne 0 ];then
+    _err_msg_="Could not create database symlinks on ${HNAME}"
+    abort_script "${_err_msg_}"
+fi
+
+# Verify sym links are correctly configured
+_sym_links_check_="${ENIQ_CORE_INST_DIR}/bin/check_sym_links.pl"
+log_msg -t -s "Verifying if database symbolic links are correctly assigned" -l ${LOGFILE}
+$PERL ${_sym_links_check_} ${ENIQ_CONF_DIR}/${SYM_LINKS_INI} >> ${LOGFILE}
+_return_code_=$?
+if [ ${_return_code_} -eq 0 ]; then
+    log_msg -t -s "DB sym_links are correctly assigned.\n" -l ${LOGFILE}
+elif [ ${_return_code_} -eq 22 -o ${_return_code_} -eq 32 ]; then
+    _err_msg_="DB sym_links are still incorrect. Please fix the sym_links manually."
+    abort_script "${_err_msg_}"
+else
+    _err_msg_="Failed to execute ${_sym_links_check_} script to verify the sym_links."
+    abort_script "${_err_msg_}"
+fi
+
+# Add devices to SAP IQ
+if [ "${CO_SERVER}" == "YES" ]; then
+    add_device_to_IQ_CO
+elif [ "${RD_SERVER}" == "YES" ]; then
+    start_stop_eniq_services "start" "eniq-dwh_reader"
+    add_device_to_IQ_RD
+fi
+
+insert_header_footer foot "Successfully completed - ${NEXT_STAGE}" ${LOGFILE}
+set_next_stage `$EXPR ${ARRAY_ELEM}+1`
+}
+
+### Function: exclude_stages ###
+#
+# Exclude unused/unnecessary stages for engine blade
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+exclude_stages()
+{
+# Excluding unnecessary stages
+$CP -pr ${ENIQ_CORE_INST_DIR}/etc/eniq_linux_temp_db_expansion_stagelist ${ENIQ_CORE_INST_DIR}/etc/eniq_linux_temp_db_expansion_stagelist_orig
+if [ $? -ne 0 ]; then
+    _err_msg_="Failed to take backup of ${ENIQ_CORE_INST_DIR}/etc/eniq_linux_temp_db_expansion_stagelist"
+    abort_script "${_err_msg_}"
+fi
+
+$SED -i "s/prerequisites_vnx_to_unity/\#prerequisites_vnx_to_unity/;s/add_temp_luns/\#add_temp_luns/;s/update_symlinks_ini/\#update_symlinks_ini/;s/create_db_symlinks/\#create_db_symlinks/" ${ENIQ_CORE_INST_DIR}/etc/eniq_linux_temp_db_expansion_stagelist
+if [ $? -ne 0 ]; then
+    _err_msg_="Failed to exclude unused stages on ${HNAME}"
+    abort_script "${_err_msg_}"
+fi
+}
+
+### Function: execute_stages ###
+#
+#   Determine stage wise execution
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+execute_stages()
+{
+# Create a stage array
+core_install_build_stage_array ${LOGFILE} ${TEM_DIR} eniq_linux temp_db_expansion ${ENIQ_CORE_INST_DIR}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not build a stage array for TEMP DB Expansion"
+    abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+fi
+
+# If stage specified, make sure it is in the stage list for this server type
+if [ "$USER_STAGE" ]; then
+    core_install_check_user_stage ${LOGFILE} ${TEM_DIR} ${USER_STAGE}
+    if [ $? -ne 0 ]; then
+       _err_msg_="The specified stage ${USER_STAGE} is not in the stage list for ${CURR_SERVER_TYPE}"
+       abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+    fi
+fi
+
+if [ "$USER_STAGE" ]; then
+    NEXT_STAGE="${USER_STAGE}"
+    # Get the element number so we can move along the array
+    get_array_element
+else
+    get_next_stage
+fi
+
+# If we read cleanup from the stagefile
+if [ "$NEXT_STAGE" == "cleanup" ]; then
+    # We exit unless the user specified that the stage be run again
+    if [ ! "$USER_STAGE" ]; then
+        $ECHO "All Stages are already completed"
+    fi
+fi
+
+# Loop through the stages for installation
+while :; do
+    _nxt_stage_="${NEXT_STAGE}"
+    $_nxt_stage_
+    if [ $? -ne 0 ]; then
+        _err_msg_="Error in Stage ${NEXT_STAGE}"
+        abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+    fi
+
+    # Exit if the user specified to run a specific stage only
+    if [ "$USER_STAGE" ]; then
+        break
+    fi
+
+    # If we read cleanup from the stagefile
+    if [ "$NEXT_STAGE" == "cleanup" ]; then
+        break
+    fi
+    get_next_stage
+done
+}
+
+### Function: execute_stages_on_secondary_nodes ###
+#
+#   Determine stage wise execution
+#
+# Arguments:
+#   $1 = user defined stage
+# Return Values:
+#   none
+execute_stages_on_secondary_nodes()
+{
+user_stage=$1
+if [ "${CO_SERVER}" == "YES" ]; then
+    for _line1_ in `$CAT ${VAR_TMP_DIR}/server_order_list`; do
+        _ip_address1_=`$ECHO ${_line1_} | $AWK -F"::" '{print $1}'`
+        _serv_hostname1_=`$ECHO ${_line1_} | $AWK -F"::" '{print $2}'`
+        _server_type_=`$ECHO ${_line1_} | $AWK -F"::" '{print $3}'`
+        if [ ! "${_ip_address1_}" -o ! "${_serv_hostname1_}" ]; then
+            _err_msg_="Could not read required info from ${VAR_TMP_DIR}/server_order_list"
+            abort_script "${_err_msg_}"
+        fi
+        if [ "${_ip_address1_}" != "${HOST_IP}" ]; then
+            if [ "${_server_type_}" == "stats_engine" ]; then
+                continue
+            else
+                for _stage_ in ${user_stage}; do
+                    if [ "${VNX_to_UNITY}" == "YES" ]; then
+                        run_remote_cmd "${_ip_address1_}" "$BASH ${SCRIPTHOME}/temp_db_expansion.bsh -U -s ${_stage_}" "${LOGFILE}"
+                        if [ $? -ne 0 ]; then
+                            if [ "${_stage_}" == "add_temp_luns" ]; then
+                                $RM -rf ${STAGEFILE}
+                            fi
+                            _err_msg_="Failed to execute ${SCRIPTHOME}/temp_db_expansion.bsh on ${_serv_hostname1_}"
+                            abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+                        fi
+                    else
+                        run_remote_cmd "${_ip_address1_}" "$BASH ${SCRIPTHOME}/temp_db_expansion.bsh -s ${_stage_}" "${LOGFILE}"
+                        if [ $? -ne 0 ]; then
+                            if [ "${_stage_}" == "add_temp_luns" ]; then
+                                $RM -rf ${STAGEFILE}
+                            fi
+                            _err_msg_="Failed to execute ${SCRIPTHOME}/temp_db_expansion.bsh on ${_serv_hostname1_}"
+                            abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+                        fi
+                    fi
+                done
+            fi
+        fi
+    done
+fi
+}
+
+### Function: get_array_element ###
+#
+# Get the current array element number
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+get_array_element()
+{
+_num_elements_=${#ENIQ_CORE_STAGES[*]}
+_array_length_=`${EXPR} ${_num_elements_} - 1`
+
+for (( _elem_=0; _elem_<=${_array_length_}; _elem_++ )); do
+    $ECHO ${ENIQ_CORE_STAGES[${_elem_}]} | $GREP -w ${NEXT_STAGE} >> /dev/null 2>&1
+    if [ $? -eq 0 ]; then
+        ARRAY_ELEM=${_elem_}
+        break
+    fi
+done
+}
+
+### Function: get_deployment_order ###
+#
+# Get the order of the deployment
+# for performing required functionality based on action type
+#
+# Arguments: none
+#
+# Return Values: none
+get_deployment_order()
+{
+$RM -rf ${VAR_TMP_DIR}/server_order_list
+
+# Get an ordered list of servers based on the server_list file
+$PERL ${ENIQ_CORE_INST_DIR}/lib/get_ip_order.pl -f ${VAR_TMP_DIR}/server_order_list
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not get an ordered list of servers"
+    abort_script "${_err_msg_}"
+fi
+}
+
+### Function: get_next_stage ###
+#
+# Get the stage to be run
+#
+# Arguments:
+#   $1 : Stage to be set to. Either numeric value or 'done'
+# Return Values:
+#   none
+get_next_stage()
+{
+ARRAY_ELEM=0
+
+if [ -s $STAGEFILE ]; then
+    NEXT_STAGE=`$CAT $STAGEFILE | $EGREP -v '^[[:blank:]]*#' | $SED -e 's| ||g'`
+    if [ ! "$NEXT_STAGE" ]; then
+        _err_msg_="Failed to read stage from ${STAGEFILE}, exiting."
+        abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+    fi
+
+    if [ "$NEXT_STAGE" == "cleanup" ]; then
+        return 0
+    else
+        $ECHO ${ENIQ_CORE_STAGES[*]} | $GREP -w ${NEXT_STAGE} >> /dev/null 2>&1
+        if [ $? -ne 0 ]; then
+            _err_msg_="Specified stage ${NEXT_STAGE} is not a valid installation stage"
+            abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+        fi
+    fi
+
+    # Get the element number so we can move along the array
+    get_array_element
+else
+    $MKDIR -p `$DIRNAME $STAGEFILE`
+    if [ $? -ne 0 ]; then
+        _err_msg_="Failed to create directory `$DIRNAME ${STAGEFILE}`, exiting."
+        abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+    fi
+
+    NEXT_STAGE=${ENIQ_CORE_STAGES[${ARRAY_ELEM}]}
+fi
+}
+
+### Function: insert_header_footer ###
+#
+#   Insert a stage header/footer message
+#
+# Arguments:
+#   $1 : head/foot
+#   $2 : Message
+#   $3 : Logfile
+# Return Values:
+#   none
+insert_header_footer()
+{
+if [ $# -ne 3 ]; then
+    _err_msg_="3 Parameters must be passed to header/footer function"
+    abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+fi
+
+if [ "$1" != "head" -a "$1" != "foot" ]; then
+    _err_msg_="Only Param of head/foot is allowed...exiting!"
+    abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+fi
+_type_=$1
+
+_msg_=$2
+
+_logfile_=$3
+$MKDIR -p `$DIRNAME ${_logfile_}`
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not create directory `$DIRNAME ${_logfile_}`"
+    abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+fi
+
+$TOUCH -a ${_logfile_}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not write to file ${_logfile_}"
+    abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+fi
+
+_time_=`$DATE '+%Y-%b-%d_%H.%M.%S'`
+if [ "$_type_" == "head" ]; then
+    $ECHO -e "\n-----------------------------------------------------" | $TEE -a ${_logfile_}
+    $ECHO "-----------------------------------------------------" | $TEE -a ${_logfile_}
+    $ECHO "$_time_ : $_msg_" | $TEE -a ${_logfile_}
+    $ECHO "-----------------------------------------------------" | $TEE -a ${_logfile_}
+fi
+
+if [ "$_type_" == "foot" ]; then
+    $ECHO -e "\n-----------------------------------------------------" | $TEE -a ${_logfile_}
+    $ECHO "$_time_ : $_msg_" | $TEE -a ${_logfile_}
+    $ECHO "-----------------------------------------------------" | $TEE -a ${_logfile_}
+    $ECHO -e "-----------------------------------------------------\n" | $TEE -a ${_logfile_}
+fi
+}
+
+### Function: partition_new_temp_luns ###
+#
+# Creates partition over newly added temp db LUNs
+#
+# Arguments: none
+#
+# Return Values: none
+partition_new_temp_luns()
+{
+if [ "${VNX_to_UNITY}" == "YES" ]; then
+    insert_header_footer head "Entering TEMP DB Expansion stage - ${NEXT_STAGE} on ${HNAME}" ${LOGFILE}
+    if [ ! -s ${VAR_TMP_DIR}/${NEXT_STAGE}_success ]; then 
+        #Create disk partitions
+        log_msg -t -s "Creating partitions over newly added LUNs in ${HNAME}" -l ${LOGFILE}
+        log_msg -t -s "bash ${ENIQ_CORE_INST_SCRIPT} -s create_disk_partition -n -M -l ${LOGFILE}\n" -l ${LOGFILE}
+        $BASH ${ENIQ_CORE_INST_SCRIPT} -s create_disk_partition -n -M -l ${LOGFILE}
+        if [ $? -ne 0 ];then
+            _err_msg_="Could not create disk partitions on ${HNAME}"
+            abort_script "${_err_msg_}"
+        fi
+
+        # Update lun_map.ini on Engine blade
+        if [ "${CURR_SERVER_TYPE}" == "stats_engine" ]; then
+            log_msg -t -s "Updating lun_map.ini on ${HNAME}" -l ${LOGFILE}
+            log_msg -t -s "bash ${ENIQ_CORE_INST_SCRIPT} -s create_lun_map -n -l ${LOGFILE}\n" -l ${LOGFILE}
+            $BASH ${ENIQ_CORE_INST_SCRIPT} -s create_lun_map -n -l ${LOGFILE}
+            if [ $? -ne 0 ];then
+                _err_msg_="Could not update lun_map.ini on ${HNAME}"
+                abort_script "${_err_msg_}"
+            fi
+        fi
+
+        insert_header_footer foot "Successfully completed - ${NEXT_STAGE} on ${HNAME}" ${LOGFILE}
+        $ECHO "Successfully completed - ${NEXT_STAGE} on ${HNAME}" > ${VAR_TMP_DIR}/${NEXT_STAGE}_success
+        execute_stages_on_secondary_nodes "partition_new_temp_luns"
+        set_next_stage `$EXPR ${ARRAY_ELEM}+1`
+    else
+        insert_header_footer foot "Skipping TEMP DB Expansion stage - ${NEXT_STAGE} as it is already completed on ${HNAME}" ${LOGFILE}
+        execute_stages_on_secondary_nodes "partition_new_temp_luns"
+        set_next_stage `$EXPR ${ARRAY_ELEM}+1`
+    fi
+else
+    insert_header_footer foot "Applicable only for VNX to Unity migration - Skipping TEMP DB Expansion stage - ${NEXT_STAGE}" ${LOGFILE}
+    set_next_stage `$EXPR ${ARRAY_ELEM}+1`
+    return 0
+fi
+}
+
+### Function: get_existing_temp_dbs_CO ###
+#
+# Get the list of the existing Temp DBs 
+# registered to the DWHDB on Standalone/CO
+#
+# Arguments: none
+#
+# Return Values: none
+get_existing_temp_dbs_CO()
+{
+# Getting Existing Temp DBs Configured with VNX Storage
+log_msg -t -s "Getting Existing Temp DBs Configured with VNX Storage on ${HNAME}" -l ${LOGFILE}
+if [ -s ${BINARIES_DIR}/vnx_temp_dbs.txt ]; then
+    log_msg -t -s "Skipping as ${BINARIES_DIR}/vnx_temp_dbs.txt already present on ${HNAME}" -l ${LOGFILE}
+else
+    $SU - $SYSUSER -c "${IQDIR}/bin64/dbisql -nogui -onerror exit @${CONN_STR_USER_DBA_ENC_} \"select DBFileName from sp_iqfile() where DBSpaceName='IQ_SYSTEM_TEMP'; OUTPUT TO ${BINARIES_DIR}/vnx_temp_dbs.txt\"" >> ${LOGFILE}
+    if [ $? -ne 0 ];then
+        _err_msg_="Could not get existing Temp DBs configured with VNX Storage on ${HNAME}"
+        abort_script "${_err_msg_}"
+    fi
+fi
+}
+
+### Function: get_existing_temp_dbs_RD ###
+#
+# Get the list of the existing Temp DBs 
+# registered to the DWHDB on Reader(s)
+#
+# Arguments: none
+#
+# Return Values: none
+get_existing_temp_dbs_RD()
+{
+# Getting Existing Temp DBs Configured with VNX Storage
+log_msg -t -s "Getting Existing Temp DBs Configured with VNX Storage on ${HNAME}" -l ${LOGFILE}
+if [ -s ${BINARIES_DIR}/vnx_temp_dbs.txt ]; then
+    log_msg -t -s "Skipping as ${BINARIES_DIR}/vnx_temp_dbs.txt already present on ${HNAME}" -l ${LOGFILE}
+else
+    $SU - $SYSUSER -c "${IQDIR}/bin64/dbisql -nogui -onerror exit @${_CONN_STR_USER_DBA_RD_ENC} \"select DBFileName from sp_iqfile() where DBSpaceName='IQ_SYSTEM_TEMP'; OUTPUT TO ${BINARIES_DIR}/vnx_temp_dbs.txt\"" >> ${LOGFILE}
+    if [ $? -ne 0 ];then
+        _err_msg_="Could not get existing Temp DBs configured with VNX Storage on ${HNAME}"
+        abort_script "${_err_msg_}"
+    fi
+fi
+}
+
+### Function: prerequisites_vnx_to_unity ###
+#
+# Get information of TEMP DBs configured with VNX Storage
+#
+# Arguments: none
+#
+# Return Values: none
+prerequisites_vnx_to_unity()
+{
+if [ "${VNX_to_UNITY}" == "YES" ]; then
+    insert_header_footer head "Entering TEMP DB Expansion stage - ${NEXT_STAGE} on ${HNAME}" ${LOGFILE}
+    if [ ! -s ${VAR_TMP_DIR}/${NEXT_STAGE}_success ]; then 
+        if [ "${CO_SERVER}" == "YES" ]; then
+            # Get the list of the existing Temp DBs for Standalone/CO blade
+            get_existing_temp_dbs_CO
+        elif [ "${RD_SERVER}" == "YES" ]; then
+            # Get the list of the existing Temp DBs for Reader blades
+            start_stop_eniq_services "start" "eniq-dwh_reader"
+            get_existing_temp_dbs_RD
+        fi
+    
+        # Getting the details of Temp DBs Configured with VNX Storage
+        log_msg -t -s "Getting details of Temp DBs to be deleted on ${HNAME}" -l ${LOGFILE}
+        if [ -s ${BINARIES_DIR}/temp_dbs_to_delete.txt ]; then
+            log_msg -t -s "Skipping as ${BINARIES_DIR}/temp_dbs_to_delete.txt already present on ${HNAME}" -l ${LOGFILE}
+        else
+            iniget DWH_DBSPACES_TEMP -f ${ENIQ_CONF_DIR}/${SYM_LINKS_INI} > ${BINARIES_DIR}/temp_dbs_to_delete.txt
+            if [ $? -ne 0 ]; then
+                _err_msg_="Could not get details of DWH_DBSPACES_TEMP from ${ENIQ_CONF_DIR}/${SYM_LINKS_INI}"
+                abort_script "${_err_msg_}"
+            fi
+    
+            $CHOWN $SYSUSER:$SYSGROUP ${BINARIES_DIR}/temp_dbs_to_delete.txt
+            if [ $? -ne 0 ]; then
+                _err_msg_="Could not change ownership of ${BINARIES_DIR}/temp_dbs_to_delete.txt"
+                abort_script "${_err_msg_}"
+            fi
+        fi
+    
+        log_msg -t -s "Getting details of Temp DB files to be deleted on ${HNAME}" -l ${LOGFILE}
+        if [ -s ${BINARIES_DIR}/temp_db_files_to_delete.txt ]; then
+            log_msg -t -s "Skipping as ${BINARIES_DIR}/temp_db_files_to_delete.txt already present on ${HNAME}" -l ${LOGFILE}
+        else
+            $RM -rf ${BINARIES_DIR}/temp_db_files_to_delete.txt
+            for _temp_db_ in `$CAT ${BINARIES_DIR}/temp_dbs_to_delete.txt`;do 
+                iniget ${_temp_db_} -f ${ENIQ_CONF_DIR}/${SYM_LINKS_INI} -v Path >> ${BINARIES_DIR}/temp_db_files_to_delete.txt
+                if [ $? -ne 0 ]; then
+                    _err_msg_="Could not get TEMP DBspaces path details from ${ENIQ_CONF_DIR}/${SYM_LINKS_INI}"
+                    abort_script "${_err_msg_}"
+                fi
+            done
+    
+            $CHOWN $SYSUSER:$SYSGROUP ${BINARIES_DIR}/temp_db_files_to_delete.txt
+            if [ $? -ne 0 ]; then
+                _err_msg_="Could not change ownership of ${BINARIES_DIR}/temp_db_files_to_delete.txt"
+                abort_script "${_err_msg_}"
+            fi
+        fi
+    
+        log_msg -t -s "Getting details of Temp DB mpaths to be deleted on ${HNAME}" -l ${LOGFILE}
+        if [ -s ${BINARIES_DIR}/temp_db_mpaths_to_delete.txt ]; then
+            log_msg -t -s "Skipping as ${BINARIES_DIR}/temp_db_mpaths_to_delete.txt already present on ${HNAME}" -l ${LOGFILE}
+        else
+            iniget DB_DISK_ALLOC -f ${ENIQ_CONF_DIR}/${SYM_LINKS_INI} -v TEMPDB_DISKS > ${BINARIES_DIR}/temp_db_mpaths_to_delete.txt
+            if [ $? -ne 0 ]; then
+                _err_msg_="Could not read TEMPDB_DISKS from ${ENIQ_CONF_DIR}/${SYM_LINKS_INI}"
+                abort_script "${_err_msg_}"
+            fi
+    
+            $CHOWN $SYSUSER:$SYSGROUP ${BINARIES_DIR}/temp_db_mpaths_to_delete.txt
+            if [ $? -ne 0 ]; then
+                _err_msg_="Could not change ownership of ${BINARIES_DIR}/temp_db_mpaths_to_delete.txt"
+                abort_script "${_err_msg_}"
+            fi
+        fi
+    
+        insert_header_footer foot "Successfully completed - ${NEXT_STAGE} on ${HNAME}" ${LOGFILE}
+        $ECHO "Successfully completed - ${NEXT_STAGE} on ${HNAME}" > ${VAR_TMP_DIR}/${NEXT_STAGE}_success
+        execute_stages_on_secondary_nodes "prerequisites_vnx_to_unity"
+        set_next_stage `$EXPR ${ARRAY_ELEM}+1`
+    else
+        insert_header_footer foot "Skipping TEMP DB Expansion stage - ${NEXT_STAGE} as it is already completed on ${HNAME}" ${LOGFILE}
+        execute_stages_on_secondary_nodes "prerequisites_vnx_to_unity"
+        set_next_stage `$EXPR ${ARRAY_ELEM}+1`
+    fi
+else
+    insert_header_footer foot "Applicable only for VNX to Unity migration - Skipping TEMP DB Expansion stage - ${NEXT_STAGE}" ${LOGFILE}
+    set_next_stage `$EXPR ${ARRAY_ELEM}+1`
+    return 0
+fi
+}
+
+### Function: set_next_stage ###
+#
+# Set up the stage to be run
+#
+# Arguments:
+#   $1 : Stage to be set to. Either numeric value or 'cleanup'
+# Return Values:
+#   none
+set_next_stage()
+{
+_stage_time_=`$DATE '+%Y-%b-%d_%H.%M.%S'`
+$ECHO "# Setting new stage at $_stage_time_" > ${STAGEFILE} | $TEE -a ${LOGFILE}
+$ECHO "${ENIQ_CORE_STAGES[$1]} " >> ${STAGEFILE} | $TEE -a ${LOGFILE}
+}
+
+### Function: setup_env ###
+#
+# Set up environment variables for script.
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+setup_env()
+{
+# ENIQ Directories
+if [ ! "${ENIQ_BASE_DIR}" ]; then
+    # Directory on the root filesystem
+    ENIQ_BASE_DIR=/eniq
+fi
+
+ENIQ_ADMIN_DIR=${ENIQ_BASE_DIR}/admin
+ENIQ_INST_DIR=${ENIQ_BASE_DIR}/installation
+ENIQ_CORE_INST_DIR=${ENIQ_INST_DIR}/core_install
+ENIQ_LOG_DIR=${ENIQ_BASE_DIR}/local_logs
+ENIQ_CONF_DIR=${ENIQ_INST_DIR}/config
+DEPLOYMENT=/extra_params/deployment
+
+# Admin bin dir
+ENIQ_ADMIN_BIN_DIR=${ENIQ_ADMIN_DIR}/bin
+
+# ENIQ Core install script
+ENIQ_CORE_INST_SCRIPT=${ENIQ_CORE_INST_DIR}/bin/eniq_core_install.bsh
+
+# ENIQ SW conf directory
+CLI_CONF_DIR=${ENIQ_BASE_DIR}/sw/conf
+
+#Temp directory.
+TEM=/tmp
+
+#/var/tmp directory
+VAR_TMP_DIR=/var/tmp
+
+BINARIES_DIR=${VAR_TMP_DIR}/temp_db_binaries
+if [ ! -d "${BINARIES_DIR}" ]; then
+    $MKDIR -p ${BINARIES_DIR}
+fi
+
+$CHMOD 777 ${BINARIES_DIR}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not change the permission of ${BINARIES_DIR}"
+    abort_script "${_err_msg_}"
+fi
+
+# File to hold stage information
+STAGEFILE=${ENIQ_CORE_INST_DIR}/etc/eniq_add_temp_db_stage
+
+# Hostname Information
+HNAME=`${MYHOSTNAME}`
+HOST_IP=`$GETENT hosts ${HNAME} | $AWK '{print $1}' | $HEAD -1`
+CO_IP_ADDRESS=`$GREP -w dwhdb /etc/hosts | $AWK '{print $1}'| $SORT -u`
+
+
+# Source the common functions
+_common_functions_list_="common_functions.lib common_core_install_functions.lib common_migration_functions.lib"
+for lib_file in ${_common_functions_list_}; do
+    if [ -s ${ENIQ_CORE_INST_DIR}/lib/${lib_file} ]; then
+        . ${ENIQ_CORE_INST_DIR}/lib/${lib_file}
+    else
+        _err_msg_="File ${ENIQ_CORE_INST_DIR}/lib/${lib_file} not found"
+        abort_script "${_err_msg_}"
+    fi
+done
+
+# Check hardware
+if [ -f ${ENIQ_CONF_DIR}/san_details ];then
+    STORAGE_TYPE=`$CAT ${ENIQ_CONF_DIR}/san_details | $GREP STORAGE_TYPE | $CUT -f 2 -d =`
+    if [ "${STORAGE_TYPE}" != "raw" ];then
+        _err_msg_="\nHardware type is not supported for Migration."
+        abort_script "${_err_msg_}"
+    fi
+else
+    _err_msg_="Could not find the file to get hardware type."
+    abort_script "${_err_msg_}"
+fi
+
+# Determine SAN Device type if raw
+if [ "${STORAGE_TYPE}" == "raw" ];then
+    SAN_DEVICE=`$CAT ${ENIQ_CONF_DIR}/san_details | $EGREP "^SAN_DEVICE=" | $AWK -F\= '{print $2}'`
+    if [ ! "${SAN_DEVICE}" ]; then
+        _err_msg_="Could not read SAN_DEVICE type from ${ENIQ_CONF_DIR}/san_details."
+        abort_script "${_err_msg_}"
+    fi
+fi
+
+# File containing the type of installation. Eg. events or statistics
+INST_TYPE_FILE=${ENIQ_CONF_DIR}/ericsson_use_config
+if [ ! -s "${INST_TYPE_FILE}" ]; then
+    _err_msg_="ENIQ install type not defined in ${INST_TYPE_FILE}"
+    abort_script "${_err_msg_}"
+fi
+
+if [ -x ${ENIQ_CORE_INST_DIR}/lib/iniadd.pl ]; then
+    INIADD=${ENIQ_CORE_INST_DIR}/lib/iniadd.pl
+else
+    _err_msg_="${ENIQ_CORE_INST_DIR}/lib/iniadd.pl is not found, or is not executable"
+    abort_script "$_err_msg_" "${EXEC_SHELL_CMD}"
+fi
+
+# Get current server type
+CURR_SERVER_TYPE=`$CAT ${ENIQ_CONF_DIR}/installed_server_type | $EGREP -v  '^[[:blank:]]*#' | $SED -e 's/ //g'`
+if [ ! "${CURR_SERVER_TYPE}" ]; then
+    _err_msg_="Could not determine which server type this is"
+    abort_script "${_err_msg_}"
+fi
+
+# Check if server is Coordinator or Reader type
+CO_SERVER=""
+RD_SERVER=""
+if [ "${CURR_SERVER_TYPE}" == "stats_coordinator" -o "${CURR_SERVER_TYPE}" == "eniq_stats" ]; then
+    CO_SERVER="YES"
+elif [ "${CURR_SERVER_TYPE}" == "stats_iqr" ]; then
+    RD_SERVER="YES"
+fi
+
+SYSUSER=`iniget ENIQ_INSTALL_CONFIG -f ${ENIQ_CONF_DIR}/${SUNOS_INI} -v ENIQ_SYSUSER`
+if [ ! "${SYSUSER}" ]; then
+    _err_msg_="Could not read System User from  ${ENIQ_CONF_DIR}/${SUNOS_INI}"
+    abort_script "${_err_msg_}"
+fi
+
+SYSGROUP=`iniget SunOS_GROUP_1 -f ${ENIQ_CONF_DIR}/${SUNOS_INI} -v name`
+if [ ! "${SYSGROUP}" ]; then
+    _err_msg_="Could not read SYSGROUP param from ${ENIQ_CONF_DIR}/${SUNOS_INI}"
+    abort_script "$_err_msg_"
+fi
+
+# Set the Connect DB parameters
+DWH_PORT=`iniget DWH -v PortNumber -f ${CLI_CONF_DIR}/${ENIQ_INI}`
+DWH_ENG=`iniget DWH -v ServerName -f ${CLI_CONF_DIR}/${ENIQ_INI}`
+if [ ! "${DWH_PORT}" -o ! "${DWH_ENG}" ]; then
+        _err_msg_="Could not read DWH_PORT and DWH_ENG values from ${CLI_CONF_DIR}/${ENIQ_INI}"
+        abort_script "${_err_msg_}"
+fi
+
+if [ "${CURR_SERVER_TYPE}" == "stats_iqr" ]; then
+    DWH_READER_PORT=`iniget DWH_READER_SETTINGS -v PortNumber -f ${CLI_CONF_DIR}/${ENIQ_INI}`
+    if [ ! "${DWH_READER_PORT}" ]; then
+        _err_msg_="Could not read DWH_READER_PORT value from ${CLI_CONF_DIR}/${ENIQ_INI}"
+        abort_script "${_err_msg_}"
+    fi
+fi
+
+
+DBA_PASSWORD=`inigetpassword DB -f ${CLI_CONF_DIR}/${ENIQ_INI} -v DBAPassword`
+if [ ! "${DBA_PASSWORD}" ]; then
+    if [ -f ${ENIQ_BASE_DIR}/sw/installer/dbusers ]; then
+        DBA_PASSWORD=`${ENIQ_BASE_DIR}/sw/installer/dbusers dba dwhrep`
+        if [ ! "${DBA_PASSWORD}" ] ; then
+            _err_msg_="Could not get dwhdb DBA Password"
+            abort_script "${_err_msg_}"
+        fi
+    else
+        err_msg_="Could not get dwhdb DBA Password"
+        abort_script "${_err_msg_}"
+    fi
+fi
+
+# Log file
+if [ ! "${LOGFILE}" ]; then
+    $MKDIR -p ${ENIQ_LOG_DIR}/expansion
+    LOGFILE="${ENIQ_LOG_DIR}/expansion/eniq_linux_temp_db_addition.log"
+fi
+
+$TOUCH $LOGFILE
+if [ ! -f $LOGFILE ]; then
+    _err_msg_="Failed to create $LOGFILE"
+    abort_script "${_err_msg_}"
+fi
+
+$CHMOD 777 $LOGFILE
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not change the permission of $LOGFILE"
+    abort_script "${_err_msg_}"
+fi
+
+
+# Create a temporary Directory
+TEM_DIR=/tmp/temp_db_expansion.$$.$$
+$RM -rf ${TEM_DIR}
+$MKDIR -p ${TEM_DIR}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not create directory ${TEM_DIR}"
+    abort_script "${_err_msg_}"
+fi
+
+# Get the required environment variables for Sybase
+$SU - ${SYSUSER} -c "$ENV |$EGREP '^(SYBASE|ASDIR|IQDIR|SQLANY)'" > $TEM_DIR/sybase_det.$$
+$CAT $TEM_DIR/sybase_det.$$ |$EGREP '^(SYBASE|ASDIR|IQDIR|SQLANY)' > $TEM_DIR/sybase_det_var.$$
+. $TEM_DIR/sybase_det_var.$$ >> /dev/null 2>&1
+
+if [ -z "$IQDIR" ] ; then
+    _err_msg_="ERROR: IQDIR is not set"
+    abort_script "${_err_msg_}"
+fi
+
+if [ "${CO_SERVER}" == "YES" ]; then
+
+	
+	
+    CONN_STR_USER_DBA_="-c \"uid=dba;pwd=${DBA_PASSWORD};eng=${DWH_ENG};links=tcpip{host=${DWH_ENG};port=${DWH_PORT};dobroadcast=no;verify=no}\""
+	CONN_STR_USER_DBA_ENC_=${TEM}/_conn_str_db_exp_encrypt.`uuidgen`
+	
+	# encrypt the connection string.
+	get_encrypt_file "${CONN_STR_USER_DBA_}" "${CONN_STR_USER_DBA_ENC_}"
+
+	
+	
+elif [ "${RD_SERVER}" == "YES" ]; then
+    if [ -f ${ENIQ_CONF_DIR}/install_reader_type ]; then
+        _reader_=`$CAT ${ENIQ_CONF_DIR}/install_reader_type | $GREP "dwh_reader"`
+    else
+        _err_msg_="Could not find the file ${ENIQ_CONF_DIR}/install_reader_type on ${HNAME}"
+        abort_script "${_err_msg_}"
+    fi
+	
+	
+
+	
+    _CONN_STR_USER_DBA_RD="-c \"uid=dba;pwd=${DBA_PASSWORD};eng=${_reader_};links=tcpip{host=${_reader_};port=${DWH_READER_PORT};dobroadcast=no;verify=no}\""
+	_CONN_STR_USER_DBA_RD_ENC=${TEM}/con_str_db_exp_encrypt.txt.`uuidgen`
+	
+	# encrypt the connection string.
+	get_encrypt_file "${_CONN_STR_USER_DBA_RD}" "${_CONN_STR_USER_DBA_RD_ENC}"
+	
+	
+fi
+}
+
+### Function: start_stop_eniq_services ###
+#
+# Starts / Stops all ENIQ services
+#
+# Arguments: $1 = start / stop
+#            $2 = service name
+#
+# Return Values: none
+start_stop_eniq_services()
+{
+_action_=$1
+_service_name_=$2
+
+if [ "${_action_}" == "stop" ]; then
+      $BASH ${ENIQ_ADMIN_BIN_DIR}/manage_deployment_services.bsh -a ${_action_} -s ${_service_name_} -N | $TEE -a ${LOGFILE}
+      _rc_service_stop_=`$ECHO ${PIPESTATUS[0]}`
+      if [ ${_rc_service_stop_} -ne 0 ]; then
+          _err_msg_="Failed to ${_action_} ENIQ services."
+          abort_script "${_err_msg_}"
+      fi
+elif [ "${_action_}" == "start" ]; then
+      $BASH ${ENIQ_ADMIN_BIN_DIR}/manage_eniq_services.bsh -a ${_action_} -s ${_service_name_} -N | $TEE -a ${LOGFILE}
+      _rc_service_start_=`$ECHO ${PIPESTATUS[0]}`
+      if [ ${_rc_service_start_} -ne 0 ]; then
+          _err_msg_="Failed to ${_action_} ENIQ services."
+          abort_script "${_err_msg_}"
+      fi
+fi
+}
+
+### Function: update_symlinks_ini ###
+#
+#   Updates the sym_links.ini file
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+update_symlinks_ini()
+{
+if [ -s ${VAR_TMP_DIR}/add_temp_luns_no_disk_success -o -s ${VAR_TMP_DIR}/add_temp_luns_none_success ]; then
+    exit 0
+fi
+insert_header_footer head "Entering TEMP DB Expansion stage - ${NEXT_STAGE} on ${HNAME}" ${LOGFILE}
+if [ ! -s ${VAR_TMP_DIR}/${NEXT_STAGE}_success ]; then 
+    if [ -f ${VAR_TMP_DIR}/selected_disks ]; then
+        _count_=`$CAT ${VAR_TMP_DIR}/selected_disks | $WC -l`
+        if [ $? -ne 0 ]; then
+            _err_msg_="Failed to get the count of TEMP DB disks selected for expansion/addition on ${HNAME}"
+            abort_script "${_err_msg_}"
+        fi
+    else
+        _err_msg_="Could not find the file ${VAR_TMP_DIR}/selected_disks on ${HNAME}"
+        abort_script "${_err_msg_}"
+    fi
+
+    if [ "${CO_SERVER}" == "YES" ]; then
+        # Start the DWHDB service
+        start_stop_eniq_services "start" "eniq-dwhdb"
+    fi
+
+    # export the LANG variable
+    export LANG="en_US.UTF-8"
+
+    # Update the symlinks.ini file
+    log_msg -t -s "Updating symlinks.ini file on ${HNAME}" -l ${LOGFILE}
+    log_msg -t -s "bash ${ENIQ_ADMIN_BIN_DIR}/update_cell_node_count.bsh -r -t ${_count_} -T -l ${LOGFILE}" -l ${LOGFILE}
+    $BASH ${ENIQ_ADMIN_BIN_DIR}/update_cell_node_count.bsh -r -t ${_count_} -T -l ${LOGFILE}
+    if [ $? -ne 0 ]; then
+        _err_msg_="Failed to update symlinks.ini file on ${HNAME}"
+        abort_script "${_err_msg_}"
+    fi
+
+    if [ "${CO_SERVER}" == "YES" ]; then
+        $CP -pr ${ENIQ_CONF_DIR}/${SYM_LINKS_INI} ${CLI_CONF_DIR}/${CO_SYM_LINKS_INI}
+        if [ $? -ne 0 ]; then
+            _err_msg_="Could not copy ${ENIQ_CONF_DIR}/${SYM_LINKS_INI} to ${CLI_CONF_DIR}/${CO_SYM_LINKS_INI}"
+            abort_script "${_err_msg_}"
+        fi
+    fi
+
+    $CP -pr ${CLI_CONF_DIR}/${CO_SYM_LINKS_INI} ${ENIQ_CONF_DIR}/${CO_SYM_LINKS_INI}
+    if [ $? -ne 0 ]; then
+        _err_msg_="Could not copy ${CLI_CONF_DIR}/${CO_SYM_LINKS_INI} to ${ENIQ_CONF_DIR}/${CO_SYM_LINKS_INI}"
+        abort_script "${_err_msg_}"
+    fi
+
+    insert_header_footer foot "Successfully completed - ${NEXT_STAGE} on ${HNAME}" ${LOGFILE}
+    $ECHO "Successfully completed - ${NEXT_STAGE} on ${HNAME}" > ${VAR_TMP_DIR}/${NEXT_STAGE}_success
+    execute_stages_on_secondary_nodes "add_temp_luns update_symlinks_ini"
+    set_next_stage `$EXPR ${ARRAY_ELEM}+1`
+else
+    insert_header_footer foot "Skipping TEMP DB Expansion stage - ${NEXT_STAGE} as it is already completed on ${HNAME}" ${LOGFILE}
+    execute_stages_on_secondary_nodes "add_temp_luns update_symlinks_ini"
+    set_next_stage `$EXPR ${ARRAY_ELEM}+1`
+fi
+}
+
+### Function: usage_msg ###
+#
+#   Print out the usage message
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+usage_msg()
+{
+clear
+$ECHO "
+Usage:
+
+`$BASENAME $0`
+
+`$BASENAME $0` -U
+
+Optional: [-s <stage_name>] [ -l <path_to_logfile> ]
+
+-U  : (If executed as part of VNX to Unity) Mandatory parameter specifying that the
+      script has been executed as part of VNX to Unity
+
+-l  : Optional parameter specifying the full path to logfile. If not specified,
+      a logfile will be created in /eniq/local_logs/migration
+
+"
+}
+
+# ********************************************************************
+#
+#   Main body of program
+#
+# ********************************************************************
+RUN_TIME=`$DATE '+%Y-%b-%d_%H:%M:%S'`
+
+# Check that the effective id of the user is root
+check_id ${DEFAULT_USER}
+
+while getopts ":s:Ul:" arg; do
+  case $arg in
+    s) USER_STAGE="$OPTARG"
+       ;;
+    U) VNX_to_UNITY="YES"
+       ;;
+    l) LOGFILE="$OPTARG"
+       ;;
+   \?) usage_msg
+       _err_msg_="Required parameters are not passed"
+       abort_script "${_err_msg_}"
+       ;;
+  esac
+done
+
+shift `expr $OPTIND - 1`
+
+# Determine absolute path to software
+check_absolute_path
+
+# Set up environment variables for script.
+setup_env
+
+_skip_flag_=0
+
+if [ ! "${USER_STAGE}" ]; then
+    $ECHO "\n-------- ${RUN_TIME} - Entering TEMP DB LUNs Addition on ${HNAME} --------\n"
+fi
+
+if [ "${CO_SERVER}" == "YES" ]; then
+    #Get the list of servers on this deployment
+    get_deployment_order
+    
+    for _line_ in `$CAT ${VAR_TMP_DIR}/server_order_list`; do
+        _ip_address_=`$ECHO ${_line_} | $AWK -F"::" '{print $1}'`
+        _serv_hostname_=`$ECHO ${_line_} | $AWK -F"::" '{print $2}'`
+        if [ ! "${_ip_address_}" -o ! "${_serv_hostname_}" ]; then
+            _err_msg_="Could not read required info from ${VAR_TMP_DIR}/server_order_list"
+            abort_script "${_err_msg_}"
+        fi
+
+        if [ "${_ip_address_}" == "${HOST_IP}" ]; then
+            $ECHO -e "\n=======================================================" >> ${LOGFILE}
+            $ECHO "${RUN_TIME} - Entering TEMP DB LUNs Addition on ${_serv_hostname_}" >> ${LOGFILE}
+            $ECHO -e "\n=======================================================" >> ${LOGFILE}
+            
+            #temp db addition on Standalone/CO blade
+            if [ -s ${VAR_TMP_DIR}/temp_db_expansion_success ]; then
+                log_msg -t -s "Skipping TEMP DB LUNs Addition on ${HNAME} as it is already completed" -l ${LOGFILE}
+            else
+                execute_stages
+                $TOUCH ${VAR_TMP_DIR}/temp_db_expansion_success
+                $ECHO "${HNAME}" > ${VAR_TMP_DIR}/temp_db_expansion_success
+            fi
+            if [ ${_skip_flag_} -eq 1 ]; then
+                log_msg -s "---------------- ${RUN_TIME} - Skipping Temp DB addition on ${HNAME} ----------------\n" -l ${LOGFILE}
+            else
+                $ECHO -e "\n=======================================================" >> ${LOGFILE}
+                $ECHO "${RUN_TIME} - Completed TEMP DB LUNs Addition on ${_serv_hostname_}" >> ${LOGFILE}
+                $ECHO -e "\n=======================================================" >> ${LOGFILE}
+                log_msg -s "-------- ${RUN_TIME} - Successfully completed TEMP DB LUNs Addition on ${HNAME}. Logfile : ${LOGFILE} --------\n" -l ${LOGFILE}
+            fi
+        else
+            $ECHO -e "\n=======================================================" >> ${LOGFILE}
+            $ECHO "${RUN_TIME} - Entering TEMP DB LUNs Addition on ${_serv_hostname_}" >> ${LOGFILE}
+            $ECHO -e "\n=======================================================" >> ${LOGFILE}
+            
+            #temp db addition on secondary blades
+            if [ "${VNX_to_UNITY}" == "YES" ]; then
+                run_remote_cmd "${_ip_address_}" "$BASH ${SCRIPTHOME}/temp_db_expansion.bsh -U" "${LOGFILE}"
+                if [ $? -ne 0 ]; then
+                    _err_msg_="Failed to execute ${SCRIPTHOME}/temp_db_expansion.bsh on ${_serv_hostname_}"
+                    abort_script "${_err_msg_}"
+                fi
+            else
+                run_remote_cmd "${_ip_address_}" "$BASH ${SCRIPTHOME}/temp_db_expansion.bsh" "${LOGFILE}"
+                if [ $? -ne 0 ]; then
+                    _err_msg_="Failed to execute ${SCRIPTHOME}/temp_db_expansion.bsh on ${_serv_hostname_}"
+                    abort_script "${_err_msg_}"
+                fi
+            fi
+            $ECHO -e "\n=======================================================" >> ${LOGFILE}
+            $ECHO "${RUN_TIME} - Completed TEMP DB LUNs Addition on ${_serv_hostname_}" >> ${LOGFILE}
+            $ECHO -e "\n=======================================================" >> ${LOGFILE}
+        fi
+    done
+elif [ "${RD_SERVER}" == "YES" ]; then
+    if [ ! "${USER_STAGE}" ]; then
+        $ECHO -e "\n=======================================================" >> ${LOGFILE}
+        $ECHO "${RUN_TIME} - Entering TEMP DB LUNs Addition on ${HNAME}" >> ${LOGFILE}
+        $ECHO -e "\n=======================================================" >> ${LOGFILE}
+    fi
+
+    #temp db addition on secondary blades
+    if [ -s ${VAR_TMP_DIR}/temp_db_expansion_success ]; then
+        log_msg -t -s "Skipping TEMP DB LUNs Addition on ${HNAME} as it is already completed" -l ${LOGFILE}
+    else
+        execute_stages
+        $TOUCH ${VAR_TMP_DIR}/temp_db_expansion_success
+        $ECHO "${HNAME}" > ${VAR_TMP_DIR}/temp_db_expansion_success
+    fi
+    if [ ${_skip_flag_} -eq 1 ]; then
+        log_msg -s "---------------- ${RUN_TIME} - Skipping Temp DB addition on ${HNAME} ----------------\n" -l ${LOGFILE}
+    else
+        if [ ! "${USER_STAGE}" ]; then
+            $ECHO -e "\n=======================================================" >> ${LOGFILE}
+            $ECHO "${RUN_TIME} - Completed TEMP DB LUNs Addition on ${HNAME}" >> ${LOGFILE}
+            $ECHO -e "\n=======================================================" >> ${LOGFILE}
+            log_msg -s "-------- ${RUN_TIME} - Successfully completed TEMP DB LUNs Addition on ${HNAME}. Logfile : ${LOGFILE} --------\n" -l ${LOGFILE}
+        fi
+    fi
+elif [ ! "${CO_SERVER}" -a ! "${RD_SERVER}" -a "${VNX_to_UNITY}" == "YES" ]; then
+    $ECHO -e "\n=======================================================" >> ${LOGFILE}
+    $ECHO "${RUN_TIME} - Entering TEMP DB LUNs Addition on ${HNAME}" >> ${LOGFILE}
+    $ECHO -e "\n=======================================================" >> ${LOGFILE}
+
+    if [ -s ${VAR_TMP_DIR}/temp_db_expansion_success ]; then
+        log_msg -t -s "Skipping TEMP DB LUNs Addition on ${HNAME} as it is already completed" -l ${LOGFILE}
+    else
+        # Excluding unnecessary stages 
+        exclude_stages
+
+        #temp db addition on secondary blades
+        execute_stages
+        $TOUCH ${VAR_TMP_DIR}/temp_db_expansion_success
+        $ECHO "${HNAME}" > ${VAR_TMP_DIR}/temp_db_expansion_success
+    fi
+    $ECHO -e "\n=======================================================" >> ${LOGFILE}
+    $ECHO "${RUN_TIME} - Completed TEMP DB LUNs Addition on ${HNAME}" >> ${LOGFILE}
+    $ECHO -e "\n=======================================================" >> ${LOGFILE}
+    log_msg -s "-------- ${RUN_TIME} - Successfully completed TEMP DB LUNs Addition on ${HNAME}. Logfile : ${LOGFILE} --------\n" -l ${LOGFILE}
+else
+    log_msg -t -s "Skipping execution of script on ${HNAME}" -l ${LOGFILE}
+fi
+
+# Delete success flag
+if [ "${CO_SERVER}" == "YES" ]; then
+    for _line_ in `$CAT ${VAR_TMP_DIR}/server_order_list`; do
+        _ip_address_=`$ECHO ${_line_} | $AWK -F"::" '{print $1}'`
+        _serv_hostname_=`$ECHO ${_line_} | $AWK -F"::" '{print $2}'`
+        if [ ! "${_ip_address_}" -o ! "${_serv_hostname_}" ]; then
+            _err_msg_="Could not read required info from ${VAR_TMP_DIR}/server_order_list"
+            abort_script "${_err_msg_}"
+        fi
+
+        if [ "${_ip_address_}" == "${HOST_IP}" ]; then
+            log_msg -t -s "Removing success flags on ${_serv_hostname_}\n" -l ${LOGFILE}
+            $RM -rf ${VAR_TMP_DIR}/temp_db_expansion_success
+            $RM -rf ${VAR_TMP_DIR}/prerequisites_vnx_to_unity_success
+            $RM -rf ${VAR_TMP_DIR}/partition_new_temp_luns_success
+            $RM -rf ${VAR_TMP_DIR}/add_temp_luns_no_disk_success
+            $RM -rf ${VAR_TMP_DIR}/add_temp_luns_none_success
+            $RM -rf ${VAR_TMP_DIR}/add_temp_luns_success
+            $RM -rf ${VAR_TMP_DIR}/update_symlinks_ini_success
+        else
+            log_msg -t -s "Removing success flags on ${_serv_hostname_}\n" -l ${LOGFILE}
+            run_remote_cmd "${_ip_address_}" "$RM -rf ${VAR_TMP_DIR}/temp_db_expansion_success" "${LOGFILE}"
+            run_remote_cmd "${_ip_address_}" "$RM -rf ${VAR_TMP_DIR}/prerequisites_vnx_to_unity_success" "${LOGFILE}"
+            run_remote_cmd "${_ip_address_}" "$RM -rf ${VAR_TMP_DIR}/partition_new_temp_luns_success" "${LOGFILE}"
+            run_remote_cmd "${_ip_address_}" "$RM -rf ${VAR_TMP_DIR}/add_temp_luns_no_disk_success" "${LOGFILE}"
+            run_remote_cmd "${_ip_address_}" "$RM -rf ${VAR_TMP_DIR}/add_temp_luns_none_success" "${LOGFILE}"
+            run_remote_cmd "${_ip_address_}" "$RM -rf ${VAR_TMP_DIR}/add_temp_luns_success" "${LOGFILE}"
+            run_remote_cmd "${_ip_address_}" "$RM -rf ${VAR_TMP_DIR}/update_symlinks_ini_success" "${LOGFILE}"
+        fi
+    done
+    $RM -rf ${VAR_TMP_DIR}/server_order_list
+
+    log_msg -s "---------------- Successfully completed TEMP DB LUNs Addition ----------------\n" -l ${LOGFILE}
+elif [ "${USER_STAGE}" -a ! "${CO_SERVER}"]; then
+    $RM -rf ${VAR_TMP_DIR}/temp_db_expansion_success
+fi
+
+$RM -rf ${CONN_STR_USER_DBA_ENC_}
+$RM -rf ${_CONN_STR_USER_DBA_RD_ENC}
+
+$ECHO "Changing permission of the ${LOGFILE} to 644" | $TEE -a ${LOGFILE}
+$CHMOD 644 ${LOGFILE}
+    if [ $? -ne 0 ]; then
+        _err_msg_="Could not change ${LOGFILE} file permission to 644"
+    	abort_script "${_err_msg_}"
+    fi
+
+exit 0

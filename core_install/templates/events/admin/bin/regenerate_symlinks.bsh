@@ -1,0 +1,393 @@
+#!/bin/bash
+# ********************************************************************
+# Ericsson Radio Systems AB                                     SCRIPT
+# ********************************************************************
+#
+#
+# (c) Ericsson Radio Systems AB 2019 - All rights reserved.
+#
+# The copyright to the computer program(s) herein is the property
+# of Ericsson Radio Systems AB, Sweden. The programs may be used 
+# and/or copied only with the written permission from Ericsson Radio 
+# Systems AB or in accordance with the terms and conditions stipulated 
+# in the agreement/contract under which the program(s) have been 
+# supplied.
+#
+# ********************************************************************
+# Name    : regenerate_symlinks.bsh
+# Date    : 04/1/2019
+# Revision: main\10
+# Purpose : Generates symbolic links from a list of commands.
+#
+# Usage   : regenerate_symlinks.bsh [ <path to file with commands> ] [ <path to log file> ]
+#
+# ********************************************************************
+#
+#       Command Section
+#
+# ********************************************************************
+AWK=/usr/bin/awk
+BASENAME=/usr/bin/basename
+CAT=/usr/bin/cat
+DATE=/usr/bin/date
+ECHO="/usr/bin/echo -e"
+GREP=/usr/bin/grep
+MKDIR=/usr/bin/mkdir
+MV=/usr/bin/mv
+PS=/usr/bin/ps
+RM=/usr/bin/rm
+SED=/usr/bin/sed
+TAIL=/usr/bin/tail
+TEE=/usr/bin/tee
+
+
+# ********************************************************************
+#
+#       Configuration Section
+#
+# ********************************************************************
+# Name of SunOS ini Files
+SUNOS_INI=SunOS.ini
+
+# Directory on the root filesystem
+ENIQ_ROOT_DIR=/eniq
+
+ENIQ_CONF_DIR=${ENIQ_ROOT_DIR}/installation/config
+DTRACE_LOG_DIR="/eniq/local_logs/Dtrace"
+BATCH_PERIOD=900 #seconds (15mins)  - the time to wait between each batch
+LINES_PER_BATCH=15000 #The number of lines to process per batch
+LN_MINUS_S_CMD="ln -s" #The base of command for generating a symbolic link
+SCRIPT_NAME=`$BASENAME $0`
+SHORT_SCRIPT_NAME=`$BASENAME $0 | $AWK -F. '{print $1}'`
+PID_CHECK_FILE=/tmp/$SHORT_SCRIPT_NAME.pid
+CURRENT_PROCESS_ID=$$
+REGEN_LOG_DIR=/eniq/log/sw_log/Regeneration
+REGEN_ERROR_CTRL_FILE=${REGEN_LOG_DIR}/${SHORT_SCRIPT_NAME}.err
+FAILED_LINE_NUM_FILE=/tmp/line_num_file.txt
+
+### Function: abort_script ###
+#
+#   This will is called if the script is aborted thru an error
+#   error signal sent by the kernel such as CTRL-C or if a serious
+#   error is encountered during runtime
+#
+# Arguments:
+#       $1 - Error message from part of program (Not always used)
+# Return Values:
+#       none
+abort_script()
+{
+_err_time_=`$DATE '+%Y-%b-%d_%H.%M.%S'`
+
+if [ "$1" ]; then
+    _err_msg_="${_err_time_} - $1"
+else
+    _err_msg_="${_err_time_} - ERROR : Script aborted.......\n"
+fi
+
+if [ "${LOG}" ]; then
+    $ECHO "\nERROR : $_err_msg_\n"|$TEE -a ${LOG}
+else
+    $ECHO "\nERROR : $_err_msg_\n"
+fi
+### create an error file so we can monitor for errors
+$ECHO "ERROR: Running $SCRIPT_NAME on host: `hostname`" >>$REGEN_ERROR_CTRL_FILE
+
+# tidy up on error 
+cleanup
+exit 1
+
+}
+
+## Function: read_storage_type ###
+#
+# Arguments:
+#   none
+# Return Values:
+#   set varibale STORAGE_TYPE
+read_storage_type()
+{
+# Read the storage type
+if [ -s ${ENIQ_CONF_DIR}/${SUNOS_INI} ]; then
+    STORAGE_TYPE=`iniget STOR_TYPE -f ${ENIQ_CONF_DIR}/${SUNOS_INI} -v STORAGE_TYPE`
+else
+    if [ -s ${ENIQ_CONF_DIR}/san_details ]; then
+        STORAGE_TYPE=`$CAT ${ENIQ_CONF_DIR}/san_details | $GREP "^STORAGE_TYPE=" | $AWK -F\= '{print $2}'`
+    fi
+fi
+
+if [ ! "${STORAGE_TYPE}" ]; then
+    _err_msg_="Could not read STORAGE_TYPE param "
+    abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+fi
+}
+
+check_already_running() 
+{
+#If there is no PID file, log the current process id to file
+if [ ! -f $PID_CHECK_FILE ]; then
+    $ECHO $$ > $PID_CHECK_FILE
+    return 0
+fi
+
+#get the PID of the last executed script
+PID=`$CAT $PID_CHECK_FILE`
+
+#if that PID not match the current PID, return sating already running
+if [ $PID -ne $CURRENT_PROCESS_ID ]; then
+    $ECHO "$SCRIPT_NAME is already running." |$TEE -a ${LOG}
+    $ECHO "LockFile $PID_CHECK_FILE" |$TEE -a ${LOG}
+    return 1
+fi
+
+return 0
+}
+
+cleanup() {
+    rm -f $PID_CHECK_FILE >> /dev/null 2>&1
+
+
+}
+
+usage_msg () {
+	$ECHO "
+	Usage: `$BASENAME $0` [ -f <filepath_with_symlink_command_file> ]  [ -l <path_to_logfile> ]
+						  
+	options:
+
+	-f  : Optional path to file with commands for generating symbolic links. Default will be: /eniq/local_logs/Dtrace/dtrace_symlink_log_*.txt
+
+	-l  : Optional path for log file. The default will be /eniq/local_logs/Dtrace/regen_symlink.log. Default will be: 
+
+	-m  : Optional arg for number of lines to process per batch. Default will be 15000: 
+
+	-p  : Optional arg in seconds for the time between batches. Default will be: 900 sec (15 min)"
+}
+
+generate_symlinks_reverse_order () {
+	local file=${1}
+	
+	local numberOfLinesInFile=`wc -l $file | awk '{print $1}'` #The number of lines in file (num of commands to execute)
+		if [ ${?} -ne 0 ] ; then 
+			abort_script "ERROR: when getting number of lines in file." ;
+		fi
+	
+	NUMBER_OF_BATCHES=$(($numberOfLinesInFile/$LINES_PER_BATCH))
+	
+	local NUMBER_OF_BATCHES_withRemainder=`echo "scale=5; $numberOfLinesInFile/$LINES_PER_BATCH" | bc`
+		
+		#Is there a remainder?
+		if [[ $NUMBER_OF_BATCHES_withRemainder != *.00000* ]] ; then
+			#Yes, then get a rounded up value for number of batches, so that we have the correct number of batches
+			NUMBER_OF_BATCHES=$(($NUMBER_OF_BATCHES+1))
+		fi
+	
+	$ECHO "Going to generate ${numberOfLinesInFile} symbolic links starting from end of file, in ${NUMBER_OF_BATCHES} batch(s)." | tee -a ${LOG}
+	local batch=1
+
+	if [ -f $FAILED_LINE_NUM_FILE ] ; then
+		lineNum=$(head -1 $FAILED_LINE_NUM_FILE)
+		$ECHO "Regeneration failed on last run. Resuming regeneration at line ${lineNum}." | tee -a ${LOG}
+	else
+		lineNum=$numberOfLinesInFile #Starting from last line
+	fi	
+	
+	while [ $lineNum -ge 1 ] #Iterate through lines in file in reverse order
+	do
+		$ECHO "Batch ${batch}:" | tee -a ${LOG}
+		
+		local timeBefore=`$AWK 'BEGIN{print srand()}'`
+		$ECHO "Starting batch ${batch} at ${timeBefore} seconds epoch time" | tee -a ${LOG}
+		
+		if [ $batch -eq 1 ] ; then
+			firstBatchStartTime=$timeBefore
+		fi
+		
+		#Parser the lines for a batch and use them to generate symlinks:
+		generate_batch $LINES_PER_BATCH #The lineNum variable should be decremented in this function for each line fo batch processedsed.
+		if [ ${?} -ne 0 ] ; then
+			abort_script "ERROR: in batch ${batch}."
+		fi
+		local timeAfter=`$AWK 'BEGIN{print srand()}'`
+		$ECHO "Finished batch ${batch} of ${NUMBER_OF_BATCHES} at ${timeAfter} seconds epoch time. Time taken for batch: $(($timeAfter-$timeBefore)) seconds." | tee -a ${LOG}
+		
+		local batch=$(($batch+1))
+		
+		#If there are no more lines in this batch, and batch has taken no longer than the intended batch period..
+		if [ $lineNum -ge 1 -a $(($timeAfter-$timeBefore)) -lt $BATCH_PERIOD ] ; then
+			#..calculate how long to wait until next batch
+			waitTimeThisBatch=$(($BATCH_PERIOD-$(($timeAfter-$timeBefore))))
+			$ECHO "Waiting for ${waitTimeThisBatch} seconds until next batch." | tee -a ${LOG}
+			sleep $waitTimeThisBatch
+		fi
+	done
+	$ECHO "Total time for symlink regeneration: $(($timeAfter-$firstBatchStartTime)) sec." | tee -a ${LOG}
+
+}
+
+generate_batch () {
+	local LINES_PER_BATCH=${1}
+ 	local lastLineBatch=$(($lineNum-$LINES_PER_BATCH+1)) #Need to add the 1 here because the range used in the sed command bellow is inclusive.
+	if [ $lastLineBatch -lt 1 ] ; then
+		local lastLineBatch=1
+	fi
+	
+	local numLinesThisBatch=$(($lineNum-$lastLineBatch+1))
+	$ECHO "Processing $numLinesThisBatch lines this batch: line ${lineNum} to ${lastLineBatch}"
+	
+	#Parse a batch of lines from file
+	local linesParsed=`$SED -n "$lastLineBatch,$lineNum"p $file | $TAIL -f`
+	if [ ${PIPESTATUS[0]} -ne 0 -o ${?} -ne 0 ] ; then 
+		abort_script "ERROR: when parsing or executing lines from file $file." 
+	fi
+        
+	# Read the storage type
+	read_storage_type
+
+	#Iterate through the parsed line, evaluating each as a command:
+	while read line ; do
+	echo $lineNum > $FAILED_LINE_NUM_FILE
+
+        # Ensure that NAS is still up for RAW system, before we try to generate the symlink
+        if [ "${STORAGE_TYPE}" == "raw" ]; then
+        	if [ ! -f /eniq/data/pmdata/.tagfile ]; then
+			abort_script "ERROR: NAS connection LOST "
+		fi
+	fi
+ 
+	$line #This parsed line will be format "linkfile <real filepath> <symlink filepath>" and will call the linkfile function in this script
+        if [ ${?} -ne 0 ] ; then
+              	$ECHO "ERROR: There is something wrong with line $lineNum. Here it is: $line" | tee -a ${LOG}
+        fi
+        lineNum=$(($lineNum-1))
+
+	done <<< "$linesParsed"
+}
+
+linkfile () {
+	local targetFile=${1} #Path to real file
+	local symlink=${2} #Path to symlink
+	
+	$ECHO "Generating symbolic link with inputs from line $lineNum using command: ${LN_MINUS_S_CMD} ${targetFile} ${symlink}"
+	#This echo not sent to log file for performance reasons, and to prevent log getting too big. It will only be seen in terminal (stdout).
+	
+	#Check if real file exists
+	if [ -f $targetFile ] ; then 
+	
+		$LN_MINUS_S_CMD $targetFile $symlink 2>&1 | tee -a ${LOG} #Create symbolic link based on input args to this function, and let stderr be seen in teminal and written to log file.
+		
+		#Checking if something went wrong other than symlink already existing or directory for symlink not existing. Would be very rare.
+		if [ ${PIPESTATUS[0]} -ne 0 -a ${PIPESTATUS[0]} -ne 2 ] ; then
+			$ECHO "ERROR: Generation of symlink ${symlink} for target file ${targetFile} failed for an unknown reason! See line ${lineNum} of file ${file}" | tee -a ${LOG}
+		fi
+		#NB: exit code 2 from ln command is not handled as we want script to continue if it happens, and the stderror for it will be logged anyway.
+	else
+		$ECHO "WARNING: the target file ${targetFile} does not exist. Symlink ${symlink} will not be created. See line ${lineNum} of file ${file}." | tee -a ${LOG}
+	fi
+	
+	return 0
+}
+
+################################
+#MAIN BODY######################
+################################
+
+if [ ! -d "$DTRACE_LOG_DIR" ] ; then
+	abort_script "Directory ${DTRACE_LOG_DIR}/ not found. Exiting."
+fi
+
+#Get the input args, if any
+while getopts ":f:l:b:m:p:" arg; do
+  case $arg in
+	f) COMMAND_FILE="$OPTARG" #This is optional path to file containing commands for generations of symbolic links to existing files.
+	;;
+	l) LOG="$OPTARG" #This is optional logging path - will overfide default.
+	;;
+	m) LINES_PER_BATCH="$OPTARG" #This is optional param for lines per batch - will override default.       
+	;;
+	p) BATCH_PERIOD="$OPTARG" #This is optional param for batch period in sec - will override default.
+	;;
+	\?) usage_msg
+		exit 1
+	;;
+  esac
+done
+
+#Was the log file path given as user input arg?
+if [ ! $LOG ] ; then
+    if [ ! -d "$REGEN_LOG_DIR" ] ; then
+        $MKDIR $REGEN_LOG_DIR
+    fi
+    _time_=`$DATE '+%Y-%b-%d_%H.%M.%S'`
+    LOG=${REGEN_LOG_DIR}/`hostname`-regen_symlink-${_time_}.log
+fi
+
+# Source the common functions
+if [ -s ${ENIQ_ROOT_DIR}/admin/lib/common_functions.lib ]; then
+    . ${ENIQ_ROOT_DIR}/admin/lib/common_functions.lib
+	if [ ${?} -ne 0 ] ; then
+		abort_script "common_functions.lib file not found in directory ${ENIQ_ROOT_DIR}/admin/lib/ Exiting." 
+	fi
+else
+    _err_msg_="File ${ENIQ_ROOT_DIR}/admin/lib/common_functions.lib not found"
+    abort_script "$_err_msg_"
+fi
+
+#check_already_running
+#if [ ${?} -ne 0 ] ; then
+#    $ECHO "Symlink generation command already running on this server." | tee -a ${LOG}
+#    exit 0
+#fi
+
+# Trap interrupts ( do nothing )
+# Run if Hang up detected on controlling terminal -SIGHUP
+# Run if user sends an interrupt signal (Ctrl + C) -SIGINT
+# Run if Software termination signal (sent by kill by default) -SIGTERM 
+# The SIGABRT signal is sent to a process to tell it to abort, i.e. to terminate -SIGABRT
+# SIGQUIT by default, this causes the process to terminate and dump core -SIGQUIT 
+# SIGTSTP by default, this causes the process to suspend execution. -SIGTSTP
+# SIGUSR1 & SIGUSR2 User-defined signals
+# to test e.g. kill -SIGTERM pid
+trap '' SIGHUP SIGINT SIGTERM SIGABRT SIGQUIT SIGTSTP SIGUSR1 SIGUSR2
+
+# Remove the error file since we are (re)running the script
+$RM -f $REGEN_ERROR_CTRL_FILE >> /dev/null 2>&1
+#Was dtrace log file path given as user input arg?
+if [ ! $COMMAND_FILE ] ; then
+	COMMAND_FILE=`ls ${DTRACE_LOG_DIR}/dtrace_symlink_log_*.txt` #No it wasn't, so going to use this default.
+
+
+
+
+	if [ ${?} -ne 0 ] ; then
+		abort_script "Default symlink generation command file not found in directory ${DTRACE_LOG_DIR}/ Exiting." 
+	fi
+	#Make sure there is only one file found:
+    num_of_files=`$ECHO "${COMMAND_FILE}" | wc -l`
+	if [ $num_of_files -gt 1 ] ; then
+		abort_script "More than one symlink generation command file found in ${DTRACE_LOG_DIR}/. Exiting."
+	fi
+elif [ ! -s $COMMAND_FILE ] ; then #Yes it was give, check if it exist..
+	#No it doesn't exists
+	abort_script "${COMMAND_FILE} not found. Exiting."
+fi
+
+
+$ECHO "#####Starting symbolic link generation.#####" | tee -a ${LOG}
+$ECHO "Input file to be used: ${COMMAND_FILE}" | tee -a ${LOG}
+
+#GENERATE THE SYMBOLIC LINKS IN BATCHES
+generate_symlinks_reverse_order $COMMAND_FILE
+if [ ${?} -ne 0 ] ; then 
+	abort_script "Exiting from generate_symlinks_reverse_order"
+fi
+
+cleanup
+
+#Ensure that line_num_file is deleted on successful regeneration.
+$RM -f $FAILED_LINE_NUM_FILE >> /dev/null 2>&1
+
+#Rename the input file used to enusre that if script is run again, the original file will not be re-processed
+$MV ${COMMAND_FILE} ${COMMAND_FILE}COMPLETED
+
+$ECHO "#####Symbolic link generation completed.#####" | tee -a ${LOG}

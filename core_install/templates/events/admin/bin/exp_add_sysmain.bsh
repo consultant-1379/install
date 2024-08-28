@@ -1,0 +1,1768 @@
+#!/bin/bash
+# ********************************************************************
+# Ericsson Radio Systems AB                                     SCRIPT
+# ********************************************************************
+#
+# (c) Ericsson Radio Systems AB 2019 - All rights reserved.
+#
+# The copyright to the computer program(s) herein is the property
+# of Ericsson Radio Systems AB, Sweden. The programs may be used
+# and/or copied only with the written permission from Ericsson Radio
+# Systems AB or in accordance with the terms and conditions stipulated
+# in the agreement/contract under which the program(s) have been
+# supplied.
+#
+# ********************************************************************
+# Name    : exp_add_sysmain.bsh
+# Date    : 06/12/2019
+# Revision: /main/26
+# Purpose : This Script is to only ran as part of the Expansion of Stats single blade
+# a multi-blade environment it replace existing sysmain  to one
+#
+# Usage   : exp_add_sysmain.bsh -c <path_to_cli_conf> -d <niq.ini_file_location>
+#                               [-l <logfile>]
+#
+# ********************************************************************
+#
+#   Command Section
+#
+# ********************************************************************
+AWK=/usr/bin/awk
+BASENAME=/usr/bin/basename
+BASH=/usr/bin/bash
+CAT=/usr/bin/cat
+CP=/usr/bin/cp
+DATE=/usr/bin/date
+DIRNAME=/usr/bin/dirname
+ECHO='/usr/bin/echo -e'
+EGREP=/usr/bin/egrep
+EXPR=/usr/bin/expr
+FIND=/usr/bin/find
+GREP=/usr/bin/grep
+HEAD=/usr/bin/head
+ID=/usr/bin/id
+LN=/usr/bin/ln
+LS=/usr/bin/ls
+MKDIR=/usr/bin/mkdir
+MULTIPATH=/usr/sbin/multipath
+MV=/usr/bin/mv
+RAW=/usr/bin/raw
+RM=/usr/bin/rm
+SED=/usr/bin/sed
+SORT=/usr/bin/sort
+SU=/usr/bin/su
+TAIL=/usr/bin/tail
+TEE=/usr/bin/tee
+TOUCH=/usr/bin/touch
+UDEVADM=/usr/sbin/udevadm
+UNLINK=/usr/bin/unlink
+VGS=/usr/sbin/vgs
+WC=/usr/bin/wc
+XARGS=/usr/bin/xargs
+
+# ********************************************************************
+#
+#   Configuration
+#
+# ********************************************************************
+DEFAULT_USER=root
+# Name of SunOS ini File
+SUNOS_INI=SunOS.ini
+BLK_STOR_INI=block_storage.ini
+SYM_INI_FILE=sym_links.ini
+SYM_CO_INI_FILE=coordinator_sym_links.ini
+LUN_MAP_FILE=lun_map.ini
+SYBASE_PATH="/eniq/database"
+LUN_FILE_LAYOUT="LUN_ID;DISK;SIZE;RAID_TYPE;DESC;USED_BY"
+DROPLEAKS_RAN="NO"
+NEXT_DBFILE_ADDED="NO"
+# ********************************************************************
+#
+#   Functions
+#
+# ********************************************************************
+### Function: abort_script ###
+#
+#   This will is called if the script is aborted thru an error
+#   signal sent by the kernel such as CTRL-C or if a serious
+#   error is encountered during runtime
+#
+# Arguments:
+#       $1 - Error message from part of program (Not always used)
+# Return Values:
+#       none
+abort_script()
+{
+if [ "$1" ]; then
+    _err_msg_=$1
+else
+    _err_msg_="`$DATE '+%Y-%b-%d_%H.%M.%S'` - ERROR : Script aborted.......\n"
+fi
+
+if [ "${LOGFILE}" ]; then
+    ${ECHO} "\n `$DATE '+%Y-%b-%d_%H.%M.%S'` - ERROR : $_err_msg_\n" | $TEE -a ${LOGFILE}
+else
+    ${ECHO} "\n `$DATE '+%Y-%b-%d_%H.%M.%S'` - ERROR : $_err_msg_\n"
+fi
+
+$RM -rf ${TEM_DIR}
+
+if  [ "${NEXT_DBFILE_ADDED}" == "YES" ]; then
+        $CP -p ${SYM_LINK_BACKUP} ${SYM_INI}
+        if [[ $? -ne 0 ]]; then
+                $ECHO "ERROR : Failed to $CP ${SYM_LINK_BACKUP} ${SYM_INI}" | $TEE -a ${LOGFILE}
+        fi
+fi
+
+
+$SU - ${SYSUSER} -c "${IQDIR}/bin64/dbping -q -c \"${CONN_STR_USER_DBA}\""
+if [ $? -eq 0 ]; then
+        dwhdb_stop
+fi
+
+exit 55
+}
+
+### Function: check_id ###
+#
+#   Check that the effective id of the user is correct
+#   If not print error msg and exit.
+#
+# Arguments:
+#       $1 : User ID name
+# Return Values:
+#       none
+check_id()
+{
+_check_id_=`$ID | $AWK -F\( '{print $2}' | $AWK -F\) '{print $1}'`
+if [ "$_check_id_" != "$1" ]; then
+    _err_msg_="You must be $1 to execute this script."
+    abort_script "$_err_msg_"
+fi
+}
+### Function: chk_create_logfile ###
+#
+# Check/Create Logfile
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+chk_create_logfile()
+{
+if [[ ! -d "$(${DIRNAME} ${LOGFILE})" ]]; then
+        ${MKDIR} -p $(${DIRNAME} ${LOGFILE}) > /dev/null 2>&1
+    if [ $? -ne 0 ]; then
+                _err_msg_="Could not create directory [$($DIRNAME ${LOGFILE})]"
+                abort_script "$_err_msg_"
+        fi
+fi
+${TOUCH} -a ${LOGFILE}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not write to file [${LOGFILE}]"
+    abort_script "$_err_msg_"
+fi
+}
+### Function: chk_syslinks ###
+#
+# check the sym_links file
+# update the sym link with new sysmain file if needed.
+#
+# Arguments:
+#   line with lun details, sym_links.ini
+# Return Values:
+#   none
+#Set globals
+#
+chk_syslinks()
+{
+if  [ "${1}" == "" ]; then
+    _err_msg_="Must provide lun details"
+    abort_script "$_err_msg_"
+fi
+if  [ "${2}" == "" ]; then
+    _err_msg_="Must provide next dbfile"
+    abort_script "$_err_msg_"
+fi
+if  [ "${3}" == "" ]; then
+    _err_msg_="Must provide sym_link.ini file"
+    abort_script "$_err_msg_"
+fi
+
+
+local _lun_details_=$1
+local _next_dbfile_=$2
+_next_dbfile_=$($ECHO ${_next_dbfile_} | $SED -e 's/[[:blank:]]//g')
+
+local _symlink_ini_=$3
+local next_system_main=1
+local already_added=0
+local _iq_lun_id_=$($ECHO ${_lun_details_} | $AWK -F ";" '{print $1}')
+if [ ! "${_iq_lun_id_}" ]; then
+        _err_msg_="Could not find ${_iq_lun_id_} from  ${_lun_details_} "
+        abort_script "$_err_msg_"
+fi
+_iq_sys_disc_=$($ECHO ${_lun_details_} | $AWK -F ";" '{print $2}')
+if [ ! "${_iq_sys_disc_}" ]; then
+        _err_msg_="Could not find get ${_iq_sys_disc_} from  ${_lun_details_}"
+        abort_script "$_err_msg_"
+fi
+
+count=`$RAW -a |$WC -l`
+count=`$EXPR ${count} + 1`
+_iq_sys_link_="/dev/raw/raw${count}"
+
+$RAW ${_iq_sys_link_} /dev/mapper/${_iq_sys_disc_}1
+
+local _num_entry=$($CAT ${_symlink_ini_} | $EGREP "${_next_dbfile_}" | $WC -l)
+if [ ${_num_entry} -gt 1 ] ; then
+        _err_msg_="${_symlink_ini_}  configured for more than one entry of ${_next_dbfile_} "
+        abort_script "$_err_msg_"
+fi
+
+#get the DWH_SYSTEM_MAIN's file sym_links
+local _dbfile_sym_list_=`iniget DWH_SYSTEM_MAIN -f ${_symlink_ini_} | $SORT`
+if [ ! "${_dbfile_sym_list_}" ]; then
+    _err_msg_="Could not find any DWH_SYSTEM_MAIN in ${_symlink_ini_}"
+    abort_script "$_err_msg_"
+fi
+
+local _wwn_id_=`$MULTIPATH -l | $GREP ${_iq_sys_disc_} | $AWK -F "(" '{print $2}' | $AWK -F ")" '{print $1}'`
+if [ ! "${_wwn_id_}" ]; then
+        _err_msg_="Could not  get WWN ID for ${_iq_sys_disc_}"
+        abort_script "$_err_msg_"
+fi
+
+for _sysmain_test_ in ${_dbfile_sym_list_}; do
+        local _dbfile_=`iniget ${_sysmain_test_} -f ${_symlink_ini_} -v Path | $SED -e 's/[[:blank:]]//g'`
+        if [ ! "${_dbfile_}" ]; then
+                _err_msg_="Could not find get Path from ${_sysmain_test_} in ${_symlink_ini_}"
+                abort_script "$_err_msg_"
+        fi
+        local _lunid_=`iniget ${_sysmain_test_} -f ${_symlink_ini_} -v Lun_ID | $SED -e 's/[[:blank:]]//g'`
+        if [ ! "${_lunid_}" ]; then
+                _err_msg_="Could not find get Lun_ID from ${_sysmain_test_} in ${_symlink_ini_} "
+                abort_script "$_err_msg_"
+        fi
+        local _link_=`iniget ${_sysmain_test_} -f ${_symlink_ini_} -v Link | $SED -e 's/[[:blank:]]//g'`
+        if [ ! "${_link_}" ]; then
+                _err_msg_="Could not find get Link from ${_sysmain_test_} in ${_symlink_ini_} "
+                abort_script "$_err_msg_"
+        fi
+        if [ "${_next_dbfile_}" == "${_dbfile_}" ] ;then
+                if [ "${_lunid_}" == "${_iq_lun_id_}" ] ; then
+                        ${ECHO} "${_next_dbfile_} Already added to ${_symlink_ini_}" | $TEE -a ${LOGFILE}
+                        already_added=1
+                else
+                        _err_msg_="${_symlink_ini_} not configured properly exiting Lun_ID for ${_next_dbfile_}"
+                        abort_script "$_err_msg_"
+                fi
+                if [ "${_link_}" != "${_iq_sys_link_}" ] ; then
+                        _err_msg_="${_symlink_ini_} not configured properly exiting Link for ${_next_dbfile_}"
+                        abort_script "$_err_msg_"
+                fi
+
+        fi
+done
+
+if [ ${already_added} -eq 0 ] ; then
+        $RM -f ${TEM_DIR}/ins_det
+        $RM -f ${_symlink_ini_}_tmp
+        TEST_MAIN_1=$(iniget DWH_SYSTEM_MAIN_1 -f ${_symlink_ini_})
+        if [ "${TEST_MAIN_1}" ]; then
+                # Get the next DWH_SYSTEM_MAIN Parent number
+                _iq_parent_num_=`iniget DWH_SYSTEM_MAIN -f ${_symlink_ini_} |$AWK -F\_ '{print $NF}'|$SORT -n | $TAIL -1`
+                _iq_parent_num_=$($EXPR ${_iq_parent_num_} + 1 )
+        else
+                _iq_parent_num_=1
+        fi
+
+        ${ECHO} "Next DWH_SYSTEM_MAIN is ${_iq_parent_num_}" | $TEE -a ${LOGFILE}
+
+        ${ECHO} "[DWH_SYSTEM_MAIN_${_iq_parent_num_}]" >> ${TEM_DIR}/ins_det
+        ${ECHO} "Path=${_next_dbfile_}" >> ${TEM_DIR}/ins_det
+        ${ECHO} "Lun_ID=${_iq_lun_id_}" >> ${TEM_DIR}/ins_det
+        ${ECHO} "Type=${STORAGE_TYPE}" >> ${TEM_DIR}/ins_det
+        ${ECHO} "Size=" >> ${TEM_DIR}/ins_det
+        ${ECHO} "Link=${_iq_sys_link_}" >> ${TEM_DIR}/ins_det
+        ${ECHO} "Disk=${_iq_sys_disc_}1" >> ${TEM_DIR}/ins_det
+        ${ECHO} "WWN=${_wwn_id_}" >> ${TEM_DIR}/ins_det
+        $RM -f ${TEM_DIR}/${SYM_INI}_tmp
+
+        ${ECHO} "Updating ${_symlink_ini_} with DWH_SYSTEM_MAIN_${_iq_parent_num_}" | $TEE -a ${LOGFILE}
+        ${ENIQ_ADMIN_DIR}/lib/iniadd.pl -g DWH_SYSTEM_MAIN -p DWH_SYSTEM_MAIN_${_iq_parent_num_} -i ${_symlink_ini_} -d ${TEM_DIR}/ins_det -o ${_symlink_ini_}_tmp
+        if [ $? -ne 0 ]; then
+                _err_msg_="Error adding DWH_SYSTEM_MAIN_${_iq_parent_num_} to ${TEM_DIR}/${SYM_INI}"
+                abort_script "$_err_msg_"
+        fi
+        $CP ${_symlink_ini_}_tmp ${_symlink_ini_}
+        if [ $? -ne 0 ]; then
+                _err_msg_="Error cp ${_symlink_ini_}_tmp ${_symlink_ini_}"
+                abort_script "$_err_msg_"
+        fi
+        #get the disk allocated to tempDb files, this will need to be update when the tempDB are dropped
+        local sysmaindisks=`iniget DB_DISK_ALLOC -f ${_symlink_ini_} -v IQ_SYS_MAIN_DISKS`
+        if [ ! "${sysmaindisks}" ]; then
+                _err_msg_="Could not get IQ_SYS_MAIN_DISKS value from ${_symlink_ini_}"
+                abort_script "$_err_msg_"
+        fi
+        sysmaindisks="${sysmaindisks} ${_iq_sys_disc_}"
+        if [ ! "${sysmaindisks}" ]; then
+                _err_msg_="Could not get creat new IQ_SYS_MAIN_DISKS entry"
+                abort_script "$_err_msg_"
+        fi
+        iniset DB_DISK_ALLOC -f ${_symlink_ini_}  IQ_SYS_MAIN_DISKS="${sysmaindisks}"
+        if [ $? -ne 0 ]; then
+                _err_msg_="ERROR: Failed on iniset DB_DISK_ALLOC -f ${_symlink_ini_}_tmp IQ_SYS_MAIN_DISKS=${sysmaindisks}"
+                abort_script "$_err_msg_"
+        fi
+fi
+
+}
+### Function: get_sysmainfiles ###
+#
+# get the current size of
+#
+# Arguments:
+#   String for sym_link file
+# Return Values:
+#   none
+#Set globals
+#
+get_sysmainfiles()
+{
+$SU - ${SYSUSER} -c "${IQDIR}/bin64/dbping -q -c \"${CONN_STR_USER_DBA}\""
+if [ $? -ne 0 ]; then
+        dwhdb_args_start
+fi
+#get the other dbfiles from sybase that have to be dropped
+unset SYSMAIN_DBFILES
+SYSMAIN_DBFILES=$( $SU - ${SYSUSER} -c "${IQDIR}/bin64/dbisql -c \"${CONN_STR_USER_DBA}\" sp_iqfile" | $EGREP -i "${_first_dbfile}|${_string_dbfile_}" | $AWK '{print $2"::"$3}' | $SORT)
+if [ ! "${SYSMAIN_DBFILES}" ]; then
+    _err_msg_="Could not get sp_iqfile sybase"
+    abort_script "$_err_msg_"
+fi
+}
+### Function: chk_dbfiles ###
+#
+# get the current size of
+#
+# Arguments:
+#   String for sym_link file
+# Return Values:
+#   none
+#Set globals
+#
+chk_dbfiles()
+{
+if  [ "${1}" == "" ]; then
+    _err_msg_="Must provide an String for checking example DWH_SYSTEM_MAIN"
+    abort_script "$_err_msg_"
+fi
+
+local _dbtype_=$1
+local _string_dbfile_="iq_system_main_"
+local _first_dbfile="iq_system_main.iq"
+unset NEXT_AVAILABLE_IQ
+unset NEXT_DBFILE
+unset FIRST_SYSMAIN_SET
+unset TOTAL_SIZE_NEEDED
+NEXT_AVAILABLE_IQ=1
+TOTAL_SIZE_NEEDED=0
+FIRST_SYSMAIN_SET="NO"
+
+get_sysmainfiles
+SYSMAIN_DBFILES_START=${SYSMAIN_DBFILES}
+for _sysmain_ in ${SYSMAIN_DBFILES_START}; do
+        local _dbfile_=$($ECHO ${_sysmain_} | $AWK -F"::" '{print $2}' | $SED -e 's/[[:blank:]]//g')
+        if [ ! "${_dbfile_}" ]; then
+                _err_msg_="Could not get _dbfile_"
+                abort_script "$_err_msg_"
+        fi
+        local db_basename=$($BASENAME ${_dbfile_})
+        if [ ! "${db_basename}" ]; then
+                _err_msg_="Could not find get $BASENAME ${_dbfile_}"
+                abort_script "$_err_msg_"
+        fi
+        if [ "${db_basename}" == "${_first_dbfile}" ]; then
+        FIRST_SYSMAIN_SET="YES"
+        fi
+        local _num_=$( $ECHO "${db_basename}" | $EGREP "[0-9]+\.iq$" | $SED -e 's/.*_\([0-9]*\)\.iq$/\1/g')
+        if [ "${_num_}" ]; then
+                if [ ${_num_} -gt ${NEXT_AVAILABLE_IQ} -o ${_num_} -eq ${NEXT_AVAILABLE_IQ} ] ;then
+                        NEXT_AVAILABLE_IQ=$($EXPR $_num_ + 1)
+                fi
+        fi
+        local _disk_=$($LS -l ${_dbfile_} | $EGREP "/dev/raw" | $AWK '{print $11}' | $AWK -F "/" '{print $4}' | $SED -e 's/s[0-9]*$//g')
+        if [ ! "${_disk_}" ]; then
+                _err_msg_="Could not find get $LS -l ${_disk_}"
+                abort_script "$_err_msg_"
+        fi
+        local _dbfile_dir_=$($DIRNAME ${_dbfile_})
+        NEXT_DBFILE="${_dbfile_dir_}/${_string_dbfile_}${NEXT_AVAILABLE_IQ}.iq"
+        _raw_mpath_mapping_=`iniget DB_DISK_ALLOC -f ${ENIQ_CONF_DIR}/${SYM_INI_FILE} -v IQ_SYS_MAIN_DISKS`
+        local _line_=$($CAT ${LUN_LIST_DISK} | $EGREP "${_raw_mpath_mapping_}")
+        if [ ! "${_line_}" ]; then
+                _err_msg_="Could not find get _line_"
+                abort_script "$_err_msg_"
+        fi
+
+        local _dbfile_size_=$($ECHO ${_line_} | $AWK -F ";" '{print $3}'| $AWK '{print $1}' | $AWK -F 'GBytes' '{print $1}')
+        if [ ! "${_dbfile_size_}" ]; then
+                _err_msg_="Could not find get $ECHO ${_line_} | $AWK -F ";" '{print \$3}'| $AWK '{print \$1}'"
+                abort_script "$_err_msg_"
+        fi
+
+        TOTAL_SIZE_NEEDED=$($EXPR ${TOTAL_SIZE_NEEDED} + ${_dbfile_size_} + 1 )
+
+done
+TOTAL_SIZE_NEEDED=$($EXPR ${TOTAL_SIZE_NEEDED} - 1)
+
+if [ ${FIRST_SYSMAIN_SET} == "NO" ]; then
+        NEXT_DBFILE="${_dbfile_dir_}/${_first_dbfile}"
+fi
+}
+
+### Function: db_dropleaks ###
+#
+# check dbfile in sybase
+#
+# Arguments:
+#       dbfile
+# Return Values:
+#       none
+db_dropleaks()
+{
+if  [ "${DROPLEAKS_RAN}" == "NO" ]; then
+        $MKDIR -p ${TEM_DIR}/sql
+        local _sql_drop_leak_=${TEM_DIR}/sql/sp_iq_dropleaks.sql
+        $ECHO "Configuring IQ Cache values in niq.ini\n" | $TEE -a ${LOGFILE}
+        ${BASH} ${ENIQ_CORE_BIN_DIR}/set_core_memcache.bsh -d ${ENIQ_CONF_DIR} -m -T 25 -M 25 -L 25 -C 25 -f -l ${LOGFILE}
+        if [ $? -ne 0 ]; then
+                _err_msg_="Failed to run set_core_memcache.bsh.\n"
+                abort_script "$_err_msg_"
+        fi
+        ${BASH} ${MANAGE_SERVICES_BSH} -a restart -s dwhdb -N -l ${LOGFILE}
+        if [ $? -ne 0 ]; then
+                _err_msg_="Failed to restart dwhdb \nExiting...."
+                abort_script "$_err_msg_"
+        fi
+        dwhdb_ping
+        $ECHO "`$DATE '+%Y-%b-%d_%H.%M.%S'` sp_iqcheckdb, this could take a while" | $TEE -a ${LOGFILE}
+        $ECHO "sp_iqcheckdb 'dropleaks database'" > ${_sql_drop_leak_}
+        $CAT ${_sql_drop_leak_}  | $TEE -a ${LOGFILE}
+        $SU - ${SYSUSER} -c "${IQDIR}/bin64/dbisqlc -c \"${CONN_STR_USER_DBA}\" -q ${_sql_drop_leak_}"
+        if [ $? -ne 0 ]; then
+                _err_msg_="sp_iqcheckdb 'dropleaks database' failed"
+                $ECHO "Reverting IQ Cache values to previous values in niq.ini\n" | $TEE -a ${LOGFILE}
+                ${BASH} ${ENIQ_CORE_BIN_DIR}/set_core_memcache.bsh -d ${ENIQ_CONF_DIR} -m -f -l ${LOGFILE}
+                if [ $? -ne 0 ]; then
+                        _err_msg_="Failed to run set_core_memcache.bsh.\n"
+                        abort_script "$_err_msg_"
+                fi
+                ${BASH} ${MANAGE_SERVICES_BSH} -a restart -s dwhdb -N -l ${LOGFILE}
+                abort_script "$_err_msg_"
+        fi
+        $ECHO " `$DATE '+%Y-%b-%d_%H.%M.%S'` sp_iqcheckdb 'dropleaks database' ran " | $TEE -a ${LOGFILE}
+        DROPLEAKS_RAN="YES"
+        $ECHO "Reverting IQ Cache values to previous values in niq.ini\n" | $TEE -a ${LOGFILE}
+        ${BASH} ${ENIQ_CORE_BIN_DIR}/set_core_memcache.bsh -d ${ENIQ_CONF_DIR} -m -f -l ${LOGFILE}
+        if [ $? -ne 0 ]; then
+                _err_msg_="Failed to run set_core_memcache.bsh.\n"
+                abort_script "$_err_msg_"
+        fi
+        ${BASH} ${MANAGE_SERVICES_BSH} -a restart -s dwhdb -N -l ${LOGFILE}
+        if [ $? -ne 0 ]; then
+                _err_msg_="Failed to restart dwhdb. \nExiting...."
+                abort_script "$_err_msg_"
+        fi
+fi
+}
+### Function: check_db_added ###
+#
+# check dbfile in sybase
+#
+# Arguments:
+#       dbfile
+# Return Values:
+#       none
+check_db_added()
+{
+
+if  [ "${1}" == "" ]; then
+    _err_msg_="Must provide an dbfile"
+    abort_script "$_err_msg_"
+fi
+
+$SU - ${SYSUSER} -c "${IQDIR}/bin64/dbisql -c \"${CONN_STR_USER_DBA}\" sp_iqfile"  | $EGREP ${1} > /dev/null 2>&1
+if [ $? -eq 0 ]; then
+        ${ECHO} "${1} is added from sybase" | $TEE -a ${LOGFILE}
+else
+        _err_msg_="${1} not  found in dwhdb"
+        abort_script "$_err_msg_"
+fi
+
+}
+### Function: check_db_removed  ###
+#
+# check dbfile not in  sybase
+#
+# Arguments:
+#       dbfile
+# Return Values:
+#       none
+check_db_removed()
+{
+
+if  [ "${1}" == "" ]; then
+    _err_msg_="Must provide an dbfile"
+    abort_script "$_err_msg_"
+fi
+
+$SU - ${SYSUSER} -c "${IQDIR}/bin64/dbisql -c \"${CONN_STR_USER_DBA}\" sp_iqfile"  | $EGREP ${1} > /dev/null 2>&1
+if [ $? -ne 0 ]; then
+        ${ECHO} "${1} is dropped from sybase" | $TEE -a ${LOGFILE}
+else
+        _err_msg_="${1} not found in dwhdb"
+        abort_script "$_err_msg_"
+fi
+
+}
+### Function: create_sym_label ###
+#
+# create sym link and label
+# Arguments:
+#       dbfile
+# Return Values:
+#       none
+create_sym_label()
+{
+        ${ECHO} "create sym links \n  ${ENIQ_CORE_INSTALL_BSH} -s create_db_sym_links -n\n" | $TEE -a ${LOGFILE}
+        ${ENIQ_CORE_INSTALL_BSH} -s create_db_sym_links -n
+        if [ $? -ne 0 ]; then
+                _err_msg_="Could not create  /usr/bin/bash $ENIQ_CORE_INSTALL_BSH -s create_db_sym_links -n"
+                abort_script "$_err_msg_"
+        fi
+
+}
+### Function: cleanup_symlinks ###
+#
+# clean up the sym_link file to have only the one sysmain file
+#
+# Arguments:
+#   the sysmain dbfile to be kept, sym_links.ini
+# Return Values:
+#   none
+#Set globals
+#
+cleanup_symlinks()
+{
+
+if  [ "${1}" == "" ]; then
+    _err_msg_="Must provide next dbfile"
+    abort_script "$_err_msg_"
+fi
+if  [ "${2}" == "" ]; then
+    _err_msg_="Must provide sym_link.ini file"
+    abort_script "$_err_msg_"
+fi
+
+
+local _next_dbfile_=$1
+_next_dbfile_=$($ECHO ${_next_dbfile_} | $SED -e 's/[[:blank:]]//g')
+
+local _symlink_ini_org_=$2
+local next_system_main=1
+local already_added=0
+local _symlink_ini_=${TEM_DIR}/copy_sym_links.ini
+$CP ${_symlink_ini_org_} ${_symlink_ini_}
+if [[ $? -ne 0 ]]; then
+        abort_script "ERROR : Failed to $CP ${_symlink_ini_org_} ${_symlink_ini_}"
+fi
+
+$RM -rf ${SYSMAIN_LUN_RM}
+
+
+local _num_entry=$($CAT ${_symlink_ini_} | $EGREP "${_next_dbfile_}" | $WC -l)
+if [ ${_num_entry} -gt 1 ] ; then
+        _err_msg_="${_symlink_ini_}  configured for than one entry of ${_next_dbfile_} "
+        abort_script "$_err_msg_"
+fi
+
+#get the DWH_SYSTEM_MAIN's file sym_links
+local _dbfile_sym_list_=`iniget DWH_SYSTEM_MAIN -f ${_symlink_ini_} | $SORT`
+if [ ! "${_dbfile_sym_list_}" ]; then
+    _err_msg_="Could not find any DWH_SYSTEM_MAIN in ${_symlink_ini_}"
+    abort_script "$_err_msg_"
+fi
+for _sysmain_test_ in ${_dbfile_sym_list_}; do
+        local _dbfile_=`iniget ${_sysmain_test_} -f ${_symlink_ini_} -v Path | $SED -e 's/[[:blank:]]//g'`
+        if [ ! "${_dbfile_}" ]; then
+                _err_msg_="Could not find get PATH from  ${_sysmain_test_} in ${_symlink_ini_} "
+                abort_script "$_err_msg_"
+        fi
+        local _lunid_=`iniget ${_sysmain_test_} -f ${_symlink_ini_} -v Lun_ID | $SED -e 's/[[:blank:]]//g'`
+        if [ ! "${_lunid_}" ]; then
+                _err_msg_="Could not find get Lun_ID from  ${_sysmain_test_} in ${_symlink_ini_}  "
+                abort_script "$_err_msg_"
+        fi
+        local _size_=`iniget ${_sysmain_test_} -f ${_symlink_ini_} -v Size | $SED -e 's/[[:blank:]]//g'`
+
+        local _link_=`iniget ${_sysmain_test_} -f ${_symlink_ini_} -v Link | $SED -e 's/[[:blank:]]//g'`
+        if [ ! "${_link_}" ]; then
+                _err_msg_="Could not find get Link from  ${_sysmain_test_} in ${_symlink_ini_}"
+                abort_script "$_err_msg_"
+        fi
+        local _disk_=`iniget ${_sysmain_test_} -f ${_symlink_ini_} -v Disk | $SED -e 's/[[:blank:]]//g'`
+        if [ ! "${_disk_}" ]; then
+                _err_msg_="Could not find get Disk from  ${_sysmain_test_} in ${_symlink_ini_}"
+                abort_script "$_err_msg_"
+        fi
+        local _wwn_id_=`iniget ${_sysmain_test_} -f ${_symlink_ini_} -v WWN | $SED -e 's/[[:blank:]]//g'`
+        if [ ! "${_wwn_id_}" ]; then
+                _err_msg_="Could not find get WWN from  ${_sysmain_test_} in ${_symlink_ini_}"
+                abort_script "$_err_msg_"
+        fi
+        local _disc_=$($ECHO ${_link_} | $AWK -F "/" '{ print $4}' | $SED -e 's/s0$//g')
+        if [ "${_next_dbfile_}" == "${_dbfile_}" ] ;then
+                ${ECHO} "[DWH_SYSTEM_MAIN_1]" >> ${TEM_DIR}/keep_sysmain
+                ${ECHO} "Path=${_dbfile_}" >> ${TEM_DIR}/keep_sysmain
+                ${ECHO} "Lun_ID=${_lunid_}" >> ${TEM_DIR}/keep_sysmain
+                ${ECHO} "Type=${STORAGE_TYPE}" >> ${TEM_DIR}/keep_sysmain
+                ${ECHO} "Size=${_size_}" >> ${TEM_DIR}/keep_sysmain
+                ${ECHO} "Link=${_link_}" >> ${TEM_DIR}/keep_sysmain
+                ${ECHO} "Disk=${_disk_}" >> ${TEM_DIR}/keep_sysmain
+                ${ECHO} "WWN=${_wwn_id_}" >> ${TEM_DIR}/keep_sysmain
+                                
+        else
+                ${ECHO} "${_lunid_}::${_dbfile_}::${_link_}" >> ${SYSMAIN_LUN_RM}
+                #remove sym_link
+                $ECHO "Removing  sym_link '${_dbfile_}'" | $TEE -a ${LOGFILE}
+                $LS ${_dbfile_} >> /dev/null 2>&1
+                if [ $? -ne 0 ]; then
+                        _err_msg_="ERROR: Failed on $LS {_dbfile_}"
+                        abort_script "$_err_msg_"
+                fi
+                $RM -rf ${_dbfile_}
+                if [ $? -ne 0 ]; then
+                        _err_msg_="ERROR: Failed on $RM ${_dbfile_}"
+                        abort_script "$_err_msg_"
+                fi
+                update_block_storage_ini "remove" "${_lunid_}"
+        fi
+        $RM -f ${TEM_DIR}/${SYM_INI}_tmp
+        ${INIDEL} -g DWH_SYSTEM_MAIN -p ${_sysmain_test_} -i ${_symlink_ini_} -o ${_symlink_ini_}_tmp
+        if [[ $? -ne 0 ]]; then
+                abort_script "ERROR : ${INIDEL} -p {_sysmain_test_} -i ${_symlink_ini_} -o ${_symlink_ini_}_tmp"
+        fi
+        $MV ${_symlink_ini_}_tmp ${_symlink_ini_}
+        if [ $? -ne 0 ]; then
+           _err_msg_="Error moving $MV ${_symlink_ini_}_tmp ${_symlink_ini_}"
+           abort_script "$_err_msg_"
+        fi
+
+done
+
+#Removing {_symlink_ini_}_tmp file
+$RM -rf ${_symlink_ini_}_tmp
+#To check the existence of {_symlink_ini_}_tmp file
+    if [ -f ${_symlink_ini_}_tmp ]; then
+        _err_msg_="ERROR: Failed to remove ${_symlink_ini_}_tmp"
+        abort_script "$_err_msg_"
+    fi
+
+$ECHO "adding DWH_SYSTEM_MAIN_1  sym_link " | $TEE -a ${LOGFILE}
+${INIADD} -g DWH_SYSTEM_MAIN -p DWH_SYSTEM_MAIN_1 -i ${_symlink_ini_} -d ${TEM_DIR}/keep_sysmain -o ${_symlink_ini_}_tmp
+if [ $? -ne 0 ]; then
+        _err_msg_="Error adding DWH_SYSTEM_MAIN_${_iq_parent_num_} to ${TEM_DIR}/${SYM_INI}"
+        abort_script "$_err_msg_"
+fi
+
+$SU - ${SYSUSER} -c "${IQDIR}/bin64/dbping -q -c \"${CONN_STR_USER_DBA}\""
+if [ $? -eq 0 ]; then
+        dwhdb_stop
+fi
+
+$UNLINK ${NEXT_DBFILE}
+if [ $? -ne 0 ]; then
+        _err_msg_="ERROR: Failed to remove the existing symlink for ${NEXT_DBFILE}"
+        abort_script "$_err_msg_"
+fi
+
+$RAW ${_iq_sys_link_} 0 0
+if [ $? -ne 0 ]; then
+        _err_msg_="ERROR: Failed to clear the raw device ${_iq_sys_link_}"
+        abort_script "$_err_msg_"
+fi
+
+$RAW ${RAW_DEVICE} 0 0
+if [ $? -ne 0 ]; then
+        _err_msg_="ERROR: Failed to clear the raw device ${RAW_DEVICE}"
+        abort_script "$_err_msg_"
+fi
+
+$RAW ${RAW_DEVICE} /dev/mapper/${_iq_sys_disc_}1
+if [ $? -ne 0 ]; then
+        _err_msg_="ERROR: Failed to register the raw device ${RAW_DEVICE} with /dev/mapper/${_iq_sys_disc_}1 "
+        abort_script "$_err_msg_"
+fi
+
+$SU - ${SYSUSER} -c "$LN -s ${RAW_DEVICE} ${NEXT_DBFILE}"
+if [ $? -ne 0 ]; then
+        _err_msg_="ERROR: Failed to create symlink ${RAW_DEVICE} with ${NEXT_DBFILE}"
+        abort_script "$_err_msg_"
+fi
+
+iniset DWH_SYSTEM_MAIN_1 -f ${_symlink_ini_}_tmp  Link="${RAW_DEVICE}"
+if [ $? -ne 0 ]; then
+        _err_msg_="ERROR: Failed on iniset DWH_SYSTEM_MAIN_1 -f ${_symlink_ini_}_tmp Link=${RAW_DEVICE}"
+        abort_script "$_err_msg_"
+fi
+
+$CP ${_symlink_ini_}_tmp ${_symlink_ini_}
+if [ $? -ne 0 ]; then
+   _err_msg_="Error moving $CP ${_symlink_ini_}_tmp ${_symlink_ini_}"
+   abort_script "$_err_msg_"
+fi
+iniset DB_DISK_ALLOC -f ${_symlink_ini_}  IQ_SYS_MAIN_DISKS=${_iq_sys_disc_}
+if [ $? -ne 0 ]; then
+        _err_msg_="ERROR: Failed on iniset DB_DISK_ALLOC -f ${_symlink_ini_}  IQ_SYS_MAIN_DISKS=${_iq_sys_disc_}"
+        abort_script "$_err_msg_"
+fi
+
+for _lun_map_ in `iniget LUN_MAP_DETAILS -f ${LUNMAP_INI}`;do
+         _disk_id=`iniget ${_lun_map_} -f ${LUNMAP_INI} -v DISK_ID`
+                 if [ ${_disk_id} == ${_iq_sys_disc_} ];then
+                        iniset ${_lun_map_} -f ${LUNMAP_INI}  LINK="${RAW_DEVICE}"
+                        if [ $? -ne 0 ]; then
+                                _err_msg_="ERROR: Failed on iniset ${_lun_map_} -f ${LUNMAP_INI}  LINK="${RAW_DEVICE}""
+                                abort_script "$_err_msg_"
+                        fi
+                 elif [ ${_disk_id} == ${_raw_mpath_mapping_} ];then
+                        iniset ${_lun_map_} -f ${LUNMAP_INI}  LINK=""
+                        if [ $? -ne 0 ]; then
+                                _err_msg_="ERROR: Failed on iniset ${_lun_map_} -f ${LUNMAP_INI}  LINK="""
+                                abort_script "$_err_msg_"
+                        fi
+                 fi
+done
+
+$CP ${_symlink_ini_} ${_symlink_ini_org_}
+if [ $? -ne 0 ]; then
+   _err_msg_="Error moving $CP ${_symlink_ini_}_tmp ${_symlink_ini_org_}"
+   abort_script "$_err_msg_"
+fi
+
+}
+### Function: dwhdb_args_start ###
+#
+# stops the dwhdb
+# Arguments:
+#       None
+# Return Values:
+#       none
+
+dwhdb_args_start()
+{
+# start dwhdb
+_dwhdb_args_opts_="${IQDIR}/bin64/start_iq -STARTDIR /eniq/database/dwh_main @/eniq/database/dwh_main/dwhdb.cfg -c ${DWH_CATCACHE}m -n ${DWH_ENG} -iqmc ${MAINCACHE} -iqtc ${TEMPCACHE} -x 'tcpip{port=${DWH_PORT}}' -dt /eniq/database/dwh_temp_dbspace  -gd dba -gm 2 /eniq/database/dwh_main/dwhdb.db"
+
+$SU - ${SYSUSER} -c "${IQDIR}/bin64/dbping -q -c \"${CONN_STR_USER_DBA}\"" >> ${LOGFILE} 2>&1
+if [ $? -ne 0 ]; then
+        $SU - ${SYSUSER} -c "${_dwhdb_args_opts_}" >> ${LOGFILE} 2>&1
+        if [ $? -ne 0 ]; then
+                _err_msg_="Failure to start IQ server ${DWH_ENG}"
+                abort_script "$_err_msg_"
+        fi
+else
+        dwhdb_stop
+        $SU - ${SYSUSER} -c "${_dwhdb_args_opts_}" >> ${LOGFILE} 2>&1
+        if [ $? -ne 0 ]; then
+                _err_msg_="Failure to start IQ server ${DWH_ENG}"
+                abort_script "$_err_msg_"
+        fi
+fi
+dwhdb_ping
+}
+### Function: dwhdb_ping ###
+#
+# pings the dwhdb
+# Arguments:
+#       None
+# Return Values:
+#       none
+dwhdb_ping()
+{
+local cnt=0
+local ping_cnt=40
+local sleep_time=5
+${ECHO} "NOTE : pinging dwhdb service." | $TEE -a  ${LOGFILE}
+until [ ${cnt} -eq ${ping_cnt} ]; do
+        $SU - ${SYSUSER} -c "${IQDIR}/bin64/dbping -q -c \"${CONN_STR_USER_DBA}\""
+        if [ $? -eq 0 ]; then
+                $SU - ${SYSUSER} -c "${IQDIR}/bin64/dbisql -c \"${CONN_STR_USER_DBA}\" sp_iqfile" > /dev/null 2>&1
+                if [ $? -eq 0 ]; then
+                        break
+                fi
+        fi
+    sleep ${sleep_time}
+        let cnt=cnt+1
+        ${ECHO} "NOTE : pinging dwhdb service again attempt $cnt" | $TEE -a  ${LOGFILE}
+done
+if [ ${cnt} -eq ${ping_cnt} ]; then
+   _err_msg_="dwhdb not responding"
+        abort_script "$_err_msg_"
+fi
+}
+### Function: dwhdb_stop ###
+#
+# stops the dwhdb
+# Arguments:
+#       None
+# Return Values:
+#       none
+dwhdb_stop()
+{
+$SU - ${SYSUSER} -c "${ENIQ_ADMIN_DIR}/bin/${DWH_ENG} stop"
+if [ $? -ne 0 ]; then
+        _err_msg_="Failure to stop IQ server ${DWH_ENG}"
+        abort_script "$_err_msg_"
+        else
+                ${ECHO} "NOTE :$SU - ${SYSUSER} -c \"${ENIQ_ADMIN_DIR}/bin/${DWH_ENG} stop\"" | $TEE -a  ${LOGFILE}
+fi
+}
+### Function: get_absolute_path ###
+#
+# Determine absolute path to software
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+get_absolute_path()
+{
+_dir_=`$DIRNAME $0`
+SCRIPTHOME=`cd $_dir_ 2>/dev/null && pwd || $ECHO $_dir_`
+}
+### Function: get_lun_list ###
+#
+# Determine absolute path to software
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+get_lun_list()
+{
+if  [ "${1}" == "" ]; then
+    _err_msg_="Must provide lun_list file"
+    abort_script "$_err_msg_"
+fi
+
+
+local _lun_list_file_=$1
+$RM -rf ${_lun_list_file_}
+local _tmp_lun_list_=${TEM_DIR}/lun_disk_tmp_$TIMESTAMP.txt
+local _tmp_lun_list_size_=${TEM_DIR}/lun_disk_tmp_size_$TIMESTAMP.txt
+local _tmp_sybase_disc_=${TEM_DIR}/lun_disk_sybase_$TIMESTAMP.txt
+
+$RM -rf ${_tmp_lun_list_}
+$RM -rf ${_tmp_lun_list_size_}
+$RM -rf ${_tmp_sybase_disc_}
+
+$FIND ${SYBASE_PATH} -type l | $XARGS  $LS -l | $EGREP  "/dev/raw" | $AWK '{print $9";"$11}' | $SED -e 's/s[0-9]*$//g'  > ${_tmp_sybase_disc_}
+if [ ! -s ${_tmp_sybase_disc_} ]; then
+    _err_msg_="Could get files in ${SYBASE_PATH}"
+    abort_script "$_err_msg_"
+fi
+
+${BLKCLI} --action listluns > ${_tmp_lun_list_}
+if [ ! -s ${_tmp_lun_list_} ]; then
+    _err_msg_="Could get ${BLKCLI} --action listluns"
+    abort_script "$_err_msg_"
+fi
+$BASH ${GET_DISK_LIST} -f -d ";" | $SED -e 's/\s//g' > ${_tmp_lun_list_size_}
+if [  ! -s ${_tmp_lun_list_size_} ]; then
+    _err_msg_="Could get $BASH ${GET_DISK_LIST} -f -d \";\""
+    abort_script "$_err_msg_"
+fi
+
+for _line_ in `$CAT ${_tmp_lun_list_} | $AWK -F ";" '{ print $1";"$2}'`; do
+        local _lun_id_=$($ECHO "${_line_}"  | $AWK -F ";" '{print $1}')
+        if [ ! "${_lun_id_}" ]; then
+                        _err_msg_="Could not read _lun_id_ param"
+                        abort_script "$_err_msg_"
+        fi
+        local _lun_disk_=$($ECHO "${_line_}"  | $AWK -F ";" '{print $2}')
+        if [ ! "${_lun_disk_}" ]; then
+                        _err_msg_="Could not read _lun_disk_ param"
+                        abort_script "$_err_msg_"
+        fi
+        local _disk_=$($CAT ${_tmp_lun_list_size_}  | $EGREP "^${_lun_disk_};")
+        if [ ! "${_disk_}" ]; then
+                        _err_msg_="Could not read _disk_ param"
+                        abort_script "$_err_msg_"
+        fi
+        local _lun_size_gb_=$($ECHO "${_disk_}" | $AWK -F ";" '{print $3}')
+        if [ ! "${_lun_size_gb_}" ]; then
+                        _err_msg_="Could not read _lun_size_gb_ param"
+                        abort_script "$_err_msg_"
+        fi
+        local _lun_raid_=$($ECHO "${_disk_}"  | $AWK -F ";" '{print $5}')
+        if [ ! "${_lun_raid_}" ]; then
+                        _err_msg_="Could not read _lun_raid_ param"
+                        abort_script "$_err_msg_"
+        fi
+        local _lun_desc_=$($CAT ${_tmp_lun_list_} | $EGREP -w "${_lun_id_}"  | $AWK -F ";" '{print $3}' | $AWK '{print $2}')
+        local use_by="NONE"
+                unset _sybase_file_
+                local _raw_=`$GREP -B 1 ${_lun_disk_} ${SYM_INI} | $HEAD -1 | $AWK -F"/" {'print $NF'}`
+                if [ ! -z ${_raw_} ];then
+                                local _sybase_file_=$($CAT ${_tmp_sybase_disc_} | $EGREP "${_raw_}" | $AWK -F ";" '{print $1}')
+        fi
+                if [ ! "${_sybase_file_}" ]; then
+                $VGS -o +devices | $EGREP "${_lun_disk_}" > /dev/null 2>&1
+                if [ $? -eq 0 ]; then
+                        use_by="ZPOOL"
+                fi
+        else
+                use_by=${_sybase_file_}
+        fi
+        ${ECHO} "${_lun_id_};${_lun_disk_};${_lun_size_gb_};${_lun_raid_};${_lun_desc_};${use_by}" >> ${_lun_list_file_}
+done
+
+}
+### Function: alter_sysmain_file ###
+#
+# runs sql on dbfile
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+# Uses Global variable $SYSMAIN_DBFILES_START
+alter_sysmain_file()
+{
+if  [ "${1}" == "" ]; then
+    _err_msg_="ACTION must be provide example READONLY, READWRITE"
+    abort_script "$_err_msg_"
+fi
+if  [ "${2}" == "" ]; then
+    _err_msg_="Must provide a dbfile"
+    abort_script "$_err_msg_"
+fi
+
+local _action_=$1
+local _sybase_file_name_=$2
+$MKDIR -p ${TEM_DIR}/sql
+local _sql_file_=${TEM_DIR}/sql/atler_symain_file_${_sybase_file_name_}.sql
+$RM -rf ${_sql_file_}
+        $ECHO "ALTER DBSPACE ${DBSPACE} " > ${_sql_file_}
+        $ECHO "${_action_} " >> ${_sql_file_}
+        $ECHO "sql on ${_sybase_file_name_} in ${DBSPACE}\n" | $TEE -a ${LOGFILE}
+        $CAT ${_sql_file_} | $TEE -a ${LOGFILE}
+        $SU - ${SYSUSER} -c "${IQDIR}/bin64/dbisqlc -c \"${CONN_STR_USER_DBA}\" -q ${_sql_file_}"
+        if [ $? -ne 0 ]; then
+                _err_msg_="Failed to run ${_action_} on ${_sybase_file_name_} in ${DBSPACE} failed"
+                abort_script "$_err_msg_"
+        fi
+}
+### Function: sp_iqempty_sysmain_file ###
+#
+# runs sql on dbfile
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+# Uses Global variable $SYSMAIN_DBFILES_START
+sp_iqempty_sysmain_file()
+{
+if  [ "${1}" == "" ]; then
+    _err_msg_="ACTION must be provide example READONLY, READWRITE"
+    abort_script "$_err_msg_"
+fi
+local _sybase_file_name_=$1
+$MKDIR -p ${TEM_DIR}/sql
+local _sql_empty_=${TEM_DIR}/sql/emptyfile_symain_file_${_sybase_file_name_}.sql
+$RM -rf ${_sql_empty_}
+
+        $ECHO "Empty  dbfile  ${_sybase_file_name_} in  ${DBSPACE}" | $TEE -a ${LOGFILE}
+        $ECHO "sp_iqemptyfile ${_sybase_file_name_}" > ${_sql_empty_}
+        $SU - ${SYSUSER} -c "${IQDIR}/bin64/dbisqlc -c \"${CONN_STR_USER_DBA}\" -q ${_sql_empty_}"
+        if [ $? -ne 0 ]; then
+                _err_msg_="sp_iqemptyfile dbfile ${_sybase_file_name_} from  ${DBSPACE} failed"
+                abort_script "$_err_msg_"
+        fi
+        $ECHO "sql to empty ${_sybase_file_name_} in ${DBSPACE}\n" | $TEE -a ${LOGFILE}
+        $CAT ${_sql_empty_} | $TEE -a ${LOGFILE}
+
+}
+
+### Function: sp_drop_sysmain_file ###
+#
+# runs sql on dbfile
+#
+# Arguments:
+#   none
+# Return Values:
+#   value from frop file
+# Uses Global variable $SYSMAIN_DBFILES_START
+sp_drop_sysmain_file()
+{
+if  [ "${1}" == "" ]; then
+    _err_msg_="ACTION must be provide example READONLY, READWRITE"
+    abort_script "$_err_msg_"
+fi
+local _sybase_file_name_=$1
+$MKDIR -p ${TEM_DIR}/sql
+local _sql_drop_=${TEM_DIR}/sql/drop_symain_file_${_sybase_file_name_}.sql
+$RM -rf ${_sql_empty_}
+        $ECHO "Drop  dbfile  ${_sybase_file_name_} in  ${DBSPACE}" | $TEE -a ${LOGFILE}
+        $ECHO "ALTER DBSPACE ${DBSPACE} " > ${_sql_drop_}
+        $ECHO "DROP FILE ${_sybase_file_name_}" >> ${_sql_drop_}
+        $ECHO "sql to drop ${_sybase_file_name_} in ${DBSPACE}\n" | $TEE -a ${LOGFILE}
+        $CAT ${_sql_drop_} | $TEE -a ${LOGFILE}
+        $SU - ${SYSUSER} -c "${IQDIR}/bin64/dbisqlc -c \"${CONN_STR_USER_DBA}\" -q ${_sql_drop_}" 2> /dev/null
+        return $?
+
+}
+### Function: remove_replaced_sysmain ###
+#
+# Replace the original sysman files
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+# Uses Global variable $SYSMAIN_DBFILES_START
+remove_replaced_sysmain()
+{
+$MKDIR -p ${TEM_DIR}/sql
+for _old_sysmain_ in ${SYSMAIN_DBFILES_START}; do
+        local _sybase_file_name_=$($ECHO ${_old_sysmain_} | $AWK -F"::" '{print $1}' | $SED -e 's/[[:blank:]]//g')
+        if [ ! "${_sybase_file_name_}" ]; then
+                _err_msg_="Could not get _dwhdbtmp_"
+                abort_script "$_err_msg_"
+        fi
+        local _dbfilename_=$($ECHO ${_old_sysmain_} | $AWK -F"::" '{print $2}' | $SED -e 's/[[:blank:]]//g')
+        if [ ! "${_dbfilename_}" ]; then
+                _err_msg_="Could not get _dbfilename_"
+        fi
+        ${ECHO} "Starting to removed : ${_dbfilename_}\n " | $TEE -a ${LOGFILE}
+
+        #Sybase make iq file readonly
+        alter_sysmain_file "ALTER FILE ${_sybase_file_name_} READONLY" "${_sybase_file_name_}"
+        #Sybase empty file
+        sp_iqempty_sysmain_file "${_sybase_file_name_}"
+        #Sybase drop file
+        sp_drop_sysmain_file "${_sybase_file_name_}"
+        if [ $? -ne 0 ]; then
+                if  [ "${DROPLEAKS_RAN}" == "NO" ]; then
+                        $ECHO "issue dropping ${_sybase_file_name_} file need to run checks" | $TEE -a ${LOGFILE}
+                        alter_sysmain_file "ALTER FILE ${_sybase_file_name_} READWRITE" "${_sybase_file_name_}"
+                        db_dropleaks
+                        alter_sysmain_file "ALTER FILE ${_sybase_file_name_} READONLY" "${_sybase_file_name_}"
+                        sp_iqempty_sysmain_file "${_sybase_file_name_}"
+                        sp_drop_sysmain_file "${_sybase_file_name_}"
+                        if [ $? -ne 0 ]; then
+                                _err_msg_="Removing dbfile ${_sybase_file_name_} from  ${DBSPACE} failed"
+                                abort_script "$_err_msg_"
+                        fi
+                else
+                        alter_sysmain_file "ALTER FILE ${_sybase_file_name_} READWRITE" "${_sybase_file_name_}"
+                        alter_sysmain_file "ALTER FILE ${NEXT_DBFILE} READONLY" "${NEXT_DBFILE}"
+                        sp_iqempty_sysmain_file "${NEXT_DBFILE}"
+                        sp_drop_sysmain_file "${NEXT_DBFILE}"
+                        _err_msg_="Removing dbfile ${_sybase_file_name_} from  ${DBSPACE} failed"
+                        abort_script "$_err_msg_"
+                fi
+
+        fi
+        check_db_removed ${_dbfilename_}
+done
+}
+
+
+### Function: select_next_lun ###
+#
+# get the current size of
+#
+# Arguments:
+#   file with luns, next dbfile, size needed
+# Return Values:
+#   none
+#Set globals
+# NEXT_DBFILE_LUN
+# NEXT_DBFILE_LUN_SIZE
+# NEXT_DBFILE_LUN_DISC
+#
+select_next_lun()
+{
+if  [ "${1}" == "" ]; then
+    _err_msg_="Must provide a lun list file"
+    abort_script "$_err_msg_"
+fi
+if  [ "${2}" == "" ]; then
+    _err_msg_="Must provide next available dbfile"
+    abort_script "$_err_msg_"
+fi
+if  [ "${3}" == "" ]; then
+    _err_msg_="Must provide size needed"
+    abort_script "$_err_msg_"
+fi
+
+local _lun_list_=$1
+local _next_dbfile_=$2
+local _size_needed_=$3
+local tmp_lun_list_free=${TEM_DIR}/tmp_lun_list_free$$.txt
+local tmp_display=${TEM_DIR}/tmp_display.txt
+unset NEXT_DBFILE_LUN
+unset NEXT_DBFILE_LUN_SIZE
+if [ ! "${INPUT_LUN_ID}" ] ; then
+        NEXT_DBFILE_LUN=$($CAT ${_lun_list_} | $EGREP ${_next_dbfile_})
+        if [ "${NEXT_DBFILE_LUN}" ]; then
+                ${ECHO} "symlink ${NEXT_DBFILE}  already created"
+        else
+                index=0
+                $CAT ${_lun_list_} | $EGREP ";NONE$" > $tmp_lun_list_free
+                index=0
+        #       $CLEAR
+                ${ECHO} "Please select Lun for sysmain to replace existing iq_system_main.iq files"
+                local display_header=$($ECHO ${LUN_FILE_LAYOUT} | $SED -e 's/;USED_BY$//g'  -e 's/;/    /g')
+                if [ ! "${display_header}" ]; then
+                        err_msg_="display_header not set"
+                        abort_script "$_err_msg_"
+                fi
+                ${ECHO} "        ${display_header}\n" > ${tmp_display}
+                while read line ; do
+                        index=$(($index+1))
+                        LUNS[$index]="$line"
+                        local display_lun=$($ECHO $line | $SED -e 's/;NONE$//g'  -e 's/;/    /g')
+                        if [ ! "${display_header}" ]; then
+                                err_msg_="display_header not set"
+                                abort_script "$_err_msg_"
+                        fi
+                        ${ECHO} "[ $index ] ${display_lun}\n" >> ${tmp_display}
+                done < $tmp_lun_list_free
+                ${ECHO} "\nSelect Lun to use\n" >> ${tmp_display}
+                while :; do
+                        $CAT ${tmp_display} | $TEE -a ${LOGFILE}
+                        read _num_
+                        if [ "${_num_}" ]; then
+                                ${ECHO} ${_num_} | $EGREP '[^0-9]' >> /dev/null 2>&1
+                                if [ $? -ne 0 ]; then
+                                        if [ ${_num_} -gt 0 -a ${_num_} -lt $(($index+1)) ]; then
+                                                break
+                                        fi
+                                fi
+                        fi
+                done
+
+                NEXT_DBFILE_LUN=${LUNS[$_num_]}
+                ${ECHO} "Selected Lun is \n ${NEXT_DBFILE_LUN}"
+
+                ${ECHO} "\nDo you wish to continue?  (Yes|No)"
+                read _ans_
+                if [ ! "${_ans_}" ]; then
+                    _err_msg_="no input"
+                    abort_script "$_err_msg_"
+                fi
+                
+                if [ "${_ans_}" != "Yes" ]; then
+                    _err_msg_="User exited"
+                    abort_script "$_err_msg_"
+                fi
+                
+                _DISK_LUN_ID_=`$ECHO ${NEXT_DBFILE_LUN} | $AWK -F ";" '{print $1}'`
+                if [ $? -ne 0 ]; then
+                    _err_msg_="Could not get the selected disk"
+                    abort_script "$_err_msg_"
+                fi
+                
+        fi
+else
+        NEXT_DBFILE_LUN=$($CAT ${_lun_list_} | $EGREP "${INPUT_LUN_ID}")
+        if [ ! "${NEXT_DBFILE_LUN}" ]; then
+                _err_msg_="Could not get LUN Details\n $CAT ${_lun_list_} | $EGREP \"${INPUT_LUN_ID}\""
+                abort_script "$_err_msg_"
+        fi
+fi
+
+NEXT_DBFILE_LUN_SIZE=$($ECHO ${NEXT_DBFILE_LUN} | $AWK -F ";" '{print $3}'| $AWK '{print $1}' | $AWK -F 'GBytes' '{print $1}')
+if [ ! "${NEXT_DBFILE_LUN_SIZE}" ]; then
+        _err_msg_="Could not find get LUN Size \n$ECHO ${NEXT_DBFILE_LUN} | $AWK -F ";" '{print \$3}'| $AWK '{print \$1}'"
+        abort_script "$_err_msg_"
+fi
+
+if [ ! "${ROLL_BACK}" ]; then
+        if [ ${NEXT_DBFILE_LUN_SIZE} -lt ${_size_needed_} ]; then
+                _err_msg_="Lun is not big enough, needs to be greater than  ${_size_needed_}\n $NEXT_DBFILE_LUN \n "
+                abort_script "$_err_msg_"
+        fi
+else
+        $ECHO "Skiping LUN Size Check for storage rollback from VNX to Clariion."
+fi
+
+$ECHO "NEXT_DBFILE_LUN=${NEXT_DBFILE_LUN}" > /tmp/LUN_SELECTED
+}
+### Function: check_files_and_scripts ###
+#
+#   Checks required files/scripts are present
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+check_files_and_scripts()
+{
+$ECHO "\nChecking for required files and scripts" | $TEE -a ${LOGFILE}
+
+if [ ! -f ${ENIQ_INI} ]; then
+    _err_msg_="Unable to access ${ENIQ_INI}. Exiting Script."
+    abort_script "$_err_msg_";
+fi
+
+if [ ! -f ${SYM_INI} ]; then
+    _err_msg_="Unable to access ${SYM_INI}. Exiting Script."
+    abort_script "$_err_msg_";
+fi
+
+if [ ! -f ${SYM_CO_INI} ]; then
+    _err_msg_="Unable to access ${SYM_CO_INI}. Exiting Script."
+    abort_script "$_err_msg_";
+fi
+
+if [ ! -f ${SYM_CO_INI_SW} ]; then
+    _err_msg_="Unable to access ${SYM_CO_INI}. Exiting Script."
+    abort_script "$_err_msg_";
+fi
+
+if [ ! -f ${LUNMAP_INI} ]; then
+        _err_msg_="${LUNMAP_INI} does not exists"
+        abort_script "$_err_msg_"
+fi
+
+if [ ! -f "${ENIQ_CONF_DIR}/${BLK_STOR_INI}" ]; then
+    _err_msg_="Unable to access ${ENIQ_CONF_DIR}/${BLK_STOR_INI}. Exiting Script."
+    abort_script "$_err_msg_";
+fi
+
+if [ ! -x ${BLKCLI} ]; then
+    _err_msg_="${BLKCLI} is not found or is not executable"
+    abort_script "$_err_msg_" "${EXEC_SHELL_CMD}"
+fi
+
+if [ ! -f ${GET_DISK_LIST} ]; then
+    _err_msg_="$GET_DISK_LIST not found or not executable"
+    abort_script "$_err_msg_" "${EXEC_SHELL_CMD}"
+fi
+
+if [ ! -s ${ENIQ_CORE_INSTALL_BSH} ]; then
+    _err_msg_="Unable to access ${ENIQ_CORE_INSTALL_BSH}. Exiting Script."
+    abort_script "$_err_msg_";
+fi
+if [ ! -s ${ADD_SYSMAINDB_BSH} ]; then
+    _err_msg_="Unable to access ${ADD_SYSMAINDB_BSH}. Exiting Script."
+    abort_script "$_err_msg_";
+fi
+if [ ! -s ${MANAGE_SERVICES_BSH} ]; then
+    _err_msg_="Failed to locate ENIQ service manager script - ${MANAGE_SERVICES_BSH}"
+    abort_script "$_err_msg_"
+fi
+
+}
+### Function: register_raw_device ###
+#
+# Registering new raw device
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+register_raw_device()
+{
+# Registering raw devices
+local _old_udev_=`$UDEVADM info --query=all --name=/dev/mapper/${_raw_mpath_mapping_}1 | $GREP -i DM_UUID | $AWK -F = '{print $2}'`
+local _new_udev_=`$UDEVADM info --query=all --name=/dev/mapper/${_iq_sys_disc_}1 | $GREP -i DM_UUID | $AWK -F = '{print $2}'`
+$SED -i "s/${_old_udev_}/${_new_udev_}/g"  ${UDEV_FILE}
+
+if [ $? -ne 0 ];then
+        _err_msg_="Could not update the udev file with new raw device"
+        abort_script "$_err_msg_" "${EXEC_SHELL_CMD}"
+fi
+
+#Activate the raw device created in udev rules
+$UDEVADM control --reload-rules
+if [ $? -ne 0 ];then
+        _err_msg_="Could not reload udev rules for raw device"
+        abort_script "$_err_msg_" "${EXEC_SHELL_CMD}"
+fi
+
+$UDEVADM trigger --type=devices --action=change
+if [ $? -ne 0 ];then
+        _err_msg_="Could not trigger udev rules for raw devices"
+        abort_script "$_err_msg_" "${EXEC_SHELL_CMD}"
+fi
+}
+
+### Function: setup_env ###
+#
+# Set up some setup_env
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+setup_env()
+{
+DBSPACE=IQ_SYSTEM_MAIN
+if [ ! "${ENIQ_BASE_DIR}" ]; then
+    # Directory on the root filesystem
+    ENIQ_BASE_DIR=/eniq
+fi
+
+# Admin Directory
+ENIQ_ADMIN_DIR=${ENIQ_BASE_DIR}/admin
+ENIQ_ADMIN_BIN_DIR=${ENIQ_ADMIN_DIR}/bin
+
+# Main Directory for the Core Installation SW
+ENIQ_INST_DIR=${ENIQ_BASE_DIR}/installation
+
+# Main Directory for the Core Installation SW
+ENIQ_CORE_INST_DIR=${ENIQ_INST_DIR}/core_install
+
+ENIQ_CORE_BIN_DIR=${ENIQ_CORE_INST_DIR}/bin
+
+# Config dir
+ENIQ_CONF_DIR=${ENIQ_INST_DIR}/config
+SYM_INI=${ENIQ_CONF_DIR}/${SYM_INI_FILE}
+SYM_CO_INI=${ENIQ_CONF_DIR}/${SYM_CO_INI_FILE}
+SYM_CO_INI_SW=${ENIQ_BASE_DIR}/sw/conf/${SYM_CO_INI_FILE}
+LUNMAP_INI=${ENIQ_CONF_DIR}/${LUN_MAP_FILE}
+LUN_ORG_DETAILS=${TEM_DIR}/luns_details_org_tmp.txt
+
+ENIQ_CORE_INSTALL_BSH=${ENIQ_CORE_INST_DIR}/bin/eniq_core_install.bsh
+ADD_SYSMAINDB_BSH=${ENIQ_CORE_INST_DIR}/bin/add_iq_sys_main_dbspaces.bsh
+MANAGE_SERVICES_BSH=${ENIQ_ADMIN_BIN_DIR}/manage_eniq_services.bsh
+GET_DISK_LIST=${ENIQ_CORE_INST_DIR}/bin/get_disk_list.sh
+SYSMAIN_LUN_ADDED=${ENIQ_BASE_DIR}/local_logs/expansion/added_sysmain_lun_${TIMESTAMP}.txt
+SYSMAIN_LUN_RM=${ENIQ_BASE_DIR}/local_logs/expansion/removed_sysmain_lun_${TIMESTAMP}.txt
+
+
+# Set up Variable to hold network path to SW
+if [ ! -s ${ENIQ_CORE_INST_DIR}/lib/iniadd.pl ]; then
+    _err_msg_="Cannot locate ${ENIQ_CORE_INST_DIR}/lib/iniadd.pl"
+    abort_script "$_err_msg_"
+else
+        INIADD=${ENIQ_CORE_INST_DIR}/lib/iniadd.pl
+fi
+
+if [ ! -s ${ENIQ_CORE_INST_DIR}/lib/inidel.pl ]; then
+    _err_msg_="Cannot locate ${ENIQ_CORE_INST_DIR}/lib/inidel.pl"
+    abort_script "$_err_msg_"
+else
+        INIDEL=${ENIQ_CORE_INST_DIR}/lib/inidel.pl
+fi
+# Source the common functions
+if [ -s ${ENIQ_CORE_INST_DIR}/lib/common_functions.lib ]; then
+    . ${ENIQ_CORE_INST_DIR}/lib/common_functions.lib
+else
+    _err_msg_="File /eniq/installation/core_install/lib/common_functions.lib not found"
+    abort_script "$_err_msg_"
+fi
+if [ -z "$CONF_DIR" ] ; then
+    _err_msg_="Unable to access ${CONF_DIR}. Exiting Script."
+    abort_script "$_err_msg_";
+fi
+
+# Check required files and scripts exist
+if [ ! -s ${CONF_DIR}/niq.rc ]; then
+    _err_msg_="File ${CONF_DIR}/niq.rc not found, or is empty"
+    abort_script "$_err_msg_"
+else
+    #$ECHO "Sourcing ${CONF_DIR}/niq.rc"
+    . ${CONF_DIR}/niq.rc
+fi
+
+
+LOG_DIR=${ENIQ_BASE_DIR}/local_logs/expansion
+if [ ! "$LOGFILE" ] ; then
+        LOGFILE=${LOG_DIR}/exp_add_sysmain_${TIMESTAMP}.log
+fi
+
+#copy of sym_ini file
+SYM_LINK_BACKUP=${LOG_DIR}/${SYM_INI_FILE}_${TIMESTAMP}
+
+
+# Create a temporary Directory
+TEM_DIR=/tmp/expansion.$$.$$
+$RM -rf ${TEM_DIR}
+$MKDIR -p ${TEM_DIR}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not create directory $TEM_DIR"
+    abort_script "$_err_msg_"
+fi
+
+#Create a temporary files
+SYS_MAIN_DETAILS=/tmp/sys_details.txt
+
+# File containing the type of OSS installation. Eg. statistics
+INST_TYPE_FILE=${ENIQ_CONF_DIR}/ericsson_use_config
+if [ ! -s "${INST_TYPE_FILE}" ]; then
+    _err_msg_="ENIQ install type not defined in ${INST_TYPE_FILE}"
+    abort_script "$_err_msg_"
+fi
+# Read the installation type
+INSTALL_TYPE=`$CAT ${INST_TYPE_FILE} | $AWK -F\= '{print $2}'`
+
+
+RAW_DEVICE=`iniget DWH_SYSTEM_MAIN_1 -f ${ENIQ_CONF_DIR}/${SYM_INI_FILE} -v Link`
+if [ ! "${RAW_DEVICE}" ]; then
+    _err_msg_="Could not read RAW_DEVICE param"
+    abort_script "$_err_msg_"
+fi
+
+STORAGE_TYPE=`iniget STOR_TYPE -f ${ENIQ_CONF_DIR}/${SUNOS_INI} -v STORAGE_TYPE`
+if [ ! "${STORAGE_TYPE}" ]; then
+    _err_msg_="Could not read STORAGE_TYPE param"
+    abort_script "$_err_msg_"
+fi
+# Read location of storage API command
+BLKCLI=`iniget STOR_API -f ${ENIQ_CONF_DIR}/${SUNOS_INI} -v STOR_API_CMD`
+if [ ! "${BLKCLI}" ]; then
+    _err_msg_="Could not read STOR_API_CMD param from ${ENIQ_CONF_DIR}/${SUNOS_INI}"
+    abort_script "$_err_msg_" "${EXEC_SHELL_CMD}"
+fi
+CURR_SERVER_TYPE=`$CAT $ENIQ_CONF_DIR/installed_server_type | $EGREP -v '^[[:blank:]]*#' | $SED -e 's/ //g'`
+if [ ! "${CURR_SERVER_TYPE}" ]; then
+    _err_msg_="Could not read CURR_SERVER_TYPE from $ENIQ_CONF_DIR/installed_server_type"
+    abort_script "$_err_msg_" "${EXEC_SHELL_CMD}"
+fi
+#UDEV FILE
+UDEV_FILE=/etc/udev/rules.d/99-iq-raw-devs.rules
+#Check for udev rules file if exist or not
+if [ ! -f ${UDEV_FILE} ];then
+        err_msg_="UDEV rules file does not exist"
+        abort_script "$err_msg_" "${EXEC_SHELL_CMD}"
+fi
+}
+### Function: setup_sybase ###
+#
+#   Setup Sybase variables
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+setup_sybase()
+{
+# Set the Connect DB parameters
+
+DWH_PORT=`iniget DWH -v PortNumber -f ${ENIQ_INI}`
+DWH_ENG=`iniget DWH -v ServerName -f ${ENIQ_INI}`
+MAINCACHE=`iniget DWH -v MainCache -f ${ENIQ_INI}`
+TEMPCACHE=`iniget DWH -v TempCache -f ${ENIQ_INI}`
+if [ ! "${DWH_PORT}" -o ! "${DWH_ENG}" -o ! "${MAINCACHE}" -o ! "${TEMPCACHE}"  ]; then
+        _err_msg_="Could not read IQ values from ${ENIQ_INI}"
+        abort_script "$_err_msg_"
+fi
+#DWH_CATCACHE=`iniget DWH -v CatalogCache -f ${ENIQ_INI}`
+#if [ ${DWH_CATCACHE} -lt 5001 ] ; then
+#       DWH_CATCACHE=9000
+#fi
+DWH_CATCACHE=5000
+
+if [ ! "${DWH_PORT}" -o ! "${DWH_ENG}" ]; then
+        _err_msg_="Could not read IQ values from ${ENIQ_INI}"
+        abort_script "$_err_msg_"
+fi
+
+DBA_PASSWORD=`inigetpassword DB -f ${ENIQ_INI} -v DBAPassword`
+if [ ! "${DBA_PASSWORD}" ]; then
+    if [ -f ${ENIQ_BASE_DIR}/sw/installer/dbusers ]; then
+        DBA_PASSWORD=`${ENIQ_BASE_DIR}/sw/installer/dbusers dba dwhrep`
+        if [ ! "${DBA_PASSWORD}" ] ; then
+            _err_msg_="Could not get dwhdb DBA Password"
+            abort_script "$_err_msg_"
+        fi
+    else
+        err_msg_="Could not get dwhdb DBA Password"
+        abort_script "$_err_msg_"
+    fi
+fi
+CONN_STR_USER_DBA="uid=dba;pwd=${DBA_PASSWORD};eng=${DWH_ENG};links=tcpip{host=${DWH_ENG};port=${DWH_PORT};dobroadcast=no;verify=no}"
+
+
+SYSUSER=`iniget ENIQ_INSTALL_CONFIG -f ${ENIQ_CONF_DIR}/${SUNOS_INI} -v ENIQ_SYSUSER`
+if [ ! "${SYSUSER}" ]; then
+    _err_msg_="Could not read System User from  ${ENIQ_CONF_DIR}/${SUNOS_INI}"
+    abort_script "$_err_msg_"
+fi
+#get dcuser env variables
+$SU - ${SYSUSER} -c "$ENV |$EGREP '^(SYBASE|ASDIR|IQDIR|ASALOGDIR|SQLANY)'" > $TEM_DIR/sybase_det.$$
+$CAT $TEM_DIR/sybase_det.$$ |$EGREP '^(SYBASE|ASDIR|IQDIR|ASALOGDIR|SQLANY)' > $TEM_DIR/sybase_det_var.$$
+. $TEM_DIR/sybase_det_var.$$ >> /dev/null 2>&1
+
+
+if [ -z "$IQDIR" ] ; then
+    _err_msg_="ERROR: IQDIR is not set"
+    abort_script "$_err_msg_"
+fi
+}
+### Function: usage_msg ###
+#
+# Usage
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+usage_msg()
+{
+$ECHO "
+Usage: `$BASENAME $0` -c <conf dir> -d <niq.ini file> [-l <logfile>]
+
+options:
+
+-l : Optional parameter specifying what logfile to us
+
+-c : Conf dir where niq.rc resides
+
+-d : Path to the niq.ini file.
+
+"
+}
+
+# ********************************************************************
+#
+#   Main body of program
+#
+# ********************************************************************
+#
+
+
+# Determine absolute path to software
+get_absolute_path
+
+# Check that the effective id of the user is root
+check_id $DEFAULT_USER
+
+while getopts ":c:d:l:i:r" arg; do
+    case $arg in
+        c)  CONF_DIR="$OPTARG"
+            ;;
+        d)  ENIQ_INI="$OPTARG"
+            ;;
+        l)  LOGFILE="$OPTARG"
+            ;;
+        i)  INPUT_LUN_ID="$OPTARG"
+            ;;
+        r)  ROLL_BACK="YES"
+            ;;
+        \?) usage_msg
+        exit 1
+        ;;
+    esac
+done
+shift `expr $OPTIND - 1`
+
+
+if [ ! "${CONF_DIR}" ]; then
+    usage_msg
+    exit 1
+fi
+
+if [ ! "${ENIQ_INI}" ]; then
+    usage_msg
+    exit 1
+fi
+
+TIMESTAMP=`$DATE +%d.%m.%y_%H:%M:%S`
+
+# set up env
+setup_env
+
+if [ "${STORAGE_TYPE}" != "raw" ]; then
+    _err_msg_="script only for raw storage type"
+    abort_script "$_err_msg_"
+
+fi
+if [ "${INSTALL_TYPE}" != "stats" ]; then
+    _err_msg_="script only for INSTALL_TYPE stats"
+    abort_script "$_err_msg_"
+fi
+
+if [ "${CURR_SERVER_TYPE}" != "eniq_stats" -a  "${CURR_SERVER_TYPE}" != "stats_coordinator" ]; then
+    _err_msg_="script only for CURR_SERVER_TYPE eniq_stats, eniq_coordinator and stats_coordinator"
+    abort_script "$_err_msg_"
+fi
+
+chk_create_logfile
+
+${ECHO} "Starting to Run `$BASENAME $0`" | $TEE -a ${LOGFILE}
+
+$CP ${SYM_INI} ${SYM_LINK_BACKUP}
+if [[ $? -ne 0 ]]; then
+        abort_script "ERROR : Failed to copy ${SYM_INI} to ${SYM_LINK_BACKUP}"
+else
+    _IQ_SYS_LUN_ID=`iniget DWH_SYSTEM_MAIN_1 -f ${ENIQ_CONF_DIR}/${SYM_INI_FILE} -v Lun_ID | $SED -e 's/[[:blank:]]//g'`
+fi
+
+$CP ${SYM_INI} ${TEM_DIR}/${SYM_INI_FILE}
+if [[ $? -ne 0 ]]; then
+        abort_script "ERROR : Failed to copy ${SYM_INI} to ${TEM_DIR}/${SYM_INI_FILE}"
+fi
+
+check_files_and_scripts
+
+setup_sybase
+
+if [ "${STORAGE_TYPE}" != "raw" ]; then
+        _err_msg_="script only for raw storage type"
+        abort_script "$_err_msg_"
+fi
+
+
+if [ ! -f ${SYS_MAIN_DETAILS} ];then
+    ${ECHO} "NOTE : Stopping ENIQ services." | $TEE -a  ${LOGFILE}
+    /usr/bin/bash ${MANAGE_SERVICES_BSH} -a stop -s ALL -N -l ${LOGFILE}
+    if [[ $? -ne 0 ]]; then
+            abort_script "Failed to start some ENIQ services, exiting...."
+    fi
+        
+    #Creating the disk partion
+    $BASH  ${ENIQ_CORE_INST_DIR}/bin/eniq_core_install.bsh -s create_disk_partition -n -M -l ${LOGFILE}
+    if [ $? -ne 0 ];then
+        _err_msg_="Could not run disk partitioning"
+        abort_script "$_err_msg_"
+    fi
+    
+    #Updating the lun map configuration file
+    $BASH  ${ENIQ_CORE_INST_DIR}/bin/eniq_core_install.bsh -s create_lun_map -n -l ${LOGFILE}
+    if [ $? -ne 0 ];then
+        _err_msg_="Could not update lun_map.ini file"
+        abort_script "$_err_msg_"
+    fi
+    
+    DBTYPE="DWH_SYSTEM_MAIN"
+    LUN_LIST_DISK=${TEM_DIR}/lun_disk_list.txt
+    get_lun_list "${LUN_LIST_DISK}"
+    ${ECHO} "Checking sybase for the next available iq_system_main file" | $TEE -a ${LOGFILE}
+    chk_dbfiles "${DBTYPE}"
+    ${ECHO} "Existing system main iq file are \n ${SYSMAIN_DBFILES_START} " | $TEE -a ${LOGFILE}
+    ${ECHO} "Next availble iq_system_main iq file is \n ${NEXT_DBFILE}\n\n" | $TEE -a ${LOGFILE}
+    ${ECHO} "Lun Size of least ${TOTAL_SIZE_NEEDED} GByte needed \n\n" | $TEE -a ${LOGFILE}
+    
+    if [ ! -s /tmp/LUN_SELECTED ];then
+        select_next_lun "${LUN_LIST_DISK}" "${NEXT_DBFILE}" "${TOTAL_SIZE_NEEDED}"
+    else
+        NEXT_DBFILE_LUN=`$CAT /tmp/LUN_SELECTED | $GREP -i NEXT_DBFILE_LUN | $AWK -F"=" '{print $2}'` 
+    fi
+    chk_syslinks "${NEXT_DBFILE_LUN}" "${NEXT_DBFILE}" "${TEM_DIR}/${SYM_INI_FILE}"
+    
+    $CP ${TEM_DIR}/${SYM_INI_FILE} ${SYM_INI}
+    if [[ $? -ne 0 ]]; then
+            abort_script "ERROR : Failed to copy ${TEM_DIR}/${SYM_INI_FILE} to ${SYM_INI}"
+    fi
+    
+    if [ ! -e ${NEXT_DBFILE} ] ; then
+            create_sym_label
+    fi
+    
+    ${ECHO} "NOTE : Starting dwhdb" | $TEE -a  ${LOGFILE}
+    dwhdb_args_start
+    
+    $SU - ${SYSUSER} -c "/usr/bin/bash ${ADD_SYSMAINDB_BSH} -c ${CONF_DIR} -d ${ENIQ_INI} -s ${SYM_INI}"
+    if [[ $? -ne 0 ]]; then
+        _err_msg_="Could not /usr/bin/bash ${ADD_SYSMAINDB_BSH} -c ${CONF_DIR} -d ${ENIQ_INI} -s ${SYM_INI}"
+        abort_script "$_err_msg_"
+    fi
+    
+    get_sysmainfiles
+    
+    SYSMAIN_DBFILES_NEXTADDED=${SYSMAIN_DBFILES}
+    
+    ${ECHO} ${SYSMAIN_DBFILES_NEXTADDED} | $EGREP ${NEXT_DBFILE} >> /dev/null 2>&1
+    if [ $? -ne 0 ]; then
+        _err_msg_="${NEXT_DBFILE} not added to Sybase"
+        abort_script "$_err_msg_"
+    fi
+    NEXT_DBFILE_ADDED="YES"
+    
+    remove_replaced_sysmain
+    
+    get_sysmainfiles
+    SYSMAIN_AFTER_DELETION=${SYSMAIN_DBFILES}
+    ${ECHO} ${SYSMAIN_AFTER_DELETION} | $EGREP ${NEXT_DBFILE} >> /dev/null 2>&1
+    if [ $? -ne 0 ]; then
+        _err_msg_="${NEXT_DBFILE} not in Sybase"
+        abort_script "$_err_msg_"
+    fi
+    count_sysmain=0
+    for _sysmain_gone_ in ${SYSMAIN_AFTER_DELETION}; do
+            ${ECHO} ${_sysmain_gone_} | $EGREP "iq_system_main" >> /dev/null 2>&1
+            if [ $? -eq 0 ]; then
+                    count_sysmain=$(($count_sysmain+1))
+            fi
+    done
+    if [ ${count_sysmain} -ne 1 ]; then
+        _err_msg_="Should only be one sysmain at this stage ${SYSMAIN_AFTER_DELETION} "
+        abort_script "$_err_msg_"
+    fi
+    
+    ${ECHO} "NEXT_DBFILE=${NEXT_DBFILE}" > ${SYSMAIN_LUN_ADDED}
+    ${ECHO} "NEXT_DBFILE_LUN=${NEXT_DBFILE_LUN}" >> ${SYSMAIN_LUN_ADDED}
+    
+    ${ECHO} "Added ${NEXT_DBFILE} LUN is ${NEXT_DBFILE_LUN}\n" | $TEE -a ${LOGFILE}
+    ${ECHO} "Added ${NEXT_DBFILE} LUN Size is ${NEXT_DBFILE_LUN_SIZE}" | $TEE -a ${LOGFILE}
+    
+    ${ECHO} "NEXT_DBFILE=${NEXT_DBFILE}" >> ${SYS_MAIN_DETAILS}
+    ${ECHO} "SYM_INI=${SYM_INI}" >> ${SYS_MAIN_DETAILS}
+    ${ECHO} "_iq_sys_link_=${_iq_sys_link_}" >> ${SYS_MAIN_DETAILS}
+    ${ECHO} "_iq_sys_disc_=${_iq_sys_disc_}" >> ${SYS_MAIN_DETAILS}
+    ${ECHO} "_raw_mpath_mapping_=${_raw_mpath_mapping_}" >> ${SYS_MAIN_DETAILS}
+    ${ECHO} "RAW_DEVICE=${RAW_DEVICE}" >> ${SYS_MAIN_DETAILS}
+    $CP ${SYM_INI} /tmp/SYM_INI
+
+else
+    NEXT_DBFILE=`$CAT ${SYS_MAIN_DETAILS} | $GREP -i NEXT_DBFILE | $AWK -F"=" '{print $2}'`
+    SYM_INI=`$CAT ${SYS_MAIN_DETAILS} | $GREP -i SYM_INI | $AWK -F"=" '{print $2}'`
+    _iq_sys_link_=`$CAT ${SYS_MAIN_DETAILS} | $GREP -i _iq_sys_link_ | $AWK -F"=" '{print $2}'`
+    _iq_sys_disc_=`$CAT ${SYS_MAIN_DETAILS} | $GREP -i _iq_sys_disc_ | $AWK -F"=" '{print $2}'`
+    _raw_mpath_mapping_=`$CAT ${SYS_MAIN_DETAILS} | $GREP -i _raw_mpath_mapping_ | $AWK -F"=" '{print $2}'`
+    RAW_DEVICE=`$CAT ${SYS_MAIN_DETAILS} | $GREP -i RAW_DEVICE | $AWK -F"=" '{print $2}'`
+    $CP /tmp/SYM_INI ${SYM_INI} 
+fi
+
+cleanup_symlinks "${NEXT_DBFILE}" "${SYM_INI}" 
+
+$CP ${SYM_INI} ${SYM_CO_INI}
+if [[ $? -ne 0 ]]; then
+        abort_script "ERROR : Failed to copy ${SYM_INI} to ${SYM_CO_INI}"
+fi
+
+$CP ${SYM_INI} ${SYM_CO_INI_SW}
+if [[ $? -ne 0 ]]; then
+        abort_script "ERROR : Failed to copy ${SYM_INI} to ${SYM_CO_INI_SW}"
+fi
+
+register_raw_device
+
+$SU - ${SYSUSER} -c "${IQDIR}/bin64/dbping -q -c \"${CONN_STR_USER_DBA}\""
+if [ $? -ne 0 ]; then
+        dwhdb_args_start
+fi
+
+$SU - ${SYSUSER} -c "${IQDIR}/bin64/dbping -q -c \"${CONN_STR_USER_DBA}\""
+if [ $? -eq 0 ]; then
+        dwhdb_stop
+fi
+
+${ECHO} "Successfully replaced existing sys_main files" | $TEE -a ${LOGFILE}
+$RM -rf ${TEM_DIR}
+$RM -rf ${SYS_MAIN_DETAILS}
+$RM -rf /tmp/SYM_INI
+$RM -rf /tmp/LUN_SELECTED
+
+exit 0

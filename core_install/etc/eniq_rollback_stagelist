@@ -1,0 +1,11 @@
+get_active_snapshot
+disable_oss_mounts
+rollback_fs_snapshot
+rollback_nas_snapshot
+rollback_san_snapshot
+restore_repository_database
+restore_dwhdb_database
+enable_rolling_snapshot
+post_rollback
+manage_ombs_policies
+cleanup

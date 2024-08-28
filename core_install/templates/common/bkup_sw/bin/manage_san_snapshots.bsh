@@ -1,0 +1,987 @@
+#!/bin/bash
+# ********************************************************************
+# Ericsson Radio Systems AB                                     SCRIPT
+# ********************************************************************
+#
+#
+# (c) Ericsson Radio Systems AB 2022 - All rights reserved.
+#
+# The copyright to the computer program(s) herein is the property
+# of Ericsson Radio Systems AB, Sweden. The programs may be used
+# and/or copied only with the written permission from Ericsson Radio
+# Systems AB or in accordance with the terms and conditions stipulated
+# in the agreement/contract under which the program(s) have been
+# supplied.
+#
+# ********************************************************************
+# Name    : manage_san_snapshot.bsh
+# Date    : 25/07/2023
+# Revision: main\18
+# Purpose : ENIQ script to that handles SAN snapshots.
+#
+# Usage   : manage_san_snapshots.bsh -a <snap_action> -f <lun id's>
+#          -n <snap_name> [ -N ] [ -l <logfile> ]
+#
+# ********************************************************************
+#
+#   Command Section
+#
+# ********************************************************************
+AWK=/usr/bin/awk
+BASENAME=/usr/bin/basename
+CAT=/usr/bin/cat
+CHMOD=/usr/bin/chmod
+CLEAR=/usr/bin/clear
+CUT=/usr/bin/cut
+DATE=/usr/bin/date
+DIRNAME=/usr/bin/dirname
+ECHO='/usr/bin/echo -e'
+EGREP=/usr/bin/egrep
+EXPR=/usr/bin/expr
+GREP=/usr/bin/grep
+ID=/usr/bin/id
+MKDIR=/usr/bin/mkdir
+RM=/usr/bin/rm
+SED=/usr/bin/sed
+TEE=/usr/bin/tee
+TIMEDATECTL=/usr/bin/timedatectl
+TOUCH=/usr/bin/touch
+TR=/usr/bin/tr
+UEMCLI=/usr/bin/uemcli
+
+
+# ********************************************************************
+#
+#       Configuration Section
+#
+# ********************************************************************
+ENIQ_ENV=niq.rc
+ENIQ_INI=niq.ini
+SYM_INI=sym_links.ini
+DWH_INI=dwh.ini
+SUNOS_INI=SunOS.ini
+STORAGE_INI=storage.ini
+
+# Directory on the root filesystem
+ENIQ_ROOT_DIR=/eniq
+
+
+# ********************************************************************
+#
+#       Pre-execution Operations
+#
+# ********************************************************************
+
+
+# ********************************************************************
+#
+#   functions
+#
+# ********************************************************************
+### Function: abort_script ###
+#
+#   This will is called if the script is aborted thru an error
+#   error signal sent by the kernel such as CTRL-C or if a serious
+#   error is encountered during runtime
+#
+# Arguments:
+#       $1 - Error message from part of program (Not always used)
+# Return Values:
+#       none
+abort_script()
+{
+if [ "$1" ]; then
+    _err_msg_=$1
+else
+    _err_msg_="Script aborted.......\n"
+fi
+
+# Check if log_msg() is defined
+type log_msg > /dev/null 2>&1
+if [ $? -gt 0 ]; then
+    if [ "${LOGFILE}" ]; then
+        if [ ! "${SNAP_QUIET}" ]; then
+            $ECHO "\n${_err_msg_}\n" |$TEE -a ${LOGFILE}
+        else
+            $ECHO "\n${_err_msg_}\n" >> ${LOGFILE}
+        fi
+    else
+        $ECHO "\n${_err_msg_}\n"
+    fi
+else
+    if [ "${LOGFILE}" ]; then
+    log_msg -s "\n${_err_msg_}\n" -l ${LOGFILE} ${SNAP_QUIET}
+    else
+    log_msg -s "\n${_err_msg_}\n" ${SNAP_QUIET}
+    fi
+fi
+
+cd $SCRIPTHOME
+$RM -rf ${TEM_DIR}
+if [ "$2" ]; then
+    ${2}
+else
+   exit 1
+fi
+}
+
+# Check/Create Logfile
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+chk_create_logfile()
+{
+$MKDIR -p `$DIRNAME ${LOGFILE}`
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not create directory `$DIRNAME ${LOGFILE}`"
+     abort_script "$_err_msg_"
+fi
+
+$TOUCH -a ${LOGFILE}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not write to file ${LOGFILE}"
+    abort_script "$_err_msg_"
+fi
+
+_log_id_str="-l ${LOGFILE}"
+}
+
+### Function: check_id ###
+#
+#   Check that the effective id of the user is correct
+#   If not print error msg and exit.
+#
+# Arguments:
+#       $1 : User ID name
+# Return Values:
+#       none
+check_id()
+{
+_check_id_=`$ID  | $AWK -F\( '{print $2}' | $AWK -F\) '{print $1}'`
+if [ "$_check_id_" != "$1" ]; then
+    _err_msg_="You must be $1 or have equal permissions to execute this script."
+    abort_script "$_err_msg_"
+fi
+}
+
+### Function: check_params ###
+#
+# Check Input Params
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+check_params()
+{
+# Must have SNAP_ACTION, & SNAP_FS
+if [ ! "${SNAP_ACTION}" -o ! "${BLK_DEV}" ]; then
+    usage_msg
+    exit 1
+fi
+
+if [ "${SNAP_ACTION}" == "create" ]; then
+    if [ ! "${SNAP_NAME}" ]; then
+        usage_msg
+        exit 1
+    fi
+fi
+
+case "${SNAP_ACTION}" in
+    create)             SNAP_OPT=snapshot
+                        ;;
+    delete)             SNAP_OPT=destroy
+                        ;;
+    list)               SNAP_OPT=list
+                        ;;
+    rollback)           SNAP_OPT=rollback
+                        ;;
+    *)                  usage_msg
+                        exit 1
+                        ;;
+esac
+}
+
+# Create required Snapshots
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+create_snapshots()
+{
+if [ ! ${SNAP_NAME} ]; then
+    _err_msg_="Snap label not set see usage"
+    abort_script "$_err_msg_"
+fi
+
+log_msg -s "\nBuilding LUN list for create snapshots\n" ${_log_id_str} ${SNAP_QUIET}
+# Lets build the snapshot list
+if [ "${BLK_DEV}" == "ALL" ]; then
+    get_disk_list
+    $BLKCLI --action listluns | egrep -w "${_disk_list_}" > ${TEM_DIR}/disk_list
+else
+    _disk_list_=`$ECHO ${BLK_DEV} | $SED -e 's|,|\||g'`
+    $BLKCLI --action listluns | egrep -w "${_disk_list_}" > ${TEM_DIR}/disk_list
+fi
+
+if [ -s ${TEM_DIR}/disk_list ]; then
+    printf "\n--------------------------------------------------------\n" > ${TEM_DIR}/san_list
+    printf "\nLUN ID \t\tDISK ID \t\t\t\tDescription\n\n" >> ${TEM_DIR}/san_list
+
+    while read _entry_;do
+        _lun_id_=`$ECHO ${_entry_} | $AWK -F";" '{print $1}'`
+        _disk_id_=`$ECHO ${_entry_} | $AWK -F";" '{print $2}'`
+        _description_=`$ECHO ${_entry_} | $AWK -F";" '{print $3}'`
+        printf "${_lun_id_} \t${_disk_id_} \t${_description_}\n"  >> ${TEM_DIR}/san_list
+    done < ${TEM_DIR}/disk_list
+
+    printf "\n--------------------------------------------------------\n" >> ${TEM_DIR}/san_list
+
+    if [ ! "${NO_CONFIRM}" ]; then
+        user_confirm "snapshot the Luns"
+        if [ $USER_CONF == No ]; then
+            $RM -rf ${TEM_DIR}
+            exit 0
+        fi
+    fi
+else
+    _err_msg_="No LUNs found to be snapped"
+    abort_script "$_err_msg_"
+fi
+
+#_lun_id_list_=""
+#while read _entry_; do
+#    _lun_id_=`$ECHO ${_entry_} | $AWK -F";" '{print $1}'`
+#    if [ "${_lun_id_list_}" == "" ]; then
+#        _lun_id_list_="${_lun_id_}"
+#    else
+#        _lun_id_list_="${_lun_id_list_},${_lun_id_}"
+#    fi
+#done < "${TEM_DIR}/san_list"
+
+_lun_id_list_=`$ECHO ${_disk_list_} | $SED -e 's|\||,|g'`
+
+log_msg -s " Starting Snap Session with label \"${SNAP_NAME}\"" ${_log_id_str} ${SNAP_QUIET} -t
+
+$BLKCLI --action createsnapshot --ids ${_lun_id_list_} --tag ${SNAP_NAME}  >> ${LOGFILE}
+if [ $? -ne 0 ]; then
+    _err_msg_="Failed to Create snapshots with label ${SNAP_NAME} for Luns ${_lun_id_list_}"
+    abort_script "$_err_msg_"
+fi
+
+log_msg -s " Snapshots with label ${SNAP_NAME} created successfully" ${_log_id_str} ${SNAP_QUIET} -h -t
+
+}
+
+### Function: destroy_snapshots ###
+#
+# Destroy required Snapshots
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+destroy_snapshots()
+{
+if [ ! ${SNAP_NAME} ]; then
+    _err_msg_="Snap label not set see usage"
+    abort_script "$_err_msg_"
+fi
+log_msg -s "\nBuilding LUN list for delete snapshots\n" ${_log_id_str} ${SNAP_QUIET}
+# Lets build the snapshot list
+if [ "${BLK_DEV}" == "ALL" ]; then
+    get_disk_list
+    $BLKCLI --action listluns | egrep -w "${_disk_list_}" > ${TEM_DIR}/lun_list
+else
+    _disk_list_=`$ECHO ${BLK_DEV} | $SED -e 's|,|\||g'`
+    $BLKCLI --action listluns | egrep -w "${_disk_list_}" > ${TEM_DIR}/lun_list
+fi
+
+if [ ! -s ${TEM_DIR}/lun_list ]; then
+    _err_msg_="Could Not find a list of luns to check for snapshots"
+    abort_script "$_err_msg_"
+fi
+
+#_lun_id_list_=""
+#while read _entry_; do
+#    _lun_id_=`$ECHO ${_entry_} | $AWK -F";" '{print $1}'`
+#    if [ "${_lun_id_list_}" == "" ]; then
+#        _lun_id_list_="${_lun_id_}"
+#    else
+#        _lun_id_list_="${_lun_id_list_},${_lun_id_}"
+#    fi
+#done < "${TEM_DIR}/lun_list"
+
+_lun_id_list_=`$ECHO ${_disk_list_} | $SED -e 's|\||,|g'`
+
+log_msg -s "Building snapshots list for delete" ${_log_id_str} ${SNAP_QUIET}
+
+$BLKCLI --action listsnapshots --ids ${_lun_id_list_} | $GREP -w ${SNAP_NAME}  > ${TEM_DIR}/snapshot_list
+
+if [ -s ${TEM_DIR}/snapshot_list ]; then
+    printf "\n--------------------------------------------------------\n" > ${TEM_DIR}/san_list
+    printf "\nLUN ID \t\tSNAPSHOT ID \t\tSTATUS\n\n" >> ${TEM_DIR}/san_list
+
+    while read _entry_;do
+        _lun_id_=`$ECHO ${_entry_} | $AWK -F";" '{print $1}'`
+        _snap_id_=`$ECHO ${_entry_} | $AWK -F";" '{print $2}'`
+        _snap_status_=`$ECHO ${_entry_} | $AWK -F";" '{print $3}'`
+        printf "${_lun_id_} \t${_snap_id_} \t${_snap_status_}\n"  >> ${TEM_DIR}/san_list
+    done < ${TEM_DIR}/snapshot_list
+
+    printf "\n--------------------------------------------------------\n" >> ${TEM_DIR}/san_list
+
+    #$CAT ${TEM_DIR}/snap_list
+    $ECHO "\n"
+    if [ ! "${NO_CONFIRM}" ]; then
+        user_confirm "delete the snapshots"
+        if [ $USER_CONF == No ]; then
+           $RM -rf ${TEM_DIR}
+            exit 0
+        fi
+    fi
+else
+    _err_msg_="No Snapshots found to be delete"
+    abort_script "$_err_msg_"
+fi
+
+_snap_id_list_=""
+while read _entry_; do
+    _snap_id_=`$ECHO ${_entry_} | $AWK -F";" '{print $2}'`
+    if [ "${_snap_id_list_}" == "" ]; then
+        _snap_id_list_="${_snap_id_}"
+    else
+        _snap_id_list_="${_snap_id_list_},${_snap_id_}"
+    fi
+done < "${TEM_DIR}/snapshot_list"
+
+log_msg -s " Stopping Snapshot Session with label \"${SNAP_NAME}\"\n" ${_log_id_str} ${SNAP_QUIET} -t
+
+#In case of Unity we need to pass only single snapshot ID
+if [ "${SAN_DEVICE}" == "unity" -o "${SAN_DEVICE}" == "unityXT" ]; then
+	_snap_id_list_=`$ECHO ${_snap_id_list_} | $SED 's/,/\n/g' |$SORT -u`
+	if [ ! "${_snap_id_list_}" ]; then
+		_err_msg_="Failed to get unique snap id"
+		abort_script "$_err_msg_"
+	fi
+fi
+
+$BLKCLI --action deletesnapshot --ids ${_snap_id_list_} >> ${LOGFILE}
+if [ $? -ne 0 ]; then
+    _err_msg_="Failed to stop Snap Session with label ${SNAP_NAME}"
+    abort_script "$_err_msg_"
+fi
+
+log_msg -s " Snapshots with label ${SNAP_NAME} deleted" ${_log_id_str} ${SNAP_QUIET} -h -t
+
+
+}
+
+
+### Function: get_absolute_path ###
+#
+# Determine absolute path to software
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+get_absolute_path()
+{
+_dir_=`$DIRNAME $0`
+SCRIPTHOME=`cd $_dir_ 2>/dev/null && pwd || $ECHO $_dir_`
+}
+
+### Function: get_absolute_path ###
+#
+# Determine absolute path to software
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+get_absolute_path()
+{
+_dir_=`$DIRNAME $0`
+SCRIPTHOME=`cd $_dir_ 2>/dev/null && pwd || $ECHO $_dir_`
+}
+
+### Function: get_disk_lisk ###
+#
+# create a list of disks used in the DB
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+get_disk_list()
+{
+# get sys main
+_sys_main_disk_list_=""
+_sys_main_list_=`iniget DWH_SYSTEM_MAIN -f ${ENIQ_CONF_DIR}/${SYM_INI}`
+for _sys_main_ in ${_sys_main_list_}; do
+    _sys_main_disk_=`iniget ${_sys_main_} -f ${ENIQ_CONF_DIR}/${SYM_INI} -v Lun_ID`
+    if [ "${_sys_main_disk_list_}" == "" ]; then
+        _sys_main_disk_list_="${_sys_main_disk_}"
+    else
+        _sys_main_disk_list_="${_sys_main_disk_list_}|${_sys_main_disk_}"
+     fi
+done
+
+# get main dbs
+_main_db_disk_list_=""
+_db_space_list_=`iniget DWH_DBSPACES_MAIN -f ${ENIQ_CONF_DIR}/${SYM_INI}`
+for _db_space_ in ${_db_space_list_}; do
+    _main_db_disk_=`iniget ${_db_space_} -f ${ENIQ_CONF_DIR}/${SYM_INI} -v Lun_ID`
+    if [ "${_main_db_disk_list_}" == "" ]; then
+        _main_db_disk_list_="${_main_db_disk_}"
+    else
+        _main_db_disk_list_="${_main_db_disk_list_}|${_main_db_disk_}"
+    fi
+done
+
+_disk_list_="${_sys_main_disk_list_}|${_main_db_disk_list_}"
+
+}
+
+
+### Function: create_final_list_snapshots ###
+#
+#Final List required Snapshots
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+create_final_list()
+{
+san_navilist=() 
+   while I= read -r line 
+   do
+    san_navilist+=("$line") 
+   done < ${TEM_DIR}/navi_lists
+
+san_snaplist=() 
+   while I= read -r line 
+   do
+   if [ ${SAN_DEVICE} == vnx ]; then
+       line=`$ECHO "${line}" | $AWK -F"@" '{print $4}' | awk -F";" '{print $1}'`
+   else
+       line=`$ECHO "${line}" | $AWK -F"@" '{print $2}' | awk -F";" '{print $1}'`
+   fi
+    san_snaplist+=("$line") 
+   done < ${TEM_DIR}/snapshot_list
+	
+$TOUCH ${TEM_DIR}/final_lists
+   for id in ${san_snaplist[@]}
+   do
+      for i in "${!san_navilist[@]}"; do
+      $ECHO "${san_navilist[$i]}" | $EGREP -w -- "$id" > /dev/null
+if [ $? -eq 0 ]; then
+   ((i+=1))
+   if [ ${SAN_DEVICE} == vnx ]; then
+       time=`$ECHO "${san_navilist[$i]}" | $AWK -F"Session creation time:  " '{print $2}'`
+   else
+       time=`$ECHO "${san_navilist[$i]}" | $AWK -F"=" '{print $2}'`
+   fi
+   $ECHO "$id;$time" >> ${TEM_DIR}/final_lists
+fi
+   done
+  done
+}
+
+
+### Function: list_snapshots ###
+#
+# List required Snapshots
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+list_snapshots()
+{
+
+log_msg -s "\nBuilding LUN list for list snapshots\n" ${_log_id_str} ${SNAP_QUIET}
+# Lets build the snapshot list
+if [ "${BLK_DEV}" == "ALL" ]; then
+    get_disk_list
+    #$BLKCLI --action listluns | egrep "${_disk_list_}" > ${TEM_DIR}/lun_list
+else
+    _disk_list_=`$ECHO ${BLK_DEV} | $SED -e 's|,|\||g'`
+    #$BLKCLI --action listluns | egrep "${_disk_list_}" > ${TEM_DIR}/lun_list
+fi
+
+#if [ ! -s ${TEM_DIR}/lun_list ]; then
+#    _err_msg_="Could Not find a list of luns to check for snapshots"
+##    abort_script "$_err_msg_"
+#fi
+
+#_lun_id_list_=""
+#while read _entry_; do
+#    _lun_id_=`$ECHO ${_entry_} | $AWK -F";" '{print $1}'`
+#    if [ "${_lun_id_list_}" == "" ]; then
+#        _lun_id_list_="${_lun_id_}"
+#    else
+#        _lun_id_list_="${_lun_id_list_},${_lun_id_}"
+#    fi
+#done < "${TEM_DIR}/lun_list"
+
+if [ ! ${_disk_list_} ];then
+    _err_msg_="List of luns not found or specified to check for snapshots"
+    abort_script "$_err_msg_"
+fi
+
+_lun_id_list_=`$ECHO ${_disk_list_} | $SED -e 's|\||,|g'`
+_blk_id_=`$CAT ${ENIQ_CONF_DIR}/block_storage.ini |$EGREP BLK_STORAGE_IP_SPA= |$CUT -d "=" -f2`
+_cg_id_=`$CAT ${ENIQ_CONF_DIR}/block_storage.ini |$GREP BLK_CONSISTENCY_GROUP_ID= |$CUT -d "=" -f2`
+log_msg -s "Listing LUNs with snapshots" ${_log_id_str} ${SNAP_QUIET}
+if [ ${SNAP_NAME} ]; then
+    if [ ! "${TIME}" ]; then
+      $BLKCLI --action listsnapshots --ids ${_lun_id_list_} | $GREP -w ${SNAP_NAME}  > ${TEM_DIR}/snapshot_list
+     else
+      $BLKCLI --action listsnapshots --ids ${_lun_id_list_} > ${TEM_DIR}/snapshot_list
+       if [ ${SAN_DEVICE} == vnx ]; then
+         ${NAVISEC_CLI_CONF_DIR}/naviseccli -secfilepath /ericsson/storage/san/plugins/${SAN_DEVICE}/cred -Address ${_blk_id_} snapview -listsessions|$EGREP "Name of the session|Session creation time" >  ${TEM_DIR}/navi_lists
+         create_final_list       
+	   else
+         ${UEMCLI} -d ${_blk_id_} -gmtoff ${_offset_} /prot/snap -source ${_cg_id_} show -detail | $EGREP "Name|Creation time" >  ${TEM_DIR}/navi_lists
+         create_final_list
+      fi
+    fi
+else
+    if [ ! "${TIME}" ]; then
+      $BLKCLI --action listsnapshots --ids ${_lun_id_list_} > ${TEM_DIR}/snapshot_list
+     else
+      $BLKCLI --action listsnapshots --ids ${_lun_id_list_} > ${TEM_DIR}/snapshot_list
+        if [ ${SAN_DEVICE} == vnx ]; then
+         ${NAVISEC_CLI_CONF_DIR}/naviseccli -secfilepath /ericsson/storage/san/plugins/${SAN_DEVICE}/cred -Address ${_blk_id_} snapview -listsessions|$EGREP "Name of the session|Session creation time" >  ${TEM_DIR}/navi_lists
+         create_final_list        
+		else
+         ${UEMCLI} -d ${_blk_id_} -gmtoff ${_offset_} /prot/snap -source ${_cg_id_} show -detail | $EGREP "Name|Creation time" >  ${TEM_DIR}/navi_lists
+ create_final_list
+        fi
+    fi
+fi
+if [ -s ${TEM_DIR}/snapshot_list ]; then
+     if [ ! "${TIME}" ] ; then
+    #$CAT ${TEM_DIR}/san_list
+    printf "\n--------------------------------------------------------\n" > ${TEM_DIR}/san_list
+    printf "\nLUN ID \t\tSNAPSHOT ID \t\tSTATUS\n\n" >> ${TEM_DIR}/san_list
+
+    while read _entry_;do
+        _lun_id_=`$ECHO ${_entry_} | $AWK -F";" '{print $1}'`
+        _snap_id_=`$ECHO ${_entry_} | $AWK -F";" '{print $2}'`
+        _snap_status_=`$ECHO ${_entry_} | $AWK -F";" '{print $3}'`
+        printf "${_lun_id_} \t${_snap_id_} \t${_snap_status_}\n"  >> ${TEM_DIR}/san_list
+    done < ${TEM_DIR}/snapshot_list
+
+    printf "\n---------------------------------------------------------\n" >> ${TEM_DIR}/san_list
+    $CAT ${TEM_DIR}/san_list
+    $ECHO "\n"
+else
+    printf "\n--------------------------------------------------------\n" > ${TEM_DIR}/san_list
+    printf "\nLUN ID \t\tSNAPSHOT ID \t\tSTATUS \t\tCREATE TIME\n\n" >> ${TEM_DIR}/san_list
+    while read _entry_;do
+        _lun_id_=`$ECHO ${_entry_} | $AWK -F";" '{print $1}'`
+        _snap_id_=`$ECHO ${_entry_} | $AWK -F";" '{print $2}'`
+        _snap_status_=`$ECHO ${_entry_} | $AWK -F";" '{print $3}'`
+        if [ ${SAN_DEVICE} == vnx ]; then
+            _snap_id_to_search=`echo "${_snap_id_}" | $AWK -F"@" '{print $3}'`
+        else
+            _snap_id_to_search=`echo "${_snap_id_}" | $AWK -F"@" '{print $2}'`
+        fi
+        _snap_time_=`$CAT ${TEM_DIR}/final_lists | $GREP -w -- "${_snap_id_to_search}"  | tail -1 | $CUT -d ";" -f2`
+    printf "${_lun_id_} \t${_snap_id_} \t${_snap_status_}\t\t${_snap_time_}\n"  >> ${TEM_DIR}/san_list
+    done < ${TEM_DIR}/snapshot_list
+
+    printf "\n--------------------------------------------------------\n" >> ${TEM_DIR}/san_list
+    $CAT ${TEM_DIR}/san_list
+    $ECHO "\n"
+fi
+else
+    log_msg -s " No SAN Snapshots found to list\n" ${_log_id_str} ${SNAP_QUIET} -t
+    $RM -rf ${TEM_DIR}
+    exit 1
+fi
+}
+
+### Function: rollback_snapshots ###
+#
+# Rollback required Snapshots
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+rollback_snapshots()
+{
+if [ ! ${SNAP_NAME} ]; then
+    _err_msg_="Snap label not set see usage"
+    abort_script "$_err_msg_"
+fi
+
+log_msg -s "\nBuilding LUN list for rollback snapshots\n" ${_log_id_str} ${SNAP_QUIET}
+# Lets build the snapshot list for rollback
+if [ "${BLK_DEV}" == "ALL" ]; then
+    get_disk_list
+    #$BLKCLI --action listluns | egrep "${_disk_list_}" > ${TEM_DIR}/lun_list
+else
+    _disk_list_=`$ECHO ${BLK_DEV} | $SED -e 's|,|\||g'`
+    #$BLKCLI --action listluns | egrep "${_disk_list_}" > ${TEM_DIR}/lun_list
+fi
+
+#if [ ! -s ${TEM_DIR}/lun_list ]; then
+#    _err_msg_="Could Not find a list of luns to check for snapshots"
+#    abort_script "$_err_msg_"
+#fi
+
+#_lun_id_list_=""
+#while read _entry_; do
+#    _lun_id_=`$ECHO ${_entry_} | $AWK -F";" '{print $1}'`
+#    if [ "${_lun_id_list_}" == "" ]; then
+#        _lun_id_list_="${_lun_id_}"
+#    else
+#        _lun_id_list_="${_lun_id_list_},${_lun_id_}"
+#    fi
+#done < "${TEM_DIR}/lun_list"
+
+_lun_id_list_=`$ECHO ${_disk_list_} | $SED -e 's|\||,|g'`
+
+log_msg -s "Building snapshots list for rollback" ${_log_id_str} ${SNAP_QUIET}
+
+$BLKCLI --action listsnapshots --ids ${_lun_id_list_} | $GREP -w ${SNAP_NAME}  > ${TEM_DIR}/rollback_list
+
+if [ -s ${TEM_DIR}/rollback_list ]; then
+
+    printf "\n--------------------------------------------------------\n" > ${TEM_DIR}/san_list
+    printf "\nLUN ID \t\tSNAPSHOT ID \t\tSTATUS\n\n" >> ${TEM_DIR}/san_list
+
+    while read _entry_;do
+        _lun_id_=`$ECHO ${_entry_} | $AWK -F";" '{print $1}'`
+        _snap_id_=`$ECHO ${_entry_} | $AWK -F";" '{print $2}'`
+        _snap_status_=`$ECHO ${_entry_} | $AWK -F";" '{print $3}'`
+        printf "${_lun_id_} \t${_snap_id_} \t${_snap_status_}\n"  >> ${TEM_DIR}/san_list
+    done < ${TEM_DIR}/rollback_list
+
+    printf "\n--------------------------------------------------------\n" >> ${TEM_DIR}/san_list
+
+    if [ ! "${NO_CONFIRM}" ]; then
+        user_confirm "Rollback the snapshots"
+        if [ $USER_CONF == No ]; then
+            $RM -rf ${TEM_DIR}
+            exit 0
+        fi
+    fi
+else
+    _err_msg_="No Snapshots found to rollback to"
+    abort_script "$_err_msg_"
+fi
+
+_snap_id_list_=""
+while read _entry_; do
+    _snap_id_=`$ECHO ${_entry_} | $AWK -F";" '{print $2}'`
+    if [ "${_snap_id_list_}" == "" ]; then
+        _snap_id_list_="${_snap_id_}"
+    else
+        _snap_id_list_="${_snap_id_list_},${_snap_id_}"
+    fi
+done < "${TEM_DIR}/rollback_list"
+
+log_msg -s " Rolling back to snapshots with label \"${SNAP_NAME}\"\n" ${_log_id_str} ${SNAP_QUIET} -t
+
+#In case of Unity we need to pass only one snapshot ID
+if [ "${SAN_DEVICE}" == "unity" -o "${SAN_DEVICE}" == "unityXT" ]; then
+	_snap_id_list_=`$ECHO ${_snap_id_list_} | $SED 's/,/\n/g' |$SORT -u`
+	if [ ! ${_snap_id_list_} ]; then
+		_err_msg_="Failed to get unique snap id"
+		abort_script "$_err_msg_"
+	fi
+fi
+
+# Now rollback all snapshots to snap label
+$BLKCLI --action rollbacksnapshot --ids ${_snap_id_list_} >> ${LOGFILE}
+if [ $? -ne 0 ]; then
+    _err_msg_="Failed to stop Snap Session with label ${SNAP_NAME}"
+    abort_script "$_err_msg_"
+fi
+log_msg -s " Snapshots ${SNAP_NAME} successfully rolled back" ${_log_id_str} ${SNAP_QUIET} -h -t
+
+#Logging Eniq Activity
+SNAP_DATE=`$DATE '+%Y-%m-%d %H:%M:%S'`
+$ECHO "ENIQ ACTIVITY INFO=Snapshot_Rollback;${SNAP_DATE};SAN Snapshot Rollback" | $TEE -a /eniq/local_logs/eniq_activity_history.log >> ${LOGFILE}
+_hist_status_=$?
+if [ "${_hist_status_}" -ne 0 ]; then
+	_err_msg_="Failed to update Eniq Activity log file\n"
+	abort_script "$_err_msg_"
+else
+   $ECHO "Successfully logged Eniq Activity"
+fi
+}
+
+### Function: setup_env ###
+#
+# Setup up path environment etc
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+setup_env()
+{
+ENIQ_BASE_DIR=/eniq
+
+ENIQ_ADMIN_DIR=${ENIQ_BASE_DIR}/admin
+
+ENIQ_CONF_DIR=${ENIQ_BASE_DIR}/installation/config
+
+# Core install directory that contains scripts
+ENIQ_CORE_DIR=${ENIQ_BASE_DIR}/installation/core_install
+
+CLI_CONF_DIR=${ENIQ_BASE_DIR}/sw/conf
+NAVISEC_CLI_CONF_DIR=/opt/Navisphere/bin
+
+# Source the common functions
+if [ -s ${ENIQ_ADMIN_DIR}/lib/common_functions.lib ]; then
+    . ${ENIQ_ADMIN_DIR}/lib/common_functions.lib
+else
+    if [ -s ${ENIQ_CORE_DIR}/lib/common_functions.lib ]; then
+        . ${ENIQ_CORE_DIR}/lib/common_functions.lib
+    else
+        _err_msg_="File ${ENIQ_ADMIN_DIR}/lib/common_functions.lib or ${ENIQ_CORE_DIR}/lib/common_functions.lib  not found"
+        abort_script "$_err_msg_"
+    fi
+fi
+
+STORAGE_TYPE=`iniget STOR_TYPE -f ${ENIQ_CONF_DIR}/${SUNOS_INI} -v STORAGE_TYPE`
+if [ ! "${STORAGE_TYPE}" ]; then
+    _err_msg_="Could not read STORAGE_TYPE param"
+    abort_script "$_err_msg_"
+fi
+
+# If I'm ZFS, no need to go any further
+if [ "${STORAGE_TYPE}" == "zfs" ]; then
+        return 0
+fi
+
+# Read location of storage API command
+BLKCLI=`iniget STOR_API -f ${ENIQ_CONF_DIR}/${SUNOS_INI} -v STOR_API_CMD`
+if [ ! "${BLKCLI}" ]; then
+    _err_msg_="Could not read STOR_API_CMD param from ${ENIQ_CONF_DIR}/${SUNOS_INI}"
+    abort_script "$_err_msg_" "${EXEC_SHELL_CMD}"
+fi
+
+SAN_DEVICE=`$CAT ${ENIQ_CONF_DIR}/san_details |$EGREP SAN_DEVICE= |$CUT -d "=" -f2`
+if [ ! "${SAN_DEVICE}" ]; then
+    _err_msg_="Could not get SAN_DEVICE from ${ENIQ_CONF_DIR}/san_details"
+    abort_script "$_err_msg_" "${EXEC_SHELL_CMD}"
+fi
+
+if [ ! -x ${_stor_api_cmd_} ]; then
+    _err_msg_="${BLKCLI} is not found or is not executable"
+    abort_script "$_err_msg_" "${EXEC_SHELL_CMD}"
+fi
+
+# Source niq.rc
+if [ -s ${CLI_CONF_DIR}/${ENIQ_ENV} ]; then
+    . ${CLI_CONF_DIR}/${ENIQ_ENV}
+fi
+
+# Define root user's home
+HOME=/root
+
+export HOME
+
+# Get offset value for time zone
+_offset_=`${TIMEDATECTL} | $GREP -i 'Time zone:' | $AWK -F"," '{print $2}' |  $AWK -F")" '{print $1}' | $TR -d ' '| $SED 's/\(...\)/\1:/'`
+}
+
+### Function: usage_msg ###
+#
+#   Print out the usage message
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+usage_msg()
+{
+$ECHO "
+Usage: `$BASENAME $0` -a <snap_action> -f <lun id> [ -n <snap_name> ] [ -l <logfile> ]
+
+options:
+
+-a  : Snapshot Action. Must be either
+              create   --> Create a snapshot of list/ALL SAN filesystems
+              delete   --> Delete specified snapshot(s).
+              list     --> List of ALL/matching snapshot(s)
+              rollback --> Roll back to specified snapshot(s).
+
+-f  : In the case of create
+              Disk(s) to be Snapshot. Must be specified in the following format
+              '<LUN ID>' e.g. atcx4-18@35. Multiple luns can be
+              specified if seperated by ','.
+
+              'ALL' can be specified to snapshot all disks
+
+              NOTE: None of the ENIQ services should be online from SMF point of view
+
+      In the case of delete
+              Snapshots(s) to be deleted. Must be specified in the following format
+              '<LUN ID>' e.g. atcx4-18@35
+              Multiple snapshots can be specified if seperated by ','.
+
+              'ALL' can be specified to delete all snapshots which contain
+               the specified snapshot id string e.g. ALL -n <snap_label>
+
+      In the case of list
+              List Snapshots. 'ALL' can be specified to list all snapshot
+
+              'ALL' can be specified to list all snapshots which contain
+               the specified snapshot id string e.g. ALL -n <snap_label>
+
+      In the case of rollback
+              Snapshots(s) to roll back to. Must be specified in the following format
+              '<LUN ID>
+              Multiple snapshots can be specified if seperated by ','.
+
+              'ALL -n <snap label>' can be specified to roll back to all snapshots which contain
+               the specified snapshot id string e.g. ALL -n snap1
+
+               NOTE: None of the ENIQ services can be online from SMF point of view
+
+-n  : In the case of snapshot creation, specify a name or label that each
+      snapshot will use. e.g. -n snap1 would create <LUN ID>@snap1.
+
+-l  : Optional parameter specifying the full path to logfile. If not specified, a
+      logfile will be created in ${ENIQ_ROOT_DIR}/local_logs/snapshot_logs/manage_san_snapshot.log
+-t  : Optional parameter specifying the the time of the snapshots being taken
+"
+}
+
+### Function: user_confirm ###
+#
+# Get confirmation from user to proceed with snapshot action
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+user_confirm()
+{
+while :; do
+    unset USER_CONF
+    $CLEAR
+    $CAT ${TEM_DIR}/san_list
+    $ECHO "\nAre you sure you wish to ${1} above"
+    $ECHO "Enter [Yes | No] (case sensitive) : \c"
+
+    read USER_CONF
+    if [ "$USER_CONF" == "Yes" -o "$USER_CONF" == "No" ]; then
+        break
+    fi
+done
+}
+
+# ********************************************************************
+#
+#   Main body of program
+#
+# ********************************************************************
+#
+RUN_TIME=`$DATE '+%Y-%b-%d_%H.%M.%S'`
+
+# Determine absolute path to software
+get_absolute_path
+
+# Check that the effective id of the user is root
+#check_id root
+
+while getopts ":a:f:Fl:n:NqS:R:t" arg; do
+  case $arg in
+    a) SNAP_ACTION="$OPTARG"
+       ;;
+    f) BLK_DEV="$OPTARG"
+       ;;
+    F) SNAP_FORCE="YES"
+       ;;
+    l) LOGFILE="$OPTARG"
+       ;;
+    n) SNAP_NAME="$OPTARG"
+       ;;
+    N) NO_CONFIRM="YES"
+       ;;
+    q) SNAP_QUIET="-q"
+       ;;
+    S) SKIP_SERVICE_CHECK="YES"
+       ;;
+    R) ROLL_SNAP="YES"
+       ;;
+    t) TIME="YES"
+       ;;
+   \?) usage_msg
+       exit 1
+       ;;
+  esac
+done
+shift `expr $OPTIND - 1`
+
+# Setup up path environment etc
+setup_env
+
+# Check Input Params
+check_params
+
+# Set up default logfile if required
+if [ ! "${LOGFILE}" ]; then
+    LOGFILE="${ENIQ_ROOT_DIR}/local_logs/snapshot_logs/manage_san_snapshot.log"
+fi
+
+# Check/Create Logfile
+chk_create_logfile
+
+log_msg -s " Starting to ${SNAP_ACTION} SAN snapshots" ${_log_id_str} ${SNAP_QUIET} -h -t
+
+if [ "${STORAGE_TYPE}" != "raw" ]; then
+        $ECHO "Storage type determined to be ${STORAGE_TYPE}, script will not execute" | $TEE -a $LOGFILE
+        exit 0
+fi
+
+# Create a temporary Directory
+TEM_DIR=/tmp/manage_san_snapshot.$$.$$
+$RM -rf ${TEM_DIR}
+$MKDIR -p ${TEM_DIR}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not create directory ${TEM_DIR}"
+    abort_script "$_err_msg_"
+fi
+
+$CHMOD 640 ${TEM_DIR}
+
+case "${SNAP_OPT}" in
+    snapshot)
+    create_snapshots
+        ;;
+
+    destroy)
+    destroy_snapshots
+        ;;
+
+    list)
+    list_snapshots
+        ;;
+
+    rollback)
+    rollback_snapshots
+        ;;
+    *)  : # SHOULD NOT GET HERE
+       ;;
+esac
+
+$RM -rf ${TEM_DIR}
+
+exit 0
+

@@ -1,0 +1,345 @@
+#!/bin/bash
+# ********************************************************************
+# Ericsson Radio Systems AB SCRIPT
+# ********************************************************************
+#
+#
+# (c) Ericsson Radio Systems AB 2016 - All rights reserved.
+#
+# The copyright to the computer program(s) herein is the property
+# of Ericsson Radio Systems AB, Sweden. The programs may be used
+# and/or copied only with the written permission from Ericsson Radio
+# Systems AB or in accordance with the terms and conditions stipulated
+# in the agreement/contract under which the program(s) have been
+# supplied.
+#
+# ********************************************************************
+# Name    : check_core_dump.bsh
+# Date    : 08/29/2016 
+# Revision: C 
+# Purpose : Script to check core dump
+# Usage   : check_core_dump.bsh
+# Exit Values:  
+#  0   : SUCCESS
+#  3   : NO RUN  : Healthcheck Aborted
+#  15  : NO RUN  : Config file unavailable
+#  153 : WARNING : Core Dump found
+#  154 : WARNING : Core Dump path not found
+## ********************************************************************
+#
+#   Command Section
+#
+# ********************************************************************
+AWK=/usr/bin/awk
+TEE=/usr/bin/tee
+CHMOD=/usr/bin/chmod
+DATE=/usr/bin/date
+ID=/usr/bin/id
+RM=/usr/bin/rm
+TOUCH=/usr/bin/touch
+MKDIR=/usr/bin/mkdir
+WC=/usr/bin/wc
+FIND=/usr/bin/find
+CAT=/usr/bin/cat
+CUT=/usr/bin/cut
+TR=/usr/bin/tr
+ECHO=/usr/bin/echo
+# *********************************************************************
+#                                                                     *
+#                           Functions                                 *
+#                                                                     *
+# *********************************************************************
+
+### Function: abort_script 
+#                                                                     
+#   This will be called if the script is aborted through an error        
+#   encountered during runtime                               
+#                                                                     
+# Arguments:                                                          
+#       $1 - Error message from part of program     
+# Return Values:                                                      
+#       none                                                          
+#
+
+abort_script()
+{
+_err_time_=`$DATE '+%Y-%b-%d_%H.%M.%S'`
+
+if [ "$1" ]; then
+    _err_msg_="${_err_time_} - $1"
+else
+    _err_msg_="${_err_time_} - ERROR : Script aborted.......\n"
+fi
+
+if [ "${LOGFILE}" ]; then
+    $ECHO "\nERROR: ${_err_msg_}\n" | $TEE -a ${LOGFILE}
+else
+    $ECHO "\nERROR: ${_err_msg_}\n"
+fi
+exit 3
+}
+
+### Function: check_id ###
+#
+#   Check that the effective id of the user is correct
+#   If not print error msg and exit.
+#
+# Arguments:
+#       $1 : User ID name
+# Return Values:
+#       none
+#
+check_id()
+{
+local _check_id_=`$ID  | $AWK -F\( '{print $2}' | $AWK -F\) '{print $1}'`
+
+if [ "$_check_id_" != "$1" ]; then
+    _err_msg_="You must be $1 to execute this script."
+    abort_script "$_err_msg_"
+fi
+}
+
+### Function: check_create_logfile ###
+#
+# Check/Create Logfile
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+#
+check_create_logfile()
+{
+if [ -s $LOGFILE  ]; then
+    $RM -rf $LOGFILE
+    if [ -f $LOGFILE  ]; then
+        _err_msg_="Could not remove older ${LOGFILE}"
+        abort_script "$_err_msg_"
+    fi
+fi
+
+if [ ! -d  ${ENIQ_PRECHECK_LOG_DIR} ]; then
+    ${MKDIR} -p ${ENIQ_PRECHECK_LOG_DIR}
+    if [ $? -ne 0 ]; then 
+        _err_msg_="Could not create ${ENIQ_PRECHECK_LOG_DIR}"
+        abort_script "$_err_msg_"
+    fi
+fi
+
+$TOUCH ${LOGFILE}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not create log file ${LOGFILE}"
+    abort_script "$_err_msg_"
+fi
+
+$CHMOD 640 ${LOGFILE}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not change the permissions of the ${LOGFILE}"
+    abort_script "$_err_msg_"
+fi
+}
+
+### Function: check_core_dump ###
+#
+# Checks if core dump has occurred or not
+#
+# Arguments:
+#           $1 : CORE_FILE_PATH, $2 :  CORE_FILE_NAME and $3 : SERVER_TYPE
+# Return values:
+#          None
+##
+check_core_dump()
+{
+var=`$CAT $INSTALLED_SERVER_TYPE`
+if [[ $var == "eniq_events" ]] || [[ $var == "eniq_stats" ]] || [[ $var == "$SERVER_TYPE" ]] || [[ $server == "$SERVER_TYPE" ]]; then
+    if [ -d "$1" ]; then
+        cd $1
+        _list_of_files=`$FIND . \( ! -name . -prune \) \( -type f -o -type l \) -mtime -1 | $GREP $2`
+        if [[ $_list_of_files ]]; then
+            log_msg -s "\n WARNING: $2 dump files found in the path $1" -l ${LOGFILE}
+            log_msg -s "\n Name of the $2 files:" -l ${LOGFILE}
+            log_msg -s "$_list_of_files" | $TR ./ ' '| $TR \/ \ | $TEE -a ${LOGFILE} 
+            return 2
+        else
+            log_msg -s "\n INFO: $2 dump files not found in the path $1 \n" -l ${LOGFILE}
+            return 0
+        fi
+    else
+        if [ "$1" == "/eniq/local_logs/core_dumps" ]; then
+            log_msg -s "\n INFO: Core dump files not found in the path /eniq/local_logs/ \n" -l ${LOGFILE}
+            return 0
+        else
+            log_msg -s "\n WARNING: $1 path not found \n" -l ${LOGFILE}
+            return 3
+        fi
+    fi
+fi
+
+}
+
+### Function check_core_dump_result ###
+# 
+# Arguments:
+#           None
+# Return values:
+#    0 : SUCCESS 
+#  153 : WARNING : Core Dump found
+#  154 : WARNING : Core Dump path not found
+##
+check_core_dump_result()
+{
+$CAT $core_dump_config_file | grep CHECK_CORE_DUMP >/tmp/config_core_dump
+
+while read line
+do
+if [ "${line:0:1}" != "#" ]; then
+    parameter=`$ECHO ${line} | $NAWK -F":" '{print $1}'`
+    if [ "$parameter" == "CHECK_CORE_DUMP" ]; then
+        CORE_FILE_PATH=`$ECHO ${line} | $NAWK -F":" '{print $2}'`
+        CORE_FILE_NAME=`$ECHO ${line} | $NAWK -F":" '{print $3}'`
+        SERVER_TYPE=`$ECHO ${line} | $NAWK -F":" '{print $4}'`
+        check_core_dump "$CORE_FILE_PATH" "$CORE_FILE_NAME" "$SERVER_TYPE"
+        return_code=$?
+        case $return_code in
+            2)
+                warning=$((warning+1))
+                ;;
+            3)
+                dir_warning=$((dir_warning+1))
+                ;;
+        *)
+                ;;
+        esac
+    fi
+else
+continue
+fi
+done </tmp/config_core_dump
+
+$RM -rf /tmp/config_core_dump
+
+if [[ ${dir_warning} -ne 0 ]] && [[ ${warning} -ne 0 ]]; then
+   RET_CODE=153
+elif [[ ${dir_warning} -ne 0 ]]; then
+   RET_CODE=154
+elif [[ ${warning} -ne 0 ]]; then
+   RET_CODE=153
+else
+   RET_CODE=0
+fi
+}
+
+######### Check for stats or events server ##
+#
+# Arguments:
+#           None
+# Return values:
+#           15 : NO RUN : Config file unavailable
+#
+check_server_type()
+{
+if [ ! -f "${ERICSSON_USE_CONFIG}" ]; then
+    log_msg -s "WARNING: ${ERICSSON_USE_CONFIG} file missing, this is required for this script, exiting!!!!" -l ${LOGFILE}
+    exit 15
+fi
+
+server=`$CAT $ERICSSON_USE_CONFIG | $CUT -d "=" -f2`
+if [[ $server == "stats" ]]; then
+    core_dump_config_file=${STATS_CHECK_CONFIG}
+elif [[ $server == "events" ]]; then
+    core_dump_config_file=${EVENTS_CHECK_CONFIG}
+fi
+}
+
+### Function: setup_env ###
+#
+# Setup path environment
+# Imports the common lib files which imports common functions 
+# 
+# Arguments:
+#   none
+# Return Values:
+#   none
+#
+setup_env()
+{
+if [ ! "${ENIQ_BASE_DIR}" ]; then
+    ENIQ_BASE_DIR=/eniq
+fi
+
+# Main Directory for the Core Installation SW
+ENIQ_INST_DIR=${ENIQ_BASE_DIR}/installation
+
+# Installation config directory
+ENIQ_CONF_DIR=${ENIQ_INST_DIR}/config
+
+# Precheck logs directory
+ENIQ_PRECHECK_LOG_DIR=${ENIQ_BASE_DIR}/local_logs/precheck_logs
+
+# Installation lib directory
+ENIQ_LIB_DIR=${ENIQ_INST_DIR}/core_install/lib/
+
+# Common function directory
+COMMON_FUNCS_LIB=${ENIQ_LIB_DIR}/common_functions.lib
+
+# Installed server type path
+INSTALLED_SERVER_TYPE=${ENIQ_CONF_DIR}/installed_server_type
+
+# Ericsson config file path
+ERICSSON_USE_CONFIG=${ENIQ_CONF_DIR}/ericsson_use_config
+
+# Events_checks config file
+EVENTS_CHECK_CONFIG=${ENIQ_INST_DIR}/core_install/eniq_checks/config/precheck_events.cfg
+
+# Stats_checks config file
+STATS_CHECK_CONFIG=${ENIQ_INST_DIR}/core_install/eniq_checks/config/precheck_stats.cfg
+
+# Logfile path
+LOGFILE=${ENIQ_PRECHECK_LOG_DIR}/log_core_dump.log
+
+# Return code declaration
+RET_CODE=0
+
+# Imports the common library functions
+if [ ! -f "${COMMON_FUNCS_LIB}" ]; then
+    _err_msg_="${COMMON_FUNCS_LIB} missing, this is required for this script, exiting!!!!"
+    abort_script "${_err_msg_}"
+fi
+
+. ${COMMON_FUNCS_LIB}
+
+if [ $? -ne 0 ]; then
+    _err_msg_="Importing functions of ${COMMON_FUNCS_LIB} failed, exiting!!!!"
+    abort_script "${_err_msg_}"
+fi
+}
+
+# ********************************************************************
+#
+#       Main body of program
+#
+# ********************************************************************
+
+# Default user
+DEFAULT_USER=root
+
+# Check that the effective id of the user is root
+check_id $DEFAULT_USER
+
+# Set up environment variables for script.
+setup_env
+
+# Variable Declaration
+warning=0
+dir_warning=0
+return_code=0
+
+# Check/Create Logfile
+check_create_logfile
+
+# Check for Core Dump
+check_server_type
+check_core_dump_result
+log_msg -t -s "Core Dump check completed" -l ${LOGFILE}
+log_msg -t -s "Check log $LOGFILE\n"
+exit $RET_CODE

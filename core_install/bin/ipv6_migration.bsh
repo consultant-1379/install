@@ -1,0 +1,2141 @@
+#!/bin/bash
+# ********************************************************************
+# Ericsson Radio Systems AB                                     SCRIPT
+# ********************************************************************
+#
+# (c) Ericsson Radio Systems AB 2023 - All rights reserved.
+#
+# The copyright to the computer program(s) herein is the property
+# of Ericsson Radio Systems AB, Sweden. The programs may be used
+# and/or copied only with the written permission from Ericsson Radio
+# Systems AB or in accordance with the terms and conditions stipulated
+# in the agreement/contract under which the program(s) have been
+# supplied.
+#
+# ********************************************************************
+# Name    : ipv6_migration.bsh
+# Date    : 26/10/2023
+# Revision: \main\01
+# Purpose : Main wrapper script handling the IPv4 to IPv6 migration.
+#
+# Usage   : ipv6_migration.bsh
+#
+# ********************************************************************
+#
+#   Command Section
+#
+# ********************************************************************
+AWK=/usr/bin/awk
+BASENAME=/usr/bin/basename
+BASH=/usr/bin/bash
+CAT=/usr/bin/cat
+CP=/usr/bin/cp
+CUT=/usr/bin/cut
+CHMOD=/usr/bin/chmod
+CHOWN=/usr/bin/chown
+DATE=/usr/bin/date
+DIRNAME=/usr/bin/dirname
+ECHO='/usr/bin/echo -e'
+EGREP=/usr/bin/egrep
+EXPR=/usr/bin/expr
+GREP=/usr/bin/grep
+HEAD=/usr/bin/head
+MYHOSTNAME=/usr/bin/hostname
+ID=/usr/bin/id
+MKDIR=/usr/bin/mkdir
+NAVISECCLI=/opt/Navisphere/bin/naviseccli
+NMCLI=/usr/bin/nmcli
+PERL=/usr/bin/perl
+PING=/usr/bin/ping
+PS=/usr/bin/ps
+PRINTF=/usr/bin/printf
+PWD=/usr/bin/pwd
+RM=/usr/bin/rm
+SED=/usr/bin/sed
+SLEEP=/usr/bin/sleep
+SYSTEMCTL=/usr/bin/systemctl 
+TEE=/usr/bin/tee
+TOUCH=/usr/bin/touch
+TR=/usr/bin/tr
+UEMCLI=/usr/bin/uemcli
+WC=/usr/bin/wc
+
+
+# ********************************************************************
+#
+#       Configuration Section
+#
+# ********************************************************************
+
+# Default user
+#DEFAULT_USER=root
+
+
+# Cmd to exec a shell and drop user to it in case of an error
+EXEC_SHELL_CMD="exec /bin/bash -o emacs"
+
+# Name of SunOS & ENIQ ini Files
+BLK_STOR_INI=block_storage.ini
+ENIQ_INI=niq.ini
+SYM_INI=sym_links.ini
+
+
+
+# ********************************************************************
+#
+#   Functions
+#
+# ********************************************************************
+### Function: abort_script ###
+#
+#   This will is called if the script is aborted thru an error
+#   signal sent by the kernel such as CTRL-C or if a serious
+#   error is encountered during runtime
+#
+# Arguments:
+#       $1 - Error message from part of program (Not always used)
+# Return Values:
+#       none
+abort_script()
+{
+_err_time_=`${DATE} '+%Y-%b-%d_%H.%M.%S'`
+
+if [ "$1" ]; then
+    _err_msg_="${_err_time_} - $1"
+else
+    _err_msg_="${_err_time_} - ERROR : Script aborted.......\n"
+fi
+
+if [ "${LOGFILE}" ]; then
+    $ECHO -e "\nERROR : ${_err_msg_}\n" | $TEE -a "${LOGFILE}"
+else
+    $ECHO -e "\nERROR : ${_err_msg_}\n"
+fi
+
+$RM -rf "${TEM_DIR}"
+#Removin tmp files
+remove_tmp_file
+
+exit 1
+
+}
+
+
+### Function: check_id ###
+#
+#   Check that the effective id of the user is correct
+#   If not print error msg and exit.
+#
+# Arguments:
+#       $1 : User ID name
+# Return Values:
+#       none
+check_id()
+{
+_get_id_=`$ENV |$GREP -w SUDO_USER | $EGREP "^[[:blank:]]*SUDO_USER="|$AWK -F\= '{print $2}'|$SED -e 's|"||g'`
+
+_check_id_=`$ID | $AWK -F\( '{print $2}' | $AWK -F\) '{print $1}'`
+
+_check_group_=`$ID $_get_id_ | $AWK -F\( '{print $3}' | $AWK -F\) '{print $1}'`
+
+
+    if [ "${_get_id_}" == "" ]; then
+
+        if [ "${_check_id_}" == "root" ]; then
+           # Set 1 for true
+           _user_root=1
+
+        else
+           _err_msg_="You must be root or admin to execute this script."
+           abort_script "${_err_msg_}"
+        fi
+    else
+        if [ "${_check_group_}" == "ENIQ_ADMIN_ROLE" ]; then
+           # Set 0 for false
+           _user_root=0
+
+        else
+            _err_msg_="You must be root or admin to execute this script."
+            abort_script "${_err_msg_}"
+        fi
+    fi
+}
+
+
+
+### Function: cleanup ###
+#
+# Final stage. Cleanup of temporary directory 
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+cleanup()
+{
+insert_header_footer head "Entering ENIQ_IPV6 Migration ${ACTION_TYPE} stage - ${NEXT_STAGE}" ${LOGFILE}
+
+log_msg -t -q -s "Deleting temporary files" -l ${LOGFILE}
+_temp_files_="/var/tmp/input_file1.txt"
+for _file_ in ${_temp_files_}; do
+    if [ -f "${_file_}" ]; then
+        log_msg -t -q -s "Deleting ${_file_} file" -l ${LOGFILE}
+        $RM -rf ${_file_}
+    fi
+done
+
+log_msg -s "Cleaning up the temporary directory" -l ${LOGFILE}
+$RM -rf ${TEM_DIR}
+$RM -rf ${Var_TEM_DIR}
+$RM -rf ${Rollback_EXP}
+$RM -rf ${TEMP_DIR}/sp_iqmpxinfo.txt
+$RM -rf ${TEMP_DIR}/sp_iqmpxvalidate.txt
+$RM -rf ${TEMP_DIR}/dropleaks.txt
+remove_tmp_file
+insert_header_footer foot "Successfully completed the cleanup" ${LOGFILE}
+$ECHO "\nENIQ IPV6 Migration Stages Completed: ${number_of_stages} of ${number_of_stages}" | $TEE -a ${LOGFILE}
+}
+
+
+
+### Function: ipv6_migration_build_stage_array ###
+#
+# Build a stage array using the stage file
+#
+# Arguments:
+# None
+# Return Values:
+# None
+ipv6_migration_build_stage_array(){
+
+# Stagelist file location
+$ECHO "Determining the stage file to use" | $TEE -a "${LOGFILE}" 
+_stage_file_="${ENIQ_CORE_INST_DIR}/etc/eniq_ipv6_migration_stagelist"
+if [ ! -s "${_stage_file_}" ]; then
+    _err_msg_="Could not find ${_stage_file_} file, or it is empty"
+    abort_script "$_err_msg_" 
+fi
+$ECHO "Building stage list from ${_stage_file_}\n" | $TEE -a "${LOGFILE}"
+
+# Remove stages that are commented out
+$RM -rf "${TEM_DIR}"/ipv6_migration_stagelist_file
+$CAT "${_stage_file_}" | $EGREP -v '^[     ]*#' | $SED -e 's/ //g' > "${TEM_DIR}"/ipv6_migration_stagelist_file
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not remove comments from ${_stage_file_} file"
+    abort_script "$_err_msg_" 
+fi
+
+_cnt_=0
+
+while read _line_; do
+    _migration_stage_=$($ECHO "${_line_}" | $AWK '{print $1}' | sed -e 's/ //g')
+
+    # Store the details in an array
+    MIGRATION_STAGES[${_cnt_}]=${_migration_stage_}
+
+    let _cnt_=_cnt_+1
+done < "${TEM_DIR}"/ipv6_migration_stagelist_file
+}
+
+
+### Function: ipv6_migration_check_user_stage ###
+#
+# Check specified stage is valid
+#
+# Arguments:
+#   $1 : User stage
+# Return Values:
+# None
+ipv6_migration_check_user_stage(){
+if [ ! "$1" ]; then
+   $ECHO "ERROR: User stage not set, exiting"
+   return 1
+else
+   _user_stage_=$1
+fi
+
+if [ "${_user_stage_}" == "cleanup" ]; then
+    return 0
+fi
+
+log_msg -s "Checking if user specified stage - ${_user_stage_} - is valid" -l "${LOGFILE}"
+$ECHO "${MIGRATION_STAGES[*]}" | $GREP -w "${_user_stage_}" >> /dev/null 2>&1
+if [ $? -ne 0 ]; then
+    log_msg -s "Specified stage ${_user_stage_} not a valid IPV6 Migration stage" -l "${LOGFILE}"
+    return 1
+else
+    log_msg -s "Specified stage ${_user_stage_} is a IPV6 Migration stage" -l "${LOGFILE}" 
+fi
+}
+
+
+
+### Function: get_absolute_path ###
+#
+# Determine absolute path to software
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+get_absolute_path()
+{
+_dir_=`$DIRNAME $0`
+SCRIPTHOME=`cd $_dir_ 2>/dev/null && pwd || $ECHO $_dir_`
+}
+
+
+### Function: insert_header_footer ###
+#
+#   Insert a stage header/footer message
+#
+# Arguments:
+#   $1 : head/foot
+#   $2 : Message
+#   $3 : Logfile
+# Return Values:
+#   none
+insert_header_footer()
+{
+if [ $# -ne 3 ]; then
+    _err_msg_="3 Parameters must be passed to header/footer function"
+    abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+fi
+
+if [ "$1" != "head" ] && [ "$1" != "foot" ]; then
+    _err_msg_="Only Param of head/foot is allowed...exiting!"
+    abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+fi
+_type_=$1
+
+_msg_=$2
+
+_logfile_=$3
+
+_time_=`$DATE '+%Y-%b-%d_%H.%M.%S'`
+if [ "$_type_" == "head" ]; then
+    log_msg -s "\n----------------------------------------------------------------------------" -l "${LOGFILE}"
+    log_msg -s "----------------------------------------------------------------------------" -l "${LOGFILE}"
+    log_msg -s "$_time_ : $_msg_" -l "${LOGFILE}"
+    log_msg -s "----------------------------------------------------------------------------" -l "${LOGFILE}"
+fi
+
+if [ "$_type_" == "foot" ]; then
+    log_msg -s "\n----------------------------------------------------------------------------" -l "${LOGFILE}"
+    log_msg -s "$_time_ : $_msg_" -l "${LOGFILE}"
+    log_msg -s "----------------------------------------------------------------------------" -l "${LOGFILE}"
+fi
+}
+
+
+
+### Function: set_next_stage ###
+#
+# Set up the stage to be run
+#
+# Arguments:
+#   $1 : Stage to be set to. Either numeric value or 'cleanup'
+# Return Values:
+#   none
+set_next_stage()
+{
+# Do I have to reset stage
+if [ "${USER_STAGE}" -a "${NO_RESET_STAGE}" ]; then
+    return 0
+fi
+
+_stage_time_=$($DATE '+%Y-%b-%d_%H.%M.%S')
+$ECHO "# Setting new stage at $_stage_time_" > "${STAGEFILE}" | $TEE -a "${LOGFILE}"
+$ECHO "${MIGRATION_STAGES[$1]}" > "${STAGEFILE}" | $TEE -a "${LOGFILE}"
+stage_name=$($ECHO "${MIGRATION_STAGES[$1]}")
+stage_num=$($GREP -n -F -w "$stage_name" /eniq/installation/core_install/etc/eniq_ipv6_migration_stagelist | $AWK -F ":" '{print $1}')
+stage_num1=$(expr "${stage_num}" - 1)
+$ECHO "\nENIQ IPV6 Migration Stages Completed: ${stage_num1} of ${number_of_stages}" | $TEE -a ${LOGFILE}
+}
+
+
+
+### Function: get_array_element ###
+#
+# Get the current array element number
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+get_array_element()
+{
+_num_elements_=${#MIGRATION_STAGES[*]}
+_array_length_=$(expr "${_num_elements_}" - 1)
+
+for (( _elem_=0; _elem_<=${_array_length_}; _elem_++ )); do
+    $ECHO "${MIGRATION_STAGES[${_elem_}]}" | $GREP -w "${NEXT_STAGE}" >> /dev/null 2>&1
+    if [ $? -eq 0 ]; then
+        ARRAY_ELEM=${_elem_}
+        break
+    fi
+done
+}
+
+### Function: get_next_stage ###
+#
+# Get the stage to be run
+#
+# Arguments:
+#   $1 : Stage to be set to. Either numeric value or 'done'
+# Return Values:
+#   none
+get_next_stage()
+{
+ARRAY_ELEM=0
+if [ -s "$STAGEFILE" ]; then
+    NEXT_STAGE=$($CAT "$STAGEFILE" | $EGREP -v '^[[:blank:]]*#' | $SED -e 's| ||g')
+    if [ ! "$NEXT_STAGE" ]; then
+        _err_msg_="Failed to read stage from ${STAGEFILE}, exiting."
+        abort_script "${_err_msg_}"
+    fi
+
+    if [ "$NEXT_STAGE" == "cleanup" ]; then
+        return 0
+    else
+        $ECHO "${MIGRATION_STAGES[*]}" | $GREP -w "${NEXT_STAGE}" >> /dev/null 2>&1
+        if [ $? -ne 0 ]; then
+            _err_msg_="Specified stage ${NEXT_STAGE} is not a valid ENIQ IPV^ Migration stage"
+            abort_script "${_err_msg_}"
+        fi
+    fi
+
+    # Get the element number so we can move along the array
+    get_array_element
+else
+    $MKDIR -p $($DIRNAME "$STAGEFILE")
+    if [ $? -ne 0 ]; then
+        _err_msg_="Failed to create directory $($DIRNAME "${STAGEFILE}"), exiting."
+        abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+    fi
+    
+    NEXT_STAGE=${MIGRATION_STAGES[${ARRAY_ELEM}]}
+fi
+}
+
+### Function: snapshot_creation ###
+#
+#   To create snapshot
+#   
+#
+# Arguments:
+#       none
+# Return Values:
+#
+create_snapshots()
+{
+insert_header_footer head "Entering ENIQ IPV6 Migration stage - ${NEXT_STAGE}" "${LOGFILE}"
+log_msg -q -s "Starting to Create Snapshot" -l "${LOGFILE}"
+if [ ! -f "${ENIQ_BKUP_BIN_DIR}"/prep_eniq_snapshots.bsh ]; then
+    _err_msg_ "Could not find prep_eniq_snapshots.bsh"
+    abort_script "$_err_msg_"
+fi
+$BASH "${ENIQ_BKUP_BIN_DIR}"/prep_eniq_snapshots.bsh -N
+snapshot_done_exe_check=$?
+if [ $snapshot_done_exe_check -ne 0 ]; then
+    _err_msg_="ERROR: Could not create snapshot."
+    abort_script "$_err_msg_"
+else
+    log_msg -s  "Successfully created snapshot." -l "${LOGFILE}"
+
+fi
+insert_header_footer foot "Successfully completed - ${NEXT_STAGE}." "${LOGFILE}"
+set_next_stage $($EXPR "${ARRAY_ELEM}"+1)
+}
+
+
+### Function: start_services ###
+#
+# To enable the ENIQ services across the deployment
+#
+# Arguments:
+#    none
+# Return Values:
+#     none
+start_services()
+{
+log_msg -q -h -s "Starting ENIQ services" -l "${LOGFILE}"
+local _check_command_="${ENIQ_ADMIN_BIN_DIR}/manage_deployment_services.bsh"
+#check_for_file -s "${_check_command_}"
+
+log_msg -q -s "Starting to run $BASH ${_check_command_} -a start -s ALL -N" -l "${LOGFILE}"
+$BASH "${_check_command_}" -a start -s ALL -N
+if [ $? -ne 0 ]; then
+    _err_msg_="Exiting... Unable to start services \n"
+    abort_script "$_err_msg_"
+fi
+
+log_msg -q -s "Successfully started ENIQ services" -l "${LOGFILE}"
+}
+
+### Function: stop_eniq_services ###
+#
+# To disable the ENIQ services across the deployment
+#
+# Arguments:
+# none
+# Return Values:
+#  none
+stop_eniq_services(){
+
+#Function call for stopping eniq services
+stop_services
+
+}
+
+### Function: stop_services ###
+#
+# To disable the ENIQ services across the deployment
+#
+# Arguments:
+# none
+# Return Values:
+#  none
+stop_services()
+{
+log_msg -q -h -s "Stopping ENIQ services" -l "${LOGFILE}"
+
+local _check_command_="${ENIQ_ADMIN_BIN_DIR}/manage_deployment_services.bsh"
+#check_for_file -s "${_check_command_}"
+
+log_msg -q -s "Starting to run $BASH ${_check_command_} -a stop -s ALL -N" -l "${LOGFILE}"
+$BASH "${_check_command_}" -a stop -s ALL -N
+stp_eniq_service_exe_check=$?
+if [ $stp_eniq_service_exe_check -ne 0 ]; then
+    _err_msg_="Exiting... Unable to stop services \n"
+    abort_script "$_err_msg_"
+fi
+
+log_msg -q -s "Successfully stopped ENIQ services" -l "${LOGFILE}"
+}
+
+### Function: stop_rollsnap_services ###
+#
+# To stop the ENIQ rollsnap services across the deployment
+#
+# Arguments:
+#    none
+# Return Values:
+#     none
+stop_rollsnap_services()
+{
+insert_header_footer head "Entering ENIQ IPV6 Migration stage - ${NEXT_STAGE}" "${LOGFILE}"
+log_msg -q -h -s "Stopping ROLL-SNAP services" -l "${LOGFILE}"
+
+local _check_command_="${ENIQ_ADMIN_BIN_DIR}/manage_deployment_services.bsh"
+#check_for_file -s "${_check_command_}"
+
+log_msg -q -s "Starting to run $BASH ${_check_command_} -a stop -s roll-snap" -l "${LOGFILE}"
+$BASH "${_check_command_}" -a stop -s roll-snap -N
+roll_snap_down_exe_check=$?
+if [ $roll_snap_down_exe_check -ne 0 ]; then
+    _err_msg_="Exiting... Unable to stop services \n"
+    abort_script "$_err_msg_"
+fi
+
+log_msg -q -s "Successfully stopped ROLL-SNAP services" -l "${LOGFILE}"
+insert_header_footer foot "Successfully completed - ${NEXT_STAGE}." "${LOGFILE}" | $TEE -a "${LOGFILE}"
+set_next_stage $($EXPR "${ARRAY_ELEM}"+1)
+}
+
+### Function: remove_tmp_file ###
+#
+#   Check the current configuration type of the server from the attached luna dn size.
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+remove_tmp_file()
+{
+_temp_files_="
+${TEM_DIR}/main_lun
+"
+
+for _file_ in ${_temp_files_}; do
+    if [ -f "${_file_}" ]; then
+        log_msg -t -q -s "Deleting ${_file_} file" -l ${LOGFILE}
+        $RM -rf ${_file_} >> /dev/null 2>&1
+    fi
+done
+}
+
+### Function: setup_env ###
+#
+# Set up environment variables for script.
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+setup_env()
+{
+
+if [ ! "${ENIQ_BASE_DIR}" ]; then
+    # Directory on the root filesystem
+    ENIQ_BASE_DIR=/eniq
+fi
+
+# ENIQ ADMIN Directory
+ENIQ_ADMIN_DIR=${ENIQ_BASE_DIR}/admin
+
+# ENIQ ADMIN Directory
+ENIQ_ADMIN_BIN_DIR=${ENIQ_ADMIN_DIR}/bin
+
+# ENIQ Log Directory
+ENIQ_LOCAL_LOG_DIR=${ENIQ_BASE_DIR}/local_logs
+
+#ENIQ log directory
+ENIQ_LOG_DIR=${ENIQ_BASE_DIR}/log
+
+# ENIQ SW conf
+CLI_CONF_DIR=${ENIQ_BASE_DIR}/sw/conf
+
+# Main Directory for the Core Installation SW
+ENIQ_INST_DIR=${ENIQ_BASE_DIR}/installation
+
+#ENIQ_CONF_DIR
+ENIQ_CONFIG_DIR=${ENIQ_INST_DIR}/config
+
+# Main Directory for the Core Installation SW
+ENIQ_CORE_INST_DIR=${ENIQ_INST_DIR}/core_install
+
+# ENIQ Config Directory
+ENIQ_CONF_DIR=${ENIQ_INST_DIR}/config
+
+#ENIQ DATABASE directory
+ENIQ_DB_DIR=${ENIQ_BASE_DIR}/database
+
+#DWH_DIR directory
+DWH_DIR=${ENIQ_DB_DIR}/dwh_main
+
+#ENIQ_SW_CONF_DIR
+ENIQ_SW_CONF_DIR=${ENIQ_BASE_DIR}/sw/conf
+
+#ENIQ_bakup_bin_DIR
+ENIQ_BKUP_BIN_DIR=/eniq/bkup_sw/bin/
+
+#ENIQ sentinel dir
+ENIQ_SENTINEL_DIR=${ENIQ_BASE_DIR}/sentinel
+
+#Setup IQ directory
+IQDIR=${ENIQ_BASE_DIR}/sybase_iq/IQ-*
+
+server_type=$($CAT /eniq/installation/config/installed_server_type)
+ENIQ_LIB_DIR=/eniq/installation/core_install/lib
+TEMP_DIR=/var/tmp
+INSTALLED_SERVER_TYPE=/eniq/installation/config/installed_server_type
+
+# File containing the type of OSS installation. Eg. events or statistics
+INST_TYPE_FILE=${ENIQ_CONF_DIR}/ericsson_use_config
+if [ ! -s "${INST_TYPE_FILE}" ]; then
+    _err_msg_="ENIQ install type not defined in ${INST_TYPE_FILE}"
+    abort_script "${_err_msg_}"  "${EXEC_SHELL_CMD}"
+fi
+
+TIMESTAMP=$($DATE +%d.%m.%y_%H:%M:%S)
+
+# Var Tem dir
+VAR_TMP_DIR=/var/tmp
+
+CURR_SERVER_TYPE=$($CAT "$ENIQ_CONF_DIR"/installed_server_type | $EGREP -v '^[[:blank:]]*#' | $SED -e 's/ //g')
+if [ ! "${CURR_SERVER_TYPE}" ]; then
+    _err_msg_="Could not determine which server type this is"
+    abort_script "$_err_msg_"
+fi
+
+if [ ${CURR_SERVER_TYPE} == "stats_iqr" ]; then
+CURR_READER_TYPE=$($CAT "$ENIQ_CONF_DIR"/install_reader_type | $EGREP -v '^[[:blank:]]*#' | $SED -e 's/ //g')
+if [ ! "${CURR_READER_TYPE}" ]; then
+    _err_msg_="Could not determine which server type this is"
+    abort_script "$_err_msg_"
+fi
+fi 
+
+PORT_PING=${ENIQ_CORE_INST_DIR}/lib/port_ping.pl
+if [ ! -x "$PORT_PING" ]; then
+    _err_msg_="$PORT_PING not found or not executable"
+    abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+fi
+
+
+#san details file 
+SAN_DETAILS=${ENIQ_CONF_DIR}/san_details
+STORAGE_TYPE=$($CAT "$SAN_DETAILS" | $EGREP "STORAGE_TYPE=" | $CUT -d "=" -f2)
+if [ "${STORAGE_TYPE}" != "fs" ]; then 
+    SAN_DEVICE=$($CAT "$SAN_DETAILS" | $EGREP "SAN_DEVICE=" | $CUT -d "=" -f2)
+fi
+
+# Source the common functions
+if [ -s "${ENIQ_CORE_INST_DIR}"/lib/common_functions.lib ]; then
+    . "${ENIQ_CORE_INST_DIR}"/lib/common_functions.lib
+else
+    _err_msg_="File ${ENIQ_CORE_INST_DIR}/lib/common_functions.lib not found"
+    abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+fi
+
+if [ -s "${ENIQ_CORE_INST_DIR}"/lib/common_core_install_functions.lib ]; then
+    . "${ENIQ_CORE_INST_DIR}"/lib/common_core_install_functions.lib
+else
+    _err_msg_="File ${ENIQ_CORE_INST_DIR}/lib/common_core_install_functions.lib not found"
+    abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+fi
+
+if [ -s "${ENIQ_CORE_INST_DIR}"/lib/common_inirator_functions.lib ]; then
+    . "${ENIQ_CORE_INST_DIR}"/lib/common_inirator_functions.lib
+else
+    _err_msg_="File ${ENIQ_CORE_INST_DIR}/lib/common_inirator_functions.lib not found"
+    abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+fi
+
+
+
+HNAME=$(${MYHOSTNAME})
+
+_sysuser_=$(iniget ENIQ_INSTALL_CONFIG -f "${ENIQ_CONF_DIR}"/SunOS.ini -v ENIQ_SYSUSER)
+
+# Has debug flag been used?
+if [ -s "${ENIQ_CONF_DIR}"/extra_params/debug ]; then
+    set -xv
+    BASH="/usr/bin/bash -xv"
+fi
+
+
+#Script check
+if [ -s "${ENIQ_CORE_INST_DIR}"/lib/get_ip_order.pl ]; then
+    GET_IP_ORDER_SCRIPT=${ENIQ_CORE_INST_DIR}/lib/get_ip_order.pl
+else
+    _err_msg_="File ${ENIQ_CORE_INST_DIR}/lib/get_ip_order.pl not found"
+    abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+fi
+# Get an ordered list of servers based on the server_list file to reallocate the memory:
+_deployed_servers_="${TEM_DIR}/deployed_servers.$$.tmp"
+$PERL "${GET_IP_ORDER_SCRIPT}" -f "${_deployed_servers_}"
+
+#Forming connection string
+DBISQL="$(ls /eniq/sybase_iq/IQ-*/bin64/dbisql)"
+if [ ! -x "$DBISQL" ]; then
+    _err_msg_="$DBISQL commands not found or not executable."
+    abort_script "${_err_msg_}"
+fi
+
+# Get DBA Password
+DBA_PASSWORD=$(inigetpassword DB -f "${CLI_CONF_DIR}"/"${ENIQ_INI}" -v DBAPassword)
+if [ ! "${DBA_PASSWORD}" ]; then
+    _err_msg_="Could not get DBA Password"
+    abort_script "${_err_msg_}"
+fi
+
+# Get RepDB Port and ServerName Password
+DB_PORT=$(iniget DWH -v PortNumber -f "${CLI_CONF_DIR}"/niq.ini)
+DB_ENG=$(iniget DWH -v ServerName -f "${CLI_CONF_DIR}"/niq.ini)
+if [ ! "${DB_PORT}" ] || [ ! "${DB_ENG}" ]; then
+    _err_msg_="Could not read db values from ${CLI_CONF_DIR}/${ENIQ_INI}"
+    abort_script "$_err_msg_"
+fi
+
+#Initialising the connection string for dwhdb
+db_connection_string="-c \"eng=${DB_ENG};links=tcpip{host=localhost;port=${DB_PORT}};uid=dba;pwd=${DBA_PASSWORD}\""
+db_connection_string_enc=${VAR_TMP_DIR}/con_str_encrypt.txt.$$
+
+# encrypt the connection string.
+get_encrypt_file "${db_connection_string}" "${db_connection_string_enc}" >> /dev/null 2>&1 
+
+#SAN commands
+VNX_CRED=/ericsson/storage/san/plugins/vnx/cred
+
+#blkcli command
+BLKCLI="/ericsson/storage/san/bin/blkcli --action listluns"
+
+#Precheck script
+ENIQ_CHECKS_PATH=${ENIQ_CORE_INST_DIR}/eniq_checks/bin
+HEALTHCHECK_SCRIPT=${ENIQ_CORE_INST_DIR}/eniq_checks/bin/eniq_checks.bsh
+HEALTH_SUMMARY_DIR=${ENIQ_BASE_DIR}/log/precheck/summary
+
+
+#SUNOS_INI
+SUNOS_INI=SunOS.ini
+
+#ENIQ_INI
+ENIQ_INI=niq.ini
+
+number_of_stages=$(cat /eniq/installation/core_install/etc/eniq_ipv6_migration_stagelist | wc -w)
+
+DWH_ENG=`iniget DWH -v ServerName -f ${ENIQ_CONF_DIR}/${ENIQ_INI}`
+if [ ! ${DWH_ENG} ]; then
+    _err_msg_="Could not read ServerName param from ${ENIQ_CONF_DIR}/${ENIQ_INI}"
+    abort_script "$_err_msg_"
+fi
+
+DWH_PORT=`iniget DWH -v PortNumber -f ${ENIQ_CONF_DIR}/${ENIQ_INI}`
+if [ ! ${DWH_PORT} ]; then
+    _err_msg_="Could not read PortNumber param from ${ENIQ_CONF_DIR}/${ENIQ_INI}"
+    abort_script "$_err_msg_"
+fi
+
+#Initialising the connection string for dpstop & dbping
+Conn_STR_USER_DWH="-q -c \"con=$DWH_ENG;eng=${DWH_ENG};links=tcpip{host=${DWH_ENG};port=${DWH_PORT};dobroadcast=none;verify=no};uid=dba;pwd=${DBA_PASSWORD}\""
+Conn_STR_USER_DWH_enc=/tmp/Con_str_db_rem_encrypt_dbping.`uuidgen`
+
+# encrypt the connection string.
+get_encrypt_file "${Conn_STR_USER_DWH}" "${Conn_STR_USER_DWH_enc}"
+
+IQ_PS_STR="iqsrv"
+
+#Initialising the connection string for dbisql
+#Conn_STR_USER_DBA="-nogui -c \"uid=dba;pwd=${DBA_PASSWORD};eng=${DWH_ENG};links=tcpip{host=${DWH_ENG};port=${DWH_PORT}}\""
+#Conn_STR_USER_DBA_enc=/tmp/Con_str_db_rem_encrypt_dbisql.`uuidgen`
+
+
+Conn_STR_USER_DBA="-q -nogui -onerror exit -c \"eng=${DWH_ENG};links=tcpip{host=${DWH_ENG};port=${DWH_PORT};verify=no};uid=dba;pwd=${DBA_PASSWORD}\""
+Conn_STR_USER_DBA_enc=/tmp/Con_str_db_rem_encrypt_dbpisql.`uuidgen`
+
+get_encrypt_file "${Conn_STR_USER_DBA}" "${Conn_STR_USER_DBA_enc}"
+
+
+MAINCACHE=`iniget DWH -v MainCache -f ${ENIQ_CONF_DIR}/${ENIQ_INI}`
+if [ ! ${MAINCACHE} ]; then
+    _err_msg_="Could not read MainCache param from ${ENIQ_CONF_DIR}/${ENIQ_INI}"
+    abort_script "$_err_msg_"
+fi
+
+TEMPCACHE=`iniget DWH -v TempCache -f ${ENIQ_CONF_DIR}/${ENIQ_INI}`
+if [ ! ${TEMPCACHE} ]; then
+    _err_msg_="Could not read TempCache param from ${ENIQ_CONF_DIR}/${ENIQ_INI}"
+    abort_script "$_err_msg_"
+fi
+
+LARGEMEMORY=`iniget DWH -v LargeMemory -f ${ENIQ_CONF_DIR}/${ENIQ_INI}`
+if [ ! ${LARGEMEMORY} ]; then
+    _err_msg_="Could not read LargeMemory param from ${ENIQ_CONF_DIR}/${ENIQ_INI}"
+    abort_script "$_err_msg_"
+fi
+
+CATALOGCACHE=`iniget DWH -v CatalogCache -f ${ENIQ_CONF_DIR}/${ENIQ_INI}`
+if [ ${CATALOGCACHE} ]; then
+        CC="-c ${CATALOGCACHE}m"
+
+fi
+
+}
+
+
+### Function: get_ip ###
+#
+# Take inputs from user.
+#
+# Arguments:
+#   server_type
+# Return Values:
+#   none
+get_ip()
+{
+   server_type=$1
+   usr_msg="Enter IPv6 ip address for $server_type:"
+   while :; do
+    $ECHO "\n${usr_msg}:"
+    read ip_address
+    # Did user enter anything
+    if [ ! "${ip_address}" ]; then
+        continue
+    fi
+    if ! $(ipcalc -s -6 -c ${ip_address}); then
+       #echo "valid"
+       continue
+    fi
+	$ECHO "${server_type}_ip_address="$ip_address >> ${ENIQ_CONFIG_DIR}/user_input.txt
+    break
+done
+
+}
+
+### Function: common_get_ipmp_ip ###
+#
+# Take ipv6 ip inputs from user.
+#
+# Arguments:
+#   server_type
+# Return Values:
+#   none
+common_get_ipmp_ip()
+{
+unset IPMP_IPS
+local _ipmp_grp_name_=$1
+
+while :; do
+    $PRINTF '\33[H\33[2J'
+    
+
+    $ECHO "\nEnter the IPv6 address for the ${_ipmp_grp_name_}"
+    read _ip_value_
+
+    if [ ! "${_ip_value_}" ]; then
+        continue
+    fi
+
+    validate_ip ${_ip_value_}
+    if [ $? -ne 0 ]; then
+        continue
+    fi
+
+    IPMP_IPS="${_ip_value_}"
+    break
+done
+
+export IPMP_IPS
+}
+
+### Function: common_get_vlan_gateway ###
+#
+# inirator question to get the gateway IP
+#
+# Arguments:
+#   $1 : bond group name
+# Return Values:
+#   none
+#
+common_get_vlan_gateway()
+{
+local _ipmp_grp_name_=$1
+
+while :; do
+    $PRINTF '\33[H\33[2J'
+    unset _ipmp_gateway_value_ IPMP_GATEWAY
+
+    $ECHO "\nEnter the Gateway IP address of the ${_ipmp_grp_name_}"
+    read _ipmp_gateway_value_
+
+    if [ ! "${_ipmp_gateway_value_}" ]; then
+        continue
+    fi
+
+    validate_ip ${_ipmp_gateway_value_}
+    if [ $? -ne 0 ]; then
+        continue
+    fi
+
+    IPMP_GATEWAY="${_ipmp_gateway_value_}"
+    break
+done
+
+export IPMP_GATEWAY
+}
+
+
+### Function: common_get_ipv6_netmask ###
+#
+# Check all inirator scripts exist
+#
+# Arguments:
+#   ipmp group name
+# Return Values:
+#   none
+#
+common_get_ipv6_netmask()
+{
+local _ipmp_grp_name_=$1
+
+while :; do
+    $CLEAR
+    unset _ipv6_netmask_value_ IPv6_NETMASKS
+
+    $ECHO "\nEnter the IPv6 netmask address for the ${_ipmp_grp_name_}"
+    read _ipv6_netmask_value_
+
+    if [ ! "${_ipv6_netmask_value_}" ]; then
+        continue
+    fi
+
+    # Validates the subnet prefix of IPV6
+    if [[ ${_ipv6_netmask_value_} =~ ^\s*[0-9]+\s*$ ]] ; then
+        if [[ ${_ipv6_netmask_value_} -lt 1 || ${_ipv6_netmask_value_} -gt 128 ]] ; then
+            $ECHO -ne "\nIPv6 subnet prefix validation failed. Please enter valid subnet prefix [1-128]\n\n"
+            continue
+        fi
+    fi
+
+    IPv6_NETMASKS="${_ipv6_netmask_value_}"
+    break
+done
+
+export IPv6_NETMASKS
+}
+
+
+### Function: update_VLAN_network_bond ###
+#
+# Update PM services VLAN network bond with IPv6 details
+# Enable IPv6 network and disable IPv4 network for PM services VLAN
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+update_service_VLAN_network_bond()
+{
+    insert_header_footer head "Entering ENIQ IPV6 Migration stage - ${NEXT_STAGE}" "${LOGFILE}"
+    if [ "${CURR_SERVER_TYPE}" == "eniq_stats" ] || [ "${CURR_SERVER_TYPE}" == "stats_coordinator" ] || [ "${CURR_SERVER_TYPE}" == "stats_iqr" ] || [ "${CURR_SERVER_TYPE}" == "stats_engine" ]; then
+	    if [ "${CURR_SERVER_TYPE}" == "eniq_stats" ] || [ "${CURR_SERVER_TYPE}" == "stats_coordinator" ] || [ "${CURR_SERVER_TYPE}" == "stats_engine" ]; then
+		     ip=$( $CAT ${CLI_CONF_DIR}/migration_user_input.txt | $GREP -i ${CURR_SERVER_TYPE}_ipv6_address | $AWK -F"=" '{print $2}')
+			 if [ -z ${ip} ]; then
+				_err_msg_="Could not fetch ip from ${CLI_CONF_DIR}/migration_user_input.txt file\n"
+				abort_script "$_err_msg_"
+             fi
+		elif [ "${CURR_SERVER_TYPE}" == "stats_iqr" ]; then
+		     ip=$( $CAT ${CLI_CONF_DIR}/migration_user_input.txt | $GREP -i ${CURR_READER_TYPE}_ipv6_address | $AWK -F"=" '{print $2}')
+			 if [ -z ${ip} ]; then
+				_err_msg_="Could not fetch ip from ${CLI_CONF_DIR}/migration_user_input.txt file\n"
+				abort_script "$_err_msg_"
+             fi
+		fi
+		netmask_subnet=$( $CAT ${CLI_CONF_DIR}/migration_user_input.txt | $GREP -i "Netmask" | $AWK -F"=" '{print $2}')
+		if [ -z ${netmask_subnet} ]; then
+				_err_msg_="Could not fetch ip from ${CLI_CONF_DIR}/migration_user_input.txt file\n"
+				abort_script "$_err_msg_"
+        fi
+		gateway=$( $CAT ${CLI_CONF_DIR}/migration_user_input.txt | $GREP -i "Gateway" | $AWK -F"=" '{print $2}')
+		if [ -z ${gateway} ]; then
+				_err_msg_="Could not fetch ip from ${CLI_CONF_DIR}/migration_user_input.txt file\n"
+				abort_script "$_err_msg_"
+        fi
+		dns_ip=$( $CAT ${CLI_CONF_DIR}/migration_user_input.txt | $GREP -i "DNS_IP" | $AWK -F"=" '{print $2}')
+		if [ -z ${dns_ip} ]; then
+				_err_msg_="Could not fetch ip from ${CLI_CONF_DIR}/migration_user_input.txt file\n"
+				abort_script "$_err_msg_"
+        fi
+		dns_domain_name=$( $CAT ${CLI_CONF_DIR}/migration_user_input.txt | $GREP -i "DNS_DOMAIN_NAME" | $AWK -F"=" '{print $2}')		
+		if [ -z ${dns_domain_name} ]; then
+				_err_msg_="Could not fetch ip from ${CLI_CONF_DIR}/migration_user_input.txt file\n"
+				abort_script "$_err_msg_"
+        fi
+		if [ ${STORAGE_TYPE} == "raw" ]; then
+	        $CP -p  /etc/sysconfig/network-scripts/ifcfg-bond0 /var/tmp/ifcfg-bond0
+		    if [ $? -ne 0 ]; then
+                _err_msg_="Could not copy file ifcfg-bond0 on ${_serv_hostname_}\n"
+                abort_script "$_err_msg_"
+            fi
+            $CP -p  /etc/sysconfig/network-scripts/ifcfg-bond1 /var/tmp/ifcfg-bond1
+		    if [ $? -ne 0 ]; then
+                _err_msg_="Could not copy file ifcfg-bond1 on ${_serv_hostname_}\n"
+                abort_script "$_err_msg_"
+            fi
+			if [ -s /etc/sysconfig/network-scripts/ifcfg-bond2 ]; then
+                 $CP -p  /etc/sysconfig/network-scripts/ifcfg-bond2 /var/tmp/ifcfg-bond2
+		         if [ $? -ne 0 ]; then
+                    _err_msg_="Could not copy file ifcfg-bond2 on ${_serv_hostname_}\n"
+                    abort_script "$_err_msg_"
+                 fi
+			fi
+		    #updating bond0
+		    _primary_intf=`iniget IPMP_INTF_1 -f ${ENIQ_CONF_DIR}/ipmp.ini -v IPMP_Group_Intf | $AWK '{print $1}'`
+		    #$NMCLI con mod bond0 bond.options ""mode=active-backup" "primary=${_primary_intf}"" ipv6.addresses ${ip}/${netmask_subnet} ipv6.gateway ${gateway} ipv6.dns ${dns_ip} ipv6.dns-search ${dns_domain_name} ipv6.method manual miimon "2000"
+		    $NMCLI con mod bond0 bond.options ""miimon=2000,mode=active-backup,primary=${_primary_intf}"" ipv6.addresses ${ip}/${netmask_subnet} ipv6.gateway ${gateway} ipv6.dns ${dns_ip} ipv6.dns-search ${dns_domain_name} ipv6.method manual
+        
+		    if [ $? -ne 0 ]; then
+                _err_msg_="Could not update IPv6 network details for bond0 on ${_serv_hostname_}\n"
+                abort_script "$_err_msg_"
+            fi
+		    $NMCLI con mod bond0 ipv4.addresses "" ipv4.gateway "" ipv4.dns "" ipv4.dns-search "" ipv4.method auto
+		    if [ $? -ne 0 ]; then
+                _err_msg_="Could not remove IPv4 network details for bond0 on ${_serv_hostname_}\n"
+                abort_script "$_err_msg_"
+            fi
+		    $NMCLI con mod bond0 ipv4.method disabled
+		    if [ $? -ne 0 ]; then
+                _err_msg_="Could not disable ipv4 for bond0 on ${_serv_hostname_}\n"
+                abort_script "$_err_msg_"
+            fi
+		    $NMCLI con mod bond1 ipv4.dns ""
+		    if [ $? -ne 0 ]; then
+                _err_msg_="Could not Remove dns ipv4 ip from bond1 on ${_serv_hostname_}\n"
+                abort_script "$_err_msg_"
+            fi
+			if [ -s /etc/sysconfig/network-scripts/ifcfg-bond2 ]; then
+		        $NMCLI con mod bond2 ipv4.dns ""
+		        if [ $? -ne 0 ]; then
+                   _err_msg_="Could not Remove dns ipv4 ip from bond2 on ${_serv_hostname_}\n"
+                   abort_script "$_err_msg_"
+                fi
+			fi
+		    $CP /etc/sysconfig/network-scripts/ifcfg-bond0 /etc/sysconfig/network-scripts/ifcfg-bond0_orig
+		    log_msg -s "Updating bond0 connection..." -l ${LOGFILE}
+		    $NMCLI con up bond0
+		    if [ $? -ne 0 ]; then
+                _err_msg_="Could not update bond0 on ${_serv_hostname_}\n"
+                abort_script "$_err_msg_"
+            fi
+		    log_msg -s "Restarting network service, please wait..." -l ${LOGFILE}
+		    $SYSTEMCTL restart network
+		    $SLEEP 30
+		    if [ $? -ne 0 ]; then
+                _err_msg_="Could not reaster network service on ${_serv_hostname_}\n"
+                abort_script "$_err_msg_"
+            fi
+		elif [ ${STORAGE_TYPE} == "fs" ]; then
+		    interface_bond=`$NMCLI con | $GREP ethernet | $HEAD -1 | $AWK '{print $(NF-2)}'`
+			if [ -z ${interface_bond} ]; then
+				_err_msg_="Could not fetch bond from $NMCLI con command\n"
+				abort_script "$_err_msg_"
+            fi
+		    interface_name=`$NMCLI con | $GREP ethernet  | $HEAD -1 | $AWK -F "${interface_bond}" '{print $1}' | $AWK '{$1=$1};1'`
+			if [ $? -ne 0 ]; then
+				_err_msg_="Could not fetch interface name from $NMCLI con command\n"
+				abort_script "$_err_msg_"
+            fi
+		    $NMCLI con mod "${interface_name}" ipv6.addresses ${ip}/${netmask_subnet} ipv6.gateway ${gateway} ipv6.dns ${dns_ip} ipv6.dns-search ${dns_domain_name} ipv6.method manual
+			if [ $? -ne 0 ]; then
+                _err_msg_="Could not update IPv6 network details for ${interface_name} on ${_serv_hostname_}\n"
+                abort_script "$_err_msg_"
+            fi
+			$NMCLI con mod "${interface_name}" ipv4.addresses "" ipv4.gateway "" ipv4.dns "" ipv4.dns-search "" ipv4.method auto
+			if [ $? -ne 0 ]; then
+                _err_msg_="Could not remove IPv4 network details for bond0 on ${_serv_hostname_}\n"
+                abort_script "$_err_msg_"
+            fi
+			$NMCLI con mod "${interface_name}" ipv4.method disabled
+			if [ $? -ne 0 ]; then
+                _err_msg_="Could not disable ipv4 for bond0 on ${_serv_hostname_}\n"
+                abort_script "$_err_msg_"
+            fi
+			log_msg -s "Restarting network service, please wait..." -l ${LOGFILE}
+		    $SYSTEMCTL restart network
+			$SLEEP 30
+		    if [ $? -ne 0 ]; then
+                _err_msg_="Could not reaster network service on ${_serv_hostname_}\n"
+                abort_script "$_err_msg_"
+            fi
+		fi
+		
+	fi
+	$ECHO "IPv6" > ${ENIQ_CONF_DIR}/ip_type
+	insert_header_footer foot "Successfully completed - ${NEXT_STAGE}." "${LOGFILE}"
+    set_next_stage $($EXPR "${ARRAY_ELEM}"+1)
+}
+
+
+
+
+### Function: get_user_input ###
+#
+# Take inputs from user.
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+get_user_input()
+{
+    insert_header_footer head "Entering ENIQ IPV6 Migration stage - ${NEXT_STAGE}" "${LOGFILE}"
+    #get ipv6 ip
+	if [ "${CURR_SERVER_TYPE}" == "eniq_stats" ] || [ "${CURR_SERVER_TYPE}" == "stats_coordinator" ] || [ "${CURR_SERVER_TYPE}" == "stats_iqr" ] || [ "${CURR_SERVER_TYPE}" == "stats_engine" ]; then
+		#get_ip "${CURR_SERVER_TYPE}"
+		common_get_ipmp_ip "PM Services group"
+		ip=$IPMP_IPS
+		#$ECHO "${CURR_SERVER_TYPE}_ipv6_address="$IPMP_IPS >> ${ENIQ_CONFIG_DIR}/user_input.txt
+		#get ipv6 netmask
+		common_get_ipv6_netmask "PM Services group"
+		netmask_subnet=$IPv6_NETMASKS
+		#$ECHO "Netmask="$IPv6_NETMASKS >> ${ENIQ_CONFIG_DIR}/user_input.txt
+		#get ipv6 gateway
+		common_get_vlan_gateway "PM Services group"
+		gateway=$IPMP_GATEWAY
+		#$ECHO "Gateway="$IPMP_GATEWAY >> ${ENIQ_CONFIG_DIR}/user_input.txt
+		#get dns_ip
+		common_get_dns_serv
+		dns_ip=$DNSSERVERS
+		#$ECHO "DNS_IP="$DNSSERVERS >> ${ENIQ_CONFIG_DIR}/user_input.txt
+		#get dns domain name
+		common_get_dns_domain
+		dns_domain_name=$DNSDOMAIN
+		#$ECHO "DNS_DOMAIN_NAME="$DNSDOMAIN >> ${ENIQ_CONFIG_DIR}/user_input.txt
+	fi
+	insert_header_footer foot "Successfully completed - ${NEXT_STAGE}." "${LOGFILE}"
+    set_next_stage $($EXPR "${ARRAY_ELEM}"+1)
+}
+
+
+### Function: pre_migration ###
+#
+# Perform prerequisites for ipv6 migration
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+stop_all_services()
+{ 
+    insert_header_footer head "Entering ENIQ IPV6 Migration stage - ${NEXT_STAGE}" "${LOGFILE}"
+	if [ "${CURR_SERVER_TYPE}" == "eniq_stats" ] || [ "${CURR_SERVER_TYPE}" == "stats_coordinator" ]; then
+       #create snapshots
+	   #snapshot_creation
+	   #stop_eniq_services
+	   stop_services
+	   #stop hostsync service
+	   log_msg -s "\nStopping hostsync on ${CURR_SERVER_TYPE}" -l "${LOGFILE}"
+	   $SYSTEMCTL stop hostsync
+	   stop_hostsync_service_exe_check=$?
+       if [ $stop_hostsync_service_exe_check -ne 0 ]; then
+          _err_msg_="Exiting... Unable to stop hostsync service \n"
+          abort_script "$_err_msg_"
+       fi
+	   log_msg -s "\nStopped hostsync service on ${CURR_SERVER_TYPE}" -l "${LOGFILE}"
+	   if [ "${CURR_SERVER_TYPE}" == "stats_coordinator" ]; then
+	      for _line_ in $($CAT "${_deployed_servers_}" | $EGREP -v 'stats_coordinator'); do
+		       _serv_hostname_=$($ECHO "${_line_}" | $AWK -F"::" '{print $2}')
+			   _serv_type_=$($ECHO "${_line_}" | $AWK -F"::" '{print $3}')
+			   log_msg -s "\nStopping hostsync on ${_serv_type_}" -l "${LOGFILE}"
+			   if [ "${_user_root}" == 1 ]; then
+				   run_remote_cmd "${_serv_hostname_}" "/usr/bin/systemctl stop hostsync" >> /dev/null 2>&1
+				   if [ $? -ne 0 ]; then
+						 _err_msg_="Could not stop hostsync service on ${_serv_hostname_}\n"
+						 abort_script "$_err_msg_"
+				   fi
+			   else
+			       run_remote_cmd "${_serv_hostname_}" "$SUDO /usr/bin/systemctl stop hostsync" >> /dev/null 2>&1
+				   if [ $? -ne 0 ]; then
+						 _err_msg_="Could not stop hostsync service on ${_serv_hostname_}\n"
+						 abort_script "$_err_msg_"
+				   fi
+			   fi
+			   log_msg -s "\nStopped hostsync service on ${_serv_type_}" -l "${LOGFILE}"
+		  done
+	   fi
+	   #stop sentinel service
+	   log_msg -s "\nStopping sentinel service on ${CURR_SERVER_TYPE}" -l "${LOGFILE}"
+	   $SYSTEMCTL stop licensing-sentinel
+	   stop_sentinel_service_exe_check=$?
+       if [ $stop_sentinel_service_exe_check -ne 0 ]; then
+          _err_msg_="Exiting... Unable to stop sentinel service \n"
+          abort_script "$_err_msg_"
+       fi
+	   log_msg -s "\nStopped sentinel service on ${CURR_SERVER_TYPE}" -l "${LOGFILE}"
+	fi
+	insert_header_footer foot "Successfully completed - ${NEXT_STAGE}." "${LOGFILE}"
+    set_next_stage $($EXPR "${ARRAY_ELEM}"+1)
+	
+}
+
+
+
+
+
+### Function: update_configuration_files ###
+#
+# Update OS and ENIQ-S configuration file for IPv6 IP address
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+update_configuration_files()
+{
+    insert_header_footer head "Entering ENIQ IPV6 Migration stage - ${NEXT_STAGE}" "${LOGFILE}"
+	if [ "${CURR_SERVER_TYPE}" == "eniq_stats" ] || [ "${CURR_SERVER_TYPE}" == "stats_coordinator" ] || [ "${CURR_SERVER_TYPE}" == "stats_iqr" ] || [ "${CURR_SERVER_TYPE}" == "stats_engine" ]; then	
+        #Updating /etc/hosts and /eniq/sw/conf/service_names file"
+        # Need to stop hostsync so that we can start it fine at the end of this stage
+        _serv_hostname_=`$MYHOSTNAME`
+        _hostsync_smf_str_=`iniget HOST_SYNC_DAEMON -f ${ENIQ_CONF_DIR}/${SUNOS_INI} -v HOST_SYNC_SERVICE_STR`
+        if [ ! "${_hostsync_smf_str_}" ]; then
+            _err_msg_="Could not read host_syncd SMF string from ${ENIQ_CONF_DIR}/${SUNOS_INI}"
+            abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+        fi
+
+        log_msg -s "Stopping ${_hostsync_smf_str_} on ${CURR_SERVER_TYPE}" -l ${LOGFILE}
+        $SYSTEMCTL stop ${_hostsync_smf_str_}
+        if [ $? -ne 0 ]; then
+            _err_msg_="Could not stop ${_hostsync_smf_str_}"
+            abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+        fi
+
+        log_msg -s "Disabling ${_hostsync_smf_str_} on ${CURR_SERVER_TYPE}" -l ${LOGFILE}
+        $SYSTEMCTL disable ${_hostsync_smf_str_}
+        if [ $? -ne 0 ]; then
+            _err_msg_="Could not disable ${_hostsync_smf_str_}"
+            abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+        fi
+		
+		_sysuser_=`iniget ENIQ_INSTALL_CONFIG -f ${ENIQ_CONF_DIR}/${SUNOS_INI} -v ENIQ_SYSUSER`
+		if [ ! "${_sysuser_}" ]; then
+                _err_msg_="Could not read parameter ENIQ_SYSUSER from file - ${ENIQ_CONF_DIR}/${SUNOS_INI}"
+                abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+        fi
+
+        _sysgrp_=`$ID ${_sysuser_} | $AWK '{print $2}' | $AWK -F\( '{print $2}' | $AWK -F\) '{print $1}'`
+        if [ ! "${_sysuser_}" ]; then
+                _err_msg_="Could not determine group ID of ${_sysuser_}"
+                abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+        fi
+
+
+		#Backup /etc/hosts  and service file
+		$CP /etc/hosts /etc/hosts_orig
+		$CP ${ENIQ_SW_CONF_DIR}/service_names ${ENIQ_SW_CONF_DIR}/service_names_orig
+		$CP ${ENIQ_CONF_DIR}/service_names ${ENIQ_CONF_DIR}/service_names_orig
+		$CP ${ENIQ_SW_CONF_DIR}/server_types ${ENIQ_SW_CONF_DIR}/server_types_orig
+		$CP ${ENIQ_CONF_DIR}/niq.ini ${ENIQ_CONF_DIR}/niq.ini_orig
+		$CP ${ENIQ_SW_CONF_DIR}/niq.ini ${ENIQ_SW_CONF_DIR}/niq.ini_orig
+		#Updating /etc/hosts service file
+		
+		#new_ip=`$MYHOSTNAME -I | $AWK '{print $3}'`
+		new_ip=`ip a | $GREP -w "inet6" | $GREP -w "global" | $AWK '{print $2}' | $AWK -F"/" '{print $1}'`
+		if [ -z ${new_ip} ];then
+				 _err_msg_="Could not find IPv6 ip address for ${_serv_hostname_}\n"
+				 abort_script "$_err_msg_"
+		fi
+		
+		log_msg -s "Updating configuration files with IPV6 details on ${CURR_SERVER_TYPE}" -l ${LOGFILE}
+		if [ "${CURR_SERVER_TYPE}" == "eniq_stats" ] || [ "${CURR_SERVER_TYPE}" == "stats_coordinator" ]; then
+		    old_ip=`$CAT /etc/hosts | $GREP -i "dwhdb" | $AWK '{print $1}'`
+			if [ -z ${old_ip} ];then
+				 _err_msg_="Could not find IPv4 ip address for ${_serv_hostname_}\n"
+				 abort_script "$_err_msg_"
+		    fi
+			$SED -i "0,/"${old_ip}"/s//"${new_ip}"/" /etc/hosts
+			if [ $? -ne 0 ]; then
+				 _err_msg_="Could not update /etc/hosts file with ipv6 ip on ${_serv_hostname_}\n"
+				abort_script "$_err_msg_"
+			fi
+			$SED -i "s/"${old_ip}"/"${new_ip}"/g" ${ENIQ_SW_CONF_DIR}/service_names
+			if [ $? -ne 0 ]; then
+				 _err_msg_="Could not update ${ENIQ_SW_CONF_DIR}/service_names file with ipv6 ip on ${_serv_hostname_}\n"
+				 abort_script "$_err_msg_"
+			fi
+			$SED -i "s/"${old_ip}"/"${new_ip}"/g" ${ENIQ_SW_CONF_DIR}/server_types
+			if [ $? -ne 0 ]; then
+				 _err_msg_="Could not update  ${ENIQ_SW_CONF_DIR}/server_types file with ipv6 ip on ${_serv_hostname_}\n"
+				abort_script "$_err_msg_"
+			fi
+			$SED -i "s/"${old_ip}"/"${new_ip}"/g" ${ENIQ_CONF_DIR}/service_names
+			if [ $? -ne 0 ]; then
+				 _err_msg_="Could not update ${ENIQ_CONF_DIR}/service_names file with ipv6 ip on ${_serv_hostname_} \n"
+				abort_script "$_err_msg_"
+			fi
+			
+		elif [ "${CURR_SERVER_TYPE}" == "stats_engine" ]; then
+		    old_ip=`$CAT /etc/hosts | $GREP -i "engine" | $AWK '{print $1}'`
+			if [ -z ${old_ip} ];then
+				 _err_msg_="Could not find IPv4 ip address for ${_serv_hostname_}\n"
+				 abort_script "$_err_msg_"
+		    fi
+			$SED -i "0,/"${old_ip}"/s//"${new_ip}"/" /etc/hosts
+			if [ $? -ne 0 ]; then
+				 _err_msg_="Could not update /etc/hosts file with ipv6 ip on ${_serv_hostname_}\n"
+				abort_script "$_err_msg_"
+			fi
+			$SED -i "s/"${old_ip}"/"${new_ip}"/g" ${ENIQ_SW_CONF_DIR}/service_names
+			if [ $? -ne 0 ]; then
+				 _err_msg_="Could not update ${ENIQ_SW_CONF_DIR}/service_names file with ipv6 ip on ${_serv_hostname_}\n"
+				 abort_script "$_err_msg_"
+			fi
+			$SED -i "s/"${old_ip}"/"${new_ip}"/g" ${ENIQ_SW_CONF_DIR}/server_types
+			if [ $? -ne 0 ]; then
+				 _err_msg_="Could not update  ${ENIQ_SW_CONF_DIR}/server_types file with ipv6 ip on ${_serv_hostname_}\n"
+				abort_script "$_err_msg_"
+			fi
+			$SED -i "s/"${old_ip}"/"${new_ip}"/g" ${ENIQ_CONF_DIR}/service_names
+			if [ $? -ne 0 ]; then
+				 _err_msg_="Could not update ${ENIQ_CONF_DIR}/service_names file with ipv6 ip on ${_serv_hostname_} \n"
+				abort_script "$_err_msg_"
+			fi
+			
+		elif [ "${CURR_SERVER_TYPE}" == "stats_iqr" ]; then
+		    if [ "${CURR_READER_TYPE}" == "dwh_reader_1" ]; then
+			   old_ip=`$CAT /etc/hosts | $GREP -i "dwh_reader_1" | $AWK '{print $1}'`
+			   if [ -z ${old_ip} ];then
+				 _err_msg_="Could not find IPv4 ip address for ${_serv_hostname_}\n"
+				 abort_script "$_err_msg_"
+		       fi
+			elif [ "${CURR_READER_TYPE}" == "dwh_reader_2" ]; then
+			   old_ip=`$CAT /etc/hosts | $GREP -i "dwh_reader_2" | $AWK '{print $1}'`
+			   if [ -z ${old_ip} ];then
+				 _err_msg_="Could not find IPv4 ip address for ${_serv_hostname_}\n"
+				 abort_script "$_err_msg_"
+		       fi
+			fi
+			$SED -i "0,/"${old_ip}"/s//"${new_ip}"/" /etc/hosts
+			if [ $? -ne 0 ]; then
+				 _err_msg_="Could not update /etc/hosts file with ipv6 ip on ${_serv_hostname_}\n"
+				abort_script "$_err_msg_"
+			fi
+			$SED -i "s/"${old_ip}"/"${new_ip}"/g" ${ENIQ_SW_CONF_DIR}/service_names
+			if [ $? -ne 0 ]; then
+				 _err_msg_="Could not update ${ENIQ_SW_CONF_DIR}/service_names file with ipv6 ip on ${_serv_hostname_}\n"
+				 abort_script "$_err_msg_"
+			fi
+			$SED -i "s/"${old_ip}"/"${new_ip}"/g" ${ENIQ_SW_CONF_DIR}/server_types
+			if [ $? -ne 0 ]; then
+				 _err_msg_="Could not update  ${ENIQ_SW_CONF_DIR}/server_types file with ipv6 ip on ${_serv_hostname_}\n"
+				abort_script "$_err_msg_"
+			fi
+			$SED -i "s/"${old_ip}"/"${new_ip}"/g" ${ENIQ_CONF_DIR}/service_names
+			if [ $? -ne 0 ]; then
+				 _err_msg_="Could not update ${ENIQ_CONF_DIR}/service_names file with ipv6 ip on ${_serv_hostname_} \n"
+				abort_script "$_err_msg_"
+		    fi
+			$SED -i "s/"${old_ip}"/"${new_ip}"/g" ${ENIQ_CONF_DIR}/niq.ini
+			if [ $? -ne 0 ]; then
+				 _err_msg_="Could not update ${ENIQ_CONF_DIR}/niq.ini file with reader1 ipv6 ip on ${_serv_hostname_}\n"
+				 abort_script "$_err_msg_"
+			fi
+			$SED -i "s/"${old_ip}"/"${new_ip}"/g" ${ENIQ_SW_CONF_DIR}/niq.ini
+			if [ $? -ne 0 ]; then
+				 _err_msg_="Could not update ${ENIQ_SW_CONF_DIR}/niq.ini file with reader1 ipv6 ip on ${_serv_hostname_}\n"
+				 abort_script "$_err_msg_"
+			fi
+		fi
+		
+		mws_ip=$( $CAT ${CLI_CONF_DIR}/migration_user_input.txt | $GREP -i "MWS_IP" | $AWK -F"=" '{print $2}')
+		mws_hostname=$( $CAT ${CLI_CONF_DIR}/migration_user_input.txt | $GREP -i "MWS_HOST" | $AWK -F"=" '{print $2}')
+		MWS_name="MWS"
+		# Update service_names file with MWS deatils
+        update_service_file ${CLI_CONF_DIR}/service_names ${mws_ip} ${mws_hostname} ${MWS_name} "NULL_GRP"
+        if [ $? -ne 0 ]; then
+                _err_msg_="Failed to update ${CLI_CONF_DIR}/service_names with MWS server details"
+                abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+        fi
+
+        log_msg -s "Changing ownership of ${CLI_CONF_DIR}/service_names to ${_sysuser_}:${_sysgrp_} after adding MWS details." -l ${LOGFILE}
+        $CHOWN ${_sysuser_}:${_sysgrp_} ${CLI_CONF_DIR}/service_names
+        if [ $? -ne 0 ]; then
+                 _err_msg_="Failed to change ownership of ${CLI_CONF_DIR}/service_names to ${_sysuser_}:${_sysgrp_}"
+                 abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+        fi
+
+		
+		
+		log_msg -s "Successfully updated configuration files with IPv6 details on ${CURR_SERVER_TYPE}" -l ${LOGFILE}
+	    
+        # Need to start hostsync to get the alias info back
+        _hostsync_smf_str_=`iniget HOST_SYNC_DAEMON -f ${ENIQ_CONF_DIR}/${SUNOS_INI} -v HOST_SYNC_SERVICE_STR`
+        if [ ! "${_hostsync_smf_str_}" ]; then
+            _err_msg_="Could not read host_syncd SMF string from ${ENIQ_CONF_DIR}/${SUNOS_INI}"
+            abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+        fi
+
+        log_msg -s "Starting ${_hostsync_smf_str_}" -l ${LOGFILE}
+        $SYSTEMCTL start  ${_hostsync_smf_str_}
+        if [ $? -ne 0 ]; then
+            _err_msg_="Could not start ${_hostsync_smf_str_}"
+            abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+        fi
+
+        log_msg -s "Enabling ${_hostsync_smf_str_}" -l ${LOGFILE}
+        $SYSTEMCTL enable  ${_hostsync_smf_str_}
+        if [ $? -ne 0 ]; then
+            _err_msg_="Could not enable ${_hostsync_smf_str_}"
+            abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+        fi
+		
+		#Fetching values to update in ipmp.ini File
+		netmask_subnet=$( $CAT ${CLI_CONF_DIR}/migration_user_input.txt | $GREP -i "Netmask" | $AWK -F"=" '{print $2}')
+		if [ -z ${netmask_subnet} ]; then
+				_err_msg_="Could not fetch ip from ${CLI_CONF_DIR}/migration_user_input.txt file\n"
+				abort_script "$_err_msg_"
+        fi
+		gateway=$( $CAT ${CLI_CONF_DIR}/migration_user_input.txt | $GREP -i "Gateway" | $AWK -F"=" '{print $2}')
+		if [ -z ${gateway} ]; then
+				_err_msg_="Could not fetch ip from ${CLI_CONF_DIR}/migration_user_input.txt file\n"
+				abort_script "$_err_msg_"
+        fi
+		dns_ip=$( $CAT ${CLI_CONF_DIR}/migration_user_input.txt | $GREP -i "DNS_IP" | $AWK -F"=" '{print $2}')
+		if [ -z ${dns_ip} ]; then
+				_err_msg_="Could not fetch ip from ${CLI_CONF_DIR}/migration_user_input.txt file\n"
+				abort_script "$_err_msg_"
+        fi
+		dns_domain_name=$( $CAT ${CLI_CONF_DIR}/migration_user_input.txt | $GREP -i "DNS_DOMAIN_NAME" | $AWK -F"=" '{print $2}')		
+		if [ -z ${dns_domain_name} ]; then
+				_err_msg_="Could not fetch ip from ${CLI_CONF_DIR}/migration_user_input.txt file\n"
+				abort_script "$_err_msg_"
+        fi
+		
+		if [ ${STORAGE_TYPE} == "raw" ]; then
+		    #Updating ipmp.ini file
+		    iniset IPMP_INTF_1 -f ${ENIQ_CONF_DIR}/ipmp.ini IPMP_Group_IP="${new_ip}"
+		    iniset IPMP_INTF_1 -f ${ENIQ_CONF_DIR}/ipmp.ini IPMP_Group_Gateway="${gateway}"
+		    iniset IPMP_INTF_1 -f ${ENIQ_CONF_DIR}/ipmp.ini IPv6_Enable="Y"
+		    iniset IPMP_INTF_1 -f ${ENIQ_CONF_DIR}/ipmp.ini IPMP_Group_Subnet="${netmask_subnet}"
+		    iniset IPMP_INTF_1 -f ${ENIQ_CONF_DIR}/ipmp.ini IPMP_Group_Dns_IP="${dns_ip}"
+		    iniset IPMP_INTF_1 -f ${ENIQ_CONF_DIR}/ipmp.ini IPMP_Group_Dns_Domain="${dns_domain_name}"
+		fi
+        		
+
+	fi
+insert_header_footer foot "Successfully completed - ${NEXT_STAGE}." "${LOGFILE}"
+set_next_stage $($EXPR "${ARRAY_ELEM}"+1)
+
+}
+
+
+
+### Function: verify_NAS_connectivity ###
+#
+# Verify ENIQ NAS passwordless connectivity
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+verify_NAS_connectivity()
+{
+    insert_header_footer head "Entering ENIQ IPV6 Migration stage - ${NEXT_STAGE}" "${LOGFILE}"
+	if [ "${CURR_SERVER_TYPE}" == "eniq_stats" ] || [ "${CURR_SERVER_TYPE}" == "stats_coordinator" ]; then
+	    if [ ${STORAGE_TYPE} == "raw" ]; then
+		    NASCLI="/ericsson/storage/bin/nascli"
+		    #executing command to ensure ENIQ to NAS connectivity is working
+		    log_msg -s "Veryfying ENIQ to NAS connectivity" -l ${LOGFILE}
+		    $NASCLI list_fs >> /dev/null 2>&1
+		    if [ $? -ne 0 ]; then
+		      _err_msg_="Could not connect to NAS server"
+		      abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+		    fi
+		    log_msg -s "Successfully verified ENIQ to NAS connectivity" -l ${LOGFILE}
+		    insert_header_footer foot "Successfully completed - ${NEXT_STAGE}." "${LOGFILE}"
+		elif [ ${STORAGE_TYPE} == "fs" ]; then
+		    insert_header_footer foot "Skipping stage verify_NAS_connectivity for ${CURR_SERVER_TYPE} " ${LOGFILE}
+		fi
+	else
+	    insert_header_footer foot "Skipping stage verify_NAS_connectivity for ${CURR_SERVER_TYPE}  " ${LOGFILE}
+	fi
+    set_next_stage $($EXPR "${ARRAY_ELEM}"+1)
+}
+
+
+### Function: verify_passwordless_interblade_connectivity ###
+#
+# Verify interblade passwordless connectivity
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+verify_passwordless_interblade_connectivity()
+{
+    insert_header_footer head "Entering ENIQ IPV6 Migration stage - ${NEXT_STAGE}" "${LOGFILE}"
+	if [ "${CURR_SERVER_TYPE}" == "stats_coordinator" ]; then
+		for _line_ in $($CAT "${_deployed_servers_}" | $EGREP -v 'stats_coordinator'); do
+				  local _count_=`$ECHO ${line} |$GREP -o "::" | $WC -l`
+			      if [ "${_count_}" == 3 ]; then
+			         _serv_hostname_=$($ECHO "${_line_}" | $AWK -F"::" '{print $3}')
+				     _serv_type_=$($ECHO "${_line_}" | $AWK -F"::" '{print $4}')
+			      else
+				     _serv_hostname_=$($ECHO "${_line_}" | $AWK -F"::" '{print $2}')
+				     _serv_type_=$($ECHO "${_line_}" | $AWK -F"::" '{print $3}')
+			      fi
+				   log_msg -s "Verifying interblade passwordless connectivity between ${CURR_SERVER_TYPE} and ${_serv_type_}" -l ${LOGFILE}
+				   SSH_COMMAND="ssh -o BatchMode=yes ${_serv_hostname_} /bin/true"
+				   if [ $? -ne 0 ]; then
+						 _err_msg_="Passwordless conectivity between ${CURR_SERVER_TYPE} and ${_serv_type_}is not enabled \n"
+						 abort_script "$_err_msg_"
+				   fi
+				   log_msg -s "Able to connect to ${_serv_type_} from ${CURR_SERVER_TYPE}  " -l ${LOGFILE}
+		done
+		insert_header_footer foot "Successfully completed - ${NEXT_STAGE}." "${LOGFILE}"
+	else
+	   insert_header_footer foot "Skipping stage verify_passwordless_interblade_connectivity for ${CURR_SERVER_TYPE} " ${LOGFILE} 
+	fi
+    
+    set_next_stage $($EXPR "${ARRAY_ELEM}"+1)
+}
+
+
+### Function: update_sentinel_file
+# Verify ENIQ NAS passwordless connectivity
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+update_sentinel_file()
+{
+    insert_header_footer head "Entering ENIQ IPV6 Migration stage - ${NEXT_STAGE}" "${LOGFILE}"
+	_serv_hostname_=`$MYHOSTNAME`
+	license_path=$( $CAT ${CLI_CONF_DIR}/migration_user_input.txt | $GREP -i "LICENSE_PATH" | $AWK -F"=" '{print $2}')
+	path=$($CAT ${ENIQ_CONF_DIR}/eniq_sw_locate | $AWK -F"@" '{print $2}')
+	mws_host=$( $CAT ${CLI_CONF_DIR}/migration_user_input.txt | $GREP -i "MWS_HOST" | $AWK -F"=" '{print $2}')
+	new_path="/net/"${mws_host}${path}
+	$LS -lart ${new_path} >> /dev/null 2>&1
+	if [ $? -ne 0 ]; then
+	      _err_msg_="${mws_host} does not seem to be sharing any filesystem \n ${path}"
+	      abort_script "$_err_msg_"
+	fi
+	
+	if [ "${CURR_SERVER_TYPE}" == "eniq_stats" ] || [ "${CURR_SERVER_TYPE}" == "stats_coordinator" ]; then
+
+$RM -rf ${ENIQ_SENTINEL_DIR}/install.complete	
+log_msg -s "Executing ${ENIQ_CORE_INST_DIR}/bin/eniq_core_install.bsh -s install_sentinel" -l "${LOGFILE}" 
+SSH_create_LOGFILE=/var/tmp/sentinel_log
+$EXPECT <<EOF >${SSH_create_LOGFILE} 2>&1
+set timeout 40
+spawn su root -c "bash /eniq/installation/core_install/bin/eniq_core_install.bsh -s install_sentinel"
+expect {
+"e.g. /var/tmp/<licence_file>" {send -- "${license_path}\r";exp_continue}
+timeout {send user "\nTIMEOUT\n"; exit 9}
+}
+expect eof
+EOF
+            $CAT ${SSH_create_LOGFILE} | $GREP "Successfully installed ENIQ Sentinel server" >> /dev/null 2>&1
+			if [ $? -eq 0 ]; then
+			        log_msg -s "Successfully installed sentinel  " -l ${LOGFILE}
+			else
+	           _err_msg_="Sentinel installation is not successfull, please check file ${SSH_create_LOGFILE} for more details.. "
+	           abort_script "$_err_msg_"
+	        fi
+			$SYSTEMCTL restart licensing-sentinel
+			start_sentinel_service_exe_check=$?
+			if [ $start_sentinel_service_exe_check -ne 0 ]; then
+				  _err_msg_="Exiting... Unable to start sentinel service \n"
+				  abort_script "$_err_msg_"
+			fi
+			log_msg -s "Successfully started sentinel service" -l ${LOGFILE}
+			log_msg -s "Fetching license details..." -l ${LOGFILE}
+			source ${ENIQ_SENTINEL_DIR}/etc/sentinel.env
+			${ENIQ_SENTINEL_DIR}/bin/lsmon ${_serv_hostname_} >>/dev/null
+			if [ $? -ne 0 ]; then
+				  _err_msg_="Could not fetch license details  \n"
+				  abort_script "$_err_msg_"
+			fi
+			insert_header_footer foot "Successfully completed - ${NEXT_STAGE}." "${LOGFILE}"
+	else
+	        insert_header_footer foot "Skipping stage update_sentinel_file for ${CURR_SERVER_TYPE} " ${LOGFILE}
+	fi
+    set_next_stage $($EXPR "${ARRAY_ELEM}"+1)
+    
+}
+
+### Function: pre_checks ###
+#
+#   To perform pre_checks
+#   
+#
+# Arguments:
+#       none
+# Return Values:
+#
+pre_checks()
+{
+insert_header_footer head "Entering ENIQ IPV6 Migration stage - ${NEXT_STAGE}" "${LOGFILE}"
+log_msg -s "\nExecution for $BASH ${ENIQ_CHECKS_PATH}/eniq_checks.bsh in progress......" -l "${LOGFILE}"
+
+$BASH "${ENIQ_CHECKS_PATH}"/eniq_checks.bsh  >>/dev/null
+_precheck_exe_status_=$?
+if [[ $_precheck_exe_status_ -ne 0 ]];then
+    _err_msg_="Pre-Checks Execution failed."
+    abort_script "$_err_msg_"
+fi
+
+_last_summary_file_=$($LS -rt "${HEALTH_SUMMARY_DIR}" | $TAIL -1)
+if [ -z "{_last_summary_file_}" ]; then
+    _err_msg_="Could not find latest precheck summry file under "${HEALTH_SUMMARY_DIR}""
+    abort_script "$_err_msg_" 
+fi
+
+# Check for failures in health check summary file
+failure_chk=$($CAT "${HEALTH_SUMMARY_DIR}"/"${_last_summary_file_}" | $GREP -v "TOTAL CHECKS" | $GREP "FAILURE" | $WC -l)
+if [ "$failure_chk" -gt 0 ]; then
+    log_msg -s "\nHealth Checks with FAILURE: " -l "${LOGFILE}"  
+    $CAT "${HEALTH_SUMMARY_DIR}"/"${_last_summary_file_}" | $GREP -v "TOTAL CHECKS" | $GREP "FAILURE" | $AWK -F "|" '{print $1,"\t" "REMARK:"$3 "\t" "Log:" $4}' > /var/tmp/pre_check
+    $SED 's/^ *//' /var/tmp/pre_check | cut -d" " -f2-
+fi
+# Check for warning in health check summary file
+warning_chk=$($CAT "${HEALTH_SUMMARY_DIR}"/"${_last_summary_file_}" | $GREP -v "TOTAL CHECKS" | $GREP "WARNING" | $WC -l)
+if [ "$warning_chk" -gt 0 ]; then
+    log_msg -s "\nHealth Checks with WARNING: " -l "${LOGFILE}"  
+    $CAT "${HEALTH_SUMMARY_DIR}"/"${_last_summary_file_}" | $GREP -v "TOTAL CHECKS" | $GREP "WARNING" | $AWK -F "|" '{print $1,"\t" "REMARK:"$3 "\t" "Log:" $4}' > /var/tmp/pre_check
+    $SED 's/^ *//' /var/tmp/pre_check | cut -d" " -f2-
+fi
+
+if [[ $failure_chk -gt 0 ]]; then
+    _err_msg_="Aborting the execution, as failure for ENIQ pre-checks found. Resolve the issue(s) and re-run the script again. "
+    abort_script "$_err_msg_"
+elif [[ ( $failure_chk == 0 ) && ( $warning_chk -gt 0 ) ]]; then
+    $ECHO "Do you want to continue with current state of pre_checks? (yes/no)"
+    read pre_check_flow
+    if [[ $pre_check_flow == "no" || $pre_check_flow == "NO" || $pre_check_flow == "No" || $pre_check_flow == "n" || $pre_check_flow == "N" ]]; then
+        _err_msg_="Aborting the execution, as eniq checks are failed. Resolve the issue(s) and re-run the script again."
+        abort_script "$_err_msg_"
+    fi
+elif [[ ( $failure_chk == 0 ) && ( $warning_chk == 0 ) ]]; then
+    $ECHO "\nAll ENIQ pre-checks execution status is sucessfull" | $TEE -a ${LOGFILE}
+fi
+
+log_msg -s "Prechecks Execution Completed Successfully" -l "${LOGFILE}"
+
+$RM -rf /var/tmp/pre_check
+$RM -rf /var/tmp/precheck
+insert_header_footer foot "Successfully completed - ${NEXT_STAGE}." "${LOGFILE}"
+set_next_stage $($EXPR "${ARRAY_ELEM}"+1)
+}
+
+
+stop_iq()
+{
+ SSH_create_LOGFILE=/var/tmp/stop_iq
+ log_msg -s "Stopping IQ service using ${IQDIR}/bin64/stop_iq" -l "${LOGFILE}" 
+$EXPECT <<EOF >${SSH_create_LOGFILE} 2>&1
+set timeout 40
+spawn su dcuser -c "${IQDIR}/bin64/stop_iq"
+expect {
+"Do you want to stop the server displayed above <Y/N>?" {"Y\r";exp_continue}
+timeout {send user "\nTIMEOUT\n"; exit 9}
+}
+expect eof
+EOF
+}
+
+### Function: migrate_IQ ###
+#
+# Migrate IQ from IPv4 to IPv6
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+migrate_IQ()
+{
+    insert_header_footer head "Entering ENIQ IPV6 Migration stage - ${NEXT_STAGE}" "${LOGFILE}"
+	if [ "${CURR_SERVER_TYPE}" == "stats_coordinator" ]; then
+    _sysuser_=`iniget ENIQ_INSTALL_CONFIG -f ${ENIQ_CONF_DIR}/${SUNOS_INI} -v ENIQ_SYSUSER`
+    if [ ! "${_sysuser_}" ]; then
+        _err_msg_="Could not read parameter ENIQ_SYSUSER from ${ENIQ_CONF_DIR}/${SUNOS_INI} file"
+        abort_script "${_err_msg_}" 
+    fi
+
+    #Stop all ENIQ services
+    stop_services
+
+    # create database startup configuration for IP migration file
+    IP=$($CAT /etc/hosts | $GREP "dwhdb" | $AWK '{print $1}')
+    log_msg -s "Creating configuration file ${ENIQ_DB_DIR}/dwh_main/dwhdb_migration.cfg with IPv6 details..." -l "${LOGFILE}"
+    $TOUCH ${DWH_DIR}/dwhdb_migration.cfg
+    $CHMOD 750 ${DWH_DIR}/dwhdb_migration.cfg
+    $CHOWN dcuser ${DWH_DIR}/dwhdb_migration.cfg
+    $ECHO "-n dwhdb" > ${DWH_DIR}/dwhdb_migration.cfg
+    $ECHO "-x tcpip(MyIP=${IP};port=${DWH_PORT})" >> ${DWH_DIR}/dwhdb_migration.cfg
+    log_msg -s "Succesfully created file ${ENIQ_DB_DIR}/dwh_main/dwhdb_migration.cfg with IPv6 details..." -l "${LOGFILE}"
+
+    log_msg -s "Starting Coordinator dwhdb service for updating IP information for dwhdb" -l "${LOGFILE}"
+    $SU - ${_sysuser_} -c "${IQDIR}/bin64/start_iq @${DWH_DIR}/dwhdb_migration.cfg ${CC} ${CH}  -iqmc ${MAINCACHE} -iqtc ${TEMPCACHE} -iqlm ${LARGEMEMORY} -gd dba -gm 1 -iqmpx_sn 1 -iqmpx_ov 1 -iqfrec -z ${DWH_DIR}/dwhdb.db"
+    if [ $? -ne 0 ]; then
+        _err_msg_="Could not start coordinator with configuration\n"
+		stop_iq
+        abort_script "$_err_msg_"
+    fi
+    log_msg -s "Checking whether database dwhdb service is up and running..." -l "${LOGFILE}"
+
+    # Check if server is up
+    $SU - ${_sysuser_} -c "${IQDIR}/bin64/dbping @${Conn_STR_USER_DWH_enc}" >> ${LOGFILE} 2>&1
+    _start_res_=$?
+    if [ ${_start_res_} -eq 0 ] ; then
+        log_msg -l ${LOGFILE}  -s "Database dwhdb succesfully started"
+    else
+        _err_msg_="IQ server $DWH_ENG start failed with configuration"
+		stop_iq
+        abort_script "$_err_msg_"
+    fi
+    
+    log_msg -s "Executing 'alter multiplex server' statement to change host/ip address for the coordinator" -l "${LOGFILE}"
+    $SU - ${_sysuser_} -c "${IQDIR}/bin64/dbisql @${Conn_STR_USER_DBA_enc} \"alter multiplex server dwhdb host '${IP}' port ${DWH_PORT};\"">/dev/null
+    #if [ $? -ne 0 ]; then
+       # _err_msg_="Could not execute 'alter multiplex server for Coordinator' statement\n"
+       # abort_script "$_err_msg_"
+    #fi
+
+    PID=`$PS -auxww | $EGREP  "(${IQ_PS_STR})" | $EGREP -v egrep| $EGREP -w ${DWH_ENG} | $AWK '{print $2}'`
+    if [ -z "${PID}" ] ; then
+    log_msg -l ${LOGFILE} -q -s "Can't find dwhdb process. Database not running."
+    return 0
+    fi
+
+    log_msg -s "Starting Coordinator dwhdb service..." -l "${LOGFILE}"
+    $SU - ${_sysuser_} -c "${IQDIR}/bin64/start_iq @${DWH_DIR}/dwhdb_migration.cfg ${DWH_DIR}/dwhdb.db ${CC} ${CH}  -iqmc ${MAINCACHE} -iqtc ${TEMPCACHE} -iqlm ${LARGEMEMORY} -gd dba -gm 1 -iqmpx_sn 1"
+    if [ $? -ne 0 ]; then
+        _err_msg_="Could not start coordinator in simplex mode\n"
+		stop_iq
+        abort_script "$_err_msg_"
+    fi
+    log_msg -s "Checking whether database dwhdb service is up and running..." -l "${LOGFILE}"
+    # Check if server is up
+    $SU - ${_sysuser_} -c "${IQDIR}/bin64/dbping @${Conn_STR_USER_DWH_enc}" >> ${LOGFILE} 2>&1
+    _start_res_=$?
+    if [ ${_start_res_} -eq 0 ] ; then
+        log_msg -l ${LOGFILE}  -s "Database dwhdb succesfully started"
+        #log_msg -l ${LOGFILE} -q -s "Releasing Suspended Transactions"
+        #${IQDIR}/bin64/dbisql @${Conn_STR_USER_RDBA_enc} "sp_iqmpxrollbacksuspendedtransactions 'dwhdb'"
+        #if [ $? -ne 0 ];
+        #then
+            #log_msg -q -s "Fail to release suspended Transaction" -l ${LOGFILE}
+        #fi
+    else
+        _err_msg_="IQ server $DWH_ENG start failed"
+		stop_iq
+        abort_script "$_err_msg_"
+    fi
+    
+    log_msg -s "Executing dropleak on database, this step might take some time..." -l "${LOGFILE}"
+    $RM -rf ${TEMP_DIR}/dropleaks.txt
+    $SU - ${_sysuser_} -c "${IQDIR}/bin64/dbisql @${Conn_STR_USER_DBA_enc} \"sp_iqcheckdb 'dropleaks database';OUTPUT TO ${TEMP_DIR}/dropleaks.txt\"">/dev/null
+    if [ $? -ne 0 ]; then
+        _err_msg_="Could not execute dropleaks database statement\n"
+		stop_iq
+        abort_script "$_err_msg_"
+    fi
+    $CHMOD 754 ${TEMP_DIR}/dropleaks.txt
+    $CHOWN root ${TEMP_DIR}/dropleaks.txt
+    $CAT ${TEMP_DIR}/dropleaks.txt >> ${LOGFILE}
+     VAL=`$CAT "${TEMP_DIR}/dropleaks.txt"`
+    if [[ $VAL == *"No Error"* ]]; then
+        log_msg -s "Successfully completed dropleaks on database" -l "${LOGFILE}"
+    else
+        _err_msg_="Failed to run dropleak on database"
+		stop_iq
+        abort_script "$_err_msg_"
+    fi
+    
+    READER_1_IP=$($CAT /etc/hosts | $GREP "dwh_reader_1" | $AWK '{print $1}')
+    READER_2_IP=$($CAT /etc/hosts | $GREP "dwh_reader_2" | $AWK '{print $1}')
+    DWH_PORT=`iniget DWH_READER_SETTINGS -v PortNumber -f ${ENIQ_CONF_DIR}/${ENIQ_INI}`
+
+    $SU - ${_sysuser_} -c "${IQDIR}/bin64/dbisql @${Conn_STR_USER_DBA_enc} \"alter multiplex server dwh_reader_1 host '${READER_1_IP}' port ${DWH_PORT};\"">/dev/null
+    if [ $? -ne 0 ]; then
+        _err_msg_="Could not execute 'alter multiplex server for Reader 1' statement\n"
+		stop_iq
+        abort_script "$_err_msg_"
+    fi
+    
+    $SU - ${_sysuser_} -c "${IQDIR}/bin64/dbisql @${Conn_STR_USER_DBA_enc} \"alter multiplex server dwh_reader_2 host '${READER_2_IP}' port ${DWH_PORT};\"">/dev/null
+    if [ $? -ne 0 ]; then
+        _err_msg_="Could not execute 'alter multiplex server for Reader 2' statement\n"
+		stop_iq
+        abort_script "$_err_msg_"
+    fi
+    
+    SSH_create_LOGFILE=/var/tmp/stop_iq
+$EXPECT <<EOF >${SSH_create_LOGFILE} 2>&1
+set timeout 40
+spawn su dcuser -c "${IQDIR}/bin64/stop_iq"
+expect {
+"Do you want to stop the server displayed above <Y/N>?" {"Y\r";exp_continue}
+timeout {send user "\nTIMEOUT\n"; exit 9}
+}
+expect eof
+EOF
+
+    PID=`$PS -auxww | $EGREP  "(${IQ_PS_STR})" | $EGREP -v egrep| $EGREP -w ${DWH_ENG} | $AWK '{print $2}'`
+    if [ -z "${PID}" ] ; then
+        log_msg -l ${LOGFILE} -q -s "Can't find dwhdb process. Database not running."
+        return 0
+    fi
+    log_msg -s "Starting the database dwhdb service.." -l "${LOGFILE}"
+    #Starting dwhdb service
+    $BASH ${ENIQ_ADMIN_BIN_DIR}/manage_eniq_services.bsh -a start -s eniq-dwhdb -N
+    if [ $? -ne 0 ]; then
+        _err_msg_="Could not start eniq-dwhdb service\n"
+		stop_iq
+        abort_script "$_err_msg_"
+    fi
+    
+    log_msg -s "Checking whether database dwhdb service is up and running..." -l "${LOGFILE}"
+    # Check if server is up
+    $SU - ${_sysuser_} -c "${IQDIR}/bin64/dbping @${Conn_STR_USER_DWH_enc}" >> ${LOGFILE} 2>&1
+    _start_res_=$?
+    if [ ${_start_res_} -eq 0 ] ; then
+        log_msg -l ${LOGFILE}  -s "Database dwhdb succesfully started"
+        #log_msg -l ${LOGFILE} -q -s "Releasing Suspended Transactions"
+        #${IQDIR}/bin64/dbisql @${Conn_STR_USER_RDBA_enc} "sp_iqmpxrollbacksuspendedtransactions 'dwhdb'"
+        #if [ $? -ne 0 ];
+        #then
+            #log_msg -q -s "Fail to release suspended Transaction" -l ${LOGFILE}
+        #fi
+    else
+        _err_msg_="IQ server $DWH_ENG start failed"
+		stop_iq
+        abort_script "$_err_msg_"
+    fi
+    
+    $RM -rf ${TEMP_DIR}/sp_iqmpxinfo.txt 
+    $SU - ${_sysuser_} -c "${IQDIR}/bin64/dbisql @${Conn_STR_USER_DBA_enc} \"sp_iqmpxinfo;OUTPUT TO ${TEMP_DIR}/sp_iqmpxinfo.txt\"">/dev/null
+    if [ $? -ne 0 ]; then
+        _err_msg_="Could not execute sp_iqmpxinfo procedure\n"
+		stop_iq
+        abort_script "$_err_msg_"
+    fi
+    $CHMOD 754 ${TEMP_DIR}/sp_iqmpxinfo.txt
+    $CHOWN root ${TEMP_DIR}/sp_iqmpxinfo.txt
+    ${CAT} "${TEMP_DIR}/sp_iqmpxinfo.txt" >> ${LOGFILE}
+    
+    $RM -rf ${TEMP_DIR}/sp_iqmpxvalidate.txt
+    $SU - ${_sysuser_} -c "${IQDIR}/bin64/dbisql @${Conn_STR_USER_DBA_enc} \"sp_iqmpxvalidate;OUTPUT TO ${TEMP_DIR}/sp_iqmpxvalidate.txt\"">/dev/null
+    if [ $? -ne 0 ]; then
+        _err_msg_="Could not execute sp_iqmpxvalidate procedure\n"
+		stop_iq
+        abort_script "$_err_msg_"
+    fi
+
+
+    $CHMOD 754 ${TEMP_DIR}/sp_iqmpxvalidate.txt
+    $CHOWN root ${TEMP_DIR}/sp_iqmpxvalidate.txt
+    $CAT ${TEMP_DIR}/sp_iqmpxvalidate.txt >> ${LOGFILE}
+    VAL=`$CAT "${TEMP_DIR}/sp_iqmpxvalidate.txt"`
+    if [[ $VAL == *"No error"* ]]; then
+        log_msg -s "IQ MPX started successfully without any error" -l "${LOGFILE}"
+    else
+        _err_msg_="IQ MPX Couldn't start correctly"
+		stop_iq
+        abort_script "$_err_msg_"
+    fi   
+    
+    insert_header_footer foot "Successfully completed - ${NEXT_STAGE}." "${LOGFILE}"
+	else
+	    insert_header_footer foot "Skipping stage migrate_IQ for ${CURR_SERVER_TYPE}" ${LOGFILE}
+	fi
+    set_next_stage $($EXPR "${ARRAY_ELEM}"+1)
+}
+
+
+### Function: start_all_services ###
+#
+# To start all the services on all blades and
+# update files which will inform migration is
+# completed.
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+start_all_services()
+{
+    insert_header_footer head "Entering ENIQ IPV6 Migration stage - ${NEXT_STAGE}" "${LOGFILE}"
+	if [ "${CURR_SERVER_TYPE}" == "eniq_stats" ] || [ "${CURR_SERVER_TYPE}" == "stats_coordinator" ]; then        
+			#start all ENIQ services
+			start_services
+			#Restart hostsync services on all blades to reflect all ipv6 ip's from service_names File
+			$PERL "${GET_IP_ORDER_SCRIPT}" -f "${_deployed_servers_}"
+			log_msg -s "\nRestarting hostsync on ${CURR_SERVER_TYPE}" -l "${LOGFILE}"
+			   $SYSTEMCTL restart hostsync
+			   stop_hostsync_service_exe_check=$?
+			   if [ $stop_hostsync_service_exe_check -ne 0 ]; then
+				  _err_msg_="Exiting... Unable to stop hostsync service \n"
+				  abort_script "$_err_msg_"
+			   fi
+			   log_msg -s "\n Restarted hostsync service on ${CURR_SERVER_TYPE}" -l "${LOGFILE}"
+			   if [ "${CURR_SERVER_TYPE}" == "stats_coordinator" ]; then
+				  for _line_ in $($CAT "${_deployed_servers_}" | $EGREP -v 'stats_coordinator'); do
+					   local _count_=`$ECHO ${line} |$GREP -o "::" | $WC -l`
+					   if [ "${_count_}" == 3 ]; then
+						   _serv_hostname_=$($ECHO "${_line_}" | $AWK -F"::" '{print $3}')
+						   _serv_type_=$($ECHO "${_line_}" | $AWK -F"::" '{print $4}')
+					   else
+						   _serv_hostname_=$($ECHO "${_line_}" | $AWK -F"::" '{print $2}')
+						   _serv_type_=$($ECHO "${_line_}" | $AWK -F"::" '{print $3}')
+					   fi
+					   log_msg -s "\nStopping hostsync on ${_serv_type_}" -l "${LOGFILE}"
+					   if [ "${_user_root}" == 1 ]; then
+						   run_remote_cmd "${_serv_hostname_}" "/usr/bin/systemctl restart hostsync" >> /dev/null 2>&1
+						   if [ $? -ne 0 ]; then
+								 _err_msg_="Could not restart hostsync service on ${_serv_hostname_}\n"
+								 abort_script "$_err_msg_"
+						   fi
+					   else
+						   run_remote_cmd "${_serv_hostname_}" "$SUDO /usr/bin/systemctl restart hostsync" >> /dev/null 2>&1
+						   if [ $? -ne 0 ]; then
+								 _err_msg_="Could not restart hostsync service on ${_serv_hostname_}\n"
+								 abort_script "$_err_msg_"
+						   fi
+					   fi
+					   log_msg -s "\nRestarted hostsync service on ${_serv_type_}" -l "${LOGFILE}"
+				  done
+			   fi
+			   
+			   #Making file ip_type
+			   $ECHO "IPv6" > ${ENIQ_CONF_DIR}/ip_type
+			   
+			   #Updating ipmp.ini file to denote server is migrated
+			   #iniset IPMP_INTF_1 -f ${ENIQ_CONF_DIR}/ipmp.ini IPv6_Migrated="Y"
+			   $TOUCH ${ENIQ_SW_CONF_DIR}/ipv6_migrated
+			   if [ $? -ne 0 ]; then
+			      _err_msg_="Could not touch file ${ENIQ_SW_CONF_DIR}/ipv6_migrated on ${_serv_hostname_}\n"
+			      abort_script "$_err_msg_"
+			   fi
+	else
+	    insert_header_footer foot "Skipping stage start_all_services for ${CURR_SERVER_TYPE} " ${LOGFILE}
+	fi		
+	
+    set_next_stage $($EXPR "${ARRAY_ELEM}"+1)
+}
+
+
+
+
+# ********************************************************************
+#
+#   Main body of program
+#
+# ********************************************************************
+#
+
+RUN_TIME=`$DATE '+%Y-%b-%d_%H.%M.%S'`
+
+# Determine absolute path to software
+get_absolute_path
+
+# Set up environment variables for script.
+setup_env
+
+# Check that the effective id of the user is root
+check_id 
+
+
+while getopts ":l:s:n:a:" arg; do
+  case $arg in
+    l) LOGFILE="$OPTARG"
+       ;;
+    s) USER_STAGE="$OPTARG"
+       ;;
+    n) NO_RESET_STAGE="YES"
+       ;;
+	a) PRE_MIGRATION="$OPTARG"
+	   ;;
+   \?) _err_msg_="$($BASENAME "$0") -s <stage>"
+       abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+       ;;
+  esac
+done
+shift $(expr $OPTIND - 1)
+
+
+
+# Log file
+if [ ! "${LOGFILE}" ]; then
+    $MKDIR -p "${ENIQ_LOCAL_LOG_DIR}"/ipv6_migration
+    LOGFILE="${ENIQ_LOCAL_LOG_DIR}/ipv6_migration/${HNAME}_ipv6_migration.log"
+fi
+
+
+
+# If log file doesn't exist, create log file
+if [ ! -f "${LOGFILE}" ]; then
+    $TOUCH "${LOGFILE}"
+    if [ $? -ne 0 ]; then
+        _err_msg_="Could not make log file"
+        abort_script "$_err_msg_"
+    fi
+
+
+    $ECHO "Changing permission of the ${LOGFILE} to 644" | $TEE -a "${LOGFILE}"
+    $CHMOD 644 "${LOGFILE}"
+    if [ $? -ne 0 ]; then
+        _err_msg_="Could not change ${LOGFILE} file permissions to 644"
+        abort_script "$_err_msg_"
+    fi
+fi
+
+#Checking if migration is already completed
+#migrated=`iniget IPMP_INTF_1 -f ${ENIQ_CONF_DIR}/ipmp.ini -v IPv6_Migrated`
+if [ -f ${ENIQ_SW_CONF_DIR}/ipv6_migrated ]; then
+    log_msg -s "IPv4 to IPv6 migration is already completed on `$MYHOSTNAME`" -l ${LOGFILE}
+	exit 0
+fi
+
+
+#Executing premigration Stages
+if [ "${PRE_MIGRATION}" ]; then
+    if [ "${PRE_MIGRATION}" == "pre_migration" ]; then
+	    $BASH ${ENIQ_CORE_INST_DIR}/bin/ipv6_premigration.bsh
+		if [ $? -ne 0 ]; then
+        _err_msg_="Could not execute ${ENIQ_CORE_INST_DIR}/bin/ipv6_premigration.bsh"
+        abort_script "$_err_msg_"
+    fi
+	exit 0	
+	fi
+fi
+
+$ECHO "\n===================================" | $TEE -a "${LOGFILE}"
+$ECHO "${RUN_TIME} - Executing IPV6 Migration " | $TEE -a "${LOGFILE}"
+$ECHO "=====================================\n" | $TEE -a "${LOGFILE}"
+
+
+# Create a temporary Directory
+TEM_DIR=/tmp/ipv6_migration.$$.$$
+if [ -d ${TEM_DIR} ]; then
+    $RM -rf ${TEM_DIR}
+    if [ $? -ne 0 ]; then
+        _err_msg_="Could not delete directory $TEM_DIR. Please delete it manually."
+        abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+    fi
+fi
+
+$MKDIR -p ${TEM_DIR}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not create directory $TEM_DIR"
+    abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+fi
+
+
+    
+# File to hold current stage information
+STAGEFILE=/eniq/installation/core_install/etc/current_eniq_ipv6_migration_stage
+
+# Create a stage array
+ipv6_migration_build_stage_array 
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not build a stage array for ENIQ IPV^ Migration"
+    abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+fi
+
+# If specific stage specified, check if it is in the stage list for IPV6 Migration
+if [ "$USER_STAGE" ]; then
+    ipv6_migration_check_user_stage "${USER_STAGE}"
+    if [ $? -ne 0 ]; then
+       _err_msg_="The specified stage ${USER_STAGE} is not in the stage list for ENIQ IPV6 Migration"
+       abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+    fi
+fi
+
+# Get the element number and next stage function so we can move along the array
+if [ "$USER_STAGE" ]; then
+    NEXT_STAGE="${USER_STAGE}"
+    get_array_element
+else
+    get_next_stage
+fi
+
+# If we read cleanup from the stagefile
+if [ "$NEXT_STAGE" == "cleanup" ]; then
+    # We exit unless the user specified that the stage be run again
+    if [ ! "$USER_STAGE" ]; then
+        log_msg -s "All Stages are already completed" -l "${LOGFILE}"
+        exit 0
+    fi
+fi
+
+# Loop through the stages for ipv4 to ipv6 migration
+while :; do
+    _nxt_stage_="${NEXT_STAGE}"
+    $_nxt_stage_
+    if [ $? -ne 0 ]; then
+        _err_msg_="Error in Stage ${NEXT_STAGE}"
+        abort_script "${_err_msg_}"
+    fi
+
+    # Exit if the user specified to run a specific stage only
+    if [ "$USER_STAGE" ]; then
+        break
+    fi
+
+    # If we read cleanup from the stagefile
+    if [ "$NEXT_STAGE" == "cleanup" ]; then
+        break
+    fi
+
+    get_next_stage
+done
+
+$RM -rf ${TEM_DIR}
+
+exit 0
+

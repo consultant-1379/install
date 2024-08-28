@@ -1,0 +1,20 @@
+[Unit]
+Description=The Eniq Scheduler Service
+Requires=eniq-rmiregistry.service NAS-online.service
+After=NAS-online.service
+
+[Service]
+Type=forking
+User=dcuser
+Group=dc5000
+ExecStart=/eniq/smf/bin/eniq_smf_start_stop.sh -a start -s scheduler
+ExecStop=/eniq/smf/bin/eniq_smf_start_stop.sh -a stop -s scheduler
+Restart=always
+RestartSec=15
+StartLimitInterval=150
+StartLimitBurst=3
+TimeoutStartSec=0
+TimeoutStopSec=150
+
+[Install]
+WantedBy=multi-user.target eniq-rmiregistry.service NAS-online.service

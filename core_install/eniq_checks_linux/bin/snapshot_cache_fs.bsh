@@ -1,0 +1,324 @@
+#!/bin/bash
+#********************************************************************
+# Ericsson Radio Systems AB SCRIPT
+#********************************************************************
+#
+# (c) Ericsson Radio Systems AB 2019 - All rights reserved.
+#
+# The copyright to the computer program(s) herein is the property
+# of Ericsson Radio Systems AB, Sweden. The programs may be used
+# and/or copied only with the written permission from Ericsson Radio
+# Systems AB or in accordance with the terms and conditions stipulated
+# in the agreement/contract under which the program(s) have been
+# in the agreement/contract under which the program(s) have been
+# supplied.
+#
+#********************************************************************
+# Name     : snapshot_cache_fs.bsh
+# Date     : 15/09/2022
+# Revision : \main\3
+# Purpose  : Objective of this script is to check the % used snapshot cache for FS
+# Usage    : snapshot_cache_fs.bsh
+# Exit Values:
+#    0   : Success : Snapshot cache used is less than 90%.
+#    3   : Failure : Script Aborted.
+#    82  : Failure : Could not retrieve snapshot cache used.
+#    16  : No Run  : Not Applicable for rack
+#    121 : Failure : Snapshot cache used is greater than or equal to 90%.
+#
+#********************************************************************
+#
+#       Command Section
+#
+#********************************************************************
+AWK=/usr/bin/awk
+BC=/usr/bin/bc
+CAT=/usr/bin/cat
+DATE=/usr/bin/date
+ECHO='/usr/bin/echo -e'
+GREP=/usr/bin/grep
+ID=/usr/bin/id
+MKDIR=/usr/bin/mkdir
+RM=/usr/bin/rm
+SSH=/usr/bin/ssh
+SU=/usr/bin/su
+TEE=/usr/bin/tee
+TR=/usr/bin/tr
+TOUCH=/usr/bin/touch
+LVS=/usr/sbin/lvs
+
+# ********************************************************************
+#
+#   Functions
+#
+# ********************************************************************
+
+### Function: abort_script ###
+#
+#   This will is called if the script is aborted through an error
+#   signal sent by the kernel such as CTRL-C or if a serious
+#   error is encountered during runtime
+#
+# Arguments:
+#       $1 - Error message from part of program (Not always used)
+# Return Values:
+#       none
+abort_script()
+{
+_err_time_=`$DATE '+%Y-%b-%d_%H.%M.%S'`
+
+if [ "$1" ]; then
+    _err_msg_="${_err_time_} - $1"
+else
+    _err_msg_="${_err_time_} - ERROR : Script aborted.......\n"
+fi
+
+if [ "${LOGFILE}" ]; then
+    $ECHO "\nERROR : ${_err_msg_}\n" | $TEE -a ${LOGFILE}
+else
+    $ECHO "\nERROR : ${_err_msg_}\n"
+fi
+
+$RM -rf ${TEM_DIR}
+exit 3
+}
+
+
+### Function: check_id ###
+#
+#   Check that the effective id of the user is correct
+#   If not print error message and exit.
+#
+# Arguments:
+#       $1 : User ID name
+# Return Values:
+#       none
+check_id()
+{
+_check_id_=`$ID | $AWK -F\( '{print $2}' | $AWK -F\) '{print $1}'`
+if [ "${_check_id_}" != "$1" ]; then
+    _err_msg_="You must be $1 to execute this script."
+    abort_script "${_err_msg_}"
+fi
+}
+
+### Function: chk_logfile ###
+#
+# Check Logfile
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+
+chk_logfile()
+{
+
+if [ ! -d ${ENIQ_CHK_LOG_DIR}  ]
+    then
+	$MKDIR -p ${ENIQ_CHK_LOG_DIR}
+    if [ $? -ne 0 ]; then
+    _err_msg_="Could not create directory ${ENIQ_CHK_LOG_DIR}"
+    abort_script "${_err_msg_}" 
+    fi
+ fi
+ 
+ if [ -s ${LOGFILE}  ]
+    then
+    $RM -rf ${LOGFILE} 
+    if [ -s ${LOGFILE}  ]
+    then
+        _err_msg_="Warning : Could not remove older ${LOGFILE}"
+        abort_script "$_err_msg_"
+    fi    
+ fi
+
+ 
+$TOUCH ${LOGFILE}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not write to file ${LOGFILE}"
+    abort_script "$_err_msg_"
+fi
+
+$ECHO "Changing permission of the ${LOGFILE} to 644" | $TEE -a ${LOGFILE}
+$CHMOD 644 ${LOGFILE}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not change the permissions of the ${LOGFILE} file to 644"
+    abort_script "$_err_msg_"
+fi
+}
+
+
+### Function: cache_fs ###
+#
+#   Check the percentage of snapshot cache used for active FS Pool.  
+#   If not print error message and exit.
+#
+# Arguments:
+#       $1 : Threshold 
+# Return Values:
+#       none
+cache_fs()
+{
+log_msg -t -s "Fetching value for eniq_stats_pool" -l ${LOGFILE}
+_eniq_stats_pool_=`iniget SunOS_FS_POOL_1 -f ${ENIQ_CONF_DIR}/SunOS.ini -v name`
+if [ "${_eniq_stats_pool_}"  == "" ]; then
+    log_msg -t -s "ERROR: Could not fetch details for pool cache."  -l ${LOGFILE}
+    cleanup
+    exit 82
+fi
+log_msg -t -s "name= ${_eniq_stats_pool_}" -l ${LOGFILE}
+
+log_msg -t -s "Checking percentage used snapshot cache for ${_eniq_stats_pool_}. " -l ${LOGFILE}
+_flag_=0
+
+
+$ECHO `$LVS -o lv_name,lv_attr,snap_percent --noheadings  -S "lv_attr=~[^s.*]" | $AWK '{print $1,$3}' >> ${TEM_DIR}/perc_used.txt `
+
+while read output 
+do
+_lv_name_=`$ECHO $output|$AWK '{print $1}' `
+_lv_size_=`$ECHO $output|$AWK '{print $2}'`
+_lv_limit_=90
+if [ 1 -eq "$($ECHO "${_lv_size_} > ${_lv_limit_}" | $BC)" ]; then
+  _flag_=1
+   log_msg -t -s "ERROR:Snapshot Cache size for ${_lv_name_}=${_lv_size_}% is greater than or equal to threshold(${_lv_limit_})%." -l ${LOGFILE}
+fi
+done < ${TEM_DIR}/perc_used.txt
+
+if [ ${_flag_} == 0 ]; then
+   log_msg -t -s "INFO:Snapshot Cache used for fs is less than threshold(90)%." -l ${LOGFILE}
+   _RET_CODE_=0
+else 
+   cleanup
+   _RET_CODE_=121
+fi
+
+}
+
+### Function: cleanup ###
+#
+# Cleanup of temporary directory
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+cleanup()
+{
+log_msg -q -t -s "Cleaning up the temporary directory" -l ${LOGFILE}
+$RM -rf ${TEM_DIR}
+log_msg -q -t -s "Successfully completed the cleanup" -l ${LOGFILE}
+}
+
+### Function: setup_env ###
+#
+# Set up environment variables for script.
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+setup_env()
+{
+# ENIQ Base Directory
+ENIQ_BASE_DIR=/eniq
+
+# ENIQ Core Installation Directory
+ENIQ_INST_DIR=${ENIQ_BASE_DIR}/installation
+
+# ENIQ Core Installation SW
+ENIQ_CORE_INST_DIR=${ENIQ_INST_DIR}/core_install
+
+# ENIQ Log Directory
+ENIQ_LOG_DIR=${ENIQ_BASE_DIR}/local_logs
+
+# ENIQ Precheck Log Directory
+ENIQ_CHK_LOG_DIR=${ENIQ_LOG_DIR}/precheck_logs
+
+# ENIQ Config Directory
+ENIQ_CONF_DIR=${ENIQ_INST_DIR}/config
+
+# ENIQ LIB Directory
+ENIQ_LIB_DIR=${ENIQ_CORE_INST_DIR}/lib
+
+# Source the common functions
+if [ -s ${ENIQ_LIB_DIR}/common_functions.lib ]; then
+    . ${ENIQ_LIB_DIR}/common_functions.lib
+else
+    _err_msg_="File ${ENIQ_LIB_DIR}/common_functions.lib not found"
+    abort_script "${_err_msg_}"
+fi
+
+if [ -s ${ENIQ_LIB_DIR}/common_core_install_functions.lib ]; then
+    . ${ENIQ_LIB_DIR}/common_core_install_functions.lib
+else
+    _err_msg_="File ${ENIQ_LIB_DIR}/common_core_install_functions.lib not found"
+    abort_script "${_err_msg_}"
+fi
+
+if [ -s ${ENIQ_LIB_DIR}/common_inirator_functions.lib ]; then
+    . ${ENIQ_LIB_DIR}/common_inirator_functions.lib
+else
+    _err_msg_="File ${ENIQ_LIB_DIR}/common_inirator_functions.lib not found"
+    abort_script "${_err_msg_}"
+fi
+
+# File containing the type of OSS installation. Eg. statistics
+INST_TYPE_FILE=${ENIQ_CONF_DIR}/ericsson_use_config
+if [ ! -s "${INST_TYPE_FILE}" ]; then
+    _err_msg_="ENIQ install type not defined in ${INST_TYPE_FILE}"
+    abort_script "${_err_msg_}"
+fi
+
+# Read the installation type - should be "stats"
+INST_TYPE=`$CAT ${INST_TYPE_FILE} | $AWK -F\= '{print $2}'`
+
+# Storage type
+STORAGE_TYPE=`iniget STOR_TYPE -f ${ENIQ_BASE_DIR}/installation/config/SunOS.ini -v STORAGE_TYPE`
+if [ ! "${STORAGE_TYPE}" ]; then
+    _err_msg_="Could not obtain storage type from ${ENIQ_BASE_DIR}/installation/config/SunOS.ini"
+    abort_script "${_err_msg_}"
+fi
+
+}
+
+# ********************************************************************
+#
+#   Main body of program
+#
+# ********************************************************************
+
+# Default user
+DEFAULT_USER=root
+
+# Timestamp
+TIMESTAMP=`$DATE '+%d-%m-%y_%H.%M.%S'`
+
+# Check that the effective id of the user is root
+check_id ${DEFAULT_USER}
+
+# Set up environment variables for script.
+setup_env
+
+# Log file
+LOGFILE=${ENIQ_CHK_LOG_DIR}/fs_snap_cache.log
+
+# Check Logfile
+chk_logfile
+
+# Create a temporary Directory
+TEM_DIR=/tmp/s_cache.$$.$$
+$RM -rf ${TEM_DIR}
+$MKDIR -p ${TEM_DIR}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not create directory $TEM_DIR"
+    abort_script "${_err_msg_}"
+fi
+
+#Check cache used for FS
+cache_fs
+log_msg -s "-------------------------------------------------------------------------------------------\n" -l ${LOGFILE}
+log_msg -t -s "ENIQ check for snapshot_cache_fs completed" -l ${LOGFILE}
+log_msg -t -s "Check log ${LOGFILE}\n"
+exit ${_RET_CODE_}

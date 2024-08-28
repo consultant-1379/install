@@ -1,0 +1,875 @@
+#!/bin/bash
+# ********************************************************************
+# Ericsson Radio Systems AB SCRIPT
+# ********************************************************************
+#
+#
+# (c) Ericsson Radio Systems AB 2023 - All rights reserved.
+#
+# The copyright to the computer program(s) herein is the property
+# of Ericsson Radio Systems AB, Sweden. The programs may be used
+# and/or copied only with the written permission from Ericsson Radio
+# Systems AB or in accordance with the terms and conditions stipulated
+# in the agreement/contract under which the program(s) have been
+# supplied.
+#
+# ********************************************************************
+# Name    : nbit2flat_Auto.bsh
+# Date    : 15/05/2023
+# Revision: /main/2
+# Purpose : Converts the nbit indexes to flat which are failing to convert automatically
+# Usage   : bash nbit2flat_Auto.bsh -t <file_with_table_names>
+#
+# ********************************************************************
+#
+#     Command Section
+#
+# ********************************************************************
+AWK=/usr/bin/awk
+BASENAME=/usr/bin/basename
+BASH=/usr/bin/bash
+CAT=/usr/bin/cat
+CD=/usr/bin/cd
+DATE=/usr/bin/date
+EXPECT=/usr/bin/expect
+CP=/usr/bin/cp
+CHMOD=/usr/bin/chmod
+CHOWN=/usr/bin/chown
+COLUMN=/usr/bin/column
+CUT=/bin/cut
+ECHO=/usr/bin/echo
+EGREP=/usr/bin/egrep
+GREP=/usr/bin/grep
+GTAR=/usr/bin/gtar
+HEAD=/usr/bin/head
+LN=/usr/bin/ln
+LS=/usr/bin/ls
+MKDIR=/usr/bin/mkdir
+ID=/usr/bin/id
+PASTE=/usr/bin/paste
+PS=/usr/bin/ps
+SED=/usr/bin/sed
+SU=/usr/bin/su
+RM=/usr/bin/rm
+TAIL=/usr/bin/tail
+TAR=/usr/bin/tar
+TEE=/usr/bin/tee
+TOUCH=/usr/bin/touch
+SYSTEMCTL=/usr/bin/systemctl
+SLEEP=/usr/bin/sleep
+WC=/bin/wc
+
+# ********************************************************************
+#
+#       Configuration Section
+#
+# ********************************************************************
+
+# Jumpstart Directory where all ENIQ SW will reside
+ENIQ_BASE_DIR=/eniq
+ENIQ_ADMIN_DIR=$ENIQ_BASE_DIR/admin/bin
+ENIQ_ADMIN=$ENIQ_BASE_DIR/admin
+ENIQ_BASE_SW=eniq_base_sw
+DEFAULT_USER=dcuser
+
+# Name of SunOS & ENIQ ini Files
+
+ENIQ_ENV=niq.rc
+ENIQ_INI=niq.ini
+RBAC_INI=RBAC.ini
+SUNOS_INI=SunOS.ini
+SENTINEL_INI=sentinel.ini
+STORAGE_INI=storage.ini
+DEPLOYMENT_TYPE=`$CAT /eniq/installation/config/extra_params/deployment`
+STORAGE_INI_TEMPL="storage_ini.${DEPLOYMENT_TYPE}"
+SYM_INI=sym_links.ini
+COORD_INI=coordinator_sym_links.ini
+BITMAP_ENV=${ENIQ_ADMIN}/etc/bitmapCheck.env
+
+## Function: abort_script ###
+#
+#   This will is called if the script is aborted thru an error
+#   signal sent by the kernel such as CTRL-C or if a serious
+#   error is encountered during runtime
+#
+# Arguments:
+#       $1 - Error message from part of program (Not always used)
+# Return Values:
+#       none
+abort_script()
+{
+_err_time_=`$DATE '+%Y-%b-%d_%H.%M.%S'`
+
+if [ "$1" ]; then
+    _err_msg_="${_err_time_} - $1"
+else
+    _err_msg_="${_err_time_} - ERROR : Script aborted.......\n"
+fi
+if [ "${LOGFILE}" ]; then
+    $ECHO "\nERROR: ${_err_msg_}\n" | $TEE -a ${LOGFILE}
+else
+    $ECHO "\nERROR: ${_err_msg_}\n"
+fi
+
+$RM -rf ${conn_string_dba_enc}
+$RM -rf ${conn_string_dc_enc}
+$RM -rf ${REP_CONN_STR_USER_DBA_ENC}
+
+exit 1
+}
+
+### Function: check_id ###
+#
+#   Check that the effective id of the user is correct
+#   If not print error msg and exit.
+#
+# Arguments: $1 : User ID name
+# Return Values: none
+#
+#
+check_id()
+{
+local _check_id_=`$ID  | $AWK -F\( '{print $2}' | $AWK -F\) '{print $1}'`
+if [ "$_check_id_" != "$1" ]; then
+    _err_msg_="You must be $1 to execute this script."
+    abort_script "$_err_msg_"
+fi
+}
+
+### Function: setup_env ###
+#
+# Setup path environment
+# Imports the common lib files which imports common functions
+#
+# Arguments: none
+# Return Values: none
+#
+#
+setup_env()
+{
+if [ ! "${ENIQ_BASE_DIR}" ]; then
+    ENIQ_BASE_DIR=/eniq
+fi
+
+double_line="======================================================================="
+single_line="-----------------------------------------------------------------------"
+
+# ENIQ Log Directory
+ENIQ_LOG_DIR=${ENIQ_BASE_DIR}/local_logs
+
+# Main Directory for the Core Installation SW
+ENIQ_INST_DIR=${ENIQ_BASE_DIR}/installation
+
+CONF_DIR=${ENIQ_INST_DIR}/config
+ENIQ_INI=niq.ini
+
+# Core install directory that contains scripts
+ENIQ_CORE_DIR=${ENIQ_INST_DIR}/core_install
+ENIQ_DATABASE_DIR=${ENIQ_BASE_DIR}/database/
+ENIQ_ADMIN=${ENIQ_BASE_DIR}/admin
+ENIQ_SQL=${ENIQ_ADMIN}/sql
+ENIQ_BKUP_SW_BIN_DIR=${ENIQ_BASE_DIR}/bkup_sw/bin
+ENIQ_HOME=/eniq/home/dcuser
+SCRIPT_HOME=${ENIQ_ADMIN}/bin
+LOG_DIR=${SCRIPT_HOME}/logs
+
+
+#Installation lib directory
+ENIQ_LIB_DIR=${ENIQ_INST_DIR}/core_install/lib/
+
+# ENIQ Config Directory
+ENIQ_CONF_DIR=${ENIQ_INST_DIR}/config
+
+# File containing the type of OSS installation. Eg. events or statistics
+INST_TYPE_FILE=${ENIQ_CONF_DIR}/ericsson_use_config
+
+# Source the common functions
+if [ -s ${COMMON_FUNCS_LIB} ]; then
+    . /eniq/installation/core_install/lib/common_functions.lib
+else
+    _err_msg_="File /eniq/installation/core_install/lib/common_functions.lib not found"
+    abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+fi
+
+# Get the System User and Group. All directories are owned by this
+SYSUSER=`iniget ENIQ_INSTALL_CONFIG -f ${ENIQ_CONF_DIR}/${SUNOS_INI} -v ENIQ_SYSUSER`
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not read SYSUSER param from ${ENIQ_CONF_DIR}/${SUNOS_INI}"
+    abort_script "$_err_msg_"
+fi
+
+SYSGRP=`$ID ${SYSUSER}|$AWK '{print $2}'|$AWK -F\( '{print $2}'|$AWK -F\) '{print $1}'`
+if [ ! "${SYSGRP}" ]; then
+    _err_msg_="Could not read SYSGRP param from ${ENIQ_CONF_DIR}/${SUNOS_INI}"
+    abort_script "$_err_msg_"
+fi
+
+_iqdir_=/eniq/sybase_iq
+version=`$CAT ${_iqdir_}/version/iq_version |$GREP -w VERSION`
+prt=$(iniget DWH -f /eniq/sw/conf/niq.ini -v PortNumber)
+REP_PORT=$(iniget REP -f /eniq/sw/conf/niq.ini -v PortNumber)
+dba_pass=$(inigetpassword DB -f /eniq/sw/conf/niq.ini -v DBAPassword)
+dcpublic_pass=$(inigetpassword DWH -f /eniq/sw/conf/niq.ini -v DCPUBLICPassword)
+dcbo_pass=$(inigetpassword DWH -f /eniq/sw/conf/niq.ini -v DCBOPassword)
+dc_pass=$(inigetpassword DWH -f /eniq/sw/conf/niq.ini -v DCPassword)
+dwhrep_pass=$(inigetpassword REP -f /eniq/sw/conf/niq.ini -v DWHREPPassword)
+etlrep_pass=$(inigetpassword REP -f /eniq/sw/conf/niq.ini -v ETLREPPassword)
+
+# Read the installation type - should be "events" or "stats"
+INSTALL_TYPE=`$CAT ${INST_TYPE_FILE} | $AWK -F\= '{print $2}'`
+
+
+CURR_SERVER_TYPE=`$CAT $ENIQ_CONF_DIR/installed_server_type | $EGREP -v  '^[[:blank:]]*#' | $SED -e 's/ //g'`
+# Read the storage type
+STORAGE_TYPE=`iniget STOR_TYPE -f ${ENIQ_BASE_DIR}/installation/config/SunOS.ini -v STORAGE_TYPE`
+if [ ! "${STORAGE_TYPE}" ]; then
+    _err_msg_="Could not obtain storage type from ${ENIQ_BASE_DIR}/installation/config/SunOS.ini"
+    abort_script "${_err_msg_}"
+fi
+SNAPSHOT_LOGFILE=/eniq/log/sw_log/rolling_snapshot_logs/prep_eniq_snapshots.log
+SERVICES='/eniq/installation/core_install/bin/list_services.bsh'
+
+# Create TEMP_DIR
+TEMP_DIR=/tmp/nbit2flat_Auto_logs
+manage_temp_dirs ${TEMP_DIR} create
+#manage_temp_dirs ${TEMP_DIR}/dbfhide_logs create
+
+# setting dbisql command for dba user
+conn_string_dba_dec="-c \"eng=dwhdb;links=tcpip{host=localhost;port=${prt}};uid=dba;pwd=${dba_pass}\""
+conn_string_dba_enc=${TEMP_DIR}/con_str_rm_encrypt.`uuidgen`
+
+# encrypt the connection string.
+get_encrypt_file "${conn_string_dba_dec}" "${conn_string_dba_enc}"
+DBISQL_DBA="dbisql -nogui -onerror exit @${conn_string_dba_enc}"
+DBPING_DBA="/eniq/sql_anywhere/bin64/dbping @${conn_string_dba_enc} "
+
+# Setting dbisql command for dc user
+conn_string_dc_dec="-nogui -onerror exit -c \"eng=dwhdb;links=tcpip{host=localhost;port=${prt}};uid=dc;pwd=${dc_pass}\""
+conn_string_dc_enc=${TEMP_DIR}/conn_string_dc_encryption.`uuidgen`
+
+# encrypt the connection string.
+get_encrypt_file "${conn_string_dc_dec}" "${conn_string_dc_enc}"
+DBISQL_DC="dbisql @${conn_string_dc_enc}"
+
+#Repdb configuration
+REP_CONN_STR_USER_DBA="-c \"uid=dba;pwd=${dba_pass};eng=repdb;links=tcpip{host=localhost;port=${REP_PORT}}\""
+REP_CONN_STR_USER_DBA_ENC=${TEMP_DIR}/con_str_repdb_encrypt.`uuidgen`
+
+# encrypt the connection string.
+get_encrypt_file "${REP_CONN_STR_USER_DBA}" "${REP_CONN_STR_USER_DBA_ENC}"
+DBISQL_DBA_REP="/eniq/sql_anywhere/bin64/dbisql -nogui @${REP_CONN_STR_USER_DBA_ENC}"
+
+DBPING_DBA_REP="/eniq/sql_anywhere/bin64/dbping @${REP_CONN_STR_USER_DBA_ENC}"
+}
+
+### Function: manage_temp_dirs ###
+#
+#   Creates a directory at given location
+#
+# Arguments: $1 : dir to created
+# Arguments: $2 : action type
+# Return Values: none
+#
+#
+manage_temp_dirs(){
+
+dir_name=$1
+action_type=${2^^}
+
+if [ "$action_type" == "REMOVE" -o "$action_type" == "CREATE" ]; then
+        $RM -rf $dir_name
+        if [ $? -ne 0 ]; then
+                log_msg -t -s "Failed to remove the temp directory $dir_name " >> $LOGFILE
+        fi
+fi
+
+if [ "$action_type" == "CREATE" ]; then
+        $MKDIR -p $dir_name
+        if [ $? -ne 0 ]; then
+                log_msg -t -s "Failed to create the temp directory $dir_name " >> $LOGFILE
+        else
+                log_msg -t -s "Created a working directory at ${dir_name}" -l ${LOGFILE}
+        fi
+fi
+
+}
+
+### Function: ping_db_status ###
+#
+#   pings DB as dba user
+#
+# Return Values: 1 : ping is unsuccessful
+# Return Values: 0 : ping is successful
+#
+#
+ping_db_status(){
+
+$DBPING_DBA > /dev/null
+if [ $? -eq 0 ]; then
+        return 0;
+else
+        return 1;
+fi
+}
+
+### Function: ping_repdb_status ###
+#
+#   pings DB as dba user
+#
+# Return Values: 1 : ping is unsuccessful
+# Return Values: 0 : ping is successful
+#
+#
+ping_repdb_status(){
+
+$DBPING_DBA_REP > /dev/null
+if [ $? -eq 0 ]; then
+        return 0;
+else
+        return 1;
+fi
+}
+
+### Function: precheck ###
+#
+#   Performs the pre-check before calling rebuilding indexes
+#
+# Return Values: None
+#
+#
+precheck(){
+
+        #check if loading & scheduler is stopped.
+        ping_db_status
+        if [[ $? -eq 0 ]]; then
+                 log_msg -t -s "DWHDB is running...." -l ${LOGFILE}
+        else
+                 log_msg -t -s "DWHDB is not running....Exiting" -l ${LOGFILE}
+                 abort_script "DWHDB is downn"
+        fi
+
+        ping_repdb_status
+        if [[ $? -eq 0 ]]; then
+                 log_msg -t -s "REPDB is running...." -l ${LOGFILE}
+        else
+                 log_msg -t -s "REPDB is not running....Exiting" -l ${LOGFILE}
+                  abort_script "REPDB is downn"
+        fi
+
+        # engine_check
+        eng_profile=`engine -e getCurrentProfile`
+        log_msg -t -s "Engine Profile: ${eng_profile}" -l ${LOGFILE}
+
+}
+
+### Function: file_from_user ###
+#
+#   Requests the file from the user, which contains table names to fix.
+#
+# Return Values: None
+#
+#
+file_from_user(){
+
+        #Ask user to make an entry of table_name in the tables.list file
+        log_msg -t -s "Please supply the filename containing tables which needed explicit conversion as dcuser" -l ${LOGFILE}
+        log_msg -t -s "Entries should be in below format,else script will fail\n" -l ${LOGFILE}
+        log_msg  -s "${single_line}" -l ${LOGFILE}
+        log_msg  -s "SAMPLE_TABLE_DAY_03" -l ${LOGFILE}
+        log_msg  -s "SAMPLE_TABLE_DAY_04" -l ${LOGFILE}
+        log_msg  -s "SAMPLE_TABLE_DAY_05" -l ${LOGFILE}
+        log_msg  -s "${single_line}\n" -l ${LOGFILE}
+
+        #read -p "Tables list File Path: " table_list_file
+}
+
+### Function: read_user_values ###
+#
+#   Reads values from user and validates against running ENIQ_S.
+#
+# Return Values: None
+#
+#
+read_user_values(){
+
+        table_list_file=${TABLES_FILE_NAME}
+        if [[ ! -s $table_list_file ]]; then
+                log_msg -t -s "No such file found at $table_list_file " -l ${LOGFILE}
+                abort_script "No file found.....Exiting (or) No entires found"
+        fi
+
+        $CAT $table_list_file | uniq | $SED  -e "/^$/d" > $TEMP_DIR/tables.list
+
+        # Getting Tables list file
+        $GREP -i "|" $TEMP_DIR/tables.list > /dev/null
+        if [[ $? -eq 0 ]]; then
+
+                # If uuids are also passed along with tablename
+                # <TableName>|<UUID>
+
+                $CP -p $TEMP_DIR/tables.list  $TEMP_DIR/tables_list_UUID
+
+                # Parse the table_name's for UUID's
+                log_msg -t -s "Parsing the filelist name for UUID" -l ${LOGFILE}
+                while read line; do
+                        _tb_n=`$ECHO $line | $CUT -d"|" -f1`
+                        $ECHO ${_tb_n} >> $TEMP_DIR/finalTables.list
+                done < $TEMP_DIR/tables.list
+                TABLE_LIST=$TEMP_DIR/finalTables.list
+        else
+                TABLE_LIST=$TEMP_DIR/tables.list
+        fi
+
+        # Sorting for unique entires
+        $SORT -u $TABLE_LIST > $TEMP_DIR/sorted_unique.list
+        $CP -p $TEMP_DIR/sorted_unique.list $TABLE_LIST
+        dos2unix $TABLE_LIST
+
+        log_msg -t -s "Total no:of unique tables supplied:  `$WC -l ${TABLE_LIST} | $CUT -d " " -f1` \n" -l ${LOGFILE}
+        #check if the list is having valid tables and by dc
+        log_msg -t -s "Checking if tables exist in database\n" -l ${LOGFILE}
+        $MKDIR -p $TEMP_DIR/table_check;
+
+        for table in `$CAT ${TABLE_LIST}`;
+        do
+                COUNT_FILE=$TEMP_DIR/table_check/${table}_count.txt
+                $DBISQL_DC "select count(*) from systab where table_name='${table}' and creator='103'" > $COUNT_FILE
+
+                $CAT $COUNT_FILE | $EGREP -v "rows|count|-" | $GREP  "1" >> /dev/null
+                if [[ $? -ne 0 ]]; then
+                        log_msg -t -s "$table not found in DB. Please check the name supplied." -l ${LOGFILE}
+                        abort_script "$table not found"
+                else
+                log_msg -t -s "$table found in DB" -l ${LOGFILE}
+
+                fi
+        done
+        log_msg -t -s "All supplied tables are found in DB\n" -l ${LOGFILE}
+
+        # Get the threshold(FP_NBIT_AUTOSIZE_LIMIT) setting from DB
+        $RM -rf /eniq/home/dcuser/threshold.value
+        log_msg -t -s "Getting the Rollover limit from DB" -l ${LOGFILE}
+        $DBISQL_DBA "select setting from sysoptions where [Option] like '%FP_NBIT_AUTOSIZE_LIMIT%'; output to /eniq/home/dcuser/threshold.value" > /dev/null 2>&1
+        if [[ $? -ne 0 ]]; then
+                 #statements
+                log_msg -t -s "Failed to fetch the FP_NBIT_AUTOSIZE_LIMIT from DB " -l ${LOGFILE}
+        else
+                ROLLOVER_THRESHOLD=`$CAT /eniq/home/dcuser/threshold.value | $SED -e "s/'//g"`;
+                if [[ ! $ROLLOVER_THRESHOLD -gt 0 ]]; then
+                        abort_script " Unable to fetch the ROLLOVER_THRESHOLD value....Exiting"
+                fi
+                log_msg -t -s "Limit for FP_NBIT_AUTOSIZE_LIMIT: ${ROLLOVER_THRESHOLD} \n" -l ${LOGFILE}
+        fi
+
+        log_msg -s "${double_line}\n" -l ${LOGFILE}
+
+# Cleanup
+$RM -rf $TEMP_DIR/sorted_unique.list
+
+}
+
+### Function: generate_table_inforamtion ###
+#
+#   Generates the cardinality,indexes,column info for the supplied tables.
+#
+# Return Values: None
+#
+#
+generate_table_inforamtion(){
+
+        log_msg -s "\n" -l ${LOGFILE}
+        log_msg -s "${double_line} \n" -l ${LOGFILE}
+
+        mkdir -p $TEMP_DIR/cardinality/ $TEMP_DIR/sysindexes/ $TEMP_DIR/syscolumns/
+
+        # Run the sp_iqcardinality_analysis 'DC_E_ERBSG2_EUTRANCELLFDD_DAY_03','dc'
+        for tn in `$CAT ${TABLE_LIST}`;
+        do
+                log_msg -t -s "Generating the cardinality,indexes,columns info for ${tn}\n" -l ${LOGFILE}
+                #cardinality
+                CARDINALITY_TXT=$TEMP_DIR/cardinality/${tn}_cardinality.txt
+                $DBISQL_DBA "sp_iqcardinality_analysis '${tn}','dc'" > $CARDINALITY_TXT
+                if [[ $? -ne 0 ]]; then
+                        #statements
+                        abort_script "Failed to Generate the cardinality for ${tn}"
+                fi
+                $ECHO $CARDINALITY_TXT >> $TEMP_DIR/cardinality_file.list
+
+                #indexes
+                INDEXES_TXT=$TEMP_DIR/sysindexes/${tn}_indexes.txt
+                $DBISQL_DBA "select iname,tname,colnames from sys.sysindexes where tname='${tn}' and iname like '%FP'" | $SED -e "s/ASC//g" > ${INDEXES_TXT}
+                if [[ $? -ne 0 ]]; then
+                        #statements
+                        abort_script "Failed to Generate the indexes info for ${tn}"
+                fi
+                $ECHO $INDEXES_TXT >> $TEMP_DIR/indexes_file.list
+
+                #columns
+                COLUMNS_TXT=$TEMP_DIR/syscolumns/${tn}_columns.txt
+                $DBISQL_DBA "select * from sys.syscolumns where tname='${tn}' and creator='dc' " > ${COLUMNS_TXT}
+                if [[ $? -ne 0 ]]; then
+                        #statements
+                        abort_script "Failed to Generate the columns info for ${tn}"
+                fi
+                $ECHO $COLUMNS_TXT >> $TEMP_DIR/columns_file.list
+
+        done
+
+        log_msg -t -s "Successfully generated table information for all tables\n" -l ${LOGFILE}
+}
+
+### Function: asses_cardinality ###
+#
+#   Post generating the table information, cardinality of columns will be assessed.
+#   The columns/indexes crossing the threshold value will be listed
+# Return Values: None
+#
+#
+asses_cardinality(){
+
+        # Perform some calculations to get the supposed indexes to convert
+        mkdir -p ${TEMP_DIR}/rebuild/
+        log_msg -t -s "Getting all the indexes which needed explicit conversion\n" -l ${LOGFILE}
+
+        if [[ -z $ROLLOVER_THRESHOLD ]]; then
+                ROLLOVER_THRESHOLD=2097152;
+                log_msg -t -s "Setting default ROLLOVER_THRESHOLD value to   : ${ROLLOVER_THRESHOLD}" -l ${LOGFILE}
+        fi
+
+        # 2097152 - 1800000 == 297152
+        ROLLOVER_LOWER_LIMIT=`expr "$ROLLOVER_THRESHOLD" - 297152` #1800000
+        log_msg -t -s "ROLLOVER_THRESHOLD is   : ${ROLLOVER_THRESHOLD}" -l ${LOGFILE}
+        log_msg -t -s "ROLLOVER_LOWER_LIMIT is : ${ROLLOVER_LOWER_LIMIT}" -l ${LOGFILE}
+
+        if [[ -z $ROLLOVER_LOWER_LIMIT && -z $ROLLOVER_THRESHOLD && $ROLLOVER_LOWER_LIMIT > 0 && $ROLLOVER_THRESHOLD && $ROLLOVER_LOWER_LIMIT ]]; then
+                abort_script "Unable to fetch values for ROLLOVER_THRESHOLD & ROLLOVER_LOWER_LIMIT...Exiting"
+        fi
+
+        # read -p "Do you want to continue with the above mentioned range? enter Y/y : " range_user_confirm
+
+        # if [ ${range_user_confirm} == "y" -o  ${range_user_confirm} == "Y" ]; then
+
+        #   log_msg -t -s "User is ok with the range shown" -l ${LOGFILE}
+        # else
+        #   log_msg -t -s "User is not ok with the range" -l ${LOGFILE}
+        #   abort_script "User selected other than y/Y"
+        # fi
+
+        for tn in `$CAT ${TABLE_LIST}`;
+        do
+                # DIM_DATE|DATE_ID|14
+                # DIM_DATE|DAY_ID|14
+
+                cat $TEMP_DIR/cardinality/${tn}_cardinality.txt | egrep -v "table_name|-|rows" | awk -F" " '{ if ($4 <= '$ROLLOVER_THRESHOLD' && $4 >= '$ROLLOVER_LOWER_LIMIT' ) {print $1 "|" $3 "|" $4}}' >> ${TEMP_DIR}/rebuild/${tn}_crossed_columns.txt
+                if [[ $? -ne 0 ]]; then
+                        abort_script "Failed to get columns to rebuild for ${tn}"
+                fi
+
+        done
+
+        log_msg -t -s "Listed out the indexes which needed explicit conversion\n" -l ${LOGFILE}
+        log_msg -s "${double_line}\n\n" -l ${LOGFILE}
+
+}
+
+### Function: show_index_types ###
+#
+#   Displays the indexes style, whether it is Flat FP or Nbit FP.
+#
+# Return Values: None
+#
+#
+show_index_types(){
+
+        table_name_param=$1
+        position=$2
+        _count_=0
+
+        # $RM -r /var/tmp/display_itype.txt;
+
+        log_msg -t -s "Showing index types for table ${table_name_param} ${position} converting \n" -l ${LOGFILE}
+        log_msg -s "Sn  TABLE \t COLUMN \t DISTINCT_COUNT \t INDEX_NAME \t  STYLE" -l ${LOGFILE}
+
+        for line in `$CAT ${TEMP_DIR}/rebuild/${table_name_param}_crossed_columns.txt`;
+        do
+                    # select colnames,indextype from sys.sysindexes where tname='${_table_name_}' and colnames like '%${_column_name_}%' and iname like '%FP'; output to /var/tmp/display_itype.txt append
+                    # sp_iqindexmetadata 'ASIQ_IDX_T398926_C1093_FP' ,'DC_E_ERBSG2_EUTRANCELLFDD_DAY_03', 'dc'
+                    _count_=`expr "$_count_" + 1`
+                    _table_name_=`$ECHO $line | $CUT -d"|" -f1`
+                    _column_name_=`$ECHO $line | $CUT -d"|" -f2`
+                    _column_threshold_=`$ECHO $line | $CUT -d"|" -f3`
+                    _index_name_=`$CAT $TEMP_DIR/sysindexes/${_table_name_}_indexes.txt | $GREP -w ${_column_name_} |$CUT -d " " -f1 | $HEAD -1 `
+
+                    _style_=`$DBISQL_DBA "sp_iqindexmetadata '${_index_name_}' ,'${_table_name_}', 'dc'" | $GREP -i "Style"` 
+
+                    $ECHO ${_style_} | $GREP -i "Nbit" >> /dev/null
+                    if [[ $? -eq 0 ]]; then
+                            _display_style_="NBit FP"
+                    fi
+
+                    $ECHO ${_style_} | $GREP -w "Flat" >> /dev/null
+                    if [[ $? -eq 0 ]]; then
+                            _display_style_="Flat style FP"
+                    fi
+
+                    log_msg -s "${_count_}   ${_table_name_} \t ${_column_name_} \t ${_column_threshold_} \t \t ${_index_name_} \t ${_display_style_}" -l ${LOGFILE}
+        done
+
+        # $CAT /var/tmp/display_itype.txt | sort -u | $SED -e "s/'//g" -e "s/ ASC//g" | $CUT -d"," -f1,2 | $TEE ${LOGFILE}
+        log_msg  -s "\n" -l ${LOGFILE}
+}
+
+### Function: buil_sql ###
+#
+#   Rebuilds the indexes, which have cardinality in range of ROLLOVER_LOWER_LIMIT & ROLLOVER_THRESHOLD
+#
+# Return Values: None
+#
+#
+buil_sql(){
+
+        log_msg -s "${double_line}\n" -l ${LOGFILE}
+        mkdir -p ${TEMP_DIR}/sql/
+
+        for tn in `$CAT ${TABLE_LIST}`;
+        do
+                # DIM_DATE|DATE_ID|14
+                # DIM_DATE|DAY_ID|14
+                for line in `$CAT ${TEMP_DIR}/rebuild/${tn}_crossed_columns.txt`; do
+                        # rebuild the indexes that are got in check_cardinality()
+                        # sp_iqrebuildindex 'dc.DC_E_ERBSG2_EUTRANCELLFDD_DAY_03', 'column pmUlGrantsTransVolte 0';
+                        _table_name_=`$ECHO $line | $CUT -d"|" -f1`
+                        _column_name_=`$ECHO $line | $CUT -d"|" -f2`
+                        _column_threshold_=`$ECHO $line | $CUT -d"|" -f3`
+                        $ECHO "sp_iqrebuildindex 'dc.${_table_name_}', 'column ${_column_name_} 0';" >> ${TEMP_DIR}/sql/${tn}_rebuild.sql
+                done
+
+                log_msg -s "${single_line}\n" -l ${LOGFILE}
+
+                if [ -s ${TEMP_DIR}/sql/${tn}_rebuild.sql ];
+                then
+                        ping_db_status
+                        if [[ $? -eq 0 ]]; then
+                                show_index_types ${tn} "before"
+                                log_msg -t -s "Trying to convert indexes for table: ${tn} \n " -l ${LOGFILE}
+                                # Execute SQL by locking tables
+                                # $DBISQL_DBA "select now()" >> /dev/null
+                                $ECHO "lock table dc.${tn} with hold in exclusive mode;" >> ${TEMP_DIR}/sql/${tn}_rebuild.sql
+                                $ECHO "sp_iqlocks;" >> ${TEMP_DIR}/sql/${tn}_rebuild.sql
+                                $DBISQL_DBA ${TEMP_DIR}/sql/${tn}_rebuild.sql >>  ${TEMP_DIR}/sql.log
+                                if [[ $? -ne 0 ]]; then
+                                        log_msg -t -s "Failed to convert the below indexes for table: ${tn}\n" -l ${LOGFILE}
+				                        # $CUT -d"|" -f 2,3 --output-delimiter=', '  ${TEMP_DIR}/rebuild/${tn}_crossed_columns.txt | $TEE ${LOGFILE}
+                                        show_index_types ${tn} "after failed"
+                                        generateDDPReportFor ${tn} "Failure"
+                                else
+                                        log_msg -t -s "Successfully Converted indexes for table: ${tn}\n" -l ${LOGFILE}
+                                        # echo > /var/tmp/data.report!
+                                        # $CUT -d"|" -f 2,3 --output-delimiter=', '  ${TEMP_DIR}/rebuild/${tn}_crossed_columns.txt | $TEE ${LOGFILE}
+                                        show_index_types ${tn} "after"
+                                        generateDDPReportFor ${tn} "Success"
+                                fi
+                else
+                    log_msg -t -s "dwhdb is not running....Exiting" -l ${LOGFILE}
+                    abort_script "DB is down"
+                fi
+            else
+                log_msg -t -s "No Indexes Found to convert for table: ${tn}" -l ${LOGFILE}
+                generateDDPReportFor ${tn} "No-Indexes-Found"
+            fi
+            log_msg -s "${single_line}\n" -l ${LOGFILE}
+        done
+}
+
+### Function: generateDDPReportFor ###
+#
+#   Generates the DDP report file which has the high-level information.
+#   
+# Return Values: None
+#
+#
+generateDDPReportFor(){
+        FEIB=/eniq/log/sw_log/iq/bitmapDailyLogs/filteredEIB.btmp
+        DDP_Report=/eniq/log/sw_log/iq/bitmapDailyLogs/ddp.report
+
+        if [[ ! -d ${TEMP_DIR}/DDP ]]; then
+                $MKDIR -p ${TEMP_DIR}/DDP
+        fi
+
+        if [[ ! -s $DDP_Report  ]]; then
+                $TOUCH $DDP_Report
+                $ECHO "TABLE_NAME|STATUS|FILENAME|ERROR_TS|ENGID|FIXED_TS|RUN|UUID" > $DDP_Report
+        fi
+
+        local table_name=$1
+        local status=$2
+        # get the passed UUID from tableslist file.
+        local passedUUID=`$GREP -w ${table_name} $TEMP_DIR/tables_list_UUID | $HEAD -1 | $CUT -d"|" -f2`
+        local fixedAt=`date '+%Y-%m-%d_%H:%M:%S'`
+        local RN
+        RN=`$GREP -i RUNNUMBER= ${BITMAP_ENV} | $HEAD -1 | $CUT -d "=" -f2`
+        if [[ -z $RN ]]; then
+                RN="NA"
+        fi
+
+        # Populate the DDP.report!
+        if [[ -z ${FAILED_TABLES} ]]; then
+                # No failed Tables
+                # Setting same status for similar tables.
+                $GREP -w $table_name $FEIB > ${TEMP_DIR}/DDP/${table_name}.ddp
+                if [[ -s ${TEMP_DIR}/DDP/${table_name}.ddp ]]; then 
+                    while read fbs; do
+                        local FILENAME=`$ECHO $fbs | $CUT -d"|" -f1`
+                        local CHECKEDAT=`$ECHO $fbs | $CUT -d"|" -f2`
+                        local BITMAPSEEN=`$ECHO $fbs | $CUT -d"|" -f3`
+                        local ERRORTS=`$ECHO $fbs | $CUT -d"|" -f4`
+                        local ENGID=`$ECHO $fbs | $CUT -d"|" -f5`
+                        local UUID=`$ECHO $fbs | $CUT -d"|" -f6`
+                        $ECHO "${table_name}|${status}|${FILENAME}|${ERRORTS}|${ENGID}|${fixedAt}|${RN}|${UUID}" >> $DDP_Report
+                    done < ${TEMP_DIR}/DDP/${table_name}.ddp
+                fi
+        else
+            # Yes: Failed tables
+            # DC_E_ERBSG2_BBPROCESSINGRESOURCE_DAY_01|Success|error-1.log|16.10-11:37:35|112147|2021-01-06_09:46:41|31648119-f912-4138-bbb9-6166d51c0631
+
+            # change the status of existing entries in the DDP-Report on basis of UUID!
+            $AWK -F"|" -v P_UID=$passedUUID -v st="$status" -v dt="$fixedAt" -v rnum="$RN" '{if ($NF == P_UID) { {$2=st} {$6=dt} {$7=rnum} } {print $0} {OFS="|"} }' $DDP_Report > ${TEMP_DIR}/DDP/ddp_report.copy
+            if [[ $? -ne 0 ]]; then
+                log_msg -t -s "Unable to update the status for $table_name having $passedUUID, latest status --> $status" -l ${LOGFILE}
+            else
+                log_msg -t -s "Updated the status for $table_name having $passedUUID " -l ${LOGFILE}
+            fi
+
+            # Copy back the original report!
+            $CP -p ${TEMP_DIR}/DDP/ddp_report.copy $DDP_Report
+            if [[ $? -ne 0 ]]; then
+                    log_msg -t -s "Unable to copy back the DDP report...!" -l ${LOGFILE}
+            fi
+        fi
+
+# Cleanup
+$RM -rf ${TEMP_DIR}/DDP
+
+}
+
+### Function: backup_logs ###
+#
+# Back-up the logs & Zips them.
+#
+# Return Values: None
+#
+#
+backup_logs(){
+        start_time_tar=`date '+%m-%d-%y_%H-%M-%S'`
+        log_msg -t -s "Backing up the logs....!" -l ${LOGFILE}
+        log_msg -t -s "working Dir: ${TEMP_DIR}" -l ${LOGFILE}
+        log_msg -t -s "Logfile: ${LOGFILE}" -l ${LOGFILE}
+        $CP -p ${LOGFILE} ${TEMP_DIR}/
+        tar -zcf nbit2flat_BACKUP_${start_time_tar}.tar.gz ${TEMP_DIR} > /dev/null 2>&1
+        if [[ $? -eq 0 ]]; then
+                $ECHO "Backed up all logs & zipped at : nbit2flat_BACKUP_${start_time_tar}.tar.gz"
+        else
+                $ECHO " WARNING: Failed to zip the logs...."
+        fi
+}
+
+usage_msg(){
+        $ECHO "---> USAGE: bash nbit2flat_Auto.bsh -t <file_name_with_table_names>"
+        $ECHO "(or)"
+        $ECHO "---> USAGE: bash nbit2flat_Auto.bsh -t <file_name_with_table_names> -f"
+}
+
+### Function: handleDDPHeader ###
+#
+#   The DDP header in ddp.report will be fixed in-case of anomalies.
+#
+# Return Values: None
+#
+#
+handleDDPHeader(){
+
+        headerLine=`$GREP -in "TABLE_NAME" $DDP_Report | $CUT -d":" -f1`
+        if [[ $headerLine -eq 1 ]]; then
+                headerHere="TABLE_NAME|STATUS|FILENAME|ERROR_TS|ENGID|FIXED_TS|RUN|UUID"
+                $SED -i "1d" $DDP_Report
+                $SED -i "1s/^/$headerHere\n/" $DDP_Report
+        fi
+}
+
+# ********************************************************************
+#
+#     Main body of program
+#
+# ********************************************************************
+#
+# Ctrl+C
+trap "abort_script" INT
+
+# Check that the effective id of the user is root
+check_id $DEFAULT_USER
+
+while getopts "ft:l:" arg; do
+  case $arg in
+    t) FILE_PASSED="YES"
+           TABLES_FILE_NAME="$OPTARG"
+       ;;
+    f) FAILED_TABLES="YES"
+               ;;
+       l) LOGFILE_SUPPLIED="YES"
+       LOGFILE="$OPTARG"
+        ;;
+    \?) _err_msg_="Wrong usage of script"
+                usage_msg
+       abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+       ;;
+  esac
+done
+shift `expr $OPTIND - 1`
+
+if [[ -z ${FILE_PASSED} ]]; then
+        usage_msg
+        abort_script "Wrong usage of the script....Exiting"
+fi
+
+# Incase no logfile passed!
+if [[ -z $LOGFILE ]]; then
+        start_time=`date '+%m-%d-%y_%H.%M.%S'`
+        LOGFILE="/eniq/log/sw_log/iq/bitmapDailyLogs/index_conversion_${start_time}.log"
+        $RM -rf $LOGFILE
+        $TOUCH $LOGFILE
+fi
+
+$ECHO "Log file: $LOGFILE"
+
+# Set up environment variables for script.
+setup_env
+
+log_msg -s "${double_line}\n" -l ${LOGFILE}
+log_msg -t -s "Starting the Procedure for Converting Nbit-FP indexes to Flat-FP" -l $LOGFILE
+
+precheck
+
+read_user_values
+
+generate_table_inforamtion
+
+asses_cardinality
+
+if [[ $ROLLOVER_LOWER_LIMIT -ge 1800000 && $ROLLOVER_THRESHOLD -gt $ROLLOVER_LOWER_LIMIT  ]]; then
+       log_msg -t -s "Triggering build_sql after checking the lower limit" -l ${LOGFILE}
+       buil_sql
+else
+       log_msg -t -s "Issue with the lower & upper limits of ROLLOVER_THRESHOLD" -l ${LOGFILE}
+       abort_script "Exiting......"
+fi
+
+
+handleDDPHeader
+
+manage_temp_dirs ${TEMP_DIR} remove
+
+log_msg -t -s "Successfully Completed the Automation Procedure....for supplied tables" -l $LOGFILE
+
+$RM -rf ${conn_string_dba_enc}
+$RM -rf ${conn_string_dc_enc}
+$RM -rf ${REP_CONN_STR_USER_DBA_ENC}

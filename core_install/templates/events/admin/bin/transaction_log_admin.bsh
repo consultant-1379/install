@@ -1,0 +1,823 @@
+#!/bin/bash 
+# ********************************************************************
+# Ericsson Radio Systems AB                                     SCRIPT
+# ********************************************************************
+#
+#
+# (c) Ericsson Radio Systems AB 2012 - All rights reserved.
+#
+# The copyright to the computer program(s) herein is the property
+# of Ericsson Radio Systems AB, Sweden. The programs may be used 
+# and/or copied only with the written permission from Ericsson Radio 
+# Systems AB or in accordance with the terms and conditions stipulated 
+# in the agreement/contract under which the program(s) have been 
+# supplied.
+#
+# ********************************************************************
+# Name    :transaction_log_admin.bsh
+# Date    : 15/10/2018
+# Revision: main\8
+# Purpose : This script is used to truncate the transaction log of the 
+#			dwhdb and repdb in the recommended manner.
+#
+# Usage   : bash transaction_log_admin.bsh -t dwhdb|repdb [-l LOGFILE] [-u] [-R] [-N]
+#
+# ********************************************************************
+#
+# 	Command Section
+#
+# ********************************************************************
+#
+AWK=/usr/bin/awk
+BASENAME=/usr/bin/basename
+CAT=/usr/bin/cat
+DATE=/usr/bin/date
+ECHO='/usr/bin/echo -e'
+EGREP=/usr/bin/egrep
+GREP=/usr/bin/grep
+ID=/usr/bin/id
+LS=/usr/bin/ls
+SED=/usr/bin/sed
+SLEEP=/usr/bin/sleep
+SU=/usr/bin/su
+SSH=/usr/bin/ssh
+TAIL=/usr/bin/tail
+TEE=/usr/bin/tee
+TOUCH=/usr/bin/touch
+WC=/usr/bin/wc
+
+
+# Name of SunOS & ENIQ ini Files
+ENIQ_INI=niq.ini
+SUNOS_INI=SunOS.ini
+
+### Function: abort_script ###
+#
+#  abort function
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+abort_script()
+{
+if [ "$1" ]; then
+    _err_msg_=$1
+else
+    _err_msg_="Script aborted.......\n"    
+fi
+
+$ECHO $_err_msg_  | $TEE -a ${LOGFILE}
+
+
+exit 1
+}
+
+### Function: usage_msg ###
+#
+#   Print out the usage message
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+usage_msg()
+{
+$CLEAR
+$ECHO "
+Usage: `$BASENAME $0` -t
+
+options:
+        -t dwhdb|repeb	: Truncate transaction log of the indicated database
+
+        -l  : Optional parameter specifying the full path to logfile. If not specified, a 
+              logfile will be created in ${LOGFILE_DIR}
+
+        -u	: Indicates that the script is being run as part of upgrade, thus engine does not need to be put on hold
+        
+        -R	: Renaming the transaction log from *.log to *.tran
+
+"
+}
+
+### Function: setup_env ###
+#
+# Setup up path environment etc
+#
+# Arguments:
+#	none
+# Return Values:
+#	DWH_port,DWH_eng and DBA password
+
+setup_env()
+{
+ENIQ_BASE_DIR=/eniq
+ENIQ_SW_DIR=${ENIQ_BASE_DIR}/sw
+ENIQ_BKUPSW_DIR=${ENIQ_BASE_DIR}/bkup_sw
+CLI_CONF_DIR=${ENIQ_BASE_DIR}/sw/conf
+# Main Directory for the Core Installation SW
+ENIQ_INST_DIR=${ENIQ_BASE_DIR}/installation
+
+# ENIQ Config Directory
+ENIQ_CONF_DIR=${ENIQ_INST_DIR}/config
+# Main Directory for the admin SW
+ENIQ_ADMIN_DIR=${ENIQ_BASE_DIR}/admin
+
+# Main Directory for the Core Installation SW
+ENIQ_CORE_INST_DIR=${ENIQ_INST_DIR}/core_install
+
+# Source the common functions
+if [ -s ${ENIQ_BASE_DIR}/admin/lib/common_functions.lib ]; then
+    . ${ENIQ_BASE_DIR}/admin/lib/common_functions.lib
+else
+    _err_msg_="File ${ENIQ_BASE_DIR}/admin/lib/common_functions.lib not found"
+    abort_script "$_err_msg_"
+fi
+
+
+DBA_PASSWORD=`inigetpassword DB -f ${CLI_CONF_DIR}/${ENIQ_INI} -v DBAPassword`
+if [ ! ${DBA_PASSWORD} ]; then
+  if [ -f ${ENIQ_BASE_DIR}/sw/installer/dbusers ]; then
+            DBA_PASSWORD=`${ENIQ_BASE_DIR}/sw/installer/dbusers dba dwh`
+     if [ ! "${DBA_PASSWORD}" ] ; then
+                _err_msg_="Could not get dwhdb DBA Password"
+                abort_script "$_err_msg_"
+     fi
+   fi
+fi
+    
+
+#Initialising the environmental variables
+# RESULTSDIR is the location where results are stored
+RESULTSDIR=/eniq/local_logs/iq
+MAXNUMLOG=5
+
+db_start_up_flag=0
+IQDIR=/eniq/sybase_iq/IQ-*
+
+. ${ENIQ_CONF_DIR}/niq.rc
+if [ $? -ne 0 ]; then
+	_err_msg_="Could not source niq.rc  "
+	abort_script "${_err_msg_}"
+fi
+
+if [ -s ${ASA_DIR}/bin64/sa_config.sh ]; then
+	. ${ASA_DIR}/bin64/sa_config.sh >> /dev/null 2>&1
+else
+	_err_msg_="File ${ASA_DIR}/bin64/sa_config.sh not found or empty"
+	abort_script "$_err_msg_"
+fi
+
+if [ -s ${IQ_DIR}/IQ.sh ]; then
+	. ${IQ_DIR}/IQ.sh >> /dev/null 2>&1
+elif [ -s /eniq/sybase_iq/SYBASE.sh ]; then
+       . /eniq/sybase_iq/SYBASE.sh >> /dev/null 2>&1
+else
+	_err_msg_="File ${IQ_DIR}/IQ.sh and /eniq/sybase_iq/SYBASE.sh not found or empty"
+	abort_script "$_err_msg_"
+fi
+# Default user
+DEFAULT_USER=root
+
+# Get the System User.
+_sysuser_=`iniget ENIQ_INSTALL_CONFIG -f ${ENIQ_CONF_DIR}/${SUNOS_INI} -v ENIQ_SYSUSER`
+    
+}
+
+
+### Function: check_files_scripts ###
+#
+# Check all required files and scripts exist
+#
+# Arguments:
+#	none
+# Return Values:
+#	none
+check_files_scripts()
+{
+if [ ! -s ${ENIQ_ADMIN_DIR}/bin/manage_eniq_services.bsh ]; then
+    _err_msg_="${ENIQ_ADMIN_DIR}/bin/manage_eniq_services.bsh script not found"
+    abort_script "${_err_msg_}"
+fi
+
+if [ ! -s ${ENIQ_CORE_INST_DIR}/lib/get_ip_order.pl ]; then
+    _err_msg_="${ENIQ_CORE_INST_DIR}/lib/get_ip_order.pl script not found"
+    abort_script "${_err_msg_}"
+fi
+
+if [ ! -s ${SMF_CONTRACT_INFO} ]; then
+    _err_msg_="Could not find ${SMF_CONTRACT_INFO} file, or it is empty"
+    abort_script "${_err_msg_}" 
+fi
+
+if [ ! -s ${SERVER_TYPES_FILE} ]; then
+    _err_msg_="Could not find ${SERVER_TYPES_FILE} file, or it is empty"
+    abort_script "${_err_msg_}" 
+fi
+
+if [ ! -s ${SERVICE_NAMES_FILE} ]; then
+    _err_msg_="Could not find ${SERVICE_NAMES_FILE} file, or it is empty"
+    abort_script "${_err_msg_}" 
+fi
+
+if [ ! -d ${IQDIR} ]; then
+    _err_msg_="Folder for IQDIR ${IQDIR} not found"
+    abort_script "$_err_msg_"
+fi
+
+SQLANY=/eniq/sql_anywhere
+if [ ! -d ${SQLANY} ]; then
+    _err_msg_="Folder for SQLANY ${SQLANY} not found"
+    abort_script "$_err_msg_"
+fi
+
+}
+
+
+
+### Function: restore dwhdb.cfg ###
+#
+#   restore original dwhdb.cfg
+#   
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+restore_backup_file()
+{
+$LS $cfg_path_db/$cfg_backup_filename >/dev/null
+if [ $? -eq 0 ];
+then
+    log_msg -s "Restoring original $cfg_full_filename file" -l ${LOGFILE}
+    $SU - ${_sysuser_} -c "mv -f $cfg_path_db/$cfg_backup_filename $cfg_full_filename"
+    restore_return=$?
+    
+    
+    if [ $restore_return -ne 0 ]; then
+        _err_msg_="Could not restore $cfg_full_filename "
+        abort_script "${_err_msg_}"
+    fi
+
+else 
+    log_msg -s "Backup file $cfg_path_db/$cfg_backup_filename not found!"  -l ${LOGFILE}
+    log_msg -s "Failed to restore file $cfg_filename" -l ${LOGFILE}
+    exit 1
+
+    
+fi
+}
+
+### Function: backup dwhdb.cfg ###
+#
+#   backup original dwhdb.cfg
+#   
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+backup_file()
+{
+log_msg -s "Backing up original $cfg_full_filename file" -l ${LOGFILE}
+$SU - ${_sysuser_} -c "cp  $cfg_full_filename $cfg_path_db/$cfg_backup_filename"
+backup_return=$?
+
+if [ $backup_return -ne 0 ]; then
+    _err_msg_="Could not backup $cfg_full_filename "
+    abort_script "${_err_msg_}"
+fi
+}
+
+
+
+### Function: check_server ###
+#
+#   Check if the script is run on the coordinator
+#   
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+check_server()
+{
+
+CURR_SERVER_TYPE=`$CAT $ENIQ_CONF_DIR/installed_server_type | $EGREP -v  '^[[:blank:]]*#' | $SED -e 's/ //g'`
+if [ ! "${CURR_SERVER_TYPE}" ]; then
+    _err_msg_="Could not determine which server type this is"
+    abort_script "$_err_msg_" 
+fi
+
+if [ "${CURR_SERVER_TYPE}" == "eniq_coordinator" -o "${CURR_SERVER_TYPE}" == "stats_coordinator" \
+    -o "${CURR_SERVER_TYPE}" == "eniq_events" -o "${CURR_SERVER_TYPE}" == "eniq_stats" -o "${CURR_SERVER_TYPE}" == "eniq_iqw" -o "${CURR_SERVER_TYPE}" == "son_coordinator" ]; then
+    SERVER_TYPE="CO"
+fi
+
+if [ "$SERVER_TYPE" != "CO" ]; then
+    _err_msg_="You must be on coordinator to execute this script."
+    abort_script "$_err_msg_"
+fi
+}
+
+
+
+### Function: running engine commands ###
+# 
+#
+# Arguments:
+#       Engine comand to run and user to run it as.
+# Return Values:
+#       none
+engine_command()
+{
+    
+    
+    eng_command_id=$1
+    _sysuser_=$2
+
+    #engine commad mapper
+    if [ "$eng_command_id" == "NoLoads" ]; then
+        eng_command="engine -e changeProfile 'NoLoads'"
+    elif [ "$eng_command_id" == "Normal" ]; then
+        eng_command="engine -e changeProfile 'Normal'"
+    elif [ "$eng_command_id" == "InActive" ]; then
+        eng_command="engine -e changeProfile 'InActive'"
+    elif [ "$eng_command_id" == "slots" ]; then
+        eng_command="engine -e showSetsInExecutionSlots "
+    elif [ "$eng_command_id" == "status" ]; then
+        eng_command="engine status "
+    else
+        _err_msg_="unknown engine command"
+        abort_script "${_err_msg_}"
+    fi
+    
+    # If the IP found in the order file matches my IP,
+    # then I better run the command locally - no need to ssh
+    if [ -z $engine_ip ]; then
+        log_msg -s "Running engine command for $eng_command_id locally"  -l ${LOGFILE}
+        $SU - ${_sysuser_} -c  "${eng_command}"
+        if [ $? -ne 0 ]; then
+            _err_msg_="Could not run engine command"
+            abort_script "${_err_msg_}"
+        fi
+    else
+        log_msg -s "Running engine command for $eng_command_id on $engine_ip"  -l ${LOGFILE}
+        #$SSH -t -t -t -o StrictHostKeyChecking=no -o BatchMode=yes  $engine_ip "$SU - ${_sysuser_} -c \"${eng_command}\""
+        $SSH   $engine_ip "$SU - ${_sysuser_} -c \"${eng_command}\""
+        if [ $? -ne 0 ]; then
+            _err_msg_="Could not run engine command on $engine_ip"
+            abort_script "${_err_msg_}"
+        fi
+    fi
+
+
+
+
+ 
+}
+
+### Function: check_id ###
+#
+#   Check that the effective id of the user is correct
+#   If not print error msg and exit.
+#
+# Arguments:
+#       $1 : User ID name
+# Return Values:
+#       none
+check_id()
+{
+_check_id_=`$ID  | $AWK -F\( '{print $2}' | $AWK -F\) '{print $1}'`
+if [ "$_check_id_" != "$1" ]; then
+    _err_msg_="You must be $1 to execute this script."
+    abort_script "$_err_msg_"
+fi
+}
+
+
+
+
+
+### Function: truncate_log ###
+#
+# Setup up path environment etc
+#
+# Arguments:
+#	Name of the database to have its transaction log truncated.
+# Return Values:
+#	none
+
+truncate_log()
+{
+if [ "$1" == "dwhdb" ]
+then
+    sw_folder=${IQDIR}
+    eng=$DWH_ENG
+    port=$DWH_PORT
+elif [ "$1" == "repdb" ]
+then
+    sw_folder=${SQLANY}
+    eng=$REP_ENG
+    port=$REP_PORT
+fi
+    
+
+
+$SU - ${_sysuser_} -c ". /eniq/sybase_iq/SYBASE.sh;${sw_folder}/bin64/dbping -q -c \"con=$eng;eng=$eng;links=tcpip{host=localhost;port=${port};dobroadcast=none;verify=no};uid=dba;pwd=${DBA_PASSWORD}\"" >> ${LOGFILE} 2>&1
+ping_return=$?
+if [ $ping_return -ne 0 ]; then
+    log_msg -s "Trying to start $eng as initial ping did not respond."  -l ${LOGFILE}
+    bash ${ENIQ_ADMIN_DIR}/bin/manage_eniq_services.bsh -a start -s $eng -N -l ${LOGFILE}
+    
+    $SU - ${_sysuser_} -c ". /eniq/sybase_iq/SYBASE.sh;${sw_folder}/bin64/dbping -q -c \"con=$eng;eng=$eng;links=tcpip{host=localhost;port=${port};dobroadcast=none;verify=no};uid=dba;pwd=${DBA_PASSWORD}\"" >> ${LOGFILE} 2>&1
+    ping_return_2=$?
+	db_start_up_flag=1
+    if [ $ping_return_2 -ne 0 ]; then
+        _err_msg_="Could not ping database. The database should be started to begin truncation of log. Aborting script"
+        restore_backup_file 
+        abort_script "${_err_msg_}"
+    fi
+
+fi
+
+
+#running sql to commit changes
+log_msg -s "Running sql in the database."  -l ${LOGFILE}
+$SU - ${_sysuser_} -c ". /eniq/sybase_iq/SYBASE.sh;dbisql -nogui -c \"eng=$eng;links=tcpip{host=localhost;port=$port};uid=dba;pwd=$DBA_PASSWORD\"   \"commit; checkpoint; checkpoint; checkpoint;\" "
+sql_return=$?
+if [ $sql_return -ne 0 ]; then
+    _err_msg_="Could not execute sql commands."
+    restore_backup_file 
+    abort_script "${_err_msg_}"
+fi
+
+
+#stopping db
+log_msg -s "Stopping the database."  -l ${LOGFILE}
+bash ${ENIQ_ADMIN_DIR}/bin/manage_eniq_services.bsh -a stop -s $eng -N -l ${LOGFILE}
+stop_return=$?
+if [ $stop_return -ne 0 ]; then
+    _err_msg_="Could not stop $eng cleanly"
+    restore_backup_file 
+    abort_script "${_err_msg_}"
+fi
+
+#adding truncate command to cfg for start up
+echo -m >>$cfg_full_filename
+
+#starting db with -m .cfg file
+log_msg -s "Starting the database with -m flag to truncate transaction log."  -l ${LOGFILE}
+bash ${ENIQ_ADMIN_DIR}/bin/manage_eniq_services.bsh -a start -s $eng -N -l ${LOGFILE}
+start_m_return=$?
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not start $eng with -m flag"
+    restore_backup_file 
+    abort_script "${_err_msg_}"
+fi
+
+#restoring original cfg file and restarting database
+restore_backup_file 
+
+log_msg -s "Restarting the database."  -l ${LOGFILE}
+
+bash ${ENIQ_ADMIN_DIR}/bin/manage_eniq_services.bsh -a restart -s $eng -N -l ${LOGFILE}
+restart_return=$?
+if [ $restart_return -ne 0 ]; then
+    _err_msg_="Could not restart dwhdb"
+    abort_script "${_err_msg_}"
+fi
+
+}
+### Function: remove_old_logs ###
+#
+# removes old logs that exceed the max number of logs to be kept and cleans tmp sql files created during run.
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+#       
+remove_old_logs() 
+{
+Number_of_logs_present=$(ls  -lt $RESULTSDIR|grep transaction_log_admin_ |wc -l)
+number_of_logs_remove=`expr $Number_of_logs_present - $MAXNUMLOG `
+
+
+if  [[ $Number_of_logs_present -gt $MAXNUMLOG ]]
+then
+    for i in $(ls -r ${RESULTSDIR}/transaction_log_admin_* | tail -${number_of_logs_remove}) 
+    do
+        fileTOremove=$i
+        rm $fileTOremove; 
+    done	
+fi
+
+
+}
+
+### Function: user_confirm ###
+#
+# Get confirmation from user to proceed with snapshot action
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+user_confirm()
+{
+while :; do
+    unset USER_CONF
+    $CLEAR
+   
+    log_msg -s "\nAre you sure you wish to truncate the transaction log?" 
+     if [ "${upgrade_sybase_run}" != "YES"  -a "${rename_log}" == "YES" ]
+	then    
+                log_msg -s "\nThis will set the engine to NoLoads, stop the database, truncate the transaction log, rename the transcation log, restart the database and set the engine to Normal"
+	elif [ "${upgrade_sybase_run}" != "YES" ]
+	then   
+                log_msg -s  "\nThis will set the engine to NoLoads, stop the database, truncate the transaction log, restart the database and set the engine to Normal"
+    else        
+                log_msg -s "\nThis will stop the database, truncate the transaction log and restart the database"
+	fi
+        log_msg -s "Enter [Yes | No] (case sensitive) : \c" 
+        read USER_CONF
+    if [ "$USER_CONF" == "Yes" -o "$USER_CONF" == "No" ]; then
+         $ECHO $USER_CONF
+         break
+    fi
+done
+}
+
+### Function: rename_log ###
+#
+# renames transaction log from dwhdb.log to dwhdb.tran to avoid accidently deletion.
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+rename_log()
+{
+if [ "$1" == "repdb" ] 
+then
+    if [ -f $cfg_path_db/repdb.log ]; then
+        log_msg -s "Renaming the database transaction log from repdb.log to repdb.tran."  -l ${LOGFILE}
+        bash ${ENIQ_ADMIN_DIR}/bin/manage_eniq_services.bsh -a stop -s repdb -N -l ${LOGFILE}
+        if [ $? -ne 0 ]; then
+            _err_msg_="Could not stop the server."
+            abort_script "${_err_msg_}"
+        fi
+        $SU - ${_sysuser_} -c ". /eniq/sybase_iq/SYBASE.sh;dblog -t $cfg_path_db/repdb.tran $cfg_path_db/repdb.db"
+        if [ $? -ne 0 ]; then
+            _err_msg_="Could not rename the transaction log."
+            abort_script "${_err_msg_}"
+        fi
+        bash ${ENIQ_ADMIN_DIR}/bin/manage_eniq_services.bsh -a start -s repdb -N -l ${LOGFILE}
+        if [ $? -ne 0 ]; then
+            _err_msg_="Could not start the server."
+            abort_script "${_err_msg_}"
+        fi	
+        rm -f $cfg_path_db/repdb.log
+    else
+        log_msg -s "The database transaction log has already be renamed."  -l ${LOGFILE}
+    fi
+elif [ "$1" == "dwhdb" ] 
+then
+    if [ -f $cfg_path_db/dwhdb.log ]; then
+        log_msg -s "Renaming the database transaction log from dwhdb.log to dwhdb.tran."  -l ${LOGFILE}
+        bash ${ENIQ_ADMIN_DIR}/bin/manage_eniq_services.bsh -a stop -s dwhdb -N -l ${LOGFILE}
+        if [ $? -ne 0 ]; then
+            _err_msg_="Could not stop the server."
+            abort_script "${_err_msg_}"
+        fi
+        $SU - ${_sysuser_} -c ". /eniq/sybase_iq/SYBASE.sh;dblog -t $cfg_path_db/dwhdb.tran $cfg_path_db/dwhdb.db"
+        if [ $? -ne 0 ]; then
+            _err_msg_="Could not rename the transaction log."
+            abort_script "${_err_msg_}"
+        fi
+        bash ${ENIQ_ADMIN_DIR}/bin/manage_eniq_services.bsh -a start -s dwhdb -N -l ${LOGFILE}
+        if [ $? -ne 0 ]; then
+            _err_msg_="Could not start the server."
+            abort_script "${_err_msg_}"
+        fi	
+        rm -f $cfg_path_db/dwhdb.log
+    else
+        log_msg -s "The database transaction log has already be renamed."  -l ${LOGFILE}
+    fi
+fi
+}
+# ********************************************************************
+#
+# 	Main body of program
+#
+# ********************************************************************
+#
+
+
+while getopts "t:l:NuR" arg; do
+  case $arg in
+   t)	db="$OPTARG"
+        truncate_flag="yes"
+       ;;
+    l) LOGFILE="$OPTARG"
+       ;;
+    N) NO_CONFIRM="YES" 
+       ;;   
+    u) upgrade_sybase_run="YES" 
+       ;;
+    R) rename_log="YES"
+        ;;
+   \?) usage_msg 
+         _err_msg_="Invalid option used or no option used."
+        abort_script "${_err_msg_}"
+       	;;
+       
+  esac
+done
+
+if [ -z "${truncate_flag}" ]
+then
+    usage_msg 
+    _err_msg_="Invalid option used or no option used."
+    abort_script "${_err_msg_}"
+fi
+
+if [ $db == repdb -o  $db == dwhdb ] 
+then
+ echo ""
+else
+    usage_msg 
+    _err_msg_="Invalid option used or no option used."
+    abort_script "${_err_msg_}"
+fi
+
+# Pull in the environment
+setup_env
+setup_env_ec=$?
+if [ $setup_env_ec -ne 0 ]; then
+    _err_msg_="Could not set_env"
+    abort_script "$_err_msg_"
+fi
+
+
+
+TIMESTAMP=`$DATE +%d.%m.%y_%H:%M:%S`
+# Setup logfile
+if [ ! "$LOGFILE" ] ; then
+        LOGFILE=${RESULTSDIR}/transaction_log_admin_${TIMESTAMP}.log
+else
+    $TOUCH $LOGFILE
+    non_default_log="yes"
+fi 
+
+
+
+
+# Check that the effective id of the user is root, check the current server and check nescessary files exist
+log_msg -s "Checking for correct user and server type to exectue script."  -l ${LOGFILE}
+check_id $DEFAULT_USER
+check_server
+check_files_scripts
+
+#Confirming if the user wishes to proceed with action
+if [ ! "${NO_CONFIRM}" ]; then
+     user_confirm 
+     if [ $USER_CONF == No ]; then
+         exit 0
+     fi    
+fi
+
+
+log_msg -t -h -s "Starting $0"  -l ${LOGFILE}
+
+#engine is off for sybase upgrade so don't have to go to noloads
+if [ "${upgrade_sybase_run}" != "YES" ]
+then
+
+    # Get an ordered list of servers based on the server_list file
+    log_msg -s "Getting an ordered list of server(s)."  -l ${LOGFILE}
+    /usr/bin/perl ${ENIQ_CORE_INST_DIR}/lib/get_ip_order.pl -f /tmp/full_server_list
+    if [ $? -ne 0 ]; then
+        _err_msg_="Could not get an ordered list of servers"
+        abort_script "${_err_msg_}"
+    fi
+
+    engine_ip=$($GREP engine /tmp/full_server_list |$AWK -F"::" '{print $1}')
+
+    rm /tmp/full_server_list
+
+
+    #getting current engine profile
+    eng_profile=$( engine_command "status" "dcuser"  |$GREP "Current Profile: " |$SED 's/Current Profile: //'| tr -d ' ')
+
+
+    if [ "$eng_profile" != "NoLoads" ]
+    then 
+    #setting the engine to noloads profile
+        log_msg -s "Setting engine to noloads and wating for execution slots to empty"  -l ${LOGFILE}
+        engine_command "NoLoads" "dcuser"
+    else
+        no_engine_change="yes"
+    fi
+
+    exec_count=$( engine_command "slots" "dcuser" |egrep '(Loader|Count)'| wc -l)
+
+    while [ $exec_count -ne 0 ]
+    do
+        sleep 30
+        exec_count=$( engine_command "slots" "dcuser" |egrep '(Loader|Count)'| wc -l)
+    done
+
+fi
+
+if [ "$db" == "dwhdb" ] 
+then
+    DWH_PORT=`iniget DWH -v PortNumber -f ${ENIQ_CONF_DIR}/niq.ini`
+    DWH_ENG=`iniget DWH -v ServerName -f ${ENIQ_CONF_DIR}/niq.ini`
+    if [ ! "${DWH_PORT}" -o ! "${DWH_ENG}" ]; then
+        _err_msg_="Could not read db values from ${CLI_CONF_DIR}/${ENIQ_INI}"
+        abort_script "$_err_msg_"
+    fi
+    
+
+    cfg_path_db="/eniq/database/dwh_main"
+    cfg_filename="dwhdb.cfg"
+    cfg_full_filename=$cfg_path_db/$cfg_filename
+    cfg_backup_filename="dwhdb_backup.cfg"
+    
+    #backup the original cfg file
+    backup_file 
+    
+    if [ "${truncate_flag}" == "yes" ]
+    then
+        log_msg -s "Starting the process to truncate the database transaction log."  -l ${LOGFILE}
+        truncate_log dwhdb
+    else
+        usage_msg 
+        _err_msg_="Invalid option used or no option used."
+        abort_script "${_err_msg_}"
+    fi
+
+elif [ "$db" == "repdb" ] 
+then
+    REP_PORT=`iniget REP -v PortNumber -f ${ENIQ_CONF_DIR}/niq.ini`
+    REP_ENG=`iniget REP -v ServerName -f ${ENIQ_CONF_DIR}/niq.ini`
+    if [ ! "${REP_PORT}" -o ! "${REP_ENG}" ]; then
+        _err_msg_="Could not read db values from ${CLI_CONF_DIR}/${ENIQ_INI}"
+        abort_script "$_err_msg_"
+    fi
+    
+
+    cfg_path_db="/eniq/database/rep_main"
+    cfg_filename="repdb.cfg"
+    cfg_full_filename=$cfg_path_db/$cfg_filename
+    cfg_backup_filename="repdb_backup.cfg"
+
+    #backup the original cfg file
+    backup_file
+
+
+    if [ "${truncate_flag}" == "yes" ]
+    then
+        log_msg -s "Starting the process to truncate the database transaction log."  -l ${LOGFILE}
+        truncate_log repdb
+    else
+        usage_msg 
+        _err_msg_="Invalid option used or no option used."
+        abort_script "${_err_msg_}"
+    fi
+
+fi
+
+if [ "${rename_log}" == "YES" ]
+then
+#rename transaction log from dwhdb.log to dwhdb.tran	
+rename_log $db
+fi
+
+#engine is off for sybase upgrade so don't have to reset engine state
+if [ "${upgrade_sybase_run}" != "YES" ]
+then
+    if [ "$no_engine_change" != "yes" ]
+    then 
+        #setting the engine to original profile
+        log_msg -s "Setting engine to original profile."  -l ${LOGFILE}
+        engine_command "${eng_profile}" "dcuser" 
+    fi
+fi
+
+if [ "$non_default_log" != "yes" ]
+then
+log_msg -s "Tidying up old logs."  -l ${LOGFILE}
+remove_old_logs
+fi
+
+if [ $db_start_up_flag -eq 1 ]; then
+    log_msg -s "Stopping $eng after starting $eng up for truncation."  -l ${LOGFILE}
+    bash ${ENIQ_ADMIN_DIR}/bin/manage_eniq_services.bsh -a stop -s $eng -N -l ${LOGFILE}
+fi
+
+log_msg -t -h -s "Finishing $0"  -l ${LOGFILE}
+exit 0
+

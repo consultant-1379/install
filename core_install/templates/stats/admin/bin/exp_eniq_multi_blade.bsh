@@ -1,0 +1,614 @@
+#!/bin/bash
+# ********************************************************************
+# Ericsson Radio Systems AB                                     SCRIPT
+# ********************************************************************
+#
+#
+# (c) Ericsson Radio Systems AB 2022 - All rights reserved.
+#
+# The copyright to the computer program(s) herein is the property
+# of Ericsson Radio Systems AB, Sweden. The programs may be used 
+# and/or copied only with the written permission from Ericsson Radio 
+# Systems AB or in accordance with the terms and conditions stipulated 
+# in the agreement/contract under which the program(s) have been 
+# supplied.
+#
+# ********************************************************************
+# Name    : exp_eniq_multi_blade.bsh
+# Date    : 18/08/2023
+# Revision: \main\12
+# Purpose : Script to expand eniq stats single blade to multi blade
+#           
+#
+# Usage   : exp_eniq_multi_blade.bsh
+#
+# ********************************************************************
+#
+#   Command Section
+#
+# ********************************************************************
+
+AWK=/usr/bin/awk
+BASH=/usr/bin/bash
+CAT=/usr/bin/cat
+CP=/usr/bin/cp
+DATE=/usr/bin/date
+DIRNAME=/usr/bin/dirname
+ECHO='/usr/bin/echo -e'
+ENV=/usr/bin/env
+EGREP=/usr/bin/egrep
+GREP=/usr/bin/grep
+ID=/usr/bin/id
+MKDIR=/usr/bin/mkdir
+MV=/usr/bin/mv
+PWD=/usr/bin/pwd
+RM=/usr/bin/rm
+SED=/usr/bin/sed
+SUDO=/usr/bin/sudo
+SYSTEMCTL=/usr/bin/systemctl
+TEE=/usr/bin/tee
+TOUCH=/usr/bin/touch
+VGDISPLAY=/usr/sbin/vgdisplay
+VGRENAME=/usr/sbin/vgrename
+VGS=/usr/sbin/vgs
+
+
+# ********************************************************************
+#
+#       Configuration Section
+#
+# ********************************************************************
+# ********************************************************************
+#
+#       Pre-execution Operations
+#
+# ********************************************************************
+
+### Function: abort_script ###
+#
+# Abort the script and perform any cleanup in case of any error
+#
+# Arguments:
+#   Error String
+# Return Values:
+#   exit 1
+abort_script()
+{
+#Assigning the default value to variable if $1 is not defined
+_err_msg_=${1:="ERROR : Script aborted.......\n"}
+$ECHO "\nERROR : \n$_err_msg_\n" | $TEE -a ${LOGFILE} 2> /dev/null
+cd $SCRIPTHOME
+[ "${TEM_DIR}" ] && $RM -rf ${TEM_DIR}
+exit 1
+}
+### Function: change_fs_name ###
+#
+# Change the name in FS filesystem in SunOS.ini
+#
+# Arguments:
+#   $1   name to change from
+#   $2   name to change to
+# Return Values:
+#   none
+change_fs_name()
+{
+if  [ "${1}" = "" ]; then
+    _err_msg_="Must provide an name to change from"
+    abort_script "$_err_msg_"
+fi
+_change_from_=$1
+if  [ "${2}" = "" ]; then
+    _err_msg_="Must provide an name to change to"
+    abort_script "$_err_msg_"
+fi
+_change_to_=$2
+
+ #get the FS details for the server
+_zfs_fs_list=`iniget SunOS_ZFS_FS -f ${ENIQ_CONF_DIR}/${SUNOS_INI}`
+if [ ! "${_zfs_fs_list}" ]; then
+    _err_msg_="Could not get SunOS_ZFS_FS value from ${ENIQ_CONF_DIR}/${SUNOS_INI}"
+    abort_script "$_err_msg_"
+fi
+for _zfs_fs_ in ${_zfs_fs_list}; do
+    _zfs_fs_name_=`iniget ${_zfs_fs_} -f ${ENIQ_CONF_DIR}/${SUNOS_INI} -v name`
+    if [ ! "${_zfs_fs_name_}" ]; then
+        _err_msg_="Could not get name value for ${_zfs_fs_} in ${ENIQ_CONF_DIR}/${SUNOS_INI}"
+        abort_script "$_err_msg_"
+    fi
+    if [ "$($ECHO ${_zfs_fs_name_} | ${EGREP} ${_change_from_} )" ]; then
+        _new_zfs_name_=$($ECHO "${_zfs_fs_name_}" | $SED -e "s/^${_change_from_}/${_change_to_}/g")
+        if [ ! "${_new_zfs_name_}" ]; then
+            _err_msg_="Could not new name for FS"
+            abort_script "$_err_msg_"
+        fi
+        iniset ${_zfs_fs_} -f ${ENIQ_CONF_DIR}/${SUNOS_INI} name=${_new_zfs_name_}
+        if [ $? -ne 0 ]; then
+            _err_msg_="Could not update ${_zfs_fs_} in ${ENIQ_CONF_DIR}/${SUNOS_INI} with name=${_new_zfs_name_}"
+            abort_script "$_err_msg_"
+        fi
+    fi
+done
+    
+}
+
+### Function: chk_create_logfile ###
+#
+# Check/Create Logfile
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+chk_create_logfile()
+{
+if [[ ! -d "$(${DIRNAME} ${LOGFILE})" ]]; then
+    $MKDIR -p $(${DIRNAME} ${LOGFILE}) > /dev/null 2>&1
+    if [ $? -ne 0 ]; then
+        _err_msg_="Could not create directory [$($DIRNAME ${LOGFILE})]"
+        abort_script "${_err_msg_}"
+    fi
+fi
+$TOUCH -a ${LOGFILE}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not write to file [${LOGFILE}]"
+    abort_script "${_err_msg_}"
+fi
+}
+### Function: check_id ###
+#
+#   Check that the effective id of the user is correct
+#   If not print error message and exit.
+#
+# Arguments:
+#       $1 : User ID name
+# Return Values:
+#       none
+check_id()
+{
+ _get_id_=`$ENV |$GREP -w SUDO_USER | $EGREP "^[[:blank:]]*SUDO_USER="|$AWK -F\= '{print $2}'|$SED -e 's|"||g'`
+
+_check_id_=`$ID | $AWK -F\( '{print $2}' | $AWK -F\) '{print $1}'`
+
+_check_group_=`$ID $_get_id_ | $AWK -F\( '{print $3}' | $AWK -F\) '{print $1}'`
+
+
+    if [ "${_get_id_}" == "" ]; then
+
+        if [ "${_check_id_}" == "root" ]; then
+           # Set 1 for true
+           _user_root=1
+
+        else
+           _err_msg_="You must be root or admin to execute this script."
+           abort_script "${_err_msg_}"
+        fi
+    else
+        if [ "${_check_group_}" == "ENIQ_ADMIN_ROLE" ]; then
+           # Set 0 for false
+           _user_root=0
+
+        else
+            _err_msg_="You must be root or admin to execute this script." 
+            abort_script "${_err_msg_}"
+        fi
+    fi
+ 
+}
+### Function: get_absolute_path ###
+#
+# Determine absolute path to software
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+get_absolute_path() 
+{
+    _dir_=$($DIRNAME $0)
+    SCRIPTHOME=$(cd ${_dir_} 2>/dev/null && pwd || $ECHO ${_dir_})
+}
+
+### Function: lvm_reconfig ###
+#
+# Export the eniq stats Volume Group and re-import it as stats_coordinator_pool 
+# and update the ini files
+# Arguments:
+#   none
+# Return Values:
+#   none
+lvm_reconfig()
+{
+# Check pools are healthy before export
+_health_status_="r/w"
+
+if [ -s ${VAR_TMP_DIR}/mb_expansion_flag ]; then
+    _vg_name_=`$VGS -o name --noheading | $EGREP -w "eniq_stats_pool|stats_coordinator_pool"`
+    if [ ! -z ${_vg_name_} ]; then
+        _eniq_stats_pool=eniq_stats_pool
+        _eniq_stats_=eniq_stats
+        if [ ${_vg_name_} == "stats_coordinator_pool" ]; then
+            log_msg -s "VG is already renamed." -l ${LOGFILE}
+        else
+          # Get the list of all available VG on the server 
+            _vg_list_=`$VGS -o name --noheading | $EGREP -w "$_vg_name_"`
+            if [ ! -z ${_vg_list_} ]; then
+                log_msg -s "\nChecking the health of following Volume Group: ${_vg_list_}" -l ${LOGFILE}
+                # Check the health status of all fetched VG's
+                _vg_health_status_=`${VGDISPLAY} ${_vg_list_} -c  | $AWK -F":" '{print $2}'`
+                if [ "${_vg_health_status_}" != "r/w" ];then
+                    _err_msg_="VGs are not in proper state. Please check."
+                    abort_script "${_err_msg_}"
+                else
+                    log_msg -s "${_vg_list_} VG is online." -l ${LOGFILE}
+                fi
+            else 
+                _err_msg_="VGs are not in proper state. Please check."
+                abort_script "${_err_msg_}"
+            fi
+            ${ECHO} "NOTE : Stoping ENIQ services." | $TEE -a  ${LOGFILE}
+            ${BASH} ${ENIQ_ADMIN_DIR}/bin/manage_eniq_services.bsh -a stop -s ALL -N > /dev/null 2>&1
+
+            log_msg -s "Renaming $_vg_list_ to stats_coordinator_pool " -l ${LOGFILE}
+            ${VGRENAME} ${_vg_list_} stats_coordinator_pool >> /dev/null 2>&1
+            if [ $? -ne 0 ];then
+                _err_msg_="VGRENAME of ${_vg_list_} is not done Properly ."
+                abort_script "$_err_msg_"
+            fi
+
+            $ECHO "stats_coordinator_pool" > ${VAR_TMP_DIR}/mb_expansion_flag
+        fi  
+
+        $EGREP -w ${_eniq_stats_pool} /etc/fstab >> /dev/null 2>&1
+        if [ $? -eq 0 ] ; then
+            log_msg -s "Updating the entries in fstab file" -l ${LOGFILE}
+            $CP -p /etc/fstab /etc/fstab_bk 
+            $SED -i 's/eniq_stats_pool/stats_coordinator_pool/g' /etc/fstab
+            if [ $? -ne 0 ]; then
+                $CP -p /etc/fstab_bk /etc/fstab
+                abort_script "Could not update entries in fstab file with name=stats_coordinator_pool"
+            fi
+        fi
+        $EGREP -w ${_eniq_stats_} /root/.bash_profile >> /dev/null 2>&1
+        if [ $? -eq 0 ] ; then 
+            $CP -p /root/.bash_profile /root/.bash_profile_bk
+            $SED -i 's/eniq_stats/stats_coordinator/g' /root/.bash_profile
+            if [ $? -ne 0 ]; then
+                $CP -p /root/.bash_profile_bk /root/.bash_profile
+                abort_script "Could not update bash_profile file with name=stats_coordinator_pool"
+            fi
+        fi
+
+		#Code changes for privilege user bash profile and enable dcuser ssh
+		$CAT /etc/group | $GREP -w ENIQ_ADMIN_ROLE > /dev/null 2>&1
+		if [ $? -eq 0 ]; then
+			feature_check=1
+		else
+			feature_check=0
+         
+		fi
+		
+		if [ ${feature_check} == 1 ]; then
+
+        gid=`$CAT /etc/group | $GREP -w ENIQ_ADMIN_ROLE | $AWK -F":" '{print $3}'`
+        $CAT /etc/passwd | $GREP -w $gid > /tmp/admin_user_list.txt
+
+        for line in `$CAT /tmp/admin_user_list.txt`; do
+         $ECHO $line | $AWK -F ":" '{print $1}'>> /tmp/admin_users.txt
+        done
+
+		for var in `$CAT /tmp/admin_users.txt`; do
+        _user_name_=$var        
+        $EGREP -w ${_eniq_stats_} /home/${_user_name_}/.bash_profile >> /dev/null 2>&1
+        if [ $? -eq 0 ] ; then
+            $CP -p /home/${_user_name_}/.bash_profile /home/${_user_name_}/.bash_profile_bk
+            $SED -i 's/eniq_stats/stats_coordinator/g' /home/${_user_name_}/.bash_profile
+            if [ $? -ne 0 ]; then
+                $CP -p /home/${_user_name_}/.bash_profile_bk /home/${_user_name_}/.bash_profile
+                abort_script "Could not update bash_profile of {_user_name_} with name=stats_coordinator"
+            fi
+        fi
+		done
+		fi
+		
+		if [ ${feature_check} == 1 ]; then
+
+			$CAT /etc/ssh/sshd_config | $GREP -w AllowUsers | $GREP -w dcuser > /dev/null 2>&1
+			if [ $? -eq 0 ]; then
+				$SED -i 's/\S*\(dcuser@\)\S*/dcuser/g' /etc/ssh/sshd_config
+				$SYSTEMCTL restart sshd
+				if [ $? -eq 0 ]; then
+					log_msg -s "SSHD service restart successful"
+				else
+					_err_msg_="Could not restart sshd service"
+				fi
+			fi
+		fi
+
+
+	if [ -f /tmp/admin_user_list.txt ]; then
+        $RM -rf /tmp/admin_user_list.txt
+	fi
+
+	if [ -f /tmp/admin_users.txt ]; then
+        $RM -rf /tmp/admin_users.txt
+	fi
+				
+        log_msg -s "\nUpdating SunOS.ini file" -l ${LOGFILE}
+        iniset SunOS_FS_POOL_1 -f ${ENIQ_CONF_DIR}/${SUNOS_INI} name=stats_coordinator_pool
+        if [ $? -ne 0 ]; then
+            abort_script "Could not update SunOS_FS_POOL_1 in ${ENIQ_CONF_DIR}/${SUNOS_INI} with name=stats_coordinator_pool"
+        fi
+        iniset SunOS_FS_SWAP_VOL -f ${ENIQ_CONF_DIR}/${SUNOS_INI} name=stats_coordinator_pool-swapvol
+        if [ $? -ne 0 ]; then
+            abort_script "Could not update SunOS_FS_SWAP_VOL in ${ENIQ_CONF_DIR}/${SUNOS_INI} with name=stats_coordinator_pool-swapvol"
+        fi
+        change_fs_name "eniq_stats_pool" "stats_coordinator_pool"
+        $ECHO "stats_coordinator_pool-swapvol" > ${VAR_TMP_DIR}/mb_expansion_flag
+        
+    else 
+        _err_msg_="VGs are not in proper state. Please check."
+        abort_script "${_err_msg_}"
+    fi  
+fi
+}
+### Function: enable_iq_mpx ###
+#
+# Enable IQ MPX, assuming it is already licensed 
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+enable_iq_mpx()
+{
+
+    ${ECHO} "Enabling MPX in IQ."
+    #dwhdb must be running before running this stage
+    ${ENIQ_CORE_INST_DIR}/bin/eniq_core_install.bsh -s create_iq_mpx -n -l ${LOGFILE}
+    $ECHO "Cleanup" > ${VAR_TMP_DIR}/mb_expansion_flag
+	
+	#Logging Eniq Activity
+    SB_CO_DATE=`$DATE '+%Y-%m-%d %H:%M:%S'`
+    $ECHO "ENIQ ACTIVITY INFO=SB_To_MB_Expansion;${SB_CO_DATE};Single blade is converted to coordinator server for expansion to Multiblade" | $TEE -a /eniq/local_logs/eniq_activity_history.log >> ${LOGFILE}
+    _SB_CO_status_=$?
+    if [ "${_SB_CO_status_}" -ne 0 ]; then
+        _err_msg_="Failed to update Eniq Activity log file\n"
+        abort_script "$_err_msg_"
+    else
+       $ECHO "Successfully logged Eniq Activity"
+    fi
+}
+### Function: change_server_type_name ###
+#
+# Change the name of the installed server type from eniq_stats to stats_coordinator
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+change_server_type_name()
+{
+    local stats_co="stats_coordinator"
+    local eniq_stats="eniq_stats"
+
+     if [ "${CURR_SERVER_TYPE}" == "${eniq_stats}" ]; then
+        $EGREP -w ${eniq_stats} ${ENIQ_CONF_DIR}/installed_server_type >> /dev/null 2>&1
+        if [ $? -eq 0 ]; then
+            $ECHO "Copying ${ENIQ_CONF_DIR}/installed_server_type to ${ENIQ_CONF_DIR}/installed_server_type.orig" | $TEE -a ${LOGFILE}
+            $CP -p ${ENIQ_CONF_DIR}/installed_server_type ${ENIQ_CONF_DIR}/installed_server_type.orig
+            $CAT ${ENIQ_CONF_DIR}/installed_server_type >> ${LOGFILE} 2>&1
+            $ECHO "Changing server type from ${eniq_stats} to ${stats_co} in ${ENIQ_CONF_DIR}/installed_server_type " | $TEE -a ${LOGFILE}
+            $ECHO ${stats_co} > ${ENIQ_CONF_DIR}/installed_server_type 2> /dev/null
+            if [ $? -ne 0 ]; then
+                abort_script "Could not change ${ENIQ_CONF_DIR}/installed_server_type to stats_coordinator"
+            fi
+        fi
+        $EGREP -w ${eniq_stats} ${ENIQ_SW_CONF}/server_types >> /dev/null 2>&1
+        if [ $? -eq 0 ] ; then
+            $ECHO "Copying ${ENIQ_SW_CONF}/server_types to ${ENIQ_SW_CONF}/server_types.orig" | $TEE -a ${LOGFILE}
+            $CP -p ${ENIQ_SW_CONF}/server_types ${ENIQ_SW_CONF}/server_types.orig
+            $CAT ${ENIQ_SW_CONF}/server_types >> ${LOGFILE} 2>&1
+            $ECHO "Changing server type from ${eniq_stats} to ${stats_co} in ${ENIQ_SW_CONF}/server_types" | $TEE -a ${LOGFILE}
+            $SED -e "s/::${eniq_stats}/::${stats_co}/" ${ENIQ_SW_CONF}/server_types > ${ENIQ_SW_CONF}/server_types.tmp
+            if [ $? -ne 0 ]; then
+                abort_script "Could not change ${ENIQ_SW_CONF}/server_types to stats_coordinator"
+            fi
+            $MV ${ENIQ_SW_CONF}/server_types.tmp ${ENIQ_SW_CONF}/server_types
+            if [ $? -ne 0 ]; then
+                abort_script "Could not move ${ENIQ_SW_CONF}/server_types.tmp to ${ENIQ_SW_CONF}/server_types"
+            fi
+            if [ $($CAT ${ENIQ_SW_CONF}/server_types | $EGREP -w "${stats_co}" | wc -l) -ne  1 ]; then
+                abort_script "${ENIQ_SW_CONF}/server_types has not been updated to include ${stats_co}"
+            fi
+        fi
+    fi
+
+$TOUCH  ${VAR_TMP_DIR}/mb_expansion_flag
+$ECHO "eniq_stats_pool" > ${VAR_TMP_DIR}/mb_expansion_flag
+}
+
+### Function: dwhdb_config_users ###
+#
+# Change the number of connections allowed for dwhdb
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+ dwhdb_config_users()
+{
+local _noconnvar_="NumberOfConnectionsLarge"
+local _tmp_upgrade_cfg_=${ENIQ_ADMIN_DIR}/sybase_conf/dwhdb_exp.cfg
+local _tmp_iniadd_file_=${TEM_DIR}/niq_conn_det
+local _tmp_niq_ini_=${TEM_DIR}/niq_ini_tmp
+$RM -rf ${_tmp_niq_ini_}
+local _no_connections_=`iniget DWH -v ${_noconnvar_} -f ${ENIQ_TEMPL_DIR}/${ENIQ_INI}`
+if [ ! "${_no_connections_}" ]; then
+    _err_msg_="Could not find get DWH -v ${_noconnvar_} -f ${ENIQ_TEMPL_DIR}/${ENIQ_INI} \n has a upgrade been done before converting this server to coordinator "
+    abort_script "$_err_msg_"
+fi
+$ECHO "Changing number of dwhdb connections (-gm) to $_no_connections_ to ${ORG_DB_DIR}/dwhdb.cfg" | $TEE -a ${LOGFILE}
+$CAT ${ORG_DB_DIR}/dwhdb.cfg | $SED -e "s|^-gm .*|-gm $_no_connections_|g" > ${_tmp_upgrade_cfg_}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not update ${DWH_DIR}/dwhdb.cfg with Number Of Connections(-gm)"
+    abort_script "$_err_msg_" "${EXEC_SHELL_CMD}"
+fi
+$MV ${_tmp_upgrade_cfg_} ${ORG_DB_DIR}/dwhdb.cfg
+if [ $? -ne 0 ]; then
+    _err_msg_="Error $MV ${_tmp_upgrade_cfg_} ${ORG_DB_DIR}/dwhdb.cfg"
+    abort_script "$_err_msg_" 
+fi
+
+local _no_connections_local_=`iniget DWH -v ${_noconnvar_} -f ${ENIQ_CONF_DIR}/${ENIQ_INI}`
+if [ ! "${_no_connections_local_}" ]; then
+    $ECHO "Adding ${_noconnvar_} to ${ENIQ_CONF_DIR}/${ENIQ_INI}" | $TEE -a ${LOGFILE}
+    $ECHO "${_noconnvar_}=${_no_connections_}" > /tmp/ini_insert_new_param
+    $SED "/\[DWH\]/ r /tmp/ini_insert_new_param" < ${ENIQ_CONF_DIR}/${ENIQ_INI} > ${TEM_DIR}/${ENIQ_INI}.new
+    if [ $? -ne 0 ]; then
+        _err_msg_="Could not update ${_noconnvar_} in ${TEM_DIR}/${ENIQ_INI}"
+        abort_script "$_err_msg_"
+    fi
+    $MV ${TEM_DIR}/${ENIQ_INI}.new ${ENIQ_CONF_DIR}/${ENIQ_INI}
+    if [ $? -ne 0 ]; then
+        _err_msg_="Error ${TEM_DIR}/${ENIQ_INI}.new ${TEM_DIR}/${ENIQ_INI}"
+        abort_script "$_err_msg_" 
+    fi
+else
+    iniset DWH -f ${ENIQ_CONF_DIR}/${ENIQ_INI}  ${_noconnvar_}=${_no_connections_}
+    if [ $? -ne 0 ]; then
+        _err_msg_="ERROR: Failed on iniset DWH -f ${_symlink_ini_}  ${_noconnvar_}=${_no_connections_}"
+        abort_script "$_err_msg_"
+    fi
+fi
+
+}
+### Function: setup_env ###
+#
+# Set up some setup_env
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+setup_env()
+{
+LOGFILE=/eniq/local_logs/expansion/eniq_multi_Blade_expension.log
+ORG_DB_DIR=/eniq/database/dwh_main
+ENIQ_BASE_DIR=/eniq
+# Main Directory for the Core Installation SW
+ENIQ_INST_DIR=${ENIQ_BASE_DIR}/installation
+
+# Main Directory for the Core Installation SW
+ENIQ_CORE_INST_DIR=${ENIQ_INST_DIR}/core_install
+
+ENIQ_CONF_DIR=${ENIQ_BASE_DIR}/installation/config
+
+ENIQ_SW_CONF=${ENIQ_BASE_DIR}/sw/conf
+
+ENIQ_ADMIN_DIR=${ENIQ_BASE_DIR}/admin
+SUNOS_INI=SunOS.ini
+ENIQ_INI=niq.ini
+
+TEM_DIR=/tmp/expansion.$$.$$
+$RM -rf ${TEM_DIR}
+$MKDIR -p ${TEM_DIR}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not create directory $TEM_DIR"
+    abort_script "$_err_msg_"
+fi
+# File containing the type of OSS installation. Eg. oss or single
+INST_TYPE_FILE=${ENIQ_CONF_DIR}/ericsson_use_config
+# Read the installation type
+INSTALL_TYPE=`$CAT ${INST_TYPE_FILE} | $AWK -F\= '{print $2}'`
+if [ ! "${INSTALL_TYPE}" ]; then
+    _err_msg_="Could not find get INSTALL_TYPE "
+    abort_script "$_err_msg_"
+fi
+if [ "${INSTALL_TYPE}" != "stats" ]; then
+    _err_msg_="This script can be only ran for eniq stats"
+    abort_script "$_err_msg_"
+fi
+ENIQ_TEMPL_DIR="${ENIQ_CORE_INST_DIR}/templates/${INSTALL_TYPE}"
+
+
+
+# Source the common functions
+if [ -s ${ENIQ_CORE_INST_DIR}/lib/common_functions.lib ]; then
+    . ${ENIQ_CORE_INST_DIR}/lib/common_functions.lib
+else
+    _err_msg_="File /eniq/installation/core_install/lib/common_functions.lib not found"
+    abort_script "$_err_msg_"
+fi
+
+CURR_SERVER_TYPE=`$CAT $ENIQ_CONF_DIR/installed_server_type | $EGREP -v  '^[[:blank:]]*#' | $SED -e 's/ //g'`
+if [ ! "${CURR_SERVER_TYPE}" ]; then
+    _err_msg_="Could not determine which server type"
+    abort_script "$_err_msg_" "${EXEC_SHELL_CMD}"
+fi
+
+# Set temporary directory
+VAR_TMP_DIR=/var/tmp
+}
+
+
+# ********************************************************************
+#
+#   Main body of program
+#
+# ********************************************************************
+#
+
+# Determine absolute path to software
+get_absolute_path
+
+DEFAULT_USER=root
+# Check that the effective id of the user is root
+check_id
+
+# set up env
+setup_env
+if [ -s ${VAR_TMP_DIR}/mb_expansion_flag ]; then
+    _vg_name_=`$CAT ${VAR_TMP_DIR}/mb_expansion_flag`
+    if [ "${_vg_name_}" == "stats_coordinator_pool-swapvol" ]; then
+        #change the -gm number of users
+        dwhdb_config_users
+
+        #change Sybase to mpx
+        enable_iq_mpx
+        
+        $RM -rf ${TEM_DIR}
+        $RM -rf ${VAR_TMP_DIR}/mb_expansion_flag
+    elif [ "${_vg_name_}" == "eniq_stats_pool" ] || [ "${_vg_name_}" == "stats_coordinator_pool" ]; then
+        #change the Volume group
+        lvm_reconfig
+
+        #change the -gm number of users
+        dwhdb_config_users
+
+        #change Sybase to mpx
+        enable_iq_mpx
+
+        $RM -rf ${TEM_DIR}
+        $RM -rf ${VAR_TMP_DIR}/mb_expansion_flag 
+    fi
+else
+        #create logfile
+        chk_create_logfile
+
+        #change server type
+        change_server_type_name
+
+        #change the Volume group
+        lvm_reconfig
+
+        #change the -gm number of users
+        dwhdb_config_users
+
+        #change Sybase to mpx
+        enable_iq_mpx
+
+        $RM -rf ${TEM_DIR}
+        $RM -rf ${VAR_TMP_DIR}/mb_expansion_flag
+fi
+
+

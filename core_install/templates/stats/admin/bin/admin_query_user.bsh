@@ -1,0 +1,2236 @@
+#!/bin/bash
+# ********************************************************************
+# Ericsson Radio Systems AB                                     SCRIPT
+# ********************************************************************
+#
+#
+# (c) Ericsson Radio Systems AB 2021 - All rights reserved.
+#
+# The copyright to the computer program(s) herein is the property
+# of Ericsson Radio Systems AB, Sweden. The programs may be used
+# and/or copied only with the written permission from Ericsson Radio
+# Systems AB or in accordance with the terms and conditions stipulated
+# in the agreement/contract under which the program(s) have been
+# supplied.
+#
+# ********************************************************************
+# Name    : admin_query_user.bsh
+# Date    : 18/08/2023
+# Revision: main\17
+# Purpose : To perform various operations on customized user like check status, change password, etc.
+# Usage   : admin_query_user.bsh -n <user name|All>  -a <Status|ChangePWD|Lock|Unlock|Grant|Revoke|CLP|Drop>
+#           [ -l <path_to_logfile> ]
+#
+# ********************************************************************
+#
+#     Command Section
+#
+# ********************************************************************
+AWK=/usr/bin/awk
+BASENAME=/usr/bin/basename
+CAT=/usr/bin/cat
+CHMOD=/usr/bin/chmod
+CHOWN=/usr/bin/chown
+COLUMN=/usr/bin/column
+CP=/usr/bin/cp
+CUT=/usr/bin/cut
+DATE=/usr/bin/date
+DIRNAME=/usr/bin/dirname
+ECHO='/usr/bin/echo -e'
+EGREP=/usr/bin/egrep
+ENV=/usr/bin/env
+GREP=/usr/bin/grep
+ID=/usr/bin/id
+MKDIR=/usr/bin/mkdir
+OPENSSL=/usr/bin/openssl
+RM=/usr/bin/rm
+SED=/usr/bin/sed
+SU=/usr/bin/su
+#SUDO=/usr/bin/sudo
+TEE=/usr/bin/tee
+TOUCH=/usr/bin/touch
+TR=/usr/bin/tr
+# ********************************************************************
+#
+#       Configuration Section
+#
+# ********************************************************************
+ENIQ_BASE_DIR=/eniq
+ENIQ_CONF_DIR=$ENIQ_BASE_DIR/installation/config
+ENIQ_ADMIN_DIR=$ENIQ_BASE_DIR/admin
+INTERACTIVE="Yes"
+
+# Name of SunOS & ENIQ ini Files
+ENIQ_ENV=niq.rc
+ENIQ_INI=niq.ini
+SUNOS_INI=SunOS.ini
+SYM_INI=sym_links.ini
+# Source the common functions
+if [ -s $ENIQ_ADMIN_DIR/lib/common_functions.lib ]; then
+    . $ENIQ_ADMIN_DIR/lib/common_functions.lib
+else
+    _err_msg_="File $ENIQ_ADMIN_DIR/lib/common_functions.lib not found"
+    abort_script "$_err_msg_"
+fi
+
+# Get the System User and Group. All directories are owned by this
+SYSUSER=`iniget ENIQ_INSTALL_CONFIG -f ${ENIQ_CONF_DIR}/${SUNOS_INI} -v ENIQ_SYSUSER`
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not read SYSUSER param from ${ENIQ_CONF_DIR}/${SUNOS_INI}"
+    abort_script "$_err_msg_"
+fi
+
+SYSGRP=`$ID ${SYSUSER}|$AWK '{print $2}'|$AWK -F\( '{print $2}'|$AWK -F\) '{print $1}'`
+if [ ! "${SYSGRP}" ]; then
+    _err_msg_="Could not read SYSGRP param from ${ENIQ_CONF_DIR}/${SUNOS_INI}"
+    abort_script "$_err_msg_"
+fi
+
+# ********************************************************************
+#
+#       Global Variables
+#
+# ********************************************************************
+CHANGE_PASSWORD_ATTEMPT_COUNT=0
+
+# ********************************************************************
+#
+#   functions
+#
+# ********************************************************************
+### Function: abort_script ###
+#
+#   This will is called if the script is aborted thru an error
+#   error signal sent by the kernel such as CTRL-C or if a serious
+#   error is encountered during runtime
+#
+# Arguments:
+#       $1 - Error message from part of program (Not always used)
+# Return Values:
+#       none
+abort_script()
+{
+if [ "$1" ]; then
+    _err_msg_=$1
+else
+    _err_msg_="$($DATE '+%Y-%m-%d_%H.%M.%S'): Script aborted.......\n"
+fi
+
+if [ "${LOGFILE}" ]; then
+    $ECHO "\n$_err_msg_\n"|$TEE -a ${LOGFILE}
+else
+    $ECHO "\n$_err_msg_\n"
+fi
+
+
+$RM -rf ${dwh_connection_string_enc}
+$RM -rf ${dwh_connection_dwh_enc}
+
+$RM -rf ${dwh_connection_rep_enc}
+
+$RM -rf ${rep_connection_string_enc}
+
+$RM -rf ${dwh_connection_string_continue_enc}
+
+$RM -rf ${dwh_connection_string_check_pwd_enc}
+
+$RM -rf ${conn_str_enc}
+
+#cleanup
+
+if [ "$2" ]; then
+    exit ${2}
+else
+   exit 1
+fi
+
+}
+
+### Function: add_ft4user ###
+#
+#
+#
+# Arguments: none
+#
+# Return Values: none
+add_ft4user()
+{
+if [ "${NEWUSER}" = "All" ]; then
+    _err_msg_="$($DATE '+%Y-%b-%d_%H.%M.%S'): Feature access can be granted for one specified user at a time."
+    abort_script "$_err_msg_"
+fi
+
+if [ ! -s ${CLI_CONF_DIR}/queryUserConf.cfg ]; then 
+    _err_msg_="$($DATE '+%Y-%b-%d_%H.%M.%S'): Exiting ...${CLI_CONF_DIR}/queryUserConf.cfg is empty or does not exist "
+    abort_script "$_err_msg_"
+fi
+
+local l_p_name4ftChange=$( $CAT ${CLI_CONF_DIR}/queryUserConf.cfg | $GREP -w ${NEWUSER} | $AWK -F"::" '{print $3}' | uniq)
+local l_p_v_max_connections=$( $CAT ${CLI_CONF_DIR}/queryUserConf.cfg | $GREP -w ${NEWUSER} | $AWK -F"::" '{print $4}' | uniq)
+local l_p_v_pwd_creation=$( $CAT ${CLI_CONF_DIR}/queryUserConf.cfg | $GREP -w ${NEWUSER} | $AWK -F"::" '{print $5}' | uniq)
+local l_p_v_password_life_time=$( $CAT ${CLI_CONF_DIR}/queryUserConf.cfg | $GREP -w ${NEWUSER} | $AWK -F"::" '{print $6}' | uniq)
+local l_p_v_pwd_exp=$( $CAT ${CLI_CONF_DIR}/queryUserConf.cfg | $GREP -w ${NEWUSER} | $AWK -F"::" '{print $7}' | uniq)
+local l_p_v_password_grace_time=$( $CAT ${CLI_CONF_DIR}/queryUserConf.cfg | $GREP -w ${NEWUSER} | $AWK -F"::" '{print $8}' | uniq)
+local l_p_v_login_attempt=$( $CAT ${CLI_CONF_DIR}/queryUserConf.cfg | $GREP -w ${NEWUSER} | $AWK -F"::" '{print $9}' | uniq)
+
+
+_cnt=0
+_db_retry_=1
+declare -a featureArray
+DSFile=${TEM_DIR}/displayFile
+FTListFile=${TEM_DIR}/ftlist.txt
+$RM -f ${DSFile} ${FTListFile}
+$TOUCH ${DSFile} ${FTListFile}
+
+current_ft_list=$($CAT ${CLI_CONF_DIR}/queryUserConf.cfg | $GREP -w ${NEWUSER} | $AWK -F"::" '{print$2}')
+
+$ECHO "\nInstalled ENIQ features the user does not already have access to:" >> ${DSFile}
+$ECHO "-----------------------" >> ${DSFile}
+
+    while IFS='' read -r line || [[ -n "$line" ]]; do
+        if [  -z "${line}" ]; then
+            continue
+        fi
+        let _cnt=_cnt+1
+        feature=$($ECHO ${line}| $SED 's/::/,/g'| cut -d',' -f2)
+        if [[ "$current_ft_list" != *"${feature}"* ]]; then
+            featureArray[${_cnt}]="${feature}"
+            $ECHO "Feature Number: ${_cnt}             Feature Name: ${feature}" >>${DSFile}
+        fi
+    done < ${ENIQ_ADMIN_MANAGED_OSS_DIR}/total_feature_install_list
+
+ftArraySize=${#featureArray[@]}
+if [ $ftArraySize -eq 0 ]; then
+    _err_msg_="$($DATE '+%Y-%b-%d_%H.%M.%S'): Exiting ... User '${NEWUSER}' already has access to all installed features."
+    abort_script "$_err_msg_"
+else
+    $ECHO "\nSelect the ENIQ Features to give User: ${NEWUSER} access to using the format [n,n,n-n,n...n]" >> ${DSFile}
+    $ECHO "\tE.G. 1,2,3-8,....,N" >> ${DSFile}
+
+    while :; do
+        $CLEAR
+        $CAT ${DSFile}
+        $ECHO "\n\nSelect ENIQ Features to give User: ${NEWUSER} access to"
+        read _opt_
+        # If the User hit nothing and there is a default. that will do
+        if [ ! "${_opt_}" ]; then
+            continue
+        else
+            _numerror_=0
+            for _num_ in `$ECHO ${_opt_} | $SED -e 's/ //g' -e 's/,/ /g'`; do
+                $ECHO ${_num_} | $EGREP '-' >> /dev/null 2>&1
+                if [ $? -eq 0 ]; then
+                    _start_=`$ECHO ${_num_} | $AWK -F\- '{print $1}'`
+                    if [ ! "${_start_}" ]; then
+                        continue
+                    fi
+                    _end_=`$ECHO ${_num_} | $AWK -F\- '{print $2}'`
+                    for (( _sel_=${_start_}; _sel_<=${_end_}; _sel_++ )); do
+                        $ECHO ${_sel_} | $EGREP '^[0-9]+$' >> /dev/null 2>&1
+                        if [ $? -ne 0 ]; then
+                            _numerror_=1
+                            break
+                        fi
+                        if [ ${_sel_} -lt 1 -o ${_sel_} -gt ${_cnt} ]; then
+                            _numerror_=1
+                            break
+                        fi
+                        $ECHO "${featureArray[${_sel_}]}">>${FTListFile}
+                    done
+                else
+                    $ECHO ${_num_} | $EGREP '^[0-9]+$' >> /dev/null 2>&1
+                    if [ $? -ne 0 ]; then
+                        _numerror_=1
+                        break
+                    fi
+                    if [ ${_num_} -lt 1 -o ${_num_} -gt ${_cnt} ]; then
+                        _numerror_=1
+                        break
+                    fi
+                    $ECHO "${featureArray[${_num_}]}">>${FTListFile}
+                fi
+            done
+            if [ ${_numerror_} -eq 0 ]; then
+                break
+            fi
+        fi
+    done
+
+    while IFS='' read -r line || [[ -n "$line" ]]; do
+        if [ "${line}" != "" ]; then
+            Version=$($CAT ${CLI_CONF_DIR}/feature_descriptions | $GREP -w "${line}" | $AWK -F"::" '{print $1}')
+        else
+            _err_msg_="$($DATE '+%Y-%b-%d_%H.%M.%S'): ${NEWUSER} has access to provided features already. Please provide correct input to grant access."
+            abort_script "${_err_msg_}"
+        fi
+        interFaces="$($CAT /eniq/sw/conf/feature_techpacks | $GREP -w "${Version}" | $SED "s/${Version}:://g")"
+        if4q=$($ECHO "('$($ECHO ${interFaces})')" | $SED "s/ /','/g")
+        checkDBStatus
+        #$SU - $SYSUSER -c "$DBISQL @${rep_connection_string_enc} \"select  '${line},'||TECHPACKNAME from whrep.InterfaceTechpacks WHERE INTERFACENAME in  ${if4q};OUTPUT TO ${TEM_DIR}/tplist.txt APPEND EXADECIMAL ASIS FORMAT TEXT ;\""  >/dev/null 2>&1
+        $SU - $SYSUSER -c "$DBISQL @${rep_connection_string_enc} \"select  '${line}',ift.TECHPACKNAME, dt.TYPENAME, dt.TABLELEVEL from dwhrep.InterfaceTechpacks ift, dwhrep.dwhtype dt  WHERE ift.INTERFACENAME in ${if4q} and ift.TECHPACKNAME=dt.TECHPACK_NAME and dt.TYPENAME not like '%|_CURRENT|_DC' escape '|';OUTPUT TO ${TEM_DIR}/tplist.txt APPEND HEXADECIMAL ASIS FORMAT TEXT ;\""  >/dev/null 2>&1
+        if [ $? -ne 0 ] ; then
+            checkDBStatus
+            if [ $_db_count_ -ne 1 ]; then
+                $SU - $SYSUSER -c "$DBISQL @${rep_connection_string_enc} \"select  '${line}',ift.TECHPACKNAME, dt.TYPENAME, dt.TABLELEVEL from dwhrep.InterfaceTechpacks ift, dwhrep.dwhtype dt  WHERE ift.INTERFACENAME in ${if4q} and ift.TECHPACKNAME=dt.TECHPACK_NAME and dt.TYPENAME not like '%|_CURRENT|_DC' escape '|';OUTPUT TO ${TEM_DIR}/tplist.txt APPEND HEXADECIMAL ASIS FORMAT TEXT ;\""  >/dev/null 2>&1
+                if [ $? -ne 0 ] ; then
+                    _err_msg_="$($DATE '+%Y-%b-%d_%H.%M.%S'): Failed to execute the query to read feature techpacks list"
+                    abort_script "$_err_msg_"
+                fi
+            else
+                _err_msg_="$($DATE '+%Y-%b-%d_%H.%M.%S'): repdb is online, but failed to execute the query to read feature techpacks list"
+                abort_script "$_err_msg_"
+            fi
+        fi
+    done < ${FTListFile}
+    $CAT ${TEM_DIR}/tplist.txt | sort | uniq >  ${TEM_DIR}/uniq_ftlist.txt
+fi
+
+#Generating the sql to add features selectivity to the user
+log_msg -s "$($DATE '+%Y-%b-%d_%H.%M.%S'): Generating the sql to add features selectivity to ${NEWUSER}" -l ${LOGFILE}
+SqlFile=`mktemp ${TEM_DIR}/addFeature.XXXXXXXXXX` 
+$TOUCH ${TEM_DIR}/viewNameList1.txt
+
+while IFS='' read -r line || [[ -n "$line" ]]; do
+    view=$($ECHO $line | cut -d',' -f3 |$SED "s/'//g")
+    type=$($ECHO $line | cut -d',' -f4 |$SED "s/'//g")
+    if [ "${type}" = "PLAIN" ]; then
+        $ECHO "','"${view} >> ${TEM_DIR}/viewNameList1.txt
+    else
+        $ECHO "','"${view}_${type} >> ${TEM_DIR}/viewNameList1.txt
+    fi
+done <  ${TEM_DIR}/uniq_ftlist.txt
+$CAT ${TEM_DIR}/viewNameList1.txt | $SED "s/ *$//g" | sort | uniq > ${TEM_DIR}/viewNameList2.txt 
+
+#Executing the sql to add features selectivity to user
+log_msg -s "$($DATE '+%Y-%b-%d_%H.%M.%S'): Executing the sql to add features selectivity to ${NEWUSER}" -l ${LOGFILE}
+
+while [ -s ${TEM_DIR}/viewNameList2.txt ]; do
+    _count_=`$CAT ${TEM_DIR}/viewNameList2.txt | wc -l`
+    viewNameList="('"
+    if [ $_count_ -gt 2000 ]; then
+        viewNameList=${viewNameList}`$HEAD -n 2000 ${TEM_DIR}/viewNameList2.txt`
+    else
+        viewNameList=${viewNameList}`$CAT ${TEM_DIR}/viewNameList2.txt`
+    fi
+    viewNameList=${viewNameList}+"')"
+    viewNameList=$( $ECHO $viewNameList | $SED "s/('','/('/g" | $SED "s/+')/')/g" | $SED "s/ //g" )
+    #Executing the sql to add features selectivity to user
+    $SU - $SYSUSER -c "$DBISQL @${dwh_connection_string_enc} \"select 'GRANT SELECT ON dcpublic.'||t.table_name||' to ${NEWUSER};' from systab t, sysuser u where t.creator=u.user_id and u.user_name like 'dcpublic' and t.table_type_str like 'view' and t.table_name in ${viewNameList}; OUTPUT TO ${TEM_DIR}/viewNameList.txt APPEND HEXADECIMAL ASIS FORMAT TEXT ;\""  >/dev/null 2>&1
+    if [ $? -ne 0 ]; then
+        $SU - ${SYSUSER} -c "/eniq/sybase_iq/IQ-*/bin64/dbping @${dwh_connection_dwh_enc}" >> ${LOGFILE} 2>&1
+        if [ $? -ne 0 ] ; then
+            if [ ${_db_retry_} -le 5 ]; then
+                if [ ${_db_retry_} -eq 1 ]; then
+                    log_msg -s "\n Waiting for dwhdb to come online, it may take some time \n" -l ${LOGFILE}
+                fi 
+                log_msg -s "attempt=${_db_retry_} \n" -l ${LOGFILE}
+                let _db_retry_=${_db_retry_}+1
+                sleep 60
+                continue
+            else
+                _err_msg_="$($DATE '+%Y-%b-%d_%H.%M.%S'): Could not ping dwhdb "
+                abort_script "$_err_msg_"
+            fi
+        else
+            _err_msg_="$($DATE '+%Y-%b-%d_%H.%M.%S'): dwhdb is online, but could not execute the query"
+            abort_script "$_err_msg_"
+        fi
+    fi
+    _db_retry_=1
+    if [ $_count_ -gt 2000 ]; then
+        $SED -i '1,2000 d' ${TEM_DIR}/viewNameList2.txt
+    else
+        $SED -i '/^/d' ${TEM_DIR}/viewNameList2.txt
+    fi
+done
+
+$CAT ${TEM_DIR}/viewNameList.txt | $SED "s/'//g" | sort | uniq >>$SqlFile
+while :; do
+    $DBISQL @${dwh_connection_string_enc} $SqlFile >> /dev/null 2>&1
+    if [ $? -ne 0 ]; then
+        $SU - ${SYSUSER} -c "/eniq/sybase_iq/IQ-*/bin64/dbping @${dwh_connection_dwh_enc}" >> ${LOGFILE} 2>&1
+        if [ $? -ne 0 ] ; then
+            if [ ${_db_retry_} -le 5 ]; then
+                if [ ${_db_retry_} -eq 1 ]; then
+                    log_msg -s "\n Waiting for dwhdb to come online, it may take some time \n" -l ${LOGFILE}
+                fi 
+                log_msg -s "attempt=${_db_retry_} \n" -l ${LOGFILE}
+                let _db_retry_=${_db_retry_}+1
+                sleep 60
+                continue
+            else
+                _err_msg_="$($DATE '+%Y-%b-%d_%H.%M.%S'): Could not ping dwhdb. Failed to add features selectivity to ${NEWUSER}"
+                abort_script "$_err_msg_"
+            fi
+        else
+            _err_msg_="$($DATE '+%Y-%b-%d_%H.%M.%S'): dwhdb is online, but failed to add features selectivity to ${NEWUSER}"
+            abort_script "$_err_msg_"
+        fi
+    fi
+    break
+done
+
+if [ ! -f ${CLI_CONF_DIR}/queryUserConf.cfg ]; then
+    $TOUCH ${CLI_CONF_DIR}/queryUserConf.cfg
+fi
+
+while IFS='' read -r line || [[ -n "$line" ]]; do
+    if [ ! -z "${line}" ]; then
+        $ECHO "${NEWUSER}::'${line}'::${l_p_name4ftChange}::${l_p_v_max_connections}::${l_p_v_pwd_creation}::${l_p_v_password_life_time}::${l_p_v_pwd_exp}::${l_p_v_password_grace_time}::${l_p_v_login_attempt}" | $SED "s/'//g" >> ${CLI_CONF_DIR}/queryUserConf.cfg
+    fi
+done <  ${FTListFile}
+log_msg -s "$($DATE '+%Y-%b-%d_%H.%M.%S'): The ${NEWUSER} entries are successfully updated in ${CLI_CONF_DIR}/queryUserConf.cfg" -l ${LOGFILE}
+_remove_null_=`$CAT ${CLI_CONF_DIR}/queryUserConf.cfg |$GREP -w ${NEWUSER}| $EGREP "NULL"`
+if [ $? -eq 0 ] ; then
+    $CAT ${CLI_CONF_DIR}/queryUserConf.cfg | $GREP -wv ${_remove_null_} >> ${TEM_DIR}/queryUserConf.cfg_1
+    $CP -p ${TEM_DIR}/queryUserConf.cfg_1 ${CLI_CONF_DIR}/queryUserConf.cfg
+fi
+
+log_msg -s "$($DATE '+%Y-%b-%d_%H.%M.%S'): Successfully added features selectivity to user ${NEWUSER}." -l ${LOGFILE}
+
+}
+
+### Function: choose_login_policy ###
+#
+#
+#
+# Arguments: none
+#
+# Return Values: none
+change_login_policy()
+{
+    if [ "${NEWUSER}" = "All" ]; then
+       _err_msg_="$($DATE '+%Y-%b-%d_%H.%M.%S'): Login policy can be changed for one specified user at a time"
+       abort_script "$_err_msg_"
+    fi
+
+    $SU - $SYSUSER -c "$DBISQL @${dwh_connection_string_enc} \"select slp.login_policy_name, slpo.login_option_name, slpo.login_option_value from sysloginpolicy as slp, sysloginpolicyoption slpo where slpo.login_policy_id=slp.login_policy_id and slp.login_policy_name like 'query_user_login_policy%' and slpo.login_option_name in ('max_connections','password_life_time','max_failed_login_attempts');OUTPUT TO ${TEM_DIR}/login_policy.txt APPEND HEXADECIMAL ASIS FORMAT TEXT ;\""  >/dev/null 2>&1
+
+    _cnt=1
+    declare -a login_policyArray
+    login_policy=''
+    DSFile=${TEM_DIR}/displayFile
+    $RM -f ${DSFile}
+    $TOUCH ${DSFile}
+
+    $ECHO "Login policies for query users exist\n" >>${DSFile}
+    while IFS='' read -r line || [[ -n "$line" ]]
+    do
+        optionchoice=''
+        login_policyDelta=$($ECHO ${line}| cut -d',' -f1| $SED "s/'//g")
+
+        if [ "${login_policy}" != "${login_policyDelta}" ]; then
+            $ECHO "\n\nLogin Policy Number: ${_cnt}             Login Policy Name: ${login_policyDelta}" >>${DSFile}
+            options=$($GREP -w "${login_policyDelta}" ${TEM_DIR}/login_policy.txt)
+            optionchoice="${login_policyDelta}"
+            for i in $options
+            do
+                login_option_nameDelta=$($ECHO $i| cut -d',' -f2|$SED "s/'//g")
+
+                if [ "$login_option_nameDelta" = "max_connections" ]
+                then
+                    $ECHO " The Max Number of Connection allow by ${login_policyDelta} is $($ECHO $i| cut -d',' -f3)">>${DSFile}
+                    max_connections_optionchoice=" $($ECHO $i|| cut -d',' -f3)"
+                elif [ "$login_option_nameDelta" = "max_failed_login_attempts" ]
+                then
+                    $ECHO " The Max Number of failed logins  allow by ${login_policyDelta} is $($ECHO $i| cut -d',' -f3)">>${DSFile}
+                    max_failed_login_attempts_optionchoice=" $($ECHO $i|| cut -d',' -f3)"
+                elif [ "$login_option_nameDelta" = "password_life_time" ]
+                then
+                    $ECHO " The password lifetime  allow by ${login_policyDelta} is $($ECHO $i| cut -d',' -f3)">>${DSFile}
+                    password_life_time_optionchoice=" $($ECHO $i|| cut -d',' -f3)"
+                fi
+            done
+
+            login_policyArray["${_cnt}"]="${login_policyDelta},${max_connections_optionchoice},${max_failed_login_attempts_optionchoice},${password_life_time_optionchoice}"
+
+            let _cnt=$_cnt+1
+            login_policy="${login_policyDelta}"
+        fi
+    done < ${TEM_DIR}/login_policy.txt
+
+
+    while :; do
+            $ECHO ""
+            $CAT ${DSFile}
+            $ECHO "\n\n Please enter the integer number of one of the existing login policies below to apply it or enter 'New' to create a new login policy."
+            read _num_
+
+            if [ "${_num_}" = "New" ]
+            then
+                break
+            fi
+
+            re='^[0-9]+$'
+            if  [[ $_num_ =~ $re ]] ; then
+                break
+            else
+                log_msg -s "\nThe list must contain a number."
+                continue
+            fi
+    done
+
+
+
+     if [ "${_num_}" != "New" ]
+        then
+            if [ "${_num_}" -le "${#login_policyArray[@]}" ]
+            then
+                login_policy_name=$($ECHO "${login_policyArray[${_num_}]}"|cut -d',' -f1 |sed "s/'//g")
+                $ECHO ${login_policy_name} > ${TEM_DIR}/Gen_login_policy_name.txt
+            else
+             log_msg -s "Policy does not exist. Creating new login policy." -l ${LOGFILE}
+             $BASH ${SCRIPTHOME}/create_query_user_login_policy.bsh -t ${TEM_DIR}
+                if [ $? -ne 0 ]
+                then
+                    abort_script
+                fi
+             login_policy_name=$($CAT ${TEM_DIR}/Gen_login_policy_name.txt)
+            fi
+        else
+            log_msg -s "Creating a new query login policy." -l ${LOGFILE}
+            $BASH ${SCRIPTHOME}/create_query_user_login_policy.bsh -t ${TEM_DIR}
+            if [ $? -ne 0 ]
+            then
+                abort_script
+            fi
+            login_policy_name=$($CAT ${TEM_DIR}/Gen_login_policy_name.txt)
+        fi
+
+    if [ "${login_policy_name}" = "failed" ]; then
+        _err_msg_="$($DATE '+%Y-%m-%d_%H.%M.%S'): Failed to assign a login policy to user"
+        abort_script "$_err_msg_"
+    fi
+
+    #Generating the sql to create the new user
+    log_msg -s "$($DATE '+%Y-%b-%d_%H.%M.%S'): Generating the sql to create ${NEWUSER} query user" -l ${LOGFILE}
+    SqlFile=`mktemp ${TEM_DIR}/alterUser.XXXXXXXXXX`
+    $ECHO "Alter USER ${NEWUSER} LOGIN POLICY ${login_policy_name};" >$SqlFile
+
+    $DBISQL @${dwh_connection_string_enc} $SqlFile
+    if [ $? -ne 0 ]
+    then
+        _err_msg_="$($DATE '+%Y-%b-%d_%H.%M.%S'): Alter user login policy failed for User: ${NEWUSER}."
+        abort_script "$_err_msg_"
+    else
+        #updating the queryUserConf configuration file with new login policy details
+        update_queryUserConf_file
+
+        log_msg -s "$($DATE '+%Y-%b-%d_%H.%M.%S'):Successfully changed user ${NEWUSER} to  ${login_policy_name} login policy." -l ${LOGFILE}
+    fi
+}
+
+### Function: change_login_policy_eniq_users ###
+#
+#
+#
+# Arguments: none
+#
+# Return Values: none
+change_login_policy_eniq_users()
+{
+if [ "${NEWUSER}" = "All" ]; then
+    _err_msg_="$($DATE '+%Y-%b-%d_%H.%M.%S'): Login policy can be changed for one specified user at a time"
+    abort_script "$_err_msg_"
+fi
+$RM -f ${TEM_DIR}/login_policy_name.txt >/dev/null 2>&1
+$SU - $SYSUSER -c "$DBISQL @${dwh_connection_string_enc} \"select count() from sysloginpolicy where login_policy_name like 'eniq_user_login_policy%';OUTPUT TO ${TEM_DIR}/login_policy_name.txt APPEND HEXADECIMAL ASIS FORMAT TEXT ;\"" >/dev/null 2>&1
+
+num=$($CAT ${TEM_DIR}/login_policy_name.txt)
+
+if [ $num -eq 0 ]; then
+    login_policy_name='eniq_user_login_policy_1'
+    log_msg -s "Policy does not exist. Creating new login policy." -l ${LOGFILE}
+    $BASH ${SCRIPTHOME}/create_query_user_login_policy.bsh -t ${TEM_DIR} -n $login_policy_name
+    if [ $? -ne 0 ]; then
+        abort_script
+    fi
+    login_policy_name=$($CAT ${TEM_DIR}/Gen_login_policy_name.txt)
+else
+    $SU - $SYSUSER -c "$DBISQL @${dwh_connection_string_enc} \"select slp.login_policy_name, slpo.login_option_name, slpo.login_option_value from sysloginpolicy as slp, sysloginpolicyoption slpo where slpo.login_policy_id=slp.login_policy_id and slp.login_policy_name like 'eniq_user_login_policy%' and slpo.login_option_name in ('password_life_time','max_failed_login_attempts');OUTPUT TO ${TEM_DIR}/login_policy.txt ;\""  >/dev/null 2>&1
+    _cnt=1
+    declare -a login_policyArray
+    login_policy=''
+    DSFile=${TEM_DIR}/displayFile
+    $RM -f ${DSFile}
+    $TOUCH ${DSFile}
+    $ECHO "Login policies for ENIQ users exist\n" >>${DSFile}
+    while IFS='' read -r line || [[ -n "$line" ]]; do
+        optionchoice=''
+        login_policyDelta=$($ECHO ${line}| cut -d',' -f1| $SED "s/'//g")
+        if [ "${login_policy}" != "${login_policyDelta}" ]; then
+            $ECHO "\n\nLogin Policy Number: ${_cnt}             Login Policy Name: ${login_policyDelta}" >>${DSFile}
+            options=$($GREP -w "${login_policyDelta}" ${TEM_DIR}/login_policy.txt)
+            optionchoice="${login_policyDelta}"
+            for i in $options; do
+                login_option_nameDelta=$($ECHO $i| cut -d',' -f2|$SED "s/'//g")
+                if [ "$login_option_nameDelta" = "max_failed_login_attempts" ]; then
+                    $ECHO " The Max Number of failed logins  allow by ${login_policyDelta} is $($ECHO $i| cut -d',' -f3)">>${DSFile}
+                    max_failed_login_attempts_optionchoice=" $($ECHO $i|| cut -d',' -f3)"
+                elif [ "$login_option_nameDelta" = "password_life_time" ]; then
+                    $ECHO " The password lifetime  allow by ${login_policyDelta} is $($ECHO $i| cut -d',' -f3)">>${DSFile}
+                    password_life_time_optionchoice=" $($ECHO $i|| cut -d',' -f3)"
+                fi
+            done
+            login_policyArray["${_cnt}"]="${login_policyDelta},${max_failed_login_attempts_optionchoice},${password_life_time_optionchoice}"
+            let _cnt=$_cnt+1
+            login_policy="${login_policyDelta}"
+        fi
+    done < ${TEM_DIR}/login_policy.txt
+
+    while :; do
+        $ECHO ""
+        $CAT ${DSFile}
+        $ECHO "\n\n Please enter the integer number of one of the existing login policies below to apply it or enter 'New' to create a new login policy."
+        read _num_
+        if [ "${_num_}" = "New" ]; then
+            break
+        fi
+        re='^[0-9]+$'
+        if  [[ $_num_ =~ $re ]] ; then
+            break
+        else
+            log_msg -s "\nThe list must contain a number."
+            continue
+        fi
+    done
+
+    if [ "${_num_}" != "New" ]; then
+        if [ "${_num_}" -le "${#login_policyArray[@]}" ]; then
+            login_policy_name=$($ECHO "${login_policyArray[${_num_}]}"|cut -d',' -f1 |sed "s/'//g")
+            $ECHO ${login_policy_name} > ${TEM_DIR}/Gen_login_policy_name.txt
+        else
+            log_msg -s "Policy does not exist. Creating new login policy." -l ${LOGFILE}
+            let num=$num+1
+            login_policy_name="eniq_user_login_policy_${num}"
+            $BASH ${SCRIPTHOME}/create_query_user_login_policy.bsh -t ${TEM_DIR} -n ${login_policy_name}
+            if [ $? -ne 0 ]; then
+                abort_script
+            fi
+            login_policy_name=$($CAT ${TEM_DIR}/Gen_login_policy_name.txt)
+        fi
+    else
+        log_msg -s "Creating a new query login policy." -l ${LOGFILE}
+        let num=$num+1
+        login_policy_name="eniq_user_login_policy_${num}"
+        $BASH ${SCRIPTHOME}/create_query_user_login_policy.bsh -t ${TEM_DIR} -n ${login_policy_name}
+        if [ $? -ne 0 ]; then
+            abort_script
+        fi
+        login_policy_name=$($CAT ${TEM_DIR}/Gen_login_policy_name.txt)
+    fi
+fi
+if [ "${login_policy_name}" = "failed" ]; then
+    _err_msg_="$($DATE '+%Y-%m-%d_%H.%M.%S'): Failed to create a login policy to ${NEWUSER}"
+    abort_script "$_err_msg_"
+fi
+#Generating the sql to create the new user
+log_msg -s "$($DATE '+%Y-%b-%d_%H.%M.%S'): Generating the sql to assign login policy to ${NEWUSER}" -l ${LOGFILE}
+SqlFile=`mktemp ${TEM_DIR}/alterUser.XXXXXXXXXX`
+$ECHO "Alter USER ${NEWUSER} LOGIN POLICY ${login_policy_name};" >$SqlFile
+$DBISQL @${dwh_connection_string_enc} $SqlFile
+if [ $? -ne 0 ]; then
+    _err_msg_="$($DATE '+%Y-%b-%d_%H.%M.%S'): Alter user login policy failed for ${NEWUSER}: ${NEWUSER}."
+    abort_script "$_err_msg_"
+else
+    #updating the queryUserConf configuration file with new login policy details
+    update_queryUserConf_file
+    log_msg -s "$($DATE '+%Y-%b-%d_%H.%M.%S'):Successfully changed ${NEWUSER} to ${login_policy_name} login policy." -l ${LOGFILE}
+fi
+}
+
+### Function: checkDBStatus ###
+#
+# Check if repdb is online
+#
+# Arguments: none
+#
+# Return Values: none
+checkDBStatus()
+{
+_db_count_=1
+_retry_=5
+_flag_=0
+while [ ${_db_count_} -le ${_retry_} ]; do
+    # Check if server is up
+    $SU - ${SYSUSER} -c "/eniq/sql_anywhere/bin64/dbping @${dwh_connection_rep_enc}" >> ${LOGFILE} 2>&1
+    if [ $? -eq 0 ] ; then
+        _flag_=1
+        break
+    else
+        if [ ${_db_count_} -eq 1 ]; then 
+            log_msg -s "\n Waiting for repdb to come online, it may take some time \n" -l ${LOGFILE}
+        fi
+        log_msg -s "attempt=${_db_count_} \n" -l ${LOGFILE}
+        let _db_count_=${_db_count_}+1
+        sleep 60
+    fi
+done
+if [ ${_flag_} -eq 0 ]; then
+    _err_msg_="Could not ping to repdb "
+    abort_script "$_err_msg_"
+fi
+}
+
+### Function: checkDBAPasword ###
+#
+# confirm user knows dba password
+#
+# Arguments: none
+#
+# Return Values: none
+checkDBAPasword()
+{
+local _attempt_count_=3
+local _check_flag_=0
+while [ ${_check_flag_} -eq 0 ]
+do
+    unset dba_user_pwd
+
+    log_msg -s "\nEnter the current password for DBA user : \c " -l ${LOGFILE}
+    read -s dba_user_pwd
+
+    if [ "${dba_user_pwd}" != "${DBA_PASSWORD}" ]; then
+        if [[ ${_attempt_count_} -eq 1 ]]; then
+            $ECHO "\nToo many login attempt(s)."
+            _err_msg_="$($DATE '+%Y-%b-%d_%H.%M.%S'): Aborting as the DBA password entered does not match the recorded DBA password."
+            abort_script "$_err_msg_"
+        else
+            log_msg -s "\nEntered password was incorrect,Please re-try..."
+            let _attempt_count_=_attempt_count_-1
+            $ECHO "\n${_attempt_count_} attempt(s) left."
+            continue
+        fi
+    fi
+	_check_flag_=1
+    $ECHO ''
+done
+}
+
+### Function: checkUserExists ###
+#
+#
+#
+# Arguments: none
+#
+# Return Values: none
+checkUserExists()
+{
+$SU - $SYSUSER -c "$DBISQL @${dwh_connection_string_enc} \"select 'USEREXISTS' from sysusers where name like '${NEWUSER}';OUTPUT TO ${TEM_DIR}/checkUserExists.txt APPEND HEXADECIMAL ASIS FORMAT TEXT ;\""  >/dev/null 2>&1
+if [ $? -ne 0 ]
+then
+    _err_msg_="$($DATE '+%Y-%b-%d_%H.%M.%S'): Failed to query the database to see if User ${NEWUSER} existed."
+    abort_script "$_err_msg_"
+fi
+
+UserExistsFlag=$($CAT ${TEM_DIR}/checkUserExists.txt | $SED "s/'//g")
+if [ $? -ne 0 ]
+then
+    _err_msg_="$($DATE '+%Y-%b-%d_%H.%M.%S'): Failed to check to see if User '${NEWUSER}' existed."
+    abort_script "$_err_msg_"
+fi
+
+if [ "${UserExistsFlag}" = "USEREXISTS" ]
+then
+    log_msg -s "$($DATE '+%Y-%b-%d_%H.%M.%S'): User ${NEWUSER} exists" -l ${LOGFILE}
+else
+    _err_msg_="$($DATE '+%Y-%b-%d_%H.%M.%S'): User '${NEWUSER}' does not exist"
+    abort_script "$_err_msg_"
+fi
+}
+
+### Function: check_id ###
+#
+#   Check that the effective id of the user is correct
+#   If not print error msg and exit.
+#
+# Arguments:
+#       $1 : User ID name
+# Return Values:
+#       none
+check_id()
+{
+
+_get_id_=`$ENV |$GREP -w SUDO_USER | $EGREP "^[[:blank:]]*SUDO_USER="|$AWK -F\= '{print $2}'|$SED -e 's|"||g'`
+
+_check_id_=`$ID | $AWK -F\( '{print $2}' | $AWK -F\) '{print $1}'`
+
+_check_group_=`$ID $_get_id_ | $AWK -F\( '{print $3}' | $AWK -F\) '{print $1}'`
+
+
+    if [ "${_get_id_}" == "" ]; then
+
+        if [ "${_check_id_}" == "root" ]; then
+           # Set 1 for true
+           _user_root=1
+
+        else
+           _err_msg_="You must be root or admin to execute this script."
+           abort_script "${_err_msg_}"
+        fi
+          else
+            if [ "${_check_group_}" == "ENIQ_ADMIN_ROLE" ]; then
+               # Set 0 for false
+               _user_root=0
+
+            else
+               _err_msg_="You must be root or admin to execute this script." 
+               abort_script "${_err_msg_}"
+            fi
+    fi
+}
+
+### Function: check_password_history ###
+#
+# check if the password entered for a user is identical to previous five password
+#
+# Arguments: none
+#
+# Return Values: none
+check_password_history()
+{
+flag_chk_pass=0
+flag_success=0
+pwd_hist_chk=`$DBISQL @${rep_connection_string_enc} "select count() from dba.IQ_UserPwd_History where password='${new_user_pwd_enc}' and user_name='${NEWUSER}'" | $AWK 'NR==3{print$1}'`
+if [ $pwd_hist_chk -ne 0 ]; then
+    let CHANGE_PASSWORD_ATTEMPT_COUNT=CHANGE_PASSWORD_ATTEMPT_COUNT+1
+    while [ $CHANGE_PASSWORD_ATTEMPT_COUNT -lt 5 ]
+    do
+        $ECHO "-e \n$($DATE '+%Y-%b-%d_%H.%M.%S'): Your password cannot be same as the previous five password."
+        user_pwd_change
+        if [ $flag_chk_pass -eq 1 ]; then
+            flag_success=1
+             break 
+        fi
+    done
+else
+    flag_chk_pass=1
+fi
+
+if [ $CHANGE_PASSWORD_ATTEMPT_COUNT -eq 5 ]; then
+     _err_msg_="$($DATE '+%Y-%b-%d_%H.%M.%S'): You have exhausted maximum number of attempts to change the password for '${NEWUSER}' user "
+     abort_script "$_err_msg_"
+fi 
+}
+
+
+### Function: check_user_status ###
+#
+#
+#
+# Arguments: none
+#
+# Return Values: none
+check_user_status() {
+
+    if [ "${NEWUSER}" = "All" ]
+    then
+        for user in $($CAT  ${CLI_CONF_DIR}/queryUserConf.cfg | $AWK -F"::" '{print$1}' | uniq)
+        do
+            user2query="${user2query}','${user}"
+        done
+
+        user2query=$($ECHO ${user2query}| $SED "s/^','/('/")
+        user2query=$($ECHO ${user2query}| $SED "s/$/')/")
+        user2query="in ${user2query}"
+    else
+        user2query="like '${NEWUSER}'"
+    fi
+
+    $SU - $SYSUSER -c "$DBISQL @${dwh_connection_string_enc} \"
+    select u.user_name,lp.login_policy_name,lpo.login_option_name,lpo.login_option_value, s.locked from sysloginpolicy lp,sysloginpolicyoption lpo, sysuser u, sa_get_user_status() s where lpo.login_policy_id=lp.login_policy_id and u.login_policy_id=lp.login_policy_id and u.user_id=s.user_id and u.user_name ${user2query};
+    OUTPUT TO ${TEM_DIR}/userStats.txt APPEND HEXADECIMAL ASIS FORMAT TEXT ;\""  >/dev/null 2>&1
+    if [ $? -ne 0 ]
+    then
+        _err_msg_="$($DATE '+%Y-%b-%d_%H.%M.%S'): Failed to query the database to see get User '${NEWUSER}' status."
+        abort_script "$_err_msg_"
+    fi
+
+    declare -a userArray
+    declare -a lpNameArray
+    declare -a lpOptionNameArray
+    declare -a lpOptionValueArray
+    _cnt=0
+    DSFile=${TEM_DIR}/displayFile
+
+    $RM -f ${DSFile}
+    $TOUCH ${DSFile}
+
+    while IFS='' read -r line || [[ -n "$line" ]]
+    do
+        user=$($ECHO ${line}| $SED "s/'//g"| cut -d',' -f1)
+        userArray[${_cnt}]="${user}"
+
+        login_policy_name=$($ECHO ${line}| $SED "s/'//g"| cut -d',' -f2)
+        lpNameArray[${_cnt}]="${login_policy_name}"
+
+        login_option_name=$($ECHO ${line}| $SED "s/'//g"| cut -d',' -f3)
+        lpOptionNameArray[${_cnt}]="${login_option_name}"
+
+        login_option_value=$($ECHO ${line}| $SED "s/'//g"| cut -d',' -f4)
+        lpOptionValueArray[${_cnt}]="${login_option_value}"
+
+        lockStaus=$($ECHO ${line}| $SED "s/'//g"| cut -d',' -f5)
+        lockStausArray[${_cnt}]="${lockStaus}"
+
+        if [ ${login_option_name} == "locked" ]; then
+            lpOptionValueArray[${_cnt}]="${lockStaus}"
+        fi
+
+        let _cnt=_cnt+1
+
+    done < ${TEM_DIR}/userStats.txt
+
+    unique_sorted_list=($(printf "%s\n" "${userArray[@]}" | sort -u))
+    cnt=0
+
+
+    for x in  "${unique_sorted_list[@]}"
+    do
+        index=0
+        indexes=""
+        for y in "${userArray[@]}"
+        do
+            if [ "${y}" = "${x}" ]
+            then
+                indexes="${indexes} ${index}"
+            fi
+            let index=$index+1
+        done
+
+        $ECHO "User name is ${x}">>${DSFile}
+        for num in ${indexes}
+        do
+            if [ "${lpn}" != "${lpNameArray[${num}]}" ]
+            then
+                lpn="Login policy name is ${lpNameArray[${num}]}"
+            fi
+            if [ "${lStaus}" != "${lockStausArray[${num}]}" ]
+            then
+                if [ ${lockStausArray[${num}]} -eq 1 ]
+                then
+                    lststus='Locked.'
+                else
+                    lststus='Unlocked.'
+                fi
+                lStaus="The lock status for the user is ${lststus}"
+            fi
+            lpon="${lpon}$(printf "||%-30s" ${lpOptionNameArray[${num}]})"
+            lpov="${lpov}$(printf "||%-30s" ${lpOptionValueArray[${num}]})"
+            #lpov="${lpov}|\t\t${lpOptionValueArray[${num}]}"
+        done
+        $ECHO "${lpn}">>${DSFile}
+        $ECHO "${lStaus}">>${DSFile}
+        $ECHO "Login Policy options for ${x}">>${DSFile}
+        printf "||===============================||==============================||==============================||================================||================================||\n">>${DSFile}
+        $ECHO "${lpon}">>${DSFile}
+        #$ECHO "${lpon}||$(printf "||%-30s" Lock_Ststus)">>${DSFile}
+        $ECHO "${lpov}">>${DSFile}
+        $ECHO "">>${DSFile}
+        $ECHO "Features that the user ${x} have access to">>${DSFile}
+        printf "||=================================================================================================================================||\n">>${DSFile}
+        $CAT ${CLI_CONF_DIR}/queryUserConf.cfg | $GREP -w ${x} | $AWK -F"::" '{print $2}' | $SED "s/'//g">>${DSFile}
+        printf "||=================================================================================================================================||\n">>${DSFile}
+        $ECHO "">>${DSFile}
+        lpn=""
+        lpon=""
+        lpov=""
+    done
+
+    $CAT ${DSFile}
+}
+
+### Function: chk_create_logfile ###
+#
+# Check/Create Logfile
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+chk_create_logfile()
+{
+
+if [ ! "${LOGFILE}" ]; then
+    LOGFILE=${ENIQ_BASE_DIR}/log/sw_log/iq/admin_query_user_$($DATE '+%Y-%b-%d_%H.%M.%S').log
+fi
+
+$MKDIR -p `$DIRNAME ${LOGFILE}`
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not create directory `$DIRNAME ${LOGFILE}`"
+     abort_script "$_err_msg_"
+fi
+
+$TOUCH -a ${LOGFILE}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not write to file ${LOGFILE}"
+    abort_script "$_err_msg_"
+fi
+}
+
+### Function: cleanup ###
+#
+#
+#
+# Arguments: none
+#
+# Return Values: none
+cleanup() {
+  $RM -rf ${TEM_DIR} >/dev/null 2>&1
+}
+
+### Function: dropUser ###
+#
+# Takes new password as input from the user and validates it as per the defined rules
+#
+# Arguments: none
+#
+# Return Values: none
+dropUser()
+{
+    if [ "${NEWUSER}" = "All" ]
+    then
+        _err_msg_="$($DATE '+%Y-%b-%d_%H.%M.%S'): Can only drop one specified user at a time."
+        abort_script "$_err_msg_"
+    fi
+
+
+
+    $DBISQL @${dwh_connection_string_enc} "drop user ${NEWUSER}"  >/dev/null 2>&1
+    if [ $? -ne 0 ]
+    then
+        _err_msg_="$($DATE '+%Y-%b-%d_%H.%M.%S'): Failed to drop User '${NEWUSER}' ."
+        abort_script "$_err_msg_"
+    else
+        log_msg -s "$($DATE '+%Y-%b-%d_%H.%M.%S'): The user ${NEWUSER} was successfully ${action}ped from the database." -l ${LOGFILE}
+    fi
+
+    $DBISQL @${rep_connection_string_enc} "delete from dba.IQ_UserPwd_History where user_name='${NEWUSER}'"
+    if [ $? -ne 0 ]
+    then
+        _err_msg_="$($DATE '+%Y-%b-%d_%H.%M.%S'): Failed to remove '${NEWUSER}' details from IQ_UserPwd_History table ."
+        abort_script "$_err_msg_"
+    else
+        log_msg -s "$($DATE '+%Y-%b-%d_%H.%M.%S'): Successfully removed '${NEWUSER}' details from IQ_UserPwd_History table." -l ${LOGFILE}
+    fi
+
+    $CAT  ${CLI_CONF_DIR}/queryUserConf.cfg |$GREP -wv ${NEWUSER} > ${TEM_DIR}/queryUserConf.cfg
+    $CP -f ${TEM_DIR}/queryUserConf.cfg ${CLI_CONF_DIR}/queryUserConf.cfg
+    if [ $? -ne 0 ]
+    then
+        _err_msg_="$($DATE '+%Y-%b-%d_%H.%M.%S'): Failed to remove entries for User '${NEWUSER}' from ${TEM_DIR}/queryUserConf.cfg."
+        abort_script "$_err_msg_"
+    else
+        log_msg -s "$($DATE '+%Y-%b-%d_%H.%M.%S'): The user ${NEWUSER} entries was successfully removed from ${CLI_CONF_DIR}/queryUserConf.cfg." -l ${LOGFILE}
+    fi
+}
+
+### Function: get_absolute_path ###
+#
+# Determine absolute path to software
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+get_absolute_path()
+{
+    _dir_=`$DIRNAME $0`
+    SCRIPTHOME=`cd $_dir_ 2>/dev/null && pwd || $ECHO $_dir_`
+}
+
+### Function: regrant_ft4user ###
+#
+# Granting features for User
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+regrant_ft4user()
+{
+FTListFile=${TEM_DIR}/ftlist.txt
+$RM -f ${FTListFile}
+$TOUCH ${FTListFile}
+_db_retry_=1
+log_msg -s "-------------$($DATE '+%Y-%b-%d_%H.%M.%S'): Re-granting customized database users access to features.-------------\n" -l ${LOGFILE}
+
+if [ -f ${UPGRADE_FTLIST} ]; then
+    $CAT ${UPGRADE_FTLIST} | $AWK -F"::" '{print$2}' | $SED "s/ *$//g" >${TEM_DIR}/upgrade_ftlist
+else
+    _err_msg_="$($DATE '+%Y-%b-%d_%H.%M.%S'):Feature selection file not found"
+    abort_script "$_err_msg_"
+fi 
+_user_list_=`$CAT ${CLI_CONF_DIR}/queryUserConf.cfg | $AWK -F "::" '{print $1}' | $GREP -wv 'User_Name' | uniq`
+for _user_ in ${_user_list_}; do 
+    if [ "$_user_" == "dcbo" -o "$_user_" == "dcpublic" ]; then
+        log_msg -s "\n$($DATE '+%Y-%b-%d_%H.%M.%S'): Skipping addition of feature selectivity, since $_user_ already has access to all features\n" -l ${LOGFILE}
+        continue
+    fi
+    $CAT ${CLI_CONF_DIR}/queryUserConf.cfg | $GREP -w ${_user_} | $AWK -F"::" '{print$2}' | $GREP -v "NULL" > ${FTListFile}
+    if [ $? -ne 0 ]; then
+        log_msg -s "\n$($DATE '+%Y-%b-%d_%H.%M.%S'): Skipping addition of feature selectivity, since no feature has been assigned to ${_user_}\n" -l ${LOGFILE}
+        continue;
+    fi
+    $TOUCH ${TEM_DIR}/ftlistfinal.txt
+    while IFS='' read -r line || [[ -n "$line" ]]; do
+        while IFS='' read -r line1 || [[ -n "$line1" ]]; do
+            if [ "$line1" == "$line" ]; then
+                $ECHO $line1 >> ${TEM_DIR}/ftlistfinal.txt
+            else
+                continue
+            fi
+        done < ${TEM_DIR}/upgrade_ftlist
+    done < ${FTListFile}
+
+
+    while IFS='' read -r line || [[ -n "$line" ]]; do
+        Version=$($CAT ${CLI_CONF_DIR}/feature_descriptions | $GREP -w "${line}" | $AWK -F"::" '{print $1}')
+        interFaces="$($CAT /eniq/sw/conf/feature_techpacks | $GREP -w "${Version}" | $SED "s/${Version}:://g")"
+        if4q=$($ECHO "('$($ECHO ${interFaces})')" | $SED "s/ /','/g")
+        # Check if server is up
+        checkDBStatus
+        $SU - $SYSUSER -c "$DBISQL @${rep_connection_string_enc} \"select  '${line}',ift.TECHPACKNAME, dt.TYPENAME, dt.TABLELEVEL from dwhrep.InterfaceTechpacks ift, dwhrep.dwhtype dt  WHERE ift.INTERFACENAME in ${if4q} and ift.TECHPACKNAME=dt.TECHPACK_NAME and dt.TYPENAME not like '%|_CURRENT|_DC' escape '|';OUTPUT TO ${TEM_DIR}/tplist.txt APPEND HEXADECIMAL ASIS FORMAT TEXT ;\""  >/dev/null 2>&1
+        if [ $? -ne 0 ] ; then
+            checkDBStatus
+            if [ $_db_count_ -ne 1 ]; then
+                $SU - $SYSUSER -c "$DBISQL @${rep_connection_string_enc} \"select  '${line}',ift.TECHPACKNAME, dt.TYPENAME, dt.TABLELEVEL from dwhrep.InterfaceTechpacks ift, dwhrep.dwhtype dt  WHERE ift.INTERFACENAME in ${if4q} and ift.TECHPACKNAME=dt.TECHPACK_NAME and dt.TYPENAME not like '%|_CURRENT|_DC' escape '|';OUTPUT TO ${TEM_DIR}/tplist.txt APPEND HEXADECIMAL ASIS FORMAT TEXT ;\""  >/dev/null 2>&1
+                if [ $? -ne 0 ] ; then
+                    _err_msg_="$($DATE '+%Y-%b-%d_%H.%M.%S'): Failed to execute the query to read feature techpacks list"
+                    abort_script "$_err_msg_"
+                fi
+            else
+                _err_msg_="$($DATE '+%Y-%b-%d_%H.%M.%S'): repdb is online, but failed to execute the query to read feature techpacks list"
+                abort_script "$_err_msg_"
+            fi
+        fi
+    done < ${TEM_DIR}/ftlistfinal.txt
+    $CAT ${TEM_DIR}/tplist.txt | sort | uniq >  ${TEM_DIR}/uniq_ftlist.txt
+    #Generating the sql to add features selectivity to the user
+    log_msg -s "\n$($DATE '+%Y-%b-%d_%H.%M.%S'): Generating the sql to add features selectivity to ${_user_}" -l ${LOGFILE}
+    SqlFile=`mktemp ${TEM_DIR}/regrant_Features.XXXXXXXXXX` 
+    $TOUCH ${TEM_DIR}/viewNameList1.txt
+    while IFS='' read -r line || [[ -n "$line" ]]; do
+        view=$($ECHO $line | cut -d',' -f3 |$SED "s/'//g")
+        type=$($ECHO $line | cut -d',' -f4 |$SED "s/'//g")
+        if [ "${type}" = "PLAIN" ]; then
+            $ECHO "','"${view} >> ${TEM_DIR}/viewNameList1.txt
+        else
+            $ECHO "','"${view}_${type} >> ${TEM_DIR}/viewNameList1.txt
+        fi
+    done <  ${TEM_DIR}/uniq_ftlist.txt
+    $CAT ${TEM_DIR}/viewNameList1.txt | $SED "s/ *$//g" | sort | uniq > ${TEM_DIR}/viewNameList2.txt 
+    log_msg -s "$($DATE '+%Y-%b-%d_%H.%M.%S'): Executing the sql to add features selectivity to ${_user_} query user\n" -l ${LOGFILE}
+
+    while [ -s ${TEM_DIR}/viewNameList2.txt ]; do
+        _count_=`$CAT ${TEM_DIR}/viewNameList2.txt | wc -l`
+        viewNameList="('"
+        if [ $_count_ -gt 2000 ]; then
+            viewNameList=${viewNameList}`$HEAD -n 2000 ${TEM_DIR}/viewNameList2.txt`
+        else
+            viewNameList=${viewNameList}`$CAT ${TEM_DIR}/viewNameList2.txt`
+        fi
+        viewNameList=${viewNameList}+"')"
+        viewNameList=$( $ECHO $viewNameList | $SED "s/('','/('/g" | $SED "s/+')/')/g" | $SED "s/ //g" )
+        #Executing the sql to add features selectivity to user
+        $SU - $SYSUSER -c "$DBISQL @${dwh_connection_string_enc} \"select 'GRANT SELECT ON dcpublic.'||t.table_name||' to ${_user_};' from systab t, sysuser u where t.creator=u.user_id and u.user_name like 'dcpublic' and t.table_type_str like 'view' and t.table_name in ${viewNameList}; OUTPUT TO ${TEM_DIR}/viewNameList.txt APPEND HEXADECIMAL ASIS FORMAT TEXT ;\""  >/dev/null 2>&1
+        if [ $? -ne 0 ]; then
+            $SU - ${SYSUSER} -c "/eniq/sybase_iq/IQ-*/bin64/dbping @${dwh_connection_dwh_enc}" >> ${LOGFILE} 2>&1
+            if [ $? -ne 0 ] ; then
+                if [ ${_db_retry_} -le 10 ]; then
+                    if [ ${_db_retry_} -eq 1 ]; then
+                        log_msg -s "\n Waiting for dwhdb to come online, it may take some time \n" -l ${LOGFILE}
+                    fi 
+                    log_msg -s "attempt=${_db_retry_}\n" -l ${LOGFILE}
+                    let _db_retry_=${_db_retry_}+1
+                    sleep 60
+                    continue
+                else
+                    _err_msg_="$($DATE '+%Y-%b-%d_%H.%M.%S'): Could not ping dwhdb. Failed to grant the features selectivity to ${NEWUSER}"
+                    abort_script "$_err_msg_"
+                fi
+            else
+                _err_msg_="$($DATE '+%Y-%b-%d_%H.%M.%S'): dwhdb is online, but failed to grant the features selectivity to ${NEWUSER}"
+                abort_script "$_err_msg_"
+            fi
+        fi
+        _db_retry_=1
+        if [ $_count_ -gt 2000 ]; then
+            $SED -i '1,2000 d' ${TEM_DIR}/viewNameList2.txt
+        else
+            $SED -i '/^/d' ${TEM_DIR}/viewNameList2.txt
+        fi
+    done
+
+    $CAT ${TEM_DIR}/viewNameList.txt | $SED "s/'//g"  | sort | uniq >>$SqlFile
+    while :; do
+        $DBISQL @${dwh_connection_string_enc} $SqlFile
+        if [ $? -ne 0 ]; then
+            $SU - ${SYSUSER} -c "/eniq/sybase_iq/IQ-*/bin64/dbping @${dwh_connection_dwh_enc}" >> ${LOGFILE} 2>&1
+            if [ $? -ne 0 ] ; then
+                if [ ${_db_retry_} -le 10 ]; then
+                    if [ ${_db_retry_} -eq 1 ]; then
+                        log_msg -s "\n Waiting for dwhdb to come online, it may take some time \n" -l ${LOGFILE}
+                    fi 
+                    log_msg -s "attempt=${_db_retry_}\n" -l ${LOGFILE}
+                    let _db_retry_=${_db_retry_}+1
+                    sleep 60
+                    continue
+                else
+                    _err_msg_="$($DATE '+%Y-%b-%d_%H.%M.%S'): Could not ping dwhdb. Failed to re-grant features selectivity to ${_user_}"
+                    abort_script "$_err_msg_"
+                fi
+            else
+                _err_msg_="$($DATE '+%Y-%b-%d_%H.%M.%S'): dwhdb is online, but failed to re-grant features selectivity to ${_user_}"
+                abort_script "$_err_msg_"
+            fi
+        fi
+        break
+    done
+done
+
+$RM -rf ${UPGRADE_FTLIST} >/dev/null 2>&1
+log_msg -s "\n-------------$($DATE '+%Y-%b-%d_%H.%M.%S'): Successfully re-granted features selectivity to all the customized query users.-------------\n" -l ${LOGFILE}
+}
+
+### Function: lockUsers ###
+#
+#
+#
+# Arguments: none
+#
+# Return Values: none
+lockUsers() {
+
+
+    SqlFile=`mktemp ${TEM_DIR}/unlocklockUser.XXXXXXXXXX`
+    if [ "${NEWUSER}" = "All" ]
+    then
+        for user in $($CAT  ${CLI_CONF_DIR}/queryUserConf.cfg | $GREP -vw "User_Name" | $AWK -F "::" '{print$1}' | uniq)
+        do
+            $ECHO "ALTER USER ${user} LOGIN POLICY locked_users;" >>$SqlFile
+        done
+
+
+    else
+        $ECHO "ALTER USER ${NEWUSER} LOGIN POLICY locked_users" >>$SqlFile
+    fi
+
+    $CHOWN ${SYSUSER}:${SYSGRP} $SqlFile
+
+    $DBISQL @${dwh_connection_string_enc} $SqlFile  >/dev/null 2>&1
+    if [ $? -ne 0 ]
+    then
+        _err_msg_="$($DATE '+%Y-%b-%d_%H.%M.%S'): Failed to ${action} User '${NEWUSER}' ."
+        abort_script "$_err_msg_"
+    else
+        log_msg -s "$($DATE '+%Y-%b-%d_%H.%M.%S'): The user ${NEWUSER} was successfully ${action}ed." -l ${LOGFILE}
+    fi
+}
+
+### Function: remove_ft4user ###
+#
+#
+#
+# Arguments: none
+#
+# Return Values: none
+remove_ft4user()
+{
+
+
+
+dwh_connection_string_continue="-nogui -onerror continue -c \"eng=${DWH_ENG};links=tcpip{host=localhost;port=${DWH_PORT}};uid=dba;pwd=${DBA_PASSWORD}\""
+dwh_connection_string_continue_enc=${TEM}/string_admin_encrypt.txt.`uuidgen`
+
+# encrypt the connection string.
+get_encrypt_file "${dwh_connection_string_continue}" "${dwh_connection_string_continue_enc}"
+
+
+if [ "${NEWUSER}" = "All" ];  then
+    _err_msg_="$($DATE '+%Y-%b-%d_%H.%M.%S'): Feature access can be revoked for one specified user at a time."
+    abort_script "$_err_msg_"
+fi
+
+local l_p_name4ftChange=$( $CAT ${CLI_CONF_DIR}/queryUserConf.cfg | $GREP -w ${NEWUSER} | $AWK -F"::" '{print $3}' | uniq)
+local l_p_v_max_connections=$( $CAT ${CLI_CONF_DIR}/queryUserConf.cfg | $GREP -w ${NEWUSER} | $AWK -F"::" '{print $4}' | uniq)
+local l_p_v_pwd_creation=$( $CAT ${CLI_CONF_DIR}/queryUserConf.cfg | $GREP -w ${NEWUSER} | $AWK -F"::" '{print $5}' | uniq)
+local l_p_v_password_life_time=$( $CAT ${CLI_CONF_DIR}/queryUserConf.cfg | $GREP -w ${NEWUSER} | $AWK -F"::" '{print $6}' | uniq)
+local l_p_v_pwd_exp=$( $CAT ${CLI_CONF_DIR}/queryUserConf.cfg | $GREP -w ${NEWUSER} | $AWK -F"::" '{print $7}' | uniq)
+local l_p_v_password_grace_time=$( $CAT ${CLI_CONF_DIR}/queryUserConf.cfg | $GREP -w ${NEWUSER} | $AWK -F"::" '{print $8}' | uniq)
+local l_p_v_login_attempt=$( $CAT ${CLI_CONF_DIR}/queryUserConf.cfg | $GREP -w ${NEWUSER} | $AWK -F"::" '{print $9}' | uniq)
+
+_cnt=0
+_db_retry_=1
+declare -a featureArray
+DSFile=${TEM_DIR}/displayFile
+FTListFile=${TEM_DIR}/ftlist.txt
+$RM -f ${DSFile} ${FTListFile}
+$TOUCH ${DSFile} ${FTListFile}
+
+$CAT ${CLI_CONF_DIR}/queryUserConf.cfg | $GREP -w ${NEWUSER} | $AWK -F"::" '{print$2}' > ${TEM_DIR}/queryUserConf.cfg
+$GREP "NULL" ${TEM_DIR}/queryUserConf.cfg >/dev/null 2>&1
+if [ $? -eq 0 ]; then
+    $CAT ${TEM_DIR}/queryUserConf.cfg | $GREP -v "NULL" > ${TEM_DIR}/queryUserConf.cfg.1
+    $CP -f ${TEM_DIR}/queryUserConf.cfg.1 ${TEM_DIR}/queryUserConf.cfg
+fi
+
+$ECHO "\nInstalled ENIQ features the user has access to:" >> ${DSFile}
+$ECHO "-----------------------" >> ${DSFile}
+while IFS='' read -r line || [[ -n "$line" ]]; do
+    if [  -z "${line}" ]; then
+        continue
+    fi
+    let _cnt=_cnt+1
+    feature=$($ECHO ${line}| cut -d',' -f2)
+    if [ ! -z "${feature}" ]; then
+        featureArray[${_cnt}]="${feature}"
+        $ECHO "Feature Number: ${_cnt}             Feature Name: ${feature}" >>${DSFile}
+    fi
+done < ${TEM_DIR}/queryUserConf.cfg
+
+ftArraySize=${#featureArray[@]}
+if [ $ftArraySize -eq 0 ]; then
+    _err_msg_="$($DATE '+%Y-%b-%d_%H.%M.%S'): Exiting ... User '${NEWUSER}' has access to no installed features."
+    abort_script "$_err_msg_"
+else
+    $ECHO "\nSelect the ENIQ Features to revoke feature access of User:${NEWUSER} using the formats [n,n,n,n...n] OR [n,n-n,n]" >> ${DSFile}
+    $ECHO "\tE.G. 1,2,3-8,....,N" >> ${DSFile}
+
+    while :; do
+        $CLEAR
+        $CAT ${DSFile}
+        $ECHO "\n\nSelect ENIQ Features to revoke the feature access of User: ${NEWUSER}"
+        read _opt_
+        # If the User hit nothing and there is a default. that will do
+        if [ ! "${_opt_}" ]; then
+            continue
+        else
+            _numerror_=0
+            for _num_ in `$ECHO ${_opt_} | $SED -e 's| ||g' -e 's|,| |g'`; do
+                $ECHO ${_num_} | $EGREP '-' >> /dev/null 2>&1
+                if [ $? -eq 0 ]; then
+                    _start_=`$ECHO ${_num_} | $AWK -F\- '{print $1}'`
+                    if [ ! "${_start_}" ]; then
+                        continue
+                    fi
+                    _end_=`$ECHO ${_num_} | $AWK -F\- '{print $2}'`
+                    for (( _sel_=${_start_}; _sel_<=${_end_}; _sel_++ )); do
+                        $ECHO ${_sel_} | $EGREP '^[0-9]+$' >> /dev/null 2>&1
+                        if [ $? -ne 0 ]; then
+                            _numerror_=1
+                            break
+                        fi
+                        if [ ${_sel_} -lt 1 -o ${_sel_} -gt ${_cnt} ]; then
+                            _numerror_=1
+                            break
+                        fi
+                        $ECHO "${featureArray[${_sel_}]}">>${FTListFile}
+                    done
+                else
+                    $ECHO ${_num_} | $EGREP '^[0-9]+$' >> /dev/null 2>&1
+                    if [ $? -ne 0 ]; then
+                        _numerror_=1
+                        break
+                    fi
+                    if [ ${_num_} -lt 1 -o ${_num_} -gt ${_cnt} ]; then
+                        _numerror_=1
+                        break
+                    fi
+                    $ECHO "${featureArray[${_num_}]}">>${FTListFile}
+                fi
+            done
+            if [ ${_numerror_} -eq 0 ]; then
+                break
+            fi
+        fi
+    done
+    while IFS='' read -r line || [[ -n "$line" ]]; do
+        line=$($ECHO ${line} | $SED "s/'//g")
+        Version=$($CAT ${CLI_CONF_DIR}/feature_descriptions | $GREP -w "${line}" | $AWK -F"::" '{print $1}')
+        interFaces="$($CAT /eniq/sw/conf/feature_techpacks | $GREP -w "${Version}" | $SED "s/${Version}:://g")"
+        if4q=$($ECHO "('$($ECHO ${interFaces})')" | $SED "s/ /','/g")
+        checkDBStatus
+        #$SU - $SYSUSER -c "$DBISQL @${rep_connection_string_enc} \"select  '${line},'||TECHPACKNAME from dwhrep.InterfaceTechpacks WHERE INTERFACENAME in  ${if4q};OUTPUT TO ${TEM_DIR}/tplist.txt APPEND HEXADECIMAL ASIS FORMAT TEXT ;\""  >/dev/null 2>&1
+        $SU - $SYSUSER -c "$DBISQL @${rep_connection_string_enc} \"select  '${line}',ift.TECHPACKNAME, dt.TYPENAME, dt.TABLELEVEL from dwhrep.InterfaceTechpacks ift, dwhrep.dwhtype dt  WHERE ift.INTERFACENAME in ${if4q} and ift.TECHPACKNAME=dt.TECHPACK_NAME and dt.TYPENAME not like '%|_CURRENT|_DC' escape '|';OUTPUT TO ${TEM_DIR}/tplist.txt APPEND HEXADECIMAL ASIS FORMAT TEXT ;\""  >/dev/null 2>&1
+        if [ $? -ne 0 ] ; then
+            checkDBStatus
+            if [ $_db_count_ -ne 1 ]; then
+                $SU - $SYSUSER -c "$DBISQL @${rep_connection_string_enc} \"select  '${line}',ift.TECHPACKNAME, dt.TYPENAME, dt.TABLELEVEL from dwhrep.InterfaceTechpacks ift, dwhrep.dwhtype dt  WHERE ift.INTERFACENAME in ${if4q} and ift.TECHPACKNAME=dt.TECHPACK_NAME and dt.TYPENAME not like '%|_CURRENT|_DC' escape '|';OUTPUT TO ${TEM_DIR}/tplist.txt APPEND HEXADECIMAL ASIS FORMAT TEXT ;\""  >/dev/null 2>&1
+                if [ $? -ne 0 ] ; then
+                    _err_msg_="$($DATE '+%Y-%b-%d_%H.%M.%S'): Failed to execute the query to read feature techpacks list"
+                    abort_script "$_err_msg_"
+                fi
+            else
+                _err_msg_="$($DATE '+%Y-%b-%d_%H.%M.%S'): repdb is online, but failed to execute the query to read feature techpacks list"
+                abort_script "$_err_msg_"
+            fi
+        fi
+    done < ${FTListFile}
+
+    $CAT ${TEM_DIR}/tplist.txt | sort | uniq >  ${TEM_DIR}/uniq_ftlist.txt
+fi
+
+#Generating the sql to add features selectivity to the user
+log_msg -s "$($DATE '+%Y-%b-%d_%H.%M.%S'): Generating the sql to remove features selectivity of ${NEWUSER}" -l ${LOGFILE}
+SqlFile=`mktemp ${TEM_DIR}/revokeFeature.XXXXXXXXXX` 
+
+$TOUCH ${TEM_DIR}/viewNameList1.txt
+
+while IFS='' read -r line || [[ -n "$line" ]]; do
+    view=$($ECHO $line | cut -d',' -f3 |$SED "s/'//g")
+    type=$($ECHO $line | cut -d',' -f4 |$SED "s/'//g")
+    if [ "${type}" = "PLAIN" ]; then
+        $ECHO "','"${view} >> ${TEM_DIR}/viewNameList1.txt
+    else
+        $ECHO "','"${view}_${type} >> ${TEM_DIR}/viewNameList1.txt
+    fi
+done <  ${TEM_DIR}/uniq_ftlist.txt
+
+$CAT ${TEM_DIR}/viewNameList1.txt | $SED "s/ *$//g" | sort | uniq > ${TEM_DIR}/viewNameList2.txt 
+
+#Executing the sql to revoke features selectivity
+log_msg -s "$($DATE '+%Y-%b-%d_%H.%M.%S'): Executing the sql to revoke features selectivity of ${NEWUSER}" -l ${LOGFILE}
+
+while [ -s ${TEM_DIR}/viewNameList2.txt ]; do
+    _count_=`$CAT ${TEM_DIR}/viewNameList2.txt | wc -l`
+    viewNameList="('"
+    if [ $_count_ -gt 2000 ]; then
+        viewNameList=${viewNameList}`$HEAD -n 2000 ${TEM_DIR}/viewNameList2.txt`
+    else
+        viewNameList=${viewNameList}`$CAT ${TEM_DIR}/viewNameList2.txt`
+    fi
+    viewNameList=${viewNameList}+"')"
+    viewNameList=$( $ECHO $viewNameList | $SED "s/('','/('/g" | $SED "s/+')/')/g" | $SED "s/ //g" )
+    $SU - $SYSUSER -c "$DBISQL @${dwh_connection_string_enc} \"select 'Revoke SELECT ON dcpublic.'||t.table_name||' from ${NEWUSER};' from systab t, sysuser u where t.creator=u.user_id and u.user_name like 'dcpublic' and t.table_type_str like 'view' and t.table_name in ${viewNameList}; OUTPUT TO ${TEM_DIR}/viewNameList.txt APPEND HEXADECIMAL ASIS FORMAT TEXT ;\""  >/dev/null 2>&1
+    if [ $? -ne 0 ]; then
+        $SU - ${SYSUSER} -c "/eniq/sybase_iq/IQ-*/bin64/dbping @${dwh_connection_dwh_enc}" >> ${LOGFILE} 2>&1
+        if [ $? -ne 0 ] ; then
+            if [ ${_db_retry_} -le 5 ]; then
+                if [ ${_db_retry_} -eq 1 ]; then
+                    log_msg -s "\n Waiting for dwhdb to come online, it may take some time \n" -l ${LOGFILE}
+                fi 
+                log_msg -s "attempt=${_db_retry_} \n" -l ${LOGFILE}
+                let _db_retry_=${_db_retry_}+1
+                sleep 60
+                continue
+            else
+                _err_msg_="$($DATE '+%Y-%b-%d_%H.%M.%S'): Could not ping dwhdb "
+                abort_script "$_err_msg_"
+            fi
+        else
+            _err_msg_="$($DATE '+%Y-%b-%d_%H.%M.%S'): dwhdb is online, but could not execute the query "
+            abort_script "$_err_msg_"
+        fi
+    fi
+    _db_retry_=1
+    if [ $_count_ -gt 2000 ]; then
+        $SED -i '1,2000 d' ${TEM_DIR}/viewNameList2.txt
+    else
+        $SED -i '/^/d' ${TEM_DIR}/viewNameList2.txt
+    fi
+done
+
+$CAT ${TEM_DIR}/viewNameList.txt | $SED "s/'//g" | sort | uniq >>$SqlFile
+_flag1_=0
+while :; do
+    $DBISQL @${dwh_connection_string_enc} $SqlFile >> ${TEM_DIR}/revoked_features.txt 2>&1 
+    if [ $? -ne 0 ]; then
+        $CAT ${TEM_DIR}/revoked_features.txt | $GREP "not been granted" >> /dev/null 2>&1
+        if [ $? -eq 0 ]; then
+            _flag1_=1
+        fi
+        $SU - ${SYSUSER} -c "/eniq/sybase_iq/IQ-*/bin64/dbping @${dwh_connection_dwh_enc}" >> ${LOGFILE} 2>&1
+        if [ $? -ne 0 ] ; then
+            if [ ${_db_retry_} -le 5 ]; then
+                if [ ${_db_retry_} -eq 1 ]; then
+                    log_msg -s "\n Waiting for dwhdb to come online, it may take some time \n" -l ${LOGFILE}
+                fi 
+                log_msg -s "attempt=${_db_retry_} \n" -l ${LOGFILE}
+                let _db_retry_=${_db_retry_}+1
+                sleep 60
+                continue
+            else
+                _err_msg_="$($DATE '+%Y-%b-%d_%H.%M.%S'): Could not ping dwhdb. Failed to add features selectivity to ${NEWUSER}"
+                abort_script "$_err_msg_"
+            fi
+        elif [ $_flag1_ -eq 1 ]; then
+            $DBISQL @${dwh_connection_string_continue_enc} $SqlFile >> /dev/null 2>&1
+        else
+            _err_msg_="$($DATE '+%Y-%b-%d_%H.%M.%S'): Failed to revoke features selectivity of ${NEWUSER}"
+            abort_script "$_err_msg_"
+        fi
+    fi 
+    break
+done
+
+$CP -f ${CLI_CONF_DIR}/queryUserConf.cfg ${TEM_DIR}/queryUserConf_NEW.cfg
+while IFS='' read -r line || [[ -n "$line" ]]; do
+    removeft=`$CAT ${CLI_CONF_DIR}/queryUserConf.cfg | $GREP -w "${NEWUSER}" | $GREP "${line}"`
+    $CAT  ${TEM_DIR}/queryUserConf_NEW.cfg | $GREP -wv "${removeft}" > ${TEM_DIR}/queryUserConf_NEW1.cfg
+    $CP -f ${TEM_DIR}/queryUserConf_NEW1.cfg ${TEM_DIR}/queryUserConf_NEW.cfg
+done <  ${FTListFile}
+log_msg -s "$($DATE '+%Y-%b-%d_%H.%M.%S'): Successfully revoked features selectivity of ${NEWUSER}" -l ${LOGFILE}
+
+$CP -f ${TEM_DIR}/queryUserConf_NEW.cfg ${CLI_CONF_DIR}/queryUserConf.cfg
+if [ $? -ne 0 ]; then
+    _err_msg_="$($DATE '+%Y-%b-%d_%H.%M.%S'): Failed to remove entries for User '${NEWUSER}' from ${CLI_CONF_DIR}/queryUserConf.cfg"
+    abort_script "$_err_msg_"
+fi
+$GREP -w "${NEWUSER}" ${CLI_CONF_DIR}/queryUserConf.cfg >/dev/null 2>&1
+
+if [ $? -ne 0 ]; then
+    $ECHO "${NEWUSER}::NULL::${l_p_name4ftChange}::${l_p_v_max_connections}::${l_p_v_pwd_creation}::${l_p_v_password_life_time}::${l_p_v_pwd_exp}::${l_p_v_password_grace_time}::${l_p_v_login_attempt}" >> ${CLI_CONF_DIR}/queryUserConf.cfg
+fi
+    log_msg -s "$($DATE '+%Y-%b-%d_%H.%M.%S'): The ${NEWUSER} entries are successfully updated in ${CLI_CONF_DIR}/queryUserConf.cfg" -l ${LOGFILE}
+}
+
+### Function: rules ###
+#
+# Rules defined to change the password
+#
+# Arguments: none
+#
+# Return Values: none
+rules()
+{
+$ECHO "Password Policies:
+
+** Minimum password length 5 characters.
+** Maximum password length 30 characters.
+** All alphanumeric characters allowed.
+** The following special characters are allowed # % ~ _ + @ : ! * = { } , . /
+** Must contain a uppercase letter, lowercase letter, number and special character
+** No spaces allowed.
+"
+}
+
+### Function: setup_env ###
+#
+# Setup up path environment etc
+#
+# Arguments:
+#    none
+# Return Values:
+#    DWH_port,DWH_eng and DBA password
+
+setup_env()
+{
+ENIQ_BASE_DIR=/eniq
+ENIQ_SW_DIR=${ENIQ_BASE_DIR}/sw
+ENIQ_BKUPSW_DIR=${ENIQ_BASE_DIR}/bkup_sw
+CLI_CONF_DIR=${ENIQ_BASE_DIR}/sw/conf
+ENIQ_CORE_BIN_DIR=${ENIQ_BASE_DIR}/installation/core_install/bin/
+ENIQ_ADMIN_MANAGED_OSS_DIR=${ENIQ_BASE_DIR}/admin/managed_oss
+# Sentinel Stuff
+ENIQ_SENTINEL_DIR=${ENIQ_BASE_DIR}/sentinel
+ENIQ_SENTINEL_BIN_DIR=${ENIQ_SENTINEL_DIR}/bin
+ENIQ_SENTINEL_ENV=${ENIQ_SENTINEL_DIR}/etc/sentinel.env
+
+ENIQ_CONF_DIR=${ENIQ_BASE_DIR}/installation/config
+if [ ! -s ${ENIQ_CONF_DIR}/SunOS.ini ]; then
+    _err_msg_="Could not lo$cate file ${ENIQ_CONF_DIR}/SunOS.ini"
+    abort_script "$_err_msg_"
+fi
+
+#Temp directory.
+TEM=/tmp
+
+# Source the common functions
+if [ -s ${ENIQ_BASE_DIR}/admin/lib/common_functions.lib ]; then
+    . ${ENIQ_BASE_DIR}/admin/lib/common_functions.lib
+else
+    _err_msg_="File ${ENIQ_BASE_DIR}/admin/lib/common_functions.lib not found"
+    abort_script "$_err_msg_"
+fi
+
+if [ ! -s ${ENIQ_CORE_BIN_DIR}/set_core_memcache.bsh ]; then
+        _err_msg_="Failed to lo$cate script ${ENIQ_CORE_BIN_DIR}/set_core_memcache.bsh"
+        abort_script "$_err_msg_" "${EXEC_SHELL_CMD}"
+fi
+
+DWH_PORT=`iniget DWH -v PortNumber -f ${CLI_CONF_DIR}/niq.ini`
+DWH_ENG=`iniget DWH -v ServerName -f ${CLI_CONF_DIR}/niq.ini`
+if [ ! "${DWH_PORT}" -o ! "${DWH_ENG}" ]; then
+        _err_msg_="Could not read db values from ${CLI_CONF_DIR}/${ENIQ_INI}"
+        abort_script "$_err_msg_"
+fi
+
+DBA_PASSWORD=`inigetpassword DB -f ${CLI_CONF_DIR}/${ENIQ_INI} -v DBAPassword`
+if [ ! ${DBA_PASSWORD} ]; then
+  if [ -f ${ENIQ_BASE_DIR}/sw/installer/dbusers ]; then
+            DBA_PASSWORD=`${ENIQ_BASE_DIR}/sw/installer/dbusers dba dwh`
+     if [ ! "${DBA_PASSWORD}" ] ; then
+                _err_msg_="Could not get dwhdb DBA Password"
+                abort_script "$_err_msg_"
+     fi
+   fi
+fi
+
+
+REP_PORT=`iniget REP -v PortNumber -f ${CLI_CONF_DIR}/niq.ini`
+REP_ENG=`iniget REP -v ServerName -f ${CLI_CONF_DIR}/niq.ini`
+if [ ! "${REP_PORT}" -o ! "${REP_ENG}" ]; then
+        _err_msg_="Could not read db values from ${CLI_CONF_DIR}/${ENIQ_INI}"
+        abort_script "$_err_msg_"
+fi
+
+
+. /eniq/sybase_iq/IQ-*/IQ-*.sh
+sybase_env_variables_ec=$?
+if [ $sybase_env_variables_ec -ne 0 ]; then
+    _err_msg_="Could not source sybase environment"
+    abort_script "$_err_msg_"
+fi
+
+
+CURR_SERVER_TYPE=`$CAT $ENIQ_CONF_DIR/installed_server_type | $EGREP -v '^[[:blank:]]*#' | $SED -e 's/ //g'`
+if [ ! "${CURR_SERVER_TYPE}" ]; then
+    _err_msg_="Could not determine which server type this is"
+    abort_script "$_err_msg_"
+fi
+
+
+if [ ! -s ${CLI_CONF_DIR}/${ENIQ_ENV} ]; then
+    _err_msg_="Could not locate file ${CLI_CONF_DIR}/${ENIQ_ENV}"
+    abort_script "$_err_msg_"
+else
+    . ${CLI_CONF_DIR}/niq.rc
+fi
+
+# Create a temporary Directory
+TEM_DIR=/tmp/admin_query_user.$$.$$
+$RM -rf ${TEM_DIR}
+$MKDIR -p ${TEM_DIR}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not create directory ${TEM_DIR}"
+    abort_script "$_err_msg_"
+fi
+$CHOWN ${SYSUSER}:${SYSGRP} ${TEM_DIR}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not change ownership for ${TEM_DIR}"
+    abort_script "$_err_msg_"
+fi
+$CHMOD 750 ${TEM_DIR}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not update directory ${TEM_DIR} permissions"
+    abort_script "$_err_msg_"
+fi
+
+#Initialising the connection string for dwhdb
+dwh_connection_string="-nogui -onerror exit -c \"eng=${DWH_ENG};links=tcpip{host=localhost;port=${DWH_PORT}};uid=dba;pwd=${DBA_PASSWORD}\""
+dwh_connection_string_enc=${TEM}/conn_str_admin_encrypt.txt.`uuidgen`
+
+# encrypt the connection string.
+get_encrypt_file "${dwh_connection_string}" "${dwh_connection_string_enc}"
+
+dwh_connection_dwh="-q -c \"con=$DWH_ENG;eng=$DWH_ENG;links=tcpip{host=$DWH_ENG;port=${DWH_PORT};dobroadcast=none;verify=no};uid=dba;pwd=${DBA_PASSWORD}\""
+dwh_connection_dwh_enc=${TEM}/conn_str_admin_encrypt_dwh.txt.`uuidgen`
+
+# encrypt the connection string.
+get_encrypt_file "${dwh_connection_dwh}" "${dwh_connection_dwh_enc}"
+
+dwh_connection_rep="-q -c \"con=$REP_ENG;eng=$REP_ENG;links=tcpip{host=$REP_ENG;port=${REP_PORT};dobroadcast=none;verify=no};uid=dba;pwd=${DBA_PASSWORD}\""
+dwh_connection_rep_enc=${TEM}/conn_str_admin_encrypt_rep.txt.`uuidgen`
+
+# encrypt the connection string.
+get_encrypt_file "${dwh_connection_rep}" "${dwh_connection_rep_enc}"
+
+#Initialising the connection string for repdb
+rep_connection_string="-nogui -onerror exit -c \"eng=${REP_ENG};links=tcpip{host=localhost;port=${REP_PORT}};uid=dba;pwd=${DBA_PASSWORD}\""
+rep_connection_string_enc=${TEM}/con_str_admin_encrypt.`uuidgen`
+
+# encrypt the connection string.
+get_encrypt_file "${rep_connection_string}" "${rep_connection_string_enc}"
+}										
+
+
+### Function: setup_sybase_env ###
+#
+# Set up Sybase environment
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+setup_sybase_env()
+{
+$ENV |$EGREP '^(SYBASE|ASDIR|IQDIR|ASALOGDIR|SQLANY)' > $TEM_DIR/sybase_det.$ >> /dev/null 2>&1
+
+# Source the environment
+set -a
+. $TEM_DIR/sybase_det.$ >> /dev/null 2>&1
+set +a
+
+if [ ! "${SYBASE}" ]; then
+    _err_msg_="Could not determine Sybase environment variable \${SYBASE}"
+    abort_script "$_err_msg_"
+fi
+
+DBISQL="$(ls /eniq/sybase_iq/IQ-*/bin64/dbisql)"
+if [ ! -x "$DBISQL" ]; then
+    _err_msg_="$DBISQL commands not found or not executable."
+    abort_script "$_err_msg_"
+fi
+
+}
+
+### Function: unlockUsers ###
+#
+#
+#
+# Arguments: none
+#
+# Return Values: none
+unlockUsers() {
+
+    SqlFile=`mktemp ${TEM_DIR}/unlocklockUser.XXXXXXXXXX`
+    if [ "${NEWUSER}" = "All" ]
+    then
+
+        for user in $($CAT  ${CLI_CONF_DIR}/queryUserConf.cfg | $GREP -vw "User_Name" | $AWK -F "::" '{print$1}' | uniq)
+        do
+            lpn=$($CAT ${CLI_CONF_DIR}/queryUserConf.cfg | $GREP -w "${user}" | $AWK  -F "::" '{print $3}'| uniq)
+            $ECHO "ALTER USER ${user} LOGIN POLICY ${lpn};" >>$SqlFile
+        done
+
+
+    else
+            lpn=$($CAT ${CLI_CONF_DIR}/queryUserConf.cfg | $GREP -w "${NEWUSER}" | $AWK -F "::" '{print $3}'| uniq )
+            $ECHO "ALTER USER ${NEWUSER} LOGIN POLICY ${lpn};" >>$SqlFile
+    fi
+
+    $DBISQL @${dwh_connection_string_enc} $SqlFile  >/dev/null 2>&1
+    if [ $? -ne 0 ]
+    then
+        _err_msg_="$($DATE '+%Y-%b-%d_%H.%M.%S'): Failed to ${action} User '${NEWUSER}' ."
+        abort_script "$_err_msg_"
+    else
+        log_msg -s "$($DATE '+%Y-%b-%d_%H.%M.%S'): The user ${NEWUSER} was successfully ${action}ed." -l ${LOGFILE}
+    fi
+}
+
+### Function: usage_msg ###
+#
+#   Print out the usage message
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+usage_msg()
+{
+$ECHO "
+Usage: /usr/bin/bash `$BASENAME $0` -n <user name|All>  -a <Status|ChangePWD|Lock|Unlock|Grant|Revoke|CLP|Drop|> [ -l <path_to_logfile> ]
+
+Compulsory:
+-n : Username or All.
+
+Note : -n All is applicable for action types Status|Lock|Unlock
+
+-a : action to perform for the stated user.
+        <Status>                            Check user status
+        <ChangePWD>                         Change a user's password
+        <Lock>                              Lock the user access to the database
+        <Unlock>                            Unlock the user access to the database
+        <Grant>                             Grant user access to feature(s)
+        <Revoke>                            Revoke user access to feature(s)
+        <CLP>                               Change Login Policy assigned to the user
+        <Drop>                              Drop a user from the system.
+
+-l  : Optional Parameter.Specifies logfile name with absolute path.Default path /eniq/log/sw_log/iq.
+"
+}
+
+### Function: user_confirm_pwd_change ###
+#
+# Get confirmation from user to proceed with database password change
+#
+# Arguments: none
+#
+# Return Values: none
+user_confirm_pwd_change()
+{
+    local _password_attempts_=3
+    while [ ${_password_attempts_} -gt 0 ]
+    do
+        unset USER_CONF
+        ((_password_attempts_--))
+        $ECHO "\nPlease re-enter the new password to confirm the change: \c "
+        read -s USER_CONF
+        if [ "$USER_CONF" == "${new_user_pwd}" ]; then
+                break
+        else
+                log_msg -s "\nPasswords not matching." -l ${LOGFILE}
+                if [ ${_password_attempts_} -eq 0 ]; then
+                        abort_script "$ERROR_MESSAGE"
+                fi
+        fi
+    done
+}
+
+### Function: update_IQ_UserPwd_History_table ###
+#
+# if more then five entries are present for database user delete the oldest password for a database user
+# update the IQ_UserPwd_History_table with new password entry for the database user
+#
+# Arguments: none
+#
+# Return Values: none
+update_IQ_UserPwd_History_table()
+{
+
+    SqlFile=`mktemp ${TEM_DIR}/delete_pwd_entry.XXXXXXXXXX`
+    echo "if (select count() from dba.IQ_UserPwd_History where user_name='${NEWUSER}') = 5  then
+            delete top 1 from dba.IQ_UserPwd_History where user_name='${NEWUSER}' order by password_creation_time asc
+    end if;" >$SqlFile
+
+    no_pwd_entry=`$DBISQL @${rep_connection_string_enc} "select count() from dba.IQ_UserPwd_History where user_name='${NEWUSER}'" | $AWK 'NR==3{print$1}'`
+
+    $DBISQL @${rep_connection_string_enc} $SqlFile
+    if [ $? -ne 0 ];
+    then
+        _err_msg_="$($DATE '+%Y-%b-%d_%H.%M.%S'): Failed to delete oldest password entry from IQ_UserPwd_History_table "
+        abort_script "$_err_msg_"
+    elif [ $no_pwd_entry -eq 5 ]; then
+        log_msg -s "$($DATE '+%Y-%b-%d_%H.%M.%S'): Successfully deleted oldest password entry from IQ_UserPwd_History_table" -l ${LOGFILE}
+    fi
+
+    $DBISQL @${rep_connection_string_enc} "insert into dba.IQ_UserPwd_History (user_name,password,password_creation_time,password_encrypted) values ('${NEWUSER}','${new_user_pwd_enc}',getdate(),'Y');" >/dev/null 2>&1
+    if [ $? -ne 0 ];
+    then
+        _err_msg_="$($DATE '+%Y-%b-%d_%H.%M.%S'): Failed to update IQ_UserPwd_History_table "
+        abort_script "$_err_msg_"
+    else
+            log_msg -s "$($DATE '+%Y-%b-%d_%H.%M.%S'): Successfully updated IQ_UserPwd_History_table" -l ${LOGFILE}
+    fi
+
+}
+
+### Function: update_queryUserConf_file ###
+#
+# Update the queryUserConf configuration file with new login policy details
+#
+# Arguments: none
+#
+# Return Values: none
+update_queryUserConf_file()
+{
+MAX_CONNECTIONS=`$DBISQL @${dwh_connection_string_enc} "select slpo.login_option_value from sysloginpolicy as slp, sysloginpolicyoption slpo where slpo.login_policy_id=slp.login_policy_id and slp.login_policy_name = '${login_policy_name}' and slpo.login_option_name='max_connections'" | $AWK 'NR==3{print$1}'`
+if [ $? -ne 0 ]; then
+    _err_msg_="$($DATE '+%Y-%b-%d_%H.%M.%S'): Failed to get the Max_Connections value from the database ."
+    abort_script "$_err_msg_"
+fi
+if [ ! ${MAX_CONNECTIONS} ] || [ ${MAX_CONNECTIONS} == 'unlimited' ]; then
+    MAX_CONNECTIONS=0
+    if [ ${MAX_CONNECTIONS} -ne 0 ]; then
+        _err_msg_="$($DATE '+%Y-%b-%d_%H.%M.%S'): Failed to set the Max_Connections to '0'."
+        abort_script "$_err_msg_"
+    fi
+fi
+
+PASSWORD_LIFE_TIME=`$DBISQL @${dwh_connection_string_enc} "select slpo.login_option_value from sysloginpolicy as slp, sysloginpolicyoption slpo where  slpo.login_policy_id=slp.login_policy_id and slp.login_policy_name = '${login_policy_name}' and slpo.login_option_name='password_life_time'" | $AWK 'NR==3{print$1}'`
+if [ $? -ne 0 ]; then
+    _err_msg_="$($DATE '+%Y-%b-%d_%H.%M.%S'): Failed to get the Password_Lifetime value from the database ."
+    abort_script "$_err_msg_"
+fi
+if [ ! ${PASSWORD_LIFE_TIME} ] || [ ${PASSWORD_LIFE_TIME} == 'unlimited' ]; then
+    PASSWORD_LIFE_TIME=0
+    if [ ${PASSWORD_LIFE_TIME} -ne 0 ]; then
+        _err_msg_="$($DATE '+%Y-%b-%d_%H.%M.%S'): Failed to set the PASSWORD_LIFE_TIME to '0'."
+        abort_script "$_err_msg_"
+    fi
+fi
+Password_Creation_Date=`$DBISQL @${dwh_connection_string_enc} "select password_creation_time from sysuser where user_name='${NEWUSER}'" | awk 'NR==3{print$1}'`
+if [ $? -ne 0 ]; then
+    _err_msg_="$($DATE '+%Y-%b-%d_%H.%M.%S'): Failed to set the Password_Creation_Date."
+    abort_script "$_err_msg_"
+fi
+if [ $PASSWORD_LIFE_TIME -eq 0 ]; then
+    Password_Expiration_Date=0
+else
+    Password_Expiration_Date=`date -d "$date +$PASSWORD_LIFE_TIME days" +"%Y-%m-%d"`
+    if [ $? -ne 0 ]; then
+        _err_msg_="$($DATE '+%Y-%b-%d_%H.%M.%S'): Failed to set the Password_Expiration_Date."
+        abort_script "$_err_msg_"
+    fi
+fi
+
+PASSWORD_GRACE_TIME=`$DBISQL @${dwh_connection_string_enc} "select slpo.login_option_value from sysloginpolicy as slp, sysloginpolicyoption slpo where slpo.login_policy_id=slp.login_policy_id and slp.login_policy_name = '${login_policy_name}' and slpo.login_option_name='password_grace_time'" | $AWK 'NR==3{print$1}'`
+if [ $? -ne 0 ]; then
+    _err_msg_="$($DATE '+%Y-%b-%d_%H.%M.%S'): Failed to get the Password_Grace_Time value from the database ."
+    abort_script "$_err_msg_"
+fi
+if [ ! ${PASSWORD_GRACE_TIME} ] || [ ${PASSWORD_GRACE_TIME} == 'unlimited' ]; then
+    PASSWORD_GRACE_TIME=0
+    if [ ${PASSWORD_GRACE_TIME} -ne 0 ]; then
+        _err_msg_="$($DATE '+%Y-%b-%d_%H.%M.%S'): Failed to set the PASSWORD_GRACE_TIME to '0'."
+        abort_script "$_err_msg_"
+    fi
+fi
+
+MAX_FAILED_LOGIN_ATTEMPTS=`$DBISQL @${dwh_connection_string_enc} "select slpo.login_option_value from sysloginpolicy as slp, sysloginpolicyoption slpo where slpo.login_policy_id=slp.login_policy_id and slp.login_policy_name = '${login_policy_name}' and slpo.login_option_name='max_failed_login_attempts'" | $AWK 'NR==3{print$1}'`
+if [ $? -ne 0 ]; then
+    _err_msg_="$($DATE '+%Y-%b-%d_%H.%M.%S'): Failed to get the Login_Attempts value from the database ."
+    abort_script "$_err_msg_"
+fi
+if [ ! ${MAX_FAILED_LOGIN_ATTEMPTS} ] || [ ${MAX_FAILED_LOGIN_ATTEMPTS} == 'unlimited' ]; then
+    MAX_FAILED_LOGIN_ATTEMPTS=0
+    if [ ${MAX_FAILED_LOGIN_ATTEMPTS} -ne 0 ]; then
+        _err_msg_="$($DATE '+%Y-%b-%d_%H.%M.%S'): Failed to set the Max_Connections to '0'."
+        abort_script "$_err_msg_"
+    fi
+fi
+
+$CAT ${CLI_CONF_DIR}/queryUserConf.cfg | $GREP -w ${NEWUSER} > /dev/null 2>&1
+if [ $? -ne 0 ]; then
+    if [ "${NEWUSER}" == "dcbo" -o "${NEWUSER}" == "dcpublic" ]; then
+        $ECHO "${NEWUSER}::ALL::${login_policy_name}::${MAX_CONNECTIONS}::${Password_Creation_Date}::${PASSWORD_LIFE_TIME}::${Password_Expiration_Date}::${PASSWORD_GRACE_TIME}::${MAX_FAILED_LOGIN_ATTEMPTS}" | $SED "s/'//g" >> ${CLI_CONF_DIR}/queryUserConf.cfg
+        log_msg -s "$($DATE '+%Y-%b-%d_%H.%M.%S'): Successfully updated the ${CLI_CONF_DIR}/queryUserConf.cfg file with ${NEWUSER} details" -l ${LOGFILE}
+    fi
+else
+    org_login_policy_name=$($CAT ${CLI_CONF_DIR}/queryUserConf.cfg | $GREP -w ${NEWUSER} | $AWK -F"::" '{print $3}' | uniq )
+    org_max_connection=$($CAT ${CLI_CONF_DIR}/queryUserConf.cfg | $GREP -w ${NEWUSER} | $AWK -F"::" '{print $4}' | uniq)
+    org_pwd_creation=$( $CAT ${CLI_CONF_DIR}/queryUserConf.cfg | $GREP -w ${NEWUSER} | $AWK -F"::" '{print $5}' | uniq)
+    org_password_life_time=$($CAT ${CLI_CONF_DIR}/queryUserConf.cfg | $GREP -w ${NEWUSER} | $AWK -F"::" '{print $6}' | uniq)
+    org_pwd_exp=$( $CAT ${CLI_CONF_DIR}/queryUserConf.cfg | $GREP -w ${NEWUSER} | $AWK -F"::" '{print $7}' | uniq)
+    org_password_grace_time=$($CAT ${CLI_CONF_DIR}/queryUserConf.cfg | $GREP -w ${NEWUSER} | $AWK -F"::" '{print $8}' | uniq)
+    org_login_attempt=$($CAT ${CLI_CONF_DIR}/queryUserConf.cfg | $GREP -w ${NEWUSER} | $AWK -F"::" '{print $9}' | uniq)
+
+    $CP ${CLI_CONF_DIR}/queryUserConf.cfg  ${TEM_DIR}/queryUserConf.cfg.bkup
+    $CAT ${CLI_CONF_DIR}/queryUserConf.cfg | $GREP -vw ${NEWUSER} > ${TEM_DIR}/queryUserConf.cfg
+    $CAT ${CLI_CONF_DIR}/queryUserConf.cfg | $GREP -w ${NEWUSER} | $SED -e "s/\<${org_login_policy_name}\>/${login_policy_name}/" -e "s/\<${org_max_connection}\>/${MAX_CONNECTIONS}/"  -e "s/\<${org_pwd_creation}\>/${Password_Creation_Date}/" -e "s/\<${org_password_life_time}\>/${PASSWORD_LIFE_TIME}/" -e "s/\<${org_pwd_exp}\>/${Password_Expiration_Date}/" -e "s/\<${org_password_grace_time}\>/${PASSWORD_GRACE_TIME}/" -e "s/\<${org_login_attempt}\>/${MAX_FAILED_LOGIN_ATTEMPTS}/" >> ${TEM_DIR}/queryUserConf.cfg
+
+
+    $CP ${TEM_DIR}/queryUserConf.cfg ${CLI_CONF_DIR}/queryUserConf.cfg
+    if [ $? -ne 0 ]; then
+        $CP ${TEM_DIR}/queryUserConf.cfg.bkup ${CLI_CONF_DIR}/queryUserConf.cfg
+        log_msg -s "$($DATE '+%Y-%b-%d_%H.%M.%S'): Failed to update the ${CLI_CONF_DIR}/queryUserConf.cfg file with ${NEWUSER} details" -l ${LOGFILE}
+    else
+        log_msg -s "$($DATE '+%Y-%b-%d_%H.%M.%S'): Successfully updated the ${CLI_CONF_DIR}/queryUserConf.cfg file with ${NEWUSER} details" -l ${LOGFILE}
+    fi
+fi
+}
+
+### Function: user_pwd_change ###
+#
+# Takes new password as input from the user and validates it as per the defined rules
+#
+# Arguments: none
+#
+# Return Values: none
+user_pwd_change()
+{
+    if [ "${NEWUSER}" = "All" ]
+    then
+        _err_msg_="$($DATE '+%Y-%b-%d_%H.%M.%S'): Can only change the password for one specified user at a time."
+        abort_script "$_err_msg_"
+    fi
+
+    if [  $CHANGE_PASSWORD_ATTEMPT_COUNT -eq 0 ]
+    then
+        local _pwd_count_=3
+		local _check_flag_=0
+		while [ ${_check_flag_} -eq 0 ]
+        do
+        unset current_user_pwd
+
+        log_msg -s "\nEnter the current password for user ${NEWUSER} to confirm password change: \c " -l ${LOGFILE}
+        read -s current_user_pwd
+		
+		
+
+        dwh_connection_string_check_pwd="-nogui -onerror exit -c \"eng=${DWH_ENG};links=tcpip{host=localhost;port=${DWH_PORT}};uid=${NEWUSER};pwd=${current_user_pwd}\""
+        dwh_connection_string_check_pwd_enc=${TEM}/str_admin_encrypt.`uuidgen`
+		
+		# encrypt the connection string.
+		get_encrypt_file "${dwh_connection_string_check_pwd}" "${dwh_connection_string_check_pwd_enc}"
+
+		
+        $DBISQL @${dwh_connection_string_check_pwd_enc} "select '1'"  >/dev/null 2>&1
+		
+        if [ $? -ne 0 ]; then
+           
+            if [[ ${_pwd_count_} -eq 1 ]]; then 
+			    $ECHO "Too many wrong attempts. Exiting the script."
+                _err_msg_="$($DATE '+%Y-%b-%d_%H.%M.%S'): Failed to ping the database with User '${NEWUSER}' with current password."
+                abort_script "$_err_msg_"
+            else
+			    log_msg -s "Entered password was incorrect,Please re-try..."
+			    let _pwd_count_=_pwd_count_-1
+			    $ECHO "${_pwd_count_} attempts left."
+			    continue
+            fi
+			
+        fi
+		_check_flag_=1
+		done
+        rules
+    fi
+
+    local _password_attempts_=3
+    while [ ${_password_attempts_} -gt 0 ]
+    do
+        unset new_user_pwd
+        if [ ${_password_attempts_} -eq 0 ]; then
+            abort_script "$ERROR_MESSAGE"
+        fi
+        ((_password_attempts_--))
+        $ECHO "\nEnter the new password for ${NEWUSER} user: \c "
+        read -s new_user_pwd
+        local _password_length_=${#new_user_pwd}
+
+        if  [ -z "${new_user_pwd}" ] ; then
+            log_msg -s "\nThe new password cannot be empty."
+            continue
+        fi
+
+        if ! [[ "${new_user_pwd}" =~ [A-Z] ]] ; then
+            log_msg -s "\nThe new password entered is not compliant with the Password Policies must contain a uppercase letter." -l ${LOGFILE}
+            continue
+        fi
+        if ! [[ "${new_user_pwd}" =~ [a-z] ]] ; then
+            log_msg -s "\nThe new password entered is not compliant with the Password Policies must contain a lowercase letter." -l ${LOGFILE}
+            continue
+        fi
+
+        if ! [[ "${new_user_pwd}" =~ [0-9] ]] ; then
+            log_msg -s "\nThe new password entered is not compliant with the Password Policies must contain a number." -l ${LOGFILE}
+            continue
+        fi
+
+        if  [[ "${new_user_pwd}" != *['!'@#%~={},./@:*_+]* ]] ; then
+            log_msg -s "\nThe new password entered is not compliant with the Password Policies must contain a special character ." -l ${LOGFILE}
+            continue
+        fi
+
+        if [ ${_password_length_} -lt 5 ] || [ ${_password_length_} -gt 30 ]; then
+            log_msg -s "\nThe new password length should be not less than 5 characters or greater than 30 characters." -l ${LOGFILE}
+            continue
+        fi
+
+        break
+    done
+    user_confirm_pwd_change
+    new_user_pwd_enc=$($ECHO $new_user_pwd | $OPENSSL enc -base64)
+    
+
+    #check if the entered password is same as the previous five password
+    check_password_history
+    if [ $flag_success -eq 1 ]; then
+        exit
+    fi
+    #To change the password for the user in database
+	
+	
+
+	conn_str="-nogui -onerror exit -c \"eng=${DWH_ENG};links=tcpip{host=dwhdb;port=${DWH_PORT}};uid=${NEWUSER};pwd=${current_user_pwd};newpwd=$new_user_pwd\"" 
+	conn_str_enc=${TEM}/new_string_admin_encrypt.txt.`uuidgen`
+	
+	# encrypt the connection string.
+	get_encrypt_file "${conn_str}" "${conn_str_enc}"
+
+	
+    $DBISQL @${conn_str_enc} "exit" >/dev/null 2>&1
+    if [ $? -ne 0 ]
+    then
+        _err_msg_="$($DATE '+%Y-%b-%d_%H.%M.%S'): Failed to change password for User '${NEWUSER}' ."
+        abort_script "$_err_msg_"
+    else
+        log_msg -s "\n$($DATE '+%Y-%b-%d_%H.%M.%S'): The password for user ${NEWUSER} was successfully changed." -l ${LOGFILE}
+    fi
+
+    local l_p_name=$( $CAT ${CLI_CONF_DIR}/queryUserConf.cfg | $GREP -w ${NEWUSER} | $AWK -F"::" '{print $3}' | uniq)
+
+    PASSWORD_LIFE_TIME=`$DBISQL @${dwh_connection_string_enc} "select slpo.login_option_value from sysloginpolicy as slp, sysloginpolicyoption slpo where  slpo.login_policy_id=slp.login_policy_id and slp.login_policy_name = '${l_p_name}' and slpo.login_option_name='password_life_time'" | $AWK 'NR==3{print$1}'`
+    if [ $? -ne 0 ]
+    then
+        _err_msg_="$($DATE '+%Y-%b-%d_%H.%M.%S'): Failed to get the Password_Lifetime value from the database ."
+        abort_script "$_err_msg_"
+    fi
+    if [ ! ${PASSWORD_LIFE_TIME} ] || [ ${PASSWORD_LIFE_TIME} == 'unlimited' ]; then
+        PASSWORD_LIFE_TIME=0
+        if [ $? -ne 0 ]; then
+           _err_msg_="$($DATE '+%Y-%b-%d_%H.%M.%S'): Failed to set the PASSWORD_LIFE_TIME to '0'."
+           abort_script "$_err_msg_"
+        fi
+    fi
+
+    Password_Creation_Date=`$DBISQL @${dwh_connection_string_enc} "select convert (date,GETDATE())" | $AWK 'NR==3{print$1}'`
+        if [ $? -ne 0 ]
+        then
+            _err_msg_="$($DATE '+%Y-%b-%d_%H.%M.%S'): Failed to set the Password_Creation_Date."
+            abort_script "$_err_msg_"
+        fi
+    
+    if [ $PASSWORD_LIFE_TIME -eq 0 ]; then
+        Password_Expiration_Date=0
+    else
+        Password_Expiration_Date=`date -d "$date +$PASSWORD_LIFE_TIME days" +"%Y-%m-%d"`
+        if [ $? -ne 0 ]
+        then
+            _err_msg_="$($DATE '+%Y-%b-%d_%H.%M.%S'): Failed to set the Password_Expiration_Date."
+            abort_script "$_err_msg_"
+        fi
+    fi
+
+    org_pwd_creation=$( $CAT ${CLI_CONF_DIR}/queryUserConf.cfg | $GREP -w ${NEWUSER} | $AWK -F"::" '{print $5}' | uniq)
+    org_pwd_exp=$( $CAT ${CLI_CONF_DIR}/queryUserConf.cfg | $GREP -w ${NEWUSER} | $AWK -F"::" '{print $7}' | uniq)
+
+
+    $CP ${CLI_CONF_DIR}/queryUserConf.cfg  ${TEM_DIR}/queryUserConf.cfg.bkup
+    $CAT ${CLI_CONF_DIR}/queryUserConf.cfg | $GREP -vw ${NEWUSER} > ${TEM_DIR}/queryUserConf.cfg
+    $CAT ${CLI_CONF_DIR}/queryUserConf.cfg | $GREP -w ${NEWUSER} | $SED   -e "s/\<${org_pwd_creation}\>/${Password_Creation_Date}/" -e "s/\<${org_pwd_exp}\>/${Password_Expiration_Date}/"  >> ${TEM_DIR}/queryUserConf.cfg
+
+    $CP ${TEM_DIR}/queryUserConf.cfg ${CLI_CONF_DIR}/queryUserConf.cfg
+    if [ $? -ne 0 ]
+    then
+        $CP ${TEM_DIR}/queryUserConf.cfg.bkup ${CLI_CONF_DIR}/queryUserConf.cfg
+        $ECHO "$($DATE '+%Y-%b-%d_%H.%M.%S'): Failed to update the ${CLI_CONF_DIR}/queryUserConf.cfg file."
+    else
+        $ECHO "$($DATE '+%Y-%b-%d_%H.%M.%S'): Successfully updated the ${CLI_CONF_DIR}/queryUserConf.cfg file."
+    fi
+    
+    #update the IQ_UserPwd_History_table
+    update_IQ_UserPwd_History_table
+}
+
+# ********************************************************************
+#
+#     Main body of program
+#
+# ********************************************************************
+#
+# Determine absolute path to software
+get_absolute_path
+
+# Set up up path environment etc.
+setup_env
+setup_sybase_env
+
+
+# Check that the effective id of the user is dcuser
+check_id 
+
+while getopts "n:a:i:f:l:u" arg; do
+  case $arg in
+    n) NEWUSER="$OPTARG"
+       ;;
+    a) action="$OPTARG"
+       ;;
+    u) UPGRADE="TRUE"
+       ;;
+    f) UPGRADE_FTLIST="$OPTARG"
+       ;;
+    i) INTERACTIVE="$OPTARG"
+       ;;
+    l) LOGFILE="$OPTARG"
+       ;;
+    \?) usage_msg
+       abort_script "$($DATE '+%Y-%m-%d_%H.%M.%S'): Unknown argument passed to script."
+       ;;
+  esac
+done
+shift `expr $OPTIND - 1`
+
+#Create logfile
+chk_create_logfile
+
+if [ "$UPGRADE" = "TRUE" ]; then
+    if [ -z "${UPGRADE_FTLIST}" ]; then
+        abort_script "$($DATE '+%Y-%m-%d_%H.%M.%S'): Feature selection file not present."
+    fi
+    regrant_ft4user
+    #removing tmp folder created during execution of the script
+    cleanup
+    exit 0
+fi
+
+if [ -z "${NEWUSER}" ]
+then
+    usage_msg
+    abort_script "$($DATE '+%Y-%m-%d_%H.%M.%S'): A user must be provided to script"
+fi
+
+_NEWUSER_1_=`$ECHO ${NEWUSER} | $TR '[:upper:]' '[:lower:]'`
+
+if [ "${_NEWUSER_1_}" == "dc" -o "${_NEWUSER_1_}" == "dba" -o "${_NEWUSER_1_}" = "dbo" ]; then
+    abort_script "$($DATE '+%Y-%m-%d_%H.%M.%S'): Can not perform any operation on ${_NEWUSER_1_} user through this script."
+fi
+
+if [ "${_NEWUSER_1_}" == "dcpublic" -o "${_NEWUSER_1_}" == "dcbo" ]; then
+    if [ "$action" = "ChangePWD" -o "$action" = "Drop" -o "$action" = "Grant" -o "$action" = "Revoke" -o "$action" = "Lock" ]; then
+        abort_script "$($DATE '+%Y-%m-%d_%H.%M.%S'): Can not perform $action operation on ${_NEWUSER_1_} user through this script."
+    elif [ "$action" = "CLP" ]; then
+        change_login_policy_eniq_users
+        #removing tmp folder created during execution of the script
+        cleanup
+        exit 0
+    fi
+fi
+
+# Check if DBA password entered is correct
+if [ "${INTERACTIVE}" == "Yes" -a "$action" != "ChangePWD" ]; then
+     checkDBAPasword
+fi
+
+if [ "${NEWUSER}" != "All" ]
+then
+    #Check if user exists
+    log_msg -s "$($DATE '+%Y-%b-%d_%H.%M.%S'): Checking for user: ${NEWUSER}" -l ${LOGFILE}
+    checkUserExists
+fi
+
+if [ "$action" = "Status" ]
+then
+    check_user_status
+elif [ "$action" = "ChangePWD" ]
+then
+    user_pwd_change
+elif [ "$action" = "Lock" ]
+then
+    lockUsers
+elif [ "$action" = "Unlock" ]
+then
+    unlockUsers
+elif [ "$action" = "Drop" ]
+then
+    dropUser
+elif [ "$action" = "Grant" ]
+then
+    add_ft4user
+elif [ "$action" = "Revoke" ]
+then
+    remove_ft4user
+elif [ "$action" = "CLP" ]
+then
+    change_login_policy
+elif [ "$action" = "" ]
+then
+    usage_msg
+    _err_msg_="$($DATE '+%Y-%b-%d_%H.%M.%S'): ${NEWUSER} did not specify any action."
+    abort_script "$_err_msg_"
+else
+    usage_msg
+    _err_msg_="$($DATE '+%Y-%b-%d_%H.%M.%S'): ${action} is not in the supported list of actions."
+    abort_script "$_err_msg_"
+fi
+
+$RM -rf ${dwh_connection_string_enc}
+
+$RM -rf ${dwh_connection_dwh_enc}
+
+$RM -rf ${dwh_connection_rep_enc}
+								 
+$RM -rf ${rep_connection_string_enc}
+
+$RM -rf ${dwh_connection_string_continue_enc}
+
+$RM -rf ${dwh_connection_string_check_pwd_enc}
+
+$RM -rf ${conn_str_enc}
+
+#removing tmp folder created during execution of the script
+cleanup
+
+

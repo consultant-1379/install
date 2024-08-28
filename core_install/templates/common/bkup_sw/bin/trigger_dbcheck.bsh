@@ -1,0 +1,249 @@
+#!/bin/bash
+# ********************************************************************
+# Ericsson Radio Systems AB                                     SCRIPT
+# ********************************************************************
+#
+#
+# (c) Ericsson Radio Systems AB 2019 - All rights reserved.
+#
+# The copyright to the computer program(s) herein is the property
+# of Ericsson Radio Systems AB, Sweden. The programs may be used
+# and/or copied only with the written permission from Ericsson Radio
+# Systems AB or in accordance with the terms and conditions stipulated
+# in the agreement/contract under which the program(s) have been
+# supplied.
+#
+# ********************************************************************
+# Name    : trigger_dbcheck.bsh 
+# Date    : 14/01/2019
+# Revision: /main/5
+# Purpose : The purpose of this script is to trigger a DbCheck.bsh
+#           for Table verification. 
+#           This script will normally be called by crontab.
+#
+# Usage   : trigger.dbcheck.bsh 
+#
+# ********************************************************************
+#
+#       Command Section
+#
+# ********************************************************************
+AWK=/usr/bin/awk
+BASH=/usr/bin/bash
+CAT=/usr/bin/cat
+DATE=/usr/bin/date
+DIRNAME=/usr/bin/dirname
+ECHO=/usr/bin/echo
+EGREP=/usr/bin/gegrep
+GREP=/usr/bin/grep
+ID=/usr/bin/id
+MKDIR=/usr/bin/mkdir
+RM=/usr/bin/rm
+SED=/usr/bin/sed
+TEE=/usr/bin/tee
+TOUCH=/usr/bin/touch
+
+# ********************************************************************
+#
+#       Configuration Section
+#
+# ********************************************************************
+
+readonly SERVER_HOSTNAME=`hostname`
+DEFAULT_USER=root
+LOGDIR=/eniq/log/sw_log/iq/DbCheckLogs
+
+
+# ********************************************************************
+#
+#       functions
+#
+# ********************************************************************
+### Function: abort_script ###
+#
+#   This will is called if the script is aborted thru an error
+#   error signal sent by the kernel such as CTRL-C or if a serious
+#   error is encountered during runtime
+#
+# Arguments:
+#       $1 - Error message from part of program (Not always used)
+# Return Values:
+#       none
+abort_script()
+{
+_err_time_=`$DATE '+%Y-%b-%d_%H.%M.%S'`
+
+if [ "${1}" ]; then
+        _err_msg_="${_err_time_} - ERROR : ${1}\n\nScript aborted"
+else
+    _err_msg_="${_err_time_} - ERROR : Script aborted.......\n"
+fi
+
+$ECHO "${_err_msg_}"
+
+if [ "${LOGFILE}" ]; then
+    $ECHO "\nERROR : ${_err_msg_}\n" | $TEE -a ${LOGFILE}
+else
+    $ECHO "\nERROR : ${_err_msg_}\n"
+fi
+
+cd ${SCRIPTHOME}
+exit 1
+}
+
+### Function: check_id ###
+#
+#   Check that the effective id of the user is correct
+#   If not print error msg and exit.
+#
+# Arguments:
+#       $1 : User ID name
+# Return Values:
+#       none
+check_id()
+{
+_check_id_=`$ID  | $AWK -F\( '{print $2}' | $AWK -F\) '{print $1}'`
+if [ "$_check_id_" != "$1" ]; then
+    _err_msg_="You must be $1 to execute this script."
+    abort_script "$_err_msg_"
+fi
+}
+
+
+
+### Function: get_absolute_path ###
+#
+# Determine absolute path to software
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+get_absolute_path()
+{
+_dir_=`$DIRNAME $0`
+SCRIPTHOME=`cd $_dir_ 2>/dev/null && pwd || $ECHO $_dir_`
+}
+
+### Function: chk_create_logfile ###
+#
+# Check/Create Logfile
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+chk_create_logfile()
+{
+LOGFILE="${LOGDIR}/${SERVER_HOSTNAME}_cron_dbcc_log_${RUN_TIME}"
+$MKDIR -p `$DIRNAME ${LOGFILE}`
+if [ $? -ne 0 ]; then
+        _err_msg_="Could not create directory `$DIRNAME ${LOGFILE}`"
+        abort_script "$_err_msg_"
+fi
+
+$TOUCH -a ${LOGFILE}
+if [ $? -ne 0 ]; then
+        _err_msg_="Could not write to file ${LOGFILE}"
+        abort_script "$_err_msg_"
+fi
+}
+
+
+
+### Function: setup_env ###
+#
+# Setup up path environment etc
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+setup_env()
+{
+ENIQ_BASE_DIR=/eniq
+
+# ENIQ Admin Directory
+ENIQ_ADMIN_DIR=${ENIQ_BASE_DIR}/admin
+
+
+# ENIQ Admin Bin Directory
+ENIQ_ADMIN_BIN_DIR=${ENIQ_ADMIN_DIR}/bin
+
+
+# Main Directory for the Core Installation SW
+ENIQ_INST_DIR=${ENIQ_BASE_DIR}/installation
+
+# ENIQ Config Directory
+ENIQ_CONF_DIR=${ENIQ_INST_DIR}/config
+
+# Source the common functions
+if [ -s $ENIQ_ADMIN_DIR/lib/common_functions.lib ]; then
+    . $ENIQ_ADMIN_DIR/lib/common_functions.lib
+else
+    _err_msg_="File $ENIQ_ADMIN_DIR/lib/common_functions.lib not found"
+    abort_script "$_err_msg_"
+fi
+
+ADMIN_ETC=${ENIQ_BASE_DIR}/admin/etc
+
+}
+
+
+
+# ********************************************************************
+#
+#       Main body of program
+#
+# ********************************************************************
+RUN_TIME=`$DATE '+%Y-%b-%d_%H.%M.%S'`
+
+# Determine absolute path to software
+get_absolute_path
+
+# Check that the effective id of the user is root
+check_id $DEFAULT_USER
+
+
+# Check/Create Logfile
+chk_create_logfile
+
+
+#Set environmnet file
+setup_env
+
+DBCC_SNAP_FILE_INDICATOR="${ENIQ_ADMIN_BIN_DIR}/.dbcc_progress_indicator"
+if [ -f ${DBCC_SNAP_FILE_INDICATOR} ]; then
+    log_msg -t -s "DBCC already appears to be in progress File ${DBCC_SNAP_FILE_INDICATOR} exists" -l ${LOGFILE}
+     exit 1
+fi
+
+
+CURR_SERVER_TYPE=`$CAT $ENIQ_CONF_DIR/installed_server_type | $EGREP -v  '^[[:blank:]]*#' | $SED -e 's/ //g'`
+if [ ! "${CURR_SERVER_TYPE}" ]; then
+    _err_msg_="Could not determine which server type this is"
+    abort_script "${_err_msg_}" 
+fi
+
+_runnumber_status_=`$GREP RUNNUMBER= ${ADMIN_ETC}/dbcheck.env | $AWK -F\= '{print $2}'`
+if [ "$_runnumber_status_" == "" ]; then
+        _err_msg_="Could not read last runnumber from ${ADMIN_ETC}/dbcheck.env"
+        abort_script "$_err_msg_"
+fi
+
+if [ "${CURR_SERVER_TYPE}" == "stats_coordinator" -o "${CURR_SERVER_TYPE}" == "eniq_stats" ]; then
+                       if [ ${_runnumber_status_} -eq 0 ]; then
+                             if [ -f ${ADMIN_ETC}/upgrade_II_dbcc_flag_indicator ]; then
+                                $BASH  ${ENIQ_ADMIN_BIN_DIR}/DbCheck.bsh -a verify_tables -N  -l ${LOGFILE}
+                             else
+                                $ECHO "This is Full cron run, DBCC upgrade/II flag file  is not present to execute this." | $TEE -a ${LOGFILE} >> /dev/null 2>&1
+                                exit 1
+                             fi
+                       else
+                             $BASH  ${ENIQ_ADMIN_BIN_DIR}/DbCheck.bsh -a verify_tables -N  -l ${LOGFILE}
+                       fi
+else
+  $ECHO "This is not applicable for ${CURR_SERVER_TYPE}" | $TEE -a ${LOGFILE} >> /dev/null 2>&1
+
+fi
+exit 0

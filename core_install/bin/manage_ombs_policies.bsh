@@ -1,0 +1,186 @@
+#!/usr/bin/bash
+#********************************************************************
+# Ericsson Radio Systems AB SCRIPT
+#********************************************************************
+#
+# (c) Ericsson Radio Systems AB 2023 - All rights reserved.
+#
+# The copyright to the computer program(s) herein is the property
+# of Ericsson Radio Systems AB, Sweden. The programs may be used
+# and/or copied only with the written permission from Ericsson Radio
+# Systems AB or in accordance with the terms and conditions stipulated
+# in the agreement/contract under which the program(s) have been
+# in the agreement/contract under which the program(s) have been
+# supplied.
+#
+#********************************************************************
+# Name     : manage_ombs_policies.bsh
+# Date     : 15/08/2023
+# Revision : \main\2
+# Purpose  : A script to enable or disable OMBS policies
+#
+# Usage    : manage_ombs_policies.bsh
+#
+#********************************************************************
+#
+#
+# Fetch inputs from the user
+#
+#
+#********************************************************************
+
+
+### Disable Enlisted Policies ###
+
+Disable_policies()
+{
+count=`cat /ericsson/ombsl/eniq_stats_blade/bin/ombs_policies_list.txt | wc -l`
+
+while [[ $i -le $count ]]
+do
+        line=`cat /ericsson/ombsl/eniq_stats_blade/bin/ombs_policies_list.txt | head -n $i | tail -n 1`
+
+        #Checking if policy is enabled or not
+		
+        status=`/usr/openv/netbackup/bin/admincmd/bpplinfo $line -L | grep Active | awk '{print $2}'`
+        if [[ $status == 'yes' ]]; then
+                #Disabling the policy
+                echo -e "\nStarting to Disable $line Policy"
+                /usr/openv/netbackup/bin/admincmd/bpplinfo $line -modify -inactive
+
+                if [[ $? -eq 0 ]]; then
+                        echo -e "Policy $line Disabled Successfully\n"
+                        k=`expr $k + 1`
+                else
+			echo -e "\nPolicy $line could not be Disabled. \nPlease refer OMBS System Administrator Guide document to Disable the Policies manually.\n"
+		fi
+
+        else
+                echo "$line policy already inactive for $eniq_hostname"
+        fi
+        i=`expr $i + 1`
+done
+
+echo -e "\n---------------------------------------------------------\n"
+
+if [[ $count -eq $k ]];then
+        echo -e "Disabled all the active Policies Successfully\n"
+        echo -e "---------------------------------------------------------\n"
+fi
+
+}
+
+
+
+
+### Enable Enlisted Policies ###
+
+Enable_policies()
+{
+count=`cat /ericsson/ombsl/eniq_stats_blade/bin/ombs_policies_list.txt | wc -l`
+
+while [[ $i -le $count ]]
+do
+        line=`cat /ericsson/ombsl/eniq_stats_blade/bin/ombs_policies_list.txt | head -n $i | tail -n 1`
+
+        #Checking if policy is Enabled or not
+		
+        status=`/usr/openv/netbackup/bin/admincmd/bpplinfo $line -L | grep Active | awk '{print $2}'`
+        if [[ $status == 'no' ]]; then
+                #Enabling the policy
+                echo -e "\nStarting to Enable $line Policy"
+                /usr/openv/netbackup/bin/admincmd/bpplinfo $line -modify -active
+
+                if [[ $? -eq 0 ]]; then
+
+                        echo -e "Policy $line Enabled Successfully\n"
+                        k=`expr $k + 1`
+                else
+			echo -e "Policy $line could not be Enabled. \nPlease refer OMBS System Administrator Guide document to Enable the Policies manually.\n"
+		fi
+
+        else
+                echo "$line policy already active for $eniq_hostname"
+        fi
+        i=`expr $i + 1`
+done
+
+echo -e "\n---------------------------------------------------------\n"
+
+if [[ $count -eq $k ]];then
+        echo -e "Enabled all the inactive Policies Successfully\n"
+        echo -e "---------------------------------------------------------\n"
+fi
+
+}
+
+
+
+list_policies_status()
+{
+count=`cat /ericsson/ombsl/eniq_stats_blade/bin/ombs_policies_list.txt | wc -l`
+while [[ $i -le $count ]]
+do
+        line=`cat /ericsson/ombsl/eniq_stats_blade/bin/ombs_policies_list.txt | head -n $i | tail -n 1`
+        #Checking policy status
+        status=`/usr/openv/netbackup/bin/admincmd/bpplinfo $line -L | grep Active | awk '{print $2}'`
+        if [[ $status == 'yes' ]]; then
+            #Disabling the policy
+            echo -e "\n$line policy is enabled"
+        else
+            echo "$line policy is disabled"
+        fi
+        i=`expr $i + 1`
+done
+}
+
+###########################################
+# MAIN code:
+###########################################
+
+date
+
+### Setting up variables ###
+
+BPPLLIST="/usr/openv/netbackup/bin/admincmd/bppllist"
+i=1
+k=0
+#LOGFILE=/ericsson/ombsl/eniq_stats_blade/bin/ombs_logs.log
+
+### Getting variables from ini file
+
+action_type=disable
+
+### Enlist policies from server
+
+rm -rf /ericsson/ombsl/eniq_stats_blade/bin/ombs_policies_list.txt
+
+$BPPLLIST | grep $eniq_hostname >> /ericsson/ombsl/eniq_stats_blade/bin/ombs_policies_list.txt
+ 
+if [[ $? -ne 0 ]]; then
+
+        echo -e "\n---------------------------------------------------------\n\nBackup policies are not available for $eniq_hostname"
+        echo -e "\n---------------------------------------------------------\n"
+        exit 1;
+fi
+
+echo -e "\n---------------------------------------------------------\n"
+
+if [[ $action_type == 'disable' ]];then
+        echo -e "Disabling OMBS Policies for $eniq_hostname\n"
+        Disable_policies
+elif [[ $action_type == 'list' ]];then
+    list_policies_status
+else
+    if [[ $action_type == 'enable' ]];then
+            echo -e "Enabling OMBS Policies for $eniq_hostname\n"
+            Enable_policies
+    else
+            echo "Nothing needs to be done on OMBS Server"
+            exit 1
+    fi
+fi
+
+
+
+

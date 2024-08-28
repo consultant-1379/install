@@ -1,0 +1,9 @@
+recreate_eniq_structure
+migrate_stage_1
+migrate_stage_2
+migrate_stage_3
+migrate_stage_4
+repair_sym_links
+migrate_stage_5
+post_configuration
+cleanup_migration

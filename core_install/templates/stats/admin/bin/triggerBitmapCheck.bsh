@@ -1,0 +1,270 @@
+#!/bin/bash
+# ********************************************************************
+# Ericsson Radio Systems AB                                     SCRIPT
+# ********************************************************************
+#
+#
+# (c) Ericsson Radio Systems AB 2023 - All rights reserved.
+#
+# The copyright to the computer program(s) herein is the property
+# of Ericsson Radio Systems AB, Sweden. The programs may be used
+# and/or copied only with the written permission from Ericsson Radio
+# Systems AB or in accordance with the terms and conditions stipulated
+# in the agreement/contract under which the program(s) have been
+# supplied.
+#
+# ********************************************************************
+# Name    : triggerBitmapCheck.bsh
+# Date    : 15/05/2023
+# Revision: /main/3
+# Purpose : The purpose of this script is to trigger . This script will normally be called by crontab
+#
+# Usage   : triggerBitmapCheck.bsh
+#
+# ********************************************************************
+#
+#       Command Section
+#
+# ********************************************************************
+AWK=/usr/bin/awk
+CD=/usr/bin/cd
+DATE=/usr/bin/date
+DIRNAME=/usr/bin/dirname
+ECHO=/usr/bin/echo
+EGREP=/usr/bin/egrep
+GREP=/usr/bin/grep
+ID=/usr/bin/id
+MKDIR=/usr/bin/mkdir
+SYSTEMCTL=/usr/bin/systemctl
+TOUCH=/usr/bin/touch
+BASH=/usr/bin/bash
+SU=/usr/bin/su
+CHMOD=/usr/bin/chmod
+CHOWN=/usr/bin/chown
+
+
+# ********************************************************************
+#
+#       Configuration Section
+#
+# ********************************************************************
+
+DEFAULT_USER=root
+ENIQ_BASE_DIR=/eniq
+
+# Cmd to exec a shell and drop user to it in case of an error
+EXEC_SHELL_CMD="exec /uin/bash -o emacs"
+
+# Name of SunOS & ENIQ ini Files
+BLK_STOR_INI=block_storage.ini
+ENIQ_ENV=niq.rc
+ENIQ_INI=niq.ini
+SYM_INI=sym_links.ini
+IPMP_INI=ipmp.ini
+LUN_MAP_INI=lun_map.ini
+SUNOS_INI=SunOS.ini
+STORAGE_INI=storage.ini
+ENIQ_STOP_SERVICES="scheduler engine webserver repdb dwhdb licmgr rmiregistry connectd"
+ENIQ_START_SERVICES="connectd rmiregistry licmgr repdb dwhdb engine scheduler webserver"
+
+# Variables used in ENIQ version
+ENIQ_VERSION_DIR="version"
+ENIQ_STATUS="eniq_status"
+
+# ********************************************************************
+#
+#       Pre-execution Operations
+#
+# ********************************************************************
+
+# ********************************************************************
+#
+#       functions
+#
+# ********************************************************************
+### Function: abort_script ###
+#
+#   This will is called if the script is aborted thru an error
+#   error signal sent by the kernel such as CTRL-C or if a serious
+#   error is encountered during runtime
+#
+# Arguments:
+#       $1 - Error message from part of program (Not always used)
+# Return Values:
+#       none
+abort_script()
+{
+_err_time_=`$DATE '+%Y-%b-%d_%H.%M.%S'`
+if [ "${1}" ]; then
+        _err_msg_="${_err_time_} - ERROR : ${1}\n\nScript aborted"
+else
+    _err_msg_="${_err_time_} - ERROR : Script aborted.......\n"
+fi
+$ECHO ${_err_msg_}
+$CD ${SCRIPTHOME}
+exit 1
+}
+
+### Function: check_id ###
+#
+#   Check that the effective id of the user is correct
+#   If not print error msg and exit.
+#
+# Arguments:
+#       $1 : User ID name
+# Return Values:
+#       none
+check_id()
+{
+_check_id_=`$ID  | $AWK -F\( '{print $2}' | $AWK -F\) '{print $1}'`
+if [ "$_check_id_" != "$1" ]; then
+    _err_msg_="You must be $1 to execute this script."
+    abort_script "$_err_msg_"
+fi
+}
+
+### Function: get_absolute_path ###
+#
+# Determine absolute path to software
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+get_absolute_path()
+{
+_dir_=`$DIRNAME $0`
+SCRIPTHOME=`$CD $_dir_ 2>/dev/null && pwd || $ECHO $_dir_`
+}
+
+
+### Function: setup_env ###
+#
+# Set up environment variables for script.
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+setup_env()
+{
+if [ ! "${ENIQ_BASE_DIR}" ]; then
+    # Directory on the root filesystem
+    ENIQ_BASE_DIR=/eniq
+fi
+
+# ENIQ Admin Directory
+ENIQ_ADMIN_DIR=${ENIQ_BASE_DIR}/admin
+
+# ENIQ Admin etc Directory
+ENIQ_ADMIN_ETC=${ENIQ_ADMIN_DIR}/etc
+
+# ENIQ Admin bin Directory
+ENIQ_ADMIN_BIN_DIR=${ENIQ_ADMIN_DIR}/bin
+
+# ENIQ Log Directory
+ENIQ_LOG_DIR=${ENIQ_BASE_DIR}/local_logs
+
+# ENIQ Installer Directory
+ENIQ_INSTALLER_DIR=${ENIQ_BASE_DIR}/sw/installer
+
+# ENIQ TP Installer
+TP_INSTALLER=tp_installer
+
+# ENIQ SW conf
+CLI_CONF_DIR=${ENIQ_BASE_DIR}/sw/conf
+
+# Main Directory for the Core Installation SW
+ENIQ_INST_DIR=${ENIQ_BASE_DIR}/installation
+
+# Main Directory for the Core Installation SW
+ENIQ_CORE_INST_DIR=${ENIQ_INST_DIR}/core_install
+
+# Core install bin dir
+ENIQ_CORE_BIN_DIR=${ENIQ_CORE_INST_DIR}/bin
+
+# ENIQ Config Directory
+ENIQ_CONF_DIR=${ENIQ_INST_DIR}/config
+
+# Templates Directory
+ENIQ_TEMPL_DIR="`$DIRNAME ${SCRIPTHOME}`/templates/${INSTALL_TYPE}"
+
+# Source the common functions
+if [ -s /eniq/installation/core_install/lib/common_functions.lib ]; then
+    . /eniq/installation/core_install/lib/common_functions.lib
+else
+    _err_msg_="File /eniq/installation/core_install/lib/common_functions.lib not found"
+    abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+fi
+
+if [ -s /eniq/installation/core_install/lib/common_core_install_functions.lib ]; then
+    . /eniq/installation/core_install/lib/common_core_install_functions.lib
+else
+    _err_msg_="File /eniq/installation/core_install/lib/common_core_install_functions.lib not found"
+    abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+fi
+
+if [ -s /eniq/installation/core_install/lib/common_inirator_functions.lib ]; then
+    . /eniq/installation/core_install/lib/common_inirator_functions.lib
+else
+    _err_msg_="File /eniq/installation/core_install/lib/common_inirator_functions.lib not found"
+    abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+fi
+
+# Get the System User/Group. All directories are owned by this
+SYSUSER=`iniget ENIQ_INSTALL_CONFIG -f ${ENIQ_CONF_DIR}/${SUNOS_INI} -v ENIQ_SYSUSER`
+if [ ! "${SYSUSER}" ]; then
+    _err_msg_="Could not read SYSUSER param from ${ENIQ_CONF_DIR}/${SUNOS_INI}"
+    abort_script "$_err_msg_"
+fi
+
+SYSGROUP=`iniget SunOS_GROUP_1 -f ${ENIQ_CONF_DIR}/${SUNOS_INI} -v name`
+if [ ! "${SYSGROUP}" ]; then
+    _err_msg_="Could not read SYSGROUP param from ${ENIQ_CONF_DIR}/${SUNOS_INI}"
+    abort_script "$_err_msg_"
+fi
+
+#Current server blade type
+CURR_SERVER_TYPE=`$CAT $ENIQ_CONF_DIR/installed_server_type | $EGREP -v '^[[:blank:]]*#' | $SED -e 's/ //g'`
+if [ "${CURR_SERVER_TYPE}" == "stats_iqr" ];then
+   hostname=$(hostname)
+   CURR_SERVER_TYPE=$($CAT /etc/hosts | $GREP "${hostname}"| $GREP "dwh" |$AWK '{print $3}')
+fi
+
+BITMAP_ENV_FILE=${ENIQ_ADMIN_ETC}/bitmapCheck.env
+if [ ! -f "${BITMAP_ENV_FILE}" ]; then
+    _err_msg_="${BITMAP_ENV_FILE} does not exists."
+    abort_script "${_err_msg_}"
+fi
+}
+
+# ********************************************************************
+#
+#       Main body of program
+#
+# ********************************************************************
+#
+# Determine absolute path to software
+get_absolute_path
+
+# set up environment
+setup_env
+
+# Check that the effective id of the user is root
+check_id $DEFAULT_USER
+
+if [ "${CURR_SERVER_TYPE}" == "eniq_stats" ] || [ "${CURR_SERVER_TYPE}" == "dwh_reader_1" ]; then
+    $CHOWN ${SYSUSER}:${SYSGROUP} ${BITMAP_ENV_FILE} && $CHMOD 640 ${BITMAP_ENV_FILE}
+    if [ $? -eq 0 ]; then
+        if [[ -e /eniq/admin/bin/bitmapCheck.bsh ]]; then
+            $SU - $SYSUSER -c  '/usr/bin/bash /eniq/admin/bin/bitmapCheck.bsh'
+        fi
+    fi
+else
+     $ECHO "Script is required to be executed only on eniq_stats and Reader 1"
+fi
+
+
+
+
+

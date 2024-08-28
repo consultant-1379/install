@@ -1,0 +1,427 @@
+#!/bin/bash
+# ********************************************************************
+# Ericsson Radio Systems AB SCRIPT
+# ********************************************************************
+#
+#
+# (c) Ericsson Radio Systems AB 2019 - All rights reserved.
+#
+# The copyright to the computer program(s) herein is the property
+# of Ericsson Radio Systems AB, Sweden. The programs may be used
+# and/or copied only with the written permission from Ericsson Radio
+# Systems AB or in accordance with the terms and conditions stipulated
+# in the agreement/contract under which the program(s) have been
+# supplied.
+#
+# ********************************************************************
+# Name    : check_nas_ssh.bsh
+# Date    : 22/01/2020
+# Revision: \main\1
+# Purpose :This script is to check the password less connectivity validate NAS password
+#
+# Usage   : check_nas_ssh.bsh
+# ********************************************************************
+#
+#   Command Section
+#
+# ********************************************************************
+
+CAT=/usr/bin/cat
+CHMOD=/usr/bin/chmod
+DATE=/usr/bin/date
+ECHO=/usr/bin/echo
+EXPECT=/usr/bin/expect
+GEGREP=/usr/bin/gegrep
+GETENT=/usr/bin/getent
+HEAD=/usr/bin/head
+ID=/usr/bin/id
+MKDIR=/usr/bin/mkdir
+MYHOSTNAME=/usr/bin/hostname
+NAWK=/usr/bin/nawk
+PING=/usr/sbin/ping
+RM=/usr/bin/rm
+SED=/usr/bin/sed
+SSH=/usr/bin/ssh
+TEE=/usr/bin/tee
+TOUCH=/usr/bin/touch
+
+
+# Name of SunOS & ENIQ ini Files
+BLK_STOR_INI=block_storage.ini
+IPMP_INI=ipmp.ini
+STORAGE_INI=storage.ini
+SUNOS_INI=SunOS.ini
+
+#### RETURN CODE ENUM's ####
+RACK_NOT_APPLICABLE=16
+VALUE_MISSING=133
+PASS_ERROR=137
+INVALID_PWD=138
+
+
+### Function: abort_script 
+#                                                                     
+#   This will be called if the script is aborted through an error     
+#   signal sent by the kernel such as CTRL-C or if a serious          
+#   error is encountered during runtime                               
+#                                                                     
+# Arguments:                                                          
+#       $1 - Error message from part of program (Not always used)     
+# Return Values:                                                      
+#       none                                                          
+
+abort_script()
+{
+    _err_time_=`$DATE '+%Y-%b-%d_%H.%M.%S'`
+
+    if [ "$1" ]; then
+        _err_msg_="${_err_time_} - $1"
+    else
+        _err_msg_="${_err_time_} - ERROR : Script aborted.......\n"
+    fi
+
+    if [ "${LOGFILE}" ]; then
+        $ECHO "\nERROR : ${_err_msg_}\n" | $TEE -a ${LOGFILE}
+    else
+        $ECHO "\nERROR : ${_err_msg_}\n"
+    fi
+
+    $RM -rf ${TEM_DIR}
+    exit 3
+}
+
+### Function: check_id ###
+#
+#   Check that the effective id of the user is correct
+#   If not print error message and exit.
+#
+# Arguments:
+#       $1 : User ID name
+# Return Values:
+#       none
+
+check_id()
+{
+local _check_id_=`$ID  | $NAWK -F\( '{print $2}' | $NAWK -F\) '{print $1}'`
+
+if [ "${_check_id_}" != "$1" ]; then
+    _err_msg_="You must be $1 to execute this script."
+    abort_script "$_err_msg_"
+fi
+}
+
+
+### Function: chk_logfile ###
+#
+# Check Logfile
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+
+chk_logfile()
+{
+
+if [ ! -d ${ENIQ_PRECHECK_LOG_DIR}  ]
+    then
+    $MKDIR -p ${ENIQ_PRECHECK_LOG_DIR}
+    if [ $? -ne 0 ]; then
+    _err_msg_="Could not create directory : ${ENIQ_PRECHECK_LOG_DIR}"
+    abort_script "${_err_msg_}" 
+    fi
+fi
+ 
+if [ -s ${LOGFILE}  ]
+    then
+    $RM -rf ${LOGFILE} 
+    if [ -s ${LOGFILE}  ]
+    then
+        _err_msg_="Warning : Could not remove older ${LOGFILE}"
+        abort_script "$_err_msg_"
+    fi
+fi
+
+ 
+$TOUCH ${LOGFILE}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not write to file ${LOGFILE}"
+    abort_script "$_err_msg_"
+fi
+
+$CHMOD 777 ${LOGFILE}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not change the permissions of the ${LOGFILE}"
+    abort_script "$_err_msg_"
+fi
+}
+
+
+### Function: check_nas_ssh ###
+#
+# Setup up path environment
+# Imports the common lib files which imports common functions 
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+
+check_nas_ssh()
+{
+
+# VA SFS version
+_SFS_version_=`$CAT ${ERICSSON_FILESTOR_ETC}/nasplugin.conf | $GEGREP -w SFS_VERSION | $NAWK -F"=" '{print $2}'`
+if [ "${_SFS_version_}"  == "" ]; then
+    log_msg -l ${LOGFILE} -q -t -s "Could not fetch SFS version Details from NAS Plugin Configuration file."
+    exit ${VALUE_MISSING}
+fi
+
+#check the passwordless SSH connection is working
+if [ ${_SFS_version_} == 7.4 ]; then
+    $SU - ${STORADM_USR} -c "$SSH -q -o BatchMode=yes -o StrictHostKeyChecking=no -n ${NAS_SUP}@${NAS_HOST} '/opt/VRTSnas/clish/bin/clish -u master -c logout'" >> /dev/null 2>&1
+    if [ $? -ne 0 ]; then
+        log_msg -l ${LOGFILE} -q -t -s "storadm password less connectivity is not working through support user to connect master user"
+        exit ${PASS_ERROR}
+    fi
+else
+    $SU - ${STORADM_USR} -c "$SSH -q -o BatchMode=yes -o StrictHostKeyChecking=no -n ${NAS_MAS}@${NAS_HOST} logout"  >> /dev/null 2>&1 
+    if [ $? -ne 0 ]; then
+        log_msg -l ${LOGFILE} -q -t -s "storadm password less connectivity is not working with master user"
+        exit ${PASS_ERROR}
+    fi
+fi
+
+$SU - ${STORADM_USR} -c "$SSH -q -o BatchMode=yes -o StrictHostKeyChecking=no -n ${NAS_SUP}@${NAS_HOST} exit"  >> /dev/null 2>&1 
+if [ $? -ne 0 ]; then
+log_msg -l ${LOGFILE} -q -t -s "storadm password less connectivity is not working with support user"
+exit ${PASS_ERROR}
+fi
+
+
+#validate nas password
+validate_nas_pwd
+
+#set return code
+RET_CODE=0
+
+}
+
+
+### Function: setup_env ###
+#
+# Setup up path environment
+# Imports the common lib files which imports common functions 
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+
+setup_env()
+{
+if [ ! "${ENIQ_BASE_DIR}" ]; then
+    ENIQ_BASE_DIR=/eniq
+fi
+
+# Main Directory for the Core Installation SW
+ENIQ_INST_DIR=${ENIQ_BASE_DIR}/installation
+
+# ENIQ LIB Directory
+LIB_DIR=/lib
+
+# Local logs directory
+ENIQ_PRECHECK_LOG_DIR=${ENIQ_BASE_DIR}/local_logs/precheck_logs
+
+# Eniq core install directory
+ENIQ_CORE_INST_DIR=${ENIQ_INST_DIR}/core_install
+
+# Eniq core install config directory
+ENIQ_CONF_DIR=${ENIQ_INST_DIR}/config
+
+
+# Ericsson storage plugin directory
+PLUGINS_LOC=/ericsson/storage/san/plugins/
+
+# Ericsson plugin etc directory
+ERICSSON_FILESTOR_ETC=/ericsson/storage/plugins/nas/etc
+
+#SAN Device details 
+SAN_DEVICE=`$CAT ${ENIQ_CONF_DIR}/san_details | $GEGREP -w "^SAN_DEVICE=" | $NAWK -F\= '{print $2}'`
+
+# Source the common functions
+if [ -s ${ENIQ_CORE_INST_DIR}/${LIB_DIR}/common_functions.lib ]; then
+    . ${ENIQ_CORE_INST_DIR}/${LIB_DIR}/common_functions.lib
+else
+    _err_msg_="File ${ENIQ_CORE_INST_DIR}/${LIB_DIR}/common_functions.lib not found"
+    abort_script "${_err_msg_}"
+fi
+
+if [ -s ${ENIQ_CORE_INST_DIR}/${LIB_DIR}/common_core_install_functions.lib ]; then
+    . ${ENIQ_CORE_INST_DIR}/${LIB_DIR}/common_core_install_functions.lib
+else
+    _err_msg_="File ${ENIQ_CORE_INST_DIR}/${LIB_DIR}/common_core_install_functions.lib not found"
+    abort_script "${_err_msg_}"
+fi
+
+if [ -s ${ENIQ_CORE_INST_DIR}/${LIB_DIR}/common_inirator_functions.lib ]; then
+    . ${ENIQ_CORE_INST_DIR}/${LIB_DIR}/common_inirator_functions.lib
+else
+    _err_msg_="File ${ENIQ_CORE_INST_DIR}/${LIB_DIR}/common_inirator_functions.lib not found"
+    abort_script "${_err_msg_}"
+fi
+
+
+# Storage Type
+STORAGE_TYPE=`iniget STOR_TYPE -f ${ENIQ_BASE_DIR}/installation/config/${SUNOS_INI} -v STORAGE_TYPE`
+if [ ! "${STORAGE_TYPE}" ]; then
+    _err_msg_="Could not read STORAGE_TYPE param "
+    abort_script "${_err_msg_}"
+fi
+
+
+#passwordless connection user
+STORADM_USR=storadm
+STOROBS_USR=storobs
+
+#NAS host address
+NAS_HOST=nasconsole
+
+#NAS master user
+NAS_MAS=master
+
+#NAS Support user
+NAS_SUP=support
+
+HNAME=`${MYHOSTNAME}`
+HOST_IP=`$GETENT hosts ${HNAME} | $NAWK '{print $1}' | $HEAD -1`
+}
+
+
+### Function: validate_nas_pwd ###
+#
+# Validate the password from the ssh_input_file
+# 
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+
+validate_nas_pwd()
+{
+
+if [ ! ${ENIQ_CONF_DIR}/ssh_input_file ]; then
+    log_msg -l ${LOGFILE} -q -t -s  "${ENIQ_CONF_DIR}/ssh_input_file is missing"
+    exit ${VALUE_MISSING}
+fi
+
+R_PW_M=`$CAT ${ENIQ_CONF_DIR}/ssh_input_file | $GREP R_PW_M | $NAWK -F= '{print $2}' | tr -d '"'`
+R_PW_S=`$CAT ${ENIQ_CONF_DIR}/ssh_input_file | $GREP R_PW_S | $NAWK -F= '{print $2}' | tr -d '"'`
+if [ ! ${R_PW_M} ] || [ ! ${R_PW_S} ]; then
+    log_msg -l ${LOGFILE} -q -t -s "master or support password value are missing in ${ENIQ_CONF_DIR}/ssh_input_file"
+    exit ${VALUE_MISSING}
+fi
+
+
+# Validate the NAS master password
+expect <<EOF >>${LOGFILE} 2>&1
+set timeout 60
+spawn ${SSH}  -o StrictHostKeyChecking=no  ${NAS_MAS}@${NAS_HOST}
+expect {
+"*assword:" { send -- "${R_PW_M}\r" ;
+expect {
+"Last login:" { exit 0 }
+"*assword:" { exit 8 }
+}
+}
+timeout {send user "\nTIMEOUT\n"; exit 9}
+}
+expect eof
+EOF
+local exit_status=$?
+if [ ${exit_status} -eq 0 ]; then
+    log_msg -l ${LOGFILE} -q -t -s "\nsuccessfully connect to the NAS with the master password in ${ENIQ_CONF_DIR}/ssh_input_file"
+else
+    log_msg -l ${LOGFILE} -q -t -s "\nFailed to connect to the NAS with the master password in ${ENIQ_CONF_DIR}/ssh_input_file"
+    exit ${INVALID_PWD}
+fi
+unset exit_status
+
+# Validate the NAS support password
+expect <<EOF >>${LOGFILE} 2>&1
+set timeout 60
+spawn ${SSH}  -o StrictHostKeyChecking=no  ${NAS_SUP}@${NAS_HOST}
+expect {
+"*assword:" {send -- "${R_PW_S}\r" ;
+expect {
+"Last login:" { exit 0 }
+"*assword:" { exit 8 }
+}
+}
+timeout {send user "\nTIMEOUT\n"; exit 9}
+}
+expect eof
+EOF
+local exit_status=$?
+if [ ${exit_status} -eq 0 ]; then
+    log_msg -l ${LOGFILE} -q -t -s "\nSuccessfully connect to the NAS with the support password in ${ENIQ_CONF_DIR}/ssh_input_file"
+else
+    log_msg -l ${LOGFILE} -q -t -s "\nFailed to connect to the NAS with the support password in ${ENIQ_CONF_DIR}/ssh_input_file"
+    exit ${INVALID_PWD}
+fi
+unset exit_status
+
+}
+
+
+# ********************************************************************
+#
+#       Main body of program
+#
+# ********************************************************************
+#
+
+# Default user
+DEFAULT_USER=root
+
+# Check that the effective id of the user is root
+check_id ${DEFAULT_USER}
+
+# Set up environment variables for script.
+setup_env
+
+# Logfile path
+LOGFILE=${ENIQ_PRECHECK_LOG_DIR}/check_nas_ssh.log
+
+# Check Logfile
+chk_logfile
+
+#Create a temporary Directory
+TEM_DIR=/tmp/ssh_check.$$.$$
+
+$MKDIR -p ${TEM_DIR}
+
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not create directory ${TEM_DIR}"
+    abort_script "${_err_msg_}"
+fi
+
+# Check Storage type
+if [ "${STORAGE_TYPE}" == "zfs" ]; then
+    log_msg -s "This check is not applicable for RACK servers." -l $LOGFILE
+    exit $RACK_NOT_APPLICABLE
+fi
+
+# check nas ssh connectivity 
+check_nas_ssh
+
+log_msg -t -s "NAS password verification and validation check completed. Check log ${LOGFILE}\n"
+
+$RM -rf ${TEM_DIR}
+if [ -s ${TEM_DIR} ]; then
+    _err_msg_="Could not remove ${TEM_DIR}"
+    abort_script "$_err_msg_"
+fi
+
+exit ${RET_CODE}

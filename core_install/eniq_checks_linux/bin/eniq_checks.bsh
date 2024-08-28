@@ -1,0 +1,923 @@
+#!/usr/bin/bash
+#********************************************************************
+# Ericsson Radio Systems AB SCRIPT
+#********************************************************************
+#
+# (c) Ericsson Radio Systems AB 2019 - All rights reserved.
+#
+# The copyright to the computer program(s) herein is the property
+# of Ericsson Radio Systems AB, Sweden. The programs may be used
+# and/or copied only with the written permission from Ericsson Radio
+# Systems AB or in accordance with the terms and conditions stipulated
+# in the agreement/contract under which the program(s) have been
+# supplied.
+#
+#********************************************************************
+# Name     : eniq_checks.bsh
+# Date     : 15/10/2023
+# Revision : /main/16
+# Purpose  : Objective of the package is to enable users to check if
+#            ENIQ system is stable ,before any major activity is being
+#            performed.
+#            This performs the cross-functional testing to ensure system
+#            health.
+# Usage    : eniq_checks.bsh
+#
+#********************************************************************
+#
+#       Command Section
+#
+#********************************************************************
+AWK=/usr/bin/awk
+BASENAME=/usr/bin/basename
+BASH=/usr/bin/bash
+CAT=/usr/bin/cat
+CUT=/usr/bin/cut
+DATE=/usr/bin/date
+DIRNAME=/usr/bin/dirname
+ECHO='/usr/bin/echo -e'
+EGREP=/usr/bin/egrep
+EXPR=/usr/bin/expr
+FIND=/usr/bin/find
+GETENT=/usr/bin/getent
+GREP=/usr/bin/grep
+HEAD=/usr/bin/head
+ID=/usr/bin/id
+KILL=/usr/bin/kill
+MKDIR=/usr/bin/mkdir
+MV=/usr/bin/mv
+MYHOSTNAME=/usr/bin/hostname
+PERL=/usr/bin/perl
+RM=/usr/bin/rm
+SED=/usr/bin/sed
+SYSTEMCTL=/usr/bin/systemctl
+TEE=/usr/bin/tee
+TOUCH=/usr/bin/touch
+
+
+
+# ********************************************************************
+#
+#       Configuration Section
+#
+# ********************************************************************
+
+# Default user
+DEFAULT_USER=root
+
+#Present Working Directory
+CURR_DIR=`pwd`
+
+# ********************************************************************
+#
+#   Functions
+#
+# ********************************************************************
+
+### Function: abort_script ###
+#
+#   This will is called if the script is aborted thru an error
+#   signal sent by the kernel such as CTRL-C or if a serious
+#   error is encountered during runtime
+#
+# Arguments:
+#       $1 - Error message from part of program (Not always used)
+# Return Values:
+#       none
+abort_script()
+{
+_err_time_=`$DATE '+%Y-%b-%d_%H.%M.%S'`
+
+if [ "$1" ]; then
+	_err_msg_="${_err_time_} - $1"
+else
+	_err_msg_="${_err_time_} - ERROR : Script aborted.......\n"
+fi
+
+if [ "${LOGFILE}" ]; then
+	$ECHO "\nERROR : ${_err_msg_}\n" | $TEE -a ${LOGFILE}
+else
+	$ECHO "\nERROR : ${_err_msg_}\n"
+fi
+
+cleanup
+exit 1
+}
+
+
+### Function: check_id ###
+#
+#   Check that the effective id of the user is correct
+#   If not print error msg and exit.
+#
+# Arguments:
+#       $1 : User ID name
+# Return Values:
+#       none
+check_id()
+{
+_check_id_=`$ID | $AWK -F\( '{print $2}' | $AWK -F\) '{print $1}'`
+if [ "$_check_id_" != "$1" ]; then
+	_err_msg_="This script should be executed as $1 user only."
+	abort_script "${_err_msg_}"
+fi
+}
+
+
+### Function: cleanup ###
+#
+# Cleanup of temporary directory and files.
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+cleanup()
+{
+if [ -f "$LOGFILE" ] ;then
+	$ECHO "Cleaning up the temporary directory" >> $LOGFILE
+fi
+if [ -d ${TEM_DIR} ] ;then
+	$RM -rf ${TEM_DIR}
+fi
+if [ -f "$_lockfile_" ] ;then
+	$RM -rf ${_lockfile_}
+fi
+}
+
+
+### Function: execute_locally ###
+#
+# Calling functions to be executed on Local Machine
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+execute_locally(){
+
+log_msg -q -t -s "Server Type:$CURR_SERVER_TYPE" -l $LOGFILE
+log_msg -s "Server Type:$CURR_SERVER_TYPE \n" -l $DISPLAY
+
+validate_conditions
+log_msg -s "Total Prechecks completed on $CURR_SERVER_TYPE=$_count_" -l $DISPLAY
+_count_fail_=`$GREP -w -c "FAILURE" $SUMMARY`
+_count_pass_=`$GREP -w -c "SUCCESS" $SUMMARY`
+_count_warn_=`$GREP -w -c "WARNING" $SUMMARY`
+_count_norun_=`$GREP -w -c "NO RUN" $SUMMARY`
+printf '%-35s    %-15s    %-15s    %-15s    %-15s    %-15s\n' "$HNAME($CURR_SERVER_TYPE)" "$_count_" "$_count_pass_" "$_count_warn_" "$_count_fail_" "$_count_norun_" >> $COUNT
+}
+
+
+### Function: execute_remotely ###
+#
+# Calling functions to be executed on Remote Machines
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+execute_remotely(){
+get_execution_order
+ssh_remote ${TEM_DIR}/execution_order_list
+}
+
+
+### Function: get_execution_order ###
+#
+# Get the order of the blades
+# for triggering Upgrade Precheck
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+get_execution_order()
+{
+$RM -rf ${TEM_DIR}/execution_order_list
+
+log_msg -q -t -s "Getting execution order for the blades" -l $LOGFILE
+
+$PERL ${ENIQ_CORE_INST_DIR}/lib/get_ip_order.pl -f ${TEM_DIR}/execution_order_list
+
+if [ $? -ne 0 ]; then
+	_err_msg_="Could not get an ordered list of servers.Please check if the NAS is up"
+	abort_script "${_err_msg_}"
+fi
+
+$RM -rf ${TEM_DIR}/server_hostname.txt
+for _line_ in `$CAT ${TEM_DIR}/execution_order_list`; do
+  local _count_ _serv_hostname_
+  _count_=`$ECHO "${_line_}" | grep -o "::" | wc -l`
+  if [ "${_ip_type_}" == "IPv6" ] && [ "${_count_}" == 3 ]; then
+                                _serv_hostname_=`$ECHO ${_line_} | $AWK -F"::" '{print $3}'`
+  else
+                                _serv_hostname_=`$ECHO ${_line_} | $AWK -F"::" '{print $2}'`
+  fi
+                if [ ! "${_serv_hostname_}" ]; then
+                        _err_msg_="Could not read required info from ${TEM_DIR}/execution_order_list"
+                        abort_script "${_err_msg_}"
+                fi
+ $ECHO ${_serv_hostname_} >> ${TEM_DIR}/server_hostname.txt
+done
+log_msg -s "\nExecution Order for the Prechecks: \n`$CAT ${TEM_DIR}/server_hostname.txt`" -l $DISPLAY
+log_msg -t -q -s "Execution Order for the Prechecks :\n`$CAT ${TEM_DIR}/server_hostname.txt`" -l $LOGFILE
+}
+
+### Function: get_summary ###
+#
+# Get the consolidated summary and display on console
+# Arguments:
+#       none
+# Return Values:
+#       none
+get_summary(){
+$MKDIR -p ${ENIQ_BASE_DIR}/log/precheck/summary/
+if [ $? -ne 0 ]; then
+	err_msg_="Could not create directory ${ENIQ_BASE_DIR}/log/precheck/summary"
+	abort_script "${_err_msg_}"
+fi
+_final_summary_="${ENIQ_BASE_DIR}/log/precheck/summary/summary_$TIMESTAMP.txt"
+$TOUCH ${_final_summary_}
+if [ $? -ne 0 ]; then
+	err_msg_="Could not create the summary file"
+	abort_script "${_err_msg_}"
+fi
+$FIND `$DIRNAME ${_final_summary_}` -name "*.log"  -mtime +10 -exec rm -rf {} \;
+_curr_dir_=`pwd`
+cd ${ENIQ_BASE_DIR}/log/precheck/temp_summary
+ls -rt ${ENIQ_BASE_DIR}/log/precheck/temp_summary | xargs $CAT > ${_final_summary_}
+cd ${_curr_dir_}
+$CAT $COUNT >> ${_final_summary_}
+$CAT ${_final_summary_} | $TEE -a $DISPLAY
+if [ -d "${ENIQ_BASE_DIR}/log/precheck/temp_summary" ]; then
+	$RM -rf ${ENIQ_BASE_DIR}/log/precheck/temp_summary
+	log_msg -q -t -s "Removed temporary directory ${ENIQ_BASE_DIR}/log/precheck/temp_summary" -l $LOGFILE
+fi
+$RM $COUNT
+log_msg -s "\nCheck logs at  ${ENIQ_BASE_DIR}/log/precheck.\n" -l $LOGFILE
+}
+
+### Function: insert_header_footer ###
+#
+#   Insert a stage header/footer message
+#
+# Arguments:
+#   $1 : head/foot
+#   $2 : Message
+#   $3 : Logfile
+# Return Values:
+#   none
+insert_header_footer()
+{
+if [ $# -ne 3 ]; then
+	_err_msg_="3 Parameters(Head/Foot,Message,Logfile) must be passed to header/footer function."
+	abort_script "${_err_msg_}"
+fi
+
+if [ "$1" != "head" -a "$1" != "foot" ]; then
+	_err_msg_="Only Param of head/foot is allowed...exiting!"
+	abort_script "${_err_msg_}"
+fi
+_type_=$1
+
+_msg_=$2
+
+_logfile_=$3
+$MKDIR -p `$DIRNAME ${_logfile_}`
+if [ $? -ne 0 ]; then
+	_err_msg_="Could not create directory `$DIRNAME ${_logfile_}`"
+	abort_script "${_err_msg_}"
+fi
+
+$TOUCH -a ${_logfile_}
+if [ $? -ne 0 ]; then
+	_err_msg_="Could not write to file ${_logfile_}"
+	abort_script "${_err_msg_}"
+fi
+
+_time_=`$DATE '+%Y-%b-%d_%H.%M.%S'`
+if [ "$_type_" == "head" ]; then
+	$ECHO "\n-----------------------------------------------------" | $TEE -a ${_logfile_}
+	$ECHO "-----------------------------------------------------" | $TEE -a ${_logfile_}
+	$ECHO "$_msg_" | $TEE -a ${_logfile_}
+	$ECHO "-----------------------------------------------------" | $TEE -a ${_logfile_}
+fi
+
+if [ "$_type_" == "foot" ]; then
+	$ECHO "\n-----------------------------------------------------" | $TEE -a ${_logfile_}
+	$ECHO "$_msg_" | $TEE -a ${_logfile_}
+	$ECHO "-----------------------------------------------------" | $TEE -a ${_logfile_}
+	$ECHO "-----------------------------------------------------\n" | $TEE -a ${_logfile_}
+fi
+}
+
+### Function: main_exec ###
+#
+# To execute the precheck scripts and determine the Return Code,Message and Status
+#
+# Arguments:
+#   $1 : index of an array
+# Return Values:
+#   none
+main_exec(){
+_count_=$((_count_+1))
+_index_=$1
+log_msg -q -t -s "Parsing return code regitry for ${pre_check[_index_]}" -l $LOGFILE
+parse_return_code ${_index_}
+log_msg -s "Precheck started for ${pre_check[_index_]} " -l $DISPLAY
+log_msg -q -t -s "Executing script for ${pre_check[_index_]} " -l $LOGFILE
+
+cd ${ENIQ_CHK_BIN_DIR}
+timeout ./"${script_pth[_index_]}"  "${time[_index_]}" >> /dev/null 2>&1
+return_code[_index_]="$?"
+log_msg -q -t -s "Return Code=${return_code[_index_]} " -l $LOGFILE
+
+log_dir_final="$ENIQ_BASE_DIR/log/precheck/${HNAME}/${pre_check[_index_]}"
+$MKDIR -p $log_dir_final
+if [ $? -ne 0 ]; then
+	_err_msg_="Could not create directory `$DIRNAME ${log_dir_final}`"
+	abort_script "${_err_msg_}"
+fi
+_logfile_=`$ECHO ${log_pth[_index_]} | $AWK -F"/" '{print $NF}' | $CUT -d"." -f1`
+log_pth_final="$log_dir_final/${_logfile_}_$TIMESTAMP.log"
+$TOUCH $log_pth_final
+$MV ${log_pth[_index_]} ${log_pth_final} >> /dev/null 2>&1
+if [ ! -s ${log_pth_final} ] ; then
+	log_pth_final=" ";
+fi
+$FIND `$DIRNAME ${log_pth_final}` -name "*.log"  -mtime +10 -exec rm -rf {} \;
+
+for ((i=0;i<${#exit_code[@]};i++)); do
+	if [ "${return_code[_index_]}" == "${exit_code[i]}" ]; then
+		log_msg  -s "Precheck completed for ${pre_check[_index_]}.\nStatus:${exit_status[i]}.\nLogpath:${log_pth_final}\n" -l $DISPLAY
+		log_msg -q -t -s "Precheck completed for ${pre_check[_index_]}.Status:${exit_status[i]}.Logpath:${log_pth_final}" -l $LOGFILE
+		printf '%-4s %-20s  | %-7s  | %-35s  | %-80s\n' "${_count_}" "${pre_check[_index_]}" "${exit_status[i]}" "${exit_msg[i]}" "${log_pth_final}" >> $SUMMARY
+		break
+	else
+	continue
+	fi
+done
+if [ $i == ${#exit_code[@]} ]; then
+	printf '%-4s %-20s  | %-7s  | %-35s  | %-80s\n' "${_count_}" "${pre_check[_index_]}" "WARNING" "Could not determine the status" "${log_pth_final}" >> $SUMMARY
+	log_msg -t -q -s "Precheck could not complete for ${pre_check[_index_]}.Could not determine the status..Logpath:${log_pth_final}" -l $LOGFILE
+	log_msg  -s "Precheck could not complete for ${pre_check[_index_]}.\nStatus:WARNING.\n" -l $DISPLAY
+fi
+}
+
+
+### Function: nas_check ###
+#
+# To check if Nas is available .
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+nas_check(){
+$SYSTEMCTL show NAS-online.service -p ActiveState | $AWK -F\= '{print $2}' | $EGREP -v "active" > $TEM_DIR/nas.txt
+if [ -s ${TEM_DIR}/nas.txt ] ;then
+	_err_msg_="NAS is not online.Precheck scripts cannot be executed further"
+	abort_script "${_err_msg_}"
+fi
+}
+
+
+### Function: parse_scripts_reg ###
+#
+# To parse the scripts registry file and store in an array
+#
+# Arguments:
+#    none
+# Return Values:
+#   none
+parse_scripts_reg(){
+_count1_=0
+
+while read -r _line_
+do
+pre_check[_count1_]=`$ECHO ${_line_} | $AWK -F"::" '{print $1}'`
+script_pth[_count1_]=`$ECHO ${_line_} | $AWK -F"::" '{print $2}'`
+log_pth[_count1_]=`$ECHO ${_line_} | $AWK -F"::" '{print $3}'`
+machine[_count1_]=`$ECHO ${_line_} | $AWK -F"::" '{print $5}'`
+reg=`$ECHO ${_line_} | $AWK -F"::" '{print $4}'`
+	if [ $reg == "DEFAULT" ] ;then
+		RETURNCODE_PATH[_count1_]=$RETURN_CODE_REGISTRY_DEF
+	else
+		RETURNCODE_PATH[_count1_]=$reg
+	fi
+frequency[_count1_]="DAILY"
+time[_count1_]=`$ECHO ${_line_} | $AWK -F"::" '{print $6}'`
+log_msg -q  -t -s "${_line_}" -l $LOGFILE
+_count1_=$((_count1_+1))
+done < $SCRIPT_REG
+}
+
+
+### Function: parse_return_code ###
+#
+# To parse the return code registry file and store in an array.
+# This array will be looked up while displaying the final status and remarks 
+# in the main execution.
+#
+# Arguments:
+#   $1=index of an array
+# Return Values:
+#   none
+parse_return_code(){
+_count1_=0
+while read -r _line_
+do
+	[[ "${_line_}" =~ ^#.*$ ]] && continue
+	[[ -z "${_line_}" ]] && continue
+	exit_code[_count1_]=`$ECHO ${_line_} | $AWK -F"::" '{print $1}'`
+	exit_status[_count1_]=`$ECHO ${_line_} | $AWK -F"::" '{print $2}'`
+	exit_msg[_count1_]=`$ECHO ${_line_} | $AWK -F"::" '{print $3}'`
+	_count1_=$((_count1_+1))
+done< ${RETURNCODE_PATH[$1]}
+log_msg -q -t -s "Parsing Done. " -l $LOGFILE
+unset IFS
+}
+
+### Function: get_absolute_path ###
+#
+# Determine absolute path to software
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+get_absolute_path()
+{
+_dir_=`$DIRNAME $0`
+SCRIPTHOME=`cd $_dir_ 2>/dev/null && pwd || $ECHO $_dir_`
+}
+
+### Function: setup_env ###
+#
+# Set up environment variables for script.
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+setup_env()
+{
+# ENIQ Base Directory
+ENIQ_BASE_DIR=/eniq
+
+# ENIQ LIB Directory
+LIB_DIR=/lib
+
+# ENIQ Core Installation Directory
+ENIQ_INST_DIR=${ENIQ_BASE_DIR}/installation
+
+# ENIQ Core Installation SW
+ENIQ_CORE_INST_DIR=${ENIQ_INST_DIR}/core_install
+
+# ENIQ Precheck Directory
+ENIQ_CHK_DIR=${ENIQ_CORE_INST_DIR}/eniq_checks
+
+# ENIQ Precheck Bin Directory
+ENIQ_CHK_BIN_DIR=${ENIQ_CHK_DIR}/bin
+
+# ENIQ Precheck Config Directory
+ENIQ_CHK_CONF_DIR=${ENIQ_CHK_DIR}/config
+
+# ENIQ Log Directory
+ENIQ_LOG_DIR=${ENIQ_BASE_DIR}/local_logs
+
+# ENIQ Precheck Log Directory
+ENIQ_CHK_LOG_DIR=${ENIQ_LOG_DIR}/eniq_checks_log
+
+# ENIQ Config Directory
+ENIQ_CONF_DIR=${ENIQ_INST_DIR}/config
+
+#IPMP ini file
+IPMP_INI=${ENIQ_CONF_DIR}/ipmp.ini
+
+# Set temporary directory
+VAR_TMP_DIR=/var/tmp
+
+HNAME=`${MYHOSTNAME}`
+HOST_IP=`${MYHOSTNAME} -i| $AWK '{print $1}'`
+
+# Source the common functions
+if [ -s ${SCRIPTHOME}/../../lib/common_functions.lib ]; then
+    . ${SCRIPTHOME}/../../lib/common_functions.lib
+else
+    _err_msg_="File ${SCRIPTHOME}/../../lib/common_functions.lib not found"
+    abort_script "${_err_msg_}" 
+fi
+
+# File containing the type of OSS installation. Eg. statistics
+INST_TYPE_FILE=${ENIQ_CONF_DIR}/ericsson_use_config
+if [ ! -s "${INST_TYPE_FILE}" ]; then
+	_err_msg_="ENIQ install type not defined in ${INST_TYPE_FILE}"
+	abort_script "${_err_msg_}"
+fi
+
+# Read the installation type - should be "stats"
+INST_TYPE=`$CAT ${INST_TYPE_FILE} | $AWK -F\= '{print $2}'`
+
+# Read the storage type
+STORAGE_TYPE=`iniget STOR_TYPE -f ${ENIQ_BASE_DIR}/installation/config/SunOS.ini -v STORAGE_TYPE`
+if [ ! "${STORAGE_TYPE}" ]; then
+	_err_msg_="Could not obtain storage type from ${ENIQ_BASE_DIR}/installation/config/SunOS.ini"
+	abort_script "${_err_msg_}"
+fi
+
+#get ip type from ipmp.ini
+if [ -f ${ENIQ_CONF_DIR}/ip_type ]; then
+   _ip_type_=`$CAT ${ENIQ_CONF_DIR}/ip_type`
+   if [ ! "${_ip_type_}" ]; then
+       _err_msg_="Could not read parameter _ip_type_ from file ${ENIQ_CONF_DIR}/${IPMP_INI}"
+       abort_script "$_err_msg_"
+   fi
+fi
+}
+
+
+### Function: ssh_remote ###
+#
+# Run precheck remotely on all the blades
+#
+# Arguments:
+#   $1:Ordered List of Servers
+# Return Values:
+#   none
+ssh_remote(){
+for _line_ in `$CAT $1`; do
+local _count_ _ip_address_ _ip_address_
+_count_=`$ECHO ${_line_} |grep -o "::" | wc -l`
+if [ "${_ip_type_}" == "IPv6" ] && [ "${_count_}" == 3 ]; then
+    _ip_address_=`$ECHO ${_line_} |$GREP -oE '([a-fA-F0-9]{1,4}::?){1,7}[a-fA-F0-9]{1,4}' | $HEAD -n 1 | $AWK -F "::" '{ print $1 "::" $2}'`
+    _serv_hostname_=`$ECHO ${_line_} | $AWK -F"::" '{print $3}'`
+else
+     _ip_address_=`$ECHO ${_line_} | $AWK -F"::" '{print $1}'`
+     _serv_hostname_=`$ECHO ${_line_} | $AWK -F"::" '{print $2}'`
+fi
+if [ ! "${_ip_address_}" -o ! "${_serv_hostname_}" ]; then
+	_err_msg_="Could not read required info from $1"
+	abort_script "${_err_msg_}"
+fi
+insert_header_footer head "Executing PRECHECK For ${_serv_hostname_}" $DISPLAY
+log_msg -t -q -s "BLADE : ${_serv_hostname_}" -l $LOGFILE
+log_msg -t -q -s "Executing precheck scripts on ${_serv_hostname_} " -l $LOGFILE
+if [ "${_ip_address_}" == "${HOST_IP}" ]; then
+	execute_locally
+	if [ $? -ne 0 ]; then
+		"Could not start precheck on ${HNAME}.Server Unavailable "
+		continue
+	fi
+else
+run_remote_cmd "${_serv_hostname_}" "${SERVICE_COMMAND}" "$LOGFILE"
+_return_="$?"
+if [ ${_return_} -ne 0 ] ; then
+	if [ ${_return_} -eq 1 ] ;then
+		log_msg -t -q -s "Could not complete precheck on ${_serv_hostname_}.Script Aborted on Remote server" -l $ $LOGFILE
+		log_msg -s "Could not complete  precheck on ${_serv_hostname_}.Script Aborted on Remote server"
+		continue
+	else
+		log_msg -t -q -s "Could not start precheck on ${_serv_hostname_}.Server Unavailable" -l $ $LOGFILE
+		log_msg -s "Could not complete  precheck on ${_serv_hostname_}.Server Unavailable"
+		continue
+	fi
+fi
+log_msg -t -q -s "Check logs at path ${ENIQ_CHK_LOG_DIR} on ${_serv_hostname_}"  -l $LOGFILE
+log_msg -t -q -s "Precheck done on ${_serv_hostname_}" -l $LOGFILE
+fi
+done
+}
+
+### Function: timeout ###
+#
+# Checks if the precheck script timeout
+#
+# Arguments:
+#  $1= Command to eb executed
+# Return Values:
+#  exit code of command
+
+timeout(){
+_cmd_="$1"
+${_cmd_} & >> /dev/null 2>&1
+_ls_pid_num_=$!
+_timeout_=$2
+_time_now_=${SECONDS}
+_max_time_=$(( _time_now_ + _timeout_))
+while (( ${_time_now_} < ${_max_time_} )); do
+    $KILL -0 ${_ls_pid_num_} >> /dev/null 2>&1
+    if [ $? -eq 0 ]; then
+        _time_now_=${SECONDS}
+    else
+        wait ${_ls_pid_num_} >> /dev/null 2>&1
+        EXIT_CODE=$?
+        return ${EXIT_CODE}
+    fi
+done
+log_msg -t -q -s "Killing process ${_ls_pid_num_} for ${_cmd_}.It exceeds 60s" -l $LOGFILE
+$KILL -13 ${_ls_pid_num_} >> /dev/null 2>&1
+EXIT_CODE=4
+return ${EXIT_CODE}
+}
+
+### Function: validate_conditions ###
+#
+#Validate Machine type and frequency when the scripts are to executed
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+
+validate_conditions(){
+
+log_msg -q -t -s "Parsing Scripts Registry File at $SCRIPT_PATH" -l $LOGFILE
+parse_scripts_reg
+log_msg -q -t -s "Parsing Done" -l $LOGFILE
+log_msg -q -t -s "Total Scripts : ${#pre_check[@]}"
+
+_date_=`date +"%d"`
+_day_=`date +"%A"`
+_count_=0
+for ((k=0;k<${#script_pth[@]};k++)); do
+
+log_msg -q -t -s "Validating blade type for this Precheck ${pre_check[k]}" -l $LOGFILE
+
+if [ "${machine[k]}" == "$SERVER_TYPE" ] ||  [ "${machine[k]}" == "ALL" ]; then
+
+	log_msg -q -t -s "Precheck ${pre_check[k]} can be executed on BLADE $SERVER_TYPE" -l $LOGFILE
+	log_msg -q -t -s "Checking execution schedule for this Precheck." -l $LOGFILE
+		if [ "${frequency[k]}" == "DAILY" ]; then
+			log_msg -q -t -s "Precheck ${pre_check[k]}- executed Daily" -l $LOGFILE
+			main_exec $k
+		elif [ "${frequency[k]}" == "WEEKLY" ]; then
+			if [ $_day_ == "Wednesday" ]; then
+				log_msg -q -t -s "Precheck ${pre_check[k]}- executed Weekly(Wednesday)" -l $LOGFILE
+				main_exec $k
+			else
+				log_msg -q -t -s "Skipping check for ${pre_check[k]}.This check is executed once a week" -l $LOGFILE
+				log_msg -s "\nSkipping check for ${pre_check[k]}.This check is executed once a week \n" -l $DISPLAY
+			fi
+		elif [ "${frequency[k]}" == "MONTHLY" ]; then
+			if [ $_date_ == "20" ]; then
+				log_msg -q -t -s "Precheck ${pre_check[k]}- executed Monthly(every ${_date_})" -l $LOGFILE
+				main_exec $k
+			else
+				log_msg -q -t -s "Skipping check for ${pre_check[k]}.This check is executed once a month" -l $LOGFILE
+				log_msg -s "\nSkipping check for ${pre_check[k]}.This check is executed once a month\n" -l $DISPLAY
+			fi
+		fi
+else
+	log_msg -q -t -s "Skipping check for ${pre_check[k]}.This check cannot be executed on this BLADE" -l $LOGFILE
+	continue
+fi
+done
+}
+
+### Function: usage_msg ###
+#
+#   Print out the usage message
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+usage_msg()
+{
+$ECHO "
+Usage: `$BASENAME $0`
+Notes: This script does not require any argument.
+"
+}
+
+
+# ********************************************************************
+#
+#   Main body of program
+#
+# ********************************************************************
+
+# Timestamp
+TIMESTAMP=`$DATE '+%d-%m-%y_%H.%M.%S'`
+
+while getopts ":o:u" arg; do
+	case $arg in
+		u) FEATURE_UPGRADE="YES"
+		;;
+		o) DISPLAY="$OPTARG"
+		PRECHECK_VAR="YES"
+		;;
+		\?) usage_msg
+		exit 1
+		;;
+	esac
+done
+shift `expr $OPTIND - 1`
+
+# Ctrl+C
+trap "abort_script" INT
+
+# Check that the effective id of the user is root
+check_id $DEFAULT_USER
+
+#get absolute path
+get_absolute_path
+
+# Set up environment variables for script.
+setup_env
+
+#Remove precheck success flag from last run
+if [ "${FEATURE_UPGRADE}" == "YES" ]; then
+	if [ -f ${VAR_TMP_DIR}/precheck_success ]; then
+		$RM -rf ${VAR_TMP_DIR}/precheck_success
+	fi
+fi
+
+# Determine the current server type
+CURR_SERVER_TYPE=`$CAT $ENIQ_CONF_DIR/installed_server_type | $EGREP -v  '^[[:blank:]]*#' | $SED -e 's/ //g'`
+if [ ! "${CURR_SERVER_TYPE}" ]; then
+	_err_msg_="Could not determine which server type this is"
+	abort_script "${_err_msg_}"
+fi
+
+# Check if the process is trigerred more than once from the invocator[CO blade].
+if [ "${CURR_SERVER_TYPE}" == "eniq_stats" -o "${CURR_SERVER_TYPE}" == "stats_coordinator" ] ;then
+	_lockfile_="/var/tmp/.precheck_lock"
+	if [ -f ${_lockfile_} ]  ;then
+		$ECHO "\n$($DATE '+%Y-%b-%d_%H.%M.%S'): One instance of this process is already running.Aborting script.\n"
+		exit 1
+	else
+		$TOUCH ${_lockfile_}
+	fi
+fi
+
+# Log file
+$MKDIR -p ${ENIQ_CHK_LOG_DIR}
+if [ $? -ne 0 ]; then
+	_err_msg_="Could not create directory `$DIRNAME ${log_dir_final}`"
+	abort_script "${_err_msg_}"
+fi
+LOGFILE="${ENIQ_CHK_LOG_DIR}/precheck_$TIMESTAMP.log"
+$FIND `$DIRNAME ${LOGFILE}` -name "*.log"  -mtime +10 -exec rm -rf {} \;
+
+# Check if NAS is available.Skip in case of STATS RACK 
+if [ "${STORAGE_TYPE}" != "zfs" ]; then
+	nas_check 
+fi
+
+# Console Log File
+if [ ! "$2" ]; then
+	$MKDIR -p $ENIQ_BASE_DIR/log/precheck/logs/
+	if [ $? -ne 0 ]; then
+		_err_msg_="Could not create directory $ENIQ_BASE_DIR/log/precheck/logs/"
+		abort_script "${_err_msg_}"
+	fi
+	DISPLAY="$ENIQ_BASE_DIR/log/precheck/logs/console_$TIMESTAMP.log"
+else
+	DISPLAY="$2"
+fi
+$FIND `$DIRNAME ${DISPLAY}` -name "*.log"  -mtime +10 -exec rm -rf {} \;
+
+# Create a temporary Directory
+TEM_DIR=/tmp/precheck.$$.$$
+$RM -rf ${TEM_DIR}
+$MKDIR -p ${TEM_DIR}
+if [ $? -ne 0 ]; then
+	_err_msg_="Could not create directory $TEM_DIR"
+	abort_script "${_err_msg_}"
+fi
+
+# Precheck scripts registry file path
+INI_FILE_PATH="/eniq/installation/config/upgrade_params.ini"
+if [ -e "${INI_FILE_PATH}" ]; then
+	SCRIPT_PATH_1=${ENIQ_CHK_CONF_DIR}/script_registry_stats_MWS.cfg
+fi
+
+if [ "$INST_TYPE" == 'stats' ]; then
+	if [ "${FEATURE_UPGRADE}" == "YES" ];then
+		SCRIPT_PATH=${ENIQ_CHK_CONF_DIR}/script_registry_feature_upgrade.cfg
+	else
+		SCRIPT_PATH=${ENIQ_CHK_CONF_DIR}/script_registry_stats.cfg
+	fi
+fi
+
+
+if [ ! -e "${SCRIPT_PATH}" ]; then
+	_err_msg_="$SCRIPT_PATH File Not Found"
+	abort_script "${_err_msg_}"
+fi
+
+# Default return code file path
+RETURN_CODE_REGISTRY_DEF=${ENIQ_CHK_CONF_DIR}/return_code.cfg
+if [ ! -e "${RETURN_CODE_REGISTRY_DEF}" ]; then
+	_err_msg_=" $RETURN_CODE_REGISTRY_DEF File Not Found "
+	abort_script "${_err_msg_}"
+fi
+
+# Create temporary script registry file excluding space and comments
+$MKDIR -p /$TEM_DIR/script_registry
+if [ $? -ne 0 ]; then
+	_err_msg_="Could not create directory $TEM_DIR/script_registry"
+	abort_script "${_err_msg_}"
+fi
+SCRIPT_REG="$TEM_DIR/script_registry/script_registry.cfg"
+$GREP  -v ^# $SCRIPT_PATH | $GREP -v ^$ > $SCRIPT_REG
+if [ ! -z "${SCRIPT_PATH_1}" ]; then
+	$GREP  -v ^# $SCRIPT_PATH_1 | $GREP -v ^$ >> $SCRIPT_REG
+fi
+
+COUNT=/eniq/log/precheck/stats_file.txt
+if [ ! -f ${COUNT} ] ;then
+	$TOUCH $COUNT
+	log_msg  -q -s "\n\n=======================================================================================================================================" -l $COUNT
+	log_msg  -q -s "                                          PRECHECK EXECUTION COUNTS                   "  -l $COUNT
+	log_msg  -q -s "=======================================================================================================================================\n" -l $COUNT
+	printf '%-35s    %-15s    %-15s    %-15s    %-15s    %-15s\n\n' "SERVER" "TOTAL CHECKS" "SUCCESS" "WARNING" "FAILURE" "NO RUN" >> $COUNT 
+fi
+
+case ${CURR_SERVER_TYPE} in
+eniq_stats|stats_coordinator)
+	SERVER_TYPE="CO"
+	;;
+stats_iqr)
+	SERVER_TYPE="RD"
+	;;
+stats_engine)
+	SERVER_TYPE="ENGINE"
+	;;
+*)
+	_err_msg_="Could not determine the Server Type"
+	abort_script "${_err_msg_}"
+	;;
+esac
+
+# Summary file
+SUMMARY=${ENIQ_BASE_DIR}/log/precheck/temp_summary/summary_$HNAME.txt
+$MKDIR -p `$DIRNAME ${SUMMARY}`
+if [ $? -ne 0 ]; then
+	_err_msg_="Could not create directory `$DIRNAME ${_logfile_}`"
+	abort_script "${_err_msg_}"
+fi
+$RM -rf ${SUMMARY}
+$TOUCH  ${SUMMARY}
+if [ $? -ne 0 ]; then
+	_err_msg_="Could not create file summary file on $HNAME"
+	abort_script "${_err_msg_}"
+fi
+log_msg -q -s "\n\n=======================================================================================================================================" -l $SUMMARY
+log_msg -q -s "                                          PRECHECK SUMMARY : $HNAME($CURR_SERVER_TYPE)                  " -l $SUMMARY
+log_msg -q -s "=======================================================================================================================================\n" -l $SUMMARY
+printf '%-4s %-20s    %-7s    %-35s    %-80s\n \n' "No." "PRECHECK" "STATUS" "REMARK" "LOGS"  >> $SUMMARY
+
+
+# Define Service command to be Executed Remotely
+if [ "${FEATURE_UPGRADE}" == "YES" ]; then
+	SERVICE_COMMAND="cd ${ENIQ_CHK_BIN_DIR} ;$BASH ${ENIQ_CHK_BIN_DIR}/eniq_checks.bsh -o $DISPLAY -u"
+else
+	SERVICE_COMMAND="cd ${ENIQ_CHK_BIN_DIR} ;$BASH ${ENIQ_CHK_BIN_DIR}/eniq_checks.bsh -o $DISPLAY"
+fi
+
+# Check User Defined option
+if [ "$1" == "-co" ] ;then
+	if [ "$SERVER_TYPE" == "CO" ] ;then
+		log_msg -t -q -s "\n \t \t \t PRECHECK -- Coordinator" -l $LOGFILE
+		log_msg -s "\n                                          PRECHECK -- COORDINATOR" -l $DISPLAY
+		insert_header_footer head "EXECUTING PRECHECK FOR ${HNAME}" $DISPLAY
+		execute_locally
+		get_summary
+		cleanup
+	else
+		_err_msg_="This is not a coordinator Blade"
+		abort_script "${_err_msg_}"
+	fi
+elif [ "${PRECHECK_VAR}" == "YES" ] ;then
+	execute_locally
+	cleanup
+elif [ "$1" == "-all" ] || [ -z "$1" ] ;then
+	if [ "$SERVER_TYPE" == "CO" ] ;then
+		log_msg -t -q -s "\n \t \t \t PRECHECK -- ALL SERVERS" -l $LOGFILE
+		log_msg -s "\n                                            PRECHECK -- ALL SERVERS" -l $DISPLAY
+		execute_remotely
+		get_summary
+		cleanup
+	else
+		_err_msg_="This Script can be triggered from Coordinator blade only"
+		abort_script "${_err_msg_}"
+	fi
+else
+	$ECHO "\nIncorrect parameters are passed to the script \n"
+	usage_msg
+	cleanup
+	exit 1
+fi
+
+#Create precheck success flag for Admin UI
+if [ "${SERVER_TYPE}" == "CO" -a "${FEATURE_UPGRADE}" == "YES" ]; then
+	$TOUCH ${VAR_TMP_DIR}/precheck_success
+	if [ $? -ne 0 ]; then
+		_err_msg_="Could not create ${VAR_TMP_DIR}/precheck_success." 
+		abort_script "${_err_msg_}"
+	fi
+fi

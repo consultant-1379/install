@@ -1,0 +1,892 @@
+#!/bin/bash
+# ********************************************************************
+# Ericsson Radio Systems AB                                     SCRIPT
+# ********************************************************************
+#
+#
+# (c) Ericsson Radio Systems AB 2014 - All rights reserved.
+#
+# The copyright to the computer program(s) herein is the property
+# of Ericsson Radio Systems AB, Sweden. The programs may be used
+# and/or copied only with the written permission from Ericsson Radio
+# Systems AB or in accordance with the terms and conditions stipulated
+# in the agreement/contract under which the program(s) have been
+# supplied.
+#
+# ********************************************************************
+# Name    : create_snapshot_luns.bsh
+# Date    : 2/04/2014
+# Revision: main\8
+# Purpose : This primary purpose of this script is to prepare ENIQ Statistcs for Backup.
+#           It will snapshot all required luns for backup
+#
+#
+# Usage   : create_snapshot_luns.bsh [ -l <path_to_logfile> ] [ -N ]
+#
+# ********************************************************************
+#
+#       Command Section
+#
+# ********************************************************************
+AWK=/usr/bin/awk
+BASENAME=/usr/bin/basename
+CAT=/usr/bin/cat
+CHMOD=/usr/bin/chmod
+CHOWN=/usr/bin/chown
+CLEAR=/usr/bin/clear
+CMP=/usr/bin/cmp
+CP=/usr/bin/cp
+CPIO=/usr/bin/cpio
+DATE=/usr/bin/date
+DIRNAME=/usr/bin/dirname
+DOMAINNAME=/usr/bin/domainname
+DTCONFIG=/usr/dt/bin/dtconfig
+ECHO=/usr/bin/echo
+EGREP=/usr/bin/egrep
+EJECT=/usr/bin/eject
+ENV=/usr/bin/env
+EXPR=/usr/bin/expr
+FIND=/usr/bin/find
+FLARCREATE=/usr/sbin/flarcreate
+FORMAT=/usr/sbin/format
+FUSER=/usr/sbin/fuser
+GEGREP=/usr/sfw/bin/gegrep
+GETENT=/usr/bin/getent
+GETTEXT=/usr/bin/gettext
+GREP=/usr/bin/grep
+GROUPADD=/usr/sbin/groupadd
+GTAR=/usr/sfw/bin/gtar
+GZCAT=/usr/bin/gzcat
+HEAD=/usr/bin/head
+HOSTNAME=/usr/bin/hostname
+ID=/usr/bin/id
+INIT=/usr/sbin/init
+LS=/usr/bin/ls
+MKDIR=/usr/bin/mkdir
+MORE=/usr/bin/more
+MOUNT=/usr/sbin/mount
+MV=/usr/bin/mv
+NAWK=/usr/bin/nawk
+PGREP=/usr/bin/pgrep
+PING=/usr/sbin/ping
+PKGADD=/usr/sbin/pkgadd
+PKGINFO=/usr/bin/pkginfo
+PRTCONF=/usr/sbin/prtconf
+PWD=/usr/bin/pwd
+RM=/usr/bin/rm
+RCP=/usr/bin/rcp
+RSH=/usr/bin/rsh
+SED=/usr/bin/sed
+SLEEP=/usr/bin/sleep
+SORT=/usr/bin/sort
+SU=/usr/bin/su
+SVCADM=/usr/sbin/svcadm
+SVCCFG=/usr/sbin/svccfg
+SVCS=usr/bin/svcs
+SWAP=/usr/sbin/swap
+SYNC=/usr/sbin/sync
+TAIL=/usr/bin/tail
+TEE=/usr/bin/tee
+TOUCH=/usr/bin/touch
+TPUT=/usr/bin/tput
+UADMIN=/usr/sbin/uadmin
+UNAME=/usr/bin/uname
+USERADD=/usr/sbin/useradd
+VOLD=/usr/sbin/vold
+WC=/usr/bin/wc
+YES=/usr/bin/yes
+ZFS=/usr/sbin/zfs
+ZPOOL=/usr/sbin/zpool
+
+# ********************************************************************
+#
+#       Configuration Section
+#
+# ********************************************************************
+# Name of SunOS & ENIQ ini Files
+ENIQ_ENV=niq.rc
+ENIQ_INI=niq.ini
+SUNOS_INI=SunOS.ini
+BLK_STOR_INI=block_storage.ini
+SYM_INI=sym_links.ini
+
+# Backup Storage Group
+BKUP_SG=OMBS_storage_Group
+
+# Naviseccli 
+NAVISECCLI=/opt/Navisphere/bin/naviseccli
+
+# ********************************************************************
+#
+#       Functions
+#
+# ********************************************************************
+### Function: abort_script ###
+#
+#   This will is called if the script is aborted thru an error
+#   error signal sent by the kernel such as CTRL-C or if a serious
+#   error is encountered during runtime
+#
+# Arguments:
+#       $1 - Error message from part of program (Not always used)
+# Return Values:
+#       none
+abort_script()
+{
+if [ "$1" ]; then
+    _err_msg_="`$DATE '+%Y-%m-%d_%H.%M.%S'` - $1"
+else
+    _err_msg_="`$DATE '+%Y-%m-%d_%H.%M.%S'` - Script aborted.......\n"
+fi
+
+# Check if log_msg() is defined
+type log_msg > /dev/null 2>&1
+if [ $? -gt 0 ]; then
+    if [ "${LOGFILE}" ]; then
+        if [ ! "${SNAP_QUIET}" ]; then
+            $ECHO "\n${_err_msg_}\n" |$TEE -a ${LOGFILE}
+        else
+            $ECHO "\n${_err_msg_}\n" >> ${LOGFILE}
+        fi
+    else
+        $ECHO "\n${_err_msg_}\n"
+    fi
+else
+    if [ "${LOGFILE}" ]; then
+        log_msg -s "\n${_err_msg_}\n" -l ${LOGFILE} ${SNAP_QUIET}
+    else
+        log_msg -s "\n${_err_msg_}\n" ${SNAP_QUIET}
+    fi
+fi
+
+cd $SCRIPTHOME
+$RM -rf ${TEM_DIR}
+
+exit 1
+}
+
+### Function: add_luns_storage_group ###
+#
+#   Add LUNs to SG
+#
+# Arguments:
+#       $1 : SAN SPA IP Address
+# Return Values:
+#       none
+add_luns_storage_group()
+{
+local _ip_addr_=$1
+
+if  [ "${_ip_addr_}" == "" ]; then
+    _err_msg_="Must provide an ip address of SAN to add LUNs to a storage group"
+    abort_script "$_err_msg_"
+fi
+	
+# Add Luns to storage Group
+for _entry_ in `$CAT ${ENIQ_CONF_DIR}/snapshot_lun_list_${DEVICE_NAME}.txt`; do
+    _snapshot_=`$ECHO ${_entry_} | $NAWK -F"::" '{print $NF}'`
+    $ECHO "Adding snapshot LUN ${_snapshot_} to storage group ${BKUP_SG}" | $TEE -a ${LOGFILE}
+    $NAVISECCLI -secfilepath ${SAN_CRED} -Address ${_ip_addr_} storagegroup -addsnapshot -gname ${BKUP_SG} -snapshotname ${_snapshot_} >> /dev/null 2>&1
+    if [ $? -ne 0 ]; then
+        _err_msg_="Failed to add snapshot LUN ${_snapshot_} to storage group ${BKUP_SG}"
+        abort_script "$_err_msg_"
+    fi
+done
+}
+
+### Function: check_navi_pkgs ###
+#
+# Verify that the NAVI pkgs are installed correctly
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+check_navi_pkgs()
+{
+$PKGINFO -l HOSTAGENT | $GREP 'completely installed' > /dev/null 2>&1;
+if [ $? -ne 0 ]; then
+   _err_msg_="The HOSTAGENT package is not installed or installed incorrectly. Exiting."
+   abort_script "$_err_msg_"
+fi
+
+$PKGINFO -l NAVISCLI | $GREP 'completely installed' > /dev/null 2>&1;
+if [ $? -ne 0 ]; then
+    _err_msg_="The NAVISCLI package is not installed or installed incorrectly. Exiting."
+    abort_script "$_err_msg_"
+fi
+}
+
+### Function: chk_create_logfile ###
+#
+# Check/Create Logfile
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+chk_create_logfile()
+{
+$MKDIR -p `$DIRNAME ${LOGFILE}`
+if [ $? -ne 0 ]; then
+    unset LOGFILE
+    _err_msg_="Could not create directory `$DIRNAME ${LOGFILE}`"
+     abort_script "$_err_msg_"
+fi
+
+$TOUCH -a ${LOGFILE}
+if [ $? -ne 0 ]; then
+    unset LOGFILE
+    _err_msg_="Could not write to file ${LOGFILE}"
+    abort_script "$_err_msg_"
+fi
+
+if [ -s ${LOGFILE} ]; then
+    $ECHO "\n\n" >> ${LOGFILE}
+fi
+
+$ECHO "================================================================" >> ${LOGFILE}
+$ECHO "================================================================" >> ${LOGFILE} 
+$ECHO "Pre-backup snapshot LUN creation started at `$DATE +%d.%m.%y_%H:%M:%S`\n" >> ${LOGFILE} 
+}
+
+### Function: create_db_disk_lisk ###
+#
+# create a list of disks used in the DB
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+create_db_disk_list()
+{
+_sys_main_list_=`iniget DWH_SYSTEM_MAIN -f ${ENIQ_CONF_DIR}/${SYM_INI}`
+if  [ ! "${_sys_main_list_}" ]; then
+    _err_msg_="Could not read DWH_SYSTEM_MAIN information from ${ENIQ_CONF_DIR}/${SYM_INI}"
+    abort_script "$_err_msg_"
+fi
+
+_db_space_list_=`iniget DWH_DBSPACES_MAIN -f ${ENIQ_CONF_DIR}/${SYM_INI}`
+if  [ ! "${_db_space_list_}" ]; then
+    _err_msg_="Could not read DWH_DBSPACES_MAIN information from ${ENIQ_CONF_DIR}/${SYM_INI}"
+    abort_script "$_err_msg_"
+fi
+
+$RM -f ${ENIQ_CONF_DIR}/db_device_list.txt >> /dev/null 2>&1
+
+# Get sys main luns
+for _sys_main_ in ${_sys_main_list_}; do
+    _sys_main_disk_=`iniget ${_sys_main_list_} -f ${ENIQ_CONF_DIR}/${SYM_INI} -v Link | $NAWK -F"/" '{print $NF}' | $SED 's|\(.*\)\(s[0-9]*\)$|\1|'`
+    _sys_main_path_=`iniget ${_sys_main_list_} -f  ${ENIQ_CONF_DIR}/${SYM_INI} -v Path`
+    $ECHO "${_sys_main_disk_}::${_sys_main_path_}" >> ${ENIQ_CONF_DIR}/db_device_list.txt
+done
+
+# Get main dbs
+for _db_space_ in ${_db_space_list_}; do
+    _main_db_disk_=`iniget ${_db_space_} -f ${ENIQ_CONF_DIR}/${SYM_INI} -v Link | $NAWK -F"/" '{print $NF}' | $SED 's|\(.*\)\(s[0-9]*\)$|\1|'`
+    _main_db_path_=`iniget ${_db_space_} -f ${ENIQ_CONF_DIR}/${SYM_INI} -v Path`
+    $ECHO "${_main_db_disk_}::${_main_db_path_}" >> ${ENIQ_CONF_DIR}/db_device_list.txt
+done
+}
+
+### Function: create_lun_id_list ###
+#
+# create a list of disks used in the DB
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+create_lun_id_list()
+{
+local _ip_addr_=$1
+	
+if  [ "${_ip_addr_}" == "" ]; then
+    _err_msg_="Must provide an ip address of SAN to create LUN ID list"
+    abort_script "$_err_msg_"
+fi
+
+$RM -rf ${TEM_DIR}/list_file.txt
+$RM -rf ${TEM_DIR}/lun_list.txt
+$RM -rf ${TEM_DIR}/lun_map_list.txt
+
+$NAVISECCLI -secfilepath ${SAN_CRED} -Address ${_ip_addr_} storagegroup -list -gname ${ENIQ_SG} | $EGREP -v '\-\-\-\-' > ${TEM_DIR}/list_file.txt
+if [ $? -ne 0 ]; then
+    _err_msg_="Unable to find ${ENIQ_SG} on the SAN. Check the SAN and verify it exists."
+    abort_script  "$_err_msg_"
+fi
+
+f=0
+while read _line_; do
+    case ${_line_} in
+	"HLU Number     ALU Number") f=1; continue ;;
+	"Shareable:             YES" ) f=0 ;;
+    esac
+
+    if [ $f -eq 1 ]; then
+        $ECHO  ${_line_} | $AWK '{print $2}' >> ${TEM_DIR}/lun_list.txt
+    fi
+done < "${TEM_DIR}/list_file.txt"
+
+for _lun_ in `$CAT ${TEM_DIR}/lun_list.txt`; do
+    _lun_uid_=`$NAVISECCLI -secfilepath ${SAN_CRED} -Address ${_ip_addr_} getlun ${_lun_} -uid -name | $EGREP "UID" | $NAWK '{print $2}' | $SED -e 's|\:||g'`
+    if [ ! ${_lun_uid_} ]; then
+         _err_msg_="Unable to find LUN UID for LUN ${_lun_}"
+        abort_script  "$_err_msg_"
+    fi
+    $ECHO "${_lun_}::${_lun_uid_}" >> ${TEM_DIR}/lun_map_list.txt
+done
+
+if [ -s ${ENIQ_CONF_DIR}/snap_lun_list_${DEVICE_NAME}.txt ]; then
+    $MV ${ENIQ_CONF_DIR}/snap_lun_list_${DEVICE_NAME}.txt ${ENIQ_CONF_DIR}/snap_lun_list_${DEVICE_NAME}_`$DATE +%d.%m.%y_%H:%M:%S`.txt
+fi 
+
+for _disk_ in `$CAT ${ENIQ_CONF_DIR}/db_device_list.txt`; do
+    _uid_=`$ECHO $_disk_ | $NAWK -F"::" '{print $1}' | $SED 's|\(.*\)\(d[0-9]*\)$|\1|' | $CUT -d 't' -f2`
+    # lets find correct lun
+    $CAT ${TEM_DIR}/lun_map_list.txt | $GREP ${_uid_} >> /dev/null 2>&1
+    if [ $? -ne 0 ]; then
+        break
+    else
+        _lun_info_=`$CAT ${TEM_DIR}/lun_map_list.txt | $GREP ${_uid_}`
+        $ECHO "${_lun_info_}::${_disk_}" >> ${ENIQ_CONF_DIR}/snap_lun_list_${DEVICE_NAME}.txt
+    fi      
+done
+}
+
+### Function: create_snapshot_luns ###
+#
+# Create a SNAPSHOT Luns to be used in for a backup.       
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+create_snapshot_luns()
+{
+local _ip_addr_=$1
+
+if  [ "${_ip_addr_}" == "" ]; then
+    _err_msg_="Must provide an ip address of SAN to delete snapshot"
+    abort_script "$_err_msg_"
+fi
+ 
+$ECHO "\nCreating snapshots for [ ${DEVICE_NAME} ] ..." | $TEE -a ${LOGFILE}
+
+if [ -s ${ENIQ_CONF_DIR}/snapshot_lun_list_${DEVICE_NAME}.txt ]; then
+    $MV ${ENIQ_CONF_DIR}/snapshot_lun_list_${DEVICE_NAME}.txt ${ENIQ_CONF_DIR}/snapshot_lun_list_${DEVICE_NAME}_`$DATE +%d.%m.%y_%H:%M:%S`.txt
+    if [ $? -ne 0 ]; then
+    	_err_msg_="Failed to move ${ENIQ_CONF_DIR}/snapshot_lun_list_${DEVICE_NAME}.txt to ${ENIQ_CONF_DIR}/snapshot_lun_list_${DEVICE_NAME}_`$DATE +%d.%m.%y_%H:%M:%S`.txt"
+        abort_script "$_err_msg_"
+    fi
+fi
+
+for _entry_ in `$CAT ${ENIQ_CONF_DIR}/snap_lun_list_${DEVICE_NAME}.txt`; do
+    _lun_=`$ECHO ${_entry_} | $NAWK -F"::" '{print $1}'`
+    $NAVISECCLI -secfilepath ${SAN_CRED} -Address ${_ip_addr_} snapview -createsnapshot ${_lun_} -snapshotname SnapShot_${_lun_} >> /dev/null 2>&1
+    if [ $? -ne 0 ]; then
+        _err_msg_="Failed to create snapshot [ SnapShot_${lun} ] on ${DEVICE_NAME} for LUN ${_lun_}. Exiting."
+        abort_script "$_err_msg_"
+    else
+        $ECHO "Snapshot has been created for the following LUN ${_lun_} on ${DEVICE_NAME} as [ SnapShot_${_lun_} ]" | $TEE -a ${LOGFILE}
+        $ECHO "${_entry_}::SnapShot_${_lun_}" >> ${ENIQ_CONF_DIR}/snapshot_lun_list_${DEVICE_NAME}.txt
+    fi
+done
+
+$ECHO "\nSuccessfully created snapshots for [ ${DEVICE_NAME} ] ...\n" | $TEE -a ${LOGFILE}
+}
+
+### Function: create_storage_group ###
+#
+# Create
+#
+# Arguments:
+#   $1  :   SPA IP Address of BLK Storage Device
+# Return Values:
+#   none
+create_storage_group()
+{
+local _ip_addr_=$1
+
+if  [ "${_ip_addr_}" == "" ]; then
+    _err_msg_="Must provide an ip address of SAN to create storage group"
+    abort_script "$_err_msg_"
+fi
+	
+# Create SG 
+$ECHO "\nCreating backup storage group ${BKUP_SG}" | $TEE -a ${LOGFILE}
+$NAVISECCLI -secfilepath ${SAN_CRED} -Address ${_ip_addr_} storagegroup -create -gname ${BKUP_SG} >> /dev/null 2>&1
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not create backup storage group ${BKUP_SG}"
+    abort_script "$_err_msg_"
+fi
+$ECHO "Successfully created backup storage group ${BKUP_SG}" | $TEE -a ${LOGFILE}
+}
+
+### Function: delete_snapshot ###
+#
+# Delete an existing SNAPSHOT lun
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+delete_snapshot()
+{
+local _ip_addr_=$1
+local _snap_name_=$2
+	
+if  [ "${_ip_addr_}" == "" ]; then
+    _err_msg_="Must provide IP address of SAN to delete snapshot"
+    abort_script "$_err_msg_"
+fi
+
+if  [ "${_snap_name_}" == "" ]; then
+    _err_msg_="Must provide a snapshot name for deletion"
+    abort_script "$_err_msg_"
+fi
+
+$ECHO "Deleting ${_snap_name_} from ${DEVICE_NAME}" | $TEE -a ${LOGFILE}
+$NAVISECCLI -secfilepath ${SAN_CRED} -Address ${_ip_addr_} snapview -rmsnapshot -snapshotname ${_snap_name_} -o >> /dev/null 2>&1
+if [ $? -ne 0 ]; then
+    _err_msg_="Failed to delete snapshot [ ${_snap_name_} ] on ${_ip_addr_}. Exiting..."
+    abort_script "$_err_msg_"
+else
+    $ECHO "Snapshot ${_snap_name_} has been deleted on ${DEVICE_NAME}\n" | $TEE -a ${LOGFILE}
+fi
+}
+
+### Function: delete_storage_group ###
+#
+# Delete backup storage group
+#
+# Arguments:
+#       $1  :  SAN IP Address
+# Return Values:
+#       none
+delete_storage_group()
+{
+local _ip_addr_=$1
+	
+if  [ "${_ip_addr_}" == "" ]; then
+    _err_msg_="Must provide IP address of SAN to delete storage group";
+    abort_script "$_err_msg_"
+fi
+	
+# Lets Delete Storage group if it already exists
+$NAVISECCLI -secfilepath ${SAN_CRED} -Address ${_ip_addr_} storagegroup -list | $GREP ${BKUP_SG} 2>&1 >> /dev/null
+if [ $? -eq 0 ]; then
+    # Lets destroy it and any snapsot luns it contains
+    # Delete any snapshot luns that exist with in the storage group
+    $NAVISECCLI -secfilepath ${SAN_CRED} -Address ${_ip_addr_} storagegroup -list -gname ${BKUP_SG} | $EGREP -v '\-' > ${TEM_DIR}/snapshot_list.txt
+    if [ $? -ne 0 ]; then
+        _err_msg_="Unable to find ${BKUP_SG} on the SAN. Check the SAN and verify it exists."
+        abort_script  "$_err_msg_";
+    fi
+
+    f=0
+    while read _line_; do
+        case ${_line_} in
+            "HLU No.  SNAP SHOT UID                                     SNAP SHOT NAME") f=1; continue ;;
+            "Shareable:             YES" ) f=0 ;;
+        esac
+
+        if [ $f -eq 1 ]; then
+            $ECHO  ${_line_} | $AWK '{print $NF}' >> ${TEM_DIR}/snapshot_lun_list.txt
+        fi
+    done < "${TEM_DIR}/snapshot_list.txt"
+
+	if [ -s ${TEM_DIR}/snapshot_lun_list.txt ]; then
+		$ECHO "\nRemoving snapshots LUN's from storage group [${BKUP_SG}]" | $TEE -a ${LOGFILE}
+		for _snapshot_ in `$CAT ${TEM_DIR}/snapshot_lun_list.txt`; do        
+			$ECHO "Removing snapshot LUN ${_snapshot_} from ${BKUP_SG}" | $TEE -a ${LOGFILE}
+			${YES} | $NAVISECCLI -secfilepath ${SAN_CRED} -Address ${_ip_addr_} storagegroup -removesnapshot -gname ${BKUP_SG} -snapshotname ${_snapshot_} -o >> /dev/null 2>&1
+			if [ $? -ne 0 ]; then
+				_err_msg_="Failed to delete snapshot LUN ${_snapshot_} from storage group ${BKUP_SG}"
+				abort_script "$_err_msg_"
+			fi
+		done
+	fi
+
+    # Delete any connected Hosts
+    _hosts_=`$NAVISECCLI -secfilepath ${SAN_CRED} -Address ${_ip_addr_} storagegroup -list -host -gname ${BKUP_SG} | $GREP "Host name:" | $NAWK '{print $NF}' | $SORT -u`
+    for _host_ in ${_hosts_}; do
+        ${YES} | $NAVISECCLI -secfilepath ${SAN_CRED} -Address ${_ip_addr_} storagegroup -disconnecthost -host ${_host_} -gname ${BKUP_SG} >> /dev/null 2>&1
+        if [ $? -ne 0 ]; then
+            _err_msg_="Failed to delete host ${_host_} from storage group ${BKUP_SG}"
+            abort_script "$_err_msg_"
+        fi
+    done
+
+    $ECHO "\nBackup storage group ${BKUP_SG} exists, need to delete it" | $TEE -a ${LOGFILE} 
+    ${YES} | $NAVISECCLI -secfilepath ${SAN_CRED} -Address ${_ip_addr_} storagegroup -destroy -gname ${BKUP_SG} >> /dev/null 2>&1
+    if [ $? -ne 0 ]; then
+        _err_msg_="Could not delete storage group ${BKUP_SG}"
+        abort_script "$_err_msg_"
+    fi
+    $ECHO "Successfully deleted backup storage group ${BKUP_SG}\n" | $TEE -a ${LOGFILE} 
+fi
+}
+
+### Function: get_absolute_path ###
+#
+# Determine absolute path to software
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+get_absolute_path()
+{
+_dir_=`$DIRNAME $0`
+SCRIPTHOME=`cd $_dir_ 2>/dev/null && pwd || $ECHO $_dir_`
+}
+
+### Function: get_login_info ###
+#
+# Read the USER and PASSWORD from configuration file
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+get_login_info()
+{
+local _blk_dev_det_=$1
+
+if [ "${_blk_dev_det_}" == "" ]; then
+    _err_msg_="Must provide bock details"
+    abort_script "$_err_msg_"
+fi
+	
+if [ ! -s "${ENIQ_CONF_DIR}/${BLK_STOR_INI}" ]; then
+    _err_msg_="${ENIQ_CONF_DIR}/${BLK_STOR_INI} does not exist or is empty"
+    abort_script "$_err_msg_";
+fi
+
+DEVICE_NAME=`iniget ${_blk_dev_det_} -f ${ENIQ_CONF_DIR}/${BLK_STOR_INI} -v BLK_STORAGE_NAME`
+if [ ! "${DEVICE_NAME}" ]; then
+    _err_msg_="Unable to obtain device name for block storage device."
+    abort_script "$_err_msg_";
+fi
+
+$ECHO "Checking that SAN IPs are alive" | $TEE -a ${LOGFILE}
+
+# Eniq Storage Group
+ENIQ_SG=`iniget ${_blk_dev_det_} -f ${ENIQ_CONF_DIR}/${BLK_STOR_INI} -v BLK_STORAGE_GROUP_NAME`
+SPA_IP=`iniget ${_blk_dev_det_} -f ${ENIQ_CONF_DIR}/${BLK_STOR_INI} -v BLK_STORAGE_IP_SPA`
+SPB_IP=`iniget ${_blk_dev_det_} -f ${ENIQ_CONF_DIR}/${BLK_STOR_INI} -v BLK_STORAGE_IP_SPB`
+
+EMC_IPS="${SPA_IP} ${SPB_IP}"
+for _ip_ in ${EMC_IPS}; do
+	$ECHO "Pinging ${_ip_}" >> ${LOGFILE}
+    $PING ${_ip_}  > /dev/null 2>&1
+    if [ $? -ne 0 ]; then
+        _err_msg_="Unable to communicate with the array at IP address [${ip}]. Exiting."
+        abort_script "$_err_msg_"
+	else        
+		$ECHO "SAN IP ${_ip_} is alive" >> ${LOGFILE}
+    fi
+done
+}
+
+### Function: get_snapshot_luns ###
+#
+# Get a list of snapshot luns on the clariion
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+get_snapshot_luns()
+{
+local _ip_addr_=$1
+	
+if  [ "${_ip_addr_}" == "" ]; then
+    _err_msg_="Must provide an IP address of SAN to get snapshot LUNs";
+    abort_script "$_err_msg_"
+fi
+
+$RM -rf ${TEM_DIR}/snapshot_list.txt
+$RM -rf ${TEM_DIR}/snapshot_delete_list.txt
+$RM -rf ${TEM_DIR}/lun_list.txt
+
+$NAVISECCLI -secfilepath ${SAN_CRED} -address ${_ip_addr_} snapview -listsnapshots | $EGREP  'SnapView logical unit name' | $NAWK -F":" '{print $NF}' > ${TEM_DIR}/snapshot_list.txt
+if [ $? -ne 0 ]; then
+    _err_msg_="Unable to find to a list of snapshots from ${_ip_addr_}";
+    abort_script  "$_err_msg_";
+fi
+
+if [ ! -s ${TEM_DIR}/snapshot_list.txt ]; then
+    $ECHO "No snapshot LUNs found.\n" | $TEE -a ${LOGFILE} 
+else
+    $ECHO "\nFound existing snapshot LUNs." | $TEE -a ${LOGFILE} 
+    $CAT ${ENIQ_CONF_DIR}/snap_lun_list_${DEVICE_NAME}.txt | $NAWK -F"::" '{print $1}' > ${TEM_DIR}/lun_list.txt
+    for _snapshot_ in `$CAT ${TEM_DIR}/snapshot_list.txt`; do
+        _lun_id_=`$NAVISECCLI -secfilepath ${SAN_CRED} -Address ${_ip_addr_} snapview -listsnapshots -snapshotname ${_snapshot_} | $EGREP  'Target Logical Unit' | $NAWK -F":" '{print $NF}'`
+        $CAT ${TEM_DIR}/lun_list.txt | $GREP ${_lun_id_} >> /dev/null 2>&1
+        if [ $? -eq 0 ]; then
+            $ECHO ${_snapshot_} >> ${TEM_DIR}/snapshot_delete_list.txt 
+        fi
+    done
+fi
+}
+
+### Function: setup_env ###
+#
+# Setup up path environment etc
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+setup_env()
+{
+if [ ! "${ENIQ_BASE_DIR}" ]; then
+    # Directory on the root filesystem
+    ENIQ_BASE_DIR=/eniq
+fi
+
+ENIQ_CONF_DIR=${ENIQ_BASE_DIR}/installation/config
+
+CLI_CONF_DIR=${ENIQ_BASE_DIR}/sw/conf
+if [ ! -s ${CLI_CONF_DIR}/${ENIQ_INI} ]; then
+    _err_msg_="Could not locate file ${CLI_CONF_DIR}/${ENIQ_INI}"
+    abort_script "$_err_msg_"
+fi
+
+# Source the common functions
+if [ -s ${ENIQ_BASE_DIR}/admin/lib/common_functions.lib ]; then
+    . ${ENIQ_BASE_DIR}/admin/lib/common_functions.lib
+else
+    _err_msg_="File ${ENIQ_BASE_DIR}/admin/lib/common_functions.lib not found"
+    abort_script "$_err_msg_"
+fi
+
+if [ ! -s ${CLI_CONF_DIR}/${ENIQ_ENV} ]; then
+    _err_msg_="Could not locate file ${CLI_CONF_DIR}/${ENIQ_ENV}"
+    abort_script "$_err_msg_"
+fi
+
+# File containing the type of OSS installation. Eg. events or statistics
+INST_TYPE_FILE=${ENIQ_CONF_DIR}/ericsson_use_config
+if [ ! -s "${INST_TYPE_FILE}" ]; then
+    _err_msg_="ENIQ install type not defined in ${INST_TYPE_FILE}"
+    abort_script "$_err_msg_" 
+fi
+
+# Read the installation type 
+INSTALL_TYPE=`$CAT ${INST_TYPE_FILE} | $NAWK -F\= '{print $2}'`
+if [ ! "${INSTALL_TYPE}" ]; then
+    _err_msg_="Could not read install type from ${INST_TYPE_FILE}"
+    abort_script "$_err_msg_"
+fi
+
+# Determine the current server type
+CURR_SERVER_TYPE=`$CAT $ENIQ_CONF_DIR/installed_server_type | $GEGREP -v '^[[:blank:]]*#' | $SED -e 's/ //g'`
+if [ ! "${CURR_SERVER_TYPE}" ]; then
+	_err_msg_="Could not determine which server type this is"
+	abort_script "$_err_msg_"
+fi
+
+CO_SERVER=""
+if [ "${CURR_SERVER_TYPE}" == "eniq_stats" -o "${CURR_SERVER_TYPE}" == "stats_coordinator" ]; then
+    CO_SERVER="YES"
+fi
+
+# Check the storage type
+if [ -s ${ENIQ_CONF_DIR}/${SUNOS_INI} ]; then
+    STORAGE_TYPE=`iniget STOR_TYPE -f ${ENIQ_CONF_DIR}/${SUNOS_INI} -v STORAGE_TYPE`
+else
+    if [ -s ${ENIQ_CONF_DIR}/san_details ]; then
+        STORAGE_TYPE=`$CAT ${ENIQ_CONF_DIR}/san_details | $GEGREP "^STORAGE_TYPE=" | $NAWK -F\= '{print $2}'`
+    fi
+fi
+if [ ! "${STORAGE_TYPE}" ]; then
+	_err_msg_="Could not get STORAGE_TYPE information from ${ENIQ_CONF_DIR}/${SUNOS_INI} or ${ENIQ_CONF_DIR}/san_details"
+	abort_script "$_err_msg_"
+fi
+
+# SAN plugin (e.g. clariion, vnx)
+if [ -s ${ENIQ_CONF_DIR}/${SUNOS_INI} ]; then
+	SAN_PLUGIN=`iniget SAN_DEV -f ${ENIQ_CONF_DIR}/${SUNOS_INI} -v SAN_DEVICE`
+else
+	if [ -s ${ENIQ_CONF_DIR}/san_details ]; then
+		SAN_PLUGIN=`$CAT ${ENIQ_CONF_DIR}/san_details|$GEGREP "^SAN_DEVICE="|$NAWK -F\= '{print $2}'`
+	fi
+fi
+if [ ! "${SAN_PLUGIN}" ]; then
+	_err_msg_="Could not get SAN_PLUGIN information from ${ENIQ_CONF_DIR}/${SUNOS_INI} or ${ENIQ_CONF_DIR}/san_details"
+	abort_script "$_err_msg_"
+fi
+
+# SAN Security credentials dir
+SAN_CRED=/ericsson/storage/san/plugins/${SAN_PLUGIN}/cred
+}
+
+### Function: user_confirm ###
+#
+# Get confirmation from user to proceed with snapshot action
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+user_confirm()
+{
+while :; do
+    unset USER_CONF
+    $CLEAR
+    $ECHO "\nAre you sure you wish to snapshot all DB luns in preparation for backup"
+    $ECHO "Enter [Yes | No] (case sensitive) : \c"
+
+    read USER_CONF
+    if [ "$USER_CONF" == "Yes" -o "$USER_CONF" == "No" ]; then
+        break
+    fi
+done
+}
+
+# ********************************************************************
+#
+#       Main body of program
+#
+# ********************************************************************
+# Determine absolute path to software
+get_absolute_path
+
+while getopts ":l:Nq:" arg; do
+  case $arg in
+    l) LOGFILE="$OPTARG"
+       ;;
+    N) NO_CONFIRM="YES"
+       ;;
+    q) SNAP_QUIET="-q"
+       ;;
+   \?) _err_msg_="`$BASENAME $0` [ -l <path_to_logfile> ] [ -N ] -q"
+       abort_script "$_err_msg_"
+       ;;
+  esac
+done
+shift `expr $OPTIND - 1`
+
+# Setup up path environment etc
+setup_env
+
+# Default Logfile location
+readonly LOGDIR="/eniq/local_logs/backup_logs"
+DEF_LOGFILE="${LOGDIR}/create_snapshot_logs.log"
+
+# Set up default logfile if required
+if [ ! "${LOGFILE}" ]; then
+    LOGFILE="${DEF_LOGFILE}"
+fi
+
+# Check/Create Logfile
+chk_create_logfile
+
+# Create a temporary Directory
+TEM_DIR=/tmp/create_snapshots_luns.$$.$$
+$RM -rf ${TEM_DIR}
+$MKDIR -p ${TEM_DIR}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not create directory ${TEM_DIR}"
+    abort_script "$_err_msg_"
+fi
+
+if [ "${INSTALL_TYPE}" != "stats" -a "${CO_SERVER}" != "YES" ]; then
+	$ECHO "\nThis server is determined to be ${CURR_SERVER_TYPE}" | $TEE -a ${LOGFILE}
+	$ECHO "\nThis script will only execute on ENIQ Stats coordinator servers" | $TEE -a ${LOGFILE}
+    $RM -rf ${TEM_DIR}
+    exit 0
+fi
+
+if [ "${STORAGE_TYPE}" != "raw" ]; then
+    $ECHO "\nIncorrect storage type found. Script is only aplicable to \"raw\" stoprage" | $TEE -a ${LOGFILE}
+    $RM -rf ${TEM_DIR}
+    exit 0
+fi
+
+# Main Function Calls
+check_navi_pkgs
+
+if [ -f ${ENIQ_CONF_DIR}/snap_lun_list.txt ]; then
+    $MV ${ENIQ_CONF_DIR}/snap_lun_list.txt ${ENIQ_CONF_DIR}/snap_lun_list_`$DATE +%d.%m.%y_%H:%M:%S`.txt
+    if [ $? -ne 0 ]; then
+        _err_msg_="Could not move ${ENIQ_CONF_DIR}/snap_lun_list.txt to ${ENIQ_CONF_DIR}/snap_lun_list_`$DATE +%d.%m.%y_%H:%M:%S`.txt"
+        abort_script "$_err_msg_"
+    fi
+fi
+
+if [ -f ${ENIQ_CONF_DIR}/db_device_list.txt ]; then
+    $MV ${ENIQ_CONF_DIR}/db_device_list.txt ${ENIQ_CONF_DIR}/db_device_list_`$DATE +%d.%m.%y_%H:%M:%S`.txt
+    if [ $? -ne 0 ]; then
+        _err_msg_="Could not move ${ENIQ_CONF_DIR}/db_device_list.txt to ${ENIQ_CONF_DIR}/db_device_list_`$DATE +%d.%m.%y_%H:%M:%S`.txt"
+        abort_script "$_err_msg_"
+    fi
+fi
+
+# Create a lun list for snapping
+create_db_disk_list
+
+_blk_devices_=`iniget BLK_STORAGE_DEV_DETAILS -f ${ENIQ_CONF_DIR}/${BLK_STOR_INI}`
+if [ ! "${_blk_devices_}" ]; then
+	_err_msg_="Could not read BLK_STORAGE_DEV_DETAILS information from ${ENIQ_CONF_DIR}/${BLK_STOR_INI}"
+	abort_script "$_err_msg_"
+fi
+
+for _blk_ in ${_blk_devices_}; do
+    if [ -f ${ENIQ_CONF_DIR}/snap_lun_list_${DEVICE_NAME}.txt ]; then
+    	$MV ${ENIQ_CONF_DIR}/snap_lun_list_${DEVICE_NAME}.txt ${ENIQ_CONF_DIR}/snap_lun_list_${DEVICE_NAME}_`$DATE +%d.%m.%y_%H:%M:%S`.txt
+        if [ $? -ne 0 ]; then
+            _err_msg_="Could not copy ${ENIQ_CONF_DIR}/snap_lun_list_${DEVICE_NAME}.txt to ${ENIQ_CONF_DIR}/snap_lun_list_${DEVICE_NAME}_`$DATE +%d.%m.%y_%H:%M:%S`.txt"
+            abort_script "$_err_msg_"
+        fi
+    fi
+	
+    # Check that the SAN IPs are alive
+    get_login_info ${_blk_}
+    
+    # Create a LUN list
+    create_lun_id_list "${SPA_IP}"
+    
+    # Delete SG
+    delete_storage_group "${SPA_IP}"
+    
+    # Get the snapshot LUNs
+    get_snapshot_luns "${SPA_IP}"
+
+    if [ -s ${TEM_DIR}/snapshot_delete_list.txt ]; then
+        # Lets delete the following snapshots
+        for _snapshot_ in `$CAT ${TEM_DIR}/snapshot_delete_list.txt`; do
+            delete_snapshot "${SPA_IP}" "${_snapshot_}"
+        done
+    else
+        $ECHO "No snapshots found to delete\n" | $TEE -a ${LOGFILE} 
+    fi
+
+    # Create storage group
+    create_storage_group "${SPA_IP}"
+
+    # Create Snapshot luns
+    create_snapshot_luns "${SPA_IP}"
+
+    # Add LUNs to SG
+    add_luns_storage_group "${SPA_IP}"
+
+    if [ -f ${ENIQ_CONF_DIR}/snap_lun_list_${DEVICE_NAME}.txt ]; then
+        $CAT ${ENIQ_CONF_DIR}/snap_lun_list_${DEVICE_NAME}.txt >> ${ENIQ_CONF_DIR}/snap_lun_list.txt
+        if [ $? -ne 0 ]; then
+            _err_msg_="Could not copy ${ENIQ_CONF_DIR}/snap_lun_list_${DEVICE_NAME}.txt to ${ENIQ_CONF_DIR}/snap_lun_list.txt";
+            abort_script "$_err_msg_"
+        fi
+    fi
+done
+
+$ECHO "\nPre-backup snapshot LUN creation finished at `$DATE +%d.%m.%y_%H:%M:%S`" >> ${LOGFILE}
+$ECHO "================================================================" >> ${LOGFILE} 
+$ECHO "================================================================" >> ${LOGFILE} 
+
+$RM -rf ${TEM_DIR}
+
+exit 0

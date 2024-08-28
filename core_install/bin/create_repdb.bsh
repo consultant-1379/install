@@ -1,0 +1,435 @@
+#!/bin/bash
+# ********************************************************************
+# Ericsson Radio Systems AB                                     SCRIPT
+# ********************************************************************
+#
+#
+# (c) Ericsson Radio Systems AB 2021 - All rights reserved.
+#
+# The copyright to the computer program(s) herein is the property
+# of Ericsson Radio Systems AB, Sweden. The programs may be used
+# and/or copied only with the written permission from Ericsson Radio
+# Systems AB or in accordance with the terms and conditions stipulated
+# in the agreement/contract under which the program(s) have been
+# supplied.
+#
+# ********************************************************************
+# Name    : create_repdb.bsh
+# Date    : 16/04/2021
+# Revision: G
+# Purpose : Create the repdb databse
+#
+# Usage   : create_repdb.bsh -c <path_to_cli_conf> -d <ini_file_location>
+#							 -s <storage_type> 	[-l <logfile>]
+#
+# ********************************************************************
+#
+#   Command Section
+#
+# ********************************************************************
+AWK=/usr/bin/awk
+BASENAME=/usr/bin/basename
+BASH=/usr/bin/bash
+BC=/usr/bin/bc
+BOOTADM=/usr/sbin/bootadm
+CAT=/usr/bin/cat
+CHMOD=/usr/bin/chmod
+CHOWN=/usr/bin/chown
+CLEAR=/usr/bin/clear
+CMP=/usr/bin/cmp
+CP=/usr/bin/cp
+CPIO=/usr/bin/cpio
+DATE=/usr/bin/date
+DIRNAME=/usr/bin/dirname
+DLADM=/usr/sbin/dladm
+DOMAINNAME=/usr/bin/domainname
+DTCONFIG=/usr/dt/bin/dtconfig
+DUMPADM=/usr/sbin/dumpadm
+ECHO='/usr/bin/echo -e'
+EGREP=/usr/bin/egrep
+EJECT=/usr/bin/eject
+ENV=/usr/bin/env
+EXPR=/usr/bin/expr
+FIND=/usr/bin/find
+FLARCREATE=/usr/sbin/flarcreate
+FORMAT=/usr/sbin/format
+FUSER=/usr/sbin/fuser
+GETENT=/usr/bin/getent
+GETTEXT=/usr/bin/gettext
+GREP=/usr/bin/grep
+GROUPADD=/usr/sbin/groupadd
+GZCAT=/usr/bin/gzcat
+GZIP=/usr/bin/gzip
+HEAD=/usr/bin/head
+MYHOSTNAME=/usr/bin/hostname
+ID=/usr/bin/id
+IFCONFIG=/usr/sbin/ifconfig
+INIT=/usr/sbin/init
+LN=/usr/bin/ln
+LS=/usr/bin/ls
+MKDIR=/usr/bin/mkdir
+MORE=/usr/bin/more
+MOUNT=/usr/sbin/mount
+MV=/usr/bin/mv
+NSLOOKUP=/usr/sbin/nslookup
+PGREP=/usr/bin/pgrep
+PING=/usr/sbin/ping
+PKGADD=/usr/sbin/pkgadd
+PKGINFO=/usr/bin/pkginfo
+PKGRM=/usr/sbin/pkgrm
+PRTCONF=/usr/sbin/prtconf
+PSRINFO=/usr/sbin/psrinfo
+PWD=/usr/bin/pwd
+REBOOT=/usr/sbin/reboot
+RM=/usr/bin/rm
+RCP=/usr/bin/rcp
+RSH=/usr/bin/rsh
+SED=/usr/bin/sed
+SEVEN_Z=/usr/bin/7z
+SLEEP=/usr/bin/sleep
+SORT=/usr/bin/sort
+STMSBOOT=/usr/sbin/stmsboot
+SU=/usr/bin/su
+SWAP=/usr/sbin/swap
+SYNC=/usr/sbin/sync
+TAIL=/usr/bin/tail
+TAR=/usr/sbin/tar
+TEE=/usr/bin/tee
+TOUCH=/usr/bin/touch
+TPUT=/usr/bin/tput
+TR=/usr/bin/tr
+UADMIN=/usr/sbin/uadmin
+UMOUNT=/usr/sbin/umount
+UNAME=/usr/bin/uname
+USERADD=/usr/sbin/useradd
+VOLD=/usr/sbin/vold
+WC=/usr/bin/wc
+YES=/usr/bin/yes
+
+# ********************************************************************
+#
+#   Functions
+#
+# ********************************************************************
+### Function: abort_script ###
+#
+#   This will is called if the script is aborted thru an error
+#   signal sent by the kernel such as CTRL-C or if a serious
+#   error is encountered during runtime
+#
+# Arguments:
+#       $1 - Error message from part of program (Not always used)
+# Return Values:
+#       none
+abort_script()
+{
+_err_time_=`$DATE '+%Y-%b-%d_%H.%M.%S'`
+	
+if [ "$1" ]; then
+    _err_msg_="${_err_time_} - $1"
+else
+    _err_msg_="${_err_time_} - ERROR : Script aborted.......\n"
+fi
+
+if [ "${LOGFILE}" ]; then
+    $ECHO "\n${_err_time_} - ERROR : $_err_msg_\n" | $TEE -a ${LOGFILE}
+else
+    $ECHO "\n${_err_time_} - ERROR : $_err_msg_\n" 
+fi
+$RM -rf ${UTIL_CONN_STR_USER_DBA_ENC}
+$RM -rf ${CONN_STR_DB_SPAWN_ENC}
+exit 55
+}
+
+### Function: create_sql_file ###
+#
+# Create the dwhdb SQL file
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+create_sql_file()
+{
+
+if [ -f ${SQLANY}/bin64/dbeng17 ]
+then
+    $ECHO "CREATE DATABASE '${REP_DIR}/repdb.db' CASE IGNORE " > ${ENIQ_ADMIN_DIR}/sql/create_repdb.sql
+    $ECHO "MINIMUM PASSWORD LENGTH 3 DBA USER 'DBA' DBA PASSWORD '${DBA_PASSWORD}' " >> ${ENIQ_ADMIN_DIR}/sql/create_repdb.sql
+    $ECHO "PAGE SIZE ${PAGE_SIZE} COLLATION '${COLLATION}' " >> ${ENIQ_ADMIN_DIR}/sql/create_repdb.sql
+    $ECHO "BLANK PADDING ON JAVA ON JCONNECT ON " >> ${ENIQ_ADMIN_DIR}/sql/create_repdb.sql
+    $ECHO "TRANSACTION LOG ON" >> ${ENIQ_ADMIN_DIR}/sql/create_repdb.sql
+else
+    $ECHO "CREATE DATABASE '${REP_DIR}/repdb.db' CASE IGNORE " > ${ENIQ_ADMIN_DIR}/sql/create_repdb.sql
+    $ECHO "PAGE SIZE ${PAGE_SIZE} COLLATION '${COLLATION}' " >> ${ENIQ_ADMIN_DIR}/sql/create_repdb.sql
+    $ECHO "BLANK PADDING ON JAVA ON JCONNECT ON " >> ${ENIQ_ADMIN_DIR}/sql/create_repdb.sql
+    $ECHO "TRANSACTION LOG ON" >> ${ENIQ_ADMIN_DIR}/sql/create_repdb.sql
+fi
+
+if [ "${STORAGE_TYPE}" == "fs" ]; then
+	_mstoresize_=`iniget ${MSTOREID} -v Size -f ${INI_FILE}`
+	$ECHO "DATABASE SIZE ${_mstoresize_} MB" >> ${ENIQ_ADMIN_DIR}/sql/create_repdb.sql
+fi
+}
+
+### Function: get_absolute_path ###
+#
+# Determine absolute path to software
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+get_absolute_path()
+{
+_dir_=`$DIRNAME $0`
+SCRIPTHOME=`cd $_dir_ 2>/dev/null && pwd || $ECHO $_dir_`
+}
+
+### Function: setup_variables ###
+#
+# Set up some script variables
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+setup_variables()
+{
+if [ ! "${ENIQ_BASE_DIR}" ]; then
+	# Directory on the root filesystem
+	ENIQ_BASE_DIR=/eniq
+fi
+ 
+# Tmp directory
+TEM=/var/tmp 
+ 
+# Admin Directory
+ENIQ_ADMIN_DIR=${ENIQ_BASE_DIR}/admin
+
+# Main Directory for the Core Installation SW
+ENIQ_INST_DIR=${ENIQ_BASE_DIR}/installation
+ 
+# Main Directory for the Core Installation SW
+ENIQ_CORE_INST_DIR=${ENIQ_INST_DIR}/core_install
+
+# Config dir
+ENIQ_CONF_DIR=${ENIQ_INST_DIR}/config
+
+# Need to start the Util Server
+UTIL_PORT=`iniget DB -v UtilServerPort -f ${INI_FILE}`
+if [ ! "${UTIL_PORT}" ]; then
+    _err_msg_="Could not read util port value from ${INI_FILE}"
+    abort_script "$_err_msg_"
+fi
+
+UTIL_DBA_PASSWORD=`inigetpassword DB -v UtilDBAPASSWORD -f ${INI_FILE}`
+if [ ! ${UTIL_DBA_PASSWORD} ]; then
+    _err_msg_="Could not read  UtilDBAPASSWORD value from ${INI_FILE}"
+    abort_script "$_err_msg_"
+fi
+
+DBA_PASSWORD=`inigetpassword DB -v DBAPassword -f ${INI_FILE}`
+if [ ! ${DBA_PASSWORD} ]; then
+    if [ -f ${ENIQ_BASE_DIR}/sw/installer/dbusers ]; then
+        DBA_PASSWORD=`${ENIQ_BASE_DIR}/sw/installer/dbusers dba etlrep`
+        if [ ! "${DBA_PASSWORD}" ] ; then
+            _err_msg_="Could not get Repdb DBA Password"
+            abort_script "$_err_msg_"
+        fi
+    else
+        err_msg_="Could not get Repdb DBA Password"
+        abort_script "$_err_msg_"
+    fi
+fi
+
+PAGE_SIZE=`iniget REP -v PageSize -f ${INI_FILE}`
+COLLATION=`iniget REP -v Collation -f ${INI_FILE}`
+if [ ! "${PAGE_SIZE}" -o ! "${COLLATION}" ]; then
+	_err_msg_="Could not read repdb values from ${INI_FILE}"
+	abort_script "$_err_msg_"
+fi
+
+#Temp directory
+TEM=/tmp
+
+UTIL_CONN_STR_USER_DBA="-c \"uid=dba;pwd=${UTIL_DBA_PASSWORD};eng=TestEng;dbn=utility_db\""
+UTIL_CONN_STR_USER_DBA_ENC=${TEM}/conn_string_create_repdb.`uuidgen`
+
+# get the encrypted connection string.
+get_encrypt_file "${UTIL_CONN_STR_USER_DBA}" "${UTIL_CONN_STR_USER_DBA_ENC}"
+
+CONN_STR_DB_SPAWN="-su ${UTIL_DBA_PASSWORD} "
+CONN_STR_DB_SPAWN_ENC=${TEM}/conn_string_db_spawn_repdb.`uuidgen`
+
+# get the encrypted connection string.
+get_encrypt_file "${CONN_STR_DB_SPAWN}" "${CONN_STR_DB_SPAWN_ENC}"
+# Get the System User/Group. All directories are owned by this
+SYSUSER=`iniget ENIQ_INSTALL_CONFIG -f ${ENIQ_CONF_DIR}/SunOS.ini -v ENIQ_SYSUSER`
+if [ ! "${SYSUSER}" ]; then
+    _err_msg_="Could not read parameter ENIQ_SYSUSER from file ${ENIQ_CONF_DIR}/SunOS.ini"
+    abort_script "$_err_msg_"
+fi
+
+MSTOREID=`iniget REP_DBSPACES_MAIN -f ${INI_FILE} | ${HEAD} -1`
+if [ ! "${MSTOREID}" ]; then
+    _err_msg_="Could not read REP_DBSPACES_MAIN value from ${INI_FILE}"
+    abort_script "$_err_msg_"
+fi
+
+. ${ENIQ_CONF_DIR}/niq.rc
+
+
+if [ -s ${ASA_DIR}/bin64/sa_config.sh ]; then
+	. ${ASA_DIR}/bin64/sa_config.sh >> /dev/null 2>&1
+else
+	_err_msg_="File ${ASA_DIR}/bin64/sa_config.sh not found or empty"
+	abort_script "$_err_msg_"
+fi
+}
+
+### Function: usage_msg ###
+#
+# Usage
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+usage_msg()
+{
+$ECHO "
+Usage: `$BASENAME $0` -c <cli_conf_dir> -d <ini_file> -s [raw|fs] [-l <logfile>]
+
+options:
+
+-c : Conf dir where niq.rc resides
+
+-d : Path to the DWH.ini file.
+
+-l : Optional parameter specifying what logfile to use
+
+-s : Storage type [raw|fs]
+"
+}
+
+# ********************************************************************
+#
+#   Main body of program
+#
+# ********************************************************************
+#
+# Determine absolute path to software
+get_absolute_path
+
+while getopts ":l:c:d:s:" arg; do
+  case $arg in
+	c)  CLI_CONF_DIR="$OPTARG"
+		;;
+	d)  INI_FILE="$OPTARG"
+		;;
+	l)  LOGFILE="$OPTARG"
+		;;
+	s)  STORAGE_TYPE="$OPTARG"
+		;;	
+	\?)	usage_msg
+		exit 1
+		;;
+  esac
+done
+shift `expr $OPTIND - 1`
+
+# Source the common functions
+if [ -s $SCRIPTHOME/../lib/common_functions.lib ]; then
+    . $SCRIPTHOME/../lib/common_functions.lib
+else
+    _err_msg_="File $SCRIPTHOME/../lib/common_functions.lib not found"
+    abort_script "$_err_msg_"
+fi
+
+# Check we got all required parameters
+if [ ! ${CLI_CONF_DIR} -o ! ${INI_FILE} -o ! ${STORAGE_TYPE} ]; then
+	usage_msg
+	exit 1
+fi
+
+if [ -z "$CLI_CONF_DIR" ] ; then
+    _err_msg_="ERROR: CLI_CONF_DIR is not set"
+    abort_script "$_err_msg_"
+fi
+
+# Check required files and scripts exist
+if [ ! -s ${CLI_CONF_DIR}/niq.rc ]; then
+    _err_msg_="File ${CLI_CONF_DIR}/niq.rc not found, or is empty"
+    abort_script "$_err_msg_"
+else
+    log_msg -l ${LOGFILE} -q -s "Sourcing ${CLI_CONF_DIR}/niq.rc" 
+    . ${CLI_CONF_DIR}/niq.rc
+fi
+
+if [ -s ${ASA_DIR}/bin64/sa_config.sh ]; then
+    . ${ASA_DIR}/bin64/sa_config.sh  >> /dev/null 2>&1
+else
+    _err_msg_="File ${ASA_DIR}/bin64/sa_config.sh not found"
+    abort_script "$_err_msg_"
+fi
+
+# Set up variables
+setup_variables
+ 
+if [ ! -f ${INI_FILE} ]; then
+    _err_msg_="${INI_FILE} does not exists"
+    abort_script "$_err_msg_"
+fi
+
+if [ ! -d ${REP_DIR} ]; then
+    _err_msg_="Repository database directory (${REP_DIR}) does not exist"
+    abort_script "$_err_msg_"
+fi
+
+log_msg -s "Starting the TestEng for the utility_db" -l ${LOGFILE}
+
+if [ -f ${SQLANY}/bin64/dbeng17 ] 
+then
+    ${SQLANY}/bin64/dbspawn ${SQLANY}/bin64/dbeng17 -n TestEng        
+else 
+    ${SQLANY}/bin64/dbspawn ${SQLANY}/bin64/dbeng16 -n TestEng @${CONN_STR_DB_SPAWN_ENC}
+fi 
+
+if [ $? -ne 0 ]; then
+     _err_msg_="TestEng startup failed"
+    abort_script "$_err_msg_"
+fi
+
+log_msg -s "Populating CREATE DB clause" -l ${LOGFILE}
+
+# Create the SQL
+create_sql_file
+
+log_msg -s "Creating Repository database..." -l ${LOGFILE}
+${IQDIR}/bin64/dbisql @${UTIL_CONN_STR_USER_DBA_ENC} -q ${ENIQ_ADMIN_DIR}/sql/create_repdb.sql
+if [ $? -ne 0 ] ; then
+    _err_msg_="Repository database creation failed"
+    abort_script "$_err_msg_"
+fi
+
+# Need to stop the Utility Database
+log_msg -s "Stopping utildb" -l ${LOGFILE}
+${SQLANY}/bin64/dbstop -y -q @${UTIL_CONN_STR_USER_DBA_ENC}
+if [ $? -ne 0 ] ; then
+    _err_msg_="Utildb shutdown failed"
+    abort_script "$_err_msg_"
+fi
+
+log_msg -s "Trying to start Repository database..." -l ${LOGFILE}
+${ADMIN_BIN}/repdb start
+if [ $? -ne 0 ] ; then
+    _err_msg_="Repository database failed to start"
+    abort_script "$_err_msg_"
+fi
+
+log_msg -s "Repository database successfully created" -l ${LOGFILE}
+
+$RM -rf ${UTIL_CONN_STR_USER_DBA_ENC}
+$RM -rf ${CONN_STR_DB_SPAWN_ENC}
+exit 0

@@ -1,0 +1,32 @@
+#*********************************************************************
+# Ericsson Radio Systems AB                                  DATA FILE
+#*********************************************************************
+# Name    : sym_link_location.txt
+# Date    : 18/01/2011
+# Revision: A
+# Purpose : Data file for process_sym_link_location.pl
+#
+# Format  : <directory>@<retention time in minutes>
+#
+# Owner   : root:root 600
+#
+# Notes   :
+#
+# Comments should begin with a #
+#
+# The data in this file is processed by process_sym_link_location.pl
+# and passed to manage_sym_links.pl.
+#
+# 24 hours = 1440 mins
+# 7 days = 10080 mins
+# 1 year = 525600 mins
+#
+# The log directory should be included in this file so that it can
+# tidy up it's own logs. It is specified as "LOGDIR@10080"
+#
+#*********************************************************************
+/eniq/northbound/lte_event_stat_file/events_oss_1@1440
+/eniq/northbound/lte_event_stat_file/events_oss_2@1440
+/eniq/northbound/lte_event_stat_file/events_oss_3@1440
+/eniq/northbound/lte_event_stat_file/events_oss_4@1440
+LOGDIR@10080

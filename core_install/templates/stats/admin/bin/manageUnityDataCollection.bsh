@@ -1,0 +1,205 @@
+#!/bin/bash
+
+# ***********************************************************************
+# Name    : manageUnityDataCollection.bsh
+# Date    : 13/06/2022
+# Purpose : This script will manage collection for Unity in ENIQ.
+# Usage   : manageSanDataCollection.bsh -m <enable/disable> -l <logfile>
+# ***********************************************************************
+
+# ***********************************************************************
+# Command Variables
+# ***********************************************************************
+
+CAT=/usr/bin/cat
+DATE=/usr/bin/date
+ECHO=/usr/bin/echo
+GREP=/usr/bin/grep
+RM=/usr/bin/rm
+TOUCH=/usr/bin/touch
+AWK=/usr/bin/awk
+HOSTNAME=`hostname`
+
+ENIQ_BASE_DIR=/eniq
+# Main Directory for the Core Installation SW
+ENIQ_INST_DIR=${ENIQ_BASE_DIR}/installation
+
+# ENIQ Config Directory
+ENIQ_CONF_DIR=${ENIQ_INST_DIR}/config
+
+SCRIPTNAME=$(basename $0)
+
+# ********************************************************************
+#
+#   Functions
+#
+# ********************************************************************
+# Function: log_msg
+# Arguments: $1 - Error message from part of program (Not always used)
+# Return Values: none
+#
+log_msg() {
+    timestamp=`$DATE '+%Y-%m-%d %H:%M:%S'`
+    ${ECHO} "${timestamp} ${HOSTNAME} ${1}" >> $LOGFILE
+}
+
+################ READ STORGAE TYPE ##################
+# Function: read_storage_type
+# Arguments: none
+# Return Values: none
+
+read_storage_type() {
+    if [ -s ${ENIQ_CONF_DIR}/san_details ]; then
+        HARDWARE_TYPE=`$CAT ${ENIQ_CONF_DIR}/san_details | $GREP "^STORAGE_TYPE=" | $AWK -F\= '{print $2}'`
+    fi
+    if [ ! "${HARDWARE_TYPE}" ] ; then
+        log_msg "INFO: Could not determine the hardware type."
+        exit 0
+    elif [ ${HARDWARE_TYPE} = "zfs" ] ; then
+        log_msg "INFO: The hardware type is rack. Exiting..."
+        exit 0
+    fi
+}
+
+################ VALIDATE SERVER ##################
+# Function: validate_server
+# Arguments: none
+# Return Values: none
+
+validate_server() {
+    INSTALLED_SERVER_TYPE=`$CAT ${ENIQ_CONF_DIR}/installed_server_type`
+    if [ "${INSTALLED_SERVER_TYPE}" != "stats_coordinator" -a "${INSTALLED_SERVER_TYPE}" != "eniq_stats" ]; then
+        log_msg "INFO: The installed server type is ${INSTALLED_SERVER_TYPE}.Exiting..."
+        exit 0
+    fi
+}
+
+################ Restart DDC service ##################
+# Function: restart_ddc_service
+# Arguments: none
+# Return Values: none
+
+restart_ddc_service() {
+    DDC_SERVICE_STATUS=`service ddc status | $GREP DDC | $AWK '{print $2}'`
+    if [ ${DDC_SERVICE_STATUS} == "not" ]; then
+        log_msg "INFO: Starting DDC service."
+        service ddc start
+    elif [ ${DDC_SERVICE_STATUS} == "running" ]; then
+        log_msg "INFO: Restarting DDC service"
+        service ddc restart
+    else
+        ERR_MSG="ERROR: DDC service is in ${DDC_SERVICE_STATUS} state. Re-starting... "
+        log_msg  ${ERR_MSG}
+        service ddc start
+    fi
+}
+
+################ Disable Unity data collection ##################
+# Function: disable_unity_data_collection
+# Arguments: none
+# Return Values: none
+
+disable_unity_data_collection() {
+    DD_MM_YY=`$DATE '+%d%m%y'`
+    log_msg "INFO: Disabling Unity data collection..."
+    $RM -f /eniq/log/ddc_data/config/MONITOR_UNITY
+    $RM -f /eniq/log/ddc_data/$HOSTNAME/$DD_MM_YY/unity/*
+    restart_ddc_service
+    exit 0
+}
+
+################ Creates flag file required for Unity data collection ##################
+# Function: create_unity_monitoring_flag_file
+# Arguments: none
+# Return Values: none
+
+create_unity_monitoring_flag_file() {
+    if [ -d "/eniq/log/ddc_data" ]; then
+        log_msg "INFO: Creating flag file in /eniq/log/ddc_data/config/."
+        $TOUCH /eniq/log/ddc_data/config/MONITOR_UNITY
+        if [ $? -ne 0 ]; then
+            ERR_MSG="ERROR: Could not create flag file /eniq/log/ddc_data/config/MONITOR_UNITY. Exiting..."
+            log_msg  "${ERR_MSG}"
+            exit 0
+        fi
+    else
+        log_msg "INFO: /eniq/log directory not present on the server, creating flag file in /var/tmp/ddc_data/config/."
+        $TOUCH /var/tmp/ddc_data/config/MONITOR_UNITY
+        if [ $? -ne 0 ]; then
+            ERR_MSG="ERROR: Could not create flag file /var/tmp/ddc_data/config/MONITOR_UNITY. Exiting..."
+            log_msg  "${ERR_MSG}"
+            exit 0
+        fi
+    fi
+}
+
+############## Function: Main ###############################################
+#                                                                           #
+# Description:  Runs the script                                             #
+#                                                                           #
+#############################################################################
+
+usage() {
+    cat <<EOF
+Usage: $0 -m <enable/disable> -l <logfile>
+
+Where:
+     -m <enable/disable>: The option to enable/disable diagnostic data collection for SAN.
+
+     -l <logfile path>: The logfile to which this script will log.
+
+Example:
+$0 -l <logfile name(optional)> -m <enable/disable>
+
+EOF
+    exit 1
+}
+
+while getopts l:m: arg; do
+    case $arg in
+    l) LOGFILE="$OPTARG"
+        ;;
+    m) MANAGE="$OPTARG"
+        ;;
+    esac
+done
+
+if [ -z "${MANAGE}" ] ; then
+    usage
+fi
+
+if [ -z "${LOGFILE}" ]; then
+    LOGFILE="${ENIQ_BASE_DIR}/log/assureddc/${SCRIPTNAME}.log"
+    $TOUCH ${LOGFILE}
+    if [ $? -ne 0 ]; then
+        $ECHO "INFO: Could not create logfile file ${LOGFILE}."
+    fi
+fi
+
+read_storage_type
+
+validate_server
+
+if [ "${MANAGE}" == "disable" ] ; then
+    disable_unity_data_collection
+elif [ "${MANAGE}" == "enable" ] ; then
+    if [ "${HARDWARE_TYPE}" == "raw" ]; then
+        log_msg "INFO: Checking SAN device name from config file."
+        SAN_DEVICE=`$CAT ${ENIQ_CONF_DIR}/san_details | $GREP "^SAN_DEVICE=" | $AWK -F\= '{print $2}'`
+        if [ "${SAN_DEVICE}" == "unity" ] || [ "${SAN_DEVICE}" == "unityXT" ]; then
+            log_msg "INFO: SAN device name is "${SAN_DEVICE}"."
+            create_unity_monitoring_flag_file
+            restart_ddc_service
+        else
+            INFO_MSG="INFO: Could not read valid SAN_DEVICE value which is unity or unityXT from ${ENIQ_CONF_DIR}/san_details. Exiting..."
+            log_msg "${INFO_MSG}"
+            exit 0
+        fi
+    fi
+else
+    $ECHO "Invalid option..."
+    usage
+fi
+
+exit 0
+

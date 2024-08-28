@@ -1,0 +1,971 @@
+#!/bin/bash
+# ********************************************************************
+# Ericsson Radio Systems AB                                     SCRIPT
+# ********************************************************************
+#
+#
+# (c) Ericsson Radio Systems AB 2019 - All rights reserved.
+#
+# The copyright to the computer program(s) herein is the property
+# of Ericsson Radio Systems AB, Sweden. The programs may be used 
+# and/or copied only with the written permission from Ericsson Radio 
+# Systems AB or in accordance with the terms and conditions stipulated 
+# in the agreement/contract under which the program(s) have been 
+# supplied.
+#
+# ********************************************************************
+# Name    : set_core_memcache.bsh
+# Date    : 11/08/2023
+# Revision: main\28
+# Purpose : Script to update DWH memcache values in the niq.ini file
+#           
+#
+# Usage   : set_core_memcache.bsh
+#
+# ********************************************************************
+#
+# 	Command Section
+#
+# ********************************************************************
+
+AWK=/usr/bin/awk
+BASENAME=/usr/bin/basename
+BC=/usr/bin/bc
+CAT=/usr/bin/cat
+CLEAR=/usr/bin/clear
+CP=/usr/bin/cp
+DATE=/usr/bin/date
+DIRNAME=/usr/bin/dirname
+ECHO='/usr/bin/echo -e'
+ENV=/usr/bin/env
+EGREP=/usr/bin/egrep
+EXPR=/usr/bin/expr
+FREE=/usr/bin/free
+GREP=/usr/bin/grep
+ID=/usr/bin/id
+MKDIR=/usr/bin/mkdir
+PWD=/usr/bin/pwd
+RM=/usr/bin/rm
+SED=/usr/bin/sed
+SUDO=/usr/bin/sudo
+TEE=/usr/bin/tee
+TOUCH=/usr/bin/touch
+
+# ********************************************************************
+#
+#       Configuration Section
+#
+# ********************************************************************
+
+# ********************************************************************
+#
+#       Pre-execution Operations
+#
+# ********************************************************************
+
+# Default user
+DEFAULT_USER=root
+
+ENIQ_BASE_DIR=/eniq
+
+ENIQ_INST_DIR=${ENIQ_BASE_DIR}/installation
+
+ENIQ_CORE_INST_DIR=${ENIQ_INST_DIR}/core_install
+
+ENIQ_TEMPL_DIR=${ENIQ_CORE_INST_DIR}/templates
+
+ENIQ_CONF_DIR=${ENIQ_INST_DIR}/config
+
+ENIQ_INI=niq.ini
+SUNOS_INI=SunOS.ini
+
+# ********************************************************************
+#
+# 	Functions
+#
+# ********************************************************************
+### Function: abort_script ###
+#
+#   This will is called if the script is aborted thru an error
+#   error signal sent by the kernel such as CTRL-C or if a serious
+#   error is encountered during runtime
+#
+# Arguments:
+#       $1 - Error message from part of program (Not always used)
+# Return Values:
+#       none
+abort_script()
+{
+if [ "$1" ]; then
+    _err_msg_=$1
+else
+    _err_msg_="ERROR : Script aborted.......\n"    
+fi
+if [ "${LOGFILE}" ]; then
+    $ECHO "\nERROR : $_err_msg_\n" | $TEE -a ${LOGFILE}
+else
+    $ECHO "\nERROR : $_err_msg_\n"
+fi
+
+cd $SCRIPTHOME
+$RM -rf ${TEM_DIR}
+
+if [ "$2" ]; then
+    ${2}
+else
+   exit 1
+fi
+}
+
+### Function: chk_create_logfile ###
+#
+# Check/Create Logfile
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+chk_create_logfile()
+{
+$MKDIR -p `$DIRNAME ${LOGFILE}`
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not create directory `$DIRNAME ${LOGFILE}`"
+     abort_script "$_err_msg_"
+fi
+
+$TOUCH -a ${LOGFILE}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not write to file ${LOGFILE}"
+    abort_script "$_err_msg_"
+fi
+}
+
+### Function: check_id ###
+#
+#   Check that the effective id of the user is correct
+#   If not print error msg and exit.
+#
+# Arguments:
+#       $1 : User ID name
+# Return Values:
+#       none
+check_id()
+{
+
+_get_id_=`$ENV |$GREP -w SUDO_USER | $EGREP "^[[:blank:]]*SUDO_USER="|$AWK -F\= '{print $2}'|$SED -e 's|"||g'`
+
+_check_id_=`$ID | $AWK -F\( '{print $2}' | $AWK -F\) '{print $1}'`
+
+_check_group_=`$ID $_get_id_ | $AWK -F\( '{print $3}' | $AWK -F\) '{print $1}'`
+
+
+    if [ "${_get_id_}" == "" ]; then
+
+        if [ "${_check_id_}" == "root" ]; then
+           # Set 1 for true
+           _user_root=1
+
+        else
+           _err_msg_="You must be root or admin to execute this script."
+           abort_script "${_err_msg_}"
+        fi
+          else
+            if [ "${_check_group_}" == "ENIQ_ADMIN_ROLE" ]; then
+               # Set 0 for false
+               _user_root=0
+
+            else
+               _err_msg_="You must be root or admin to execute this script." 
+               abort_script "${_err_msg_}"
+            fi
+    fi
+
+}
+
+### Function: get_absolute_path ###
+#
+# Determine absolute path to software
+#
+# Arguments:
+#	none
+# Return Values:
+#	none
+get_absolute_path() 
+{
+_dir_=`$DIRNAME $0`
+SCRIPTHOME=`cd $_dir_ 2>/dev/null && pwd || $ECHO $_dir_`
+}
+
+### Function: limit_zfs_arc_cache ###
+#
+# Limit the amount of ZFS ARC cache
+#
+# Arguments:
+#	none
+# Return Values:
+#	none
+limit_zfs_arc_cache()
+{
+# Get the total memory of the server in MBytes
+_total_mem_=`$FREE -m|$GREP -iw "Mem"|$AWK '{print $2}'`
+
+if [ "${STORAGE_TYPE}" == "fs"  ]; then
+        if [ "${TOTAL_RAM}" -eq 251 -a "${STATS_RACK_ZFS_ARC_LIMIT_FACTOR_256}" ]; then
+            _zfs_arc_factor_=${STATS_RACK_ZFS_ARC_LIMIT_FACTOR_256}
+        else
+            _zfs_arc_factor_=${STATS_RACK_ZFS_ARC_LIMIT_FACTOR}
+        fi
+else
+        _zfs_arc_factor_=${STATS_BLADE_ZFS_ARC_LIMIT_FACTOR}
+fi
+
+# Determine the amount ZFS wants
+_arc_mem_value_=`$EXPR ${_total_mem_} \* 1024 \* 1024 / ${_zfs_arc_factor_}`
+
+# Set the arc value to the calculation
+_arc_value_=${_arc_mem_value_}
+
+# Convert the memory for ZFS to hex
+_arc_limit_hex_=`$ECHO "ibase=10;obase=16; ${_arc_value_}" | $BC`
+
+#$ECHO "Setting ZFS ARC value to 0x${_arc_limit_hex_} in /etc/sysctl.conf" >> ${LOGFILE}
+#$CAT /etc/sysctl.conf | $EGREP -v '^[ 	]*set[ 	]+zfs:zfs_arc_max' > ${TEM_DIR}/sysctl.conf
+#$ECHO "set zfs:zfs_arc_max = 0x${_arc_limit_hex_}" >> ${TEM_DIR}/sysctl.conf
+#$CP ${TEM_DIR}/sysctl.conf /etc/sysctl.conf
+
+#Setting Semaphore Parameters from default to 4096 SAP recommended
+$ECHO "Setting Semaphore Parameters from default to 4096 SAP recommended " >> ${LOGFILE}
+$CAT /etc/sysctl.conf | $GREP -v "kernel.sem" > ${TEM_DIR}/sysctl.conf 
+$ECHO "kernel.sem=250 32000 100 4096" >> ${TEM_DIR}/sysctl.conf
+$CP ${TEM_DIR}/sysctl.conf /etc/sysctl.conf
+#Setting semaphore in the proc file system without reboot
+$ECHO "250 32000 100 4096" > /proc/sys/kernel/sem
+
+}
+
+## Function: read_storage_type ###
+#
+# Arguments:
+#   none
+# Return Values:
+#   set varibale STORAGE_TYPE
+read_storage_type()
+{
+# Read the storage type
+if [ -s ${ENIQ_CONF_DIR}/${SUNOS_INI} ]; then
+    STORAGE_TYPE=`iniget STOR_TYPE -f ${ENIQ_CONF_DIR}/${SUNOS_INI} -v STORAGE_TYPE`
+else
+    if [ -s ${ENIQ_CONF_DIR}/san_details ]; then
+        STORAGE_TYPE=`$CAT ${ENIQ_CONF_DIR}/san_details | $EGREP "^STORAGE_TYPE=" | $AWK -F\= '{print $2}'`
+    fi
+fi
+
+if [ ! "${STORAGE_TYPE}" ]; then
+    _err_msg_="Could not read STORAGE_TYPE param "
+    abort_script "$_err_msg_" "${EXEC_SHELL_CMD}"
+fi
+}
+
+### Function: setup_default_mem_iq ###
+#
+# Set up default IQ values.
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+setup_default_mem_iq()
+{
+# Get the total memory of the server in MBytes
+RAM=`$FREE -g|$GREP -iw "Mem"|$AWK '{print $2}'`
+TOTAL_RAM=${RAM}
+
+if [ ! "${TOTAL_RAM}" ] ; then
+    _err_msg_="Could not get total memory of the server"
+    abort_script "$_err_msg_"
+fi
+
+if [ "${CURR_SERVER_TYPE}" == "eniq_stats" ]; then
+    BLADE_TYPE="SB"
+elif [ "${CURR_SERVER_TYPE}" == "stats_coordinator" ]; then
+    BLADE_TYPE="MB"
+fi
+
+if [ "${TOTAL_RAM}" -ge 251 -a "${TOTAL_RAM}" -lt 320 ]; then
+    CURR_RAM=256
+elif [ "${TOTAL_RAM}" -ge 320 ]; then
+    CURR_RAM=512
+elif [ "${TOTAL_RAM}" -lt 251 ]; then
+    CURR_RAM="${TOTAL_RAM}"
+fi
+ 
+if [ "${CURR_RAM}" -eq 256 -a "${BLADE_TYPE}" == "SB" ]; then
+    if [ "${STORAGE_TYPE}" == "fs" ]; then
+    DEFAULT_MAIN_CACHE_FACTOR=${RACK_DEF_MAIN_CACHE_FACTOR_256}
+    DEFAULT_TEMP_CACHE_FACTOR=${RACK_DEF_TEMP_CACHE_FACTOR_256}
+    DEFAULT_LARGE_MEMORY_FACTOR=${RACK_DEF_LARGE_MEMORY_FACTOR_256}
+    STATS_DEF_CATALOG_CACHE_VALUE=${CATALOG_CACHE_MEM_RESERVE}
+    else
+    DEFAULT_MAIN_CACHE_FACTOR=${CO_SB_DEF_MAIN_CACHE_FACTOR_256}
+    DEFAULT_TEMP_CACHE_FACTOR=${CO_SB_DEF_TEMP_CACHE_FACTOR_256}
+    DEFAULT_LARGE_MEMORY_FACTOR=${CO_SB_DEF_LARGE_MEMORY_FACTOR_256}
+    STATS_DEF_CATALOG_CACHE_VALUE=${CO_SB_CATALOG_CACHE_MEM_RESERVE_256}
+    fi
+elif [ "${CURR_RAM}" -eq 512 -a "${BLADE_TYPE}" == "SB" ]; then
+    DEFAULT_MAIN_CACHE_FACTOR=${CO_SB_DEF_MAIN_CACHE_FACTOR_512}
+    DEFAULT_TEMP_CACHE_FACTOR=${CO_SB_DEF_TEMP_CACHE_FACTOR_512}
+    DEFAULT_LARGE_MEMORY_FACTOR=${CO_SB_DEF_LARGE_MEMORY_FACTOR_512}
+    STATS_DEF_CATALOG_CACHE_VALUE=${CO_SB_CATALOG_CACHE_MEM_RESERVE_512}
+elif [ "${CURR_RAM}" -eq 512 -a "${BLADE_TYPE}" == "MB" ]; then
+    DEFAULT_MAIN_CACHE_FACTOR=${CO_MB_DEF_MAIN_CACHE_FACTOR_512}
+    DEFAULT_TEMP_CACHE_FACTOR=${CO_MB_DEF_TEMP_CACHE_FACTOR_512}
+    DEFAULT_LARGE_MEMORY_FACTOR=${CO_MB_DEF_LARGE_MEMORY_FACTOR_512}
+    STATS_DEF_CATALOG_CACHE_VALUE=${CO_MB_CATALOG_CACHE_MEM_RESERVE_512}
+elif [ "${CURR_RAM}" -eq 256 -a "${BLADE_TYPE}" == "MB" ]; then
+    DEFAULT_MAIN_CACHE_FACTOR=${CO_MB_DEF_MAIN_CACHE_FACTOR_256}
+    DEFAULT_TEMP_CACHE_FACTOR=${CO_MB_DEF_TEMP_CACHE_FACTOR_256}
+    DEFAULT_LARGE_MEMORY_FACTOR=${CO_MB_DEF_LARGE_MEMORY_FACTOR_256}
+    STATS_DEF_CATALOG_CACHE_VALUE=${CO_MB_CATALOG_CACHE_MEM_RESERVE_256}
+else
+    DEFAULT_MAIN_CACHE_FACTOR=${DEF_MAIN_CACHE_FACTOR}
+    DEFAULT_TEMP_CACHE_FACTOR=${DEF_TEMP_CACHE_FACTOR}
+    DEFAULT_LARGE_MEMORY_FACTOR=${DEF_LARGE_MEMORY_FACTOR}
+    STATS_DEF_CATALOG_CACHE_VALUE=${CATALOG_CACHE_MEM_RESERVE}
+fi
+
+if [ ! "${DEFAULT_MAIN_CACHE_FACTOR}" -o ! "${DEFAULT_TEMP_CACHE_FACTOR}" -o ! "${DEFAULT_LARGE_MEMORY_FACTOR}" -o ! "${STATS_DEF_CATALOG_CACHE_VALUE}" ] ; then
+    _err_msg_="Could not get the required IQ Cache values"
+    abort_script "$_err_msg_"
+fi
+}
+
+### Function: setup_script_env ###
+#
+# Set up environment variables for script. 
+#
+# Arguments:
+#	none
+# Return Values:
+#	none
+setup_script_env()
+{
+if [ ! "${ENIQ_BASE_DIR}" ]; then
+    # Directory on the root filesystem
+    ENIQ_BASE_DIR=/eniq
+fi
+
+# Main Directory for the Core Installation SW
+ENIQ_INST_DIR=${ENIQ_BASE_DIR}/installation
+
+# This should not be needed in the future
+CLI_CONF_DIR=${ENIQ_BASE_DIR}/sw/conf
+
+# Main Directory for the Core Installation SW
+ENIQ_CORE_INST_DIR=${ENIQ_INST_DIR}/core_install
+
+# Determine the current server type
+CURR_SERVER_TYPE=`$CAT $ENIQ_CONF_DIR/installed_server_type`
+
+# File containing the type of OSS installation. Eg. statistics
+INST_TYPE_FILE=${ENIQ_CONF_DIR}/ericsson_use_config
+if [ ! -s "${INST_TYPE_FILE}" ]; then
+    _err_msg_="ENIQ install type not defined in ${INST_TYPE_FILE}"
+    abort_script "$_err_msg_"
+fi
+# Read the installation type - should be "stats"
+INSTALL_TYPE=`$CAT ${INST_TYPE_FILE} | $AWK -F\= '{print $2}'`
+
+# Source the memory config file
+if [ -s ${ENIQ_TEMPL_DIR}/${INSTALL_TYPE}/admin/etc/mem_factors.cfg ]; then
+    . ${ENIQ_TEMPL_DIR}/${INSTALL_TYPE}/admin/etc/mem_factors.cfg
+else
+    _err_msg_="File ${ENIQ_BASE_DIR}/admin/etc/mem_factors.cfg not found"
+    abort_script "$_err_msg_"
+fi
+
+# Determine deployment type
+if [ -f ${ENIQ_CONF_DIR}/extra_params/deployment ]; then
+	DEPLOYMENT_TYPE=`$CAT ${ENIQ_CONF_DIR}/extra_params/deployment`
+	if [ ! "${CURR_SERVER_TYPE}" -o ! "${DEPLOYMENT_TYPE}" ]; then
+		_err_msg_="Required values could not be determined"
+		abort_script "$_err_msg_" 
+	fi
+else
+	_err_msg_="File ${ENIQ_CONF_DIR}/extra_params/deployment not found"
+	abort_script "$_err_msg_"
+fi
+}
+
+### Function: update_engine_heap ###
+#
+# Update Engine Heap Size
+#
+# Arguments:
+#	none
+# Return Values:
+#	none
+update_engine_heap()
+{
+# Set the Heap Memory size of the ENIQ engine.
+if [ ! "${ENG_HEAP}" ]; then
+        _heap_factor_=18
+else
+        _heap_factor_=${ENG_HEAP}
+fi
+
+$ECHO "Updating engine heap size using heap factor ${_heap_factor_}" >> ${LOGFILE}
+update_engine_java_heap_size ${ENIQ_CONF_DIR}/${ENIQ_INI} ${_heap_factor_}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not update engine Heap Memory size in ${ENIQ_CONF_DIR}/${ENIQ_INI}"
+    abort_script "$_err_msg_"
+fi
+
+# This should not be needed in the future
+if [ -f ${CLI_CONF_DIR}/${ENIQ_INI} ]; then
+    $CP -p ${ENIQ_CONF_DIR}/${ENIQ_INI} ${CLI_CONF_DIR}/${ENIQ_INI} >> /dev/null 2>&1
+    if [ $? -ne 0 ]; then
+	    _err_msg_="Could not copy ${ENIQ_CONF_DIR}/${ENIQ_INI} to ${CLI_CONF_DIR}/${ENIQ_INI}"
+	    abort_script "$_err_msg_"
+	fi
+fi
+}
+
+### Function: update_stats_memcache ###
+#
+# Update Main/Temp cache values for Sybase IQ
+#
+# Arguments:
+#	none
+# Return Values:
+#	none
+update_stats_memcache()
+{
+# Get the total memory of server in MBytes
+_total_phys_mem_=`$FREE -m|$GREP -iw "Mem"|$AWK '{print $2}'`
+if [ ! "${_total_phys_mem_}" ]; then
+    _err_msg_="Could not read total memory value from $PRTCONF"
+    abort_script "$_err_msg_" 
+fi
+$ECHO "\nTotal physical memory is ${_total_phys_mem_}Mb" >> ${LOGFILE}
+
+_phys_mem_res_=`$EXPR ${_total_phys_mem_} \* ${PAGE_CACHE_RES_PERCENTAGE} / 100`
+if [ ! "${_phys_mem_res_}" ]; then
+    _err_msg_="Could not set a % reserve of memory"
+    abort_script "$_err_msg_" 
+fi
+$ECHO "Total memory reserved ${_phys_mem_res_}Mb" >> ${LOGFILE}
+
+_linux_avail_mem_=`$EXPR ${OS_MIN_VALUE} + ${_phys_mem_res_}`
+if [ ! "${_linux_avail_mem_}" ]; then
+    _err_msg_="Could not set value required for OS"
+    abort_script "$_err_msg_" 
+fi
+
+if [ "${MIN_MEM_RATIO_RACK}" -a  "${TOTAL_RAM}" -eq 251 -a "${STORAGE_TYPE}" == "fs" ];then
+_min_mem_res_=`$EXPR ${_total_phys_mem_} \* ${MIN_MEM_RATIO_RACK} / 100`
+else
+_min_mem_res_=`$EXPR ${_total_phys_mem_} \* ${MIN_MEM_RATIO} / 100`
+fi
+if [ ! "${_min_mem_res_}" ]; then
+		if [ "${TOTAL_RAM}" -eq 251 -a "${STORAGE_TYPE}" == "fs" ];then
+			_err_msg_="Could not calculate  ${MIN_MEM_RATIO_RACK}% reserve of memory"
+		else
+			_err_msg_="Could not calculate  ${MIN_MEM_RATIO}% reserve of memory"
+		fi
+    abort_script "$_err_msg_" 
+fi
+$ECHO "Minimum memory reserved is ${_min_mem_res_}Mb" >> ${LOGFILE}
+
+if [ ${_min_mem_res_} -gt ${_linux_avail_mem_} ]; then
+        if [ ${_min_mem_res_} -gt ${MIN_OS_MEM} ]; then
+		_linux_res_=${_min_mem_res_}
+	else
+		_linux_res_=${MIN_OS_MEM}
+	fi
+else
+    if [ ${_linux_avail_mem_} -gt ${MIN_OS_MEM} ]; then
+		_linux_res_=${_linux_avail_mem_}
+	else
+		_linux_res_=${MIN_OS_MEM}
+	fi
+fi
+$ECHO "Total memory being hidden from IQ is ${_linux_res_}Mb" >> ${LOGFILE}
+
+if [ "${MAIN_CACHE_FACTOR}" ]; then
+   DEFAULT_MAIN_CACHE_FACTOR=${MAIN_CACHE_FACTOR}
+fi
+
+if [ "${TEMP_CACHE_FACTOR}" ]; then
+   DEFAULT_TEMP_CACHE_FACTOR=${TEMP_CACHE_FACTOR}
+fi
+
+if [ "${CATALOG_CACHE_FACTOR}" ]; then
+   STATS_DEF_CATALOG_CACHE_FACTOR=${CATALOG_CACHE_FACTOR}
+fi
+
+if [ "${CATALOG_CACHE_VALUE}" ]; then
+   STATS_DEF_CATALOG_CACHE_VALUE=${CATALOG_CACHE_VALUE}
+fi
+
+if [ "${LARGE_MEMORY_FACTOR}" ]; then
+   DEFAULT_LARGE_MEMORY_FACTOR=${LARGE_MEMORY_FACTOR}
+fi
+
+## If there is a STATS_DEF_CATALOG_CACHE_FACTOR specified use it, otherwise use the STATS_DEF_CATALOG_CACHE_VALUE
+if [ "${STATS_DEF_CATALOG_CACHE_FACTOR}" ]; then
+    if [ "${DEFAULT_MAIN_CACHE_FACTOR}" -a "${DEFAULT_TEMP_CACHE_FACTOR}" -a "${DEFAULT_LARGE_MEMORY_FACTOR}" -a "${STATS_DEF_CATALOG_CACHE_FACTOR}" ]; then
+        # Check the the four cache % values are not greater than 100%
+	_tot_percent_=`$EXPR ${DEFAULT_MAIN_CACHE_FACTOR} + ${DEFAULT_TEMP_CACHE_FACTOR} + ${DEFAULT_LARGE_MEMORY_FACTOR} + ${STATS_DEF_CATALOG_CACHE_FACTOR}`
+	if [ ${_tot_percent_} -gt 100 ]; then
+               _err_msg_="Total % of memory allocate to IQ cache cannot be greater than 100%"
+               abort_script "$_err_msg_"
+	fi
+    fi
+    _total_mem_=`$EXPR ${_total_phys_mem_} - ${_linux_res_}`
+    if [ ! "${_total_mem_}" ]; then
+        _err_msg_="Could not get a memory value for IQ"
+        abort_script "$_err_msg_" 
+    fi
+
+    if [ ${_total_mem_} -le 0 ]; then
+        _err_msg_="Memory required for IQ cannot be a negative value (${_total_mem_})"
+        abort_script "$_err_msg_" 
+    fi
+
+    $ECHO "Total memory available for IQ is ${_total_mem_}Mb" >> ${LOGFILE}
+    $ECHO "Setting STATS_DEF_CATALOG_CACHE_FACTOR to ${STATS_DEF_CATALOG_CACHE_FACTOR}" >> ${LOGFILE}
+else
+     _dwh_catalog_cache_=${STATS_DEF_CATALOG_CACHE_VALUE}
+    # Catalog Cache value is used hence not considering it in factor calculations
+    if [ "${DEFAULT_MAIN_CACHE_FACTOR}" -a "${DEFAULT_TEMP_CACHE_FACTOR}" -a "${DEFAULT_LARGE_MEMORY_FACTOR}" ]; then	
+	# Check the the three cache % values are not greater than 100%
+	if [ "${RACK_DEF_MAIN_CACHE_FACTOR_256}" -a "${RACK_DEF_TEMP_CACHE_FACTOR_256}" -a "${RACK_DEF_LARGE_MEMORY_FACTOR_256}" -a ${TOTAL_RAM} -eq 251 -a "${STORAGE_TYPE}" == "fs" ];then
+		_tot_percent_=`$EXPR ${RACK_DEF_MAIN_CACHE_FACTOR_256} + ${RACK_DEF_TEMP_CACHE_FACTOR_256} + ${RACK_DEF_LARGE_MEMORY_FACTOR_256}`
+	else
+		_tot_percent_=`$EXPR ${DEFAULT_MAIN_CACHE_FACTOR} + ${DEFAULT_TEMP_CACHE_FACTOR} + ${DEFAULT_LARGE_MEMORY_FACTOR}`
+	fi
+	if [ ${_tot_percent_} -gt 100 ]; then
+               _err_msg_="Total % of memory allocate to IQ cache cannot be greater than 100%"
+               abort_script "$_err_msg_"
+	fi
+    fi
+ 
+    # Calculating the IQ available memory by deleting the linux reserve and Catalog Cache
+    _total_mem_=`$EXPR ${_total_phys_mem_} - ${_linux_res_} - ${_dwh_catalog_cache_}`
+    if [ ! "${_total_mem_}" ]; then
+        _err_msg_="Could not get a memory value for IQ"
+        abort_script "$_err_msg_" 
+    fi
+
+    if [ ${_total_mem_} -le 0 ]; then
+        _err_msg_="Memory required for IQ cannot be a negative value (${_total_mem_})"
+        abort_script "$_err_msg_" 
+    fi
+
+    $ECHO "Total memory available for IQ is ${_total_mem_}Mb" >> ${LOGFILE}
+fi
+
+if [ ${TOTAL_RAM} -eq 251 -a "${STORAGE_TYPE}" == "fs" -a "${RACK_DEF_MAIN_CACHE_FACTOR_256}" -a "${RACK_DEF_TEMP_CACHE_FACTOR_256}" -a "${RACK_DEF_LARGE_MEMORY_FACTOR_256}" -a ! "${STATS_DEF_CATALOG_CACHE_FACTOR}" ]; then
+	$ECHO "Setting MAIN_CACHE_FACTOR to ${RACK_DEF_MAIN_CACHE_FACTOR_256}" >> ${LOGFILE}
+	$ECHO "Setting TEMP_CACHE_FACTOR to ${RACK_DEF_TEMP_CACHE_FACTOR_256}" >> ${LOGFILE}
+	$ECHO "Setting LARGE_CACHE_FACTOR to ${RACK_DEF_LARGE_MEMORY_FACTOR_256}" >> ${LOGFILE}
+
+		# Get the amount in MBytes for each cache
+		_dwh_temp_cache_=`$EXPR ${_total_mem_} \* ${RACK_DEF_TEMP_CACHE_FACTOR_256} / 100 - ${CATALOG_CACHE_UPPER_MEM_LIMIT_RESERVE}`
+		_dwh_main_cache_=`$EXPR ${_total_mem_} \* ${RACK_DEF_MAIN_CACHE_FACTOR_256} / 100`
+		_dwh_large_mem_=`$EXPR ${_total_mem_} \* ${RACK_DEF_LARGE_MEMORY_FACTOR_256} / 100`
+
+	else
+		$ECHO "Setting MAIN_CACHE_FACTOR to ${DEFAULT_MAIN_CACHE_FACTOR}" >> ${LOGFILE}
+		$ECHO "Setting TEMP_CACHE_FACTOR to ${DEFAULT_TEMP_CACHE_FACTOR}" >> ${LOGFILE}
+		$ECHO "Setting LARGE_CACHE_FACTOR to ${DEFAULT_LARGE_MEMORY_FACTOR}" >> ${LOGFILE}
+
+		# Get the amount in MBytes for each cache
+		_dwh_temp_cache_=`$EXPR ${_total_mem_} \* ${DEFAULT_TEMP_CACHE_FACTOR} / 100 - ${CATALOG_CACHE_UPPER_MEM_LIMIT_RESERVE}`
+		_dwh_main_cache_=`$EXPR ${_total_mem_} \* ${DEFAULT_MAIN_CACHE_FACTOR} / 100`
+		_dwh_large_mem_=`$EXPR ${_total_mem_} \* ${DEFAULT_LARGE_MEMORY_FACTOR} / 100`
+
+fi
+
+if [ "${STATS_DEF_CATALOG_CACHE_FACTOR}" ]; then
+    _dwh_catalog_cache_=`$EXPR ${_total_mem_} \* ${STATS_DEF_CATALOG_CACHE_FACTOR} / 100`
+fi
+
+# Okay Update the Temp Cache value
+_upd_temp_=0
+_old_dwh_temp_cache_=`iniget DWH -f ${ENIQ_CONF_DIR}/${ENIQ_INI} -v TempCache`
+if [ ! "${_old_dwh_temp_cache_}" ]; then
+    _upd_temp_=1
+else
+    if [ ${_old_dwh_temp_cache_} -gt ${_dwh_temp_cache_} ]; then
+		if [ "${FORCE_UPD}" ]; then
+		    _upd_temp_=1
+		else
+		    $ECHO "Existing Temp Cache value(${_old_dwh_temp_cache_}MB) greater than new calculated value (${_dwh_temp_cache_}MB)...skipping" | $TEE -a ${LOGFILE}
+        fi
+    else
+		_upd_temp_=1
+    fi
+fi
+
+if [ ${_upd_temp_} -eq 1 ]; then
+	$ECHO "Setting TempCache value to ${_dwh_temp_cache_} in ${ENIQ_CONF_DIR}/${ENIQ_INI}"  | $TEE -a ${LOGFILE}
+    iniset DWH -f ${ENIQ_CONF_DIR}/${ENIQ_INI} TempCache=${_dwh_temp_cache_}
+    if [ $? -ne 0 ]; then
+		_err_msg_="Could not update ${ENIQ_CONF_DIR}/${ENIQ_INI} with TempCache=${_dwh_temp_cache_}"
+		abort_script "$_err_msg_" 
+    fi
+fi
+
+# Okay Update the Main Cache value
+_upd_main_=0
+_old_dwh_main_cache_=`iniget DWH -f ${ENIQ_CONF_DIR}/${ENIQ_INI} -v MainCache`
+if [ ! "${_old_dwh_main_cache_}" ]; then
+    _upd_main_=1
+else
+    if [ ${_old_dwh_main_cache_} -gt ${_dwh_main_cache_} ]; then
+		if [ "${FORCE_UPD}" ]; then
+		    _upd_main_=1
+		else
+		    $ECHO "Existing Main Cache value(${_old_dwh_main_cache_}MB) greater than new calculated value (${_dwh_main_cache_}MB)...skipping" | $TEE -a ${LOGFILE}
+        fi
+    else
+		_upd_main_=1
+    fi
+fi
+
+if [ ${_upd_main_} -eq 1 ]; then
+	$ECHO "Setting MainCache value to ${_dwh_main_cache_} in ${ENIQ_CONF_DIR}/${ENIQ_INI}"  | $TEE -a ${LOGFILE}
+    iniset DWH -f ${ENIQ_CONF_DIR}/${ENIQ_INI} MainCache=${_dwh_main_cache_}
+    if [ $? -ne 0 ]; then
+		_err_msg_="Could not update ${ENIQ_CONF_DIR}/${ENIQ_INI} with MainCache=${_dwh_main_cache_}"
+		abort_script "$_err_msg_" 
+    fi
+fi
+
+# Okay Update the Large memory value
+_upd_large_=0
+_old_large_mem_=`iniget DWH -f ${ENIQ_CONF_DIR}/${ENIQ_INI} -v LargeMemory`
+if [ ! "${_old_large_mem_}" ]; then
+    _upd_large_=1
+else
+    if [ ${_old_large_mem_} -gt ${_dwh_large_mem_} ]; then
+		if [ "${FORCE_UPD}" ]; then
+		    _upd_large_=1
+		else
+		    $ECHO "Existing Large Memory value(${_old_large_mem_}MB) greater than new calculated value (${_dwh_large_mem_}MB)...skipping" | $TEE -a ${LOGFILE}
+        fi
+    else
+		_upd_large_=1
+    fi
+fi
+
+if [ ${_upd_large_} -eq 1 ]; then
+    $ECHO "Setting LargeMemory value to ${_dwh_large_mem_} in ${ENIQ_CONF_DIR}/${ENIQ_INI}"  | $TEE -a ${LOGFILE}
+    iniset DWH -f ${ENIQ_CONF_DIR}/${ENIQ_INI} LargeMemory=${_dwh_large_mem_}
+    if [ $? -ne 0 ]; then
+		_err_msg_="Could not update ${ENIQ_CONF_DIR}/${ENIQ_INI} with LargeMemory=${_dwh_large_mem_}"
+		abort_script "$_err_msg_" 
+    fi
+fi
+
+# Okay Update the Catalog Cache value
+_upd_catalog_=0
+_old_dwh_catalog_cache_=`iniget DWH -f ${ENIQ_CONF_DIR}/${ENIQ_INI} -v CatalogCache`
+if [ ! "${_old_dwh_catalog_cache_}" ]; then
+    _upd_catalog_=1
+else
+    if [ ${_old_dwh_catalog_cache_} -gt ${_dwh_catalog_cache_} ]; then
+		if [ "${FORCE_UPD}" ]; then
+		    _upd_catalog_=1
+		else
+		    $ECHO "Existing Catalog Cache value(${_old_dwh_catalog_cache_}MB) greater than new calculated value (${_dwh_catalog_cache_}MB)...skipping" | $TEE -a ${LOGFILE}
+        fi
+    else
+		_upd_catalog_=1
+    fi
+fi
+
+if [ ${_upd_catalog_} -eq 1 ]; then
+	$ECHO "Setting CatalogCache value to ${_dwh_catalog_cache_} in ${ENIQ_CONF_DIR}/${ENIQ_INI}"  | $TEE -a ${LOGFILE}
+    iniset DWH -f ${ENIQ_CONF_DIR}/${ENIQ_INI} CatalogCache=${_dwh_catalog_cache_}
+    if [ $? -ne 0 ]; then
+		_err_msg_="Could not update ${ENIQ_CONF_DIR}/${ENIQ_INI} with CatalogCache=${_dwh_catalog_cache_}"
+		abort_script "$_err_msg_" 
+    fi
+fi
+
+# This should not be needed in the future
+if [ -f ${CLI_CONF_DIR}/${ENIQ_INI} ]; then
+	$ECHO "Copying ${ENIQ_CONF_DIR}/${ENIQ_INI} to ${CLI_CONF_DIR}/${ENIQ_INI}" >> ${LOGFILE}
+    $CP -p ${ENIQ_CONF_DIR}/${ENIQ_INI} ${CLI_CONF_DIR}/${ENIQ_INI} >> /dev/null 2>&1
+fi
+}
+
+### Function: usage_msg ###
+#
+#   Print out the usage message
+#
+# Arguments:
+#	none
+# Return Values:
+#	none
+usage_msg() 
+{
+$CLEAR
+$ECHO "
+Usage: `$BASENAME $0` -d <path_to_niq_ini_dir> {[-c][-h][-m]} [-f] 
+                      
+options:
+
+-d  : Parameter specifying the full path to the directory containing
+      the niq.ini file to be updated. 
+
+-f  : When specified in conjunction with the '-m' parameter, this will
+      force the update even if the value to be set is smaller than the
+      value already in the ini file
+
+-h  : Update the Engine Heap Size
+
+-e 	: Specify a Engine Heap Factor
+
+-l	: Used to specify a logfile. Default will be used if none specified.            
+
+-m  : Update the memcache values
+
+-M	: The MAIN_CACHE_FACTOR value to use 
+
+-T	: The TEMP_CACHE_FACTOR value to use
+
+-C 	: The CATALOG_CACHE_FACTOR value to use
+
+-V  : The CATALOG_CACHE_VALUE value to use
+
+-L  : The LARGE_MEMORY_FACTOR value to use
+
+-z 	: The LIMIT_ZFS_ARC value to use
+
+"
+}
+
+# ********************************************************************
+#
+# 	Main body of program
+#
+# ********************************************************************
+#
+# Determine absolute path to software
+get_absolute_path
+
+# Check that the effective id of the user is root
+check_id
+
+while getopts ":d:fhl:e:mzM:T:C:V:L:" arg; do
+  case $arg in
+    d) ENIQ_CONF_DIR="$OPTARG" 
+       ;;
+    f) FORCE_UPD="YES"
+       ;;
+    h) UPD_ENG_HEAP="YES" 
+       ;;
+    e) ENG_HEAP="$OPTARG" 
+       ;;
+    l) LOGFILE="$OPTARG" 
+       ;;       
+    m) UPD_MEMCACHE="YES" 
+       ;;
+    M) MAIN_CACHE_FACTOR="$OPTARG" 
+       ;;
+    T) TEMP_CACHE_FACTOR="$OPTARG" 
+       ;;
+    C) CATALOG_CACHE_FACTOR="$OPTARG" 
+       ;;
+    V) CATALOG_CACHE_VALUE="$OPTARG" 
+       ;;
+    L) LARGE_MEMORY_FACTOR="$OPTARG"
+       ;;
+    z) LIMIT_ZFS_ARC="YES"
+       ;;
+   \?) usage_msg
+       exit 1
+       ;;
+  esac
+done
+shift `expr $OPTIND - 1`
+
+if [ ! "${ENIQ_CONF_DIR}" ]; then
+    usage_msg
+    exit 1
+fi
+
+# Set up environment variables for script. 
+setup_script_env
+
+# Setting up the default values for IQ on co-ordinator
+setup_default_mem_iq
+
+if [ ! "${LOGFILE}" ]; then
+	LOGFILE=${ENIQ_BASE_DIR}/log/upgrade/set_core_memcache.log
+fi	
+  
+# Check/Create Logfile
+chk_create_logfile
+
+RUN_TIME=`$DATE '+%Y-%b-%d_%H.%M.%S'`
+$ECHO "\n=======================================================" >> ${LOGFILE}
+$ECHO "${RUN_TIME} - Entering set_core_mamcache.bsh" >> ${LOGFILE}
+$ECHO "=======================================================\n" >> ${LOGFILE}
+
+# Source the common functions
+if [ -s ${ENIQ_CORE_INST_DIR}/lib/common_functions.lib ]; then
+    . ${ENIQ_CORE_INST_DIR}/lib/common_functions.lib
+else
+    _err_msg_="File ${ENIQ_CORE_INST_DIR}/lib/common_functions.lib not found"
+    abort_script "$_err_msg_"
+fi
+
+# Get the storage type
+read_storage_type
+
+# Overwrite with new Values if the exist
+NEW_OS_MIN_VALUE=`iniget SYSTEM_INFO -f ${ENIQ_CONF_DIR}/${ENIQ_INI} -v OS_MIN_VALUE`
+if [ "${NEW_OS_MIN_VALUE}" ]; then
+    OS_MIN_VALUE=${NEW_OS_MIN_VALUE}
+fi
+
+NEW_MIN_OS_MEM=`iniget SYSTEM_INFO -f ${ENIQ_CONF_DIR}/${ENIQ_INI} -v MIN_OS_MEM`
+if [ "${NEW_MIN_OS_MEM}" ]; then
+    MIN_OS_MEM=${NEW_MIN_OS_MEM}
+fi
+
+NEW_FT_CO_APP_BUFF=`iniget SYSTEM_INFO -f ${ENIQ_CONF_DIR}/${ENIQ_INI} -v FT_CO_APP_BUFF`
+if [ "${NEW_FT_CO_APP_BUFF}" ]; then
+	FT_CO_APP_BUFF=${NEW_FT_CO_APP_BUFF}
+fi
+
+#Checking for paramter during migration in niq.ini file
+$GREP "CatalogCacheUpperMemLimitReserve=" ${ENIQ_CONF_DIR}/${ENIQ_INI} >> /dev/null 2>&1
+if [ $? -ne 0 ]; then
+    #Setting value to 0 if parameter does not exist in niq.ini file during migration
+    CATALOG_CACHE_UPPER_MEM_LIMIT_RESERVE=0
+else
+     CATALOG_CACHE_UPPER_MEM_LIMIT_RESERVE=`iniget DWH -v CatalogCacheUpperMemLimitReserve -f ${ENIQ_CONF_DIR}/${ENIQ_INI}`
+     if [ ! ${CATALOG_CACHE_UPPER_MEM_LIMIT_RESERVE} ]; then
+         _err_msg_="Could not read CatalogCacheUpperLimitReserve param from ${ENIQ_CONF_DIR}/${ENIQ_INI}"
+         abort_script "$_err_msg_"
+     fi
+fi
+
+# Create a temporary Directory
+TEM_DIR=/tmp/set_core_memcache.$$
+$RM -rf ${TEM_DIR}
+$MKDIR -p ${TEM_DIR}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not create directory ${TEM_DIR}"
+    abort_script "$_err_msg_"
+fi
+
+if [ ! -s ${ENIQ_CONF_DIR}/${ENIQ_INI} ]; then
+    _err_msg_="File ${ENIQ_CONF_DIR}/${ENIQ_INI} not found or empty"
+    abort_script "$_err_msg_"
+fi
+
+#### If this is a Multiblade system get the latest niq.ini file.. DEFTPIST-1631
+#### So we have all the latest information from all the other blades ( Reader info, etc..) 
+#### on the local ${ENIQ_CONF_DIR}/${ENIQ_INI} before we make the updates
+if [ -s ${CLI_CONF_DIR}/${ENIQ_INI} ]; then
+	$ECHO "Copying ${CLI_CONF_DIR}/${ENIQ_INI} to ${ENIQ_CONF_DIR}/${ENIQ_INI}" >> ${LOGFILE}
+    $CP -p ${CLI_CONF_DIR}/${ENIQ_INI} ${ENIQ_CONF_DIR}/${ENIQ_INI} >> /dev/null 2>&1
+fi
+
+if [ ! -s ${ENIQ_CONF_DIR}/${SUNOS_INI} ]; then
+    _err_msg_="File ${ENIQ_CONF_DIR}/${SUNOS_INI} not found or empty"
+    abort_script "$_err_msg_"
+fi
+
+if [ "${MAIN_CACHE_FACTOR}" ]; then
+	# Check Cache factors for numeric values  greater than 0
+	$ECHO ${MAIN_CACHE_FACTOR} | $EGREP '[^0-9]' >> /dev/null 2>&1
+	if [ $? -eq 0 ]; then
+	    _err_msg_="Only numeric value in MBytes can be specified for MAIN_CACHE_FACTOR"
+	    abort_script "$_err_msg_"
+	else
+	    if [ ${MAIN_CACHE_FACTOR} -eq 0 ]; then
+			_err_msg_="Only numeric value in MBytes greater than 0 can be specified for MAIN_CACHE_FACTOR"
+			abort_script "$_err_msg_"
+	    fi
+	fi
+fi
+
+if [ "${TEMP_CACHE_FACTOR}" ]; then
+	$ECHO ${TEMP_CACHE_FACTOR} | $EGREP '[^0-9]' >> /dev/null 2>&1
+	if [ $? -eq 0 ]; then
+	    _err_msg_="Only numeric value in MBytes can be specified for TEMP_CACHE_FACTOR"
+	    abort_script "$_err_msg_"
+	else
+	    if [ ${TEMP_CACHE_FACTOR} -eq 0 ]; then
+			_err_msg_="Only numeric value in MBytes greater than 0 can be specified for TEMP_CACHE_FACTOR"
+			abort_script "$_err_msg_"
+	    fi
+	fi
+fi
+
+if [ "${LARGE_MEMORY_FACTOR}" ]; then
+        $ECHO ${LARGE_MEMORY_FACTOR} | $EGREP '[^0-9]' >> /dev/null 2>&1
+	if [ $? -eq 0 ]; then
+	    _err_msg_="Only numeric value in MBytes can be specified for LARGE_MEMORY_FACTOR"
+	    abort_script "$_err_msg_"
+	else
+	    if [ ${LARGE_MEMORY_FACTOR} -eq 0 ]; then
+		_err_msg_="Only numeric value in MBytes greater than 0 can be specified for LARGE_MEMORY_FACTOR"
+		abort_script "$_err_msg_"
+	    fi
+	fi
+fi
+
+if [ "${CATALOG_CACHE_FACTOR}" ]; then
+        $ECHO ${CATALOG_CACHE_FACTOR} | $EGREP '[^0-9]' >> /dev/null 2>&1
+	if [ $? -eq 0 ]; then
+	    _err_msg_="Only numeric value in MBytes can be specified for CATALOG_CACHE_FACTOR"
+	    abort_script "$_err_msg_"
+	else
+	    if [ ${CATALOG_CACHE_FACTOR} -eq 0 ]; then
+		_err_msg_="Only numeric value in MBytes greater than 0 can be specified for CATALOG_CACHE_FACTOR"
+		abort_script "$_err_msg_"
+	    fi
+	fi
+fi
+if [ "${ENG_HEAP}" ]; then
+	# Check for numeric values greater than 0
+	$ECHO ${ENG_HEAP} | $EGREP '[^0-9]' >> /dev/null 2>&1
+	if [ $? -eq 0 ]; then
+	    _err_msg_="Only numeric value can be specified for ENG_HEAP"
+	    abort_script "$_err_msg_"
+	else
+	    if [ ${ENG_HEAP} -eq 0 ]; then
+			_err_msg_="Only numeric value greater than 0 can be specified for ENG_HEAP"
+			abort_script "$_err_msg_"
+	    fi
+	fi
+fi
+
+# Update Engine Heap Size
+if [ "${UPD_ENG_HEAP}" ]; then
+    update_engine_heap
+fi
+
+# Update Main/Temp cache values for Sybase IQ
+if [ "${UPD_MEMCACHE}" ]; then
+        if [ "${CURR_SERVER_TYPE}" == "eniq_stats" -o "${CURR_SERVER_TYPE}" == "stats_coordinator" ]; then
+            update_stats_memcache
+        fi
+fi
+
+# Limit the amount of ZFS ARC cache
+if [ "${LIMIT_ZFS_ARC}" ]; then
+    limit_zfs_arc_cache
+fi
+
+$RM -rf ${TEM_DIR}
+
+exit 0

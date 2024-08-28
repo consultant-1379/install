@@ -1,0 +1,789 @@
+#!/bin/bash
+# ********************************************************************
+# Ericsson Radio Systems AB                                     SCRIPT
+# ********************************************************************
+#
+# (c) Ericsson Radio Systems AB 2016 - All rights reserved.
+#
+# The copyright to the computer program(s) herein is the property
+# of Ericsson Radio Systems AB, Sweden. The programs may be used
+# and/or copied only with the written permission from Ericsson Radio
+# Systems AB or in accordance with the terms and conditions stipulated
+# in the agreement/contract under which the program(s) have been
+# supplied.
+#
+# ********************************************************************
+# Name    : reconfigure_flex_fs.bsh 
+# Date    : 21/09/2016
+# Revision: A
+# Purpose : It is a wrapper script which will re-configure the FS size
+#           as per the requirment
+#
+# Usage   : reconfigure_flex_fs.bsh -a reconfigure
+#
+# ********************************************************************
+#
+#   Command Section
+#
+# ********************************************************************
+AWK=/usr/bin/awk
+BASENAME=/usr/bin/basename
+BASH=/usr/bin/bash
+BC=/usr/bin/bc
+CAT=/usr/bin/cat
+CP=/usr/bin/cp
+DATE=/usr/bin/date
+DIRNAME=/usr/bin/dirname
+ECHO=/usr/bin/echo
+EGREP=/usr/bin/egrep
+EXPR=/usr/bin/expr
+FIND=/usr/bin/find
+GEGREP=/usr/sfw/bin/gegrep
+GREP=/usr/bin/grep
+HEAD=/usr/bin/head
+ID=/usr/bin/id
+MKDIR=/usr/bin/mkdir
+MOUNT=/usr/sbin/mount
+MV=/usr/bin/mv
+NAWK=/usr/bin/nawk
+PERL=/usr/bin/perl
+PWD=/usr/bin/pwd
+RM=/usr/bin/rm
+SCP=/usr/bin/scp
+SED=/usr/bin/sed
+SLEEP=/usr/bin/sleep
+SORT=/usr/bin/sort
+SSH=/usr/bin/ssh
+SU=/usr/bin/su
+SVCADM=/usr/sbin/svcadm
+SVCS=/usr/bin/svcs
+TAIL=/usr/bin/tail
+TEE=/usr/bin/tee
+TOUCH=/usr/bin/touch
+TR=/usr/bin/tr
+UMOUNT=/usr/sbin/umount
+WC=/usr/bin/wc
+DF=/usr/sbin/df
+
+
+#********************************************************************
+#
+#       Functions Section
+#
+#********************************************************************
+### Function: abort_script ###
+#
+# This Function will abort the script if any issues or errors.
+#
+# Arguments:
+#       $1 - Error message from part of program (Not always used)
+#               $2 - Exec Shell cmd (Not always used)
+# Return Values:
+#       none
+abort_script()
+{
+ABORT_TIME=`$DATE '+%Y-%b-%d_%H.%M.%S'`
+if [ "$1" ]; then
+        _err_msg_=$1
+else
+        _err_msg_="$ABORT_TIME - ERROR : Script aborted.......\n"
+fi
+
+if [ -d ${TEM_DIR} ]; then
+        $RM -rf ${TEM_DIR}
+        if [ $? -ne 0 ]; then
+                _err_msg_="Could not delete directory $TEM_DIR. Please delete it manually."
+        fi
+fi
+
+if [ "${LOGFILE}" ]; then
+        log_msg -t -s " ERROR : $_err_msg_\n" -l ${LOGFILE}
+else
+        log_msg -t -s " ERROR : $_err_msg_\n"
+fi
+
+if [ "$2" ]; then
+        ${2}
+        exit 1
+else
+        exit 1
+fi
+}
+
+### Function: check_for_file ###
+#
+# To check whether file or directory exist or not and to test the basic file operations.
+#
+# Arguments:
+#       $1 : File operations
+#               $2 : File qualified path
+# Return Values:
+#               none
+check_for_file()
+{
+if [ ! $1 $2 ]; then
+        _err_msg_="$2 does not exist"
+        abort_script "$_err_msg_"
+fi
+}
+
+### Function: check_and_convert_fs_size ###
+#
+# Check and convert the filesystem size
+#
+# Arguments:
+#   $1 : FS size unit
+#   $2 : FS size
+# Return Values:
+#   none
+check_and_convert_fs_size()
+{
+    local _cur_size_=$1
+    local _new_fs_size_=$2
+
+    if  [ "${_cur_size_}" == "" -o "${_new_fs_size_}" == "" ]; then
+        _err_msg_="File system size is null"
+        abort_script "$_err_msg_" "${_func_name_}"
+    fi
+
+    local _curr_fs_unit_=$($ECHO "${_cur_size_}" | $SED 's/[0-9\.]*//g')
+    local _new_fs_unit_=$($ECHO "${_new_fs_size_}" | $SED 's/[0-9\.]*//g')
+
+    local _curr_fs_size_=$($ECHO "${_cur_size_}" | $SED 's/[a-z,A-Z]*//g')
+    local _new_fs_size_=$($ECHO "${_new_fs_size_}" | $SED 's/[a-z,A-Z]*//g')
+
+    convert_size_in_kb ${_curr_fs_unit_} ${_curr_fs_size_}
+    _cur_fs_size_kb_=${_size_}
+
+    convert_size_in_kb ${_new_fs_unit_} ${_new_fs_size_}
+    _new_fs_size_kb_=${_size_}
+
+    if [ ${_cur_fs_size_kb_} -ge ${_new_fs_size_kb_} ]; then
+        log_msg -s "Existing backup file-system size is greater then new backup type. Exiting ...\n"
+        exit 0
+    else
+        _new_size_kb_=$($ECHO "${_new_fs_size_kb_}" | $SED 's/[.].*//g')
+    fi
+}
+
+### Function: convert_size_in_kb ###
+#
+# Convert the filesystem size in kb's
+#
+# Arguments:
+#   $1 : FS size unit
+#   $2 : FS size
+# Return Values:
+#   none
+convert_size_in_kb()
+{
+    _units_=$1
+    _size_=$2
+
+    case "${_units_}" in
+        T|t)    _size_=$($ECHO "${_size_} * 1073741824" | $BC | $NAWK -F\. '{print $1}')
+                ;;
+        g|G)    _size_=$($ECHO "${_size_} * 1048576" | $BC | $NAWK -F\. '{print $1}')
+                ;;
+        m|M)    _size_=$($ECHO "${_size_} * 1024" | $BC | $NAWK -F\. '{print $1}')
+                ;;
+        k|K)    let _size_=${_size_}
+                ;;
+        *)      abort_script "Unit not supported '${_units_}'."
+                ;;
+    esac
+
+}
+
+### Function: delete_rolling_snaphots ###
+#
+# To delete NAS, SAN and ZFS Snapshots
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+delete_rolling_snaphots()
+{
+log_msg -h -s "Starting to delete rolling snapshots on $HOST_NAME" -l ${LOGFILE}
+
+_check_command_1_="${ENIQ_BKUP_SW_BIN_DIR}/manage_san_snapshots.bsh"
+check_for_file -f $_check_command_1_
+
+_check_command_2_="${ENIQ_BKUP_SW_BIN_DIR}/manage_nas_snapshots.bsh"
+check_for_file -f $_check_command_2_
+
+_check_command_3_="${ENIQ_BKUP_SW_BIN_DIR}/manage_zfs_snapshots.bsh"
+check_for_file -f $_check_command_3_
+
+_check_command_4_="${ENIQ_BKUP_SW_BIN_DIR}/cleanup_eniq_backup.bsh"
+check_for_file -f $_check_command_4_
+
+# Get Snapshot label
+san_snap_label=`$BASH ${ENIQ_BKUP_SW_BIN_DIR}/manage_san_snapshots.bsh -a list -f ALL | $AWK '{print \$2}' | $GREP -v '^$' | $GREP [a-z0-9-]*@[0-9]*@[a-z0-9]*| $NAWK -F'@' '{print \$NF}' | $SORT | $UNIQ`
+
+nas_snap_label=`$NASCLI list_snapshots - | $AWK '{print \$1}' | $NAWK -F'/' '{print \$NF}'| $SORT | $UNIQ`
+
+zfs_snap_label=`$BASH ${ENIQ_BKUP_SW_BIN_DIR}/manage_zfs_snapshots.bsh -a list -f ALL | $AWK '{print \$1}' | $GREP -v '^$' | $GREP @[a-z0-9]* | $NAWK -F'@' '{print \$NF}'| $SORT | $UNIQ`
+
+log_msg -q -s "Snap Labels on $HOST_NAME ::" -l ${LOGFILE}
+log_msg -q -s " SAN Snap Label(s): $san_snap_label" -l ${LOGFILE}
+log_msg -q -s " NAS Snap Label(s): $nas_snap_label" -l ${LOGFILE}
+log_msg -q -s " ZFS Snap Label(s): $zfs_snap_label" -l ${LOGFILE}
+
+if [ "${CURR_SERVER_TYPE}" == "eniq_coordinator" -o "${CURR_SERVER_TYPE}" == "stats_coordinator" -o "${CURR_SERVER_TYPE}" == "eniq_events" -o "${CURR_SERVER_TYPE}" == "eniq_stats" ]; then
+
+        if [ ! "${san_snap_label}" -a ! "${nas_snap_label}" -a ! "${zfs_snap_label}" ]; then
+                log_msg -s "\nNo Rolling Snapshots found on $HOST_NAME. " -l ${LOGFILE}
+        else
+                roll_snap_list=(${san_snap_label} ${nas_snap_label} ${zfs_snap_label})
+                unique_roll_snap=$(echo "${roll_snap_list[@]}" | tr ' ' '\n' | sort -u | tr '\n' ' ')
+                log_msg -q -s "Deleting Rolling Snapshots with label(s) - ${unique_roll_snap} " -l ${LOGFILE}
+
+                for snap_label in ${unique_roll_snap[*]} ; do
+                        log_msg -q -s "\nStarting to run $BASH ${ENIQ_BKUP_SW_BIN_DIR}/cleanup_eniq_backup.bsh -N -R -S ${snap_label} on $HOST_NAME " -l ${LOGFILE}
+                        $BASH ${ENIQ_BKUP_SW_BIN_DIR}/cleanup_eniq_backup.bsh -N -R -S ${snap_label}
+                        if [ $? -ne 0 ]; then
+                                _err_msg_="Exiting... Unable to delete snapshots. Please refer logfile: ${DEL_SNAP_LOGFILE} on $HOST_NAME  \n"
+                                abort_script "$_err_msg_"
+                        fi
+                done
+                log_msg -s "Successfully deleted Snapshots on $HOST_NAME. Please refer log file: ${DEL_SNAP_LOGFILE}\n" -l ${LOGFILE}
+        fi
+fi
+
+# Get an ordered list of servers based on the server_list file:
+_deployed_servers_="${TEM_DIR}/deployed_servers.$$.tmp"
+$PERL ${GET_IP_ORDER_SCRIPT} -f ${_deployed_servers_}
+
+for _line_ in `$EGREP -i 'engine|eniq_mz|ec_|dwh_reader_|eniq_ui' ${_deployed_servers_}`; do
+        local _ip_address_=`$ECHO ${_line_} | $NAWK -F"::" '{print $1}'`
+        local _serv_hostname_=`$ECHO ${_line_} | $NAWK -F"::" '{print $2}'`
+        local _serv_type_=`$ECHO ${_line_} | $NAWK -F"::" '{print $3}'`
+        local _snap_check_="true"
+
+        if [ ! "${_ip_address_}" -o ! "${_serv_hostname_}" -o ! "${_serv_type_}" ]; then
+                _err_msg_="Could not read required info from ${_deployed_servers_}."
+                abort_script "${_err_msg_}"
+        fi
+
+        log_msg -h -s "Deleting ZFS Snaphots on $_serv_hostname_" -l ${LOGFILE}
+
+        _cmd_1_="$BASH ${ENIQ_BKUP_SW_BIN_DIR}/manage_zfs_snapshots.bsh -a list -f ALL | $AWK '{print \$1}' | $GREP -v '^$' | $GREP @[a-z0-9*]* | $NAWK -F'@' '{print \$NF}'| $SORT | $UNIQ"
+
+        log_msg -s "run_remote_cmd ${_ip_address_} ${_cmd_1_}" -l ${LOGFILE}
+        _cmd_2_=`run_remote_cmd ${_ip_address_} "${_cmd_1_}"`
+
+        roll_snap_list=($_cmd_2_)
+        log_msg -s "List of ZFS Snap Label: ${roll_snap_list[*]}" -l ${LOGFILE}
+        if [ ${#roll_snap_list[@]} -eq 0 ]; then
+                log_msg -s "No ZFS snapshots found on $_serv_hostname_" -l ${LOGFILE}
+                _snap_check_="false"
+        fi
+
+        if [ "$_snap_check_" == "true" ]; then
+                for snap_label in ${roll_snap_list[*]}; do
+                        snap_label=`echo $snap_label | sed 's/\^M//'`
+                        log_msg -q -s "ZFS Snapshot with label - ${snap_label} found"
+                        log_msg -q -s "\nStarting to run $BASH ${ENIQ_BKUP_SW_BIN_DIR}/cleanup_eniq_backup.bsh -N -R -S ${snap_label} on $_serv_hostname_" -l ${LOGFILE}
+                        _cmd_2_="$BASH ${ENIQ_BKUP_SW_BIN_DIR}/cleanup_eniq_backup.bsh -N -R -S ${snap_label}"
+                        run_remote_cmd "${_ip_address_}" "${_cmd_2_}"
+                        if [ $? -ne 0 ]; then
+                                _err_msg_="Exiting... Unable to delete snapshots. Please refer logfile: ${DEL_SNAP_LOGFILE} on $_serv_hostname_.  \n"
+                                abort_script "$_err_msg_"
+                        fi
+                done
+        fi
+        log_msg -q -s "Successfully deleted ZFS Snapshots on $_serv_hostname_. Please refer log file: ${DEL_SNAP_LOGFILE}\n" -l ${LOGFILE}
+done
+}
+
+### Function: new_flex_backup_details ###
+#
+# Gets the path of execution directory
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+new_flex_backup_details()
+{
+    _curr_fs_size_=$1
+    _list_count_=1
+    NEW_FS_SIZE=""
+
+    # Getting the list of all available back-up type options
+    $CAT ${FLEX_DATA_BKUP_CONF_FILE} | $GREP  -v ^# | $AWK -F: '{print $1}' > ${TEM_DIR}/avl_bkup_list
+
+    # Displaying all available backup options
+    log_msg -s "\nAvailable flexible backup option" -l ${LOGFILE}
+    while read -r _line_
+    do
+        if [ ! -z "${_line_}" ]; then
+            log_msg -s "[$_list_count_] ${_line_}" -l ${LOGFILE}
+            $ECHO "$_list_count_"=${_line_} >> ${TEM_DIR}/temp_list
+            _list_count_=`expr $_list_count_ + 1`
+        fi
+    done < ${TEM_DIR}/avl_bkup_list
+
+    log_msg -s "\nCurrent backup type is : ${_sys_bkup_type_}, having backup size : ${_fs_size_}\n"
+    log_msg -s "Please enter your choice : " -l ${LOGFILE}
+    read OPTION
+
+    if [ ${OPTION} -ge ${_list_count_} -o ${OPTION} -le 0 ]; then
+        _err_msg_="Please enter a valid option."
+        abort_script "${_err_msg_}"
+    fi
+
+    _bkup_type_=`$CAT ${TEM_DIR}/temp_list | $GREP ${OPTION}= | $AWK -F= '{print $2}'`
+
+    # Checking if existing backup type and selected backup type is same
+    if [ "${_bkup_type_}" == "${_sys_bkup_type_}" ]; then
+        log_msg -s "System is already running on ${_bkup_type_} backup type. Exiting ...\n" -l  ${LOGFILE}
+        exit 0
+    fi
+
+    _sel_bkup_data_=`$CAT ${FLEX_DATA_BKUP_CONF_FILE} | $GREP  -v ^# | $GREP -w "${_bkup_type_}"`
+
+    if [ ! -z ${_sel_bkup_data_} ]; then
+        case "${DEPLOYMENT_TYPE}" in
+                ft)    NEW_FS_SIZE=`$ECHO ${_sel_bkup_data_} | $AWK -F: '{print $2}'`
+                       ;;
+             small)    NEW_FS_SIZE=`$ECHO ${_sel_bkup_data_} | $AWK -F: '{print $3}'`
+                       ;;
+            medium)    NEW_FS_SIZE=`$ECHO ${_sel_bkup_data_} | $AWK -F: '{print $4}'`
+                       ;;
+             large)    NEW_FS_SIZE=`$ECHO ${_sel_bkup_data_} | $AWK -F: '{print $5}'`
+                       ;;
+                 *)    _err_msg_="Invalid deployment type : ${_deployment_}"
+                       abort_script "${_err_msg_}" 
+                       ;;
+        esac
+   
+        # Checking and converting the FS size with the new Size 
+        check_and_convert_fs_size ${_curr_fs_size_} ${NEW_FS_SIZE}
+    else
+         _err_msg_="Failed to get the new backup type details"
+         abort_script "${_err_msg_}"
+    fi
+}
+
+### Function: reconfigure_fs ###
+#
+# To resize NAS Filesystem for flexible data backup
+#
+# Function includes: delete snapshots, resize sybase iq, resize sw,
+#                                        start roll snap service and start ENIQ servie
+# Arguments:
+#       none
+# Return Values:
+#       none
+reconfigure_fs()
+{
+    _fs_name_=`$CAT $SYS_FLEX_BKUP_CONF | $GREP "FS_NAME=" | $AWK -F= '{print $2}'`
+    _fs_path_=`$CAT $SYS_FLEX_BKUP_CONF | $GREP "FS_PATH=" | $AWK -F= '{print $2}'`
+    _fs_size_=`$CAT $SYS_FLEX_BKUP_CONF | $GREP "FS_SIZE=" | $AWK -F= '{print $2}'`
+    _sys_bkup_type_=`$CAT $SYS_FLEX_BKUP_CONF | $GREP "BKUP_TYPE=" | $AWK -F= '{print $2}'`
+
+    log_msg  -q -s "Flexible FS details : FS_Name=${_fs_name_}, FS_Path=${_fs_path_}, FS_Size=${_fs_size_}, Backup_Type=${_sys_bkup_type_}" -l ${LOGFILE}
+    if [ -z "${_fs_name_}" -o -z "${_fs_path_}" -o -z "${_fs_size_}" -o -z "${_sys_bkup_type_}" ]; then
+        _err_msg_="Failed to fetch the current flexible backup details"
+        abort_script "${_err_msg_}" 
+    fi
+
+    # Getting the new configuration details which needs to be modified
+    new_flex_backup_details ${_fs_size_}
+
+    # Updating the System file present for flexible data backup type as per the new configuration
+    update_sys_backup_conf_file
+
+    # Stop Roll Snap Service
+    stop_roll_snap
+
+    # Stop ENIQ Services
+    stop_services
+  
+    if [ ${STAGE_QUIET} ]; then
+        log_msg -s "INFO: Skipping deletion of rolling snapshots for non FT deployments" -l ${LOGFILE}
+    else
+        echo ""
+        # Delete Rolling Snapshots
+        delete_rolling_snaphots
+    fi
+
+    # Resize NAS File System
+    if [ "${CURR_SERVER_TYPE}" == "eniq_stats" -o "${CURR_SERVER_TYPE}" == "stats_coordinator"  ]; then
+        _check_command_="${ENIQ_ADMIN_BIN_DIR}/resize_nas_fs.bsh"
+        check_for_file -f "$_check_command_"
+        
+        check_for_file -d "$_fs_path_"
+
+        # Resize NAS File System for flex_data_bkup
+        log_msg -s "\nResizing NAS ${_fs_name_} File System." -l ${LOGFILE}
+
+        log_msg -s "$_fs_path_ file system needs to be resized to  ${_new_size_kb_}k" -l ${LOGFILE}
+        log_msg -q -s "\nStarting to run $BASH ${ENIQ_ADMIN_BIN_DIR}/resize_nas_fs.bsh -a auto -s ${_new_size_kb_}k -f ${_fs_name_} -N" -l ${LOGFILE}
+        $BASH ${ENIQ_ADMIN_BIN_DIR}/resize_nas_fs.bsh -a auto -s ${_new_size_kb_}k -f ${_fs_name_} -N
+
+        if [ $? -ne 0 ]; then
+            _err_msg_="NAS File System Resize for SW failed.  Please refer log file at ${RESIZE_NAS_LOGFILE_DIR}. \n"
+            abort_script "$_err_msg_"
+        fi
+        $CP ${TEM_DIR}/_sys_bkup_con $SYS_FLEX_BKUP_CONF
+    else
+        log_msg -s "INFO: Skipping Resize NAS SW File System for ${CURR_SERVER_TYPE}" ${LOGFILE}
+    fi
+
+    # Start Roll Snap Service
+    start_roll_snap
+
+    # Start ENIQ Services
+    start_services
+}
+
+### Function: setup_env ###
+#
+# Setup the environment variables
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+
+setup_env()
+{
+# Directory on the root file system
+ENIQ_BASE_DIR=/eniq
+
+# Main Directory for the Core Installation SW
+ENIQ_INST_DIR=${ENIQ_BASE_DIR}/installation
+
+# Directory for the Core Installation SW
+ENIQ_CORE_INST_DIR=${ENIQ_INST_DIR}/core_install
+
+# Admin directory in the ENIQ file system
+ENIQ_ADMIN_DIR=${ENIQ_BASE_DIR}/admin
+
+# ENIQ Config Directory
+ENIQ_CONF_DIR=${ENIQ_INST_DIR}/config
+
+# Admin bin dir
+ENIQ_ADMIN_BIN_DIR=${ENIQ_ADMIN_DIR}/bin
+
+# Core bin dir
+ENIQ_CORE_BIN_DIR=${ENIQ_CORE_INST_DIR}/bin
+
+# ENIQ Bkup Sw dir
+ENIQ_BKUP_SW_DIR=${ENIQ_BASE_DIR}/bkup_sw
+ENIQ_BKUP_SW_BIN_DIR=${ENIQ_BKUP_SW_DIR}/bin
+
+# Backup FS configuration file
+FLEX_DATA_BKUP_CONF_FILE="${ENIQ_BKUP_SW_DIR}/etc/flex_data_bkup.conf"
+
+# System Backup file
+SYS_FLEX_BKUP_CONF=${ENIQ_BKUP_SW_DIR}/etc/.flex_data_bkup_conf
+
+# NASCLI path
+NASCLI="/ericsson/storage/bin/nascli"
+
+# Current server type
+CURR_SERVER_TYPE=`$CAT $ENIQ_CONF_DIR/installed_server_type | $GEGREP -v '^[[:blank:]]*#' | $SED -e 's/ //g'`
+if [ "$CURR_SERVER_TYPE" == "eniq_events" -o "${CURR_SERVER_TYPE}" == "eniq_coordinator" ]; then
+    _err_msg_="Flexible data backup functionality is not supported for events"
+    abort_script "$_err_msg_"
+fi
+
+# ENIQ Log Directory
+ENIQ_LOG_DIR=${ENIQ_BASE_DIR}/local_logs
+LOG_DIR=${ENIQ_BASE_DIR}/log
+SW_LOG_DIR=${LOG_DIR}/sw_log
+
+# Set the log directory for Resize NAS File Systems
+RESIZE_NAS_LOGFILE_DIR=${LOG_DIR}/resize_nas
+
+# Set the log directory for Create Snapshots stage
+SNAPSHOT_LOGFILE_DIR=${SW_LOG_DIR}/rolling_snapshot_logs
+SNAPSHOT_LOGFILE=${SNAPSHOT_LOGFILE_DIR}/prep_eniq_snapshots.log
+
+# Set the log directory for Delete Snapshots stage
+DEL_SNAP_LOGFILE_DIR=${ENIQ_LOG_DIR}/rolling_snapshot_logs
+DEL_SNAP_LOGFILE=${DEL_SNAP_LOGFILE_DIR}/clean_roll_snap.log
+
+# Set the log directory for Core SW Upgrade
+CORE_SW_LOGFILE_DIR=${LOG_DIR}/manage_upgrade_log
+
+# Set the log directory for Sybase IQ
+SAP_IQ_LOGFILE_DIR=${LOG_DIR}/sybase_iq
+SAP_IQ_LOGFILE=${SAP_IQ_LOGFILE_DIR}/upgrade_sybaseiq.log
+
+# Set the log directory for Sybase ASA
+SAP_ASA_LOGFILE_DIR=${LOG_DIR}/sybase_asa
+SAP_ASA_LOGFILE=${SAP_ASA_LOGFILE_DIR}/upgrade_sybase_asa.log
+
+# Set the log directory for Platform Upgrade
+PLATFORM_UPG_LOGFILE_DIR=${SW_LOG_DIR}/platform_installer/platform_management_log
+PLATFORM_UPG_LOGFILE=${PLATFORM_UPG_LOGFILE_DIR}/upgrade_platform_modules.log
+
+# Set temporary upgrade directory
+VAR_TMP_DIR=/var/tmp
+UPG_VAR_TMP_DIR=${VAR_TMP_DIR}/upgrade
+
+# Set Temp Core SW Upgrade Directory
+TEMP_CORE_SW_UPG_DIR=${UPG_VAR_TMP_DIR}/${UPG_SW_DIR}/core_install
+
+# Set Core SW Upgrade Bin Directory
+CORE_SW_UPG_DIR=${TEMP_CORE_SW_UPG_DIR}/bin/
+
+# Source the common functions
+if [ -s ${ENIQ_CORE_INST_DIR}/lib/common_functions.lib ]; then
+    . ${ENIQ_CORE_INST_DIR}/lib/common_functions.lib
+else
+    _err_msg_="File ${ENIQ_CORE_INST_DIR}/${LIB_DIR}/common_functions.lib not found"
+    abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+fi
+
+if [ -s ${ENIQ_CORE_INST_DIR}/lib/common_core_install_functions.lib ]; then
+    . ${ENIQ_CORE_INST_DIR}/lib/common_core_install_functions.lib
+else
+    _err_msg_="File ${ENIQ_CORE_INST_DIR}/lib/common_core_install_functions.lib not found"
+    abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+fi
+
+if [ -s ${ENIQ_CORE_INST_DIR}/lib/common_inirator_functions.lib ]; then
+    . ${ENIQ_CORE_INST_DIR}/lib/common_inirator_functions.lib
+else
+    _err_msg_="File ${ENIQ_CORE_INST_DIR}/lib/common_inirator_functions.lib not found"
+    abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+fi
+
+# File containing the type of OSS installation. Eg. events or statistics
+INST_TYPE_FILE=${ENIQ_CONF_DIR}/ericsson_use_config
+if [ ! -s "${INST_TYPE_FILE}" ]; then
+    _err_msg_="ENIQ install type not defined in ${INST_TYPE_FILE}"
+    abort_script "${_err_msg_}"  "${EXEC_SHELL_CMD}"
+fi
+
+# Read the installation type - should be "events" or "stats"
+INSTALL_TYPE=`$CAT ${INST_TYPE_FILE} | $NAWK -F\= '{print $2}'`
+
+# hostname of local host
+HOST_NAME=`${MYHOSTNAME}`
+
+# Read deployment type of blade
+DEPLOYMENT_TYPE=`$CAT ${ENIQ_CONF_DIR}/${HOST_NAME}/${HOST_NAME}_installation_param_details | $GREP deployment | $CUT -d'=' -f2`
+
+# Set templates directory
+TMPL_ADMIN_BIN_DIR=${TMPL_DIR}/${INSTALL_TYPE}/admin/bin
+
+GET_IP_ORDER_SCRIPT=${ENIQ_CORE_INST_DIR}/lib/get_ip_order.pl
+if [ ! -s "${GET_IP_ORDER_SCRIPT}" ]; then
+        _err_msg_="Could not find script: ${GET_IP_ORDER_SCRIPT}"
+        abort_script "$_err_msg_" "${EXEC_SHELL_CMD}"
+fi
+
+# Set snapshot diable flag if post migration upgrade
+MIGRATION_FLAG="/var/tmp/solaris_migration_success"
+if [ -f "${MIGRATION_FLAG}" ]; then
+    STAGE_QUIET="YES"
+fi
+}
+
+### Function: stop_roll_snap ###
+#
+# To disable the ENIQ Roll-Snap service across the deployment
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+stop_roll_snap()
+{
+log_msg -q -h -s "Stopping svc:/eniq/roll-snap:default service" -l ${LOGFILE}
+
+_check_command_="${ENIQ_ADMIN_BIN_DIR}/manage_deployment_services.bsh"
+check_for_file -f $_check_command_
+
+log_msg -q -s "Starting to run $BASH $_check_command_ -a stop -s roll-snap -N" -l ${LOGFILE}
+$BASH $_check_command_ -a stop -s roll-snap -N
+if [ $? -ne 0 ]; then
+        _err_msg_="Exiting... Unable to stop roll-snap service \n"
+        abort_script "$_err_msg_"
+fi
+
+log_msg -q -s "Successfully stopped svc:/eniq/roll-snap:default service" -l ${LOGFILE}
+}
+
+### Function: start_roll_snap ###
+#
+# To enable the ENIQ Roll-Snap service across the deployment
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+start_roll_snap()
+{
+log_msg -q -h -s "Starting svc:/eniq/roll-snap:default service" -l ${LOGFILE}
+
+_check_command_="${ENIQ_ADMIN_BIN_DIR}/manage_deployment_services.bsh"
+check_for_file -f $_check_command_
+
+log_msg -q -s "Starting to run $BASH $_check_command_ -a start -s roll-snap -N" -l ${LOGFILE}
+$BASH $_check_command_ -a start -s roll-snap -N
+if [ $? -ne 0 ]; then
+        _err_msg_="Exiting... Unable to start roll-snap service \n"
+        abort_script "$_err_msg_"
+fi
+
+log_msg -q -s "Successfully started svc:/eniq/roll-snap:default service" -l ${LOGFILE}
+}
+
+### Function: start_services ###
+#
+# To enable the ENIQ services across the deployment
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+start_services()
+{
+log_msg -q -h -s "Starting ENIQ services" -l ${LOGFILE}
+_check_command_="${ENIQ_ADMIN_BIN_DIR}/manage_deployment_services.bsh"
+check_for_file -f $_check_command_
+
+log_msg -q -s "Starting to run $BASH $_check_command_ -a start -s ALL -N" -l ${LOGFILE}
+$BASH $_check_command_ -a start -s ALL -N
+if [ $? -ne 0 ]; then
+        _err_msg_="Exiting... Unable to start services \n"
+        abort_script "$_err_msg_"
+fi
+
+log_msg -q -s "Successfully started ENIQ services" -l ${LOGFILE}
+}
+
+### Function: stop_services ###
+#
+# To disable the ENIQ services across the deployment
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+stop_services()
+{
+log_msg -q -h -s "Stopping ENIQ services" -l ${LOGFILE}
+
+_check_command_="${ENIQ_ADMIN_BIN_DIR}/manage_deployment_services.bsh"
+check_for_file -f $_check_command_
+
+log_msg -q -s "Starting to run $BASH $_check_command_ -a stop -s ALL -N" -l ${LOGFILE}
+$BASH $_check_command_ -a stop -s ALL -N
+if [ $? -ne 0 ]; then
+        _err_msg_="Exiting... Unable to stop services \n"
+        abort_script "$_err_msg_"
+fi
+
+log_msg -q -s "Successfully stopped ENIQ services" -l ${LOGFILE}
+}
+
+### Function: update_sys_backup_conf_file ###
+#
+#   Update SYS_FLEX_BKUP_CONF file
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+update_sys_backup_conf_file()
+{
+    _tag_list_="BKUP_TYPE= FS_SIZE="
+    _tag_value_=($_bkup_type_ $NEW_FS_SIZE)
+    _count_=0
+
+    $CP $SYS_FLEX_BKUP_CONF ${TEM_DIR}/sys_bckup_file.conf
+
+    for _tag_ in ${_tag_list_}
+    do
+        $SED -e 's|^[       ]*'${_tag_}'.*|'${_tag_}''${_tag_value_[$_count_]}'|' ${TEM_DIR}/sys_bckup_file.conf > ${TEM_DIR}/_sys_bkup_con
+        if [ $? -ne 0 ]; then
+            _err_msg_="Failed to update ${TEM_DIR}/_sys_bkup_con file with latest values"
+            abort_script "${_err_msg_}"
+        fi
+
+        $CP ${TEM_DIR}/_sys_bkup_con ${TEM_DIR}/sys_bckup_file.conf
+        if [ $? -ne 0 ]; then
+            _err_msg_="Failed to copy ${TEM_DIR}/_sys_bkup_con file with latest values"
+            abort_script "${_err_msg_}"
+        fi
+
+        _count_=`expr $_count_ + 1`
+    done
+}
+
+### Function: usage_msg ###
+#
+#   Print out the usage message
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+usage_msg()
+{
+    $ECHO "
+    Usage : `$BASENAME $0` -a {create|destroy|resize} [-l]
+
+    options:
+
+    -a  : Action. Must be either
+             reconfigure  --> Resize the file-system size
+
+    -l  : To generate logfile other than default path
+    "
+}
+
+#######################################
+#   MAIN BODY
+#######################################
+
+# Get  values on runtime
+while getopts "a:l:" arg;
+do
+    case $arg in
+        a)     ACTION="$OPTARG"
+               ;;
+        l)     LOGFILE="$OPTARG"
+               $TOUCH $LOGFILE
+               ;;
+       \?)     $ECHO "Invalid option(s) passed"
+               usage_msg
+               exit 1
+               ;;
+    esac
+done
+
+if [ "${ACTION}" != "reconfigure" ]; then
+    usage_msg
+    exit 1
+fi
+
+# Create a temporary Directory
+TEM_DIR=/tmp/reconf_bkup.$$.$$
+$RM -rf ${TEM_DIR}
+$MKDIR -p ${TEM_DIR}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not create directory $TEM_DIR"
+    abort_script "$_err_msg_"
+fi
+
+setup_env
+
+if [ ! "${LOGFILE}" ]; then
+    LOGFILE=${ENIQ_LOG_DIR}/flex_data_bkup_${ACTION}_$TIMESTAMP.log
+    $TOUCH $LOGFILE
+fi
+
+reconfigure_fs
+
+rm -rf ${TEM_DIR}

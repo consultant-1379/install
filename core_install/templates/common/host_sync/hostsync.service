@@ -1,0 +1,18 @@
+[Unit]
+Description=Service to Monitor hosts master file and update local hosts file if required.
+
+[Service]
+Type=forking
+User=root
+Group=root
+ExecStart=/eniq/smf/bin/hostsync.sh -a start
+ExecStop=/eniq/smf/bin/hostsync.sh -a stop
+Restart=on-failure
+TimeoutStartSec=60
+TimeoutStopSec=60
+StartLimitInterval=250
+StartLimitBurst=3
+RestartSec=15
+
+[Install]
+WantedBy=multi-user.target

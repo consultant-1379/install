@@ -1,0 +1,757 @@
+#!/usr/bin/bash
+#********************************************************************
+# Ericsson Radio Systems AB SCRIPT
+#********************************************************************
+#
+# (c) Ericsson Radio Systems AB 2022 - All rights reserved.
+#
+# The copyright to the computer program(s) herein is the property
+# of Ericsson Radio Systems AB, Sweden. The programs may be used
+# and/or copied only with the written permission from Ericsson Radio
+# Systems AB or in accordance with the terms and conditions stipulated
+# in the agreement/contract under which the program(s) have been
+# in the agreement/contract under which the program(s) have been
+# supplied.
+#
+#********************************************************************
+# Name     : upgrade_params.bsh
+# Date     : 26/10/2023
+# Revision : \main\10
+# Purpose  : A script to fetch all the upgrade related parameters
+#         from the user.
+#
+# Usage    : upgrade_params.bsh
+#
+#********************************************************************
+#
+#
+# Fetch inputs from the user
+#
+#
+#********************************************************************
+
+CP="/usr/bin/cp"
+AWK="/usr/bin/awk"
+SED="/usr/bin/sed"
+ECHO="/usr/bin/echo -e"
+EXPR="/usr/bin/expr"
+BASH="/usr/bin/bash"
+CAT="/usr/bin/cat"
+SU="/usr/bin/su"
+TEE=/usr/bin/tee
+TOUCH=/usr/bin/touch
+SCP=/usr/bin/scp
+
+CLI_CONF_DIR=/eniq/sw/conf
+ENIQ_CONF_DIR='/eniq/installation/config'
+ENIQ_CORE_INST_DIR='/eniq/installation/core_install'
+ENIQ_INSTAL_DIR='/eniq/installation/core_install/bin'
+SCRIPTHOME="/eniq/admin/"
+TEM_DIR='/tmp'
+CURR_SERVER_TYPE=`$CAT ${ENIQ_CONF_DIR}/installed_server_type | egrep -v '^[[:blank:]]*#' | $SED -e 's/ //g'`
+SUNOS_INI=SunOS.ini
+SYSTEMCTL=/usr/bin/systemctl
+CHOWN=/usr/bin/chown
+IPMP_INI=ipmp.ini
+
+LOGFILE='/eniq/local_logs/upgrade_params.log'
+
+DIRNAME='/usr/bin/dirname'
+
+### Function: get_absolute_path ###
+#
+# Determine absolute path to software
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+get_absolute_path()
+{
+_dir_=`$DIRNAME $0`
+SCRIPTHOME=`cd $_dir_ 2>/dev/null && pwd || $ECHO $_dir_`
+}
+
+# Determine absolute path to software
+get_absolute_path
+
+##Creating strong enryption passphrase file
+if [ ! -f /eniq/sw/conf/strong_passphrase ]; then
+    host_name=`hostname`
+    touch /eniq/sw/conf/strong_passphrase
+    chmod 600 /eniq/sw/conf/strong_passphrase
+    chown dcuser:dc5000 /eniq/sw/conf/strong_passphrase
+    echo "${host_name}@EnIq" >/eniq/sw/conf/strong_passphrase
+fi
+
+passphrase=`cat /eniq/sw/conf/strong_passphrase`
+
+# Source the common functions
+if [ -s ${SCRIPTHOME}/../lib/common_functions.lib ]; then
+    . ${SCRIPTHOME}/../lib/common_functions.lib
+else
+    _err_msg_="File ${SCRIPTHOME}/../lib/common_functions.lib not found"
+    abort_script "${_err_msg_}" 
+fi
+
+### Function: abort_script ###
+#
+#   This will is called if the script is aborted thru an error
+#   error signal sent by the kernel such as CTRL-C or if a serious
+#   error is encountered during runtime
+#
+# Arguments:
+#       $1 - Error message from part of program (Not always used)
+# Return Values:
+#       none
+abort_script()
+{
+_err_time_=`$DATE '+%Y-%b-%d_%H.%M.%S'`	
+
+if [ "$1" ]; then
+    _err_msg_="${_err_time_} - $1"
+else
+    _err_msg_="${_err_time_} - Script aborted.......\n"    
+fi
+if [ "${LOGFILE}" ]; then
+    $ECHO "\nERROR : $_err_msg_\n" | $TEE -a ${LOGFILE}
+else
+    $ECHO "\nERROR : $_err_msg_\n"
+fi
+
+if [ "$2" ]; then
+    ${2}
+else
+   exit 1
+fi
+}
+
+#Fetching IP Type from ipmp.ini file
+check_ip_type
+
+if [ ! "${_ip_type_}" ]; then
+    _err_msg_="Could not read parameter _IP_TYPE_ from file ${ENIQ_CONF_DIR}/${IPMP_INI}"
+    abort_script "$_err_msg_"
+fi
+
+if [ ! -f ${ENIQ_CONF_DIR}/ip_type ]; then
+    $TOUCH ${ENIQ_CONF_DIR}/ip_type
+    if [ $? -ne 0 ]; then
+        _err_msg_="Could not touch ${ENIQ_CONF_DIR}/ip_type file"
+        abort_script "$_err_msg_"
+    fi
+    
+    
+	$ECHO "${_ip_type_}" > ${ENIQ_CONF_DIR}/ip_type
+    
+    if [ $? -ne 0 ]; then
+        _err_msg_="Could not copy required IP installation type to ${ENIQ_CONF_DIR}/ip_type file"
+        abort_script "$_err_msg_"
+    fi
+    
+    if [ "${CURR_SERVER_TYPE}" == "stats_coordinator" ]; then
+        /usr/bin/perl ${ENIQ_CORE_INST_DIR}/lib/get_ip_order.pl -f ${TEM_DIR}/server_order_list
+    
+        for _line_ in `$CAT ${TEM_DIR}/server_order_list | grep -v stats_coordinator`; do
+            _count_=`$ECHO "${_line_}" | grep -o "::" | wc -l`
+
+            if [ "${IPv6_Enable}" == "Y" -a "${_count_}" == 3 ]; then
+                _ip_address_=`$ECHO ${_line_} | grep -oE '([a-fA-F0-9]{1,4}::?){1,7}[a-fA-F0-9]{1,4}' | head -n 1 | awk -F "::" '{ print $1 "::" $2}'`
+                $SCP -6 -rp -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null ${ENIQ_CONF_DIR}/ip_type root@[${_ip_address_}]:${ENIQ_CONF_DIR}/  >>/dev/null 2>&1
+            else
+                _ip_address_=`$ECHO ${_line_} | $AWK -F"::" '{print $1}'`
+                $SCP -rp -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null ${ENIQ_CONF_DIR}/ip_type root@${_ip_address_}:${ENIQ_CONF_DIR}/  >>/dev/null 2>&1
+            fi
+            if [ $? -ne 0 ]; then
+                _err_msg_="Could not copy required ${ENIQ_CONF_DIR}/ip_type file to ${_ip_address_} server."
+                abort_script "$_err_msg_"
+            fi
+            
+        done
+        rm -rf ${TEM_DIR}/server_order_list
+    fi
+
+fi
+
+i=0
+k=0
+j=0
+l=0
+
+while [[ $k -eq 0 ]]
+do
+	$ECHO "\n===============================================================================\n" | $TEE -a ${LOGFILE}
+
+	$ECHO `date` | $TEE -a ${LOGFILE}
+
+	$ECHO "\n===============================================================================\n" | $TEE -a ${LOGFILE}
+
+	$ECHO "\nEnter Upgrade Software Directory Name to extract the new package" | $TEE -a ${LOGFILE}
+	read upg_sw_dir
+
+	if [ ! -d /var/tmp/upgrade/${upg_sw_dir} ]; then
+		$ECHO "${upg_sw_dir} directory doesnot exist under /var/tmp/upgrade path " | $TEE -a ${LOGFILE}
+		exit 1
+	fi
+	ENIQ_UPGR_DIR=/var/tmp/upgrade/${upg_sw_dir}
+	ENIQ_CONFIG_PATH='/eniq/installation/config/upgrade_params.ini'
+	ENIQ_TEMPLATE_PATH=${ENIQ_UPGR_DIR}/core_install/templates/stats/upgrade_params.ini
+	ENIQ_INI_BKUP_PATH='/eniq/bkup_sw/templates/upgrade_params_bkup.ini'
+
+	if [[ -f ${ENIQ_TEMPLATE_PATH} ]]; then
+        $ECHO " "
+	else
+        $ECHO "\n[inputs]\n\n" >> ${ENIQ_TEMPLATE_PATH}
+	fi
+
+
+	if [[ -f ${ENIQ_CONFIG_PATH} ]]; then
+        $CP -p ${ENIQ_CONFIG_PATH} ${ENIQ_INI_BKUP_PATH}
+        $CP -p ${ENIQ_TEMPLATE_PATH} ${ENIQ_CONFIG_PATH}
+        $ECHO "\nUpdating Ini file"
+	else
+        $ECHO " "
+        $CP -rp ${ENIQ_TEMPLATE_PATH} ${ENIQ_CONFIG_PATH}
+	fi
+
+	iniset inputs -f ${ENIQ_CONF_DIR}/upgrade_params.ini upg_sw_dir=$upg_sw_dir
+	if [[ $? -eq 0 ]];then
+        i=`$EXPR $i + 1`
+	fi
+
+	flag=0
+	$ECHO "\nEnter MWS IP Address:"
+	while :; do		
+		read mws_ip
+	
+		if [ "${_ip_type_}" == "IPv6" ]; then	
+			if ipcalc -s -6 -c ${mws_ip}; then
+				$ECHO "valid IPv6"
+			else
+				$ECHO "Entered IP is not valid IPv6 IP. Please enter valid IPv6 IP"
+				$ECHO "\nRe-enter valid IPv6 MWS IP Address:"
+				continue
+			fi
+		else
+			if ipcalc -s -4 -c ${mws_ip}; then
+				$ECHO "valid IPv4"
+			else
+				$ECHO "Entered IP is not valid IPv4 IP. Please enter valid IPv4 IP"
+				$ECHO "\nRe-enter valid IPv4 MWS IP Address:"
+				continue
+			fi
+		fi
+		ping_command=$(check_ping)
+		$ping_command -c 2 ${mws_ip} >> /dev/null 2>&1
+			
+		if [ $? -ne 0 ]; then
+			$ECHO "Entered MWS Server IP ${mws_ip} is not Reachable" | $TEE -a ${LOGFILE}
+			#flag=1
+			$ECHO "Check if IP is Reachable and Re-enter IP"
+			$ECHO "\nRe-enter MWS IP Address:"
+			continue
+		else
+			iniset inputs -f ${ENIQ_CONF_DIR}/upgrade_params.ini mws_ip=$mws_ip
+			if [[ $? -eq 0 ]]; then
+				l=`$EXPR $l + 1`
+			fi
+			break
+		fi
+	done
+	
+	$ECHO "\nEnter MWS Hostname:"
+	
+	while :; do
+		read mws_hostname
+	
+		ping_command=$(check_ping)
+		$ping_command -c 2 ${mws_hostname} >> /dev/null 2>&1
+		if [ $? -ne 0 ]; then
+			$ECHO "Entered MWS Server Hostname ${mws_hostname} is not Reachable" | $TEE -a ${LOGFILE}
+			#flag=1
+			$ECHO "Check if hostname is Reachable and Re-enter hostname"
+			$ECHO "\nRe-enter MWS Hostname:"
+			continue
+		else
+			iniset inputs -f ${ENIQ_CONF_DIR}/upgrade_params.ini mws_hostname=$mws_hostname
+			if [[ $? -eq 0 ]]; then
+				l=`$EXPR $l + 1`
+			fi
+			break
+		fi
+	done
+	
+	$ECHO "\nUpdating MWS IP and Hostname values in /etc/hosts file with user entered values" | $TEE -a ${LOGFILE}
+	
+        #stop hostsync
+	_hostsync_smf_str_=`iniget HOST_SYNC_DAEMON -f ${ENIQ_CONF_DIR}/${SUNOS_INI} -v HOST_SYNC_SERVICE_STR`
+        if [ ! "${_hostsync_smf_str_}" ]; then
+            _err_msg_="Could not read host_syncd SMF string from ${ENIQ_CONF_DIR}/${SUNOS_INI}"
+            abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+        fi
+        log_msg -s "Stopping ${_hostsync_smf_str_}" -l ${LOGFILE}
+        $SYSTEMCTL stop ${_hostsync_smf_str_}
+        if [ $? -ne 0 ]; then
+            _err_msg_="Could not stop ${_hostsync_smf_str_}"
+            abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+        fi
+        
+        log_msg -s "Disabling ${_hostsync_smf_str_}" -l ${LOGFILE}
+        $SYSTEMCTL disable ${_hostsync_smf_str_}
+        if [ $? -ne 0 ]; then
+            _err_msg_="Could not disable ${_hostsync_smf_str_}"
+            abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+        fi
+        
+    _sysuser_=`iniget ENIQ_INSTALL_CONFIG -f ${ENIQ_CONF_DIR}/${SUNOS_INI} -v ENIQ_SYSUSER`
+	if [ ! "${_sysuser_}" ]; then
+    		_err_msg_="Could not read parameter ENIQ_SYSUSER from file - ${ENIQ_CONF_DIR}/${SUNOS_INI}"
+    		abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+	fi
+        
+	_sysgrp_=`$ID ${_sysuser_} | $AWK '{print $2}' | $AWK -F\( '{print $2}' | $AWK -F\) '{print $1}'`
+	if [ ! "${_sysuser_}" ]; then
+    		_err_msg_="Could not determine group ID of ${_sysuser_}"
+    		abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+	fi
+
+	$CP /etc/hosts /etc/hosts_backup
+	if [ $? -ne 0 ]; then
+    		_err_msg_="Could not make a backup of /etc/hosts"
+    		abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+	fi
+        
+    CURR_MWS_IP_ETC_HOSTS=`$CAT /etc/hosts | $GREP -w MWS | $AWK '{print $1}'`
+	CURR_MWS_HNAME_ETC_HOSTS=`$CAT /etc/hosts | $GREP -w MWS | $AWK '{print $2}'`
+    service_namefile_update_flag=0
+        
+	if [ ! "${CURR_MWS_IP_ETC_HOSTS}" ] || [ ! "${CURR_MWS_IP_ETC_HOSTS}" ]; then
+		log_msg -s "MWS IP and Hostname values not present in /etc/hosts file. " -l ${LOGFILE}
+		sed -i "s/#<---- HOSTSYNC END MARKER ---->/${mws_ip} ${mws_hostname} MWS/g" "/etc/hosts"
+		$ECHO "#<---- HOSTSYNC END MARKER ---->" >> /etc/hosts
+		if [ $? -ne 0 ]; then
+				_err_msg_="Could not update MWS IP and hostname in /etc/hosts file."
+				abort_script "$_err_msg_"
+		fi
+		$ECHO "Successfully updated MWS IP and Hostname values in /etc/hosts file" | $TEE -a ${LOGFILE}
+                service_namefile_update_flag=1
+	else	
+		if [ "${CURR_MWS_IP_ETC_HOSTS}" == "${mws_ip}" ] && [ "${CURR_MWS_HNAME_ETC_HOSTS}" == "${mws_hostname}" ]; then
+			$ECHO "/etc/hosts file is already updated with latest values of MWS IP: ${mws_ip} and Hostname: ${mws_hostname}." | $TEE -a ${LOGFILE}
+		else
+			sed -i "s/${CURR_MWS_IP_ETC_HOSTS}/${mws_ip}/g" "/etc/hosts"
+			if [ $? -ne 0 ]; then
+				_err_msg_="Could not update MWS IP: ${CURR_MWS_IP_ETC_HOSTS} in /etc/hosts file with ${mws_ip}"
+				abort_script "$_err_msg_"
+			fi
+			sed -i "s/${CURR_MWS_HNAME_ETC_HOSTS}/${mws_hostname}/g" "/etc/hosts"
+			if [ $? -ne 0 ]; then
+				_err_msg_="Could not update MWS hostname ${CURR_MWS_HNAME_ETC_HOSTS} in /etc/hosts file with ${mws_hostname}"
+				abort_script "$_err_msg_"
+			fi
+			$ECHO "Successfully updated old values of MWS IP and Hostname with the new user entered values in /etc/hosts file" | $TEE -a ${LOGFILE}
+                        service_namefile_update_flag=1
+		fi
+	fi
+        
+        MWS_name=MWS
+        if [ "${service_namefile_update_flag}" == 1 ]; then
+                # Update service_names file    
+    		update_service_file ${CLI_CONF_DIR}/service_names ${mws_ip} ${mws_hostname} ${MWS_name} "NULL_GRP"
+    		if [ $? -ne 0 ]; then
+        		_err_msg_="Failed to update ${CLI_CONF_DIR}/service_names with MWS server details"
+        		abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+    		fi
+                
+                log_msg -s "Changing ownership of ${CLI_CONF_DIR}/service_names to ${_sysuser_}:${_sysgrp_} after adding MWS details." -l ${LOGFILE}
+    		$CHOWN ${_sysuser_}:${_sysgrp_} ${CLI_CONF_DIR}/service_names
+    		if [ $? -ne 0 ]; then
+        		_err_msg_="Failed to change ownership of ${CLI_CONF_DIR}/service_names to ${_sysuser_}:${_sysgrp_}"
+        		abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+    		fi
+	fi
+        
+        # Start hostsync 
+        _hostsync_smf_str_=`iniget HOST_SYNC_DAEMON -f ${ENIQ_CONF_DIR}/${SUNOS_INI} -v HOST_SYNC_SERVICE_STR`
+        if [ ! "${_hostsync_smf_str_}" ]; then
+            _err_msg_="Could not read host_syncd SMF string from ${ENIQ_CONF_DIR}/${SUNOS_INI}"
+            abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+        fi
+        log_msg -s "Starting ${_hostsync_smf_str_}" -l ${LOGFILE}
+        $SYSTEMCTL start  ${_hostsync_smf_str_}
+        if [ $? -ne 0 ]; then
+            _err_msg_="Could not start ${_hostsync_smf_str_}"
+            abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+        fi
+        
+        log_msg -s "Enabling ${_hostsync_smf_str_}" -l ${LOGFILE}
+        $SYSTEMCTL enable  ${_hostsync_smf_str_}
+        if [ $? -ne 0 ]; then
+            _err_msg_="Could not enable ${_hostsync_smf_str_}"
+            abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+        fi
+
+	mws_uname=root
+
+	$ECHO "\nEnter MWS Root User Password:" | $TEE -a ${LOGFILE}
+	stty -echo
+	read mws_pwd
+	stty echo
+
+
+	iniset inputs -f ${ENIQ_CONF_DIR}/upgrade_params.ini mws_uname=$mws_uname
+	if [[ $? -eq 0 ]]; then
+        l=`$EXPR $l + 1`
+	fi
+
+	#mws_pwd=`$ECHO $mws_pwd | openssl enc -base64 -e`
+	mws_pwd=`$ECHO ${mws_pwd} | openssl enc -aes-256-ctr -md sha512 -a -salt -pass pass:${passphrase}`
+	iniset inputs -f ${ENIQ_CONF_DIR}/upgrade_params.ini mws_pwd=$mws_pwd
+	if [[ $? -eq 0 ]]; then
+        l=`$EXPR $l + 1`
+	fi
+
+
+
+	while [ 1 ]; do
+
+		$ECHO "\nIs OMBS Configured?" | $TEE -a ${LOGFILE}
+		$ECHO "Enter [Yes/No]\n" | $TEE -a ${LOGFILE}
+		read ombs_choice
+		iniset inputs -f ${ENIQ_CONF_DIR}/upgrade_params.ini ombs_configuration=$ombs_choice
+					if [[ $? -eq 0 ]];then
+						j=`$EXPR $j + 1`
+					fi
+		if [[ $ombs_choice != 'Yes' && $ombs_choice != 'No' ]]; then
+			$ECHO "Invalid input. Please enter a valid input:\n" | $TEE -a ${LOGFILE}
+		else
+
+		if [[ $ombs_choice == 'Yes' ]]; then
+			while [ 1 ]; do
+			$ECHO -e "\nAre OMBS policies disabled manually?" | $TEE -a ${LOGFILE}
+			$ECHO "Enter [Yes/No]\n" | $TEE -a ${LOGFILE}
+			read ombs_policies
+			iniset inputs -f ${ENIQ_CONF_DIR}/upgrade_params.ini ombs_policies_configuration=$ombs_policies
+					if [[ $? -eq 0 ]];then
+						j=`$EXPR $j + 1`
+					fi
+			if [[ $ombs_policies != 'Yes' && $ombs_policies != 'No' ]]; then
+				$ECHO "Invalid input. Please enter a valid input:\n" | $TEE -a ${LOGFILE}
+			else
+				if [[ $ombs_policies == 'No' ]];then 
+					$ECHO -e "\nEnter OMBS Backup IP" | $TEE -a ${LOGFILE}
+					read ombs_backup_ip
+					ping -c 2 ${ombs_backup_ip} >> /dev/null 2>&1
+					if [ $? -ne 0 ]; then
+						$ECHO "Entered OMBS Server IP ${ombs_backup_ip} is not Reachable" | $TEE -a ${LOGFILE}
+						flag=1
+					else
+						iniset inputs -f ${ENIQ_CONF_DIR}/upgrade_params.ini ombs_backup_ip=$ombs_backup_ip
+						if [[ $? -eq 0 ]];then
+							j=`$EXPR $j + 1`
+						fi
+					fi
+					$ECHO "\nEnter OMBS Username" | $TEE -a ${LOGFILE}
+					read ombs_uname
+
+					$ECHO "\nEnter OMBS User Password" | $TEE -a ${LOGFILE}
+					stty -echo
+					read ombs_pass
+					stty echo
+
+					if [ "${CURR_SERVER_TYPE}" == "stats_coordinator" ]; then
+
+						$ECHO "\nEnter ENIQ Backup Hostnames Configured with OMBS Server" | $TEE -a ${LOGFILE}
+						$ECHO "\nENIQ Coordinator:" | $TEE -a ${LOGFILE}
+						read eniq_mb_hostname1
+						$ECHO "\nENIQ Engine:" | $TEE -a ${LOGFILE}
+						read eniq_mb_hostname2
+						$ECHO "\nENIQ Reader 1:" | $TEE -a ${LOGFILE}
+						read eniq_mb_hostname3
+						$ECHO "\nENIQ Reader 2:" | $TEE -a ${LOGFILE}
+						read eniq_mb_hostname4
+
+						iniset inputs -f ${ENIQ_CONF_DIR}/upgrade_params.ini eniq_mb_hostname1=$eniq_mb_hostname1
+						if [[ $? -eq 0 ]];then
+							j=`$EXPR $j + 1`
+						fi
+
+						iniset inputs -f ${ENIQ_CONF_DIR}/upgrade_params.ini eniq_mb_hostname2=$eniq_mb_hostname2
+						if [[ $? -eq 0 ]];then
+							j=`$EXPR $j + 1`
+						fi
+
+						iniset inputs -f ${ENIQ_CONF_DIR}/upgrade_params.ini eniq_mb_hostname3=$eniq_mb_hostname3
+						if [[ $? -eq 0 ]];then
+							j=`$EXPR $j + 1`
+						fi
+
+						iniset inputs -f ${ENIQ_CONF_DIR}/upgrade_params.ini eniq_mb_hostname4=$eniq_mb_hostname4
+						if [[ $? -eq 0 ]];then
+							j=`$EXPR $j + 1`
+						fi
+
+
+					else
+			
+						$ECHO "\nEnter ENIQ Backup Hostname Configured with OMBS Server" | $TEE -a ${LOGFILE}
+						read eniq_hostname
+
+						iniset inputs -f ${ENIQ_CONF_DIR}/upgrade_params.ini eniq_hostname=$eniq_hostname
+						if [[ $? -eq 0 ]];then
+							j=`$EXPR $j + 1`
+						fi
+
+					fi
+
+
+					
+					iniset inputs -f ${ENIQ_CONF_DIR}/upgrade_params.ini ombs_policies_configuration=$ombs_policies
+					if [[ $? -eq 0 ]];then
+						j=`$EXPR $j + 1`
+					fi
+
+					iniset inputs -f ${ENIQ_CONF_DIR}/upgrade_params.ini ombs_uname=$ombs_uname
+					if [[ $? -eq 0 ]];then
+						j=`$EXPR $j + 1`
+					fi
+
+					#ombs_pass=`$ECHO $ombs_pass | openssl enc -base64 -e`
+					ombs_pass=`echo ${ombs_pass} | openssl enc -aes-256-ctr -md sha512 -a -salt -pass pass:${passphrase}`
+					iniset inputs -f ${ENIQ_CONF_DIR}/upgrade_params.ini ombs_pass=$ombs_pass
+					if [[ $? -eq 0 ]];then
+						j=`$EXPR $j + 1`
+					fi
+
+					break;
+				else 
+					break 2
+				fi
+			fi
+done
+fi
+			break;
+
+		
+fi
+	done
+
+	while [ 1 ]; do
+
+		$ECHO "\nEnter Type of Upgrade:" | $TEE -a ${LOGFILE}
+		$ECHO "\n[1]Full Upgrade\n[2]Platform Upgrade\n[3]Exit" | $TEE -a ${LOGFILE}
+		read option
+
+		case $option in
+			1)action_type='upgrade'
+			break;
+			;;
+			2)action_type='upgrade_platform_only'
+			break;
+			;;
+			3)exit 1
+			;;
+			\?)echo "Invalid option selected. Please select the type of upgrade:" | $TEE -a ${LOGFILE}
+			;;
+		esac
+
+	done
+
+
+	if [[ $action_type != 'upgrade' && $action_type != 'upgrade_platform_only' ]]; then
+        $ECHO "\nInput is Invalid" | $TEE -a ${LOGFILE}
+	fi
+
+	if [[ $action_type == 'post_upgrade' || $action_type == 'rollback' ]]; then
+        iniset inputs -f ${ENIQ_CONF_DIR}/upgrade_params.ini action_type=$action_type
+        if [[ $? -eq 0 ]];then
+                i=`$EXPR $i + 1`
+        fi
+	else
+        iniset inputs -f ${ENIQ_CONF_DIR}/upgrade_params.ini action_type_upgrade=$action_type
+        if [[ $? -eq 0 ]];then
+                i=`$EXPR $i + 1`
+        fi
+	fi
+
+
+	$ECHO "\nEnter the Path for ENIQ Base Software" | $TEE -a ${LOGFILE}
+	read eniq_base_sw
+
+	if [ -d $eniq_base_sw ]; then
+		iniset inputs -f ${ENIQ_CONF_DIR}/upgrade_params.ini eniq_base_sw=$eniq_base_sw
+        if [[ $? -eq 0 ]];then
+                i=`$EXPR $i + 1`
+        fi
+
+	else
+		$ECHO "Error: Directory $eniq_base_sw does not exists." | $TEE -a ${LOGFILE}
+		flag=1
+	fi
+
+	sprint_release=`$ECHO $eniq_base_sw | $SED 's+/+ +g' | $AWK '{print $6}'`
+
+	iniset inputs -f ${ENIQ_CONF_DIR}/upgrade_params.ini sprint_release=$sprint_release
+	if [[ $? -eq 0 ]]; then
+        l=`$EXPR $l + 1`
+	fi
+
+
+	if [[ $action_type != 'upgrade_platform_only' ]]; then
+		$ECHO "\nEnter the Path for ENIQ Feature Software " | $TEE -a ${LOGFILE}
+		read eniq_feature_sw
+
+		if [ -d $eniq_feature_sw ]; then
+			#$ECHO "Directory $eniq_feature_sw exists."
+			iniset inputs -f ${ENIQ_CONF_DIR}/upgrade_params.ini eniq_feature_sw=$eniq_feature_sw
+			if [[ $? -eq 0 ]];then
+                i=`$EXPR $i + 1`
+			fi
+		else
+			$ECHO "Error: Directory $eniq_feature_sw does not exists." | $TEE -a ${LOGFILE}
+			flag=1
+		fi
+	fi
+
+
+	$ECHO "\nEnter the Path for OM Media Software " | $TEE -a ${LOGFILE}
+	read om_sw
+
+	if [ -d $om_sw ]; then
+		#$ECHO "Directory $om_sw exists."
+		iniset inputs -f ${ENIQ_CONF_DIR}/upgrade_params.ini om_sw=$om_sw
+        if [[ $? -eq 0 ]];then
+                i=`$EXPR $i + 1`
+        fi
+	else
+		$ECHO "Error: Directory $om_sw does not exists." | $TEE -a ${LOGFILE}
+		flag=1
+	fi
+
+	while [ 1 ]; do
+
+		$ECHO "\nDo you want to Install New Licenses" | $TEE -a ${LOGFILE}
+		$ECHO "\nEnter [Yes/No] Case Sensitive" | $TEE -a ${LOGFILE} 
+		read option
+
+		if [[ $option != 'Yes' && $option != 'No' ]]; then
+			$ECHO "\nInvalid Input. Please Enter Valid Input:\n" | $TEE -a ${LOGFILE} 
+		else
+
+			if [[ $option == 'Yes' ]]; then
+		
+				$ECHO -e "\nEnter License Path" | $TEE -a ${LOGFILE}
+				read license_path
+		
+				if [ -f $license_path ];
+				then
+					iniset inputs -f ${ENIQ_CONF_DIR}/upgrade_params.ini license_path=$license_path
+				if [[ $? -eq 0 ]];then
+					i=`$EXPR $i + 1`
+			fi
+		else
+			$ECHO "Error: Licence File Path $license_path is invalid." | $TEE -a ${LOGFILE}
+			exit 1;
+		fi
+
+		
+		$ECHO "\nStarting to Install Licenses \nfrom $license_path\n" | $TEE -a ${LOGFILE}
+		$SU - dcuser -c "licmgr -install $license_path" >> ${LOGFILE}
+		if [[ $? -eq 0 ]]; then
+		   $ECHO "\nCompleted Licence Installation\n" | $TEE -a ${LOGFILE}
+		   $ECHO "\n=====================================================\n" | $TEE -a ${LOGFILE}
+		   
+		else
+		   $ECHO "Could not Complete Licence Installation\n" | $TEE -a ${LOGFILE}
+		   $ECHO "\n=====================================================\n" | $TEE -a ${LOGFILE}
+			exit 1;
+		fi
+	fi
+
+	break;
+
+fi 
+
+done
+
+if [[ $action_type != 'upgrade_platform_only' ]]; then
+	VAR='${ENIQ_INSTAL_DIR}/upgrade_feature_selection.bsh'
+	if [ -e "${VAR}" ]; then
+        	$BASH ${ENIQ_INSTAL_DIR}/upgrade_feature_selection.bsh
+        	if [[ $? -eq 0 ]];then
+                	i=`$EXPR $i + 1`
+        	fi
+	else
+		$BASH ${ENIQ_UPGR_DIR}/core_install/bin/upgrade_feature_selection.bsh
+		if [[ $? -eq 0 ]];then
+                        i=`$EXPR $i + 1`
+                fi
+	fi
+fi
+
+
+$ECHO "\n\n===============================================================================" | $TEE -a ${LOGFILE}
+
+if [[ $i -gt 3 ]]; then
+		$ECHO "\nUpgrade Software Directory:\t" $upg_sw_dir | $TEE -a ${LOGFILE}
+
+        if [[ $l -eq 4 ]]; then
+                $ECHO -e "\nMWS IP Address:\t\t\t" $mws_ip | $TEE -a ${LOGFILE}
+        fi
+		
+		if [[ $l -eq 4 ]]; then
+                $ECHO -e "\nMWS Hostname:\t\t\t" $mws_hostname | $TEE -a ${LOGFILE}
+        fi
+
+        if [ "${CURR_SERVER_TYPE}" == "stats_coordinator" ]; then
+                if [[ $j -eq 8 ]]; then
+                        $ECHO -e "\nOMBS Backup IP:\t\t\t" $ombs_backup_ip | $TEE -a ${LOGFILE}
+                        $ECHO -e "\nENIQ Hostnames:\t\t\t" $eniq_mb_hostname1"\n\t\t\t\t" $eniq_mb_hostname2"\n\t\t\t\t" $eniq_mb_hostname3"\n\t\t\t\t" $eniq_mb_hostname4 | $TEE -a ${LOGFILE}
+                fi
+        else
+                if [[ $j -eq 5 ]]; then
+                        $ECHO -e "\nOMBS Backup IP:\t\t\t" $ombs_backup_ip | $TEE -a ${LOGFILE}
+                        $ECHO -e "\nENIQ Hostname:\t\t\t" $eniq_hostname | $TEE -a ${LOGFILE}
+                fi
+        fi
+
+        if [ "$action_type" == "upgrade" ]; then
+			$ECHO "\nAction Type:\t\t\t Full Upgrade" | $TEE -a ${LOGFILE}
+		else
+			$ECHO "\nAction Type:\t\t\t Platform Upgrade" | $TEE -a ${LOGFILE}
+		fi
+        $ECHO "\nENIQ Base Software Path:\t" $eniq_base_sw | $TEE -a ${LOGFILE}
+        if [[ $action_type == 'upgrade' ]]; then
+                $ECHO -e "\nENIQ Feature Software Path:\t" $eniq_feature_sw | $TEE -a ${LOGFILE}
+        fi
+        $ECHO "\nOM Software Path:\t\t" $om_sw | $TEE -a ${LOGFILE}
+
+        $ECHO "\n===============================================================================\n" | $TEE -a ${LOGFILE}
+        $ECHO "\nDo you want to continue with the above inputs? (Yes/No)" | $TEE -a ${LOGFILE}
+        read ch
+
+        if [[ $ch == 'Yes' ]]; then
+            k=1
+			if [ $flag == 0 ]; then
+				$ECHO "\n\nUpdated All Inputs Successfully" | $TEE -a ${LOGFILE}
+				$ECHO "\n===============================================================================\n" | $TEE -a ${LOGFILE}
+				break;
+			else
+				$ECHO "\n\nSome Inputs are Invalid... Please Provide Valid Inputs..." | $TEE -a ${LOGFILE}
+				$ECHO "\n===============================================================================\n" | $TEE -a ${LOGFILE}
+			fi
+        elif [[ $ch == 'No' ]]; then
+
+        j=0
+        l=0
+
+        fi
+else
+        $ECHO "\nSome Inputs Not Updated Successfully" | $TEE -a ${LOGFILE}
+		$ECHO "\n===============================================================================\n" | $TEE -a ${LOGFILE}
+        break;
+fi
+
+done
+
+

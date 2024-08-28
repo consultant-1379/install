@@ -1,0 +1,1715 @@
+#!/bin/bash
+# ********************************************************************
+# Ericsson Radio Systems AB                                     SCRIPT
+# ********************************************************************
+#
+#
+# (c) Ericsson Radio Systems AB 2017 - All rights reserved.
+#
+# The copyright to the computer program(s) herein is the property
+# of Ericsson Radio Systems AB, Sweden. The programs may be used
+# and/or copied only with the written permission from Ericsson Radio
+# Systems AB or in accordance with the terms and conditions stipulated
+# in the agreement/contract under which the program(s) have been
+# supplied.
+#
+# ********************************************************************
+# Name    : create_events_ini.bsh
+# Date    : 05/01/2017
+# Revision: main/30
+# Purpose : Script to create a new 'ini' for the ENIQ server
+#
+# Usage   : create_events_ini.bsh
+#
+# ********************************************************************
+#
+#   Command Section
+#
+# ********************************************************************
+AWK=/usr/bin/awk
+BASENAME=/usr/bin/basename
+BASH=/usr/bin/bash
+BC=/usr/bin/bc
+BOOTADM=/usr/sbin/bootadm
+CAT=/usr/bin/cat
+CHMOD=/usr/bin/chmod
+CHOWN=/usr/bin/chown
+CLEAR=/usr/bin/clear
+CMP=/usr/bin/cmp
+CP=/usr/bin/cp
+CPIO=/usr/bin/cpio
+DATE=/usr/bin/date
+DIRNAME=/usr/bin/dirname
+DOMAINNAME=/usr/bin/domainname
+DTCONFIG=/usr/dt/bin/dtconfig
+DUMPADM=/usr/sbin/dumpadm
+ECHO=/usr/bin/echo
+EGREP=/usr/bin/egrep
+EJECT=/usr/bin/eject
+ENV=/usr/bin/env
+EXPR=/usr/bin/expr
+FIND=/usr/bin/find
+FLARCREATE=/usr/sbin/flarcreate
+FORMAT=/usr/sbin/format
+FUSER=/usr/sbin/fuser
+GEGREP=/usr/sfw/bin/gegrep
+GETENT=/usr/bin/getent
+GETTEXT=/usr/bin/gettext
+GREP=/usr/bin/grep
+GROUPADD=/usr/sbin/groupadd
+GTAR=/usr/sfw/bin/gtar
+GZCAT=/usr/bin/gzcat
+GZIP=/usr/bin/gzip
+HEAD=/usr/bin/head
+MYHOSTNAME=/usr/bin/hostname
+ID=/usr/bin/id
+IFCONFIG=/usr/sbin/ifconfig
+INIT=/usr/sbin/init
+LN=/usr/bin/ln
+LS=/usr/bin/ls
+MKDIR=/usr/bin/mkdir
+MORE=/usr/bin/more
+MOUNT=/usr/sbin/mount
+MV=/usr/bin/mv
+NAWK=/usr/bin/nawk
+NETSTAT=/usr/bin/netstat
+NSLOOKUP=/usr/sbin/nslookup
+PGREP=/usr/bin/pgrep
+PING=/usr/sbin/ping
+PKGADD=/usr/sbin/pkgadd
+PKGINFO=/usr/bin/pkginfo
+PKGRM=/usr/sbin/pkgrm
+PRTCONF=/usr/sbin/prtconf
+PSRINFO=/usr/sbin/psrinfo
+PWD=/usr/bin/pwd
+REBOOT=/usr/sbin/reboot
+RM=/usr/bin/rm
+RCP=/usr/bin/rcp
+RSH=/usr/bin/rsh
+SED=/usr/bin/sed
+SEVEN_Z=/usr/bin/7z
+SLEEP=/usr/bin/sleep
+SORT=/usr/bin/sort
+STMSBOOT=/usr/sbin/stmsboot
+SU=/usr/bin/su
+SVCADM=/usr/sbin/svcadm
+SVCCFG=/usr/sbin/svccfg
+SVCPROP=/usr/bin/svcprop
+SVCS=/usr/bin/svcs
+SWAP=/usr/sbin/swap
+SYNC=/usr/sbin/sync
+TAIL=/usr/bin/tail
+TAR=/usr/sbin/tar
+TEE=/usr/bin/tee
+TOUCH=/usr/bin/touch
+TPUT=/usr/bin/tput
+TR=/usr/bin/tr
+UADMIN=/usr/sbin/uadmin
+UMOUNT=/usr/sbin/umount
+UNAME=/usr/bin/uname
+USERADD=/usr/sbin/useradd
+VOLD=/usr/sbin/vold
+WC=/usr/bin/wc
+YES=/usr/bin/yes
+ZFS=/usr/sbin/zfs
+ZPOOL=/usr/sbin/zpool
+
+# ********************************************************************
+#
+#       Configuration Section
+#
+# ********************************************************************
+# Name of SunOS & ENIQ ini Files
+BLK_STOR_INI=block_storage.ini
+ENIQ_ENV=niq.rc
+ENIQ_INI=niq.ini
+LUN_MAP_INI=lun_map.ini
+RBAC_INI=RBAC.ini
+SUNOS_INI=SunOS.ini
+SENTINEL_INI=sentinel.ini
+STORAGE_INI=storage.ini
+TP_INI=input_parameters.ini
+ECS_INI=ecs.ini
+SYM_LINK_INI=sym_links.ini
+IPMP_INI=ipmp.ini
+CEP_MED_INI=cep_mediation.ini
+
+# DVD LABEL or Jumpstart Directory where all ENIQ SW will reside
+ENIQ_BASE_SW=eniq_base_sw
+
+# String denoting the start of an OSS reference name. Appended
+# to this will be the next available number
+OSS_REF_STR=eniq_oss_
+
+# String denoting the start of a reader reference name. Appended
+# to this will be the next available number
+READER_STR=dwh_reader_
+
+# Default user
+DEFAULT_USER=root
+
+# Directory on the root filesystem
+ENIQ_ROOT_DIR=/eniq
+
+# These are the disks that are not allowed to be a root mirror. They must
+# be delimited by "|" for regex to work.
+NOT_ALLOWED_ROOT_MIRROR="SUN[ ]+T300|SUN[ ]+StorEdge[ ]*3[0-9][0-9][0-9]"
+
+# ********************************************************************
+#
+#       Pre-execution Operations
+#
+# ********************************************************************
+
+if [ -e "/etc/zoned" ]; then
+	export ZONE=yes
+fi
+
+# ********************************************************************
+#
+#       Pre-execution Operations
+#
+# ********************************************************************
+
+# ********************************************************************
+#
+#   Functions
+#
+# ********************************************************************
+### Function: abort_script ###
+#
+#   This will is called if the script is aborted thru an error
+#   error signal sent by the kernel such as CTRL-C or if a serious
+#   error is encountered during runtime
+#
+# Arguments:
+#       $1 - Error message from part of program (Not always used)
+# Return Values:
+#       none
+abort_script()
+{
+_err_time_=`$DATE '+%Y-%b-%d_%H.%M.%S'`
+
+if [ "$1" ]; then
+    _err_msg_="${_err_time_} - $1"
+else
+    _err_msg_="${_err_time_} - ERROR : Script aborted.......\n"
+fi
+
+if [ "${LOGFILE}" ]; then
+    $ECHO "\n$_err_msg_\n"|$TEE -a ${LOGFILE}
+else
+    $ECHO "\n$_err_msg_\n"
+fi
+
+cd $SCRIPTHOME
+
+$RM -rf ${TEM_DIR} 
+
+if [ "$2" ]; then
+    exit ${2}
+else
+   exit 1
+fi
+}
+
+### Function: backup_ini_files_after_nas ###
+#
+# Taking backup of various INI files after asking
+# NAS valued in ${TEM_DIR}/backup directory
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+backup_ini_files_after_nas()
+{
+# Create a ${TEM_DIR}/backup dir where backup will be taken
+$RM -rf ${TEM_DIR}/backup
+$MKDIR -p ${TEM_DIR}/backup
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not create directory ${TEM_DIR}/backup"
+    abort_script "$_err_msg_"
+fi
+
+common_store_new_inis ${TEM_DIR} ${TEM_DIR}/backup ${LOGFILE} ${SUNOS_INI} ${SYM_LINK_INI} ${ENIQ_ENV} ${RBAC_INI} ${ENIQ_INI} ${STORAGE_INI}
+
+$ECHO "Backup of ini files after NAS values confirmation has been taken under directory ${TEM_DIR}/backup" >> ${LOGFILE}
+}
+
+### Function: check_id ###
+#
+#   Check that the effective id of the user is correct
+#   If not print error msg and exit.
+#
+# Arguments:
+#       $1 : User ID name
+# Return Values:
+#       none
+check_id()
+{
+_check_id_=`$ID  | $AWK -F\( '{print $2}' | $AWK -F\) '{print $1}'`
+if [ "$_check_id_" != "$1" ]; then
+    _err_msg_="You must be $1 to execute this script."
+    abort_script "$_err_msg_"
+fi
+}
+
+### Function: chk_create_logfile ###
+#
+# Check/Create Logfile
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+chk_create_logfile()
+{
+$MKDIR -p `$DIRNAME ${LOGFILE}`
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not create directory `$DIRNAME ${LOGFILE}`"
+     abort_script "$_err_msg_"
+fi
+
+$TOUCH -a ${LOGFILE}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not write to file ${LOGFILE}"
+    abort_script "$_err_msg_"
+fi
+}
+
+### Function: create_initial_oss_cmd_file ###
+#
+# Creates a command file that will add the initial OSS
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+create_initial_oss_cmd_file()
+{
+$RM -f ${ENIQ_CONF_DIR}/.add_initial_oss.bsh
+
+# Set up the command
+_cmd_="/bin/bash ${ENIQ_ADMIN_BIN_DIR}/manage_eniq_oss.bsh -N -I -a add -i ${OSS_SRV_IP} -d ${FEATURE_SW_DIR}"
+
+$ECHO "#!/usr/bin/bash
+while getopts \":l:\" arg; do
+  case \$arg in
+    l) LOGFILE="\$OPTARG"
+       ;;
+   \?) exit 1
+       ;;
+  esac
+done
+shift \`expr \$OPTIND - 1\`
+
+if [ "\${LOGFILE}" ]; then
+    _logopt_=\"-l \${LOGFILE}\"
+fi
+
+${_cmd_} \${_logopt_}
+if [ \$? -ne 0 ]; then
+    $ECHO \"Error running command\n${_cmd_}\"
+    $RM -f ${ENIQ_CONF_DIR}/.add_initial_oss.bsh
+    exit 1
+fi
+$RM -f ${ENIQ_CONF_DIR}/.add_initial_oss.bsh
+exit 0
+" >> ${ENIQ_CONF_DIR}/.add_initial_oss.bsh
+}
+
+### Function: get_absolute_path ###
+#
+# Determine absolute path to software
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+get_absolute_path()
+{
+_dir_=`$DIRNAME $0`
+SCRIPTHOME=`cd $_dir_ 2>/dev/null && pwd || $ECHO $_dir_`
+}
+
+### Function: get_default_router ###
+#
+# Get the default router for the system
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+get_default_router()
+{
+_def_router_=""	
+_set_router_=`$NETSTAT -nr | $NAWK '{print $1,$2}' | $GREP -w default | $NAWK '{print $2}'`
+if [ "${_set_router_}" ]; then
+    _def_router_=${_set_router_}
+fi
+
+common_get_router $LOGFILE ${_def_router_} ${_set_router_}
+
+if [ "${DEFAULTROUTER}" ]; then
+    iniset SunOS_GATEWAY -f ${TEM_DIR}/${SUNOS_INI} DEFAULTROUTERS=${DEFAULTROUTER}
+    if [ $? -ne 0 ]; then
+        _err_msg_="Could not update ${TEM_DIR}/${SUNOS_INI} with DEFAULTROUTERS=${DEFAULTROUTER}"
+        abort_script "$_err_msg_"
+    fi
+fi
+}
+
+### Function: get_dns_domain ###
+#
+# Get the dns domain for the system
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+get_dns_domain()
+{
+# Check if we can get a value for DNS domain
+if [ ! "${SOLARIS_10}" ]; then
+    _client_dns_svc_="svc:/network/dns/client:default"
+    _client_dns_prop_="config/search"
+    _def_dns_domain_=`$SVCPROP -p ${_client_dns_prop_} ${_client_dns_svc_}`
+else
+    if [ -s /etc/resolv.conf ]; then
+   	 _def_dns_domain_=`$CAT /etc/resolv.conf | $GEGREP '^[[:blank:]]*domain' | $NAWK '{print $2}'`
+    fi
+fi
+
+common_get_dns_domain ${_def_dns_domain_}
+
+if [ "${DNSDOMAIN}" ]; then
+    iniset SunOS_DNS -f ${TEM_DIR}/${SUNOS_INI} DNSDOMAIN=${DNSDOMAIN}
+    if [ $? -ne 0 ]; then
+        _err_msg_="Could not update ${TEM_DIR}/${SUNOS_INI} with DNSDOMAIN=${DNSDOMAIN}"
+        abort_script "$_err_msg_"
+    fi
+fi
+}
+
+### Function: get_dns_server ###
+#
+# Get the dns server for the system
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+get_dns_server()
+{
+unset DNSSERVERS _def_dns_servers_
+
+if [ ! "${SOLARIS_10}" ]; then
+    # Check if we can get value for DNS server(s)
+    _client_dns_svc_="svc:/network/dns/client:default"
+    _client_dns_prop_="config/nameserver"
+    _def_dns_servers_=`$SVCPROP -p ${_client_dns_prop_} ${_client_dns_svc_}`
+else
+    if [ -s /etc/resolv.conf ]; then
+        _list_=`$CAT /etc/resolv.conf | $GEGREP '^[[:blank:]]*nameserver' | $NAWK '{print $2}'`
+    	for _dns_ in $_list_; do
+             if [ ! "${_def_dns_servers_}" ]; then
+          	  _def_dns_servers_=${_dns_}
+             else
+                  _def_dns_servers_="${_def_dns_servers_}:${_dns_}"
+             fi
+        done
+   fi
+fi
+
+common_get_dns_serv ${_def_dns_servers_} 
+
+if [ "${DNSSERVERS}" ]; then
+    iniset SunOS_DNS -f ${TEM_DIR}/${SUNOS_INI} NAMESERVERS=${DNSSERVERS}
+    if [ $? -ne 0 ]; then
+        _err_msg_="Could not update ${TEM_DIR}/${SUNOS_INI} with NAMESERVERS=${DNSSERVERS}"
+        abort_script "$_err_msg_"
+    fi
+fi
+}
+
+### Function: get_end_users ###
+#
+# Get the amount of end users for the system
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+get_end_users()
+{
+_max_users_=`iniget SYSTEM_INFO -f ${TEM_DIR}/${ENIQ_INI} -v Max_Num_Users`
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not read Max_Num_Users value in ${TEM_DIR}/${ENIQ_INI}"
+    abort_script "$_err_msg_"
+fi
+
+# Call the common function to get the number of end users
+common_get_num_users ${_max_users_}
+
+if [ "${END_USERS}" ]; then
+    iniset SYSTEM_INFO -f ${TEM_DIR}/${ENIQ_INI} System_End_Users=${END_USERS}
+    if [ $? -ne 0 ]; then
+        _err_msg_="Could not update ${TEM_DIR}/${ENIQ_INI} with System_End_Users=${END_USERS}"
+        abort_script "$_err_msg_"
+    fi
+fi	
+}
+
+### Function: get_cep_med_details ###
+#
+# Get the CEP Mediation information
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+get_cep_med_details()
+{
+# Check have we the ini file
+if [ ! -f ${TEM_DIR}/${CEP_MED_INI} ]; then
+	_err_msg_="${TEM_DIR}/${CEP_MED_INI} file not found"
+    abort_script "$_err_msg_"
+fi
+
+$RM -rf ${TEM_DIR}/cep_med_summary
+$ECHO "CEP Mediation Details" >> ${TEM_DIR}/cep_med_summary
+$ECHO "---------------------" >> ${TEM_DIR}/cep_med_summary
+
+# Ask if the user wants to add CEP Mediation
+
+common_get_cep_med_details
+
+iniset CEP_MEDIATION_INCLUDED -f ${TEM_DIR}/${CEP_MED_INI} ADD_CEP_MED=${CEP_MED_USR_CHOICE}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not update ${TEM_DIR}/${CEP_MED_INI} with ADD_CEP_MED=${CEP_MED_USR_CHOICE}"
+    abort_script "$_err_msg_"
+fi
+
+# Call the script that will build the ini file
+if [ "${CEP_MED_USR_CHOICE}" == "Yes" ]; then
+	$BASH ${SCRIPTHOME}/manage_cep_mediation.bsh -a add -f ${TEM_DIR}/cep_med_summary -i ${TEM_DIR}/${CEP_MED_INI} -n ${CEP_MED_NUM_SRVRS} -l ${LOGFILE}
+    if [ $? -ne 0 ]; then
+        _err_msg_="Problem encountered while running ${SCRIPTHOME}/manage_cep_mediation.bsh"
+        abort_script "$_err_msg_"
+    fi
+else
+	$RM -f ${TEM_DIR}/cep_med_summary
+fi
+
+}
+
+### Function: get_eniq_features_list ###
+#
+# Get the list of ENIQ features to be installed
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+get_eniq_features_list()
+{
+unset FEATURE_SW_DIR
+while :; do
+    $ECHO "\n\nPlease enter the ENIQ feature software path \n"
+    read FEATURE_SW_DIR
+
+    if [ ! -d ${FEATURE_SW_DIR} ]; then
+        continue
+    fi
+    break
+done
+
+$TOUCH -a ${ENIQ_CONF_DIR}/eniq_feature_locate
+if [ $? == 0 ]; then
+$ECHO ${FEATURE_SW_DIR} > ${ENIQ_CONF_DIR}/eniq_feature_locate
+else
+$ECHO Could not create ${ENIQ_CONF_DIR}/eniq_feature_locate file
+fi
+
+# Get directory where the ENIQ Features are stored on DVD/Jumpstart
+_eniq_feat_input_dir_=`iniget FEATURE_INFO -f ${TEM_DIR}/${ENIQ_INI} -v Feature_Input_Dir`
+if [ ! "${_eniq_feat_input_dir_}" ]; then
+    _err_msg_="Could not read parameter Feature_Input_Dir from file\n${TEM_DIR}/${ENIQ_INI}"
+    abort_script "$_err_msg_"
+fi
+
+# Get file where the ENIQ Features are listed on DVD/Jumpstart
+_tem_feat_input_file_=`iniget FEATURE_INFO -f ${TEM_DIR}/${ENIQ_INI} -v Feature_Input_File`
+if [ ! "${_tem_feat_input_file_}" ]; then
+    _err_msg_="Could not read parameter Feature_Input_File from file\n${TEM_DIR}/${ENIQ_INI}"
+    abort_script "$_err_msg_"
+fi
+
+# Does the feature input file exist?
+_eniq_feat_input_file_="$BASE_SW_DIR/${_eniq_feat_input_dir_}/${_tem_feat_input_file_}"
+if [ ! -s ${_eniq_feat_input_file_} ]; then
+    _err_msg_="Could not locate ENIQ Features input file\n${_eniq_feat_input_file_}"
+    abort_script "$_err_msg_"
+fi
+
+# Start Sentinel 
+start_Sentinel ${ENIQ_SENTINEL_BIN_DIR} ${ENIQ_SENTINEL_ENV} ${LOGFILE}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not start the Sentinel license server"
+    abort_script "$_err_msg_"
+fi
+
+# Does the sentinel lsmon binary exist?
+if [ ! -x ${ENIQ_SENTINEL_BIN_DIR}/lsmon ]; then
+    _err_msg_="${ENIQ_SENTINEL_BIN_DIR}/lsmon not found or not executable"
+    abort_script "$_err_msg_"
+fi
+
+# Get a list of licenced features
+get_licenced_features ${LOGFILE} ${TEM_DIR} ${ENIQ_SENTINEL_BIN_DIR}/lsmon ${LSHOST}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not generate a list of licences on ${LSHOST}"
+    abort_script "$_err_msg_"
+fi
+
+unset FEATURE_ARRAY START_DATE_ARRAY END_DATE_ARRAY
+# Build 3 arrays of all the ENIQ Features. One array for the description
+# and the 2nd array for the file designation
+_cnt_=${#_tem_feature_array_[@]}
+_ptr_=0
+for (( i=0; i<=${_cnt_}; i++)); do
+    _desc_=`$CAT ${_eniq_feat_input_file_} | $GEGREP "^[[:blank:]]*${_tem_feature_array_[${i}]}::" | $NAWK -F"::" '{print $2}'`
+    if [ "${_desc_}" ]; then
+		let _ptr_=${_ptr_}+1
+		FEATURE_ARRAY[${_ptr_}]=${_tem_feature_array_[${i}]}
+		START_DATE_ARRAY[${_ptr_}]=${_tem_start_date_array_[${i}]}
+		END_DATE_ARRAY[${_ptr_}]=${_tem_end_date_array_[${i}]}
+		DESC_ARRAY[${_ptr_}]=${_desc_}
+	
+		if [ ! "${FEATURE_ARRAY[${_ptr_}]}" -o ! "${START_DATE_ARRAY[${_ptr_}]}" -o ! "${END_DATE_ARRAY[${_ptr_}]}" -o ! "${DESC_ARRAY[${_ptr_}]}" ]; then
+		    _err_msg_="Malformed license value"
+		    abort_script "$_err_msg_"
+		fi
+    fi
+done
+
+if [ ${#START_DATE_ARRAY[@]} -eq 0 ]; then
+    _err_msg_="No valid ENIQ licenses read from License Server ${LSHOST}"
+    abort_script "$_err_msg_"
+fi
+
+# Create the Display file
+_disp_file_=${TEM_DIR}/disp_file
+_unlic_file_=${TEM_DIR}/unlicensed_file
+
+# Call the common function to get the feature choice
+common_get_feature_choice ${_disp_file_} ${_unlic_file_} ${TEM_DIR}
+
+$RM -rf ${TEM_DIR}/feature_output_list >> /dev/null 2>&1
+
+# We need to put the list in order now and remove the duplicates.
+while read _feat_detail_; do
+    _feat_=`$ECHO ${_feat_detail_}| $NAWK -F"::" '{print $1}'`
+    $CAT ${TEM_DIR}/feature_output_list1 | $SORT -u | $GEGREP "^${_feat_}::" >> ${TEM_DIR}/feature_output_list 2>/dev/null
+done < ${_eniq_feat_input_file_}
+}
+
+### Function: get_excl_ctrl_list ###
+#
+# Get a list of controllers which has disks that we deem unsuitable for root disk
+# attached to it
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+get_excl_ctrl_list()
+{
+EXCLUDE_CTRLS=""
+# Create a variable that contains a list of controllers to be excluded
+# If more than one controller, these will be seperated by '|' to work in regex
+EXCLUDE_CTRLS=`$CFGADM -alv | $GEGREP "(${NOT_ALLOWED_ROOT_MIRROR})" \
+    | $NAWK -F"::" '{print $1}' | $SORT -u | $SED -e 's| |\||g'`
+EXCLUDE_CTRLS=`$ECHO ${EXCLUDE_CTRLS} | $SED -e 's| |\||g'`
+}
+
+### Function: get_glassfish_hostname ###
+#
+# Get the FQN of the glassfish server
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+get_glassfish_hostname()
+{
+# Call the common function to get the FQDN for glassfish
+common_get_glassfish_fqdn
+
+if [ "${GF_FQDN}" ]; then
+    iniset GLASSFISH -f ${TEM_DIR}/${ENIQ_INI} GF_FullHost=${GF_FQDN}
+    if [ $? -ne 0 ]; then
+        _err_msg_="Could not update ${TEM_DIR}/${ENIQ_INI} with GF_FullHost=${GF_FQDN}"
+        abort_script "$_err_msg_"
+    fi
+fi		
+}
+
+### Function: get_ldap_details ###
+#
+# Get the LDAP details for the system
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+get_ldap_details()
+{
+# Get the LDAP domain name
+#get_ldap_domain
+	
+# Get the LDAP IP address
+get_ldap_ip
+	   
+# Get the LDAP server hostname
+get_ldap_hostname
+
+# Get the LDAP server password
+#get_ldap_password
+}
+
+### Function: get_ldap_domain ###
+#
+# Get the LDAP domain for the system
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+get_ldap_domain()
+{
+# Call the common function to get the domain
+common_get_ldap_domain
+
+if [ "${LDAPDOMAIN}" ]; then
+    iniset LDAP -f ${TEM_DIR}/${ENIQ_INI} LDAP_DOMAIN=${LDAPDOMAIN}
+    if [ $? -ne 0 ]; then
+        _err_msg_="Could not update ${TEM_DIR}/${ENIQ_INI} with LDAP_DOMAIN=${LDAPDOMAIN}"
+        abort_script "$_err_msg_"
+    fi
+fi
+}
+
+### Function: get_ldap_hostname ###
+#
+# Get the LDAP hostname
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+get_ldap_hostname()
+{
+#_ldap_ip_addr_=`iniget LDAP -f ${TEM_DIR}/${ENIQ_INI} -v LDAP_SERVER_IP`
+#if [ "${_ldap_ip_addr_}" ]; then
+#	_def_ldap_hostname_=`$GETENT hosts ${_ldap_ip_addr_} | $NAWK '{print $2}'`
+#fi
+	
+# Call the common function to get the LDAP server hostname
+#common_get_ldap_server_name ${_def_ldap_hostname_}
+
+LDAP_HOST=$HNAME
+
+if [ "${LDAP_HOST}" ]; then
+	iniset LDAP -f ${TEM_DIR}/${ENIQ_INI} LDAP_SERVER_HOSTNAME=${LDAP_HOST}
+	if [ $? -ne 0 ]; then
+	    _err_msg_="Could not update ${TEM_DIR}/${ENIQ_INI} with LDAP_SERVER_HOSTNAME=${LDAP_HOST}"
+	    abort_script "$_err_msg_"
+	fi
+fi
+}
+
+### Function: get_ldap_ip ###
+#
+# Get the LDAP IP for the system
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+get_ldap_ip()
+{
+# Call the common function to get the LDAP server IP
+#common_get_ldap_ip_addr
+
+LDAP_IP=$HOST_IP
+
+if [ "${LDAP_IP}" ]; then
+	iniset LDAP -f ${TEM_DIR}/${ENIQ_INI} LDAP_SERVER_IP=${LDAP_IP}
+	if [ $? -ne 0 ]; then
+	    _err_msg_="Could not update ${TEM_DIR}/${ENIQ_INI} with LDAP_SERVER_IP=${LDAP_IP}"
+	    abort_script "$_err_msg_"
+	fi
+fi
+}
+
+### Function: get_ldap_password ###
+#
+# Get the LDAP server password
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+get_ldap_password()
+{
+_ldap_password_="ldap"
+
+if [ ! "${_ldap_password_}" ]; then
+	continue
+fi
+
+LDAP_PASS="${_ldap_password_}"
+
+if [ "${LDAP_PASS}" ]; then
+	iniset LDAP -f ${TEM_DIR}/${ENIQ_INI} LDAP_BIND_PASSWORD=${LDAP_PASS}
+	if [ $? -ne 0 ]; then
+	    _err_msg_="Could not update ${TEM_DIR}/${ENIQ_INI} with LDAP_BIND_PASSWORD=${LDAP_PASS}"
+	    abort_script "$_err_msg_"
+	fi
+fi
+}
+
+### Function: get_nas_console_ip ###
+#
+# Get the physical IPs for the NAS
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+get_nas_console_ip()
+{
+# Call the function to get the NAS console IP	
+common_get_nas_console_ip
+
+if [ "${NAS_CONSOLE_IP}" ]; then
+    iniset NAS_DETAILS -f ${TEM_DIR}/${SUNOS_INI} NAS_Console_IP=${NAS_CONSOLE_IP}
+    if [ $? -ne 0 ]; then
+        _err_msg_="Could not update ${TEM_DIR}/${SUNOS_INI} with NAS_Console_IP=${NAS_CONSOLE_IP}"
+        abort_script "$_err_msg_"
+    fi
+fi
+
+# Update hosts
+$ECHO "nasconsole" >> ${TEM_DIR}/exclude_from_hosts
+$ECHO "${NAS_CONSOLE_IP} nasconsole" >> ${TEM_DIR}/hosts.$$
+}
+
+### Function: get_nas_details ###
+#
+# Get NAS details
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+get_nas_details()
+{
+if [ ! -s /etc/inet/hosts.orig ]; then
+    # Make a backup of the hosts file
+    $ECHO "Creating a backup copy of /etc/inet/hosts in /etc/inet/hosts.orig" >> ${LOGFILE}
+    $CP -p /etc/inet/hosts /etc/inet/hosts.orig >> /dev/null 2>&1
+    if [ $? -ne 0 ]; then
+	_err_msg_="Could not make backup of /etc/inet/hosts"
+	abort_script "$_err_msg_" 
+    fi
+fi
+
+$RM -rf ${TEM_DIR}/exclude_from_hosts ${TEM_DIR}/include_in_hosts ${TEM_DIR}/hosts.$$
+
+# Get the console IP for the NAS
+get_nas_console_ip
+
+# Get the logical NAS IP addresses
+get_virtual_nas_ips
+
+# Get the NAS pool name
+get_primary_nas_pool_name
+
+# Get the NAS passwords (use common functions)
+common_get_nas_mas_password
+common_get_nas_sup_password
+
+# Get values in regex string
+_regex_str_=`$CAT ${TEM_DIR}/exclude_from_hosts`
+_regex_str_=`$ECHO ${_regex_str_} | $SED -e's/ /\|/g'`
+
+# Update hosts
+$CAT /etc/inet/hosts | $GEGREP -vw "(${_regex_str_})" >> ${TEM_DIR}/hosts.$$
+$CAT ${TEM_DIR}/include_in_hosts >> ${TEM_DIR}/hosts.$$
+
+# Make a backup of the hosts file
+$ECHO "Updating /etc/inet/hosts with NAS values" >> ${LOGFILE}
+$CP -p ${TEM_DIR}/hosts.$$ /etc/inet/hosts >> /dev/null 2>&1
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not copy ${TEM_DIR}/hosts.$$ to /etc/inet/hosts"
+    abort_script "$_err_msg_"
+fi
+
+# Updating the ssh_input_file with NAS passwords
+$ECHO "Updating ${ENIQ_TEMPL_DIR}/ssh_input_file with NAS passwords" >> ${LOGFILE}
+$CAT ${ENIQ_TEMPL_DIR}/ssh_input_file | $SED -e 's|'R_PW_M='|'R_PW_M=\"${NAS_MAS_PASSWORD}\"'|g' \
+    -e 's|'R_PW_S='|'R_PW_S=\"${NAS_SUP_PASSWORD}\"'|g' > ${TEM_DIR}/ssh_input_file.$$
+$CP ${TEM_DIR}/ssh_input_file.$$ ${ENIQ_CONF_DIR}/ssh_input_file
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not copy ${TEM_DIR}/ssh_input_file.$$ to ${ENIQ_TEMPL_DIR}/ssh_input_file"
+    abort_script "$_err_msg_"
+fi
+
+}
+
+### Function: get_network_subscribers ###
+#
+# Get the amount of users on the network
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+get_network_subscribers()
+{
+# Call the common function to get the subscriber number	
+common_get_num_subscribers
+
+if [ "${NETWORK_USERS}" ]; then
+    iniset NETWORK_INFO -f ${TEM_DIR}/${ENIQ_INI} Network_Users=${NETWORK_USERS}
+    if [ $? -ne 0 ]; then
+        _err_msg_="Could not update ${TEM_DIR}/${ENIQ_INI} with Network_Users=${NETWORK_USERS}"
+        abort_script "$_err_msg_"
+    fi
+fi	
+}
+
+### Function: get_partition_plan ###
+#
+# Get the partition plan for platform installer
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+get_partition_plan()
+{
+$RM -f ${TEM_DIR}/partition_plan
+
+_partition_file_=${PARTITION_FILE_LOC}/partition_plan_${INSTALL_TYPE}
+if [ ! -s ${_partition_file_} ]; then
+    _err_msg_="Could not find ${_partition_file_} file"
+    abort_script "$_err_msg_"
+fi
+
+# Get the options that can be installed
+$CAT ${_partition_file_} | $GEGREP -v '^[[:blank:]]*#' > ${TEM_DIR}/partition_plan
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not copy partition options to ${TEM_DIR}/partition_plan"
+    abort_script "$_err_msg_"
+fi
+
+# Call the common function to get the primary pool information	
+common_get_partition_plan ${TEM_DIR}/partition_plan ${TEM_DIR}/disp_file
+
+# Check if the chosen plan exists
+$LS ${PARTITION_PLAN_LOC} | $GREP ${PLAN} >> /dev/null 2>&1
+if [ $? -eq 0 ]; then
+    iniset PARTITION_PLAN -f ${TEM_DIR}/${ENIQ_INI} Partition_Plan=${PLAN}
+    if [ $? -ne 0 ]; then
+	_err_msg_="Could not update ${TEM_DIR}/${ENIQ_INI} with Partition_Plan=${PLAN}"
+	abort_script "$_err_msg_"
+    fi
+else
+    _err_msg_="Chosen partition plan does not exist in ${PARTITION_PLAN_LOC}"
+    abort_script "$_err_msg_"
+fi
+}
+
+### Function: get_primary_nas_pool_name ###
+#
+# Get the NAS pool name
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+get_primary_nas_pool_name()
+{
+# Call the common function to get the primary pool information	
+common_get_pri_pool
+
+if [ "${NAS_POOL}" ]; then
+    iniset NAS_DETAILS -f ${TEM_DIR}/${SUNOS_INI} NAS_Primary_Storage_Pool=${NAS_POOL}
+    if [ $? -ne 0 ]; then
+        _err_msg_="Could not update ${TEM_DIR}/${ENIQ_INI} with NAS_Primary_Storage_Pool=${NAS_POOL}"
+        abort_script "$_err_msg_"
+    fi
+    
+    $CAT ${TEM_DIR}/${STORAGE_INI} | $SED -e "s|<CHANGE><ENIQ_POOL_ID>|${NAS_POOL}|g" \
+	-e "s|<CHANGE><ENIQ_SEC_POOL_ID>|${NAS_POOL}|g" > ${TEM_DIR}/storage_ini.$$.$$
+    if [ $? -ne 0 ]; then
+	_err_msg_="Could not update ${TEM_DIR}/storage_ini.$$.$$"
+	abort_script "$_err_msg_"
+    fi
+    $CP ${TEM_DIR}/storage_ini.$$.$$ ${TEM_DIR}/${STORAGE_INI}
+    if [ $? -ne 0 ]; then
+	_err_msg_="Could not copy ${TEM_DIR}/storage_ini.$$.$$ to ${TEM_DIR}/${STORAGE_INI}"
+	abort_script "$_err_msg_"
+    fi
+fi
+}
+
+### Function: get_reader_info ###
+#
+# Get the IQ reader information
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+get_reader_info()
+{
+# See if a reader is to be installed on PR
+unset _install_reader_ INSTALL_READER
+
+if [ "${CURR_SERVER_TYPE}" == "eniq_ui" ]; then
+	INSTALL_READER=No
+else
+	INSTALL_READER=Yes
+fi
+
+if [ "${INSTALL_READER}" == "Yes" ]; then
+	$RM -rf ${_temp_dir_}/reader_information
+	$ECHO "\nReader information" >> ${_temp_dir_}/reader_information
+	$ECHO "------------------" >> ${_temp_dir_}/reader_information
+
+	# Call the common function to get the reader name and set its IP
+	common_get_reader_details ${READER_STR} ${HOST_IP} ${TEM_DIR}
+	
+	$ECHO "Adding ${READER_ALIAS}::${READER_IP} to ${ENIQ_CONF_DIR}/.reader_info" >> ${LOGFILE}
+	$RM -rf ${ENIQ_CONF_DIR}/.reader_info
+	$ECHO "${READER_ALIAS}::${READER_IP}" >> ${ENIQ_CONF_DIR}/.reader_info
+	
+	$ECHO "Reader alias\t${READER_ALIAS}" >> $TEM_DIR/reader_information
+	$ECHO "Reader IP\t${READER_IP}" >> $TEM_DIR/reader_information
+fi
+}
+
+### Function: get_shared_mem ###
+#
+# Get the amount of shared memory to allocate to IQ
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+get_shared_mem()
+{
+#Call the common function to get the shared memory	
+common_get_shared_mem
+
+_mem_bytes_=`$EXPR ${SHARED_MEM} \* 1024 \* 1024`
+
+iniset SunOS_KERNEL -f ${TEM_DIR}/${SUNOS_INI} shmsys:shminfo_shmmax=${_mem_bytes_}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not update ${TEM_DIR}/${SUNOS_INI} with shmsys:shminfo_shmmax=${_mem_bytes_}"
+    abort_script "$_err_msg_"
+fi
+}
+
+### Function: get_timezone ###
+#
+# Get the timezone for the system
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+get_timezone()
+{
+if [ -s /etc/default/init ]; then
+    _def_timezone_=`$CAT /etc/default/init | $GEGREP '^[[:blank:]]*TZ=' | $NAWK -F\= '{print $2}'`
+fi
+
+common_get_timezone ${_def_timezone_}
+
+if [ "${TIMEZONE}" ]; then
+    iniset SunOS_MISC -f ${TEM_DIR}/${SUNOS_INI} TIMEZONE=${TIMEZONE}
+    if [ $? -ne 0 ]; then
+        _err_msg_="Could not update ${TEM_DIR}/${SUNOS_INI} TIMEZONE=${TIMEZONE}"
+        abort_script "$_err_msg_"
+    fi
+fi
+}
+
+### Function: get_virtual_nas_ips ###
+#
+# Get the logical NAS IPs
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+get_virtual_nas_ips()
+{
+# Get the number of NAS IPs for this system
+_num_ips_=`iniget NAS_DETAILS -f ${TEM_DIR}/${SUNOS_INI} -v Number_Virt_NAS_IPs`	
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not read Number_Virt_NAS_IPs in ${TEM_DIR}/${ENIQ_INI}"
+    abort_script "$_err_msg_"
+fi
+
+# Call the common function to get the IPs
+common_get_nas_virtual_ip ${_num_ips_}
+
+if [ "${VIRTUAL_NAS_IP_LIST}" ]; then
+    iniset NAS_DETAILS -f ${TEM_DIR}/${SUNOS_INI} Virtual_NAS_IP_List="${VIRTUAL_NAS_IP_LIST}"
+    if [ $? -ne 0 ]; then
+        _err_msg_="Could not update ${TEM_DIR}/${ENIQ_INI} with Virtual_NAS_IP_List=${VIRTUAL_NAS_IP_LIST}"
+        abort_script "$_err_msg_"
+    fi
+fi
+
+# Update hosts
+_num_=1
+for _ip_ in ${VIRTUAL_NAS_IP_LIST}; do
+    # Update hosts exclude/include strings files
+    $ECHO "nas${_num_}" >> ${TEM_DIR}/exclude_from_hosts
+    $ECHO "${_ip_} nas${_num_}" >> ${TEM_DIR}/include_in_hosts
+    let _num_=_num_+1
+done
+}
+
+### Function: setup_env ###
+#
+# Setup up path environment etc
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+setup_env()
+{
+# Determine Solaris OS version
+unset SOLARIS_10
+OS_VERSION=`$UNAME -r`
+if [ "${OS_VERSION}" == "5.10" ]; then
+    SOLARIS_10=YES
+fi
+
+if [ ! "${ENIQ_BASE_DIR}" ]; then
+    ENIQ_BASE_DIR=/eniq
+fi
+
+ENIQ_CONF_DIR=${ENIQ_BASE_DIR}/installation/config
+if [ ! -s ${ENIQ_CONF_DIR}/ericsson_use_config ]; then
+    _err_msg_="Could not locate file ${ENIQ_CONF_DIR}/ericsson_use_config"
+    abort_script "$_err_msg_"
+fi
+
+# Main Directory for the Core Installation SW
+ENIQ_INST_DIR=${ENIQ_BASE_DIR}/installation
+
+# Main Directory for the Core Installation SW
+ENIQ_CORE_INST_DIR=${ENIQ_INST_DIR}/core_install
+
+# File containing the type of OSS installation. Eg. stats or events
+INST_TYPE_FILE=${ENIQ_CONF_DIR}/ericsson_use_config
+
+ENIQ_ADMIN_DIR=${ENIQ_BASE_DIR}/admin
+
+ENIQ_ADMIN_BIN_DIR=${ENIQ_ADMIN_DIR}/bin
+
+ENIQ_CLI_SW_DIR=${ENIQ_BASE_DIR}/sw
+
+CLI_CONF_DIR=${ENIQ_CLI_SW_DIR}/conf
+
+# File containing LUN Ids for the coordinator
+COORD_SYM_LINK_FILE=coordinator_sym_links.ini
+
+# File containing the type of OSS installation. Eg. events or statistics
+INST_TYPE_FILE=${ENIQ_CONF_DIR}/ericsson_use_config
+if [ ! -s "${INST_TYPE_FILE}" ]; then
+    _err_msg_="ENIQ install type not defined in ${INST_TYPE_FILE}"
+    abort_script "$_err_msg_" 
+fi
+# Read the installation type - should be "events" or "stats"
+INSTALL_TYPE=`$CAT ${INST_TYPE_FILE} | $NAWK -F\= '{print $2}'`
+
+# Templates Directory
+ENIQ_TEMPL_DIR="`$DIRNAME ${SCRIPTHOME}`/templates/${INSTALL_TYPE}"
+
+# Common SW directory
+ENIQ_COMMON_SW_DIR="`$DIRNAME ${SCRIPTHOME}`/templates/common"
+
+if [ ! -s $SCRIPTHOME/../lib/iniadd.pl ]; then
+    _err_msg_="Cannot locate $SCRIPTHOME/../lib/iniadd"
+    abort_script "$_err_msg_"
+else
+	INIADD=$SCRIPTHOME/../lib/iniadd.pl
+fi
+
+if [ ! -s $SCRIPTHOME/../lib/inidel.pl ]; then
+    _err_msg_="Cannot locate $SCRIPTHOME/../lib/inidel"
+    abort_script "$_err_msg_"
+else
+	INIDEL=$SCRIPTHOME/../lib/inidel.pl
+fi
+
+# Source the common functions library
+if [ ! -s $SCRIPTHOME/../lib/common_functions.lib ]; then
+    _err_msg_="Cannot locate $SCRIPTHOME/../lib/common_functions.lib"
+    abort_script "$_err_msg_"
+else
+   . $SCRIPTHOME/../lib/common_functions.lib
+fi
+
+# Source the common inirator library
+if [ ! -s $SCRIPTHOME/../lib/common_inirator_functions.lib ]; then
+    _err_msg_="Cannot locate $SCRIPTHOME/../lib/common_inirator_functions.lib"
+    abort_script "$_err_msg_"
+else
+   . $SCRIPTHOME/../lib/common_inirator_functions.lib
+fi
+
+if [ -s ${SCRIPTHOME}/../lib/common_core_install_functions.lib ]; then
+    . ${SCRIPTHOME}/../lib/common_core_install_functions.lib
+else
+    _err_msg_="File ${SCRIPTHOME}/../lib/common_core_install_functions.lib not found"
+    abort_script "$_err_msg_"
+fi
+
+HNAME=`${MYHOSTNAME}`
+HOST_IP=`$GETENT hosts ${HNAME} | $NAWK '{print $1}' | $HEAD -1`
+
+# ENIQ admin bin directory
+ENIQ_CONNECTD_DIR=${ENIQ_BASE_DIR}/connectd
+
+# Name of file containing List of used OSS reference names
+OSS_REF_NAME_FILE=${ENIQ_CONNECTD_DIR}/mount_info/.oss_ref_name_file
+
+# Sentinel Stuff
+ENIQ_SENTINEL_DIR=${ENIQ_BASE_DIR}/sentinel
+ENIQ_SENTINEL_BIN_DIR=${ENIQ_SENTINEL_DIR}/bin
+ENIQ_SENTINEL_ENV=${ENIQ_SENTINEL_DIR}/etc/sentinel.env
+
+# Determine the current server type
+CURR_SERVER_TYPE=`$CAT $ENIQ_CONF_DIR/installed_server_type`
+if [ "${CURR_SERVER_TYPE}" == "eniq_coordinator" -o "${CURR_SERVER_TYPE}" == "eniq_events" -o "${CURR_SERVER_TYPE}" == "eniq_iqw" -o "${CURR_SERVER_TYPE}" == "son_coordinator" -o "${CURR_SERVER_TYPE}" == "eniq_es" ]; then
+	SERVER_TYPE="CO"
+else
+	SERVER_TYPE="${CURR_SERVER_TYPE}"
+fi
+
+# Core install directory that contains the partition plan
+PARTITION_FILE_LOC=${ENIQ_CORE_INST_DIR}/etc
+
+PARTITION_PLAN_LOC=${BASE_SW_DIR}/eniq_sw/post_install
+}
+
+### Function: setup_ini_files ###
+#
+# Setup up temp ini files
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+setup_ini_files()
+{
+if [ ! -d ${TEM_DIR}/backup ]; then
+    $ECHO "\nCreating temporary ini files in ${TEM_DIR}" >> ${LOGFILE}
+
+    if [ -s ${ENIQ_CONF_DIR}/${SUNOS_INI} ]; then
+        _ini_src_dir_=${ENIQ_CONF_DIR}
+        _ini_file_=${SUNOS_INI}
+    else
+        _ini_src_dir_=${ENIQ_TEMPL_DIR}
+        _ini_file_="${SUNOS_INI}_${STORAGE_TYPE}"
+    fi
+
+    # Copy the ini template files. I will work on these until it is
+    # time to move them to the main ini directory. I will update these
+    # ini files with the ENIQ_BASE_DIR value
+    $CAT ${_ini_src_dir_}/${_ini_file_} | $SED -e "s|<CHANGE><ENIQ_BASE_DIR>|${ENIQ_BASE_DIR}|g" > ${TEM_DIR}/${SUNOS_INI}
+    if [ $? -ne 0 ]; then
+        _err_msg_="Could not copy ${ENIQ_TEMPL_DIR}/${SUNOS_INI}"
+        abort_script "$_err_msg_"
+    fi
+
+    # Update SunOs.ini with ZFS details
+    update_sunos_info
+
+    # Update the sym_links.ini file
+    $CAT ${ENIQ_TEMPL_DIR}/${SYM_LINK_INI} | $SED -e "s|<CHANGE><ENIQ_BASE_DIR>|${ENIQ_BASE_DIR}|g" > ${TEM_DIR}/${SYM_LINK_INI}
+    if [ $? -ne 0 ]; then
+        _err_msg_="Could not copy ${ENIQ_TEMPL_DIR}/${SYM_LINK_INI}"
+        abort_script "$_err_msg_"
+    fi
+
+    # Update the cep_med.ini file
+    $CAT ${ENIQ_TEMPL_DIR}/${CEP_MED_INI} > ${TEM_DIR}/${CEP_MED_INI}
+    if [ $? -ne 0 ]; then
+        _err_msg_="Could not copy ${ENIQ_TEMPL_DIR}/${CEP_MED_INI}"
+        abort_script "$_err_msg_"
+    fi
+
+    _sysuser_=`iniget ENIQ_INSTALL_CONFIG -f ${TEM_DIR}/${SUNOS_INI} -v ENIQ_SYSUSER`
+    if [ ! "${_sysuser_}" ]; then
+        _err_msg_="Could not get system user value from ${TEM_DIR}/${SUNOS_INI}"
+        abort_script "$_err_msg_"
+    fi
+    $CAT ${ENIQ_TEMPL_DIR}/${ENIQ_ENV} | $SED -e "s|<CHANGE><ENIQ_BASE_DIR>|${ENIQ_BASE_DIR}|g"  \
+                                              -e "s|<CHANGE><ENIQ_SYSUSER>|${_sysuser_}|g" > ${TEM_DIR}/${ENIQ_ENV}
+    if [ $? -ne 0 ]; then
+        _err_msg_="Could not update ${ENIQ_TEMPL_DIR}/${ENIQ_ENV}"
+        abort_script "$_err_msg_"
+    fi
+
+    CLI_CONF_DIR=`$CAT ${TEM_DIR}/${ENIQ_ENV} | $GEGREP '^[[:blank:]]*CONF_DIR=' | $NAWK -F\= '{print $2}' | $SED -e 's|"||g'`
+    if [ ! "${CLI_CONF_DIR}" ]; then
+        _err_msg_="Could not read CLI_CONF_DIR parameter from ${TEM_DIR}/${ENIQ_ENV}"
+        abort_script "$_err_msg_"
+    fi
+
+    $CAT ${ENIQ_TEMPL_DIR}/${RBAC_INI} | $SED -e "s|<CHANGE><ENIQ_BASE_DIR>|${ENIQ_BASE_DIR}|g" > ${TEM_DIR}/${RBAC_INI}
+    if [ $? -ne 0 ]; then
+        _err_msg_="Could not copy ${ENIQ_TEMPL_DIR}/${RBAC_INI}"
+        abort_script "$_err_msg_"
+    fi
+
+    if [ -s ${CLI_CONF_DIR}/${ENIQ_INI} ]; then
+      	$CP ${CLI_CONF_DIR}/${ENIQ_INI} ${TEM_DIR}/${ENIQ_INI}
+	if [ $? -ne 0 ]; then
+	    _err_msg_="Could not copy ${CLI_CONF_DIR}/${ENIQ_INI} to ${TEM_DIR}/${ENIQ_INI}"
+	    abort_script "$_err_msg_"
+	fi
+    else
+	$CAT ${ENIQ_TEMPL_DIR}/${ENIQ_INI} | $SED -e "s|<CHANGE><ENIQ_BASE_DIR>|${ENIQ_BASE_DIR}|g" > ${TEM_DIR}/${ENIQ_INI}
+	if [ $? -ne 0 ]; then
+	    _err_msg_="Could not copy ${ENIQ_TEMPL_DIR}/${ENIQ_INI}"
+	    abort_script "$_err_msg_"
+	fi
+    fi
+
+    if [ "${STORAGE_TYPE}" == "raw" ];then
+	if [ -s ${ENIQ_CONF_DIR}/${STORAGE_INI} ]; then
+		$CP ${ENIQ_CONF_DIR}/${STORAGE_INI} ${TEM_DIR}/${STORAGE_INI}
+	else
+	    _err_msg_="Could not find ${ENIQ_CONF_DIR}/${STORAGE_INI}"
+	    abort_script "$_err_msg_"
+	fi
+    fi
+else
+    common_store_new_inis ${TEM_DIR}/backup ${TEM_DIR} ${LOGFILE} ${SUNOS_INI} ${SYM_LINK_INI} ${ENIQ_ENV} ${RBAC_INI} ${ENIQ_INI} ${STORAGE_INI}
+fi
+}
+
+### Function: update_sunos_info ###
+#
+# Update SunOs.ini with info for ZFS
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+update_sunos_info()
+{
+$RM -rf ${TEM_DIR}/${SUNOS_INI}_new ${TEM_DIR}/inst_det ${TEM_DIR}/${SUNOS_INI}_tmp
+
+_uniq_pool_name_="${CURR_SERVER_TYPE}_pool"
+
+# Update SunOs.ini with new pool info
+$ECHO "Updating pool name value in ${TEM_DIR}/${SUNOS_INI}" >> ${LOGFILE}
+$CAT ${TEM_DIR}/${SUNOS_INI} | $SED -e "s|<CHANGE><UNIQUE_POOL>|${_uniq_pool_name_}|g" > ${TEM_DIR}/${SUNOS_INI}_new
+if [ $? -ne 0 ]; then
+	_err_msg_="Could not update in ${TEM_DIR}/${SUNOS_INI}"
+	abort_script "$_err_msg_" 
+fi
+
+$CP ${TEM_DIR}/${SUNOS_INI}_new ${TEM_DIR}/${SUNOS_INI}
+if [ $? -ne 0 ]; then
+	_err_msg_="Could not copy ${TEM_DIR}/${SUNOS_INI}_new to ${TEM_DIR}/${SUNOS_INI}"
+	abort_script "$_err_msg_" 
+fi
+}
+
+### Function: usage_msg ###
+#
+#   Print out the usage message
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+usage_msg()
+{
+$CLEAR
+$ECHO "
+Usage: `$BASENAME $0` -d <eniq_sw_dir> [ -b <eniq_base_dir> ] [ -l <path_to_logfile> ]
+
+options:
+
+-b  : Optional parameter specifying the full path to where the ENIQ
+      BASEDIR directory is (eg. /eniq). If not specified, then the
+      script will assume the the base directory is /eniq
+
+-d  : Parameter specifying the full path to the directory
+      containing the ENIQ BASE SW directory structure.
+
+-l  : Optional parameter specifying the full path to logfile.
+"
+}
+
+### Function: get_eniq_memory_settings ###
+#
+#   Get the various JVM/IQ settings
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+get_eniq_memory_settings()
+{
+	if [ -f ${ENIQ_CONF_DIR}/extra_params/verbose_settings ] ; then
+		_ask_="-a"
+	
+		# Configure Glassfish settings
+		/bin/bash ${SCRIPTHOME}/configure_platform.sh -l ${LOGFILE} -g -i ${TEM_DIR}/${ENIQ_INI} $_ask_
+		if [ $? -ne 0 ] ; then
+			_err_msg_="Could not set glassfish parameters"
+			abort_script "$_err_msg_"
+		fi
+		/bin/bash ${SCRIPTHOME}/configure_platform.sh -l ${LOGFILE} -e -i ${TEM_DIR}/${ENIQ_INI} $_ask_
+		if [ $? -ne 0 ] ; then
+			_err_msg_="Could not set engine parameters"
+			abort_script "$_err_msg_"
+		fi
+		/bin/bash ${SCRIPTHOME}/configure_platform.sh -l ${LOGFILE} -s -i ${TEM_DIR}/${ENIQ_INI} $_ask_
+		if [ $? -ne 0 ] ; then
+			_err_msg_="Could not set scheduler parameters"
+			abort_script "$_err_msg_"
+		fi
+		/bin/bash ${SCRIPTHOME}/configure_platform.sh -l ${LOGFILE} -q -i ${TEM_DIR}/${ENIQ_INI} $_ask_
+		if [ $? -ne 0 ] ; then
+			_err_msg_="Could not set IQ parameters"
+			abort_script "$_err_msg_"
+		fi
+		/bin/bash ${SCRIPTHOME}/configure_platform.sh -l ${LOGFILE} -c -i ${TEM_DIR}/${ENIQ_INI} $_ask_
+		if [ $? -ne 0 ] ; then
+			_err_msg_="Could not set Core Memory values"
+			abort_script "$_err_msg_"
+		fi
+	fi
+}
+# ********************************************************************
+#
+#   Main body of program
+#
+# ********************************************************************
+#
+RUN_TIME=`$DATE '+%Y-%b-%d_%H.%M.%S'`
+
+# Determine absolute path to software
+get_absolute_path
+
+# Check that the effective id of the user is root
+check_id $DEFAULT_USER
+
+while getopts ":b:d:l:Rt:" arg; do
+  case $arg in
+    b) ENIQ_BASE_DIR="$OPTARG"
+       ;;
+    d) BASE_SW_DIR="$OPTARG"
+       ;;
+    l) LOGFILE="$OPTARG"
+       ;;
+    t) STORAGE_TYPE="$OPTARG"
+       ;;
+    R) RESTORE="YES"
+       ;;
+   \?) usage_msg
+       exit 1
+       ;;
+  esac
+done
+shift `expr $OPTIND - 1`
+
+if [ ! "${BASE_SW_DIR}" ]; then
+    usage_msg
+    exit 1
+fi
+
+# Setup up path environment etc
+setup_env
+
+if [ "${LOGFILE}" ]; then
+    # Check/Create Logfile
+    chk_create_logfile
+fi
+
+if [ ! ${RESTORE} ]; then
+    common_check_inirator_scripts ${LOGFILE} ${ENIQ_ADMIN_BIN_DIR} ${ENIQ_CORE_INST_DIR} ${ENIQ_SENTINEL_BIN_DIR}
+    if [ $? -ne 0 ]; then
+        _err_msg_="Required scripts do not exist"
+        abort_script "$_err_msg_"
+    fi
+fi
+
+# Create a temporary Directory
+TEM_DIR=/tmp/create_eniq_ini.$$.$$
+$RM -rf ${TEM_DIR}
+$MKDIR -p ${TEM_DIR}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not create directory ${TEM_DIR}"
+    abort_script "$_err_msg_"
+fi
+
+# Check that I have a templates directory 
+# associated with my installation type
+core_install_check_templates_dir ${LOGFILE} ${TEM_DIR} ${ENIQ_TEMPL_DIR}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not determine if ${ENIQ_TEMPL_DIR} is valid"
+    abort_script "$_err_msg_"
+fi
+
+# Get a list of controllers which has disks that we deem unsuitable for root disk
+# attached to it
+if [ "$ZONE" != "yes" ]; then
+    get_excl_ctrl_list
+fi
+
+# Okay I need to trap interrupts at this stage
+trap "abort_script" 1 2 3 14 15
+
+while :; do
+    # Update template INI files and copy them
+    # to a temp dir for use in this script
+    setup_ini_files
+
+    if [ ! ${RESTORE} ]; then
+        if [ "${STORAGE_TYPE}" == "raw" ]; then
+            $ECHO "\nGathering user information" >> ${LOGFILE}
+            get_nas_details
+    
+        # Confirm the User Input
+        common_confirm_user_nas_input ${INSTALL_TYPE} ${TEM_DIR} ${STORAGE_TYPE}
+
+            if [ "${USER_CNF}" == "Yes" ]; then
+                $CAT ${_disp_file_} | $GEGREP -v "Password for" >> ${LOGFILE}
+                break
+            fi
+       else
+          break
+       fi 
+   else
+      break
+   fi
+done
+    
+# Taking backup of ini files
+if [ "${STORAGE_TYPE}" == "raw" ];then
+    backup_ini_files_after_nas
+fi
+
+if [ ! ${RESTORE} ]; then
+    if [ "${STORAGE_TYPE}" == "raw" ];then
+	# Update storage.ini
+	if [ -f ${ENIQ_CONF_DIR}/${STORAGE_INI} ]; then
+	$MKDIR -p ${ENIQ_CONF_DIR}/backup
+	$CP ${ENIQ_CONF_DIR}/${STORAGE_INI} ${ENIQ_CONF_DIR}/backup/${STORAGE_INI}.${RUN_TIME}
+	fi
+
+	$CP ${TEM_DIR}/${STORAGE_INI} ${ENIQ_CONF_DIR}/${STORAGE_INI}
+	if [ $? -ne 0 ]; then
+		_err_msg_="Could not copy ${TEM_DIR}/${STORAGE_INI} to ${ENIQ_CONF_DIR}/${STORAGE_INI}"
+		abort_script "$_err_msg_"
+	fi
+
+        if [ ! "${SOLARIS_10}" ]; then
+            # Set the term value if needed
+            _prev_term_=`$ECHO $TERM`
+            # Check if running on console
+            /usr/bin/tty | $GREP "/dev/console" >> /dev/null 2>&1
+            if [ $? -eq 0 ]; then
+                # Change if not xterm
+                if [ "${_prev_term_}" != "xterm" ];then
+                    # Change TERM to xterm
+                    export TERM="xterm"
+                fi
+            fi
+        fi
+
+        # Set up the NAS server, and its local users
+        common_setup_nas_filestore "${TEM_DIR}/${SUNOS_INI}" "${ENIQ_CONF_DIR}/ssh_input_file" "${ENIQ_CONF_DIR}/${IPMP_INI}" "${TEM_DIR}/${STORAGE_INI}" "${LOGFILE}"
+	if [ $? -ne 0 ]; then
+  	    _err_msg_="Unable to setup NAS server and local users."
+	    abort_script "$_err_msg_"
+	fi
+
+        if [ ! "${SOLARIS_10}" ]; then
+            # Restore back previous term
+            _curr_term_=`$ECHO $TERM`
+            if [ "${_prev_term_}" != "${_curr_term_}" ];then
+                export TERM="${_prev_term_}"
+            fi
+	fi
+
+
+        # Mount the shared dir to read required files
+        if [ ! -s ${ENIQ_CONF_DIR}/${COORD_SYM_LINK_FILE} ]; then
+            _conf_dir_=`$BASENAME ${CLI_CONF_DIR}`
+            common_get_shared_files ${SERVER_TYPE} "${TEM_DIR}/${SUNOS_INI}" "${TEM_DIR}/${STORAGE_INI}" "${ENIQ_CONF_DIR}/${IPMP_INI}" "${_conf_dir_}/${COORD_SYM_LINK_FILE}" "${ENIQ_CONF_DIR}" "${LOGFILE}"
+            if [ $? -ne 0 ]; then
+                _err_msg_="Could not get required files from shared area"
+       	        abort_script "$_err_msg_"
+    	    fi
+	fi
+    fi
+fi
+
+while :; do
+
+    # Update template INI files and copy them
+    # to a temp dir for use in this script
+    setup_ini_files
+
+    # Get the reader information
+    if [ "${CURR_SERVER_TYPE}" == "eniq_ui" -o "${CURR_SERVER_TYPE}" == "eniq_iqr" ]; then
+        get_reader_info
+    fi
+
+
+    # Loop that will ensure enough disk space is available
+    # for the number of nodes/cells selected.
+    # If there is not sufficent space, the loop will
+    # return to the root mirror question (or cell count
+    # depending on whether the root disk was mirrored as
+    # part of the installation)
+    # Call the script to figure out cell numbers/disks etc
+    if [ ! ${RESTORE} ]; then
+        _arg_list_="-f ${TEM_DIR} -i ${INSTALL_TYPE} -t ${STORAGE_TYPE} -l ${LOGFILE}"
+    else
+        _arg_list_="-f ${TEM_DIR} -i ${INSTALL_TYPE} -t ${STORAGE_TYPE} -l ${LOGFILE} -r -d ${ENIQ_BASE_DIR}/installation/config -b ${ENIQ_BASE_DIR}"
+    fi
+
+    /usr/bin/bash ${SCRIPTHOME}/get_disk_info.bsh ${_arg_list_}
+    if [ $? -ne 0 ]; then
+        _err_msg_="${SCRIPTHOME}/get_disk_info.bsh did not run successfully"
+        abort_script "$_err_msg_"
+    fi
+    if [ ! ${RESTORE} ]; then
+        if [ -s ${TEM_DIR}/global_data ]; then
+            SPACE_AVAILABLE=`$CAT ${TEM_DIR}/global_data | $GREP "SPACE_AVAILABLE" | $NAWK -F\= '{print $2}'`
+        else
+            _err_msg_="${TEM_DIR}/global_data file not found"
+            abort_script "$_err_msg_"
+        fi
+
+        # Allow the user to continue if space available
+        if [ "${SPACE_AVAILABLE}" != "YES" ]; then
+             $ECHO "\n\nNot enough disk space exists for the number of managed nodes"
+             $ECHO "Please hit enter to continue"
+             read _any_
+	     continue
+	fi
+        
+	# Get the default router for the system
+        get_default_router
+        
+        # Get the dns server for the system
+        get_dns_server
+    
+        # if there is a DNS server then take in the domain
+        if [ "${DNSSERVERS}" ]; then
+            # Get the dns domain for the system
+            get_dns_domain
+        fi
+    
+        # Get the timezone for the system
+        get_timezone
+    fi
+
+    if [ "${CURR_SERVER_TYPE}" != "eniq_es" ]; then
+	    # Get the amount of shared memory to allocate to IQ
+	    get_shared_mem
+    fi
+    
+    if [ ! ${RESTORE} ]; then
+        # Get the reader information
+        if [ "${CURR_SERVER_TYPE}" == "eniq_coordinator" -o "${CURR_SERVER_TYPE}" == "eniq_iqw" ]; then
+            get_glassfish_hostname
+        fi
+	
+        if [ "${SERVER_TYPE}" == "CO" ]; then
+        	if [ "${CURR_SERVER_TYPE}" != "eniq_es" ]; then
+	        	# Get the CEP Mediation server information
+	        	get_cep_med_details
+	        	
+	            # Get the LDAP details
+	            get_ldap_details
+		
+	            # Get the number of users on the network
+	            get_network_subscribers
+		    
+	            # Get the number of end users
+	            # that will use the system
+	            get_end_users
+		    
+	            # Determine which partition plan to install
+	            get_partition_plan 
+	    	fi
+	    	
+            # Get the list of ENIQ features to be installed
+            get_eniq_features_list
+			
+			#Get the various JVM/IQ settings to use
+			get_eniq_memory_settings
+        fi
+    fi
+        
+    # Generate a Unique ID and store it.
+    common_set_unique_id ${TEM_DIR}/${SUNOS_INI}
+    
+    # Confirm the User Input
+    common_confirm_user_input ${INSTALL_TYPE} ${TEM_DIR} ${STORAGE_TYPE}
+
+    if [ "${USER_CONF}" == "Yes" ]; then
+    	$CAT ${_disp_file_} | $GEGREP -v "Password for" >> ${LOGFILE}
+        break
+    fi
+done	
+
+if [ -s ${TEM_DIR}/feature_output_list ]; then
+    $CP ${TEM_DIR}/feature_output_list ${ENIQ_CONF_DIR}
+fi
+
+# Set the server type in the niq.ini file. This may never be used, but its here if needed
+$ECHO "\nSetting Server_Type value in ENIQ_INI to ${INSTALL_TYPE}" >> ${LOGFILE}
+iniset ETLC -f ${TEM_DIR}/${ENIQ_INI} Server_Type=${INSTALL_TYPE} 
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not update ${TEM_DIR}/${ENIQ_INI} with Server_Type=${INSTALL_TYPE} "
+    abort_script "$_err_msg_"
+fi
+
+common_store_new_inis ${TEM_DIR} ${ENIQ_CONF_DIR} ${LOGFILE} ${SUNOS_INI} ${RBAC_INI} ${ENIQ_INI} ${ENIQ_ENV} ${SYM_LINK_INI} ${STORAGE_INI} ${CEP_MED_INI}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not store updated ini files"
+    abort_script "$_err_msg_"
+fi
+
+# Remove traps on interrupts
+trap 1 2 3 14 15
+
+$RM -rf ${TEM_DIR} ${DISK_LIST}
+
+exit 0

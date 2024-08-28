@@ -1,0 +1,858 @@
+#!/bin/bash
+# ********************************************************************
+# Ericsson Radio Systems AB                                     SCRIPT
+# ********************************************************************
+#
+#
+# (c) Ericsson Radio Systems AB 2021 - All rights reserved.
+#
+# The copyright to the computer program(s) herein is the property
+# of Ericsson Radio Systems AB, Sweden. The programs may be used 
+# and/or copied only with the written permission from Ericsson Radio 
+# Systems AB or in accordance with the terms and conditions stipulated 
+# in the agreement/contract under which the program(s) have been 
+# supplied.
+#
+# ********************************************************************
+# Name    : recover_iq.bsh
+# Date    : 20/10/2023
+# Revision: main\23
+# Purpose : Script to recover the Sybase IQ databases from a rolling snapshot. 
+#
+# Usage   : recover_iq.bsh [ -l <logfile> ]
+#
+# ********************************************************************
+#
+#     Command Section
+#
+# ********************************************************************
+AWK=/usr/bin/awk
+BASENAME=/usr/bin/basename
+BASH=/usr/bin/bash
+BC=/usr/bin/bc
+BOOTADM=/usr/sbin/bootadm
+CAT=/usr/bin/cat
+CFGADM=/usr/sbin/cfgadm
+CHMOD=/usr/bin/chmod
+CHOWN=/usr/bin/chown
+CLEAR=/usr/bin/clear
+CP=/usr/bin/cp
+CPIO=/usr/bin/cpio
+CUT=/usr/bin/cut
+DATE=/usr/bin/date
+DF=/usr/bin/df
+DIRNAME=/usr/bin/dirname
+DOMAINNAME=/usr/bin/domainname
+DTCONFIG=/usr/dt/bin/dtconfig
+ECHO=/usr/bin/echo
+EEPROM=/usr/sbin/eeprom
+EGREP=/usr/bin/egrep
+EJECT=/usr/bin/eject
+ENV=/usr/bin/env
+EXPR=/usr/bin/expr
+FDISK=/sbin/fdisk
+FIND=/usr/bin/find
+FMTHARD=/usr/sbin/fmthard
+FORMAT=/usr/sbin/format
+FSTYP=/usr/sbin/fstyp
+FUSER=/usr/sbin/fuser
+GETENT=/usr/bin/getent
+GETTEXT=/usr/bin/gettext
+GREP=/usr/bin/grep
+GTAR=/usr/sfw/bin/gtar
+GZCAT=/usr/bin/gzcat
+HEAD=/usr/bin/head
+HOSTID=/usr/bin/hostid
+HOSTNAME=/usr/bin/hostname
+ID=/usr/bin/id
+INIT=/usr/sbin/init
+INSTALLBOOT=/usr/sbin/installboot
+INSTALLGRUB=/sbin/installgrub
+LS=/usr/bin/ls
+METACLEAR=/usr/sbin/metaclear
+METADB=/usr/sbin/metadb
+METADETACH=/usr/sbin/metadetach
+METAINIT=/usr/sbin/metainit
+METAROOT=/usr/sbin/metaroot
+METASTAT=/usr/sbin/metastat
+MKDIR=/usr/bin/mkdir
+MORE=/usr/bin/more
+MOUNT=/usr/sbin/mount
+MV=/usr/bin/mv
+NEWFS=/usr/sbin/newfs
+PGREP=/usr/bin/pgrep
+PING=/usr/sbin/ping
+PKGADD=/usr/sbin/pkgadd
+PKGINFO=/usr/bin/pkginfo
+PRTCONF=/usr/sbin/prtconf
+PRTVTOC=/usr/sbin/prtvtoc
+PS=/usr/bin/ps
+PSRINFO=/usr/sbin/psrinfo
+PWD=/usr/bin/pwd
+RM=/usr/bin/rm
+RCP=/usr/bin/rcp
+ROLES=/usr/bin/roles
+RSH=/usr/bin/rsh
+SED=/usr/bin/sed
+SLEEP=/usr/bin/sleep
+SORT=/usr/bin/sort
+SU=/usr/bin/su
+TAIL=/usr/bin/tail
+TEE=/usr/bin/tee
+TOUCH=/usr/bin/touch
+UNAME=/usr/bin/uname
+WC=/usr/bin/wc
+
+
+
+# ********************************************************************
+#
+#       Configuration Section
+#
+# ********************************************************************
+# Name of SunOS & ENIQ ini Files
+ENIQ_ENV=niq.rc
+ENIQ_INI=niq.ini
+SUNOS_INI=SunOS.ini
+
+# REGEX string to determine if IQ server process is running. Multiple strings can be
+# secified as long as they are seperated by '|' with no space
+IQ_PS_STR="iqsrv"
+
+# ********************************************************************
+#
+#       Pre-execution Operations
+#
+# ********************************************************************
+# X86 ??
+X86=`$UNAME -p|grep -w x86_64`
+
+# ********************************************************************
+#
+#     functions
+#
+# ********************************************************************
+### Function: abort_script ###
+#
+#   This will is called if the script is aborted thru an error
+#   error signal sent by the kernel such as CTRL-C or if a serious
+#   error is encountered during runtime
+#
+# Arguments:
+#       $1 - Error message from part of program (Not always used)
+# Return Values:
+#       none
+abort_script()
+{
+if [ "$1" ]; then
+    _err_msg_=$1
+else
+    _err_msg_="Script aborted.......\n"    
+fi
+
+if [ "${LOGFILE}" ]; then
+    $ECHO "\nERROR : $_err_msg_\n"|$TEE -a ${LOGFILE}
+else
+    $ECHO "\nERROR : $_err_msg_\n"
+fi
+
+cd $SCRIPTHOME
+$RM -rf ${TEM_DIR}
+$RM -rf ${conn_string_enc}
+$RM -rf ${conection_string_enc}
+$RM -rf ${dp_st_en}
+$RM -rf ${d_enc}
+$RM -rf ${CONN_STR_strt_iq_ENC}
+
+if [ "$2" ]; then
+    ${2}
+else
+   exit 1
+fi
+}
+
+### Function: chk_create_logfile ###
+#
+# Check/Create Logfile
+#
+# Arguments:
+#    none
+# Return Values:
+#    none
+chk_create_logfile()
+{
+$MKDIR -p `$DIRNAME ${LOGFILE}`
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not create directory `$DIRNAME ${LOGFILE}`"
+     abort_script "$_err_msg_"
+fi    
+
+$TOUCH -a ${LOGFILE}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not write to file ${_logfile_}"
+    abort_script "$_err_msg_"
+fi    
+}
+
+### Function: create_sql_file ###
+#
+# Create the dwhdb SQL file
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+
+create_sql_file()
+{
+$RM -rf ${ENIQ_ADMIN_DIR}/sql/restore_iq.sql
+
+$ECHO "RESTORE DATABASE '${_dbpath_}/${_dbname_}.db' FROM '${_dmp_file_}'" > ${ENIQ_ADMIN_DIR}/sql/restore_iq.sql
+$ECHO "go" >> ${ENIQ_ADMIN_DIR}/sql/restore_iq.sql
+
+$CHOWN $SYSUSER:$SYSGRP ${ENIQ_ADMIN_DIR}/sql/restore_iq.sql
+}
+
+### Function: check_id ###
+#
+#   Check that the effective id of the user is correct
+#   If not print error msg and exit.
+#
+# Arguments:
+#       $1 : User ID name
+# Return Values:
+#       none
+check_id()
+{
+_check_id_=`$ID  | $AWK -F\( '{print $2}' | $AWK -F\) '{print $1}'`
+if [ "$_check_id_" != "$1" ]; then
+    _err_msg_="You must be $1 or have equal permissions to execute this script."
+    abort_script "$_err_msg_" 
+fi
+}
+
+### Function: get_absolute_path ###
+#
+# Determine absolute path to software
+#
+# Arguments:
+#    none
+# Return Values:
+#    none
+get_absolute_path()
+{
+_dir_=`$DIRNAME $0`
+SCRIPTHOME=`cd $_dir_ 2>/dev/null && pwd || $ECHO $_dir_`
+}
+
+### Function: restore_IQ ###
+#
+# Restore the IQ database
+#
+# Arguments:
+#    none
+# Return Values:
+#    none
+restore_IQ()
+{
+if [ ! "${NO_CONFIRM}" ]; then
+    user_confirm "Are you sure you wish to continue?\nDatabase system files will be overwritten during restore"
+    if [ $USER_CONF == No ]; then
+    $RM -rf ${TEM_DIR}
+    exit 0
+    fi    
+fi
+
+#Checking services in all the blades
+local flag="false"
+if [ -f /tmp/server_stage_list ]; then
+    $RM -rf /tmp/server_stage_list
+fi
+
+log_msg -l ${LOGFILE} -s "Checking services on the remote servers."
+/usr/bin/perl /eniq/installation/core_install/lib/get_ip_order.pl -f /tmp/server_stage_list
+local _count_
+$RM -rf server_hostnames
+_count_=`$CAT /tmp/server_stage_list |$HEAD -1 |$GREP -o "::" | $WC -l`
+if [ "${_ip_type_}" == "IPv6" ] && [ "${_count_}" == 3 ]; then
+   for entry in `$CAT /tmp/server_stage_list`; do
+      _host_=`$ECHO $entry | $AWK -F"::" '{print $3}'`
+      $ECHO $_host_ >> server_hostnames
+   done
+else
+   for entry in `$CAT /tmp/server_stage_list`; do
+      _host_=`$ECHO $entry | $AWK -F"::" '{print $2}'`
+      $ECHO $_host_ >> server_hostnames
+   done
+fi
+_server_list_=`$CAT server_hostnames`
+
+SERVICE_COMMAND="services -s eniq"
+for _server_name_list_ in ${_server_list_}; do
+    run_remote_cmd ${_server_name_list_} "${SERVICE_COMMAND}" | $GREP -w "active" >> /dev/null 2>&1
+    if [ $? -eq 0 ]; then
+        log_msg -l ${LOGFILE} -s "One or more ENIQ services on server $_server_name_list_ are active."
+        flag="true"
+    fi
+done
+
+if [ "${flag}" == "true" ]; then
+   _err_msg_="Services are not in inactive state. Please correct it and re-execute the script."
+   abort_script "$_err_msg_"
+fi
+
+# Stop the util db
+stop_util_db
+
+# Start the util db
+start_util_db
+
+# Make a copy of the Sybase interfaces file. I need to add utilty db to it
+# I will restore it at the end
+$CP ${ENIQ_BASE_DIR}/sybase_iq/interfaces ${ENIQ_BASE_DIR}/sybase_iq/interfaces_utilitydb_bkup
+
+# Create the new interfaces
+$CAT ${ENIQ_BASE_DIR}/sybase_iq/interfaces|$GREP -v utility_db|$GREP -v ${UTIL_PORT} > $TEM_DIR/interfaces
+$ECHO "\nutility_db" >> $TEM_DIR/interfaces
+$ECHO "\tmaster tcp ether localhost ${UTIL_PORT}" >> $TEM_DIR/interfaces
+$CP $TEM_DIR/interfaces  ${ENIQ_BASE_DIR}/sybase_iq/interfaces
+
+# Test that I can log into sybase IQ
+test_iq_login
+
+# Get a list of databases to be restored
+DBS_TO_BE_RESTORED=`$CAT ${BKUP_DB_FILESYS_LIST}|$EGREP -v '^[     ]*#'|$AWK -F"::" '{print $1}'`
+if [ "${DBS_TO_BE_RESTORED}" ]; then
+    for _db_ in ${DBS_TO_BE_RESTORED}; do
+        _path_to_db_file_=`$CAT ${BKUP_DB_FILESYS_LIST}|$EGREP -v '^[     ]*#' |$GREP -w "${_db_}"|$AWK -F"::" '{print $4}'`
+        restore_iq_database ${_db_} ${_path_to_db_file_}
+    done
+fi
+$CP ${ENIQ_BASE_DIR}/sybase_iq/interfaces_utilitydb_bkup ${ENIQ_BASE_DIR}/sybase_iq/interfaces
+
+# Stop the utility database
+stop_util_db
+
+# Start the database in Multiplex single-node mode
+start_dwhdb
+
+# stop the database
+stop_dwhdb
+
+ROLL_SNAP_FILE_INDICATOR="${ENIQ_BASE_DIR}/bkup_sw/etc/.create_rolling_snapshot"
+ROLL_SNAP_PROGRESS_INDICATOR="${ENIQ_BASE_DIR}//bkup_sw/etc/.rolling_snapshot_in_progress"
+BKUP_SNAP_FILE_INDICATOR="/eniq/bkup_sw/etc/.create_backup_snapshot"
+BKUP_SNAP_PROGRESS_INDICATOR="/eniq/bkup_sw/etc/.rolling_backup_in_progress"
+
+$RM -f ${ROLL_SNAP_FILE_INDICATOR} ${ROLL_SNAP_PROGRESS_INDICATOR} ${BKUP_SNAP_FILE_INDICATOR} ${BKUP_SNAP_PROGRESS_INDICATOR}
+}
+
+
+### Function: restore_iq_database ###
+#
+# Restore the IQ database
+#
+# Arguments:
+#    $1 : IQ database to be restored
+#    $2 : Directory containing the original DB files
+# Return Values:
+#    none
+restore_iq_database()
+{
+_dbname_=${1}
+_dbpath_=${2}
+_dmp_file_="${IQ_VIRT_BKUP_DIR}/${_dbname_}_FULL_ENCAP_DUMP"
+if [ ! -s ${_dmp_file_}.1 ]; then
+    $ECHO "No dump file found for ${_dbname_} in  ${IQ_VIRT_BKUP_DIR}"
+    return 0
+fi
+
+# create the sql restore file
+create_sql_file
+
+if [ -f ${_dbpath_}/${_dbname_}.db ]; then
+    $MV ${_dbpath_}/${_dbname_}.db ${_dbpath_}/${_dbname_}.db.old
+fi
+
+if [ -f ${_dbpath_}/${_dbname_}.log ]; then
+    $MV ${_dbpath_}/${_dbname_}.log ${_dbpath_}/${_dbname_}.log.old
+fi	
+
+if [ -f ${_dbpath_}/${_dbname_}.tran ]; then
+    $MV ${_dbpath_}/${_dbname_}.tran ${_dbpath_}/${_dbname_}.tran.old
+fi
+
+$ECHO "Restoring SYBASE IQ database ${_dbname_}" | $TEE -a ${LOGFILE}
+
+
+# get encrypted connection string.
+conn_string="-c \"eng=utility_srv;dbn=utility_db;links=tcpip{host=localhost;port=${UTIL_PORT};dobroadcast=none;verify=no};uid=dba;pwd=${Util_DBA_PASSWORD}\""
+conn_string_enc=/tmp/con_str_enc.`uuidgen`
+
+# encrypt the connection string.
+get_encrypt_file "${conn_string}" "${conn_string_enc}"
+
+# Restore the database
+$SU - ${SYSUSER} -c "${IQDIR}/bin64/dbisql -nogui @${conn_string_enc} ${ENIQ_ADMIN_DIR}/sql/restore_iq.sql"
+if [ $? -ne 0 ]; then
+    if [ -f ${_dbpath_}/${_dbname_}.db.old ]; then
+        $RM -f ${_dbpath_}/${_dbname_}.db
+        $MV ${_dbpath_}/${_dbname_}.db.old ${_dbpath_}/${_dbname_}.db
+    fi
+
+    if [ -f ${_dbpath_}/${_dbname_}.log.old ]; then
+        $RM -f ${_dbpath_}/${_dbname_}.log
+        $MV ${_dbpath_}/${_dbname_}.log.old ${_dbpath_}/${_dbname_}.log
+	fi	
+	
+    if [ -f ${_dbpath_}/${_dbname_}.tran.old ]; then
+        $RM -f ${_dbpath_}/${_dbname_}.tran
+        $MV ${_dbpath_}/${_dbname_}.tran.old ${_dbpath_}/${_dbname_}.tran
+    fi
+
+    _err_msg_="Error restoring database ${_dbname_} from dump file\n${_dmp_file_}."
+    abort_script "$_err_msg_"
+fi    
+
+$ECHO "Successfully Restored SYBASE IQ database ${_dbname_}" | $TEE -a ${LOGFILE}
+ 
+$RM -f ${_dbpath_}/${_dbname_}.db.old ${_dbpath_}/${_dbname_}.log.old ${_dbpath_}/${_dbname_}.tran.old
+
+}
+
+### Function: setup_script_env ###
+#
+# Set up environment variables for script. 
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+setup_env()
+{
+if [ ! "${ENIQ_BASE_DIR}" ]; then
+    # Directory on the root filesystem
+    ENIQ_BASE_DIR=/eniq
+fi
+
+# Main Directory for the Core Installation SW
+ENIQ_INST_DIR=${ENIQ_BASE_DIR}/installation/core_install
+
+# ENIQ Config Directory
+ENIQ_CONF_DIR=${ENIQ_BASE_DIR}/installation/config
+
+ENIQ_ADMIN_DIR=${ENIQ_BASE_DIR}/admin
+
+CLI_CONF_DIR=${ENIQ_BASE_DIR}/sw/conf
+if [ ! -s ${CLI_CONF_DIR}/${ENIQ_INI} ]; then
+    _err_msg_="Could not locate file ${CLI_CONF_DIR}/${ENIQ_INI}"
+    abort_script "$_err_msg_"
+fi
+
+if [ ! -s ${CLI_CONF_DIR}/${ENIQ_ENV} ]; then
+    _err_msg_="Could not locate file ${CLI_CONF_DIR}/${ENIQ_ENV}"
+    abort_script "$_err_msg_"
+else
+    . ${CLI_CONF_DIR}/${ENIQ_ENV}
+fi
+
+CLI_BIN_DIR=${ENIQ_BASE_DIR}/sw/bin
+
+if [ ! -s ${ENIQ_BASE_DIR}/admin/lib/common_functions.lib ]; then
+    _err_msg_="File ${ENIQ_BASE_DIR}/admin/lib/common_functions.lib not found"
+    abort_script "$_err_msg_"
+fi
+
+BKUP_DB_FILESYS_LIST="${ENIQ_BASE_DIR}/bkup_sw/etc/iq_filesystem_list"
+if [ ! -s ${BKUP_DB_FILESYS_LIST} ]; then
+    _err_msg_="Could not locate file ${BKUP_DB_FILESYS_LIST}"
+    abort_script "$_err_msg_"
+fi
+
+# This is the directory that will contain the IQ virtaul bkups. 
+IQ_VIRT_BKUP_DIR="${ENIQ_BASE_DIR}/backup/iq_virtual_bkup"
+
+if [ ! -d ${IQ_VIRT_BKUP_DIR} ]; then
+    _err_msg_="Could not locate any IQ backups in directory ${IQ_VIRT_BKUP_DIR}"
+    abort_script "$_err_msg_"    
+fi
+
+# Source the common functions
+if [ -s ${ENIQ_BASE_DIR}/admin/lib/common_functions.lib ]; then
+    . ${ENIQ_BASE_DIR}/admin/lib/common_functions.lib
+else
+    _err_msg_="File ${ENIQ_BASE_DIR}/admin/lib/common_functions.lib not found"
+    abort_script "$_err_msg_"
+fi
+
+#get ip type from common_functions.lib
+check_ip_type
+if [ ! "${_ip_type_}" ]; then
+    _err_msg_="Could not read parameter _ip_type_ from file ${ENIQ_CONF_DIR}/${IPMP_INI}"
+    abort_script "$_err_msg_"
+fi
+
+SYSUSER=`iniget ENIQ_INSTALL_CONFIG -f ${ENIQ_CONF_DIR}/${SUNOS_INI} -v ENIQ_SYSUSER`
+if [ ! "${SYSUSER}" ]; then
+    _err_msg_="Could not read System User from ${CLI_CONF_DIR}/${ENIQ_INI}"
+    abort_script "$_err_msg_"
+fi    
+
+SYSGRP=`$ID ${SYSUSER}|$AWK '{print $2}'|$AWK -F\( '{print $2}'|$AWK -F\) '{print $1}'`
+if [ ! "${SYSGRP}" ]; then
+    _err_msg_="Could not determine group id of ${SYSUSER}"
+    abort_script "$_err_msg_"
+fi    
+
+$SU - ${SYSUSER} >> /dev/null -c "$ENV > $TEM_DIR/sybase_det.$$" >> /dev/null 2>&1
+
+# Source the environment
+set -a
+. $TEM_DIR/sybase_det.$$ >> /dev/null 2>&1
+set +a
+
+SYB_DBA=dba
+
+UTIL_PORT=`iniget DB -f ${CLI_CONF_DIR}/${ENIQ_INI} -v UtilServerPort`
+if [ ! "${UTIL_PORT}" ]; then
+    _err_msg_="Could not read UtilServerPort param from ${CLI_CONF_DIR}/${ENIQ_INI}"
+    abort_script "$_err_msg_"
+fi    
+
+Util_DBA_PASSWORD=`inigetpassword DB -f ${CLI_CONF_DIR}/${ENIQ_INI} -v UtilDBAPASSWORD`
+if [ ! ${Util_DBA_PASSWORD} ]; then
+    err_msg_="Could not get utility DBA Password from ${CLI_CONF_DIR}/${ENIQ_INI}"
+    abort_script "$_err_msg_"
+fi
+
+DBA_PASSWORD=`inigetpassword DB -f ${CLI_CONF_DIR}/${ENIQ_INI} -v DBAPassword`
+if [ ! ${DBA_PASSWORD} ]; then
+    if [ -f ${ENIQ_BASE_DIR}/sw/installer/dbusers ]; then
+        DBA_PASSWORD=`${ENIQ_BASE_DIR}/sw/installer/dbusers dba dwh`
+        if [ ! "${DBA_PASSWORD}" ] ; then
+            _err_msg_="Could not get dwhdb DBA Password from dbusers script"
+            abort_script "$_err_msg_"
+        fi
+    else
+        err_msg_="Could not get dwhdb DBA Password from ${CLI_CONF_DIR}/${ENIQ_INI}"
+        abort_script "$_err_msg_"
+    fi
+fi
+
+# Get the main, temp and catalog cache for the coordinators dwhdb 
+MAINCACHE=`iniget DWH -v MainCache -f ${CLI_CONF_DIR}/${ENIQ_INI}`
+if [ ! ${MAINCACHE} ]; then
+    _err_msg_="Could not read MainCache param from ${CLI_CONF_DIR}/${ENIQ_INI}"
+    abort_script "$_err_msg_"
+fi
+
+TEMPCACHE=`iniget DWH -v TempCache -f ${CLI_CONF_DIR}/${ENIQ_INI}`
+if [ ! ${TEMPCACHE} ]; then
+    _err_msg_="Could not read TempCache param from ${CLI_CONF_DIR}/${ENIQ_INI}"
+    abort_script "$_err_msg_"
+fi
+
+CATALOGCACHE=`iniget DWH -v CatalogCache -f ${CONF_DIR}/${ENIQ_INI}`
+if [ ${CATALOGCACHE} ]; then
+    CC="-c ${CATALOGCACHE}m"
+fi
+
+DWH_ENG=`iniget DWH -v ServerName -f ${CONF_DIR}/${ENIQ_INI}`
+if [ ! ${DWH_ENG} ]; then
+    _err_msg_="Could not read ServerName param from ${CONF_DIR}/${ENIQ_INI}"
+    abort_script "$_err_msg_"
+fi
+
+DWH_PORT=`iniget DWH -v PortNumber -f ${CONF_DIR}/${ENIQ_INI}`
+if [ ! ${DWH_PORT} ]; then
+    _err_msg_="Could not read PortNumber param from ${CONF_DIR}/${ENIQ_INI}"
+    abort_script "$_err_msg_"
+fi
+
+# ENIQ Log Directory
+ENIQ_LOG_DIR=${ENIQ_BASE_DIR}/local_logs
+
+IQLOGDIR16=${ENIQ_LOG_DIR}/iq
+export IQLOGDIR16     
+}
+
+### Function: start_dwhdb ###
+#
+# Start the sybase IQ database
+#
+# Arguments:
+#    none
+# Return Values:
+#    none
+start_dwhdb()
+{
+$ECHO "\nStarting the dwhdb in single node mode (-iqmpx_sn 1)" | $TEE -a ${LOGFILE}
+$SU - ${SYSUSER} -c "${IQDIR}/bin64/start_iq  -STARTDIR ${DWH_DIR} @${DWH_DIR}/dwhdb.cfg ${CC} -n ${DWH_ENG} -iqmc ${MAINCACHE} -iqtc ${TEMPCACHE} -x tcpip{port=${DWH_PORT}} -dt ${DWH_TEMP_DIR} ${DWH_DIR}/dwhdb.db -iqmpx_sn 1" >> ${LOGFILE}
+if [ $? -ne 0 ]; then
+    _err_msg_="Failed to start the dwhdb in single node mode"
+    abort_script "$_err_msg_" "${EXEC_SHELL_CMD}"
+fi
+
+d_con="-c \"con=$DWH_ENG;eng=$DWH_ENG;links=tcpip{host=$DWH_ENG;port=${DWH_PORT};dobroadcast=none;verify=no};uid=dba;pwd=${DBA_PASSWORD}\""
+d_enc=/tmp/co_enc.`uuidgen`
+
+# encrypt the connection string.
+get_encrypt_file "${d_con}" "${d_enc}"
+
+# Check if server is up
+$SU - ${SYSUSER} -c "${IQDIR}/bin64/dbping -q @${d_enc}" >> ${LOGFILE} 2>&1
+if [ $? -eq 0 ] ; then
+    $ECHO "Database dwhdb succesfully started in single node mode (-iqmpx_sn 1)" >> ${LOGFILE}
+else
+    _err_msg_="IQ server $DWH_ENG start failed"
+    abort_script "$_err_msg_"
+fi
+
+}
+
+### Function: start_util_db ###
+#
+# Start the sybase IQ database
+#
+# Arguments:
+#    none
+# Return Values:
+#    none
+start_util_db()
+{
+CONN_STR_strt_iq="-su ${Util_DBA_PASSWORD}"
+CONN_STR_strt_iq_ENC=/tmp/conn_str_iq_start.`uuidgen`
+
+# encrypt the connection string.
+get_encrypt_file "${CONN_STR_strt_iq}" "${CONN_STR_strt_iq_ENC}"
+
+$ECHO "\nStarting utility db" | $TEE -a ${LOGFILE}
+$SU - ${SYSUSER} -c "${IQDIR}/bin64/start_iq -n dwhdb @${CONN_STR_strt_iq_ENC} -gu utility_db -sb 0 -x tcpip{port=${UTIL_PORT}}" >> ${LOGFILE}
+if [ $? -ne 0 ]; then
+    _err_msg_="Failed to start the Utility db"
+    abort_script "$_err_msg_" "${EXEC_SHELL_CMD}"
+fi
+
+}
+
+### Function: stop_dwhdb ###
+#
+# Stop the sybase IQ database
+#
+# Arguments:
+#    none
+# Return Values:
+#    none
+stop_dwhdb()
+{
+$ECHO "\nStopping the dwhdb" | $TEE -a ${LOGFILE}
+PID=`$PS -ef | $EGREP "(${IQ_PS_STR})" | $EGREP -v grep | $EGREP -w ${DWH_ENG} | $AWK '{print $2}'`
+if [ -z "${PID}" ] ; then
+    $ECHO "Can't find dwhdb process. Database not running." >> ${LOGFILE}
+    return 0
+else
+    $ECHO "Database is running with PID ${PID}" | $TEE -a ${LOGFILE}
+fi
+
+dp_st="-c \"con=$DWH_ENG;eng=${DWH_ENG};links=tcpip{host=${DWH_ENG};port=${DWH_PORT};dobroadcast=none;verify=no};uid=dba;pwd=${DBA_PASSWORD}\""
+dp_st_en=/tmp/connc_st.`uuidgen`
+# encrypt the connection string.
+get_encrypt_file "${dp_st}" "${dp_st_en}"
+
+$SU - ${SYSUSER} -c "${IQDIR}/bin64/dbstop -y -q @${dp_st_en} &"
+$ECHO "dbstop forked" | $TEE -a ${LOGFILE}
+
+cnt=0
+while [ ${cnt} -lt 30 ] ; do
+    $SLEEP 5
+
+    PID=`$PS -ef | $EGREP "(${IQ_PS_STR})" | $EGREP -v grep | $EGREP -w ${DWH_ENG} | $AWK '{print $2}'`
+
+    if [ -z "${PID}" ] ; then
+        break
+    else
+        $ECHO "DB process ${DWH_ENG} is still running on pid ${PID}" | $TEE -a ${LOGFILE}
+        let cnt=cnt+1
+
+        $SLEEP 5
+    fi
+done
+
+PID=`$PS -ef | $EGREP "(${IQ_PS_STR})" | $EGREP -v grep| $EGREP -w ${DWH_ENG} | $AWK '{print $2}'`
+if [ -z "${PID}" ] ; then
+    $ECHO "Database is down" >> ${LOGFILE}
+else
+    $ECHO "Database $DWH_ENG refused to stop. Attempting to force kill it." | $TEE -a ${LOGFILE}
+    $KILL -9 ${PID} >> ${LOGFILE} 2>&1
+    if [ $? -ne 0 ]; then
+        _err_msg_="Could not kill IQ SERVER PID ${PID}"
+        abort_script "$_err_msg_"
+    fi
+
+    $ECHO "Database killed." >> ${LOGFILE}
+fi
+
+}
+
+
+### Function: stop_util_db ###
+#
+# Stop the sybase IQ database
+#
+# Arguments:
+#    none
+# Return Values:
+#    none
+stop_util_db()
+{
+$ECHO "\nStopping the utility db" | $TEE -a ${LOGFILE}
+${IQDIR}/bin64/dbping -q @${conn_string_enc} >> ${LOGFILE} 2>&1
+if [ $? -eq 0 ]; then
+    $SU - ${SYSUSER} -c "${IQDIR}/bin64/dbstop -y @${conection_string_enc}" 
+    if [ $? -ne 0 ]; then
+        _err_msg_="utility db shutdown failed"
+        abort_script "$_err_msg_" "${EXEC_SHELL_CMD}"
+    fi
+else
+    $ECHO "\nUtility db not online. No need to stop it." | $TEE -a ${LOGFILE}
+fi
+
+}
+
+### Function: test_iq_login ###
+#
+# Test that I can log into sybase IQ
+#
+# Arguments:
+#    none
+# Return Values:
+#    none
+test_iq_login()
+{
+
+# get encrypted connection string.
+conection_string="-c \"uid=dba;pwd=$Util_DBA_PASSWORD;eng=utility_srv;dbn=utility_db;links=tcpip{host=localhost;port=$UTIL_PORT;dobroadcast=no;verify=no}\""
+conection_string_enc=/tmp/conn_str_enc.`uuidgen`
+
+# encrypt the connection string.
+get_encrypt_file "${conection_string}" "${conection_string_enc}"
+
+# Test that I can log into sybase IQ
+$SU - ${SYSUSER} -c "${IQDIR}/bin64/dbisql -nogui @${conection_string_enc} quit"
+if [ $? -ne 0 ]; then
+    _err_msg_="Error logging on to utility_db database."
+    abort_script "$_err_msg_"
+fi
+
+}
+
+### Function: usage_msg ###
+#
+#   Print out the usage message
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+usage_msg()
+{
+$ECHO "
+Usage: `$BASENAME $0` [ -l <logfile> ]
+
+options:
+
+-l    : Optional parameter specifying logfile where the script output will be appended to.
+"
+}
+
+### Function: user_confirm ###
+#
+# Get confirmation from user to proceed with snapshot action
+#
+# Arguments:
+#       $1 : Message string
+# Return Values:
+#       none
+user_confirm()
+{
+while :; do
+    unset USER_CONF
+    $CLEAR
+    $ECHO "\n${1}"
+    $ECHO "Enter [Yes | No] (case sensitive) : \c"
+
+    read USER_CONF
+    if [ "$USER_CONF" == "Yes" -o "$USER_CONF" == "No" ]; then
+        break
+    fi
+done
+
+}
+# ********************************************************************
+#
+#     Main body of program
+#
+# ********************************************************************
+#
+RUN_TIME=`$DATE '+%Y-%b-%d_%H.%M.%S'`
+
+# Determine absolute path to software
+get_absolute_path
+
+# Check that the effective id of the user is root
+check_id root
+
+while getopts ":b:l:N" arg; do
+  case $arg in
+    b) ENIQ_BASE_DIR="$OPTARG" 
+       ;;
+    l) LOGFILE="$OPTARG" 
+       ;;
+    N) NO_CONFIRM="YES" 
+       ;;
+   \?) usage_msg
+       exit 1
+       ;;
+  esac
+done
+shift `expr $OPTIND - 1`
+
+# Create a temporary Directory
+TEM_DIR=/tmp/restore_iq.$$.$$
+$RM -rf ${TEM_DIR}
+$MKDIR -p ${TEM_DIR}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not create directory ${TEM_DIR}"
+    abort_script "$_err_msg_"
+fi
+$CHMOD 777 ${TEM_DIR}
+
+# Set up environment variables for script. 
+setup_env
+
+if [ ! "${LOGFILE}" ]; then
+    readonly LOGDIR="${ENIQ_BASE_DIR}/local_logs/recover_sybase"
+    DEF_LOGFILE="${LOGDIR}/restore_iq.log"
+fi
+
+# Set up default logfile if required
+if [ ! "${LOGFILE}" ]; then
+    LOGFILE="${DEF_LOGFILE}"
+fi
+
+# Check/Create Logfile
+chk_create_logfile
+
+# restore the db
+restore_IQ
+
+$RM -rf ${TEM_DIR}
+$RM -rf ${conn_string_enc}
+$RM -rf ${conection_string_enc}
+$RM -rf ${dp_st_en}
+$RM -rf ${d_enc}
+$RM -rf ${CONN_STR_strt_iq_ENC}
+exit 0
+
+
+

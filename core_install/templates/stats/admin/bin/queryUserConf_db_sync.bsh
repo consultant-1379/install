@@ -1,0 +1,389 @@
+#!/bin/bash
+# ********************************************************************
+# Ericsson Radio Systems AB SCRIPT
+# ********************************************************************
+#
+#
+# (c) Ericsson Radio Systems AB 2021 - All rights reserved.
+#
+# The copyright to the computer program(s) herein is the property
+# of Ericsson Radio Systems AB, Sweden. The programs may be used
+# and/or copied only with the written permission from Ericsson Radio
+# Systems AB or in accordance with the terms and conditions stipulated
+# in the agreement/contract under which the program(s) have been
+# supplied.
+#
+# ********************************************************************
+# Name    : queryUserConf_db_sync.bsh
+# Date    : 16/04/2021
+# Revision: main\4
+# Purpose : Cron to keep the config file and database in sync 
+# Usage   : queryUserConf_db_sync.bsh [ -l <path_to_logfile> ]
+#
+# ********************************************************************
+#
+#     Command Section
+#
+# ********************************************************************
+AWK=/usr/bin/awk
+BASH=/usr/bin/bash
+BASENAME=/usr/bin/basename
+CAT=/usr/bin/cat
+CHMOD=/usr/bin/chmod
+CHOWN=/usr/bin/chown
+COLUMN=/usr/bin/column
+CP=/usr/bin/cp
+DATE=/usr/bin/date
+DIRNAME=/usr/bin/dirname
+ECHO='/usr/bin/echo -e'
+EGREP=/usr/bin/egrep
+GREP=/usr/bin/grep
+ID=/usr/bin/id
+MKDIR=/usr/bin/mkdir
+RM=/usr/bin/rm
+SED=/usr/bin/sed
+SORT=/usr/bin/sort
+SU=/usr/bin/su
+TOUCH=/usr/bin/touch
+TR=/usr/bin/tr
+UNIQ=/usr/bin/uniq
+
+# ********************************************************************
+#
+#       Configuration Section
+#
+# ********************************************************************
+ENIQ_BASE_DIR=/eniq
+ENIQ_CONF_DIR=$ENIQ_BASE_DIR/installation/config
+
+# ENIQ Admin Directory
+ENIQ_ADMIN_DIR=${ENIQ_BASE_DIR}/admin
+
+# Name of SunOS & ENIQ ini Files
+ENIQ_ENV=niq.rc
+ENIQ_INI=niq.ini
+SUNOS_INI=SunOS.ini
+
+# ENIQ SW conf
+CLI_CONF_DIR=${ENIQ_BASE_DIR}/sw/conf
+
+#Temp directory
+TEM_DIR=/tmp
+
+# Source the common functions
+if [ -s $ENIQ_ADMIN_DIR/lib/common_functions.lib ]; then
+    . $ENIQ_ADMIN_DIR/lib/common_functions.lib
+else
+    _err_msg_="File $ENIQ_ADMIN_DIR/lib/common_functions.lib not found"
+    abort_script "$_err_msg_"
+
+fi
+
+# Get the System User and Group. All directories are owned by this
+SYSUSER=`iniget ENIQ_INSTALL_CONFIG -f ${ENIQ_CONF_DIR}/${SUNOS_INI} -v ENIQ_SYSUSER`
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not read SYSUSER param from ${ENIQ_CONF_DIR}/${SUNOS_INI}"
+    abort_script "$_err_msg_"
+fi
+
+DWH_PORT=`iniget DWH -v PortNumber -f ${CLI_CONF_DIR}/niq.ini`
+DWH_ENG=`iniget DWH -v ServerName -f ${CLI_CONF_DIR}/niq.ini`
+if [ ! "${DWH_PORT}" -o ! "${DWH_ENG}" ]; then
+        _err_msg_="Could not read db values from ${CLI_CONF_DIR}/${ENIQ_INI}"
+        abort_script "$_err_msg_"
+fi
+
+DBA_PASSWORD=`inigetpassword DB -f ${CLI_CONF_DIR}/${ENIQ_INI} -v DBAPassword`
+if [ ! ${DBA_PASSWORD} ]; then
+  if [ -f ${ENIQ_BASE_DIR}/sw/installer/dbusers ]; then
+            DBA_PASSWORD=`${ENIQ_BASE_DIR}/sw/installer/dbusers dba dwh`
+     if [ ! "${DBA_PASSWORD}" ] ; then
+                _err_msg_="Could not get dwhdb DBA Password"
+                abort_script "$_err_msg_"
+     fi
+   fi
+fi
+
+#Initialising the connection string for dwhdb
+dwh_connection_string="-nogui -onerror exit -c \"eng=${DWH_ENG};links=tcpip{host=localhost;port=${DWH_PORT}};uid=dba;pwd=${DBA_PASSWORD}\""
+dwh_connection_string_enc=${TEM_DIR}/dwh_conn_string_enc.`uuidgen`
+
+# encrypt the connection string.
+get_encrypt_file "${dwh_connection_string}" "${dwh_connection_string_enc}"
+
+. /eniq/sybase_iq/IQ-*/IQ-*.sh
+sybase_env_variables_ec=$?
+if [ $sybase_env_variables_ec -ne 0 ]; then
+    _err_msg_="Could not source sybase environment"
+    abort_script "$_err_msg_"
+fi
+
+
+
+# ********************************************************************
+#
+#   functions
+#
+# ********************************************************************
+### Function: abort_script ###
+#
+#   This will is called if the script is aborted thru an error
+#   error signal sent by the kernel such as CTRL-C or if a serious
+#   error is encountered during runtime
+#
+# Arguments:
+#       $1 - Error message from part of program (Not always used)
+# Return Values:
+#       none
+abort_script()
+{
+if [ "$1" ]; then
+    _err_msg_=$1
+else
+    _err_msg_="$($DATE '+%Y-%m-%d_%H.%M.%S'): Script aborted.......\n"
+fi
+
+if [ "${LOGFILE}" ]; then
+    $ECHO "\n$_err_msg_\n"|$TEE -a ${LOGFILE}
+else
+    $ECHO "\n$_err_msg_\n"
+fi
+
+$RM -rf ${dwh_connection_string_enc}
+
+if [ "$2" ]; then
+    exit ${2}
+else
+   exit 1
+fi
+
+}
+
+
+### Function: chk_create_logfile ###
+#
+# Check/Create Logfile
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+chk_create_logfile()
+{
+
+if [ ! "${LOGFILE}" ]; then
+    LOGFILE=${ENIQ_BASE_DIR}/log/sw_log/iq/queryUserConf_db_sync/queryUserConf_db_sync_$($DATE '+%Y-%b-%d_%H.%M.%S').log
+fi
+
+$MKDIR -p `$DIRNAME ${LOGFILE}`
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not create directory `$DIRNAME ${LOGFILE}`"
+     abort_script "$_err_msg_"
+fi
+
+$TOUCH -a ${LOGFILE}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not write to file ${LOGFILE}"
+    abort_script "$_err_msg_"
+fi
+}
+
+
+
+
+### Function: check_id ###
+#
+#   Check that the effective id of the user is correct
+#   If not print error msg and exit.
+#
+# Arguments:
+#       $1 : User ID name
+# Return Values:
+#       none
+check_id()
+{
+_check_id_=`$ID  | $AWK -F\( '{print $2}' | $AWK -F\) '{print $1}'`
+if [ "$_check_id_" != "$1" ]; then
+    _err_msg_="You must be $1 to execute this script."
+    abort_script "$_err_msg_"
+fi
+}
+
+
+### Function: get_absolute_path ###
+#
+# Determine absolute path to software
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+get_absolute_path()
+{
+    _dir_=`$DIRNAME $0`
+    SCRIPTHOME=`cd $_dir_ 2>/dev/null && pwd || $ECHO $_dir_`
+}
+
+
+### Function: setup_sybase_env ###
+#
+# Set up Sybase environment
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+setup_sybase_env()
+{
+$ENV |$EGREP '^(SYBASE|ASDIR|IQDIR|ASALOGDIR|SQLANY)' > $TEM_DIR/sybase_det.$ >> /dev/null 2>&1
+
+# Source the environment
+set -a
+. $TEM_DIR/sybase_det.$ >> /dev/null 2>&1
+set +a
+
+if [ ! "${SYBASE}" ]; then
+    _err_msg_="Could not determine Sybase environment variable \${SYBASE}"
+    abort_script "$_err_msg_"
+fi
+
+DBISQL="$(ls /eniq/sybase_iq/IQ-*/bin64/dbisql)"
+if [ ! -x "$DBISQL" ]; then
+    _err_msg_="$DBISQL commands not found or not executable."
+    abort_script "$_err_msg_"
+fi
+
+}
+
+
+# ********************************************************************
+#
+#     Main body of program
+#
+# ********************************************************************
+#
+# Determine absolute path to software
+get_absolute_path
+
+# Set up up path environment etc.
+setup_sybase_env
+
+# Check that the effective id of the user is dcuser
+check_id root
+
+#Create logfile
+chk_create_logfile
+
+$RM -rf ${TEM_DIR}/Database_Users.txt ${TEM_DIR}/queryUserConf.cfg ${TEM_DIR}/user_name.txt ${TEM_DIR}/ft_list >/dev/null 2>&1
+_flag_query_=0
+_flag_eniq_query_=0
+
+$SU -  $SYSUSER -c "$DBISQL @${dwh_connection_string_enc} \"select su.user_name,slp.login_policy_name,slpo.login_option_name,slpo.login_option_value,su.password_creation_time from sysloginpolicy as slp,sysuser as su,sysloginpolicyoption as slpo where slpo.login_policy_id=slp.login_policy_id and slp.login_policy_id=su.login_policy_id and slp.login_policy_name like 'query_user_login_policy%' and slpo.login_option_name in ('max_connections','password_life_time','max_failed_login_attempts','password_grace_time');OUTPUT TO /tmp/Database_Users.txt APPEND HEXADECIMAL ASIS FORMAT TEXT ;\"">/dev/null 2>&1
+if [ $? -eq 0 ]; then
+    _flag_query_=1
+fi
+
+$SU -  $SYSUSER -c "$DBISQL @${dwh_connection_string_enc} \"select su.user_name,slp.login_policy_name,slpo.login_option_name,slpo.login_option_value,su.password_creation_time from sysloginpolicy as slp,sysuser as su,sysloginpolicyoption as slpo where slpo.login_policy_id=slp.login_policy_id and slp.login_policy_id=su.login_policy_id and slp.login_policy_name like 'eniq_user_login_policy%' and slpo.login_option_name in ('max_connections','password_life_time','max_failed_login_attempts','password_grace_time');OUTPUT TO /tmp/Database_Users.txt APPEND HEXADECIMAL ASIS FORMAT TEXT ;\"">/dev/null 2>&1
+if [ $? -eq 0 ]; then
+        _flag_eniq_query_=1
+fi
+
+if [ ${_flag_eniq_query_} -eq 1 ] || [ ${_flag_query_} -eq 1 ];then 
+    if [ ! -s ${TEM_DIR}/Database_Users.txt ]; then
+        log_msg -q -s "$($DATE '+%Y-%b-%d_%H.%M.%S'): No user information exists in the database" -l ${LOGFILE}
+    else
+        if [ -f ${CLI_CONF_DIR}/queryUserConf.cfg ]; then
+            $TOUCH ${CLI_CONF_DIR}/queryUserConf.cfg
+        fi
+            $CAT ${TEM_DIR}/Database_Users.txt | $AWK -F , '{print $1}'| $TR -d \'|$SORT -u > ${TEM_DIR}/user_name.txt
+            while IFS='' read -r user_db || [[ -n $user_db ]]; do
+                _max_connections_=` $CAT ${TEM_DIR}/Database_Users.txt | $GREP -w $user_db | $GREP -w max_connections | $AWK -F , '{print $4}' |$TR -d \'`
+                _max_failed_login_attempts_=`$CAT ${TEM_DIR}/Database_Users.txt | $GREP -w $user_db | $GREP -w max_failed_login_attempts | $AWK -F , '{print $4}' | $TR -d \'`
+                _login_policy_name_=`$CAT  ${TEM_DIR}/Database_Users.txt | $GREP -w $user_db | $AWK -F , '{print $2}' |$UNIQ`
+                _password_life_time_=` $CAT ${TEM_DIR}/Database_Users.txt | $GREP -w $user_db | $GREP -w password_life_time | $AWK -F , '{print $4}' | $TR -d \'`
+                #setting value of life time, grace time, and expiration date to zero if the life time is unlimited
+				_password_creation_date_=`$CAT ${TEM_DIR}/Database_Users.txt | $GREP -w $user_db | $AWK -F , '{print $5}' | $CUT -d ' ' -f1 |$UNIQ`
+                if [ "$_password_life_time_" == "unlimited" ]; then
+                    _password_life_time_=0
+                    _password_grace_time_=0
+                    _password_expiration_date_=0
+                else 
+                    _password_grace_time_=`$CAT  ${TEM_DIR}/Database_Users.txt | $GREP -w $user_db | $GREP -w password_grace_time | $AWK -F , '{print $4}' |$TR -d \'`
+                    _password_expiration_date_=`date -d "$_password_creation_date_ +$_password_life_time_ days" +"%Y-%m-%d"`
+                fi
+                
+                if [ "$_max_connections_" == "unlimited" ]; then
+                    _max_connections_=0
+                fi
+                #Creating feature list for each user and updating users according to features granted and NULL feature updation if user deleted
+                if [ -s ${CLI_CONF_DIR}/queryUserConf.cfg ]; then
+                        $CAT ${CLI_CONF_DIR}/queryUserConf.cfg | $GREP -w $user_db | $AWK -F :: '{print $2}'| $SORT -u > ${TEM_DIR}/ft_list
+                else 
+                    $ECHO "NULL">${TEM_DIR}/ft_list
+                fi
+                if [ -s "${TEM_DIR}/ft_list" ]; then
+                    while IFS='' read -r line || [[ -n "$line" ]]; do
+                        #Updating the feature to All  in case of standard user(dcbo and dcpublic).Updating only one entry for standard user since the standard user has access to all the feature, skipping the rest of the entry, if updated manually by user
+                        if [ "$user_db" == "dcbo" ] || [ "$user_db" == "dcpublic" ];then
+                            count=`$CAT ${TEM_DIR}/ft_list | wc -l`
+                            if [ $count -eq 1 ]; then
+                                $ECHO "${user_db}::ALL::${_login_policy_name_}::${_max_connections_}::${_password_creation_date_}::${_password_life_time_}::${_password_expiration_date_}::${_password_grace_time_}::${_max_failed_login_attempts_}"| $SED "s/'//g">> ${TEM_DIR}/queryUserConf.cfg
+                                log_msg -q -s "$($DATE '+%Y-%b-%d_%H.%M.%S'): Successfully verified ${user_db} information in ${CLI_CONF_DIR}/queryUserConf.cfg" -l ${LOGFILE}
+                            else 
+                                $ECHO "${user_db}::ALL::${_login_policy_name_}::${_max_connections_}::${_password_creation_date_}::${_password_life_time_}::${_password_expiration_date_}::${_password_grace_time_}::${_max_failed_login_attempts_}"| $SED "s/'//g">> ${TEM_DIR}/queryUserConf.cfg
+                                log_msg -q -s "$($DATE '+%Y-%b-%d_%H.%M.%S'): Successfully verified ${user_db} information in ${CLI_CONF_DIR}/queryUserConf.cfg" -l ${LOGFILE}
+                                break
+                            fi
+                        else
+                            count=`$CAT ${TEM_DIR}/ft_list | wc -l`
+                            #feature list for each customized user and updating users according to features granted and NULL feature updation if user deleted and avoiding multiple NULL entry
+                            if [ $count -eq 1 ] && [ "${line}" == " " ]; then
+                                $ECHO "${user_db}::NULL::${_login_policy_name_}::${_max_connections_}::${_password_creation_date_}::${_password_life_time_}::${_password_expiration_date_}::${_password_grace_time_}::${_max_failed_login_attempts_}"| $SED "s/'//g">> ${TEM_DIR}/queryUserConf.cfg
+                                log_msg -q -s "$($DATE '+%Y-%b-%d_%H.%M.%S'): ${user_db} information not present in ${CLI_CONF_DIR}/queryUserConf.cfg." -l ${LOGFILE}
+                                log_msg -q -s "$($DATE '+%Y-%b-%d_%H.%M.%S'): Successfully added ${user_db} information in ${CLI_CONF_DIR}/queryUserConf.cfg" -l ${LOGFILE}
+                            elif [ -z "${line}"  -o "${line}" == " " ]; then
+                                continue
+                            else
+                                $ECHO "${user_db}::${line}::${_login_policy_name_}::${_max_connections_}::${_password_creation_date_}::${_password_life_time_}::${_password_expiration_date_}::${_password_grace_time_}::${_max_failed_login_attempts_}"| $SED "s/'//g">> ${TEM_DIR}/queryUserConf.cfg
+                                log_msg -q -s "$($DATE '+%Y-%b-%d_%H.%M.%S'): Successfully verified ${user_db} information in ${CLI_CONF_DIR}/queryUserConf.cfg" -l ${LOGFILE}
+                            fi
+                        fi
+                    done < ${TEM_DIR}/ft_list
+                else
+                    if [ "$user_db" == "dcbo" ] || [ "$user_db" == "dcpublic" ];then
+                        $ECHO "${user_db}::ALL::${_login_policy_name_}::${_max_connections_}::${_password_creation_date_}::${_password_life_time_}::${_password_expiration_date_}::${_password_grace_time_}::${_max_failed_login_attempts_}"| $SED "s/'//g">> ${TEM_DIR}/queryUserConf.cfg
+                        log_msg -q -s "$($DATE '+%Y-%b-%d_%H.%M.%S'): ${user_db} information not present in ${CLI_CONF_DIR}/queryUserConf.cfg." -l ${LOGFILE}
+                        log_msg -q -s "$($DATE '+%Y-%b-%d_%H.%M.%S'): Successfully added ${user_db} information in ${CLI_CONF_DIR}/queryUserConf.cfg" -l ${LOGFILE}
+                    else 
+                        $ECHO "${user_db}::NULL::${_login_policy_name_}::${_max_connections_}::${_password_creation_date_}::${_password_life_time_}::${_password_expiration_date_}::${_password_grace_time_}::${_max_failed_login_attempts_}"| $SED "s/'//g">> ${TEM_DIR}/queryUserConf.cfg
+                        log_msg -q -s "$($DATE '+%Y-%b-%d_%H.%M.%S'): ${user_db} information not present in ${CLI_CONF_DIR}/queryUserConf.cfg." -l ${LOGFILE}
+                        log_msg -q -s "$($DATE '+%Y-%b-%d_%H.%M.%S'): Successfully added ${user_db} information in ${CLI_CONF_DIR}/queryUserConf.cfg" -l ${LOGFILE}
+                    fi
+                fi
+            done < ${TEM_DIR}/user_name.txt
+
+            $CAT ${TEM_DIR}/queryUserConf.cfg | $GREP -w 'User_Name' >/dev/null 2>&1
+            if [ $? -ne 0 ]; then
+                $SED -i '1i # User_Name::Feature_Name::Login_Policy_Name::Max_Connections::Password_Creation_Date::Password_Life_Time::Password_Expiration_Date::Password_Grace_Time::Max_Login_Attempts #' ${TEM_DIR}/queryUserConf.cfg
+                if [ $? -ne 0 ]; then
+                    _err_msg_="$($DATE '+%Y-%b-%d_%H.%M.%S'): Failed to update header information in ${CLI_CONF_DIR}/queryUserConf.cfg"
+                    abort_script "$_err_msg_"
+                else
+                    log_msg -q -s "$($DATE '+%Y-%b-%d_%H.%M.%S'): Successfully updated header information in ${CLI_CONF_DIR}/queryUserConf.cfg" -l ${LOGFILE}
+                fi
+            fi
+
+            $CP -p ${TEM_DIR}/queryUserConf.cfg ${CLI_CONF_DIR}/queryUserConf.cfg
+            if [ $? -ne 0 ];then
+                _err_msg_="Could not copy user information in ${TEM_DIR}/queryUserConf.cfg to ${CLI_CONF_DIR}/queryUserConf.cfg"
+                abort_script "$_err_msg_"
+            fi
+    fi
+else
+    _err_msg_="$($DATE '+%Y-%b-%d_%H.%M.%S'): Failed to execute the query to read user information from Database"
+    abort_script "$_err_msg_"
+fi
+
+$RM -rf ${dwh_connection_string_enc}
+
+exit 0

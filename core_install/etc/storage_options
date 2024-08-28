@@ -1,0 +1,5 @@
+# This file contains the names of the different storage options
+# that can be used during installation
+#
+raw
+fs

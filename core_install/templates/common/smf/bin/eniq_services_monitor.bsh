@@ -1,0 +1,706 @@
+#!/bin/bash
+# ********************************************************************
+# Ericsson Radio Systems AB                                     SCRIPT
+# ********************************************************************
+#
+#
+# (c) Ericsson Radio Systems AB 2018 - All rights reserved.
+#
+# The copyright to the computer program(s) herein is the property
+# of Ericsson Radio Systems AB, Sweden. The programs may be used
+# and/or copied only with the written permission from Ericsson Radio
+# Systems AB or in accordance with the terms and conditions stipulated
+# in the agreement/contract under which the program(s) have been
+# supplied.
+#
+# ********************************************************************
+# Name    : eniq_services_monitor.bsh
+# Date    : 06/10/2023
+# Revision: \main\14
+# Purpose : Script to monitor local ENIQ services and clear and start 
+#			any that have gone into failed state
+#
+# Usage   : eniq_services_monitor.bsh [-l]
+#				-l : Log to file only, don't echo to STDOUT.
+#
+# ********************************************************************
+#
+# 	Command Section
+#
+# ********************************************************************
+AWK=/usr/bin/awk
+CAT=/usr/bin/cat
+CHOWN=/usr/bin/chown
+CUT=/usr/bin/cut
+DATE=/usr/bin/date
+ECHO="/usr/bin/echo -e"
+EGREP=/usr/bin/egrep
+GAWK=/usr/bin/gawk
+GREP=/usr/bin/grep
+HOSTNAME=/usr/bin/hostname
+ID=/usr/bin/id
+IFCONFIG=/usr/sbin/ifconfig
+MKDIR=/usr/bin/mkdir
+RM=/usr/bin/rm
+SLEEP=/usr/bin/sleep
+SYSTEMCTL=/usr/bin/systemctl
+TEE=/usr/bin/tee
+TOUCH=/usr/bin/touch
+SSH=/usr/bin/ssh
+SU=/usr/bin/su
+SUDO=/usr/bin/sudo
+
+# ********************************************************************
+#
+#       Configuration Section
+#
+# ********************************************************************
+EXIT_OK=0
+EXIT_ERROR=1
+EXIT_USAGE_ERROR=2
+EXIT_FUNCTION_PARAM_ERROR=3
+ENIQ_INST=/eniq/installation
+INST_CONFIG=${ENIQ_INST}/config
+COMMON_FUNCTIONS=${ENIQ_INST}/core_install/lib/common_functions.lib
+DEBUG_FLAGFILE=${INST_CONFIG}/extra_params/esm
+SVC_STATE_ONLINE="active"
+SVC_STATE_OFFLINE="inactive"
+SVC_STATE_MAINT="failed"
+LOG_ONLYFILE=0
+COORD_NAME="dwhdb"
+REPDB_NAME="repdb"
+LICSRV_NAME="licenceservice"
+ENGINE_NAME="engine"
+SENTINEL_NAME="sentinel"
+DATE_FORMAT="+%Y-%b-%d_%H.%M.%S"
+
+ENIQ_ADM="eniq_adm"
+ESM_INI_BLOCK="ESM"
+ESM_MAIN_INTERVAL_PARAM="MainIntervalSleepSeconds"
+ESM_MAIN_INTERVAL_DEFAULT=60
+ESM_SVCS_CLEAR_WAIT="SvcsClearWaitSeconds"
+ESM_SVCS_CLEAR_WAIT_DEFAULT=30
+
+CONF_DIR=${CONF_DIR:-/eniq/sw/conf} 
+NIQINI=${CONF_DIR}/niq.ini
+NIQRC=${CONF_DIR}/niq.rc
+SERVICE_NAMES=${CONF_DIR}/service_names
+
+INSTALL_SERVER_TYPE=${INST_CONFIG}/installed_server_type 
+SVC_CONTRACT_CONFIG="/eniq/admin/etc/smf_contract_config"
+
+# ********************************************************************
+#
+#       Pre-execution Operations
+#
+# ********************************************************************
+if [ -f ${NIQRC} ] ; then
+	. ${NIQRC}
+else
+	$ECHO "File ${NIQRC} not found"
+	exit ${EXIT_ERROR}
+fi
+
+if [ ! -f ${NIQINI} ] ; then
+	$ECHO "File ${NIQINI} not found"
+	exit ${EXIT_ERROR}
+fi
+
+if [ -f ${COMMON_FUNCTIONS} ]; then
+    . ${COMMON_FUNCTIONS}
+else
+    $ECHO "File ${COMMON_FUNCTIONS} not found"
+	exit ${EXIT_ERROR}
+fi
+
+LOGFILEDIR=/eniq/local_logs/esm
+LOGFILE=${LOGFILEDIR}/esm_`$HOSTNAME | $CUT -d "." -f1`.log
+$MKDIR -p ${LOGFILEDIR}
+if [ $? -ne 0 ] ; then
+	$ECHO "Could not create directory ${LOGFILEDIR}"
+	exit ${EXIT_ERROR}
+fi
+$TOUCH ${LOGFILE}
+if [ $? -ne 0 ] ; then
+	$ECHO "Could not create file ${LOGFILE}"
+	exit ${EXIT_ERROR}
+fi
+
+SYSUSER=`iniget ENIQ_INSTALL_CONFIG -f ${INST_CONFIG}/SunOS.ini -v ENIQ_SYSUSER`
+SYSGRP=`$ID ${SYSUSER} | $GAWK '{print $2}' | $GAWK -F\( '{print $2}' | $GAWK -F\) '{print $1}'`
+$CHOWN -R ${SYSUSER}:${SYSGRP} ${LOGFILEDIR}
+
+#Fetching IP Type from IPMP_INI file.
+check_ip_type
+
+if [ ! "${_ip_type_}" ]; then
+    _err_msg_="Could not read parameter _IP_TYPE_ from file ${ENIQ_CONF_DIR}/${IPMP_INI}"
+    abort_script "$_err_msg_"
+fi
+
+# ********************************************************************
+#
+# 	functions
+#
+# ********************************************************************
+### Function: abort_script ###
+#
+#   Generic method to handle error cases. Logs the message and exits the script.
+#
+# Arguments:
+#       $1 - Error message from part of program
+#       $2 - Optional exit code. If not specified, exit code 1 is used.
+# Return Values:
+#       None
+abort_script()
+{
+	local _err_time_=`$DATE ${DATE_FORMAT}`
+	if [ "$1" ]; then
+		local _err_msg_="${_err_time_} - ERROR : $1"
+	else
+		local _err_msg_="${_err_time_} - ERROR : Script aborted.......\n"
+	fi
+
+	if [ -f "${LOGFILE}" ]; then
+		$ECHO "\n$_err_msg_" | $TEE -a ${LOGFILE}
+	else
+		$ECHO "\n$_err_msg_"
+	fi
+
+	if [ "$2" ]; then
+		exit ${2}
+	else
+		exit ${EXIT_ERROR}
+	fi
+}
+
+### Function: check_local_eniq_service ###
+#
+# Check an local ENIQ service. If the service is in state failed it gets cleared.
+# Note(1):	Some services may not get cleared if a dependant service on not 
+#			online e.g. engine wont be cleared if licensing is not online.
+#
+# Note(2): If a function called clear_service_${service_name} exists, that one 
+#			will be used to clear the service.
+#		   If clear_service_${service_name} doesn't exist, clear_service_local_generic
+#			gets called.
+#
+# Arguments:
+#       $1 - Eniq service name
+# Return Values:
+#       None
+check_local_eniq_service()
+{
+	if [ $# -ne 1 ] ; then
+		abort_script "Invalid number of arguments passed to check_local_eniq_service()" ${EXIT_FUNCTION_PARAM_ERROR}
+	fi
+	local _sname_=$1
+	local _real_name_=`map_servicename ${_sname_}`
+	local _svc_=`get_svc_name $_real_name_`
+	local _state_=`$SYSTEMCTL show ${_svc_} -p ActiveState | $AWK -F= '{print $2}'`
+	debug "${_sname_} -> ${_svc_} -> ${_state_}"
+	if [[ $_state_ =~ ${SVC_STATE_MAINT} ]] ; then
+		log "Clearing ${_svc_} ...."
+		local _service_type_="local_generic"
+		# Use bashs' type command
+		type -t clear_service_${_real_name_} > /dev/null
+		if [ $? -eq 0 ] ; then
+			_service_type_="${_real_name_}"
+		fi
+		local _clear_function_="clear_service_${_service_type_}"
+		debug "Using function ${_clear_function_} to clear ${_real_name_}"
+		${_clear_function_} "$_svc_"
+	fi
+}
+
+### Function: check_local_eniq_services ###
+#
+# Get the local service from service_names and check they aren't in a failed
+# state. If they are, clear and start them.
+#
+# Arguments:
+#       None
+# Return Values:
+#       None
+check_local_eniq_services()
+{
+	local _hostname_=`$HOSTNAME | $CUT -d "." -f1`
+	debug "Looking up ${SERVICE_NAMES} for services running on $_hostname_"
+	if [ -s ${SERVICE_NAMES} ]; then
+		local _services_=`$CAT ${SERVICE_NAMES} | $EGREP -v "^[[:blank:]]*#" | $EGREP ".*::${_hostname_}::.*" | $GAWK -F:: '{print $3}'`
+	else
+		abort_script "${SERVICE_NAMES} is empty."
+	fi
+	local _services_=`trim $_services_`
+
+       	local _install_type_=`$CAT $INSTALL_SERVER_TYPE`
+       	local _sentinel_status_=`$CAT $SVC_CONTRACT_CONFIG | $GREP ${_install_type_} | $GREP $SENTINEL_NAME | $GAWK -F:: '{print $NF}'`
+       	if [ ${_sentinel_status_} == Y ]; then
+       		_services_="$_services_ $SENTINEL_NAME" 
+       	fi
+
+	debug "ENIQ service list for host '${_hostname_}' is [${_services_}]"
+	for _service_ in ${_services_} ; do
+		check_local_eniq_service "$_service_"
+	done
+}
+
+### Function: clear_service_dwh_reader ###
+#
+# Clears a reader if dwhdb is online. If dwhdb is in any other state, the reader
+# is left in failed
+#
+# Arguments:
+#       $1 - The reader name e.g. dwh_reader_2
+# Return Values:
+#       None
+clear_service_dwh_reader()
+{
+	if [ $# -ne 1 ] ; then
+		abort_script "Invalid number of arguments passed to clear_service_dwh_reader()" ${EXIT_FUNCTION_PARAM_ERROR}
+	fi
+	local _reader_name_=$1
+	# Check dwhdb is online and only clear the failed state if it's running
+	local _dwhdb_state_=`get_service_state ${COORD_NAME}`
+	if [ $? -ne 0 ] ; then
+		# get_service_state() failed for some reason...
+		return
+	fi
+	if [[ $_dwhdb_state_ =~ ${SVC_STATE_ONLINE} ]] ; then
+		clear_service_local_generic $_reader_name_
+	else
+		warning "${COORD_NAME} is not online, not clearing $_reader_name_ until ${COORD_NAME} is started."
+	fi
+}
+
+### Function: clear_service_dwh_writer ###
+#
+# Clears a writer if dwhdb is online. If dwhdb is in any other state, the writer
+# is left in failed
+#
+# Arguments:
+#       $1 - The writer name e.g. dwh_writer_9
+# Return Values:
+#       None
+clear_service_dwh_writer()
+{
+	if [ $# -ne 1 ] ; then
+		abort_script "Invalid number of arguments passed to clear_service_dwh_writer()" ${EXIT_FUNCTION_PARAM_ERROR}
+	fi
+	local _writer_name_=$1
+	# Check dwhdb is online and only clear the failed state if it's running
+	local _dwhdb_state_=`get_service_state ${COORD_NAME}`
+	if [ $? -ne 0 ] ; then
+		# get_service_state() failed for some reason...
+		return
+	fi
+	if [[ $_dwhdb_state_ =~ ${SVC_STATE_ONLINE} ]] ; then
+		clear_service_local_generic $_writer_name_
+	else
+		warning "${COORD_NAME} is not online, not clearing $_writer_name_ until ${COORD_NAME} is started."
+	fi
+}
+
+### Function: clear_service_engine ###
+#
+# Clears engine if licsrv is online. If licsrv is in any other state, engine is 
+# left in failed
+#
+# Arguments:
+#       None
+# Return Values:
+#       None
+clear_service_engine()
+{
+	local _engine_name_=$1
+	local _licsrv_state_=`get_service_state ${LICSRV_NAME}`
+	if [ $? -ne 0 ] ; then
+		# get_service_state() failed for some reason...
+		return
+	fi
+	if [[ $_licsrv_state_ =~ ${SVC_STATE_ONLINE} ]] ; then
+		clear_service_local_generic $_engine_name_
+	else
+		warning "${LICSRV_NAME} is not online, not clearing ${ENGINE_NAME} until ${LICSRV_NAME} is started."
+	fi
+}
+
+### Function: clear_service_licenceservice ###
+#
+# Clears licsrv if sentinel is online. If sentinel is in any other state, licsrv
+# is left in failed. If sentinel isnt on the same host as licsrv, a clear 
+# of licsrv is tried anyway.
+#
+# Arguments:
+#       None
+# Return Values:
+#       None
+clear_service_licenceservice()
+{
+	# Note, this function presumes sentinel is running either on the same host 
+	# as licsrv or some other non-eniq host
+	
+	$IFCONFIG -a | $EGREP "^[[:blank:]]+inet[[:blank:]]+${LSHOST}[[:blank:]]+" > /dev/null 2>&1
+	if [ $? -eq 0 ] ; then
+		local _sent_svc_=`get_svc_name ${SENTINEL_NAME} licensing`
+		local _state_=`$SYSTEMCTL show "${_sent_svc_}" -p ActiveState | $AWK -F= '{print $2}'`
+		if [ $? -ne 0 ] ; then
+			warning "Failed to check state of ${_sent_svc_} on ${LSHOST} : $_state_"
+			return
+		fi
+		if [[ $_state_ =~ ${SVC_STATE_ONLINE} ]] ; then
+			clear_service_local_generic "${LICSRV_NAME}"
+		else
+			warning "${SENTINEL_NAME} is not online, not clearing ${LICSRV_NAME} until ${SENTINEL_NAME} is started."
+		fi
+	else
+		debug "${SENTINEL_NAME} is a non-eniq deployment, trying to clear ${LICSRV_NAME} anyway."
+		clear_service_local_generic "${LICSRV_NAME}"
+	fi
+}
+
+### Function: clear_service_local_generic ###
+#
+# Default SERVICE clear function
+#
+# Arguments:
+#       $1 - The local service
+# Return Values:
+#       None
+clear_service_local_generic()
+{
+	if [ $# -ne 1 ] ; then
+		abort_script "Invalid number of arguments passed to clear_service_local_generic()" ${EXIT_FUNCTION_PARAM_ERROR}
+	fi
+	local _svc_=$1
+	$SUDO ${SYSTEMCTL} reset-failed ${_svc_} >> ${LOGFILE} 2>&1
+	local _state_=`$SYSTEMCTL show ${_svc_} -p ActiveState | $AWK -F= '{print $2}'`
+	if [ "${_state_}" != ${SVC_STATE_OFFLINE} ] ; then
+		wait_for_state ${_svc_} ${SVC_STATE_OFFLINE}
+	fi
+	$SUDO ${SYSTEMCTL} start ${_svc_} >> ${LOGFILE} 2>&1
+	local _state_=`$SYSTEMCTL show ${_svc_} -p ActiveState | $AWK -F= '{print $2}'`
+	if [ "${_state_}" != ${SVC_STATE_ONLINE} ] ; then
+		wait_for_state ${_svc_} ${SVC_STATE_ONLINE}
+	fi
+	
+	local _retry_count_=`ini_get ${NIQINI} ${ESM_INI_BLOCK} ${ESM_SVCS_CLEAR_WAIT} ${ESM_SVCS_CLEAR_WAIT_DEFAULT}`
+	if [ $? -ne 0 ] ; then
+		# Shouldn't happen as a default was specified...
+		warning "Nothing returned from ${NIQINI} for ${ESM_SVCS_CLEAR_WAIT}, defaulting to ${ESM_SVCS_CLEAR_WAIT_DEFAULT}"
+		local _retry_count_=${ESM_SVCS_CLEAR_WAIT_DEFAULT}
+	fi
+	local _retry_=0
+	local _cleared_ok_=-1
+	log "Waiting for ${_sname_} to start ..."
+	while [ ${_retry_} -lt $_retry_count_ ] ; do
+		unset _state_
+		local _state_=`$SYSTEMCTL show ${_svc_} -p ActiveState | $AWK -F= '{print $2}'`
+		debug "${_svc_} -> $_state_"
+		if [[ $_state_ == ${SVC_STATE_ONLINE} ]] ; then
+			_cleared_ok_=0
+			break
+		elif [[ $_state_ =~ ${SVC_STATE_MAINT} ]] ; then
+			_cleared_ok_=1
+			break
+		fi
+		let _retry_=_retry_+1
+		interruptible_sleep 1
+	done
+	case $_cleared_ok_ in 
+		0) log "$_svc_ restarted OK";;
+		1) warning "$_svc_ has gone back into state ${SVC_STATE_MAINT}";;
+		?) warning "$_svc_ has not been cleared, still in state $_state_";;
+	esac
+}
+
+### Function: debug ###
+#
+# Log debug messages to ${LOGFILE} if ${DEBUG_FLAGFILE} exists.
+#
+# Arguments:
+#       $1...$N	- Debug message to log
+# Return Values:
+#       None
+debug()
+{
+	if [ -f ${DEBUG_FLAGFILE} -a -f "${LOGFILE}" ] ; then
+		local _time_=`$DATE ${DATE_FORMAT}`
+		local _msg_="${_time_} - DEBUG -- $*"
+		$ECHO "$_msg_" >> ${LOGFILE}
+	fi
+}
+
+### Function: get_service_state ###
+#
+# Get the SERVICE state for a service, either local or remote.
+#
+# Arguments:
+#       $1 - Service name
+#       $2 - Optional type, defaults to eniq if not specified
+# Return Values:
+#       0 if no errors and state echoed to stdout
+#       1 if errors and error echoed to stdout
+get_service_state()
+{
+	if [ $# -eq 0 ] ; then
+		abort_script "Invalid number of arguments passed to get_service_state()" ${EXIT_FUNCTION_PARAM_ERROR}
+	fi
+	local _name_=$1
+	local _app_=${2:-eniq}
+	local _mapped_=`map_servicename $_name_`
+	local _remote_svc_=`get_svc_name $_mapped_ $_app_`
+	
+	# Check if the service is defined to run local or remote via service_names file
+	if [ -s ${SERVICE_NAMES} ]; then
+		local _count_=`$CAT ${SERVICE_NAMES} | $GREP $_name_ | grep -o "::" | wc -l`
+
+		if [ "${_ip_type_}" == "IPv6" -a "${_count_}" == 3 ]; then
+			local _service_ip_=`$CAT ${SERVICE_NAMES} | $GREP $_name_ | grep -oE '([a-fA-F0-9]{1,4}::?){1,7}[a-fA-F0-9]{1,4}' | head -n 1 | awk -F "::" '{ print $1 "::" $2}'`
+		else
+			local _service_ip_=`$CAT ${SERVICE_NAMES} | $GREP $_name_ | $GAWK -F\:: '{print $1}'`
+		fi
+	else
+		abort_script "${SERVICE_NAMES} is empty."
+	fi
+	# Does the service ipaddress match any of the local adapters.
+	${IFCONFIG} -a | $GREP "inet" | $GAWK '{print $2}' | $GREP -w "$_service_ip_" > /dev/null
+	if [ $? -eq 0 ] ; then
+		#Service should be running locally    
+		$SYSTEMCTL show ${_remote_svc_} -p ActiveState | $AWK -F= '{print $2}'
+	else
+		#Service is not local, ssh to service host and check there
+		debug "Checking ${SYSUSER}@$_name_ for ${_remote_svc_}"
+		local _tmpfile_=/tmp/monitor.$$
+		$SU - dcuser -c "$SSH -oBatchMode=yes ${SYSUSER}@$_name_ $SYSTEMCTL show ${_remote_svc_} -p ActiveState | $AWK -F= '{print $2}'" > ${_tmpfile_} 2>&1
+		local _res_=$?
+		local _state_=`$CAT $_tmpfile_`
+		$RM -rf $_tmpfile_
+		if [ $_res_ -ne 0 ] ; then
+			warning "Failed to check state of ${_remote_svc_} on $_name_ : $_state_"
+			return 1
+		fi
+		$ECHO $_state_
+	fi
+	return 0
+}
+
+### Function: get_svc_name ###
+#
+# Get the service name
+#
+# Arguments:
+#       $1 - Service name
+#       $2 - Optional type, defaults to eniq if not specified
+# Return Values:
+#       SERVICE name e.g. eniq-webserver.service
+get_svc_name()
+{
+	if [ $# -eq 0 ] ; then
+		abort_script "Invalid number of arguments passed to get_svc_name()" ${EXIT_FUNCTION_PARAM_ERROR}
+	fi
+	local _name_=$1
+	local _app_=${2:-eniq}
+	if [[ ${_name_} =~ ${SENTINEL_NAME} ]]; then
+		_app_=licensing
+	fi
+  
+	$ECHO "${_app_}-${_name_}.service"
+}
+
+### Function: ini_get ###
+#
+# Get a value from an INI file or use a default if no value found.
+#
+# Arguments:
+#       $1 - ini file
+#       $2 - The ini block
+#       $3 - The ini parameter
+#       $4 - Optional value to return if the block or param doesn't exist
+# Return Values:
+#		0 If a param value is available in the file or if no param value available
+#			but a default was specified; it will have been echoed to STDOUT
+#		1 Nothing found in ini file and no default was specified.
+ini_get()
+{
+	if [ $# -lt 3 ] ; then
+		abort_script "Invalid number of arguments passed to ini_get()" ${EXIT_FUNCTION_PARAM_ERROR}
+	fi
+	local _inifile_=$1
+	local _block_=$2
+	local _param_=$3
+	local _default_=$4
+	local _inivalue_=`iniget ${_block_} -f ${_inifile_} -v ${_param_}`
+	if [ ! -z "$_inivalue_" ] ; then
+		debug "Found value ${_inivalue_} for ${_block_}:${_param_} from ${_inifile_}"
+		$ECHO "$_inivalue_"
+		return 0
+	elif [ ! -z "$_default_" ] ; then
+		debug "Nothing found for ${_block_}:${_param_} from ${_inifile_}, using default ${_default_}"
+		$ECHO "$_default_"
+		return 0
+	else
+		debug "Nothing found for ${_block_}:${_param_} from ${_inifile_}, no default set either"
+		return 1
+	fi
+}
+
+### Function: interruptible_sleep ###
+#
+#   Sleep function that can be interrupted by kill signals
+#
+# Arguments:
+#       $1 - sleep time in seconds
+# Return Values:
+# 		None
+interruptible_sleep()
+{
+	local _count_=0
+	local _seconds_=$1
+	until [  ${_count_} -ge ${_seconds_} ]; do
+		let _count_+=1
+		$SLEEP 1
+	done
+}
+
+### Function: log ###
+#
+# Log a message to ${LOGFILE}. 
+#	If ${LOGFILE} doesn't exist it get printed to stdout
+#
+# Arguments:
+#       $1...$N	- Message to log
+# Return Values:
+#       None
+log()
+{
+	local _time_=`$DATE ${DATE_FORMAT}`
+	local _msg_="${_time_} - $*"
+	if [ ${LOG_ONLYFILE} ]; then
+		$ECHO "$_msg_" >> ${LOGFILE}
+	else
+		$ECHO "$_msg_" | $TEE -a ${LOGFILE}
+	fi
+}
+
+### Function: map_servicename ###
+#
+# Maps a service name to it SERVICE name if they are different
+#
+# Arguments:
+#       $1 - The service name
+# Return Values:
+#       The SERVICE name for the service
+map_servicename()
+{
+	if [ $# -ne 1 ] ; then
+		abort_script "Invalid arguments passed to function map_servicename()" ${EXIT_FUNCTION_PARAM_ERROR}
+	fi
+	if [[ $1 =~ dwh_reader_.* ]] ; then
+		debug "Mapping $1 to dwh_reader"
+		$ECHO "dwh_reader"
+	elif [[ $1 =~ dwh_writer_.* ]] ; then
+		debug "Mapping $1 to dwh_writer"
+		$ECHO "dwh_writer"
+	elif [[ $1 == ${LICSRV_NAME} ]] ; then
+		debug "Mapping $1 to licmgr"
+		$ECHO "licmgr"
+	elif [[ $1 == ${SENTINEL_NAME} ]] ; then
+		debug "Mapping $1 to sentinel"
+		$ECHO "${SENTINEL_NAME}"
+	else
+		$ECHO $1
+	fi
+}
+
+### Function: trap_shutdown_and_exit ###
+#
+#   Log a stop message.
+#
+# Arguments:
+#       None
+# Return Values:
+#       None
+trap_shutdown_and_exit()
+{
+log "Stopping on `$DATE`"
+exit
+}
+
+### Function: trim ###
+#
+# Trim white spaces from start and and of input arguments
+#
+# Arguments:
+#       $1...$N - String(s) to trim
+# Return Values:
+#       Trimmed string
+trim() 
+{
+	$ECHO $*
+}
+
+### Function: wait_for_state ###
+#
+# Wait for seconds to change the service state.
+#
+# Arguments:
+#       $1 - The service name
+#		$2 - The service state
+# Return Values:
+#       None
+wait_for_state()
+{
+local _svc_=$1
+local _svc_state_=$2
+local _count_=0
+while [ ${_state_} != ${_svc_state_} ] ; do
+    
+    if [ ${_count_} -gt 5 ] ; then 
+	warning "Failed to clear ${_svc_}, see ${LOGFILE}"
+	break
+    fi
+	
+    _count_=$((_count_+1))
+    sleep 10
+    local _state_=`$SYSTEMCTL show ${_svc_} -p ActiveState | $AWK -F= '{print $2}'`
+done
+}
+
+### Function: warning ###
+#
+# Log a warning message to ${LOGFILE}. 
+#	If ${LOGFILE} doesn't exist it gets printed to stdout
+#
+# Arguments:
+#       $1...$N - Messages to warn
+# Return Values:
+#       None
+warning()
+{
+	log "WARNING -- $*"
+}
+
+# ********************************************************************
+#
+#   Main body of program
+#
+# ********************************************************************
+trap "trap_shutdown_and_exit" INT TERM
+
+if [[ $1 =~ -l ]] ; then
+	LOG_FILEONLY=1
+fi
+log "Starting on `$DATE`"
+while [ 1 ] ; do
+	check_local_eniq_services
+	_sleep_=`ini_get ${NIQINI} ${ESM_INI_BLOCK} ${ESM_MAIN_INTERVAL_PARAM} ${ESM_MAIN_INTERVAL_DEFAULT}`
+	if [ $? -ne 0 ] ; then
+		# Shouldn't happen as a default was specified...
+		warning "Nothing returned from ${NIQINI} for ${ESM_MAIN_INTERVAL_PARAM}, defaulting to ${ESM_MAIN_INTERVAL_DEFAULT}"
+		_sleep_=${ESM_MAIN_INTERVAL_DEFAULT}
+	else
+		debug "Delay until next check is $_sleep_ seconds"
+	fi
+	interruptible_sleep ${_sleep_}
+done

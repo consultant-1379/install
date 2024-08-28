@@ -1,0 +1,158 @@
+#!/bin/bash
+# ********************************************************************
+# Ericsson Radio Systems AB                                     SCRIPT
+# ********************************************************************
+#
+#
+# (c) Ericsson Radio Systems AB 2018 - All rights reserved.
+#
+# The copyright to the computer program(s) herein is the property
+# of Ericsson Radio Systems AB, Sweden. The programs may be used
+# and/or copied only with the written permission from Ericsson Radio
+# Systems AB or in accordance with the terms and conditions stipulated
+# in the agreement/contract under which the program(s) have been
+# supplied.
+#
+#
+# ********************************************************************
+# Name    : esm.sh
+# Date    : 20/09/2018
+# Revision: \main\4
+# Purpose : SYSTEMD Service script to start and stop the the eniq service monitor
+#			daemon
+#
+# ********************************************************************
+#
+# 		Command Section
+#
+# ********************************************************************
+AWK=/usr/bin/awk
+BASENAME=/usr/bin/basename
+ECHO="/usr/bin/echo -e"
+GREP=/usr/bin/grep
+PS=/usr/bin/ps
+
+# ********************************************************************
+#
+#       Configuration Section
+#
+# ********************************************************************
+
+CONF_DIR=${CONF_DIR:-/eniq/sw/conf/} 
+NIQRC=${CONF_DIR}/niq.rc
+
+if [ -f ${NIQRC} ] ; then
+	. ${NIQRC}
+else
+	$ECHO "Could not source ${NIQRC}"
+	exit 1
+fi
+
+ENIQ_SERVICES_MONITOR=${SMF_BIN_DIR}/eniq_services_monitor.bsh
+
+#*********************************************************************
+#
+# 	functions
+#
+# ********************************************************************
+### Function: start ###
+#
+# Start the eniq local service monitor script if it isn't already running.
+#
+# Arguments:
+#       None
+# Return Values:
+#       None
+start()
+{
+_lookfor_=`$BASENAME ${ENIQ_SERVICES_MONITOR}`
+
+_pid_=`$PS -ef | $GREP "${_lookfor_}" | $GREP -v grep | $AWK '{print $2}'`
+if [ ! -z "${_pid_}" ] ; then
+	$ECHO "${_lookfor_} already running"
+else
+	${ENIQ_SERVICES_MONITOR} -l &
+	_res_=$?
+	if [ ${_res_} -ne 0 ] ; then
+		exit ${_res_}
+	fi
+fi
+}
+
+### Function: stop ###
+#
+# Stop the eniq local service monitor script if it is running.
+#
+# Arguments:
+#       None
+# Return Values:
+#       None
+stop()
+{
+_lookfor_=`$BASENAME ${ENIQ_SERVICES_MONITOR}`
+
+_pid_=`$PS -ef | $GREP "${_lookfor_}" | $GREP -v grep | $AWK '{print $2}'`
+if [ ! -z "${_pid_}" ] ; then
+	_a_=`kill ${_pid_}`
+	_res_=$?
+	if [ ${_res_} -eq 0 ] ; then
+		$ECHO "Stopped ${_lookfor_}"
+	else
+		$ECHO "${_a_}"
+		exit ${_res_}
+	fi
+else
+	$ECHO "${_lookfor_} is not running"
+fi
+}
+
+### Function: status ###
+#
+# Show status the eniq local service monitor script if it is running.
+#
+# Arguments:
+#       None
+# Return Values:
+#       None
+status()
+{
+_lookfor_=`$BASENAME ${ENIQ_SERVICES_MONITOR}`
+
+_pid_=`$PS -ef | $GREP "${_lookfor_}" | $GREP -v grep | $AWK '{print $2}'`
+if [ -z "${_pid_}" ] ; then
+	$ECHO "${_lookfor_} is not running"
+else
+	$ECHO "${_lookfor_} is running"
+fi
+}
+
+### Function: usage ###
+#
+# Display usage info.
+#
+# Arguments:
+#       None
+# Return Values:
+#       None
+usage()
+{
+	$ECHO "`$BASENAME $0` start|stop|status"
+}
+
+# ********************************************************************
+#
+#   Main body of program
+#
+# ********************************************************************
+
+case "$1" in
+	start)	start
+			;;
+	stop)	stop
+			;;
+	status)	status
+			;;
+    *)		usage
+			exit 2
+			;;
+esac

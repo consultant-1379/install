@@ -1,0 +1,3435 @@
+# ********************************************************************
+# Ericsson Radio Systems AB                                     SCRIPT
+# ********************************************************************
+#
+#
+# (c) Ericsson Radio Systems AB 2022 - All rights reserved.
+#
+# The copyright to the computer program(s) herein is the property
+# of Ericsson Radio Systems AB, Sweden. The programs may be used 
+# and/or copied only with the written permission from Ericsson Radio 
+# Systems AB or in accordance with the terms and conditions stipulated 
+# in the agreement/contract under which the program(s) have been 
+# supplied.
+#
+# ********************************************************************
+# Name    : common_functions
+# Date    : 19/10/2023
+# Revision: main\126
+# Purpose : This file contains a set of functions that can be sourced from the bash
+#           shell. 
+#           NOTE : THESE FUNCTIONS ARE FOR ENIQ INSTALLATION ONLY AND THEREFORE IF 
+#                  THEY NEED TO BE CHANGED ONLY THE ENIQ INSTALLATION SCRIPTS WILL
+#                  BE CONSIDERED.
+#
+# Usage   : common_functions
+#
+# ********************************************************************
+#
+#     Command Section
+#
+# ********************************************************************
+AWK=/usr/bin/awk
+BASENAME=/usr/bin/basename
+BASH=/usr/bin/bash
+BC=/usr/bin/bc
+BOOTADM=/usr/sbin/bootadm
+CAT=/usr/bin/cat
+CHMOD=/usr/bin/chmod
+CHOWN=/usr/bin/chown
+CLEAR=/usr/bin/clear
+CMP=/usr/bin/cmp
+COMPRESS=/usr/bin/compress
+CP=/usr/bin/cp
+CPIO=/usr/bin/cpio
+CRONTAB=/usr/bin/crontab
+CUT=/usr/bin/cut
+DATE=/usr/bin/date
+DIRNAME=/usr/bin/dirname
+DOMAINNAME=/usr/bin/domainname
+ECHO='/usr/bin/echo -e'
+EGREP=/usr/bin/egrep
+ENV=/usr/bin/env
+EXPR=/usr/bin/expr
+FIND=/usr/bin/find
+GETENT=/usr/bin/getent
+GREP=/usr/bin/grep
+HEAD=/usr/bin/head
+ID=/usr/bin/id
+LS=/usr/bin/ls
+LVDISPLAY=/sbin/lvdisplay
+LVS=/usr/sbin/lvs
+MKDIR=/usr/bin/mkdir
+MORE=/usr/bin/more
+MOUNT=/usr/bin/mount
+MV=/usr/bin/mv
+MYHOSTNAME=/usr/bin/hostname
+PGREP=/usr/bin/pgrep
+PING=/usr/bin/ping
+PWD=/usr/bin/pwd
+REBOOT=/usr/sbin/reboot
+RM=/usr/bin/rm
+SED=/usr/bin/sed
+SLEEP=/usr/bin/sleep
+SORT=/usr/bin/sort
+SSH=/usr/bin/ssh
+SU=/usr/bin/su
+SUDO=/usr/bin/sudo
+SWAP=/usr/sbin/swap
+SYSTEMCTL=/usr/bin/systemctl
+TAIL=/usr/bin/tail
+TAR=/usr/bin/tar
+TEE=/usr/bin/tee
+TOUCH=/usr/bin/touch
+TR=/usr/bin/tr
+UMOUNT=/usr/bin/umount
+UNAME=/usr/bin/uname
+USERADD=/usr/sbin/useradd
+VGS=/usr/sbin/vgs
+WC=/usr/bin/wc
+
+# ********************************************************************
+#
+#       Configuration Section
+#
+# ********************************************************************
+
+
+# ********************************************************************
+#
+#     Functions
+#
+# ********************************************************************
+
+### Function: add_activate_features ###
+#
+# Add and Activate the required features for the OSS
+#
+# Arguments:
+#    $1 : Feature list file
+#    $2 : Alias name
+#    $3 : ENIQ Admin directory
+#    $4 : Install flag
+#    $5 : ENIQ base directory (/eniq)
+#    $6 : Type of deployment (stats/events/etc)
+#    $7 : Logfile
+#   $8 : Rolling Install
+# Return Values:
+#   0 : Success
+#    1 : Failure
+add_activate_features()
+{
+local _feature_list_file_=$1
+local _eniq_hname_=$2
+local _admin_dir_=$3
+local _install_flag_=$4
+local _base_dir_=$5
+local _install_type_data_=$6
+local _logfile_=$7
+local _rolling_flag_=$8
+local _no_provisioning_flag_=$9
+local _hname_act_=${10}
+local _old_sw_dir=${11}
+
+if [ "${_install_flag_}" == "NO" ]; then # = -I otherwise
+    _install_flag_=""
+fi
+if [ "${_rolling_flag_}" == "NO" ]; then # = -R otherwise
+    _rolling_flag_=""
+fi
+# Run the feature manager script and add the features
+$ECHO "\nAdding selected ENIQ features" | $TEE -a ${_logfile_}
+$ECHO "Running command:" >> ${_logfile_}
+
+    $ECHO "/usr/bin/bash ${_admin_dir_}/manage_features.bsh -d ${_base_dir_} -a add -F ${_feature_list_file_} -l ${_logfile_} ${_install_flag_} ${_rolling_flag_} ${_no_provisioning_flag_}" >> ${_logfile_}
+    /usr/bin/bash ${_admin_dir_}/manage_features.bsh -d ${_base_dir_} -a add -F ${_feature_list_file_} -l ${_logfile_} ${_install_flag_} ${_rolling_flag_} ${_no_provisioning_flag_}
+
+if [ $? -ne 0 ]; then
+    $ECHO "Error encountered when trying to add features" | $TEE -a ${_logfile_}
+    return 1
+else
+    $ECHO "Successfully added ENIQ features" | $TEE -a ${_logfile_}
+fi
+
+
+    if [ "${_hname_act_}" == "update" -o "${_rolling_flag_}" == "" ]; then
+        # Run the feature manager script and activate the features
+        if [ "${_eniq_hname_}" != "NO" ]; then
+            $ECHO "\n-----------------------------\nActivating selected ENIQ features" | $TEE -a ${_logfile_}
+        
+                 /usr/bin/bash ${_admin_dir_}/manage_features.bsh -d ${_base_dir_} -a activate -F ${_feature_list_file_} -l ${_logfile_}
+        
+            if [ $? -ne 0 ]; then
+                $ECHO "Error encountered when trying to activate features" | $TEE -a ${_logfile_}
+                    return 1
+            else
+                $ECHO "Successfully activated ENIQ features" | $TEE -a ${_logfile_}
+            fi
+        fi
+    fi
+
+}
+
+### Function: change_stor_perms ###
+#
+# This function will change permissions 
+# of files in storage dir
+#
+# Arguments:
+#    $1 : SunOS.ini file
+#    $2 : Logfile
+# Return Values:
+#       0 : Success
+#       1 : Error
+change_stor_perms()
+{
+local _sunos_ini_=$1
+local _nas_perms_file_=$2
+local _logfile_=$3
+    
+_nas_sw_target_dir_=`iniget NAS_STORAGE_API -f ${_sunos_ini_} -v NAS_API_TARGET_DIR`
+if [ ! "${_nas_sw_target_dir_}" ]; then
+    log_msg -s "\nCould not read NAS_API_TARGET_DIR value from ${_sunos_ini_}" -l ${_logfile_}
+    return 1
+fi
+    
+# Make a log directory
+log_msg -s "\nCreating ${_nas_sw_target_dir_}/log" -l ${_logfile_}
+$MKDIR -p ${_nas_sw_target_dir_}/log
+if [ $? -ne 0 ]; then
+    log_msg -s "Could not create ${_nas_sw_target_dir_}/log" -l ${_logfile_}
+    return 1
+fi
+
+if [ ! ${_nas_perms_file_} ]; then
+    log_msg -s "Could not find ${_nas_perms_file_}" -l ${_logfile_}
+    return 1
+fi
+
+$CAT ${_nas_perms_file_} | $EGREP -v '^[[:blank:]]*#' > ${TEM_DIR}/nas_perms_file
+
+while read _line_; do
+    local _recurse_flag_=""
+    local _dir_name_=`$ECHO ${_line_} | $AWK -F"::" '{print $1}'`
+    local _dir_owner_=`$ECHO ${_line_} | $AWK -F"::" '{print $2}'`
+    local _dir_group_=`$ECHO ${_line_} | $AWK -F"::" '{print $3}'`
+    local _dir_perms_=`$ECHO ${_line_} | $AWK -F"::" '{print $4}'`
+    local _recurse_=`$ECHO ${_line_} | $AWK -F"::" '{print $5}'`
+    
+    if [ "${_recurse_}" == "YES" ]; then
+        _recurse_flag_="-R"
+    fi
+    
+    log_msg -s "Changing ownership of ${_nas_sw_target_dir_}/${_dir_name_} to ${_dir_owner_}:${_dir_group_}" -l ${_logfile_}
+    $CHOWN ${_recurse_flag_} ${_dir_owner_}:${_dir_group_} ${_nas_sw_target_dir_}/${_dir_name_}
+    if [ $? -ne 0 ]; then
+        log_msg -s "Could not change ownership of ${_nas_sw_target_dir_}/${_dir_name_} to ${_dir_owner_}:${_dir_group_}" -l ${_logfile_}
+        return 1
+    fi
+    
+    log_msg -s "Changing permissions of ${_nas_sw_target_dir_}/${_dir_name_} to -rwxrwxr-x" -l ${_logfile_}
+    $CHMOD ${_dir_perms_} ${_nas_sw_target_dir_}/${_dir_name_}
+    if [ $? -ne 0 ]; then
+        log_msg -s "Could not change permissions of ${_nas_sw_target_dir_}/${_dir_name_} to -rwxrwxr-x" -l ${_logfile_}
+        return 1
+    fi
+done < ${TEM_DIR}/nas_perms_file
+}
+
+### Function: change_rsyslog ###
+#
+# Changes mail.debug value in rsyslog.conf
+#
+# Arguments:
+#       $1 : Filename
+# Return Values:
+#          0 : Success
+#          1 : Error
+change_rsyslog()
+{
+local _syslog_file_=$1
+
+# Does the syslog file exist?
+if [ ! -s ${_syslog_file_} ]; then
+    log_msg -s "${_syslog_file_} not found or empty" -l ${_logfile_}
+    return 1
+fi
+
+# Make a backup of the syslog.conf file
+log_msg -s "Creating a backup of ${_syslog_file_} named ${_syslog_file_}.bckup" -q -l ${_logfile_}
+$CP ${_syslog_file_} ${_syslog_file_}.bckup
+
+$SED -e  '/^mail.*/ s/^/#/' ${_syslog_file_} > ${_syslog_file_}.tmp
+if [ $? -ne 0 ]; then
+    log_msg -s "Could not make required change to file" -l ${_logfile_}
+    return 1
+fi
+
+$CAT ${_syslog_file_}.tmp | $EGREP -v "mail.*        /dev/null|#mail.*        /dev/null" > ${_syslog_file_}.tmp1 
+
+$SED -e '/#mail.*/ a\
+mail.debug        /dev/null' ${_syslog_file_}.tmp1 > ${_syslog_file_}.tmp2
+
+$MV ${_syslog_file_}.tmp2 ${_syslog_file_}
+if [ $? -ne 0 ]; then
+    log_msg -s "Could not make required change to file" -l ${_logfile_}
+    $MV ${_syslog_file_}.bckup $1
+    return 1
+fi
+
+log_msg -s "Restarting rsyslogd service" -l ${_logfile_}
+$SYSTEMCTL restart rsyslog
+$RM ${_syslog_file_}.bckup
+$RM ${_syslog_file_}.tmp
+$RM ${_syslog_file_}.tmp1
+
+log_msg -s "${_syslog_file_} successfully updated" -l ${_logfile_}
+
+return 0 
+}
+
+### Function: check_full_pathname ###
+#
+# Checks whether $1 contains a full pathname
+#
+# Arguments:
+#    $1 : Filename    
+# Return Values:
+#       0 : Success
+#       1 : Error
+check_full_pathname() 
+{
+_file_=`$ECHO $1|$SED 's/\/[\/]*/\//g'|$SED 's/[\/]*$//g'`
+_check_=`$ECHO $_file_|$EGREP '^[/]'`
+if [ ! "$_check_" ]; then
+    return 1
+fi
+return 0
+}
+
+
+### Function: check_nasd_milestone_online ###
+#
+# Check that NASD milestone is online
+#
+# Arguments:
+#      $1 : Template Dir
+#    $2 : SunOs.ini
+#    $3 : Eniq Base Dir 
+# Return Values:
+#       0 : Success
+#       1 : Error
+check_nasd_milestone_online()
+{
+_template_dir_=$1
+_sunos_ini_=$2
+_eniq_base_dir_=$3
+
+_nas_smf_str_=`iniget NAS_DAEMON -f ${_template_dir_}/${_sunos_ini_} -v NAS_SERVICE_STR`
+if [ ! "${_nas_smf_str_}" ]; then
+    log_msg -l ${LOGFILE} -s "Could not read NASd service string from ${_template_dir_}/${_sunos_ini_}"
+    exit 1
+fi
+
+NAS_online_FMRI=`iniget NAS_DAEMON -f ${_template_dir_}/${_sunos_ini_} -v NAS_MILESTONE_FMRI`
+if [ ! "${NAS_online_FMRI}" ]; then
+     log_msg -l ${LOGFILE} -s "Could not read NAS milestone FMRI from ${_template_dir_}/${_sunos_ini_}"
+     exit 1
+fi
+
+LoadState=`$SYSTEMCTL show ${_nas_smf_str_} -p LoadState | $AWK -F "LoadState=" '{print $2}'`
+
+if [ ${LoadState} == "loaded" ]; then
+    if [ -s ${_eniq_base_dir_}/smf/nasd/nasd_config ]; then
+        _service_state_=`$SYSTEMCTL show ${NAS_online_FMRI} -p ActiveState | $AWK -F= '{print $2}'`
+        if [ ${_service_state_} != "active" ]; then
+                log_msg info "Enabling ${_nas_smf_str_}. Please wait..."
+                $SYSTEMCTL restart ${_nas_smf_str_}
+                if [ $? -ne 0 ]; then
+                        log_msg -l ${LOGFILE} -s "Could not start ${_nas_smf_str_}"
+                        exit 1
+                fi
+                $SYSTEMCTL enable ${_nas_smf_str_}
+                if [ $? -ne 0 ]; then
+                        log_msg -l ${LOGFILE} -s "Could not enable ${_nas_smf_str_}"
+                        exit 1
+                fi
+                log_msg info "Please wait while the NAS milestone comes online...\n"
+                while [ "${_service_state_}" != "active" ]; do
+                       _service_state_=`$SYSTEMCTL show ${NAS_online_FMRI} -p ActiveState | $AWK -F= '{print $2}'`
+                       $SLEEP 2
+                done
+
+        else
+                log_msg info "${_nas_smf_str_} is in an active state"
+        fi
+    fi
+fi
+
+return 0
+}
+
+### Function: get_encrypt_file ###
+#
+# Get the encrypted value of database connection string.
+#
+# Arguments:
+#      $1 : decrypted value of connection string
+#      $2 : file having encrypted value of connection string 
+#    
+
+
+get_encrypt_file()
+{
+
+local conn_string_local=$1
+local encrypt_file_path=$2
+input_file=/var/tmp/input.file.`uuidgen`
+
+$TOUCH $encrypt_file_path
+$TOUCH $input_file
+
+$CHOWN dcuser:dc5000 $encrypt_file_path $input_file
+
+$ECHO $conn_string_local > ${input_file}
+
+check_user=`whoami`
+if [ ${check_user} == "dcuser" ]; then
+	/eniq/sybase_iq/IQ-*/bin64/dbfhide ${input_file} ${encrypt_file_path}
+else
+	su - dcuser -c "/eniq/sybase_iq/IQ-*/bin64/dbfhide ${input_file} ${encrypt_file_path}"
+fi
+  $RM -rf ${input_file}
+}
+
+
+### Function: get_licenced_features ###
+#
+# Get the list of licensed ENIQ features
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+get_licenced_features()
+{
+local _logfile_=$1
+local _temp_dir_=$2
+local _lsmon_cmd_=$3
+local _lshost_val_=$4
+
+# Get a list of all licenses
+$ECHO "\nBuilding a list of licensed features" | $TEE -a ${_logfile_}
+${_lsmon_cmd_} ${_lshost_val_} | $EGREP '^[[:blank:]]*(Feature name|License start date|Expiration date)' > ${_temp_dir_}/lic.txt
+if [ ! -s ${TEM_DIR}/lic.txt ]; then
+    $SLEEP 5
+    ${_lsmon_cmd_} ${_lshost_val_} | $EGREP '^[[:blank:]]*\|\-[[:blank:]](Feature name|License start date|Expiration date)' | $EGREP -v "....\|\-" > ${_temp_dir_}/lic.txt
+    if [ $? -ne 0 ]; then
+        $ECHO "No licenses read from license server ${_lshost_val_}" | $TEE -a ${_logfile_}
+        return 2
+    fi
+    
+    if [ ! -s ${_temp_dir_}/lic.txt ]; then
+        $ECHO "No licenses read from license server ${_lshost_val_}" | $TEE -a ${_logfile_}
+        return 2
+    fi
+fi
+
+
+# Build 3 arrays of all the Licensed Features.
+# This may also have non ENIQ licenses
+_tem_feature_array_=(`$CAT ${_temp_dir_}/lic.txt|$EGREP 'Feature name'|$AWK -F\: '{print $2}'|$SED -e 's|\"||g' -e 's| ||g'`)
+
+_tem_start_date_array_=(`$CAT ${_temp_dir_}/lic.txt|$EGREP 'License start date'|$AWK '{
+    if($0 ~ /expiration/) {
+        print 2009 01 01
+    }
+    else {
+        if($7 == "Jan"){mth="01"}
+            else if($7 == "Feb"){mth="02"}
+            else if($7 == "Mar"){mth="03"}
+            else if($7 == "Apr"){mth="04"}
+            else if($7 == "May"){mth="05"}
+            else if($7 == "Jun"){mth="06"}
+            else if($7 == "Jul"){mth="07"}
+            else if($7 == "Aug"){mth="08"}
+            else if($7 == "Sep"){mth="09"}
+            else if($7 == "Oct"){mth="10"}
+            else if($7 == "Nov"){mth="11"}
+            else {mth="12"}
+       if($8 ~ /^[1-9]$/ ){day="0"$8} 
+            else {day=$8}  
+        print $10 mth day 
+    }
+}'`)
+
+_tem_end_date_array_=(`$CAT ${_temp_dir_}/lic.txt|$EGREP 'Expiration date'|$AWK '{
+    if($0 ~ /expiration/) {
+        print 2999 12 31
+    }
+    else {
+        if($6 == "Jan"){mth="01"}
+            else if($6 == "Feb"){mth="02"}
+            else if($6 == "Mar"){mth="03"}
+            else if($6 == "Apr"){mth="04"}
+            else if($6 == "May"){mth="05"}
+            else if($6 == "Jun"){mth="06"}
+            else if($6 == "Jul"){mth="07"}
+            else if($6 == "Aug"){mth="08"}
+            else if($6 == "Sep"){mth="09"}
+            else if($6 == "Oct"){mth="10"}
+            else if($6 == "Nov"){mth="11"}
+            else {mth="12"}
+        if($7 ~ /^[1-9]$/ ){day="0"$7}
+           else {day=$7}
+        print $9 mth day 
+    }
+}'`)
+
+if [ ! "${_tem_feature_array_}" -o ! "${_tem_start_date_array_}" -o ! "${_tem_end_date_array_}" ]; then
+    $ECHO "No ENIQ Licensed Features from ${_lshost_val_}" | $TEE -a ${_logfile_}
+    return 3
+fi
+
+# Get the length of each array. They should all be the same
+$ECHO "Checking for any malformed licenses..." | $TEE -a ${_logfile_}
+_cnt_=${#_tem_feature_array_[@]}
+_cnt1_=${#_tem_start_date_array_[@]}
+_cnt2_=${#_tem_end_date_array_[@]}
+
+if [ ${_cnt_} -ne ${_cnt1_} -o ${_cnt_} -ne ${_cnt2_} -o ${_cnt1_} -ne ${_cnt2_} ]; then
+    $ECHO "Inconsistent number of values read from License Server" | $TEE -a ${_logfile_}
+    return 1
+fi
+$ECHO "license check complete" | $TEE -a ${_logfile_}
+}
+
+### Function: get_lvm_list ###
+#
+# Get list of Logical Volume for the VG supplied
+#
+# Arguments:
+#       $1  :  LVM NAME|ALL
+#       $2  :  LVG NAME(s)
+#       $3  :  exclude list(optional)
+# Return Values:
+#       none
+
+
+get_lvm_list()
+{
+local _lvm_name_="${1}"
+local _vg_name_="${2}"
+local _lvm_exclude_list_="${3}"
+local _lvglist_ _vg_regex_ _err_=0
+
+if [ "${SNAP_OPT}" != "create" ]; then
+    
+    if [[ "${_lvm_name_}" == ALL* ]]; then
+        _lvm_name_=ALL
+    fi
+fi     
+# Get a list of ALL LVM(s) 
+if [ "${_lvm_name_}" == "ALL" ]; then
+    if [ "${_lvm_exclude_list_}" ]; then
+         $LVS --noheadings ${_vg_name_} -o lv_name,vg_name,lv_attr,lv_size,origin,lv_time | $EGREP -vw "(${_lvm_exclude_list_})" 2>/dev/null
+        if [ $? -ne 0 ]; then
+            log_msg -l ${LOGFILE} -s "Error getting the lvm list"
+            _err_=1
+         fi
+    else
+        $LVS --noheadings ${_vg_name_} -o lv_name,vg_name,lv_attr,lv_size,origin,lv_time 2>/dev/null
+        if [ $? -ne 0 ]; then
+            log_msg -l ${LOGFILE} -s "Error getting the lvm list"
+            _err_=1
+        fi
+    fi      
+else
+    _lvm_regex_=`$ECHO -e ${_lvm_name_}| $SED -e 's/,/|/g'`
+    if [ "${_lvm_exclude_list_}" ]; then
+        $LVS --noheadings ${_vg_name_} -o lv_name,vg_name,lv_attr,lv_size,origin,lv_time | $EGREP -vw "(${_lvm_exclude_list_})" | $EGREP -w "(${_lvm_regex_})" 2>/dev/null
+         if [ $? -ne 0 ]; then
+            log_msg -l ${LOGFILE} -s "Error getting the lvm list"
+            _err_=1
+        fi
+    else 
+        $LVS --noheadings ${_vg_name_} -o lv_name,vg_name,lv_attr,lv_size,origin,lv_time | $EGREP -w "(${_lvm_regex_})" 2>/dev/null
+        if [ $? -ne 0 ]; then
+            log_msg -l ${LOGFILE} -s "Error getting the lvm list"
+            _err_=1
+        fi
+    fi    
+fi
+if [ ${_err_} -ne 0 ]; then
+    $ECHO -e "Error reading Logical Volumes for ${_vg_name_} Volume Groups"
+    return 1
+fi
+return 0
+}
+
+### Function: get_network_addr ###
+#
+# Get the network address of the client
+#
+# Arguments:
+#   $1 : Client Netmask
+#   $2 : Client IP
+# Return Values:
+#      : Network Address
+get_network_addr()
+{
+local _chk_=0 _tmp_ip_ _net_ip_
+local nm1 nm2 nm3 nm4
+local sno1 sno2 sno3 sno4
+local snf1 snf2 snf3 snf4 
+
+# split out the parts of the netmask
+nm1=`$EXPR $1 : '\([0-9]*\)\..*'`
+nm2=`$EXPR $1 : '[0-9]*\.\([0-9]*\)\..*'`
+nm3=`$EXPR $1 : '[0-9]*\.[0-9]*\.\([0-9]*\)\..*'`
+nm4=`$EXPR $1 : '[0-9]*\.[0-9]*\.[0-9]*\.\([0-9]*\)'`
+
+# split out the parts of the server ip address
+sno1=`$EXPR $2 : '\([0-9]*\)\..*'`
+sno2=`$EXPR $2 : '[0-9]*\.\([0-9]*\)\..*'`
+sno3=`$EXPR $2 : '[0-9]*\.[0-9]*\.\([0-9]*\)\..*'`
+sno4=`$EXPR $2 : '[0-9]*\.[0-9]*\.[0-9]*\.\([0-9]*\)'`
+
+# AND the ipaddress and the netmask
+snf1=`$ECHO $((${sno1}&${nm1}))`
+snf2=`$ECHO $((${sno2}&${nm2}))`
+snf3=`$ECHO $((${sno3}&${nm3}))`
+snf4=`$ECHO $((${sno4}&${nm4}))`
+
+_tmp_ip_="${snf1}.${snf2}.${snf3}.${snf4}"
+_net_ip_=`$ECHO ${_tmp_ip_} | sed 's/ //g'`
+
+$ECHO ${_net_ip_}
+
+}
+
+### Function: get_network_from_netmask ###
+#
+# Get the network number suffix from netmask IP
+#
+# Arguments:
+#   $1 : Client Netmask IP
+# Return Values:
+#      : Network number suffix
+get_network_from_netmask()
+{
+local nm1 nm2 nm3 nm4
+local nm1_bin nm2_bin nm3_bin nm4_bin
+
+# split out the parts of the netmask
+nm1=`$EXPR $1 : '\([0-9]*\)\..*'`
+nm2=`$EXPR $1 : '[0-9]*\.\([0-9]*\)\..*'`
+nm3=`$EXPR $1 : '[0-9]*\.[0-9]*\.\([0-9]*\)\..*'`
+nm4=`$EXPR $1 : '[0-9]*\.[0-9]*\.[0-9]*\.\([0-9]*\)'`
+
+# Convert to binary
+
+nm1_bin=`echo "obase=2;$nm1" | bc`
+nm2_bin=`echo "obase=2;$nm2" | bc`
+nm3_bin=`echo "obase=2;$nm3" | bc`
+nm4_bin=`echo "obase=2;$nm4" | bc`
+
+prefix="$nm1_bin$nm2_bin$nm3_bin$nm4_bin"
+
+# Count number of 1's, (awk -1)
+
+num=`echo $prefix | awk 'BEGIN{FS="1"} {print NF-1}'`
+
+$ECHO ${num}
+
+}
+
+### Function: iniget ###
+#
+# Read specified parts from a given ini file
+#
+# Arguments:
+#       -f  : specified ini file
+#    -p  : gives whole matching <line>
+#    -v  : gives only value of matching <line>
+#       raw : will print even commented (;) lines
+# Return Values:
+#       0 : Success
+#       1 : Error
+#    Text output
+iniget() 
+{
+if [ -n "$1" ]; then
+    INIBLOCK="$1"
+    shift 1
+else
+    $ECHO "Usage: iniget <block> -f <configfile> [-<p|v> <line>] [raw]"
+    return 1
+fi
+
+unset INIWLINE INILINE INICONFIGFILE INIPRINTTYPE
+while [ -n "$1" ]; do
+    case $1 in
+    -p)    INIWLINE=parameter
+        INILINE=$2
+        shift 2
+        ;;
+    -v)    INIWLINE=value
+        INILINE=$2
+        shift 2
+        ;;
+    -f)    INICONFIGFILE=$2
+        shift 2
+        ;;
+    raw)    INIPRINTTYPE=raw
+        shift 1
+        ;;
+    *)    return 1
+        ;;
+    esac
+done
+
+if [ -z "$INICONFIGFILE" ]; then
+    $ECHO "Usage: iniget <block> -f <configfile> [-<p|v> <line>] [raw]"
+    return 1
+fi
+
+$AWK -F= -v printtype=$INIPRINTTYPE -v line="$INILINE" -v way=$INIWLINE '
+  { sub(/[     ]*$/,"");    #remove trailing whitespace and tabs
+    if ($1=="['$INIBLOCK']") {
+    while ((getline) > 0) {
+        if ($0 ~ /^ *\[/) exit
+        if (($0 ~ /^ *;/) && (printtype!="raw")) continue
+        if ($1==line) {
+            if (way=="parameter") {print $0; exit}
+            if (way=="value")     {sub(/^[^=]*=/,""); print $0; exit}
+        }
+        else if (! line) print $0
+    }
+    }
+  }' $INICONFIGFILE
+}
+
+### Function: iniset ###
+#
+# Set specified parts from a given ini file
+#
+# Arguments:
+#    -p  : gives whole matching <line>
+#    -v  : gives only value of matching <line>
+#       -f  : defaults to /ericsson/config/system.ini
+#       raw : will print even commented (;) lines
+# Return Values:
+#       0 : Success
+#       1 : Error
+#    
+# iniset <block> [-f <configfile>] [del] <text>
+#
+iniset() 
+{
+if [ -n "$1" ]; then
+    INIBLOCK="$1"
+    shift 1
+else
+    $ECHO "Usage: iniset <block> [-f <configfile>] [del] <param1=value> [<param2=value2>]"
+    return 1
+fi
+
+unset INICONFIGFILE ini_del
+$RM -f /tmp/.file.$$
+while [ -n "$1" ]; do
+    case $1 in
+    -f)    INICONFIGFILE="$2"
+        shift 2
+        ;;
+    del)    ini_del=y
+        shift 1
+        ;;
+    *)    echo "$1" >> /tmp/.file.$$ 
+        shift 1
+        ;;
+    esac
+done
+if [ -z "$INICONFIGFILE" ]; then
+    $ECHO "Usage: iniset <block> [-f <configfile>] [del] <param1=value> [<param2=value2>]"
+    return 1
+fi
+
+# Permission-keeping copy
+$CP -p $INICONFIGFILE $INICONFIGFILE.$$ || return 1
+$ECHO "" > $INICONFIGFILE.$$ || return 1
+
+$AWK -F= -v del=$ini_del -v textfile=/tmp/.file.$$ '
+  BEGIN {
+    while((getline < textfile) > 0) {
+    foo=$1
+    sub(/^[^=]*=/,"")
+    line[foo]=$0
+    }
+  }
+  {    sub(/[     ]*$/,"");    #remove trailing whitespace and tabs
+    if (($1=="['$INIBLOCK']") && (edited=="done")) {
+        print "ERROR: Multiple instances of ['$INIBLOCK'] found, exiting" > "/dev/stderr"
+        exit 1
+    }
+    if ($1=="['$INIBLOCK']") { found="y"; print $0; next }
+    if (! found) { print $0; next }
+    if ($0 ~ /^ *\[/) {
+        # End of block, flush all remaining entries
+        for (entry in line) { print entry "=" line[entry] }
+        found=""; edited="done"; print $0; next
+    }
+    if (! del) {
+        for (entry in line) {
+            if (entry==$1) { print entry "=" line[entry]; delete line[entry]; next }
+        }
+        print $0
+    }
+  }
+  END {
+    if (found=="y") {
+        # End of file, flush all remaining entries
+        for (entry in line) { print entry "=" line[entry] }
+    }
+    else if (edited!="done") {
+        # Create new block, flush all entries
+        print; print "['$INIBLOCK']"
+        for (entry in line) { print entry "=" line[entry] }
+    }
+
+  }' $INICONFIGFILE > $INICONFIGFILE.$$
+  [ $? = 0 ] && mv $INICONFIGFILE.$$ $INICONFIGFILE || return 1
+  rm -f /tmp/.file.$$
+}
+
+### Function: insert_media ###
+#
+# Mounts the require DVD/Directory and returns the path 
+# in variable SW_DIR.
+#
+# Arguments:
+#    -a) : File to be appended to returned SW_DIR/CDDIR PATH (Optional) 
+#    -f) : File underneath that directory 
+#    -l) : DVD label 
+#    -n) : Number of tries before giving up (optional)
+#    -s) : Path of the SW location file (optional)
+# Return Values:
+#       0 : Success
+#       1 : Error
+#    $SW_DIR : Variable containing path to required data
+insert_media() 
+{
+unset APPEND_PATH FILE_IDENT LABEL_IDENT NAME_IDENT NUM_TRIES SW_LOC_FILE
+while [ -n "$1" ]; do
+    case $1 in
+    -a)    APPEND_PATH="$2"
+        shift 2
+        ;;
+    -f)    FILE_IDENT="$2"
+        shift 2
+        ;;
+    -l)    LABEL_IDENT="$2"
+        shift 2
+        ;;
+    -n)    NUM_TRIES="$2"
+        shift 2
+        ;;
+    -s)    SW_LOC_FILE="$2"
+        shift 2
+        ;;
+    *)    NAME_IDENT="$*"
+        shift $#
+        ;;
+    esac
+done
+
+if [ ! "${LABEL_IDENT}" -o ! "${FILE_IDENT}"  ]; then
+    log_msg -l ${LOGFILE} -s "<- insert_media usage error"
+    return 1
+fi
+
+if [ "${SW_LOC_FILE}" ]; then
+    if [ ! -s ${SW_LOC_FILE} ]; then
+        log_msg -l ${LOGFILE} -s "${SW_LOC_FILE} is empty"
+        return 1
+    fi
+fi
+
+if [ "${SW_LOC_FILE}" ]; then
+    INSTALL_SERVER=`$CAT ${SW_LOC_FILE} |  $AWK -F\@ '{print $1}'`
+    PING=$( check_ping)
+    $PING -c 2 $INSTALL_SERVER >> /dev/null 2>&1
+    if [ $? -ne 0 ]; then
+        log_msg -l ${LOGFILE} -s "$INSTALL_SERVER does not seem to be alive"
+        return 1
+    fi
+
+    _share_dir_=`$CAT ${SW_LOC_FILE} | $AWK -F\@ '{print $2}'|$SED -e 's/\/[\/]*/\//g' -e 's/\/$//'`
+    if [ ! "${_share_dir_}" ]; then
+        log_msg -l ${LOGFILE} -s "Corrupt entry in ${SW_LOC_FILE}"
+        return 1
+    fi
+
+    # Loop until I get a unique name for the temp dir
+    _tem_dir_=/tmp/_mp_pt_.$$
+    while :; do
+        $LS ${_tem_dir_} >> /dev/null 2>&1
+        if [ $? -ne 0 ]; then
+            break
+        fi
+        _tem_dir_=${_tem_dir_}.$$
+    done
+
+    # Set error flag
+    _err_=0
+
+    # Check that machine is sharing out its file systems.
+    
+     showmount -e $INSTALL_SERVER >> /dev/null 2>&1
+    if [ $? -eq 0 ]; then
+        $MKDIR -p  ${_tem_dir_}
+        if [ $? -ne 0 ];then
+            log_msg -l ${LOGFILE} -s "Could not make temporary directory ${tem_dir}"
+            return 1
+        fi
+
+        # Strip off any duplicate or trailing '/'
+        _mount_path_=`$CAT ${SW_LOC_FILE}|$SED -e 's|@|:|' -e 's/\/[\/]*/\//g' -e 's/\/$//'`
+    
+        # Try to mount our share up
+        $MOUNT -t nfs -o retry=2 ${_mount_path_} ${_tem_dir_} >> /dev/null 2>&1
+        if [ $? -ne 0 ]; then
+            _err_=1
+        fi
+    else
+        _err_=1
+    fi
+
+    # Not sharing out correctly
+    if [ ${_err_} -ne 0 ]; then
+        log_msg -l ${LOGFILE} -s "$INSTALL_SERVER does not seem to be sharing any filesystem\n${_share_dir_}"
+        return 1
+    fi
+
+    # Umount the directory
+    $UMOUNT ${_tem_dir_} >> /dev/null 2>&1
+    if [ $? -ne 0 ]; then
+        umount -f ${_tem_dir_} >> /dev/null 2>&1
+    fi
+fi
+
+_dvd_dir_label_=`$ECHO ${LABEL_IDENT}|$TR "[:upper:]" "[:lower:]"`
+_chk_dir_="/cdrom/${_dvd_dir_label_}"
+
+# Update jumpdir if using alternate jumpstart structure, due to CR??.
+if [ "${SW_LOC_FILE}" ]; then
+    jumpdir=`$CAT ${SW_LOC_FILE} | $AWK -F\@ '{print $2}' |$SED 's/\/$//'`
+else
+    jumpdir=/jumpstart
+fi
+
+log_msg info "-> Looking for $NAME_IDENT"
+
+_cnt_=0
+# Loop until we find the Directory we are looking for
+while :; do
+    if [ "$NUM_TRIES" ]; then
+        if [ $_cnt_ -ge $NUM_TRIES ]; then
+            unset SW_DIR
+            return 1
+        else
+            _cnt_=`expr $_cnt_ + 1`
+        fi
+    fi
+
+
+
+    # Jumpstart server
+    if [ "$INSTALL_SERVER" ]; then
+        if [ -d /net/$INSTALL_SERVER/${jumpdir}/${LABEL_IDENT} ]; then
+            if [ -f /net/$INSTALL_SERVER/${jumpdir}/${LABEL_IDENT}/$FILE_IDENT ]; then
+                SW_DIR="/net/$INSTALL_SERVER/${jumpdir}/${LABEL_IDENT}/${APPEND_PATH}"
+                break
+            fi
+    
+            SW_DIR="/net/$INSTALL_SERVER/${jumpdir}/${LABEL_IDENT}/${APPEND_PATH}"
+            break
+        fi
+    fi
+    
+    
+done
+log_msg info "<- $NAME_IDENT found, using $SW_DIR"
+
+# Remove trailing/leading spaces and any uneeded '/'
+SW_DIR=`$ECHO ${SW_DIR}|$SED -e 's/^[ ]*//' -e 's/[ ]*$//' -e 's/\/[\/]*/\//g' -e 's/[\/]*$//g'`
+export SW_DIR
+
+}
+
+### Function: insert_roll_snap_crontab ###
+#
+# Inserts the rolling snapshot entry into the root 
+# crontab
+#
+# Arguments:
+#    $1 : File containing root crontab entry
+# Return Values:
+#       0 : Success
+#       1 : Error
+insert_roll_snap_crontab() 
+{
+local cron_entry_file=${1}
+local _logfile_=/tmp/logfile.txt
+local cron_cmds
+
+if [ ! -s ${cron_entry_file} ];then
+    $ECHO "${cron_entry_file} not found or empty"
+    return 1
+fi
+
+# Loop until I get a unique name for the temp dir
+tem_dir=/tmp/update_cron.$$
+while :; do
+    $LS ${tem_dir} >> /dev/null 2>&1
+    if [ $? -ne 0 ]; then
+        break
+    fi
+    tem_dir=${tem_dir}.$$
+done
+
+$MKDIR -p  ${tem_dir}
+if [ $? -ne 0 ];then
+    $ECHO "Could not make temporary directory ${tem_dir}" | $TEE -a ${_logfile_}
+    return 1
+fi
+    
+local tem_file=${tem_dir}/roll_cron.$$
+local tem_file1=${tem_dir}/roll_cron1.$$
+local tem_file2=${tem_dir}/roll_cron2.$$
+local tem_file3=${tem_dir}/roll_cron3.$$
+
+### Get the current list of crontab entries
+$CRONTAB -l > ${tem_file}
+
+### Remove the comments from the cron tempate file
+$CAT ${cron_entry_file} | $EGREP -v '^[[:blank:]]*#' > ${tem_file1}
+
+### Get the new cron commands from the template file
+cron_cmds=`$CAT ${cron_entry_file} | $EGREP -v '^[[:blank:]]*#' | $AWK '{print $8}'`
+for _cmd_ in ${cron_cmds}; do
+    ### add the complete line for the new command to tem_file2 
+    _cmdline_=`$CAT ${tem_file1} | $AWK -v cvar="${_cmd_}" '{if($8 == cvar)print $0}'`
+    $ECHO "Updating crontab with ${_cmdline_}" | $TEE -a ${_logfile_}
+    $ECHO "${_cmdline_}" >> ${tem_file2}
+    # remove existing entries from tem_file for the entry just added ( ensure no duplicate entries )
+    $CAT ${tem_file} | $EGREP -v "${_cmd_}" > ${tem_file}.updated
+    $CP ${tem_file}.updated ${tem_file}
+done
+### Note: tem_file2 is appended to tem_file, to produce a complete list of crontab entries
+### tem_file2 contains the new/latest commands 
+### tem_file now contains all the other crob commands that were not added by us
+
+if [ ! -s ${tem_file2} ];then
+    $ECHO "No crontab entries needed to be added"  | $TEE -a ${_logfile_}
+    $RM -rf ${tem_dir}
+    return 0
+fi
+
+# Make a backup of root crontab
+if [ -s /var/spool/cron/root ]; then
+    $CP /var/spool/cron/root ${tem_dir}/root.crontab
+fi
+
+### Note: tem_file2 is appended to tem_file, to produce a complete list of crontab entries
+### tem_file2 contains the new/latest commands 
+### tem_file now contains all the other crob commands that were not added by us
+$CAT ${tem_file2} >> ${tem_file}
+
+# Sort the crontab entries
+$CAT ${tem_file} | $SORT -u > ${tem_file3}
+
+${CRONTAB} ${tem_file3}
+if [ $? -ne 0 ]; then
+    if [ -s ${tem_dir}/root.crontab ]; then
+        $CP ${tem_dir}/root.crontab /var/spool/cron/root 
+    fi
+    $ECHO "Error updating crontab"  | $TEE -a ${_logfile_}
+    $RM -rf ${tem_dir}
+    return 1
+fi
+
+$RM -rf ${tem_dir}
+
+return 0
+}
+
+### Function: log_msg ###
+#
+# I will create the function log if one does not already exist
+# This allows user to have his/her own log function and still 
+# work with the commmon functions
+#
+# Arguments:
+#       -l) : File to be logged to
+#        -h) : Print the message as a header
+#       -q) : don't echo the text, just tee it
+#       -s) : Text/message to be logged
+#        -t) : Prints the current time as part of the message
+# Return Values:
+#       0 : Success
+#       1 : Error
+log_msg()
+{
+local logfile quiet outstr header msg_time
+
+while [ -n "$1" ]; do
+    case $1 in
+    -l)    logfile=$2
+        shift 2
+        ;;
+    -h)    header=-h
+        shift 1
+        ;;
+    -q)    quiet=-q
+        shift 1
+        ;;
+    -s)    outstr=$2
+        shift 2
+        ;;
+    -t)    msg_time=-t
+        shift 1
+        ;;
+    *)    return 1
+        ;;
+    esac
+done
+
+if [ ! "${outstr}" ]; then
+    return 1
+fi
+
+local run_time=`$DATE '+%Y-%m-%d_%H.%M.%S'`
+if [ "${msg_time}" ]; then
+    outstr="${run_time} - ${outstr}"
+fi
+
+if [ "${header}" ]; then
+    # Print the message as a header. This will
+    # pad the string to a defined length and 
+    # add a prefix and postfix tag (<=== and ===>)
+    if [ "${logfile}" ]; then
+        if [ ! "${quiet}" ]; then
+            echo -e "${outstr}" | $AWK '
+            {
+                n1=length($0)
+                n2=36-n1/2-n1%2
+                n3=34-n1/2
+                printf("\n\n")
+                for ( n=1; n<n2; n++)
+                    printf("=")
+                    printf("=< %s >=",$ 0)
+                    for ( n=1; n<n3 ;n++ )
+                        printf("=")
+                        printf("\n\n")
+            }' | $TEE -a ${logfile}
+        else
+            echo -e "${outstr}" | $AWK '
+            {
+                n1=length($0)
+                n2=36-n1/2-n1%2
+                n3=34-n1/2
+                printf("\n\n")
+                for ( n=1; n<n2; n++)
+                    printf("=")
+                    printf("=< %s >=",$ 0)
+                    for ( n=1; n<n3 ;n++ )
+                        printf("=")
+                        printf("\n\n")
+            }' >> ${logfile}
+        fi
+    else
+        if [ ! "${quiet}" ]; then
+            echo -e "${outstr}" | $AWK '
+            {
+                n1=length($0)
+                n2=36-n1/2-n1%2
+                n3=34-n1/2
+                printf("\n\n")
+                for ( n=1; n<n2; n++)
+                    printf("=")
+                    printf("=< %s >=",$ 0)
+                    for ( n=1; n<n3 ;n++ )
+                        printf("=")
+                        printf("\n\n")
+            }'
+        fi
+    fi
+else
+    # Simply print the message
+    if [ "${logfile}" ]; then
+        if [ ! "${quiet}" ]; then
+            $ECHO "${outstr}" |$TEE -a ${logfile}
+        else
+            $ECHO "${outstr}" >> ${logfile}
+        fi
+    else
+        if [ ! "${quiet}" ]; then
+            $ECHO "${outstr}"
+        fi
+    fi
+fi
+}
+
+### Function: run_remote_cmd ###
+#
+#Runs a command on a remote sever and returns the return value from the command
+#
+# Arguments:
+#   $1 : hostname/ip
+#   $2 : command to be ran
+#   $3 : optional logfile
+#   $4 : optional user, defaults to root
+#   $5 : disable force tty. If set to "disable_tty", disable forcing tty.
+#        Should be disabled to run a command remotely and leave it 
+#        running on the remote machine after the calling script disconnects.
+# Return Values:
+#      : Return value from the command
+
+run_remote_cmd()
+{
+    if  [ "${1}" == "" ]; then
+        _err_msg_="Must provide server"
+        abort_script "$_err_msg_"
+    fi
+    if  [ "${2}" == "" ]; then
+        _err_msg_="Must provide next available dbfile"
+        abort_script "$_err_msg_"
+    fi
+    if  [ "${3}" != "" ]; then
+            local _logfile_="${3}"
+    else
+     local _logfile_="/eniq/local_logs/ping_server_status.log"
+        if [ ! -f $_logfile_ ]; then
+         $TOUCH $_logfile_    
+         # Changing permission of "$_logfile_" 
+         $CHMOD 666 "$_logfile_"
+        fi
+    fi
+    if  [ "${4}" != "" ]; then
+        local _user_="${4}"
+    else
+        local _user_="root"
+    fi
+    if  [ "${5}" != "" ]; then
+        local _disable_tty_="${5}"
+    else
+        local _disable_tty_=""
+    fi
+    
+    local _server_="${1}"
+    local _cmd_="${2}"
+    TS=`date "+%Y-%m-%d %H:%M:%S"`
+    $ECHO $TS "Trying to ping server" $_server_ >> $_logfile_
+    PING=$( check_ping)
+    $PING -c 2 $_server_ >> $_logfile_
+    if [ $? -ne 0 ]; then
+        flag=0
+        while [ $flag -lt 3 ]
+        do
+                TS=`date "+%Y-%m-%d %H:%M:%S"`
+                $ECHO $TS "Trying to ping server" $_server_ >> $_logfile_
+                PING=$( check_ping)
+                $PING -c 2 $_server_ >> $_logfile_
+                if [ $? -ne 0 ]; then
+                        png=1
+                else
+                        png=0
+                        break
+                fi
+                flag=`$EXPR $flag + 1`
+                $SLEEP 5
+        done
+        if [ $png -ne 0 ]; then
+                ${ECHO} "failed to ping server $_server_" | $TEE -a $_logfile_
+                return 1
+        fi
+    fi    
+    
+    # Default value for tty option is -t -t (unchanged):
+    _tty_value="-t -t"
+    if [ "${_disable_tty_}" == "disable_tty" ]; then
+        _tty_value=""
+    fi
+    
+    if [ "${_user_}" == "root" -o "${_user_}" == "dcuser" ]; then
+		$SSH ${_tty_value} -o StrictHostKeyChecking=no -o BatchMode=yes -q $_user_@$_server_ ${_cmd_}
+		return $?
+	else
+		$SUDO -u $_user_ $SSH ${_tty_value} -o StrictHostKeyChecking=no -o BatchMode=yes -q $_user_@$_server_ ${_cmd_}
+		return $?
+	fi
+	
+}
+### Function: rotate_compress_logs ###
+#
+# Rotate and compress the logs if necessary.
+#
+# Arguments:
+#       $1 - Logfile
+#       $2 - Num Logs to keep. This number is addition to the original log
+#       $3 - Size Log in Kbytes (0 means size not relevant. Rotation always occurs)
+#       $4 - Param to compress log or not (y/n)
+# Return Values:
+#       0 : Rotation sucessful
+#     1 : Error
+rotate_compress_logs()
+{
+local logfile=${1}
+local numlog=${2}
+local sizelog_kbytes=${3}
+local compress_log=${4}
+local _chk_size_ run_time num_exist_log
+
+if [ ! "${logfile}" -o ! "${numlog}" -o ! "${sizelog_kbytes}" -o ! "${compress_log}" ]; then
+    $ECHO "Incorrect Parameters supplied to function rotate_compress_logs"
+    return 1
+fi
+
+if [ ! -s ${logfile} ]; then
+    return 0
+fi
+
+# Test for numeric
+$ECHO ${numlog} | $EGREP '^[0-9]+$' >> /dev/null 2>&1
+if [ $? -ne 0 ]; then
+    $ECHO "Numeric value only for param 2 in function rotate_compress_logs"
+    return 1
+fi
+
+# Test for numeric
+$ECHO ${sizelog_kbytes} | $EGREP '^[0-9]+$' >> /dev/null 2>&1
+if [ $? -ne 0 ]; then
+    $ECHO "Numeric value only for param 3 in function rotate_compress_logs"
+    return 1
+fi
+
+# Param must be either y/n
+if [ "${compress_log}" != "y" -a "${compress_log}" != "n" ]; then 
+    $ECHO "Param 4 can only have (y/n) value in function rotate_compress_logs"
+    return 1
+fi
+
+# Is the logfile big enough to need rotation
+if [ ${sizelog_kbytes} -ne 0 ]; then
+    _chk_size_=`$LS -l ${logfile}|$AWK '{print $5}'`
+    if [ ${_chk_size_} -lt ${sizelog_kbytes} ]; then
+    return 0
+    fi
+fi
+
+tem_file=/tmp/temfile.$$
+# Loop until I get a file name that does not exist
+while :; do
+    $LS ${tem_file} >> /dev/null 2>&1
+    if [ $? -ne 0 ]; then
+    break
+    fi
+    tem_file=${tem_file}.$$
+done
+$RM -f  ${tem_file}    
+
+$LS ${logfile}_#*@* 2> /dev/null \
+            |$EGREP "${logfile}_#[1-9]+[0-9]*@[0-9]+-[0-9]+-[0-9]+.[0-9]+.[0-9]+.[0-9]+" \
+            |$SORT -t \# -k 2,2n > ${tem_file}
+num_exist_log=`$CAT ${tem_file}|$WC -l`
+if [ `$EXPR ${num_exist_log} + 1` -ge ${numlog} ]; then
+    _cnt_=0
+    for _file_ in `$CAT ${tem_file}`; do
+        _cnt_=`$EXPR ${_cnt_} +  1`
+    if [ ${_cnt_} -ge ${numlog} ]; then
+        $RM -f ${_file_}
+    fi
+    done
+fi
+
+$LS ${logfile}_#*@* 2> /dev/null \
+            |$EGREP "${logfile}_#[1-9]+[0-9]*@[0-9]+-[0-9]+-[0-9]+.[0-9]+.[0-9]+.[0-9]+" \
+            |$SORT -t \# -k 2,2nr > ${tem_file}
+
+# Rotate the dumps
+for _file_ in `$CAT ${tem_file}`; do
+    _file_num_=`$ECHO ${_file_}|$AWK -F\# '{print $2}'|$AWK -F\@ '{print $1}'`
+    _new_file_num_=`$EXPR ${_file_num_} + 1`
+    _new_file_name_=`$ECHO ${_file_}|$SED -e "s|#${_file_num_}@|#${_new_file_num_}@|"`
+    $MV -f ${_file_} ${_new_file_name_}
+done
+$RM -f  ${tem_file}    
+
+local run_time=`$DATE '+%Y-%m-%d_%H.%M.%S'`
+$MV ${logfile} ${logfile}_#1@${run_time}
+if [ "${compress_log}" = "y" ]; then 
+    $COMPRESS -f ${logfile}_#1@${run_time} 2>/dev/null &
+fi
+}
+### Function: start_Sentinel ###
+#
+#  Starts without SMF for Sentinel
+#
+# Arguments:
+#    none
+# Return Values:
+#   0 : Success
+#   1 : Error
+#
+# Uses Global variables:  SENTINEL_SERVICE_NAME
+start_Sentinel()
+{
+local sentinel_installation_dir=$1
+local environment_file=$2
+local logfile=$3
+
+local sentinel_proc="/eniq/sentinel/bin/lserv"
+
+# Does the sentinel environment file exist?
+if [ ! -s ${environment_file} ]; then
+    $ECHO "$environment_file} not found or empty" | $TEE -a ${logfile}
+    return 1
+fi
+
+# Source the env file
+. ${environment_file}
+if [ $? -ne 0 ]; then
+    $ECHO "Error sourcing environment file ${environment_file}" | $TEE -a ${logfile}
+    return 1
+fi
+
+#File containing the type of OSS installation. Eg. events or statistics
+INST_TYPE_FILE=${ENIQ_CONF_DIR}/ericsson_use_config
+if [ ! -s "${INST_TYPE_FILE}" ]; then
+    _err_msg_="ENIQ install type not defined in ${INST_TYPE_FILE}"
+    abort_script "$_err_msg_" 
+fi
+#Read the installation type - should be "events" or "stats"
+INSTALL_TYPE=`$CAT ${INST_TYPE_FILE} | $AWK -F\= '{print $2}'`
+
+# Templates Directory
+ENIQ_TEMPL_DIR="${ENIQ_CORE_INST_DIR}/templates/${INSTALL_TYPE}"
+
+CURR_SERVER_TYPE=`$CAT $ENIQ_CONF_DIR/installed_server_type | $EGREP -v  '^[[:blank:]]*#' | $SED -e 's/ //g'`
+if [ ! "${CURR_SERVER_TYPE}" ]; then
+    _err_msg_="Could not determine server type" 
+    abort_script "$_err_msg_"
+fi
+
+_enable_sentinel_=`$CAT $ENIQ_TEMPL_DIR/admin/etc/smf_contract_config | $EGREP $CURR_SERVER_TYPE | $EGREP "sentinel" | $AWK -F:: '{print $4}'` 
+if [ "${_enable_sentinel_}" == "Y" ]; then 
+   if [ -s ${sentinel_installation_dir}/lserv ]; then
+    check_sentinel=$($PGREP -fx "$sentinel_proc" | wc -l)
+    if [ $check_sentinel  -eq 1 ]; then
+        $ECHO "Sentinel already running" | $TEE -a ${logfile}
+    else 
+        $ECHO "Sentinel not running , Starting sentinel" | $TEE -a ${logfile}
+        ${sentinel_installation_dir}/lserv
+        if [ $? -ne 0 ]; then
+            $ECHO "Error , could not start sentinel" | $TEE -a ${logfile}
+            return 1
+        fi
+    fi    
+   else
+    $ECHO "ERROR: Unable to locate file ' ${sentinel_installation_dir}/lserv ' to start Sentinel LM" | $TEE -a ${logfile}
+    return 1    
+   fi
+else
+# To check sentinel flag file
+_sentinel_flag_file_=/var/tmp/sentinel_not_start
+$TOUCH ${_sentinel_flag_file_}
+   if [ ! -f ${_sentinel_flag_file_} ]; then 
+        $ECHO "Could not create the flag file ${_sentinel_flag_file_}" | $TEE -a ${logfile} 
+        return 1     
+   fi
+fi
+}
+
+### Function: store_feature_det ###
+#
+# Store the ENIQ feature list for this OSS
+#
+# Arguments:
+#    $1 : Feature list file
+#    $2 : niq.ini file
+#    $3 : Temporary directory
+#    $4 : Logfile
+# Return Values:
+#   0 : Success
+#   1 : Error
+store_feature_det()
+{
+local _upd_feature_list_=$1
+local _niq_ini_file_=$2
+local _temp_dir_=$3
+local _logfile_=$4
+
+# Get Directory where the list of managed features are/will be stored
+_feature_list_dir_=`iniget FEATURE_INFO -f ${_niq_ini_file_} -v Feature_Interface_Dir`
+if [ ! "${_feature_list_dir_}" ]; then
+    $ECHO "Failed to read Feature_Interface_Dir parameter from ${_niq_ini_file_}" | $TEE -a ${_logfile_}
+    return 1
+fi
+_eniq_total_feature_output_file_=${_feature_list_dir_}/total_feature_install_list
+
+$MKDIR -p ${_feature_list_dir_}
+
+# Store a list of the features in one handy place. 
+if [ ! -s ${_eniq_total_feature_output_file_} ]; then
+    $CAT ${_upd_feature_list_} | $SORT -u > ${_eniq_total_feature_output_file_}
+else
+    $CP ${_eniq_total_feature_output_file_} ${_temp_dir_}/total_feature_install_list
+    if [ $? -ne 0 ]; then
+        $ECHO "Could not copy ${_eniq_total_feature_output_file_} to ${_temp_dir_}/total_feature_install_list" | $TEE -a ${_logfile_}
+        return 1
+    fi
+    
+    $CAT ${_upd_feature_list_} >> ${_temp_dir_}/total_feature_install_list
+    $CAT ${_temp_dir_}/total_feature_install_list | $SORT -u > ${_temp_dir_}/total_feature_install_list1
+    $ECHO "\nUpdating ${_eniq_total_feature_output_file_} file" | $TEE -a ${_logfile_}
+    $CP ${_temp_dir_}/total_feature_install_list1 ${_eniq_total_feature_output_file_}
+    if [ $? -ne 0 ]; then
+        $ECHO "Could not copy ${_temp_dir_}/total_feature_install_list1 to ${_eniq_total_feature_output_file_}" | $TEE -a ${_logfile_}
+        return 1
+    fi
+fi
+
+# Okay store the ENIQ Feature details per OSS if an OSS exists
+_node_exists_=`$CAT ${_upd_feature_list_} | $AWK -F"::" '{print $3}' | $SORT -u`
+if [ "${_node_exists_}" ]; then
+    for _node_ in `$CAT ${_upd_feature_list_} | $AWK -F"::" '{print $3}' | $SORT -u`; do 
+        $MKDIR -p ${_feature_list_dir_}/feature_info/${_node_}
+        _eniq_node_feature_output_file_=${_feature_list_dir_}/feature_info/${_node_}/feature_install_list
+        if [ ! -s ${_eniq_node_feature_output_file_} ]; then
+            $CAT ${_upd_feature_list_} | $EGREP "::${_node_}[     ]*$" >> ${_eniq_node_feature_output_file_}
+        else
+            $CP ${_eniq_node_feature_output_file_} ${_temp_dir_}/tem_node_feature_list
+            if [ $? -ne 0 ]; then
+                $ECHO "Could not copy ${_eniq_node_feature_output_file_} to ${_temp_dir_}/tem_node_feature_list" | $TEE -a ${_logfile_}
+                return 1
+            fi
+            
+            $CAT ${_upd_feature_list_} | $EGREP "::${_node_}[     ]*$" >> ${_temp_dir_}/tem_node_feature_list
+            $CAT ${_temp_dir_}/tem_node_feature_list|$SORT -u > ${_temp_dir_}/tem_node_feature_list1
+            $ECHO "\nUpdating ${_eniq_node_feature_output_file_} file" | $TEE -a ${_logfile_}
+            $CP ${_temp_dir_}/tem_node_feature_list1  ${_eniq_node_feature_output_file_}
+            if [ $? -ne 0 ]; then
+                $ECHO "Could not copy ${_temp_dir_}/tem_node_feature_list1 to ${_eniq_node_feature_output_file_}" | $TEE -a ${_logfile_}
+                return 1
+            fi
+        fi
+    done
+fi
+}
+
+### Function: update_block_storage_ini ###
+#
+# This function will update the block_storage.ini file.
+#
+#
+# Return Values:
+#      0 : Success
+#      1 : Error
+update_block_storage_ini()
+{
+local _action_=$1
+local _lun_list_to_remove_=$2
+
+local ENIQ_BASE_DIR=/eniq
+local ENIQ_CONF_DIR=${ENIQ_BASE_DIR}/installation/config
+
+# Check hardware
+if [ -f ${ENIQ_CONF_DIR}/san_details ];then
+    STORAGE_TYPE=`$CAT ${ENIQ_CONF_DIR}/san_details | $GREP STORAGE_TYPE | $CUT -f 2 -d =`
+else
+    _err_msg_="Could not find the file to get hardware type."
+    abort_script "${_err_msg_}"
+fi
+
+# Determine SAN Device type if raw
+if [ "${STORAGE_TYPE}" == "raw" ];then
+    SAN_DEVICE=`$CAT ${ENIQ_CONF_DIR}/san_details | $EGREP "^SAN_DEVICE=" | $AWK -F\= '{print $2}'`
+    if [ ! "${SAN_DEVICE}" ]; then
+        _err_msg_="Could not read SAN_DEVICE type from ${ENIQ_CONF_DIR}/san_details."
+        abort_script "${_err_msg_}"
+    fi
+fi
+
+if [[ "${SAN_DEVICE}" == "unity" || "${SAN_DEVICE}" == "unityXT" ]]; then
+    $CP -pf ${ENIQ_CONF_DIR}/block_storage.ini /tmp/block_storage.ini.bkp
+    if [ $? -ne 0 ]; then
+        _err_msg_="Could not backup ${ENIQ_CONF_DIR}/block_storage.ini"
+        abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+    fi
+
+    /ericsson/storage/san/bin/blkcli --action listluns  > /tmp/blkluns.txt
+    if [ $? -ne 0 ]; then
+        _err_msg_="Could not fetch required LUN information using /ericsson/storage/san/bin/blkcli"
+        abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+    fi
+
+    if [ "${_action_}" == "remove" ]; then
+         for _lun_to_remove_ in `$ECHO ${_lun_list_to_remove_} | $SED "s/|/ /g"`
+         do
+             $GREP -vw ${_lun_to_remove_} /tmp/blkluns.txt > /tmp/blkluns_final.txt
+             if [ $? -ne 0 ]; then
+                  _err_msg_="Could not exclude ${_lun_to_remove_} from the list of LUNs"
+                  abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+             fi
+
+             $MV /tmp/blkluns_final.txt /tmp/blkluns.txt
+             if [ $? -ne 0 ]; then
+                 _err_msg_="Could not generate required LUN information"
+                 abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+             fi
+         done
+    fi
+
+    _DISKS_=`$CAT /tmp/blkluns.txt | $AWK -F";" '{print $1}' | $TR '\n' ',' | $SED 's/,$/\n/'`
+    if [ $? -ne 0 ]; then
+        _err_msg_="Could not access blkluns.txt"
+        abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+    fi
+
+    $GREP "BLK_STORAGE_DISKS" /tmp/block_storage.ini.bkp > /dev/null 2>&1
+    if [ $? -ne 0 ]; then
+         $ECHO "BLK_STORAGE_DISKS=" >> /tmp/block_storage.ini.bkp
+    fi
+
+    iniset BLK_STORAGE_DEV_DETAILS_1 -f /tmp/block_storage.ini.bkp BLK_STORAGE_DISKS="${_DISKS_}"
+    if [ $? -ne 0 ]; then
+        _err_msg_="Could not set BLK_STORAGE_DISKS in ${ENIQ_CONF_DIR}/${BLK_STOR_INI}"
+        abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+    fi
+
+    $CP -pf /tmp/block_storage.ini.bkp ${ENIQ_CONF_DIR}/block_storage.ini
+    if [ $? -ne 0 ]; then
+        _err_msg_="Could not update the block_storage.ini"
+        abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+    fi
+
+    $RM -rf /tmp/block_storage.ini.bkp /tmp/blkluns.txt
+
+fi
+}
+
+### Function: update_engine_java_heap_size ###
+#
+# This function will set the Heap Memory size 
+# of the ENIQ engine.
+#
+# Arguments:
+#    $1 : INI file to be updated
+#    $2 : Heap size factor (optional)
+# Return Values:
+#       0 : Success
+#       1 : Error
+update_engine_java_heap_size()
+{
+local _ini_file_=$1
+if [ ! -s ${_ini_file_} ]; then
+    log_msg -l ${LOGFILE} -s "${_ini_file_} does not exist, or is empty"
+    exit 1
+fi
+
+if [ -z $2 ] ; then
+    
+        if [ "${CURR_SERVER_TYPE}" == "stats_engine" ]; then
+            local _heap_factor_=2
+        else
+            local _heap_factor_=18
+        fi
+    
+else
+    local _heap_factor_=$2
+fi
+
+local _total_mem_=`x=$(awk '/MemTotal/ {print $2}' /proc/meminfo) ; echo $((x/1024))` 2>/dev/null 
+if [ ! ${_total_mem_} ]; then
+    log_msg -l ${LOGFILE} -s "${_total_mem_} could not be found"
+    exit 1
+fi
+
+if [ ${_total_mem_} -lt 16384 ]; then
+    local _engine_heap_size_=1024M
+else
+    local _size_=`$EXPR ${_total_mem_} / ${_heap_factor_} + 1024`
+    local _engine_heap_size_="${_size_}M"
+fi
+
+if [ -f ${ENIQ_CONF_DIR}/extra_params/verbose_settings ] ; then
+    while :; do
+        $ECHO
+        $ECHO "Enter ETLC Engine Max Heap (defaults to $_engine_heap_size_)"
+        read _read_
+        if [ -z $_read_ ] ; then
+            _read_=$_engine_heap_size_
+        fi
+        
+        _setting_=`$ECHO "$_read_" | $TR '[A-Z]' '[a-z]'`
+        _num_=`$ECHO $_setting_ | $AWK '{print substr($1, 0, length($1)-1)}'`
+        _factor_=`$ECHO $_setting_ | $AWK '{print substr($1, length($1), length($1))}'`
+
+        _kilo_=1024
+        _mega_=$((${_kilo_} * ${_kilo_}))
+        _giga_=$((${_mega_} * ${_kilo_}))
+        _tera_=$((${_giga_} * ${_kilo_}))
+
+        _mul_=1
+
+        if [ "$_factor_" == "k" ] ; then
+            _mul_=${_kilo_}
+        elif [ "$_factor_" == "m" ] ; then
+            _mul_=${_mega_}
+        elif  [ "$_factor_" == "g" ] ; then
+            _mul_=${_giga_}
+        elif  [ "$_factor_" == "t" ] ; then
+            _mul_=${_tera_}
+        else
+            log_msg -l ${LOGFILE} -s "Unknown size factor '$_factor_' in $_setting_"
+            continue
+        fi
+        
+        _engine_heap_size_bytes_=$(($_num_ * $_mul_))
+        _total_mem_bytes_=$(($_total_mem_ * ${_mega_}))
+        
+        if [ $_engine_heap_size_bytes_ -gt $_total_mem_bytes_ ] ; then
+            log_msg -l ${LOGFILE} -s "Max heap value can not be greator that available memory : $_read_ > ${_total_mem_}M"
+            continue
+        fi
+        _engine_heap_size_=$_read_
+        break
+    done
+fi
+
+iniset ETLC -f ${_ini_file_} EngineHeap=${_engine_heap_size_}
+if [ $? -ne 0 ]; then
+    log_msg -l ${LOGFILE} -s "Could not update ${_ini_file_} with EngineHeap=${_engine_heap_size_}"
+    exit 1
+fi
+
+export ENGINE_MAX_HEAP=${_engine_heap_size_}
+}
+
+### Function: update_iq_intf_file ###
+#
+# Update the SYBASE IQ interfaces file
+#
+# Arguments:
+#       $1 : iq interface file
+#    $2 : ini file
+#     $3 : Name of the reader 
+# Return Values:
+#       0 : Success
+#       1 : Error
+update_iq_intf_file()
+{
+_iq_intf_file_=$1
+_dwh_ini_file_=$2
+_reader_name_=$3
+
+if [ ! "${_iq_intf_file_}" -o ! "${_dwh_ini_file_}" -o ! "${_reader_name_}" ]; then
+    log_msg -l ${LOGFILE} -s "Incorrect arguments passed to update_iq_intf_file function"
+    exit 1
+fi
+
+if [ ! -s ${_iq_intf_file_} ]; then
+    log_msg -l ${LOGFILE} -s "Could not locate Sybase IQ interfaces file - ${_iq_intf_file_}"
+    exit 1
+fi
+
+_temp_intf_file_=/tmp/interface_file.$$.$$
+$RM -rf ${_temp_intf_file_}
+
+# Make a temp version of the interfaces dir
+$CP ${_iq_intf_file_} ${_temp_intf_file_}
+if [ $? -ne 0 ]; then
+    log_msg -l ${LOGFILE} -s "Could not create a backup of ${_iq_intf_file_}"
+    exit 1
+fi
+
+_dwh_port_num_=`iniget DWH_READER_SETTINGS -f ${_dwh_ini_file_} -v PortNumber`
+if [ ! "${_dwh_port_num_}" ]; then
+    log_msg -l ${LOGFILE} -s "Could not read DWH port number from ${_dwh_ini_file_}"
+    exit 1
+fi
+
+$ECHO "${_reader_name_}" >> ${_temp_intf_file_}
+$ECHO "\tmaster tcp ether ${_reader_name_} ${_dwh_port_num_}" >> ${_temp_intf_file_}
+$ECHO "\tquery tcp ether ${_reader_name_} ${_dwh_port_num_}\n" >> ${_temp_intf_file_}
+
+$CP ${_temp_intf_file_} ${_iq_intf_file_}
+if [ $? -ne 0 ]; then
+    log_msg -l ${LOGFILE} -s "Could not copy Sybase IQ Interfaces File to ${_iq_intf_file_}"
+    exit 1
+fi
+}
+
+### Function: update_service_file ###
+#
+# This function will update the service names
+# file with the required service
+#
+# Arguments:
+#    $1 : Service name file (Mandatory)
+#    $2 : Hostname of server (Mandatory)
+#    $3 : IP address of server (Mandatory)
+#    $4 : Service name running (Mandatory)
+#            If a list is to be supplied they must be comma seperated
+#    $5 : Service Group Name (Optional)
+#    $6 : Flag specifying if hostsync is to be restarted (Optional)
+# Return Values:
+#       0 : Success
+#       1 : Error
+update_service_file()
+{
+local _service_file_=$1
+local _host_ip_=$2
+local _hostname_=$3
+local _service_name_list_=$4
+local _service_grp_=$5
+local _restart_hostsync_=$6
+local _out_str_
+
+if [ ! "${_host_ip_}" -o ! "${_hostname_}" -o ! "${_service_name_list_}" -o ! "${_service_file_}" ]; then
+    log_msg -s "Incorrect arguments passed to update_service_file function" -l ${LOGFILE}
+    return 1
+fi
+    
+validate_ip ${_host_ip_}
+if [ $? -ne 0 ]; then
+    log_msg -s "Could not validate ${_host_ip_}" -l ${LOGFILE}
+    return 1
+fi
+
+_temp_service_file_=/tmp/service_file.$$.$$
+_temp_service_file_1_=/tmp/service_file_1.$$.$$
+
+$RM -rf ${_temp_service_file_} ${_temp_service_file_1_}
+
+$ECHO "#\n# ENIQ service list" > ${_temp_service_file_1_}
+$ECHO "# Format is:\n# <ip_address>::<hostname>::<service>::<service_group>\n#" >> ${_temp_service_file_1_}
+# First and second sed remove extra spaces before and after the entry name.
+# The third sed replaces the , with a | so the search will match all the entries in the list
+_upd_service_name_regex_=`$ECHO ${_service_name_list_} | $SED -e 's/^[ ]*//' -e 's/[ ]*$//' -e 's|\,|\||g'`
+if [ -s ${_service_file_} ]; then
+      $CAT ${_service_file_} | $EGREP -v "^[[:blank:]]*#" | $EGREP -v ".*::(${_upd_service_name_regex_})[::]*[[:blank:]]*$" >> ${_temp_service_file_}
+    # Removing the check for return values due to ENIQ Stats Standalone : - DDP-254
+    if [ -s ${_temp_service_file_} ]; then
+        $CAT ${_temp_service_file_} | $EGREP '${_upd_service_name_regex_}'
+        if [ $? -eq 0 ]; then
+            log_msg -s "Could not remove ${_service_name_list_} entries" -l ${LOGFILE}
+            return 1
+        fi
+    fi
+fi
+
+# Now remove the commas so we have a basic list of service names so we can loop through them
+_upd_service_name_list_=`$ECHO ${_service_name_list_} | $SED -e 's/^[ ]*//' -e 's/[ ]*$//' -e 's|\,| |g'`
+for _service_name_ in ${_upd_service_name_list_}; do
+    _out_str_="${_host_ip_}::${_hostname_}::${_service_name_}"
+    if [ "${_service_grp_}" != "NULL_GRP" ]; then
+        _out_str_="${_out_str_}::${_service_grp_}"
+    fi
+
+    $ECHO "${_out_str_}" >> ${_temp_service_file_}
+    if [ $? -ne 0 ]; then
+        log_msg -s "Could not update ${_temp_service_file_} with ${_out_str_}" -l ${LOGFILE}
+        return 1
+    fi
+done
+
+$CAT ${_temp_service_file_} | $SORT -u >> ${_temp_service_file_1_}
+if [ $? -ne 0 ]; then
+    log_msg -s "Could not remove duplicates from ${_temp_service_file_}" -l ${LOGFILE}
+    return 1
+fi
+
+$CP ${_temp_service_file_1_} ${_service_file_}
+if [ $? -ne 0 ]; then
+    log_msg -s "Could not create new file ${_service_file_}"
+    return 1
+fi
+
+if [ ! "${_restart_hostsync_}" ]; then
+    
+        log_msg -s "Restarting hostsync.service" -l ${LOGFILE}
+        $SYSTEMCTL restart hostsync.service
+        if [ $? -ne 0 ]; then
+            log_msg -s "Could not restart hostsync.service" -l ${LOGFILE}
+            return 1
+        fi
+    
+    _service_state=`$SYSTEMCTL show hostsync.service -p ActiveState | $AWK -F= '{print $2}'`
+    if [ "${_service_state}" == "active" ] ; then
+       log_msg -s "hostsync.service restarted successfully" -l ${LOGFILE} 
+    else
+    log_msg -s "Waiting for hostsync.service to restart" -l ${LOGFILE}
+    $SLEEP 30
+fi
+        
+fi
+}
+
+### Function: update_oss_server_det ###
+#
+# Update ENIQ server Name/IP
+#
+# Arguments:
+#   $1 : Parameter specifying the ENIQ HNAME
+#    $2 : OSS reference name file
+#
+# Return Values:
+#   none
+update_oss_server_det()
+{
+_eniq_hname_=${1}
+local _ref_name_file_=${2}
+local _input_=${3}
+
+unset OLD_SRV_IP NEW_SRV_IP SRV_NAME SRV_IP
+local _this_hostname_=`$MYHOSTNAME`
+
+OLD_SRV_IP=`$CAT ${_ref_name_file_} | $GREP -w "${_eniq_hname_}" | $AWK '{print $2}'`
+if [ $? -ne 0 ]; then
+    _err_msg_="Error reading IP address for ${_eniq_hname_} from ${_ref_name_file_}"
+    abort_script "$_err_msg_"
+fi
+
+while :; do
+    $CLEAR
+    if [ "${_input_}" != "SKIP_INPUT" ]; then
+        $ECHO "\nEnter the IP address associated with ${_eniq_hname_}"
+        $ECHO "Press enter for the default [${OLD_SRV_IP}]"
+        read NEW_SRV_IP
+    fi
+
+    if [ ! "${NEW_SRV_IP}" ]; then
+        NEW_SRV_IP=${OLD_SRV_IP}
+    fi
+
+    validate_ip ${NEW_SRV_IP}
+    if [ $? -ne 0 ]; then
+        continue
+    fi
+
+    SRV_IP=${NEW_SRV_IP}
+    break
+done
+
+if [ "${NEW_SRV_IP}" != "${OLD_SRV_IP}" ]; then
+    _chk_=`$CAT ${_ref_name_file_} | $EGREP -v "^${_eniq_hname_}[     ]*" | $GREP -w ${NEW_SRV_IP}`
+    if [ "${_chk_}" ]; then
+        _err_msg_="${NEW_SRV_IP} already referenced in ${_ref_name_file_}"
+        abort_script "$_err_msg_"
+    fi
+fi
+}
+
+### Function: update_oss_ref_file ###
+#
+# Update oss ref file with new oss
+#
+# Arguments:
+#   $1 : Shared location of OSS reference name file 
+#   $2 : OSS alias name to be changed 
+#   $3 : Old OSS IP address
+#   $4 : New OSS IP address 
+#
+# Return Values:
+#   none
+update_oss_ref_file()
+{
+local _ref_name_file_=${1}
+local _alias_=${2}
+local _old_ip_=${3}
+local _new_ip_=${4}
+
+local _service_name_file_=${CLI_CONF_DIR}/service_names
+
+log_msg -s "\nUpdating ${_alias_} with new IP address (${_new_ip_}) in ${_ref_name_file_}" -l ${LOGFILE}
+
+$RM -f ${TEM_DIR}/ref_file ${TEM_DIR}/srv_name_file
+
+$CAT ${_ref_name_file_}|$AWK -v v1="${_alias_}" -v v2="${_new_ip_}" '
+    {
+        if($1 == v1) print v1" "v2
+        else  print $0
+
+    }' >> ${TEM_DIR}/ref_file
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not substitute values for ${_alias_} in\n${_ref_name_file_} "
+    abort_script "$_err_msg_"
+fi
+
+$CP ${TEM_DIR}/ref_file ${_ref_name_file_}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not update values for ${_alias_} in\n${_ref_name_file_} "
+    abort_script "$_err_msg_"
+fi
+
+log_msg -s "Updating ${_alias_} with new IP address (${_new_ip_}) in ${_service_name_file_}" -l ${LOGFILE}
+$CAT ${_service_name_file_} | $SED -e "s|${_old_ip_}|${_new_ip_}|g" >> ${TEM_DIR}/srv_name_file
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not substitute IP address for ${_alias_} in ${_service_name_file_}"
+    abort_script "$_err_msg_"
+fi
+
+$CP ${TEM_DIR}/srv_name_file ${_service_name_file_}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not update values for ${_alias_} in ${_service_name_file_}"
+    abort_script "$_err_msg_"
+fi
+}
+
+### Function: validate_ip ###
+#
+# This function will check that an
+# IP address is valid
+#
+# Arguments:
+#    $1 : IP address to be validated
+# Return Values:
+#       0 : Success
+#       1 : Error
+validate_ip()
+{
+_chk_ip_=$1    
+_err_flag_=0
+
+if [[ ${_chk_ip_} =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]]; then
+    _orig_ifs_="$IFS"
+    IFS='.'
+    
+    _chk_ip_array_=($_chk_ip_)
+    IFS="${_orig_ifs_}"
+    
+    _array_length_="${#_chk_ip_array_[@]}"
+    if [ ${_array_length_} -ne 4 ]; then
+        _err_flag_=1
+    fi
+    
+    for (( i=0; i<${_array_length_}; i++ )); do
+        if [ ${_chk_ip_array_[$i]} -lt 0 -o ${_chk_ip_array_[$i]} -gt 255 ]; then
+            _err_flag_=1
+        fi
+    done
+else
+    local ipv6=$1
+
+    # The Regex expresion to match IPv6 adresses
+    IPv6_REGEXP='^\s*((([0-9A-Fa-f]{1,4}:){7}([0-9A-Fa-f]{1,4}|:))|(([0-9A-Fa-f]{1,4}:){6}(:[0-9A-Fa-f]{1,4}|((25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)(\.(25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)){3})|:))|(([0-9A-Fa-f]{1,4}:){5}(((:[0-9A-Fa-f]{1,4}){1,2})|:((25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)(\.(25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)){3})|:))|(([0-9A-Fa-f]{1,4}:){4}(((:[0-9A-Fa-f]{1,4}){1,3})|((:[0-9A-Fa-f]{1,4})?:((25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)(\.(25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)){3}))|:))|(([0-9A-Fa-f]{1,4}:){3}(((:[0-9A-Fa-f]{1,4}){1,4})|((:[0-9A-Fa-f]{1,4}){0,2}:((25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)(\.(25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)){3}))|:))|(([0-9A-Fa-f]{1,4}:){2}(((:[0-9A-Fa-f]{1,4}){1,5})|((:[0-9A-Fa-f]{1,4}){0,3}:((25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)(\.(25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)){3}))|:))|(([0-9A-Fa-f]{1,4}:){1}(((:[0-9A-Fa-f]{1,4}){1,6})|((:[0-9A-Fa-f]{1,4}){0,4}:((25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)(\.(25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)){3}))|:))|(:(((:[0-9A-Fa-f]{1,4}){1,7})|((:[0-9A-Fa-f]{1,4}){0,5}:((25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)(\.(25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)){3}))|:)))(%.+)?\s*$'
+
+    if [[ "$ipv6" =~ $IPv6_REGEXP ]] ; then
+            # Valid IPv6 address
+            echo "ipv6"
+    else
+        # not valid IPv6 address
+        echo "not_valid"
+        _err_flag_=1
+    fi
+fi
+
+if [ ${_err_flag_} -eq 0 ]; then
+    return 0
+else
+    return 1
+fi
+}
+
+### Function: modify_file_system ###
+#
+# Update the size of the fileSystems
+# Arguments:
+#   $1 :Path to the storage.ini file
+#   $2 :Path to the config file
+#   $3 :Deployment type
+# Return Values:
+#   none
+#
+# Return Values:
+#       0 : Success
+#       1 : Error
+
+modify_file_system()
+{
+
+local _storage_ini_
+local _config_file_
+local _deployment_type_
+local _new_nas_fs_size_
+local _filesystem_
+
+
+# Check the number of arguments passed to the script.
+if [ $# -ne 3 ]; then
+    log_msg -s "Expected 3 arguments." -l ${LOGFILE}
+    return 1
+elif [[ -z "$1" || -z "$2" || -z "$3" ]]
+then
+  log_msg -s "Some of the arguments are missing.Storgae_ini: $1,Config File: $2,Deployment type: $3"  -l ${LOGFILE}
+  return 1
+else
+  _storage_ini_=$1
+  _config_file_=$2
+  _deployment_type_=$3
+fi
+
+#Check if the files are not empty
+
+if [[ ! -s ${_storage_ini_} || ! -s ${_config_file_} ]]
+then
+    log_msg -s "One or both of the config files are empty or does not exists: ${_storage_ini_}, ${_config_file_}." -l ${LOGFILE} 
+    return 1
+fi
+
+### Remove the comments from the config file
+$CAT ${_config_file_} | $EGREP -v '^[[:blank:]]*#' > ${TEM_DIR}/config_tmp.cfg
+if [ $? -ne 0 ]; then
+   log_msg -s "Could not remove the comments from ${_config_file_}." -l ${LOGFILE}
+   return 1
+fi
+
+while read _line_
+do
+
+unset _new_nas_fs_size_
+unset _filesystem_
+
+_filesystem_=`$ECHO ${_line_} | $AWK -F:: '{print $1}'`
+if [ ! -z ${_filesystem_} ]; then
+
+case ${_deployment_type_} in
+    ft)      _new_nas_fs_size_=`$ECHO ${_line_} | $AWK -F:: '{print $2}'`
+                 ;;
+    small)   _new_nas_fs_size_=`$ECHO ${_line_} | $AWK -F:: '{print $3}'`
+                 ;;
+    medium)  _new_nas_fs_size_=`$ECHO ${_line_} | $AWK -F:: '{print $4}'`
+                 ;;
+    large)   _new_nas_fs_size_=`$ECHO ${_line_} | $AWK -F:: '{print $5}'`
+                 ;;
+    vm)      _new_nas_fs_size_=`$ECHO ${_line_} | $AWK -F:: '{print $6}'`
+                 ;;
+    *)       log_msg -s "Invalid deployment type " -l ${LOGFILE}
+             return 1
+                 ;;
+esac
+
+if [ ! -z ${_new_nas_fs_size_} ]; then
+      log_msg -s "Setting FS_SIZE value for ${_filesystem_} to ${_new_nas_fs_size_} in ${_storage_ini_}" -l ${LOGFILE}
+      iniset  ${_filesystem_} -f ${_storage_ini_} FS_SIZE=${_new_nas_fs_size_}
+      if [ $? -ne 0 ]; then
+           log_msg -s "Could not set FS_SIZE=${_new_nas_fs_size_} for ${_filesystem_} in ${_storage_ini_}" -l ${LOGFILE}
+           return 1
+      fi
+      log_msg -s "Successfully set FS_SIZE value for ${_filesystem_} to ${_new_nas_fs_size_} in ${_storage_ini_}" -q -l ${LOGFILE}
+else
+      log_msg -s "FS_SIZE value not found." -l ${LOGFILE}
+      return 1
+fi
+
+else
+
+log_msg -s "File system not found." -l ${LOGFILE}
+return 1
+fi
+done < ${TEM_DIR}/config_tmp.cfg
+}
+
+
+### Function: set_engine_profile ###
+#
+#   Sets engine profile.
+#
+# Arguments:
+#       $1 The profile name: either Normal or NoLoads
+# Return Values:
+#       0 : Success
+#       1 : Error
+set_engine_profile()
+{
+# Check the engine profile used:
+local _profile_=$1
+if [ ! "${_profile_}" == "Normal" -a ! "${_profile_}" == "NoLoads" ]; then
+    log_msg -q -t -l ${LOGFILE} -s "Error: invalid engine profile used."
+    return 1
+fi
+
+local _changed_profile_=false
+
+# Get system user (dcuser):
+local _sysuser_=`iniget ENIQ_INSTALL_CONFIG -f ${ENIQ_CONF_DIR}/${SUNOS_INI} -v ENIQ_SYSUSER`
+if [ ! "${_sysuser_}" ]; then
+    log_msg -q -t -l ${LOGFILE} -s "Could not read parameter ENIQ_SYSUSER from file ${ENIQ_CONF_DIR}/${SUNOS_INI}"
+    return 1
+fi
+
+# Put engine into the profile:
+log_msg -q -t -l ${LOGFILE} -s "Changing engine profile to ${_profile_}."
+$SU - ${_sysuser_} -c "engine -e changeProfile '${_profile_}'" > /dev/null 2>&1
+# Check that the profile change has worked ok:
+local _current_engine_profile_=`$SU - ${_sysuser_} -c "engine -e getCurrentProfile"`
+$ECHO ${_current_engine_profile_} | $GREP -i ${_profile_} > /dev/null 2>&1
+if [ $? -eq 0 ] ; then
+    _changed_profile_=true
+fi
+
+if [ "${_changed_profile_}" == "true" ]; then
+    log_msg -q -t -l ${LOGFILE} -s "Changed engine profile successfully to ${_profile_}."
+    return 0
+else
+    # Profile change has failed:
+    log_msg -q -t -l ${LOGFILE} -s "Warning: Failed to change engine profile to ${_profile_}."
+    return 1
+fi
+}
+
+## Function: save_iq_header_info ###
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+save_iq_header_info()
+{
+# Define variables
+ENIQ_BASE_DIR=/eniq
+ENIQ_CONF_DIR=${ENIQ_BASE_DIR}/installation/config
+CLI_CONF_DIR=${ENIQ_BASE_DIR}/sw/conf
+HNAME=`${MYHOSTNAME}`
+HOST_IP=`$GETENT hosts ${HNAME} | $AWK '{print $1}' | $HEAD -1`
+
+# Declare ini
+COORD_INI=coordinator_sym_links.ini
+SYM_INI=sym_links.ini
+
+#File containing the type of OSS installation. Eg. events or statistics
+INST_TYPE_FILE=${ENIQ_CONF_DIR}/ericsson_use_config
+if [ ! -s "${INST_TYPE_FILE}" ]; then
+    _err_msg_="ENIQ install type not defined in ${INST_TYPE_FILE}"
+    abort_script "$_err_msg_"
+fi
+
+#Read the installation type - should be "events" or "stats"
+INSTALL_TYPE=`$CAT ${INST_TYPE_FILE} | $AWK -F\= '{print $2}'`
+if [ ! "${INSTALL_TYPE}" ]; then
+    _err_msg_="Could not read INSTALL_TYPE parameter"
+    abort_script "${_err_msg_}"
+fi
+
+
+# Determine the current server type
+CURR_SERVER_TYPE=`$CAT $ENIQ_CONF_DIR/installed_server_type | $EGREP -v '^[[:blank:]]*#' | $SED -e 's/ //g'`
+if [ ! "${CURR_SERVER_TYPE}" ]; then
+        _err_msg_="Could not determine which server type this is"
+        abort_script "$_err_msg_"
+fi
+
+CO_SERVER=""
+if [ "${CURR_SERVER_TYPE}" == "eniq_iqw" -o "${CURR_SERVER_TYPE}"  == "eniq_stats"  \
+           -o "${CURR_SERVER_TYPE}" == "stats_coordinator" ]; then
+    CO_SERVER="YES"
+fi
+
+if [ "${CO_SERVER}" != "YES" ]; then
+    # Am i a reader
+    READER_ALIAS=`$CAT ${ENIQ_CONF_DIR}/service_names | $GREP "${HOST_IP}" | $GREP "dwh_" | $AWK -F"::" '{print $3}'`
+    if [ ${READER_ALIAS} ]; then
+        _reader_=YES
+    else
+        return 0
+    fi
+fi
+
+if [ ! -s ${CLI_CONF_DIR}/${COORD_INI} ]; then
+    _err_msg_="${CLI_CONF_DIR}/${COORD_INI} not found or is empty"
+    abort_script "${_err_msg_}"
+fi
+
+if [ ! -s ${ENIQ_CONF_DIR}/${SYM_INI} ]; then
+    _err_msg_="${ENIQ_CONF_DIR}/${SYM_INI} not found or is empty"
+    abort_script "${_err_msg_}"
+fi
+
+# Get iqheader binary
+_iqheader_=`$FIND ${ENIQ_BASE_DIR}/sybase_iq/IQ*|$EGREP "\/IQ-.*\/bin.*\/iqheader[[:blank:]]*$"|$HEAD -1`
+if [ ! -x ${_iqheader_} ]; then
+    _err_msg_="Could not locate iqheader binary"
+    abort_script "${_err_msg_}"
+fi
+
+_par_tag_list_="DWH_SYSTEM_MAIN DWH_DBSPACES_MAIN DWH_DBSPACES_TEMP"
+if [ "${CO_SERVER}" == "YES" ]; then
+    _ini_file_list_="${CLI_CONF_DIR}/${COORD_INI} ${ENIQ_CONF_DIR}/${SYM_INI}"
+else
+    _ini_file_list_="${ENIQ_CONF_DIR}/${SYM_INI}"
+fi
+
+$RM -f ${TEM_DIR}/iq_header_info.$$.$$
+for _ini_file_ in `$ECHO ${_ini_file_list_}`; do
+    for _parent_block_ in `$ECHO ${_par_tag_list_}`; do
+        if [ "${_reader_}" == "YES" ]; then
+            if [ "${_ini_file_}" == "${CLI_CONF_DIR}/${COORD_INI}" ]; then
+                if [ "${_parent_block_}" == "DWH_DBSPACES_TEMP" ]; then
+                    continue
+                fi
+            fi
+        fi
+        _block_list_=`iniget ${_parent_block_} -f ${_ini_file_}`
+        if [ ! "${_block_list_}" ]; then
+            _err_msg_="Could not find values for ${_parent_block_} in ${_ini_file_}"
+            abort_script "$_err_msg_"
+        fi
+
+        for _block_ in ${_block_list_}; do
+            _path_=`iniget ${_block_} -f ${_ini_file_} -v Path`
+            if [ ! "${_path_}" ]; then
+                _err_msg_="Could not read Path value for ${_block_} in ${_ini_file_}"
+                abort_script "$_err_msg_"
+            fi
+            _file_id_=`${_iqheader_} ${_path_} 2>/dev/null |$EGREP "^[[:blank:]]*File[[:blank:]]+ID:"|$AWK '{print $NF}'`
+            if [ ! "${_file_id_}" ]; then
+                _err_msg_="Could not read IQ File ID value for ${_path_}"
+                abort_script "$_err_msg_"
+            fi
+
+            if [ -s ${TEM_DIR}/iq_header_info.$$.$$ ]; then
+                $CAT ${TEM_DIR}/iq_header_info.$$.$$|$EGREP -w "${_file_id_}"  >> /dev/null 2>&1
+                if [ $? -ne 0 ]; then
+                    $ECHO "${_path_} ${_file_id_}" >> ${TEM_DIR}/iq_header_info.$$.$$
+                fi
+            else
+                $ECHO "${_path_} ${_file_id_}" >> ${TEM_DIR}/iq_header_info.$$.$$
+            fi
+        done
+    done
+done
+
+if [ -s ${TEM_DIR}/iq_header_info.$$.$$ ]; then
+    $CP ${TEM_DIR}/iq_header_info.$$.$$ ${ENIQ_CONF_DIR}/iq_header_info
+else
+    _err_msg_="No IQ Header information could be collected"
+    abort_script "$_err_msg_"
+fi
+} 
+### Function: inigetpassword ###
+#
+# Read specified parts from a given ini file to retrieve encrypt/unencrypted password 
+#
+# Arguments:
+#       -f  : specified ini file
+#    -v  : gives only value of matching <line>
+#       raw : will print even commented (;) lines
+# Return Values:
+#       0 : Success
+#       1 : Error
+#    Text output
+inigetpassword() 
+{
+if [ -n "$1" ]; then
+    INIBLOCK="$1"
+    shift 1
+else
+    $ECHO "Usage: inigetpassword <block> -f <configfile> -v line"
+    return 1
+fi
+
+unset INIWLINE INILINE INICONFIGFILE INIPRINTTYPE _encrypt_flag_ 
+while [ -n "$1" ]; do
+    case $1 in
+    -v)    INIWLINE=value
+        INILINE=$2
+        shift 2
+        ;;
+    -f)    INICONFIGFILE=$2
+        shift 2
+        ;;
+    raw)    INIPRINTTYPE=raw
+        shift 1
+        ;;
+    *)    return 1
+        ;;
+    esac
+done
+
+
+if [ -z "$INICONFIGFILE" ]; then
+    $ECHO "Usage: inigetpassword <block> -f <configfile> [-<p|v> <line>] [raw]"
+    return 1
+fi
+_encrypt_flag_=$(iniget DB -f ${INICONFIGFILE} -v ${INILINE}_Encrypted)
+
+
+_password_=$($AWK -F= -v printtype=$INIPRINTTYPE -v line="$INILINE" -v way=$INIWLINE '
+  { sub(/[     ]*$/,"");    #remove trailing whitespace and tabs
+    if ($1=="['$INIBLOCK']") {
+    while ((getline) > 0) {
+        if ($0 ~ /^ *\[/) exit
+        if (($0 ~ /^ *;/) && (printtype!="raw")) continue
+        if ($1==line) {
+            if (way=="value")     {sub(/^[^=]*=/,"");  print $0; exit}
+        }
+        else if (! line) print $0
+    }
+    }
+  }' $INICONFIGFILE)
+  
+if [ "${_encrypt_flag_}" == 'Y' ]; then
+    echo ${_password_} |/usr/bin/openssl enc -base64 -d
+else
+    echo ${_password_} 
+fi
+}
+
+### Function: manage_stats_alarm ###
+#
+#   takes backup of alarm password and active alarm reports
+#    before upgrade and restores password and reports post upgrade
+#
+# Arguments:
+#       $1 Action type: either pre or post
+# Return Values: none
+
+manage_stats_alarm()
+{
+local _sysuser_=`iniget ENIQ_INSTALL_CONFIG -f ${ENIQ_CONF_DIR}/${SUNOS_INI} -v ENIQ_SYSUSER`
+CURR_SERVER_TYPE=`$CAT $ENIQ_CONF_DIR/installed_server_type | $EGREP -v '^[[:blank:]]*#' | $SED -e 's/ //g'`
+ if [  "${CURR_SERVER_TYPE}" == "eniq_stats" -o "${CURR_SERVER_TYPE}" == "stats_coordinator" ] ; then
+
+    if [ $1 == "pre" ]; then
+    $SU - dcuser -c ${ENIQ_INSTALLER_DIR}/installed_techpacks | $GREP "AlarmInterfaces"
+        
+        if [ $? -eq 0 ]; then
+            if [[ ! -s ${ENIQ_INSTALLER_DIR}/temp_db_result/tmp.txt ]]; then
+                if [[ -s ${ENIQ_INSTALLER_DIR}/retrieve_from_db.sh ]]; then        
+                    $SU - ${_sysuser_} -c "${ENIQ_INSTALLER_DIR}/retrieve_from_db.sh" >/dev/null
+                    if [ $? != 0 ] ; then
+                        _err_msg_="Error when running retrieve_from_db: alarm password backup could not be taken"
+                        abort_script "$_err_msg_"
+                    else
+                        $ECHO "Alarm password backup taken successfully"
+                    fi
+                else
+                    _err_msg_="${ENIQ_INSTALLER_DIR}/retrieve_from_db.sh file does not exist"
+                    abort_script "$_err_msg_"
+                fi
+            else
+                $ECHO "Alarm password backup already taken"
+            fi
+            if [[ ! -s ${ENIQ_INSTALLER_DIR}/tmp_alarm_report.txt ]]; then
+                if [[ -s ${ENIQ_INSTALLER_DIR}/manage_alarm_reports.sh ]]; then        
+                    $SU - ${_sysuser_} -c "${ENIQ_INSTALLER_DIR}/manage_alarm_reports.sh disable" >/dev/null
+                    if [ $? != 0 ] ; then
+                        _err_msg_="Error when running manage_alarm_reports: alarm reports could not be disabled"
+                        abort_script "$_err_msg_"
+                
+                    else
+                        $ECHO "Alarm reports disabled successfully"
+                    fi
+                else
+                    _err_msg_="${ENIQ_INSTALLER_DIR}/manage_alarm_reports.sh file does not exist"
+                    abort_script "$_err_msg_"
+                fi
+            else
+                $ECHO "Alarm reports already disabled"
+            fi
+        else
+            $ECHO "INFO:Alarm module is not installed.Alarm information will not be restored and Alarm reports will not be disabled."
+        fi
+    elif [ $1 == "post" ]; then
+        $SU - dcuser -c ${ENIQ_INSTALLER_DIR}/installed_techpacks | $GREP "AlarmInterfaces"
+        if [ $? -eq 0 ]; then
+            if [ -s ${ENIQ_INSTALLER_DIR}/temp_db_result/tmp.txt ]; then
+                if [ -s ${ENIQ_INSTALLER_DIR}/store_to_db.sh ]; then
+                    $SU - ${_sysuser_} -c "${ENIQ_INSTALLER_DIR}/store_to_db.sh" >/dev/null
+                    if [ $? != 0 ] ; then
+                        #_err_msg_="Error when running store_to_db.sh - alarm password cannot be restored"
+                        #abort_script "$_err_msg_"
+                        $ECHO "Error when running ${ENIQ_INSTALLER_DIR}/store_to_db.sh - alarm password cannot be restored"
+                    else
+                        $ECHO "Alarm password restored successfully" 
+                    fi
+                else
+                    $ECHO "Error: ${ENIQ_INSTALLER_DIR}/store_to_db.sh script not found - alarm password cannot be restored"
+                fi
+            else
+                #_err_msg_="Alarm password backup was not found"
+                #abort_script "$_err_msg_"
+                $ECHO "WARNING: Alarm password backup is not found: Password could not be restored"
+            fi
+            if [ -f ${ENIQ_INSTALLER_DIR}/tmp_alarm_report.txt ]; then
+                if [ -s ${ENIQ_INSTALLER_DIR}/manage_alarm_reports.sh ]; then
+                    $SU - ${_sysuser_} -c "${ENIQ_INSTALLER_DIR}/manage_alarm_reports.sh enable" >/dev/null
+                    if [ $? != 0 ] ; then
+                        #_err_msg_="Error when running manage_alarm_reports.sh...Alarm reports cannot be enabled"
+                        #abort_script "$_err_msg_"
+                        $ECHO "Error when running ${ENIQ_INSTALLER_DIR}/manage_alarm_reports.sh: Alarm reports cannot be enabled"
+                    else
+                        $ECHO "Alarm reports enabled successfully" 
+                    fi
+                else
+                    $ECHO "${ENIQ_INSTALLER_DIR}/manage_alarm_reports.sh file does not exist"
+                fi
+            else
+                #_err_msg_="Alarm reports backup was not found"
+                #abort_script "$_err_msg_"
+                $ECHO "Alarm reports backup was not found: Could not enable reports"
+        
+            fi    
+        else 
+            $ECHO "INFO:Alarm module is not installed.Alarm information will not be restored and Alarm reports will not be enabled."
+        fi
+    fi    
+    
+    
+fi    
+}
+
+### Function: ask_for_input ###
+#
+#   Common function to ask for user input
+#   and stores user input in USER_VALUE
+#
+# Arguments:
+#       $1 : User message
+# Return Values:
+#       none
+ask_for_input()
+{
+_msg_=$*
+unset USER_VALUE
+
+while [ 1 ]; do
+    $ECHO "\nPlease enter ${_msg_}"
+    read USER_VALUE
+    
+    if [ ! "$USER_VALUE" ];then
+        $ECHO "Please enter a valid input"
+        continue
+    else
+        break
+    fi
+done
+}
+
+### Function: set_conf_value ###
+#
+#   Common function to set value in file
+#   having the param=value format
+#
+# Arguments:
+#       $1 : Parameter name
+#       $2 : Value
+#       $3 : File name
+# Return Values:
+#       none
+set_conf_value()
+{
+if [ $# -ne 3 ];then
+    _err_msg_="Incorrect number of parameters passed to set_conf_value"
+    abort_script "${_err_msg_}"
+fi
+
+_param_=$1
+_value_=$2
+_file_=$3
+
+# Update param=value
+# Check if the param exists in file
+$CAT ${_file_} | $GREP "^${_param_}=" >> /dev/null
+if [ $? -ne 0 ];then
+    $ECHO "${_param_}=${_value_}" >> ${_file_}
+else
+    $CAT ${_file_} | $SED 's/"${_param_}=*"/"${_param_}=${_value_}"/' > /tmp/updated_file.$$.$$
+    if [ $? -ne 0 ];then
+        _err_msg_="Failed to update ${_param_} value in ${_file_}"
+        abort_script "${_err_msg_}"
+    fi
+    $MV /tmp/updated_file.$$.$$ ${_file_}
+    if [ $? -ne 0 ];then
+        _err_msg_="Failed to save ${_param_} value in ${_file_}"
+        abort_script "${_err_msg_}"
+    fi
+fi
+}
+
+### Function: user_confirm ###
+#
+#   Take user confirmation
+#
+# Arguments:
+#   $1 : User display message
+# Return Values:
+#   User response : YES/NO
+user_confirm_rollback()
+{
+_usr_msg_="\n\nIs the input provided correct? (Yy/Nn) : \c"
+unset _response_
+
+while [ 1 ]
+do
+    $ECHO ${_usr_msg_}
+    read ans
+
+    case $ans in
+      Y|y|YES|Yes|yes) _response_="YES"
+                       break
+                       ;;
+      N|n|NO|No|no) _response_="NO"
+                    break
+                    ;;
+      *) $ECHO "Invalid input. Enter again."
+         ;;
+    esac
+done
+}
+
+
+### Function: get_eniq_upgrade_feature_list ###
+#
+# Get the list of ENIQ features to be installed
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+get_eniq_upgrade_feature_list()
+{
+
+# Get directory where the ENIQ Features are stored on DVD/Jumpstart
+_eniq_feat_input_dir_=`iniget FEATURE_INFO -f ${CLI_CONF_DIR}/${ENIQ_INI} -v Feature_Input_Dir`
+if [ ! "${_eniq_feat_input_dir_}" ]; then
+    _err_msg_="Could not read parameter Feature_Input_Dir from ${CLI_CONF_DIR}/${ENIQ_INI} file"
+    abort_script "$_err_msg_"
+fi
+
+# Get file where the ENIQ Features are listed on DVD/Jumpstart
+_tem_feat_input_file_=`iniget FEATURE_INFO -f ${CLI_CONF_DIR}/${ENIQ_INI} -v Feature_Input_File`
+if [ ! "${_tem_feat_input_file_}" ]; then
+    _err_msg_="Could not read parameter Feature_Input_File from${CLI_CONF_DIR}/${ENIQ_INI} file"
+    abort_script "$_err_msg_"
+fi
+##  if script is run for feature only upgrade, SW_DIR is taken from manage features script, otherwise from upgrade eniq sw script.
+if [ -z "${FEATURE_SW_DIR}" ]
+then
+    SW_DIR=${BASE_SW_DIR}
+else
+    SW_DIR=${FEATURE_SW_DIR}
+fi
+# Does the feature input file exist?
+
+    _eniq_feat_input_file_="$SW_DIR/${_eniq_feat_input_dir_}/${_tem_feat_input_file_}"
+
+
+if [ ! -s ${_eniq_feat_input_file_} ]; then
+     if [ $INSTALL_TYPE == "stats" ]; then
+        $ECHO "Could not locate ENIQ Features input file - ${_eniq_feat_input_file_}"
+        return 99
+    else
+        _err_msg_="Could not locate ENIQ Features input file - ${_eniq_feat_input_file_}"
+        abort_script "$_err_msg_"
+    fi
+fi
+
+# Get Directory where the list of managed features will be stored
+_feature_list_dir_=`iniget FEATURE_INFO -f ${ENIQ_CONF_DIR}/${ENIQ_INI} -v Feature_Interface_Dir`
+if [ ! "${_feature_list_dir_}" ]; then
+    _err_msg_="Failed to read Parameter Feature_Interface_Dir from ${ENIQ_CONF_DIR}/${ENIQ_INI}"
+    abort_script "$_err_msg_"
+fi
+
+# Total Interface File
+_eniq_total_feature_output_file_=${_feature_list_dir_}/total_feature_install_list
+if [ ! -s ${_eniq_total_feature_output_file_} ]; then
+    _err_msg_="Could not locate installed list of features - ${_eniq_total_feature_output_file_}"
+    abort_script "$_err_msg_"
+fi
+
+# Does the sentinel environment file exist?
+if [ ! -s ${ENIQ_SENTINEL_ENV} ]; then
+    _err_msg_="${ENIQ_SENTINEL_ENV} not found or empty"
+    abort_script "$_err_msg_"
+fi
+
+# Source the env file
+. ${ENIQ_SENTINEL_ENV}
+if [ $? -ne 0 ]; then
+    _err_msg_="Error sourcing environment file ${ENIQ_SENTINEL_ENV}"
+    abort_script "$_err_msg_"
+fi
+
+# Does the sentinel lsmon binary exist?
+if [ ! -x ${ENIQ_SENTINEL_BIN_DIR}/lsmon ]; then
+    _err_msg_="${ENIQ_SENTINEL_BIN_DIR}/lsmon not found or not executable"
+    abort_script "$_err_msg_"
+fi
+
+# Get a list of licensed features
+get_licenced_features ${LOGFILE} ${TEM_DIR} ${ENIQ_SENTINEL_BIN_DIR}/lsmon ${LSHOST}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not generate a list of licenses on ${LSHOST}"
+    abort_script "$_err_msg_"
+fi
+
+_working_list_=${TEM_DIR}/feature_work_list
+_working_list_1=${TEM_DIR}/feature_work_list1
+_build_list_=0
+
+$RM -f ${_working_list_} ${_working_list_1}
+# Was I supplied Feature(s) in a file for a specific OSS to be upgraded
+if [ "${ENIQ_FEATURE_FILE}" ]; then
+    if [ ! -s ${ENIQ_FEATURE_FILE} ]; then
+    _err_msg_="Interface list file ${ENIQ_FEATURE_FILE} missing or empty"
+    abort_script "$_err_msg_"
+    fi
+    $CP ${ENIQ_FEATURE_FILE} ${_working_list_}
+        if [ $? -ne 0 ]; then
+            _err_msg_="Could not copy ${ENIQ_FEATURE_FILE}\nto ${_working_list_}"
+            abort_script "$_err_msg_" 
+        fi
+    
+# Was I supplied Feature(s) to be updated
+elif [ "${ENIQ_FEATURE}" ]; then
+    if [ "${ENIQ_FEATURE}" == "ALL" ]; then
+    $CAT ${_eniq_total_feature_output_file_} | $AWK -F"::" '{print $1"::"$2}' >> ${_working_list_1}
+    else
+    _tem_list_=`$ECHO ${ENIQ_FEATURE} | $SED -e 's|,| |g'`
+    for _feat_ in ${_tem_list_}; do
+        _chk_feat_inst_=`$CAT ${_eniq_total_feature_output_file_} | $GREP -w ${_feat_} | $HEAD -1`
+        if [ $? -ne 0 ]; then
+        _err_msg_="Feature ${_feat_} cannot be updated as it has not been installed"
+        abort_script "$_err_msg_"
+        fi
+        $ECHO "${_chk_feat_inst_} | $AWK -F"::" '{print $1"::"$2}" >>  ${_working_list_1}
+    done
+    fi
+else
+    $CAT ${_eniq_total_feature_output_file_} | $AWK -F"::" '{print $1"::"$2}' >> ${_working_list_1}
+    _build_list_=1
+fi
+
+# We need to put the list in order now and remove the duplicates.
+while read _feat_detail_; do
+    _feat_=`$ECHO ${_feat_detail_} | $AWK -F"::" '{print $1}'`
+    $CAT ${_working_list_1} | $SORT -u | $EGREP "^${_feat_}::" >> ${_working_list_} 2>/dev/null
+done < ${_eniq_feat_input_file_}
+
+# I will show only LTE feature during feature only upgrade
+if [ "${FEATURE_ACTION}" == "feature_update" ]; then
+    while read p; do
+        feat_name=`$ECHO "${p}" | $CUT -d":" -f1`
+        for i in "${features_LTE[@]}"; do
+            if [ "${feat_name}" == "$i" ]; then
+                $ECHO "${p}" >> ${TEM_DIR}/.feats_to_install
+            fi
+        done
+    done < ${_working_list_}
+    
+    $CAT ${TEM_DIR}/.feats_to_install > ${_working_list_}
+fi
+
+
+unset FEATURE_ARRAY START_DATE_ARRAY END_DATE_ARRAY
+# Build 3 arrays of all the ENIQ Features. One array for the description
+# and the 2nd array for the file designation
+_cnt_=${#_tem_feature_array_[@]}
+_ptr_=0
+
+for (( i=0; i<=${_cnt_}; i++)); do
+    _desc_=`$CAT ${_working_list_} | $EGREP "^[ ]*${_tem_feature_array_[${i}]}::" | $AWK -F"::" '{print $2}'`
+    if [ "${_desc_}" ]; then
+        let _ptr_=${_ptr_}+1
+        FEATURE_ARRAY[${_ptr_}]=${_tem_feature_array_[${i}]}
+        START_DATE_ARRAY[${_ptr_}]=${_tem_start_date_array_[${i}]}
+        END_DATE_ARRAY[${_ptr_}]=${_tem_end_date_array_[${i}]}
+        DESC_ARRAY[${_ptr_}]=${_desc_}
+        
+        if [ ! "${FEATURE_ARRAY[${_ptr_}]}" -o ! "${START_DATE_ARRAY[${_ptr_}]}" -o ! "${END_DATE_ARRAY[${_ptr_}]}" -o ! "${DESC_ARRAY[${_ptr_}]}" ]; then
+            _err_msg_="Malformed license value"
+            abort_script "$_err_msg_"
+        fi
+    fi
+done
+
+if [ ${#START_DATE_ARRAY[@]} -eq 0 ]; then
+    $ECHO "No valid ENIQ licenses read from License Server ${LSHOST}"
+    $ECHO "only Standard TPs and PF installation will continue."
+    return 99
+fi
+
+# Get todays date
+_now_date_=`$DATE '+%Y%m%d'`
+
+# Create the Display file
+_disp_file_=${TEM_DIR}/disp_file
+_unlic_file_=${TEM_DIR}/unlicensed_file
+$RM -f ${_disp_file_} ${_unlic_file_}
+
+$ECHO "Currently installed and licensed ENIQ features" >> ${_disp_file_}
+$ECHO "==============================================" >> ${_disp_file_}
+
+_cnt_=${#FEATURE_ARRAY[@]}
+_menu_opt_=0
+for (( i=1; i<=${_cnt_}; i++)); do
+    if [ ${START_DATE_ARRAY[${i}]} -gt ${_now_date_} -o ${END_DATE_ARRAY[${i}]} -lt ${_now_date_} ]; then
+        $ECHO "[N/A]  ${DESC_ARRAY[${i}]}  (E)" >> ${_unlic_file_}
+    else
+        let _menu_opt_=_menu_opt_+1
+        VALID_FEATURE_ARRAY[${_menu_opt_}]=${FEATURE_ARRAY[${i}]}
+        VALID_DESC_ARRAY[${_menu_opt_}]=${DESC_ARRAY[${i}]}
+        
+        _oss_list_=`$CAT ${_eniq_total_feature_output_file_} \
+                           | $EGREP "^[[:blank:]]*${VALID_FEATURE_ARRAY[${_menu_opt_}]}::"\
+                           | $AWK -F"::" '{print $3}'`
+        if [ "${_oss_list_}" ]; then
+            _oss_list_=`$ECHO ${_oss_list_}|$SED -e 's| |,|g'`
+            _oss_list_array_[${_menu_opt_}]="${_oss_list_}"
+        fi
+        
+        if [ "${_oss_list_array_[${_menu_opt_}]}" == "" ]; then
+            $ECHO "[${_menu_opt_}]  ${DESC_ARRAY[${i}]}" >> ${_disp_file_}
+            else
+            $ECHO "[${_menu_opt_}]  ${DESC_ARRAY[${i}]}  (${_oss_list_array_[${_menu_opt_}]})" >> ${_disp_file_}
+            #$ECHO "[${_menu_opt_}]  ${DESC_ARRAY[${i}]}" >> ${_disp_file_}
+        fi
+        
+    fi
+done
+
+# Any unlicensed stuff to display
+#if [ -s ${_unlic_file_} ]; then
+#    $ECHO "\n===================UNLICENSED FEATURES=======================" >> ${_disp_file_}
+#    $CAT  ${_unlic_file_} >> ${_disp_file_}
+#    $ECHO "===============================================================" >> ${_disp_file_}
+#    _build_list_=1
+#fi
+
+$ECHO "\nSelect range of ENIQ Features to be upgraded\nusing the following format [n,n,n-n,n...n]" >> ${_disp_file_}
+$ECHO "\tE.G. 1,2,3-8,9,10" >> ${_disp_file_}
+
+if [ ${_build_list_} -eq 0 ]; then
+    # Number of options
+    _cnt_=${#VALID_FEATURE_ARRAY[@]}
+
+    $RM -f ${TEM_DIR}/feature_output_list1 ${TEM_DIR}/feature_output_list2 ${TEM_DIR}/feature_selection
+    
+    # Create the Display file
+    for (( i=1; i<=${_cnt_}; i++)); do
+        $ECHO "${i}" >>  ${TEM_DIR}/feature_selection
+    done
+else 
+    while :; do
+        $CLEAR
+        $CAT ${_disp_file_}
+        $ECHO "\nSelect 'None' if you do not wish to upgrade any features.\n"
+        read _opt_
+    
+        # If the User hit nothing
+        if [ ! "${_opt_}" ]; then
+            continue
+        fi
+        
+        $RM -f ${TEM_DIR}/feature_output_list1 ${TEM_DIR}/feature_output_list2 ${TEM_DIR}/feature_selection
+        
+        if [ "${_opt_}" == "None" -o  "${_opt_}" == "none" ]; then
+            break
+        fi
+        
+        _numerror_=0
+        
+        for _num_ in `$ECHO ${_opt_} | $SED -e 's| ||g' -e 's|,| |g'`; do
+            $ECHO ${_num_} | $EGREP '-' >> /dev/null 2>&1
+            if [ $? -eq 0 ]; then
+                _start_=`$ECHO ${_num_} | $AWK -F\- '{print $1}'`
+                if [ ! "${_start_}" ]; then
+                    continue
+                fi
+                
+                _end_=`$ECHO ${_num_} | $AWK -F\- '{print $2}'`
+                for (( _sel_=${_start_}; _sel_<=${_end_}; _sel_++ )); do
+                    $ECHO ${_sel_} | $EGREP '^[0-9]+$' >> /dev/null 2>&1
+                    if [ $? -ne 0 ]; then
+                        _numerror_=1
+                        break
+                    fi
+                    
+                    if [ ${_sel_} -lt 1 -o ${_sel_} -gt ${_cnt_} ]; then
+                        _numerror_=1
+                        break
+                    fi
+                    
+                    $ECHO ${_sel_} >> ${TEM_DIR}/feature_selection
+                done
+            else
+                $ECHO ${_num_} | $EGREP '^[0-9]+$' >> /dev/null 2>&1
+                if [ $? -ne 0 ]; then
+                    _numerror_=1
+                    break
+                fi
+                        
+                if [ ${_num_} -lt 1 -o ${_num_} -gt ${_cnt_} ]; then
+                    _numerror_=1
+                    break
+                fi
+                        
+                $ECHO ${_num_} >> ${TEM_DIR}/feature_selection
+            fi
+        done
+    
+        if [ ${_numerror_} -eq 0 ]; then
+            break
+        fi
+    done
+fi
+
+# Okay I should have a valid choice now in the ${TEM_DIR}/feature_selection
+# file, however it may need to be sorted and to remove duplicate numbers if
+# the user entered duplicate values. Output deails to output file. I will
+# output the desc as well as I might show the user
+if [ -s ${TEM_DIR}/feature_selection ]; then
+    for i in `$CAT ${TEM_DIR}/feature_selection | $SORT -u`; do
+        $ECHO "${VALID_FEATURE_ARRAY[${i}]}::${VALID_DESC_ARRAY[${i}]}::" >> ${TEM_DIR}/feature_output_list1
+
+        if [ "${_oss_list_array_[${i}]}" == "" ]; then
+            $ECHO "${VALID_DESC_ARRAY[${i}]}" >> ${TEM_DIR}/feature_output_list2
+            else
+            $ECHO "${VALID_DESC_ARRAY[${i}]} (${_oss_list_array_[${i}]})" >> ${TEM_DIR}/feature_output_list2
+        fi
+    done
+fi
+
+$RM -f ${ENIQ_CORE_ETC_DIR}/features_to_be_managed
+
+# We need to put the list in order now and remove the duplicates.
+if [ -s ${TEM_DIR}/feature_output_list1 ]; then
+    while read _feat_detail_; do
+        _feat_=`$ECHO ${_feat_detail_}| $AWK -F"::" '{print $1}'`
+        $CAT ${TEM_DIR}/feature_output_list1 | $SORT -u | $EGREP "^${_feat_}::" >> ${ENIQ_CORE_ETC_DIR}/features_to_be_managed 2>/dev/null
+    done < ${_eniq_feat_input_file_}
+fi
+
+#Product Number for LTE Events Statistics Feature
+LTEES_PRODUCT_NO=CXC4011049
+
+#Product Number for LTE Cell Trace Streaming Termination
+CTRS_PRODUCT_NO=CXC4011318
+
+#Upgrade LTEES prior to any other feature
+if [ "${CURR_SERVER_TYPE}" != "eniq_stats" -a "${CURR_SERVER_TYPE}" != "stats_coordinator" ] ; then
+       if [ "${UPGRADE_TYPE}" == "Rolling" ]; then
+     #If LTE Event Statistics is installed, then only doing the prioritization for CTRS & LTEES
+              $GREP $LTEES_PRODUCT_NO ${ENIQ_CORE_ETC_DIR}/features_to_be_managed  >/dev/null 2>&1
+              if [ $? -eq 0 ]; then
+                   $GREP $LTEES_PRODUCT_NO ${ENIQ_CORE_ETC_DIR}/features_to_be_managed >> ${TEM_DIR}/features_to_be_managed1
+                   $GREP $CTRS_PRODUCT_NO ${ENIQ_CORE_ETC_DIR}/features_to_be_managed  >/dev/null 2>&1
+                   if [ $? -eq 0 ]; then
+                      $GREP $CTRS_PRODUCT_NO ${ENIQ_CORE_ETC_DIR}/features_to_be_managed >> ${TEM_DIR}/features_to_be_managed1
+                   fi
+                   $GREP -v $LTEES_PRODUCT_NO ${ENIQ_CORE_ETC_DIR}/features_to_be_managed | $GREP -v $CTRS_PRODUCT_NO>> ${TEM_DIR}/features_to_be_managed1 
+                   if [ -s ${TEM_DIR}/features_to_be_managed1 ] ; then
+                        $CP ${TEM_DIR}/features_to_be_managed1 ${ENIQ_CORE_ETC_DIR}/features_to_be_managed
+                        if [ $? -eq 0 ]; then
+                             log_msg -l ${LOGFILE} -q -s "LTE Events Statistics will be first feature to be upgraded"
+                             $RM -f ${TEM_DIR}/features_to_be_managed1
+                        fi
+                   fi
+              else
+                   log_msg -l ${LOGFILE} -q -s "Skipping prioritization of LTE Events Statistics"
+              fi
+       fi
+fi 
+
+}
+
+### Function: get_eniq_add_features_list ###
+#
+# Get the list of ENIQ features to be installed
+#
+# Arguments:
+#       $1 - ENIQ HNAME for OSS server
+# Return Values:
+#       none
+get_eniq_add_features_list()
+{
+local _eniq_hname_=${1}
+
+# Get directory where the ENIQ Features are stored on DVD/Jumpstart - eniq_techpacks
+_eniq_feat_input_dir_=`iniget FEATURE_INFO -f ${CLI_CONF_DIR}/${ENIQ_INI} -v Feature_Input_Dir`
+if [ ! "${_eniq_feat_input_dir_}" ]; then
+    _err_msg_="Could not read parameter Feature_Input_Dir from file\n${CLI_CONF_DIR}/${ENIQ_INI}"
+    abort_script "$_err_msg_"
+fi
+
+# Get file where the ENIQ Features are listed on DVD/Jumpstart - install_features
+_tem_feat_input_file_=`iniget FEATURE_INFO -f ${CLI_CONF_DIR}/${ENIQ_INI} -v Feature_Input_File`
+if [ ! "${_tem_feat_input_file_}" ]; then
+    _err_msg_="Could not read parameter Feature_Input_File from file\n${CLI_CONF_DIR}/${ENIQ_INI}"
+    abort_script "$_err_msg_"
+fi
+
+# Does the feature input file exist?
+
+    _eniq_feat_input_file_="$FEATURE_SW_DIR/${_eniq_feat_input_dir_}/${_tem_feat_input_file_}"
+
+if [ ! -s ${_eniq_feat_input_file_} ]; then
+    _err_msg_="Could not locate ENIQ Features input file\n${_eniq_feat_input_file_}"
+    abort_script "$_err_msg_"
+fi
+
+# Get Directory where the list of managed features will be stored
+_feature_list_dir_=`iniget FEATURE_INFO -f ${ENIQ_CONF_DIR}/${ENIQ_INI} -v Feature_Interface_Dir`
+if [ ! "${_feature_list_dir_}" ]; then
+    _err_msg_="Failed to read Parameter Feature_Interface_Dir from ${ENIQ_CONF_DIR}/${ENIQ_INI}"
+    abort_script "$_err_msg_"
+fi
+
+# Total Interface File
+_eniq_total_feature_output_file_=${_feature_list_dir_}/total_feature_install_list
+if [ ! -s ${_eniq_total_feature_output_file_} ]; then
+    $ECHO "${_eniq_total_feature_output_file_} not found or empty"
+    $ECHO "We will handle via ${ENIQ_FEATURE_FILE} file."
+fi
+
+# Does the sentinel environment file exist?
+if [ ! -s ${ENIQ_SENTINEL_ENV} ]; then
+    _err_msg_="${ENIQ_SENTINEL_ENV} not found or empty"
+    abort_script "$_err_msg_"
+fi
+. ${ENIQ_SENTINEL_ENV}
+
+# Does the sentinel lsmon binary exist?
+if [ ! -x ${ENIQ_SENTINEL_BIN_DIR}/lsmon ]; then
+    _err_msg_="${ENIQ_SENTINEL_BIN_DIR}/lsmon not found or not executable"
+    abort_script "$_err_msg_"
+fi
+
+# Get a list of licensed features
+get_licenced_features ${LOGFILE} ${TEM_DIR} ${ENIQ_SENTINEL_BIN_DIR}/lsmon ${LSHOST}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not generate a list of licenses on ${LSHOST}"
+    abort_script "$_err_msg_"
+fi
+    
+_working_list_=${TEM_DIR}/feature_work_list
+
+# Build a list of features
+# Was I supplied Feature in a file for a specific OSS to be upgraded
+if [ "${ENIQ_FEATURE_FILE}" ]; then
+    if [ ! -s ${ENIQ_FEATURE_FILE} ]; then
+        _err_msg_="Interface list file ${ENIQ_FEATURE_FILE} missing or empty"
+        abort_script "$_err_msg_"
+    fi
+    $CP ${ENIQ_FEATURE_FILE} ${_working_list_} 
+    if [ $? -ne 0 ]; then
+        _err_msg_="Could not copy ${ENIQ_FEATURE_FILE} to ${_working_list_}"
+        abort_script "$_err_msg_"
+    fi
+# Was I supplied Techpacks to be updated
+elif [ "${ENIQ_FEATURE}" ]; then
+    if [ "${ENIQ_FEATURE}" == "ALL" ]; then
+        $CP ${_eniq_total_feature_output_file_} ${_working_list_} 
+    else
+        _tem_list_=`$ECHO ${ENIQ_FEATURE}|$SED -e 's|,| |g'`
+        for _feat_ in ${_tem_list_}; do
+            _chk_feat_inst_=`$CAT ${_eniq_total_feature_output_file_}|$GREP -w ${_feat_}`
+            if [ $? -ne 0 ]; then
+                _err_msg_="Feature ${_feat_} cannot be updated as it has not been installed"
+                abort_script "$_err_msg_"
+            fi
+            $ECHO ${_chk_feat_inst_} >>  ${_working_list_}
+        done
+    fi
+else
+    $CP ${_eniq_feat_input_file_} ${_working_list_}
+    if [ $? -ne 0 ]; then
+        _err_msg_="Could not copy ${_eniq_feat_input_file_} to ${_working_list_}"
+        abort_script "$_err_msg_"
+    fi
+    _build_list_=1
+fi
+
+unset FEATURE_ARRAY START_DATE_ARRAY END_DATE_ARRAY
+# Build 3 arrays of all the ENIQ Features. One array for the description
+# and the 2nd array for the file designation
+_cnt_=${#_tem_feature_array_[@]}
+_ptr_=0
+for (( i=0; i<=${_cnt_}; i++)); do
+    _desc_=`$CAT ${_working_list_}|$EGREP "^[ ]*${_tem_feature_array_[${i}]}::"|$AWK -F"::" '{print $2}'`
+    if [ "${_desc_}" ]; then
+        let _ptr_=${_ptr_}+1
+        FEATURE_ARRAY[${_ptr_}]=${_tem_feature_array_[${i}]}
+        START_DATE_ARRAY[${_ptr_}]=${_tem_start_date_array_[${i}]}
+        END_DATE_ARRAY[${_ptr_}]=${_tem_end_date_array_[${i}]}
+        DESC_ARRAY[${_ptr_}]=${_desc_}
+    
+        # Assume feature has not already being installed/activated
+        _act_chk_array_[${_ptr_}]="0"
+    
+        # Has the Interface been activated already for the OSS
+        if [ -s ${_eniq_total_feature_output_file_} ]; then
+            if [ "${_eniq_hname_}" ]; then
+                $CAT ${_eniq_total_feature_output_file_} | $EGREP "^[     ]*${FEATURE_ARRAY[${_ptr_}]}::.*::${_eniq_hname_}[     ]*$" >> /dev/null 2>&1
+                if [ $? -eq 0 ]; then
+                    _act_chk_array_[${_ptr_}]="1"
+                fi
+            else
+                $CAT ${_eniq_total_feature_output_file_} | $EGREP "^[     ]*${FEATURE_ARRAY[${_ptr_}]}::.*" >> /dev/null 2>&1
+                if [ $? -eq 0 ]; then
+                    _act_chk_array_[${_ptr_}]="1"
+                fi
+            fi
+        fi
+        if [ ! "${FEATURE_ARRAY[${_ptr_}]}" -o ! "${START_DATE_ARRAY[${_ptr_}]}" -o ! "${END_DATE_ARRAY[${_ptr_}]}" -o ! "${DESC_ARRAY[${_ptr_}]}" ]; then
+            _err_msg_="Malformed license value"
+            abort_script "$_err_msg_"
+        fi
+    fi
+done
+
+if [ ${#START_DATE_ARRAY[@]} -eq 0 ]; then
+    _err_msg_="No valid ENIQ licenses read from License Server ${LSHOST}"
+    abort_script "$_err_msg_"
+fi
+
+# Get todays date
+_now_date_=`$DATE '+%Y%m%d'`
+
+# Create the Display file
+_disp_file_1=${TEM_DIR}/disp_file_1
+_disp_file_=${TEM_DIR}/disp_file
+_unlic_file_=${TEM_DIR}/unlicensed_file
+$RM -f ${_disp_file_1} ${_unlic_file_} ${_disp_file_}
+
+$ECHO "\nENIQ Feature List" >> ${_disp_file_1}
+$ECHO "=================" >> ${_disp_file_1}
+
+_cnt_=${#FEATURE_ARRAY[@]}
+_menu_opt_=0
+for (( i=1; i<=${_cnt_}; i++)); do
+    unset _act_
+
+    if [ ${_act_chk_array_[${i}]} -eq 1 ]; then
+        _act_="(*)"
+    fi
+
+    if [ ${START_DATE_ARRAY[${i}]} -gt ${_now_date_} -o ${END_DATE_ARRAY[${i}]} -lt ${_now_date_} ]; then
+        $ECHO "[N/A]  ${DESC_ARRAY[${i}]}  (E)" >> ${_unlic_file_}
+    else
+        let _menu_opt_=_menu_opt_+1
+        VALID_FEATURE_ARRAY[${_menu_opt_}]=${FEATURE_ARRAY[${i}]}
+        VALID_DESC_ARRAY[${_menu_opt_}]=${DESC_ARRAY[${i}]}
+        $ECHO "[${_menu_opt_}]  ${DESC_ARRAY[${i}]}  ${_act_}" >> ${_disp_file_1}
+    fi
+done
+
+# Any unlicensed stuff to display
+if [ -s ${_unlic_file_} ]; then
+    $ECHO "" >> ${_disp_file_1}
+    $CAT ${_unlic_file_} >> ${_disp_file_1}
+fi
+
+$CAT ${_disp_file_1} | $GREP -v "\*" >> ${_disp_file_}
+
+#Check if all the features are already installed.
+_count_=`$CAT ${_disp_file_} | wc -l`
+if [ ${_count_} == 3 ]; then
+    $ECHO "\nAll the features are already installed for ${_eniq_hname_}\n"
+    return
+else 
+    $ECHO "\nSelect range of ENIQ features to be installed using the format [n,n,n-n,n...n]" >> ${_disp_file_}
+    $ECHO "\tE.G. 1,2,3-8,9,10" >> ${_disp_file_}
+    
+    _cnt_=${#VALID_FEATURE_ARRAY[@]}
+    while :; do
+        $CLEAR
+        $CAT ${_disp_file_}
+    
+        $ECHO "\nSelect 'None' if you do not wish to add any features\n"
+    
+        $ECHO "Select the ENIQ features numbers you wish to"
+        if [ "${_eniq_hname_}" ]; then
+            $ECHO "install & activate for ${_eniq_hname_}\n"
+        else
+            $ECHO "install & activate"
+        fi
+        read _opt_
+
+        # If the User hit nothing and there is a default. that will do
+        if [ ! "${_opt_}" ]; then
+            continue
+        fi
+    
+        $RM -f ${TEM_DIR}/feature_output_list_add_feature ${TEM_DIR}/feature_selection
+
+        if [ "${_opt_}" == "None" -o  "${_opt_}" == "none" ]; then
+            break
+        fi
+    
+            _numerror_=0
+
+        for _num_ in `$ECHO ${_opt_} | $SED -e 's| ||g' -e 's|,| |g'`; do
+            $ECHO ${_num_} | $EGREP '-' >> /dev/null 2>&1
+            if [ $? -eq 0 ]; then
+                _start_=`$ECHO ${_num_} | $AWK -F\- '{print $1}'`
+                if [ ! "${_start_}" ]; then
+                    continue
+                fi
+                _end_=`$ECHO ${_num_} | $AWK -F\- '{print $2}'`
+                for (( _sel_=${_start_}; _sel_<=${_end_}; _sel_++ )); do
+                    $ECHO ${_sel_} | $EGREP '^[0-9]+$' >> /dev/null 2>&1
+                    if [ $? -ne 0 ]; then
+                        _numerror_=1
+                        break
+                    fi
+                    if [ ${_sel_} -lt 1 -o ${_sel_} -gt ${_cnt_} ]; then
+                        _numerror_=1
+                        break
+                    fi
+                    $ECHO ${_sel_} >> ${TEM_DIR}/feature_selection
+                done
+            else
+                $ECHO ${_num_} | $EGREP '^[0-9]+$' >> /dev/null 2>&1
+                if [ $? -ne 0 ]; then
+                    _numerror_=1
+                    break
+                fi
+                if [ ${_num_} -lt 1 -o ${_num_} -gt ${_cnt_} ]; then
+                    _numerror_=1
+                    break
+                fi
+                $ECHO ${_num_} >> ${TEM_DIR}/feature_selection
+            fi
+        done
+
+        # Okay I should have a valid choice now in the ${TEM_DIR}/feature_selection
+        # file, however it may need to be sorted and to remove duplicate numbers if
+        # the user entered duplicate values. Output deails to output file. I will
+        # output the desc as well as I might show the user
+        for i in `$CAT ${TEM_DIR}/feature_selection | $SORT -u`; do
+            if [ "${_eniq_hname_}" ]; then
+                $ECHO "${VALID_FEATURE_ARRAY[${i}]}::${VALID_DESC_ARRAY[${i}]}::${_eniq_hname_}" >> ${TEM_DIR}/feature_output_list_add_feature
+            else
+                $ECHO "${VALID_FEATURE_ARRAY[${i}]}::${VALID_DESC_ARRAY[${i}]}" >> ${TEM_DIR}/feature_output_list_add_feature
+            fi
+        done
+
+        if [ ${_numerror_} -eq 0 ]; then
+            break
+        fi
+       done
+
+    $RM -rf ${ENIQ_CORE_ETC_DIR}/feature_output_list_${_eniq_hname_}
+
+    if [ -s ${TEM_DIR}/feature_output_list_add_feature ]; then
+        # We need to put the list in order now and remove the duplicates.
+        while read _feat_detail_; do
+            _feat_=`$ECHO ${_feat_detail_}| $AWK -F"::" '{print $1}'`
+            $CAT ${TEM_DIR}/feature_output_list_add_feature | $SORT -u | $EGREP "^${_feat_}::" >> ${ENIQ_CORE_ETC_DIR}/feature_output_list_${_eniq_hname_} 2>/dev/null
+        done < ${_eniq_feat_input_file_}
+    fi
+fi
+}
+
+### Function: get_fs_size_tag ###
+#
+# To get Filesystem size tag
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+get_fs_size_tag()
+{
+# Getting the current server type
+CURR_SERVER_TYPE=`$CAT ${ENIQ_CONF_DIR}/installed_server_type | $EGREP -v  '^[[:blank:]]*#' | $SED -e 's/ //g'`
+if [ ! "${CURR_SERVER_TYPE}" ]; then
+    _err_msg_="Could not determine which server type this is"
+    abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+fi
+
+if [ "${CURR_SERVER_TYPE}" == "stats_iqr" ]; then
+    _dwh_reader_type_=`$CAT ${ENIQ_CONF_DIR}/install_reader_type`
+    if [ ! "${_dwh_reader_type_}"  ]; then
+        _err_msg_="Could not get dwh_reader_type for current reader server"
+        abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+    fi
+fi
+
+# Getting the tag for FS size based on server type
+if [ "${CURR_SERVER_TYPE}" == "eniq_stats" -o "${CURR_SERVER_TYPE}" == "stats_coordinator" -o "${CURR_SERVER_TYPE}" == "stats_engine" ]; then
+    _fs_size_tag_=${CURR_SERVER_TYPE}_fs_size    
+else 
+    if [ "${CURR_SERVER_TYPE}" == "stats_iqr" ]; then
+        _fs_size_tag_=${_dwh_reader_type_}_fs_size
+    fi
+fi
+
+if [ ! "${_fs_size_tag_}"  ]; then
+    _err_msg_="Could not get _fs_size_tag_ for current server"
+    abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+fi
+}
+
+### Function: correct_disk_partition ###
+#
+#   Function to correct the entries present in disks_partitioned file
+#   If not print error msg and exit.
+#
+# Return Values:
+#       none
+correct_disk_partition(){
+# Define variables
+local TMP=/tmp
+$RM -rf $TMP/disk_value_tmp
+$RM -rf $TMP/disk_part_file
+$TOUCH $TMP/disk_value_tmp
+$TOUCH $TMP/disk_part_file
+
+local DISK_Partition=/eniq/installation/config/disks_partitioned
+if [ ! "${DISK_Partition}" ]; then
+    return 1
+else 
+    $CP -rp ${DISK_Partition} ${DISK_Partition}_bkp
+fi
+
+local ENIQ_INST_CONF=/eniq/installation/config/
+CURR_SERVER_TYPE=`$CAT ${ENIQ_INST_CONF}/installed_server_type | $EGREP -v  '^[[:blank:]]*#' | $SED -e 's/ //g'`
+if [ ! "${CURR_SERVER_TYPE}" ]; then
+    return 1
+fi
+
+SERVER_STR=`$CAT ${ENIQ_INST_CONF}/san_details | $GREP -w "STORAGE_TYPE" | $AWK -F "=" '{print $2}'`
+if [ ! "${SERVER_STR}" ]; then
+    return 1
+fi
+
+#unset parameters
+unset maindb_disk
+unset tempdb_disk
+unset sysmaindb_disk
+unset pool_disk
+
+if [ "${SERVER_STR}" == "raw" ]; then
+    if [ ! "${CURR_SERVER_TYPE}" == "stats_engine" ]; then
+        maindb_disk=`iniget DB_DISK_ALLOC -f ${ENIQ_INST_CONF}/sym_links.ini -v MAINDB_DISKS`
+        tempdb_disk=`iniget DB_DISK_ALLOC -f ${ENIQ_INST_CONF}/sym_links.ini -v TEMPDB_DISKS`
+        sysmaindb_disk=`iniget DB_DISK_ALLOC -f ${ENIQ_INST_CONF}/sym_links.ini -v IQ_SYS_MAIN_DISKS`
+        pool_disk=`iniget SunOS_FS_POOL_1 -f ${ENIQ_INST_CONF}/SunOS.ini -v disk_layout`
+        if [ ! "${maindb_disk}" -o ! "${tempdb_disk}" -o ! "${sysmaindb_disk}" -o ! "${pool_disk}" ]; then
+            $ECHO "Could not determine MAINDB_DISKS or TEMPDB_DISKS or IQ_SYS_MAIN_DISKS or disk_layout"
+            return 1
+        fi
+        disk_part_file="${maindb_disk} ${tempdb_disk} ${sysmaindb_disk} ${pool_disk}"
+        $ECHO ${disk_part_file} | $SED 's/ /\n/g' >> $TMP/disk_part_file
+        for lun_add in `$CAT $TMP/disk_part_file`; do
+            $ECHO ${lun_add} >> $TMP/disk_value_tmp
+        done
+    else
+        pool_disk=`iniget SunOS_FS_POOL_1 -f ${ENIQ_INST_CONF}/SunOS.ini -v disk_layout`
+        if [ ! "${pool_disk}" ]; then
+            $ECHO "Could not determine disk_layout"
+            return 1
+        fi
+        $ECHO ${pool_disk} >> $TMP/disk_value_tmp
+    fi
+    $CP -rp $TMP/disk_value_tmp ${DISK_Partition}
+    if [ $? -ne 0 ]; then
+        $ECHO "Could not copy the disks_partitioned file"
+        return 1
+    fi
+    $RM -rf $TMP/disk_value_tmp
+    $RM -rf ${DISK_Partition}_bkp
+    $RM -rf $TMP/disk_part_file
+fi
+}
+
+
+### Function: check_ping ###
+#
+#   Function to check if all the luns are present and has RW mode and are online
+#   If not print error msg and exit.
+#    Arguments:
+#        None
+# Return Values:
+#       ping command value
+#
+check_ping()
+{
+#get ip type from ipmp.ini
+local ENIQ_CONF_DIR IPMP_INI
+ENIQ_CONF_DIR=/eniq/installation/config
+IPMP_INI=ipmp.ini
+check_ip_type
+if [ ! "${_ip_type_}" ]; then
+   _err_msg_="Could not read ip type"
+   abort_script "$_err_msg_"
+fi
+if [ $_ip_type_ == "IPv4" ]; then
+    ping_command="/usr/bin/ping"
+fi
+if [ $_ip_type_ == "IPv6" ]; then
+    ping_command="/usr/bin/ping6"
+fi
+echo $ping_command
+}
+
+
+
+### Function: check_ip_type ###
+#
+#   Function to check if all the luns are present and has RW mode and are online
+#   If not print error msg and exit.
+#    Arguments:
+#        None
+# Return Values:
+#       ip type value
+#
+check_ip_type()
+{
+#get ip type from ipmp.ini
+local ENIQ_CONF_DIR IPMP_INI
+ENIQ_CONF_DIR=/eniq/installation/config
+IPMP_INI=ipmp.ini
+# Check hardware
+if [ -f ${ENIQ_CONF_DIR}/san_details ];then
+    STORAGE_TYPE=`$CAT ${ENIQ_CONF_DIR}/san_details | $GREP STORAGE_TYPE | $CUT -f 2 -d =`
+else
+    _err_msg_="Could not find the file to get hardware type."
+    abort_script "${_err_msg_}"
+fi
+if [ -f ${ENIQ_CONF_DIR}/ip_type ]; then
+    type=`cat ${ENIQ_CONF_DIR}/ip_type`
+    if [ ${type} == "IPv6" ]; then
+        _ip_type_=IPv6
+    elif [ ${type} == "IPv4" ]; then
+       _ip_type_=IPv4
+    else
+       _err_msg_="Could not find ip type from file ${ENIQ_CONF_DIR}/ip_type"
+       abort_script "$_err_msg_"
+    fi
+elif [ -f ${ENIQ_CONF_DIR}/${IPMP_INI} ]; then
+  IPv6_Enable=`iniget IPMP_INTF_1 -f ${ENIQ_CONF_DIR}/${IPMP_INI} -v IPv6_Enable`
+  if [ ${IPv6_Enable} == "Y" ]; then
+     _ip_type_=IPv6
+  elif [ ${IPv6_Enable} == "N" ]; then
+     _ip_type_=IPv4
+  else
+   _err_msg_="Could not find ip type from file ${ENIQ_CONF_DIR}/ipmp.ini"
+       abort_script "$_err_msg_"
+  fi
+elif [ ${STORAGE_TYPE} == "fs" ]; then
+   _ip_type_=IPv4
+fi
+if [ ! "${_ip_type_}" ]; then
+    _err_msg_="Could not read parameter IPv6_Enable from file ${ENIQ_CONF_DIR}/ip_type"
+    abort_script "$_err_msg_"
+fi
+export _ip_type_
+}
+

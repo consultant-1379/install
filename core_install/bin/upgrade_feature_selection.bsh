@@ -1,0 +1,420 @@
+#!/usr/bin/bash
+#********************************************************************
+# Ericsson Radio Systems AB SCRIPT
+#********************************************************************
+#
+# (c) Ericsson Radio Systems AB 2021 - All rights reserved.
+#
+# The copyright to the computer program(s) herein is the property
+# of Ericsson Radio Systems AB, Sweden. The programs may be used
+# and/or copied only with the written permission from Ericsson Radio
+# Systems AB or in accordance with the terms and conditions stipulated
+# in the agreement/contract under which the program(s) have been
+# in the agreement/contract under which the program(s) have been
+# supplied.
+#
+#********************************************************************
+# Name     : upgrade_feature_selection.bsh
+# Date     : 23/09/2022
+# Revision : \main\2
+# Purpose  : A script to fetch list of features to be upgraded
+#            from the user.
+#
+# Usage    : upgrade_feature_selection.bsh
+#
+#********************************************************************
+#
+#
+# Script to add features
+#
+#
+#********************************************************************
+
+SCRIPTHOME="/eniq/admin/"
+
+CLEAR='/usr/bin/clear'
+ECHO='/usr/bin/echo -e'
+CAT='/usr/bin/cat'
+AWK='/usr/bin/awk'
+TEE='/usr/bin/tee'
+LOGFILE='/var/tmp/logs.log'
+OSS_REF_NAME_FILE='/eniq/sw/conf/.oss_ref_name_file'
+EGREP='/usr/bin/egrep'
+SED='/usr/bin/sed'
+
+#Feature SW Directory
+if [ -s $SCRIPTHOME/lib/common_functions.lib ]; then
+    . $SCRIPTHOME/lib/common_functions.lib
+else
+    $ECHO "$SCRIPTHOME/lib/common_functions.lib not found or empty"
+fi
+
+FEATURE_SW_DIR=`iniget inputs -f '/eniq/installation/config/upgrade_params.ini' -v eniq_feature_sw`
+
+# Default user
+DEFAULT_USER="root"
+
+# Name of SunOS File
+SUNOS_INI="SunOS.ini"
+ENIQ_INI="niq.ini"
+
+# Name of Storage INI File
+STORAGE_INI="storage.ini"
+
+# Cmd to exec a shell and drop user to it in case of an error
+EXEC_SHELL_CMD="exec /bin/bash -o emacs"
+
+# NAS SMF
+NAS_MILESTONE_SMF_ID="NAS-online.service"
+NASd_SMF_ID="NASd.service"
+
+# Service SMFs
+#DDC_SMF_ID="ddc.service"
+
+# Directory on the root file system
+ENIQ_BASE_DIR="/eniq"
+
+# Main Directory for the Core Installation SW
+ENIQ_INST_DIR=${ENIQ_BASE_DIR}/installation
+
+# Directory for the Core Installation SW
+ENIQ_CORE_INST_DIR=${ENIQ_INST_DIR}/core_install
+
+# Templates Directory
+ENIQ_TEMPL_DIR="${ENIQ_CORE_INST_DIR}/templates/stats"
+
+# TEMP DIR FILE
+TEM_DIR='/var/tmp'
+
+# ENIQ Config Directory
+ENIQ_CONF_DIR=${ENIQ_INST_DIR}/config
+
+# Set temporary upgrade directory
+VAR_TMP_DIR=/var/tmp
+UPG_VAR_TMP_DIR=${VAR_TMP_DIR}/upgrade
+
+#CURR_SERVER_TYPE=`$CAT $ENIQ_CONF_DIR/installed_server_type | $EGREP -v '^[[:blank:]]*#' | $SED -e 's/ //g'`
+CURR_SERVER_TYPE=`cat /eniq/installation/config/installed_server_type | egrep -v '^[[:blank:]]*#' | sed -e 's/ //g'`
+
+# Directory for the Core Installation SW
+ENIQ_CORE_INST_DIR=${ENIQ_INST_DIR}/core_install
+
+# Directory for the Core Installation SW version
+ENIQ_CORE_VER_DIR=${ENIQ_CORE_INST_DIR}/version
+
+# Admin directory in the ENIQ file system
+ENIQ_ADMIN_DIR=${ENIQ_BASE_DIR}/admin
+
+# Admin bin dir
+ENIQ_ADMIN_BIN_DIR=${ENIQ_ADMIN_DIR}/bin
+
+# Core bin dir
+ENIQ_CORE_BIN_DIR=${ENIQ_CORE_INST_DIR}/bin
+ENIQ_CORE_ETC_DIR=${ENIQ_CORE_INST_DIR}/etc
+GET_IP_ORDER=${ENIQ_CORE_INST_DIR}/lib/get_ip_order.pl
+
+# ENIQ Bkup Sw dir
+ENIQ_BKUP_SW_DIR=${ENIQ_BASE_DIR}/bkup_sw
+ENIQ_BKUP_SW_BIN_DIR=${ENIQ_BKUP_SW_DIR}/bin
+
+#Templates admin bin dir
+TEMPLATES_ADMIN_BIN_DIR=${ENIQ_CORE_INST_DIR}/templates/stats/admin/bin
+
+# Sentinel dir
+ENIQ_SENTINEL_DIR=${ENIQ_BASE_DIR}/sentinel
+ENIQ_SENTINEL_BIN_DIR=${ENIQ_SENTINEL_DIR}/bin
+ENIQ_SENTINEL_ENV=${ENIQ_SENTINEL_DIR}/etc/sentinel.env
+# ENIQ Log Directory
+ENIQ_LOG_DIR=${ENIQ_BASE_DIR}/local_logs
+LOG_DIR=${ENIQ_BASE_DIR}/log
+SW_LOG_DIR=${LOG_DIR}/sw_log
+
+# Set the log directory for Resize NAS File Systems
+#RESIZE_NAS_LOGFILE_DIR=${LOG_DIR}/resize_nas
+
+# Set the log directory for Create Snapshots stage
+#SNAPSHOT_LOGFILE_DIR=${SW_LOG_DIR}/rolling_snapshot_logs
+#SNAPSHOT_LOGFILE=${SNAPSHOT_LOGFILE_DIR}/prep_eniq_snapshots.log
+
+# Set the log directory for Delete Snapshots stage
+#DEL_SNAP_LOGFILE_DIR=${ENIQ_LOG_DIR}/rolling_snapshot_logs
+#DEL_SNAP_LOGFILE=${DEL_SNAP_LOGFILE_DIR}/clean_roll_snap.log
+
+# Set the log directory for Core SW Upgrade
+CORE_SW_LOGFILE_DIR=${LOG_DIR}/manage_upgrade_log
+
+# Set the log directory for Sybase IQ
+#SAP_IQ_LOGFILE_DIR=${LOG_DIR}/sybase_iq
+#SAP_IQ_LOGFILE=${SAP_IQ_LOGFILE_DIR}/upgrade_sybaseiq.log
+
+# Set the log directory for Sybase ASA
+#SAP_ASA_LOGFILE_DIR=${LOG_DIR}/sybase_asa
+#SAP_ASA_LOGFILE=${SAP_ASA_LOGFILE_DIR}/upgrade_sybase_asa.log
+
+# Set the log directory for Platform Upgrade
+PLATFORM_UPG_LOGFILE_DIR=${SW_LOG_DIR}/platform_installer/platform_management_log
+PLATFORM_UPG_LOGFILE=${PLATFORM_UPG_LOGFILE_DIR}/upgrade_platform_modules.log
+
+# Set the log directory for Feature Upgrade
+FEATURE_UPG_LOGFILE_DIR=${ENIQ_BASE_DIR}/log/feature_management_log
+FEATURE_UPG_LOGFILE=${FEATURE_UPG_LOGFILE_DIR}/manage_features.log
+
+# Set the log directory for Add new Feature
+ADD_NEW_FEATURE_LOGFILE_DIR=${ENIQ_BASE_DIR}/log/manage_eniq_oss_log
+ADD_NEW_FEATURE_LOGFILE=${ADD_NEW_FEATURE_LOGFILE_DIR}/manage_eniq_oss.log
+
+# Set Temp Core SW Upgrade Directory
+TEMP_CORE_SW_UPG_DIR=${UPG_VAR_TMP_DIR}/${UPG_SW_DIR}/core_install
+
+# Set Core SW Upgrade Bin Directory
+CORE_SW_UPG_DIR=${TEMP_CORE_SW_UPG_DIR}/bin/
+
+# ENIQ SW conf
+CLI_CONF_DIR=${ENIQ_BASE_DIR}/sw/conf
+
+# ENIQ SW install
+SW_INSTALLER_DIR=${ENIQ_BASE_DIR}/sw/installer
+
+
+### Function: abort_script ###
+#
+# This Function will abort the script if any issues or errors.
+#
+# Arguments:
+#       $1 - Error message from part of program (Not always used)
+#        $2 - Exec Shell cmd (Not always used)
+# Return Values:
+#       none
+abort_script()
+{
+ABORT_TIME=`$DATE '+%Y-%b-%d_%H.%M.%S'`
+if [ "$1" ]; then
+    _err_msg_=$1
+else
+    _err_msg_="$ABORT_TIME - ERROR : Script aborted.......\n"
+fi
+
+if [ "${LOGFILE}" ]; then
+    $ECHO "\n${ABORT_TIME} - ERROR : $_err_msg_\n" | $TEE -a ${LOGFILE}
+else
+    $ECHO "\n${ABORT_TIME} - ERROR : $_err_msg_\n"
+fi
+
+if [ "$2" ]; then
+    ${2}
+    exit 1
+else
+    exit 1
+fi
+}
+
+
+
+setup_update_disp_file_add_features()
+{
+# Set up a file to display out
+$RM -f ${TEM_DIR}/disp_file
+
+_update_=0
+if [ "${NEW_SRV_IP}" != "${OLD_SRV_IP}" ]; then
+    $ECHO "Alias IP Address : \t$NEW_SRV_IP" >> ${TEM_DIR}/disp_file
+    _update_=1
+fi
+
+$ECHO "Alias :\t\t\t${OSS_NAME}\n" >> ${TEM_DIR}/disp_file
+if [ -s ${ENIQ_CORE_ETC_DIR}/feature_output_list_${OSS_NAME} ]; then
+    $ECHO "ENIQ Features" >> ${TEM_DIR}/disp_file
+    $ECHO "--------------" >> ${TEM_DIR}/disp_file
+    $CAT ${TEM_DIR}/feature_output_list_add_feature |$AWK -F"::" '{print $2}' >> ${TEM_DIR}/disp_file
+    $ECHO "\n\nDo you wish to continue to update the system" >> ${TEM_DIR}/disp_file
+    $ECHO "with the features above (Yy/Nn)\n" >> ${TEM_DIR}/disp_file
+    _update_=1
+else
+    $ECHO "\n\nDo you wish to continue to update the OSS Server details (Yy/Nn)\n" >> ${TEM_DIR}/disp_file
+fi
+
+# If there is nothing to upgrade then delete the disp file
+if [ ${_update_} -eq 0 ]; then
+    $RM -f ${TEM_DIR}/disp_file
+fi
+}
+
+
+
+confirm_user_input()
+{
+while :; do
+
+    $CAT ${1}
+    read USER_CONF
+
+    # If the User hit nothing
+    if [ ! "${USER_CONF}" ]; then
+        continue
+    fi
+
+    # Did the user input (Y/y)
+    if [ "${USER_CONF}" == "Y" -o "${USER_CONF}" == "y" -o "${USER_CONF}" == "N" -o "${USER_CONF}" == "n" ]; then
+        break
+    fi
+done
+}
+
+
+
+setup_update_disp_file()
+{
+# Set up a file to display out
+$RM -f ${TEM_DIR}/disp_file
+
+_update_=0
+
+if [ -s ${ENIQ_CORE_ETC_DIR}/features_to_be_managed ]; then
+        #echo "${TEM_DIR}/disp_file"
+    $ECHO "\nENIQ Features" >> ${TEM_DIR}/disp_file
+    $ECHO "=============" >> ${TEM_DIR}/disp_file
+    $CAT ${TEM_DIR}/feature_output_list2 >> ${TEM_DIR}/disp_file
+
+    $ECHO "\nDo you wish to continue to update the features above (Yy/Nn)\n" >> ${TEM_DIR}/disp_file
+    _update_=1
+fi
+
+# If there is nothing to upgrade then delete the disp file
+if [ ${_update_} -eq 0 ]; then
+    $RM -f ${TEM_DIR}/disp_file
+fi
+}
+
+
+
+list_features()
+{
+# Feature selection at start for E_Stats with full upgrade scenario.
+if [ "${CURR_SERVER_TYPE}" == "eniq_stats" -o "${CURR_SERVER_TYPE}" == "stats_coordinator" ] ; then
+    if [ "${ACTION_TYPE}" == "upgrade" -o "${ACTION_TYPE}" == "upgrade_feature_only" ]; then
+        while :; do
+
+            get_eniq_upgrade_feature_list
+
+            if [ $? == 99 -a "${INSTALL_TYPE}" == "stats" ]; then
+                log_msg -s "Cleaning up the temporary directory" -l ${LOGFILE}
+                _err_msg_="Could not locate ENIQ Features input file"
+                abort_script "$_err_msg_"
+            fi
+
+            #Setup user confirmation page
+            setup_update_disp_file
+
+            # If there is no file then there is nothing to update
+            if [ -s  ${TEM_DIR}/disp_file ]; then
+
+                # Confirm that the User still wants to add the features
+                confirm_user_input ${TEM_DIR}/disp_file
+
+
+                if [ "${USER_CONF}" == "N" -o "${USER_CONF}" == "n" ]; then
+                    $RM -rf ${ENIQ_CORE_ETC_DIR}/features_to_be_managed
+                    $RM -rf ${TEM_DIR}/feature_output_list2
+                    continue
+                fi
+            else
+                $ECHO "\nFeature upgrade not required....\n\n"
+            fi
+            break
+
+            log_msg -l ${LOGFILE} -q -s "The following features will be updated"
+            log_msg -l ${LOGFILE} -q -s "======================================"
+            $CAT ${TEM_DIR}/feature_output_list2 | $AWK -F"::" '{print $1}' >> ${LOGFILE}
+        done
+    fi
+fi
+}
+
+
+
+
+add_features_list() {
+
+ if [ "${CURR_SERVER_TYPE}" == "eniq_stats" -o "${CURR_SERVER_TYPE}" == "stats_coordinator" ] ; then
+        if [ "${ACTION_TYPE}" == "upgrade" -o "${ACTION_TYPE}" == "upgrade_feature_only" ]; then
+        
+            OSS_NAME=$1
+            
+            while :; do
+
+                get_eniq_add_features_list ${OSS_NAME}
+
+                #Setup user confirmation page
+                setup_update_disp_file_add_features
+
+                # If there is no file then there is nothing to update
+                if [ -s  ${TEM_DIR}/disp_file ]; then
+
+                    # Confirm that the User still wants to add the features
+                    confirm_user_input ${TEM_DIR}/disp_file
+
+                    if [ "${USER_CONF}" == "N" -o "${USER_CONF}" == "n" ]; then
+                        $RM -rf ${ENIQ_CORE_ETC_DIR}/feature_output_list_${OSS_NAME}
+                        continue
+                    fi
+                else
+                    $ECHO "\nNo update required for ${OSS_NAME}....\n\n"
+                fi
+                break
+            done
+        fi
+    fi
+
+}
+
+
+user_confirmation_add_features()
+{
+
+echo "==============================================================================="
+
+while :; do
+    unset USER_CONF
+    $ECHO "\nDo you wish to add new features to the server?"
+
+    $ECHO "Enter [Yes|No] (case sensitive) : \c"
+    read USER_CONF
+
+    # If the User hit nothing
+    if [ ! "${USER_CONF}" ]; then
+        continue
+    fi
+
+    if [ "${USER_CONF}" == "Yes" -o "${USER_CONF}" == "No" ]; then
+       break
+    fi
+done
+}
+
+
+##### Add new features
+
+. /eniq/admin/lib/common_functions.lib
+
+
+ACTION_TYPE=`iniget inputs -f '/eniq/installation/config/upgrade_params.ini' -v action_type_upgrade`
+
+ if [ "${ACTION_TYPE}" == "upgrade" -o "${ACTION_TYPE}" == "upgrade_feature_only" ]; then
+            echo "==============================================================================="
+            list_features
+            user_confirmation_add_features
+            if [ "${USER_CONF}" == "Yes" ]; then
+                $ECHO "\nOSS connected to this server are:" | $TEE -a ${LOGFILE}
+                $CAT ${OSS_REF_NAME_FILE} | $AWK -F" " '{print $1}' | $TEE -a ${LOGFILE}
+                $ECHO "\nDisplaying the list of features for each connected oss \n"
+                for _oss_name_ in `$CAT ${OSS_REF_NAME_FILE} | $AWK -F" " '{print $1}'`; do
+                    $ECHO "\nPlease enter your choice for ${_oss_name_}   \n"
+                    add_features_list ${_oss_name_}
+                done
+            fi
+
+    fi
+
+$ECHO "\n===============================================================================\n"
+
+

@@ -1,0 +1,534 @@
+#!/bin/bash
+# ********************************************************************
+# Ericsson Radio Systems AB                                     SCRIPT
+# ********************************************************************
+#
+#
+# (c) Ericsson Radio Systems AB 2019 - All rights reserved.
+#
+# The copyright to the computer program(s) herein is the property
+# of Ericsson Radio Systems AB, Sweden. The programs may be used 
+# and/or copied only with the written permission from Ericsson Radio 
+# Systems AB or in accordance with the terms and conditions stipulated 
+# in the agreement/contract under which the program(s) have been 
+# supplied.
+#
+# ********************************************************************
+# Name    : create_query_user_login_policy.bsh
+# Date    : 21/07/2022
+# Revision: main\10
+# Purpose : To create a new user login policy for user password expiry, lockout etc.
+# Usage   : create_query_user_login_policy.bsh [-t <temp directory>] [-n <user name>] [-m <max number of
+#           connections allowed>] [-p <life time of the password>] [-n <max failed attempts before a user is
+#           locked out>]  [-f] [ -l <path_to_logfile> ]
+#
+# ********************************************************************
+#
+#     Command Section
+#
+# ********************************************************************
+AWK=/usr/bin/awk
+BASENAME=/usr/bin/basename
+CAT=/usr/bin/cat
+CHMOD=/usr/bin/chmod
+DATE=/usr/bin/date
+DIRNAME=/usr/bin/dirname
+ECHO='/usr/bin/echo -e'
+EGREP=/usr/bin/egrep
+ID=/usr/bin/id
+MKDIR=/usr/bin/mkdir
+RM=/usr/bin/rm
+SED=/usr/bin/sed
+SU=/usr/bin/su
+
+# ********************************************************************
+#
+#       Configuration Section
+#
+# ********************************************************************
+# Name of SunOS & ENIQ ini Files
+ENIQ_ENV=niq.rc
+ENIQ_INI=niq.ini
+SUNOS_INI=SunOS.ini
+SYM_INI=sym_links.ini
+# ********************************************************************
+#
+#   functions
+#
+# ********************************************************************
+### Function: abort_script ###
+#
+#   This is called if the script is aborted through an error
+#   error signal sent by the kernel such as CTRL-C or if a serious
+#   error is encountered during runtime
+#
+# Arguments:
+#       $1 - Error message from part of program (Not always used)
+# Return Values:
+#       none
+abort_script()
+{
+if [ "$1" ]; then
+    _err_msg_=$1
+else
+    _err_msg_="$($DATE '+%Y-%m-%d_%H.%M.%S'): Script aborted.......\n"    
+fi
+
+if [ "${LOGFILE}" ]; then
+    $ECHO "\n$_err_msg_\n"|$TEE -a ${LOGFILE}
+else
+    $ECHO "\n$_err_msg_\n"
+fi
+$RM -rf ${dwh_connection_string_enc}
+#removing tmp folder created during execution of the script
+cleanup
+
+if [ "$2" ]; then
+    exit ${2}
+else
+    exit 1
+fi
+
+}
+
+### Function: checkDBAPasword ###
+#
+# confirm if user knows dba password
+#
+# Arguments: none
+#
+# Return Values: none
+checkDBAPasword()
+{
+
+unset dba_user_pwd
+
+log_msg -s "\nEnter the current password for DBA user : \c " -l ${LOGFILE}
+read -s dba_user_pwd
+
+if [ "${dba_user_pwd}" != "${DBA_PASSWORD}" ]; then
+    _err_msg_="$($DATE '+%Y-%b-%d_%H.%M.%S'): Aborting as the DBA password entered does not match the recorded DBA password."
+    abort_script "$_err_msg_"
+fi
+$ECHO ''
+}
+
+### Function: chk_create_logfile ###
+#
+# Check/Create Logfile
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+chk_create_logfile()
+{
+
+if [ ! "${LOGFILE}" ]; then
+    LOGFILE=${ENIQ_BASE_DIR}/log/sw_log/iq/create_query_user_login_policy_$($DATE '+%Y-%b-%d_%H.%M.%S').log
+fi
+
+$MKDIR -p `$DIRNAME ${LOGFILE}`
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not create directory `$DIRNAME ${LOGFILE}`"
+     abort_script "$_err_msg_"
+fi
+
+$TOUCH -a ${LOGFILE}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not write to file ${LOGFILE}"
+    abort_script "$_err_msg_"
+fi
+}
+
+### Function: cleanup ###
+#
+# 
+#
+# Arguments: none
+#
+# Return Values: none
+cleanup() 
+{
+$ECHO $RM -rf ${TEM_DIR} >/dev/null 2>&1
+}
+
+### Function: get_absolute_path ###
+#
+# Determine absolute path to software
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+get_absolute_path()
+{
+    _dir_=`$DIRNAME $0`
+    SCRIPTHOME=`cd $_dir_ 2>/dev/null && pwd || $ECHO $_dir_`
+}
+
+### Function: setup_env ###
+#
+# Setup path environment etc
+#
+# Arguments:
+#    none
+# Return Values:
+#    DWH_port,DWH_eng and DBA password
+
+setup_env()
+{
+ENIQ_BASE_DIR=/eniq
+ENIQ_SW_DIR=${ENIQ_BASE_DIR}/sw
+ENIQ_BKUPSW_DIR=${ENIQ_BASE_DIR}/bkup_sw
+CLI_CONF_DIR=${ENIQ_BASE_DIR}/sw/conf
+ENIQ_CORE_BIN_DIR=${ENIQ_BASE_DIR}/installation/core_install/bin/
+# Sentinel Stuff
+ENIQ_SENTINEL_DIR=${ENIQ_BASE_DIR}/sentinel
+ENIQ_SENTINEL_BIN_DIR=${ENIQ_SENTINEL_DIR}/bin
+ENIQ_SENTINEL_ENV=${ENIQ_SENTINEL_DIR}/etc/sentinel.env
+
+ENIQ_CONF_DIR=${ENIQ_BASE_DIR}/installation/config
+if [ ! -s ${ENIQ_CONF_DIR}/SunOS.ini ]; then
+    _err_msg_="Could not locate file ${ENIQ_CONF_DIR}/SunOS.ini"
+    abort_script "$_err_msg_"
+fi
+
+#Temp directory.
+TEM=/tmp
+
+# Source the common functions
+if [ -s ${ENIQ_BASE_DIR}/admin/lib/common_functions.lib ]; then
+    . ${ENIQ_BASE_DIR}/admin/lib/common_functions.lib
+else
+    _err_msg_="File ${ENIQ_BASE_DIR}/admin/lib/common_functions.lib not found"
+    abort_script "$_err_msg_"
+fi
+
+if [ ! -s ${ENIQ_CORE_BIN_DIR}/set_core_memcache.bsh ]; then
+    _err_msg_="Failed to locate script ${ENIQ_CORE_BIN_DIR}/set_core_memcache.bsh"
+    abort_script "$_err_msg_" "${EXEC_SHELL_CMD}"
+fi
+
+DWH_PORT=`iniget DWH -v PortNumber -f ${CLI_CONF_DIR}/niq.ini`
+DWH_ENG=`iniget DWH -v ServerName -f ${CLI_CONF_DIR}/niq.ini`
+if [ ! "${DWH_PORT}" -o ! "${DWH_ENG}" ]; then
+    _err_msg_="Could not read db values from ${CLI_CONF_DIR}/${ENIQ_INI}"
+    abort_script "$_err_msg_"
+fi
+
+DBA_PASSWORD=`inigetpassword DB -f ${CLI_CONF_DIR}/${ENIQ_INI} -v DBAPassword`
+if [ ! ${DBA_PASSWORD} ]; then
+    if [ -f ${ENIQ_BASE_DIR}/sw/installer/dbusers ]; then
+        DBA_PASSWORD=`${ENIQ_BASE_DIR}/sw/installer/dbusers dba dwh`
+        if [ ! "${DBA_PASSWORD}" ] ; then
+            _err_msg_="Could not get dwhdb DBA Password"
+            abort_script "$_err_msg_"
+        fi
+    fi
+fi
+
+
+#Initialising the connection string for dwhdb
+dwh_connection_string="-nogui -onerror exit -c \"eng=${DWH_ENG};links=tcpip{host=localhost;port=${DWH_PORT}};uid=dba;pwd=${DBA_PASSWORD}\""
+dwh_connection_string_enc=${TEM}/conn_str_login_encrypt.txt.`uuidgen`
+
+# encrypt the connection string.
+get_encrypt_file "${dwh_connection_string}" "${dwh_connection_string_enc}"
+
+
+REP_PORT=`iniget REP -v PortNumber -f ${CLI_CONF_DIR}/niq.ini`
+REP_ENG=`iniget REP -v ServerName -f ${CLI_CONF_DIR}/niq.ini`
+if [ ! "${REP_PORT}" -o ! "${REP_ENG}" ]; then
+    _err_msg_="Could not read db values from ${CLI_CONF_DIR}/${ENIQ_INI}"
+    abort_script "$_err_msg_"
+fi
+
+#Initialising the connection string for dwhdb
+rep_connection_string="-nogui -onerror exit -c \"eng=${REP_ENG};links=tcpip{host=localhost;port=${REP_PORT}};uid=dba;pwd=${DBA_PASSWORD}\""
+
+. /eniq/sybase_iq/IQ-*/IQ-*.sh
+sybase_env_variables_ec=$?
+if [ $sybase_env_variables_ec -ne 0 ]; then
+    _err_msg_="Could not source sybase environment"
+    abort_script "$_err_msg_"
+fi
+
+
+CURR_SERVER_TYPE=`$CAT $ENIQ_CONF_DIR/installed_server_type | $EGREP -v '^[[:blank:]]*#' | $SED -e 's/ //g'`
+if [ ! "${CURR_SERVER_TYPE}" ]; then
+    _err_msg_="Could not determine which server type this is"
+    abort_script "$_err_msg_"
+fi
+
+# Get the System User.
+SYSUSER=`iniget ENIQ_INSTALL_CONFIG -f ${ENIQ_CONF_DIR}/${SUNOS_INI} -v ENIQ_SYSUSER`
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not read SYSUSER param from ${ENIQ_CONF_DIR}/${SUNOS_INI}"
+    abort_script "$_err_msg_"
+fi
+
+SYSGRP=`$ID ${SYSUSER}|$AWK '{print $2}'|$AWK -F\( '{print $2}'|$AWK -F\) '{print $1}'`
+if [ ! "${SYSGRP}" ]; then
+    _err_msg_="Could not read SYSGRP param from ${ENIQ_CONF_DIR}/${SUNOS_INI}"
+    abort_script "$_err_msg_"
+fi
+
+if [ ! -s ${CLI_CONF_DIR}/${ENIQ_ENV} ]; then
+    _err_msg_="Could not locate file ${CLI_CONF_DIR}/${ENIQ_ENV}"
+    abort_script "$_err_msg_"
+else
+    . ${CLI_CONF_DIR}/niq.rc
+fi
+
+# Create a temporary Directory
+TEM_DIR=/tmp/create_query_user_login.$$.$$
+$RM -rf ${TEM_DIR}
+$MKDIR -p ${TEM_DIR}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not create directory ${TEM_DIR}"
+    abort_script "$_err_msg_"
+fi
+$CHOWN ${SYSUSER}:${SYSGRP} ${TEM_DIR}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not change ownership for ${TEM_DIR}"
+    abort_script "$_err_msg_"
+fi  
+$CHMOD 750 ${TEM_DIR}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not update directory ${TEM_DIR} permissions"
+    abort_script "$_err_msg_"
+fi 
+}
+
+
+### Function: setup_sybase_env ###
+#
+# Set up Sybase environment
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+setup_sybase_env()
+{
+$ENV |$EGREP '^(SYBASE|ASDIR|IQDIR|ASALOGDIR|SQLANY)' > $TEM_DIR/sybase_det.$$ >> /dev/null 2>&1
+
+# Source the environment
+set -a
+. $TEM_DIR/sybase_det.$$ >> /dev/null 2>&1
+set +a
+
+if [ ! "${SYBASE}" ]; then 
+    _err_msg_="Could not determine Sybase environment variable \${SYBASE}"
+    abort_script "$_err_msg_"
+fi
+
+DBISQL="$(ls /eniq/sybase_iq/IQ-*/bin64/dbisql)"
+if [ ! -x "$DBISQL" ]; then
+    _err_msg_="$DBISQL commands not found or not executable."
+    abort_script "$_err_msg_"
+fi
+
+
+}
+
+### Function: usage_msg ###
+#
+#   Print out the usage message
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+usage_msg()
+{
+$ECHO "
+Usage: /usr/bin/bash `$BASENAME $0` [-t <temp directoty>] [-n <user name>]  [-m <max number of connections allowed>] [-p <life time of the password>] [-n <max failed attempts before a user is locked out>]  [-f] [ -l <path_to_logfile> ]
+
+
+
+Optional
+-f : Gives access for the User to all installed features.
+-l  : Optional Parameter.Specifies logfile name with absolute path.Default path /eniq/log/sw_log/iq.
+"
+}
+
+# ********************************************************************
+#
+#     Main body of program
+#
+# ********************************************************************
+#
+# Determine absolute path to software
+get_absolute_path
+
+# Set up up path environment etc.
+setup_env
+setup_sybase_env
+
+while getopts "t:n:m:p:x:l:" arg; do
+    case $arg in
+    t)  TEM_DIR="$OPTARG"
+        ;;
+    n)  login_policy_name="$OPTARG"
+        ;;
+    m)  MAX_CONNECTIONS="$OPTARG"
+        ;;
+    p)  PASSWORD_LIFE_TIME="$OPTARG"
+        ;;
+    x)  MAX_FAILED_LOGIN_ATTEMPTS="$OPTARG"
+        ;;
+    l) LOGFILE="$OPTARG"
+       ;;
+    \?)  usage_msg
+         abort_script "$($DATE '+%Y-%m-%d_%H.%M.%S'): Unknown argument passed to script."
+         ;;
+    esac
+done
+shift `expr $OPTIND - 1`
+
+#Create logfile
+chk_create_logfile
+
+#Check DBA Password
+checkDBAPasword
+
+if [ -z "$TEM_DIR" ]; then
+    log_msg -s "\n Enter the full path to the temporary directory to be used while creating query user login policy." -l ${LOGFILE}
+    read TEM_DIR
+fi
+
+if [ ! -d $TEM_DIR ]; then
+    $MKDIR -p $TEM_DIR
+    if [ $? -ne 0 ]; then
+        log_msg -s "Failed to recreate $TEM_DIR folder. Exiting script" -l ${LOGFILE}
+        exit 1
+    else
+        log_msg -s "$TEM_DIR created" -l ${LOGFILE}
+    fi
+fi
+
+
+if [ -z "$login_policy_name" ]; then
+    $RM -f ${TEM_DIR}/login_policy_name.txt >/dev/null 2>&1
+    $SU - $SYSUSER -c "$DBISQL @${dwh_connection_string_enc} \"select count() from sysloginpolicy where login_policy_name like 'query_user_login_policy%';OUTPUT TO ${TEM_DIR}/login_policy_name.txt APPEND HEXADECIMAL ASIS FORMAT TEXT ;\"" >/dev/null 2>&1
+
+    num=$($CAT ${TEM_DIR}/login_policy_name.txt)
+
+    if [ $num -eq 0 ]; then
+        login_policy_name='query_user_login_policy_1'
+    else
+        let num=$num+1
+        login_policy_name="query_user_login_policy_${num}"
+    fi
+fi
+    
+
+if [[ "$login_policy_name" == "eniq_user_login_policy"* ]]; then
+    MAX_CONNECTIONS="unlimited"
+else
+    while :; do
+        if [ -z "$MAX_CONNECTIONS" ]; then
+            log_msg -s "\nEnter the maximum number of connections to allow for ${login_policy_name} login policy : [Values: Integer from 1-10]  " -l ${LOGFILE}
+            read MAX_CONNECTIONS
+            if [ -z "$MAX_CONNECTIONS" ]; then
+                MAX_CONNECTIONS=''
+                continue
+            fi
+        fi
+
+        re='^[0-9]+$'
+    
+        if [[ $MAX_CONNECTIONS =~ $re ]] ; then
+            if [ ${MAX_CONNECTIONS} -le 10 -a ${MAX_CONNECTIONS} -gt 0 ] ; then
+                break
+            else
+                MAX_CONNECTIONS=''
+                continue
+            fi
+        else
+            MAX_CONNECTIONS=''
+            continue
+        fi
+    done
+fi
+
+while :; do
+    if [ -z "$PASSWORD_LIFE_TIME" ]; then
+        read -r -p "Do you want to set the Password Life Time as unlimited [Yy/Nn]?" response
+        if [ $response == "Y" -o $response == "y" ]; then
+            PASSWORD_LIFE_TIME="unlimited"
+            break
+        elif [ $response == "N" -o $response == "n" ] ; then 
+            log_msg -s "\nEnter the maximum number of days before a password must be changed for ${login_policy_name} login policy : [Values: Integer from 15-3650] " -l ${LOGFILE}
+            read PASSWORD_LIFE_TIME
+            if [ -z "$PASSWORD_LIFE_TIME" ]; then
+                PASSWORD_LIFE_TIME=''
+                continue
+            fi
+        else 
+            continue
+        fi
+    fi
+    re='^[0-9]+$'
+    if [[ $PASSWORD_LIFE_TIME =~ $re ]] ; then
+         if [ ${PASSWORD_LIFE_TIME} -le 3650 -a ${PASSWORD_LIFE_TIME} -ge 15 ] ; then
+            let PASSWORD_LIFE_TIME=${PASSWORD_LIFE_TIME}-7
+            PASSWORD_GRACE_TIME="PASSWORD_GRACE_TIME=7"
+            break
+        else
+            PASSWORD_LIFE_TIME=''
+            continue
+        fi
+    else
+        PASSWORD_LIFE_TIME=''
+        continue
+    fi
+done
+
+
+while :; do
+    if [ -z "$MAX_FAILED_LOGIN_ATTEMPTS" ]; then
+        log_msg -s "\nEnter the maximum number of failed attempts to log into the database before the user account is locked for ${login_policy_name} login policy : [Values: Integer from 3-5]  " -l ${LOGFILE}
+        read MAX_FAILED_LOGIN_ATTEMPTS
+
+        if [ -z "$MAX_FAILED_LOGIN_ATTEMPTS" ]; then
+            MAX_FAILED_LOGIN_ATTEMPTS=''
+            continue
+        fi
+    fi
+
+    re='^[0-9]+$'
+    if [[ $MAX_FAILED_LOGIN_ATTEMPTS =~ $re ]] ; then
+        if [ ${MAX_FAILED_LOGIN_ATTEMPTS} -le 5 -a ${MAX_FAILED_LOGIN_ATTEMPTS} -ge 3 ] ; then
+        break
+        else
+            MAX_FAILED_LOGIN_ATTEMPTS=''
+            continue
+        fi
+    else
+        MAX_FAILED_LOGIN_ATTEMPTS=''
+        continue
+    fi
+done
+
+
+SqlFile=`mktemp ${TEM_DIR}/createDefaultLoginPolicy.XXXXXXXXXX`
+$ECHO "if (object_id('${login_policy_name}') is not   null)   then
+   drop LOGIN POLICY ${login_policy_name};
+   end if ;
+CREATE LOGIN POLICY ${login_policy_name} MAX_CONNECTIONS=${MAX_CONNECTIONS} ${PASSWORD_GRACE_TIME} PASSWORD_LIFE_TIME=${PASSWORD_LIFE_TIME}  MAX_FAILED_LOGIN_ATTEMPTS=${MAX_FAILED_LOGIN_ATTEMPTS} LOCKED=OFF;" >$SqlFile
+
+
+$DBISQL @${dwh_connection_string_enc} $SqlFile
+if [ $? -ne 0 ]; then
+    $ECHO "failed" > ${TEM_DIR}/Gen_login_policy_name.txt
+else
+    $ECHO ${login_policy_name} > ${TEM_DIR}/Gen_login_policy_name.txt
+fi
+
+$RM -rf ${dwh_connection_string_enc}
+
+#removing tmp folder created during execution of the script
+cleanup

@@ -1,0 +1,34 @@
+######################################################
+# This contains a list of of filesystems that contain
+# need to be snapshot at the time of the DB Virtual
+# Backup. It has the format of
+#
+# <fs_name>::<snap>::<rollback>
+#
+# Comments are preceded by '#' 
+######################################################
+admin::Y::Y
+archive::Y::Y
+backup::Y::Y
+bkup_sw::Y::Y
+connectd::Y::Y
+data::Y::Y
+dwh_main::Y::Y
+dwh_main_dbspace::Y::Y
+dwh_temp_dbspace::N::N
+dwh_reader::Y::Y
+fmdata::Y::Y
+home::Y::Y
+installation::Y::Y
+local_logs::Y::N
+log::Y::N
+misc::N::N
+rep_main::Y::Y
+rep_temp::N::N
+sentinel::Y::Y
+smf::Y::Y
+sql_anywhere::Y::Y
+sw::Y::Y
+sybase_iq::Y::Y
+upgrade::Y::Y
+vg_root::N::N

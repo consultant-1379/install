@@ -1,0 +1,566 @@
+#!/bin/bash
+# ********************************************************************
+# Ericsson Radio Systems AB                                     SCRIPT
+# ********************************************************************
+#
+#
+# (c) Ericsson Radio Systems AB 2018 - All rights reserved.
+#
+# The copyright to the computer program(s) herein is the property
+# of Ericsson Radio Systems AB, Sweden. The programs may be used
+# and/or copied only with the written permission from Ericsson Radio
+# Systems AB or in accordance with the terms and conditions stipulated
+# in the agreement/contract under which the program(s) have been
+# supplied.
+#
+#
+# ********************************************************************
+# Name    : install_hostsync.bsh
+# Updated : 10/09/2018
+# Revision: main\6
+# Purpose : Install the hostsync service
+#
+# ********************************************************************
+#
+# **********************    Command Section     **********************
+#
+# ********************************************************************
+AWK=/usr/bin/awk
+BASENAME=/usr/bin/basename
+CHMOD=/usr/bin/chmod
+CHOWN=/usr/bin/chown
+CP=/usr/bin/cp
+DATE=/usr/bin/date
+DIRNAME=/usr/bin/dirname
+ECHO="/usr/bin/echo -e"
+MKDIR=/usr/bin/mkdir
+RM=/usr/bin/rm
+SYSTEMCTL=/usr/bin/systemctl
+TOUCH=/usr/bin/touch
+UMOUNT=/usr/bin/umount
+
+# ********************************************************************
+#
+# **********************  Configuration Section  *********************
+#
+# ********************************************************************
+#
+# Configuration Files for Service to install
+readonly SERVICE_NAME="hostsync"
+readonly UNIT_FILE="hostsync.service"
+readonly METHOD_FILE="hostsync.sh"
+readonly HOSTSYNC_SCRIPT="hostsync_monitor.bsh"
+
+# Destination directories for installation
+readonly UNIT_DIR="/etc/systemd/system"
+readonly METHOD_DIR="/eniq/smf/bin"
+
+# Used for upgrade. If service is started before upgrade then restart after upgrade.
+I_STOPPED_SVC="false"
+START_SVC="false"	
+
+# ********************************************************************
+#
+# **************************     Functions    ************************
+#
+# ********************************************************************
+#
+### Function: abort_script ###
+#
+#   This function is called if the script is aborted through
+#   an error encountered during runtime
+#
+# Arguments:
+#       $1 - Error message from part of program (Not always used)
+# Return Values:
+#       none
+abort_script()
+{
+_err_time_=`$DATE '+%Y-%b-%d_%H.%M.%S'`	
+
+if [ "$1" ]; then
+    _err_msg_="${_err_time_} - $1"
+else
+    _err_msg_="${_err_time_} - Script aborted.......\n"    
+fi
+if [ "${LOGFILE}" ]; then
+    $ECHO "\nERROR : ${_err_msg_}\n" | $TEE -a ${LOGFILE}
+else
+    $ECHO "\nERROR : ${_err_msg_}\n"
+fi
+
+cd $SCRIPTHOME
+$RM -rf ${TEM_DIR}
+
+if [ "$2" ]; then
+    ${2}
+else
+   exit 1
+fi
+}
+
+### Function: check_params ###
+#
+# Check Input Params
+#
+# Arguments:
+#	none
+# Return Values:
+#	none
+check_params()
+{
+if [ ! "${SOFTWARE_SOURCE_FILE}" ]; then
+    usage_msg
+    exit 1
+fi
+}
+
+### Function: chk_create_logfile ###
+#
+# Check/Create Logfile
+#
+# Arguments:
+#	none
+# Return Values:
+#	none
+chk_create_logfile()
+{
+$MKDIR -p `$DIRNAME ${LOGFILE}`
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not create directory `$DIRNAME ${LOGFILE}`"
+     abort_script "${_err_msg_}"
+fi	
+
+$TOUCH -a ${LOGFILE}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not write to file ${LOGFILE}"
+    abort_script "${_err_msg_}"
+fi	
+}
+
+### Function: get_absolute_path ###
+#
+# Determine absolute path to software
+#
+# Arguments:
+#	none
+# Return Values:
+#	none
+get_absolute_path() 
+{
+_dir_=`$DIRNAME $0`
+SCRIPTHOME=`cd $_dir_ 2>/dev/null && pwd || $ECHO $_dir_`
+}
+
+### Function: load_unit ###
+#
+#  Loads the service unit
+#
+# Uses Global variables:  UNIT_DIR; UNIT_FILE
+# Arguments:  none
+# Return Values: 0 for success
+load_unit()
+{
+log_msg -s "\nLoading service unit for hostsync" -l ${LOGFILE}
+
+$SYSTEMCTL daemon-reload  >> /dev/null 2>&1
+if [ $? -ne 0 ]; then
+	log_msg -s "Could not load service unit for hostsync" -l ${LOGFILE}
+	return 1
+fi
+
+log_msg -s "Successfully loaded hostsync unit" -l ${LOGFILE}
+}
+
+### Function: install_unit ###
+#
+#  Installs service unit and start-stop Method script for Service
+#
+# Uses Global variables:  UNIT_DIR; UNIT_FILE; METHOD_DIR; METHOD_FILE
+# Arguments:  none
+# Return Values: 0 for success
+#
+install_unit()
+{
+log_msg -s "\nInstalling service unit for hostsync" -l ${LOGFILE}
+	
+# check we have the unit file
+if [ ! -s ${SOFTWARE_SOURCE_FILE}/${UNIT_FILE} ]; then	
+	log_msg -s "${SOFTWARE_SOURCE_FILE}/${UNIT_FILE} could not be found, or is empty" -l ${LOGFILE}
+	return 1
+fi
+
+if [ ! -s ${SOFTWARE_SOURCE_FILE}/${METHOD_FILE} ]; then	
+	log_msg -s "${SOFTWARE_SOURCE_FILE}/${METHOD_FILE} could not be found, or is empty" -l ${LOGFILE}
+	return 1
+fi
+	
+if [ ! -d ${UNIT_DIR} ]; then
+	log_msg -s "\nCreating ${UNIT_DIR}" -q -l ${LOGFILE}
+	$MKDIR -p ${UNIT_DIR} >> /dev/null 2>&1
+	if [ $? -ne 0 ]; then
+		log_msg -s "Could not create ${UNIT_DIR}" -l ${LOGFILE}
+		return 1
+	fi
+	
+	log_msg -s "Changing ownership of ${UNIT_DIR} to root:sys" -q -l ${LOGFILE}
+	$CHOWN -R root:sys ${UNIT_DIR}
+	if [ $? -ne 0 ]; then
+		log_msg -s "Could not change ownership of ${UNIT_DIR} to root:sys" -l ${LOGFILE}
+		return 1
+	fi
+fi
+    
+log_msg -s "\nCopying the service unit file ${UNIT_FILE} from ${SOFTWARE_SOURCE_FILE} to ${UNIT_DIR}" -q -l ${LOGFILE}
+$CP ${SOFTWARE_SOURCE_FILE}/${UNIT_FILE} ${UNIT_DIR} >> /dev/null 2>&1
+if [ $? -ne 0 ]; then
+	log_msg -s "Could not copy the service unit file ${UNIT_FILE} from ${SOFTWARE_SOURCE_FILE} to ${UNIT_DIR}" -l ${LOGFILE}
+	return 1
+fi
+
+log_msg -s "Changing ownership of ${UNIT_DIR}/${UNIT_FILE} to root:sys" -q -l ${LOGFILE}
+$CHOWN -R root:sys ${UNIT_DIR}/${UNIT_FILE}
+if [ $? -ne 0 ]; then
+	log_msg -s "Could not change ownership of ${UNIT_DIR}/${UNIT_FILE} to root:sys" -l ${LOGFILE}
+	return 1
+fi
+
+log_msg -s "Changing permissions of ${UNIT_DIR}/${UNIT_FILE} to -r--r--r--" -q -l ${LOGFILE}
+$CHMOD 444 ${UNIT_DIR}/${UNIT_FILE}
+if [ $? -ne 0 ]; then
+	log_msg -s "Could not change permissions of ${UNIT_DIR}/${UNIT_FILE} to -r--r--r--" -l ${LOGFILE}
+	return 1
+fi
+	
+# Install service start/stop method script
+if [ ! -d ${METHOD_DIR} ]; then
+	log_msg -s "\nCreating ${METHOD_DIR}" -q -l ${LOGFILE}
+	$MKDIR -p ${METHOD_DIR} >> /dev/null 2>&1
+	if [ $? -ne 0 ]; then
+		log_msg -s "Could not create ${METHOD_DIR}" -l ${LOGFILE}
+		return 1
+	fi
+	
+	log_msg -s "Changing ownership of ${METHOD_DIR} to root:sys" -q -l ${LOGFILE}
+	$CHOWN -R root:sys ${METHOD_DIR}
+	if [ $? -ne 0 ]; then
+		log_msg -s "Could not change ownership of ${METHOD_DIR} to root:sys" -l ${LOGFILE}
+		return 1
+	fi
+	
+	log_msg -s "Changing permissions of ${METHOD_DIR} to -rwxr-xr-x" -q -l ${LOGFILE}
+	$CHMOD  755 ${METHOD_DIR}
+	if [ $? -ne 0 ]; then
+		log_msg -s "Could not change permissions of ${METHOD_DIR} to -rwxr-xr-x" -l ${LOGFILE}
+		return 1
+	fi
+fi
+    
+log_msg -s "\nCopying the service method file ${METHOD_FILE} from ${SOFTWARE_SOURCE_FILE} to ${METHOD_DIR}" -q -l ${LOGFILE}
+$CP ${SOFTWARE_SOURCE_FILE}/${METHOD_FILE} ${METHOD_DIR} >> /dev/null 2>&1
+if [ $? -ne 0 ]; then
+	log_msg -s "Could not copy the service method file ${METHOD_FILE} from ${SOFTWARE_SOURCE_FILE} to ${METHOD_DIR}" -l ${LOGFILE}
+	return 1
+fi
+
+log_msg -s "Changing ownership of ${METHOD_DIR}/${METHOD_FILE} to root:sys" -q -l ${LOGFILE}
+$CHOWN -R root:sys ${METHOD_DIR}/${METHOD_FILE}
+if [ $? -ne 0 ]; then
+	log_msg -s "Could not change ownership of ${METHOD_DIR}/${METHOD_FILE} to root:sys" -l ${LOGFILE}
+	return 1
+fi
+
+log_msg -s "Changing permissions of ${METHOD_DIR}/${METHOD_FILE} to -rwxr-x---" -q -l ${LOGFILE}
+$CHMOD  750 ${METHOD_DIR}/${METHOD_FILE}
+if [ $? -ne 0 ]; then
+	log_msg -s "Could not change permissions of ${METHOD_DIR}/${METHOD_FILE} to -rwxr-x---" -l ${LOGFILE}
+	return 1
+fi
+
+log_msg -s "Successfully installed hostsync unit file" -l ${LOGFILE}
+}
+
+### Function: install_software ###
+#
+#  Installs hostsync monitor script
+#
+# Arguments:  none
+# Return Values: 0 for success
+# Uses Global variables:  ENIQ_SVC_BIN_DIR; SOFTWARE_SOURCE_FILE, HOSTSYNC_SCRIPT
+install_software()
+{
+log_msg -s "Installing hostsync monitor script" -l ${LOGFILE}
+	
+if [ ! -d ${ENIQ_SVC_BIN_DIR} ]; then
+	log_msg -s "\nCreating ${ENIQ_SVC_BIN_DIR} directory" -q -l ${LOGFILE}
+	$MKDIR -p ${ENIQ_SVC_BIN_DIR} >> /dev/null 2>&1
+	if [ $? -ne 0 ]; then
+		log_msg -s "Could not create ${ENIQ_SVC_BIN_DIR} directory" -l ${LOGFILE}
+		return 1
+	fi
+	
+	log_msg -s "Changing ownership of ${ENIQ_SVC_BIN_DIR} directory to root:sys" -q -l ${LOGFILE}
+	$CHOWN -R root:sys ${ENIQ_SVC_BIN_DIR}
+	if [ $? -ne 0 ]; then
+		log_msg -s "Could not create ${ENIQ_SVC_BIN_DIR} directory" -l ${LOGFILE}
+		return 1
+	fi
+fi
+    
+log_msg -s "\nCopying ${HOSTSYNC_SCRIPT} from ${SOFTWARE_SOURCE_FILE} to ${ENIQ_SVC_BIN_DIR}" -q -l ${LOGFILE}
+$CP ${SOFTWARE_SOURCE_FILE}/${HOSTSYNC_SCRIPT} ${ENIQ_SVC_BIN_DIR} >> /dev/null 2>&1
+if [ $? -ne 0 ]; then
+	log_msg -s "Could not copy ${HOSTSYNC_SCRIPT} from ${SOFTWARE_SOURCE_FILE} to ${ENIQ_SVC_BIN_DIR}" -l ${LOGFILE}
+	return 1
+fi
+
+log_msg -s "Changing ownership of ${ENIQ_SVC_BIN_DIR}/${HOSTSYNC_SCRIPT} to root:sys" -q -l ${LOGFILE}
+$CHOWN root:sys ${ENIQ_SVC_BIN_DIR}/${HOSTSYNC_SCRIPT}
+if [ $? -ne 0 ]; then
+	log_msg -s "Could not change ownership of ${ENIQ_SVC_BIN_DIR}/${HOSTSYNC_SCRIPT} to root:sys" -l ${LOGFILE}
+	return 1
+fi
+
+log_msg -s "Changing permissions of ${ENIQ_SVC_BIN_DIR}/${HOSTSYNC_SCRIPT} to -rwxr--r--" -q -l ${LOGFILE}
+$CHMOD 744 ${ENIQ_SVC_BIN_DIR}/${HOSTSYNC_SCRIPT}
+if [ $? -ne 0 ]; then
+	log_msg -s "Could not change permissions of ${ENIQ_SVC_BIN_DIR}/${HOSTSYNC_SCRIPT} to -rwxr--r--" -l ${LOGFILE}
+	return 1
+fi
+
+log_msg -s "Successfully installed hostsync monitor scripts" -l ${LOGFILE}
+}
+
+### Function: setup_env ###
+#
+# Set up environment variables for script.
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+setup_env()
+{
+if [ ! "${ENIQ_BASE_DIR}" ]; then
+    # Directory on the root filesystem
+    ENIQ_BASE_DIR=/eniq
+fi
+
+# ENIQ Log Directory
+ENIQ_LOG_DIR=${ENIQ_BASE_DIR}/local_logs
+
+# Core Installation SW
+ENIQ_INST_DIR=${ENIQ_BASE_DIR}/installation
+ENIQ_CORE_INST_DIR=${ENIQ_INST_DIR}/core_install
+
+# Service directories
+ENIQ_SVC_DIR=${ENIQ_BASE_DIR}/smf
+ENIQ_SVC_BIN_DIR=${ENIQ_SVC_DIR}/bin
+
+# Source the common functions
+if [ -s ${ENIQ_CORE_INST_DIR}/lib/common_functions.lib ]; then
+    . ${ENIQ_CORE_INST_DIR}/lib/common_functions.lib
+else
+    _err_msg_="File ${ENIQ_CORE_INST_DIR}/lib/common_functions.lib not found"
+    abort_script "${_err_msg_}"
+fi
+
+HNAME=`${MYHOSTNAME}`
+}
+
+### Function: start_SVC ###
+#
+#  Starts the Service
+#
+# Uses Global variables:  SERVICE_NAME
+# Arguments:  none
+# Return Values: 0 for success
+start_SVC()
+{
+_service_state=`$SYSTEMCTL show ${SERVICE_NAME} -p ActiveState | $AWK -F= '{print $2}'`
+log_msg -s "The current status of ${SERVICE_NAME} is $_service_state" -l ${LOGFILE}
+log_msg -s "\nStarting ${SERVICE_NAME}" -l ${LOGFILE}
+
+$SYSTEMCTL start ${SERVICE_NAME}  >> ${LOGFILE}
+_service_state=`$SYSTEMCTL show ${SERVICE_NAME} -p ActiveState | $AWK -F= '{print $2}'`
+if [ "${_service_state}" != "active" ]; then
+	log_msg -s "ERROR: Could not start the ${SERVICE_NAME} service" -l ${LOGFILE}
+	return 1
+else
+	log_msg -s "Started the ${SERVICE_NAME} service" -l ${LOGFILE}
+	return 0
+fi
+
+# Enable the service
+_enabled_state_=`$SYSTEMCTL is-enabled ${SERVICE_NAME}`
+if [ "${_enabled_state}" != "enabled" ]; then
+    $SYSTEMCTL enable ${SERVICE_NAME} >> ${LOGFILE}
+fi
+_enabled_state_=`$SYSTEMCTL is-enabled ${SERVICE_NAME}`
+if [ "${_enabled_state}" != "enabled" ]; then
+    log_msg -s "ERROR: Could not enable the ${SERVICE_NAME} service" -l ${LOGFILE}
+    return 1
+else
+    log_msg -s "Enabled the ${SERVICE_NAME} service" -l ${LOGFILE}
+    return 0
+fi
+}
+
+### Function: stop_SVC ###
+#
+#  Stops the Service
+#
+# Arguments:  none
+# Return Values: 0 for success
+# Uses Global variables:  SERVICE_NAME
+# Sets a flag if service is stopped by this function; I_STOPPED_SVC
+#
+stop_SVC()
+{
+_load_state=`$SYSTEMCTL show -p LoadState ${SERVICE_NAME} | $AWK -F= '{print $2}'`
+if [ "${_load_state}" != "loaded" ]; then
+        log_msg -s "${SERVICE_NAME} service does not exist, continuing" -l ${LOGFILE}
+        return 0
+fi 
+
+log_msg -s "\nStopping ${SERVICE_NAME}" -l ${LOGFILE}
+
+_service_state=`$SYSTEMCTL show -p ActiveState ${SERVICE_NAME} | $AWK -F= '{print $2}'`
+if [ "${_service_state}" == "inactive" ]; then
+	log_msg -s "${SERVICE_NAME} service already stopped" -l ${LOGFILE}
+	return 0
+elif [ "${_service_state}" == "active" ]; then
+	log_msg -s "${SERVICE_NAME} service is active" -q -l ${LOGFILE}
+
+	$SYSTEMCTL stop ${SERVICE_NAME}  >> ${LOGFILE}
+        _service_state=`$SYSTEMCTL show ${SERVICE_NAME} -p ActiveState | $AWK -F= '{print $2}'`
+	if [ "${_service_state}" == "inactive" ]; then
+		I_STOPPED_SVC="true"
+		log_msg -s "Stopped service ${SERVICE_NAME}" -q -l ${LOGFILE}
+		return 0
+	else
+		log_msg -s "ERROR: Problem stopping service ${SERVICE_NAME}" -l ${LOGFILE}
+		return 1
+	fi
+elif [ "${_service_state}" == "failed" ]; then
+	log_msg -s "${SERVICE_NAME} service is in failed state" -q -l ${LOGFILE}
+	$SYSTEMCTL reset-failed ${SERVICE_NAME}
+        $SYSTEMCTL stop ${SERVICE_NAME}  >> ${LOGFILE}
+        _service_state=`$SYSTEMCTL show ${SERVICE_NAME} -p ActiveState | $AWK -F= '{print $2}'`
+        if [ "${_service_state}" == "inactive" ]; then
+		I_STOPPED_SVC="true"
+		log_msg -s "Stopped service ${SERVICE_NAME}" -q -l ${LOGFILE}
+		return 0
+	else
+		log_msg -s "ERROR: Problem stopping service ${SERVICE_NAME}" -l ${LOGFILE}
+		return 1
+	fi
+else
+	log_msg -s "ERROR: ${SERVICE_NAME} service in an unrecognised state `$SYSTEMCTL show ${SERVICE_NAME} -p ActiveState`" -l ${LOGFILE}
+	return 1
+fi
+}
+
+### Function: usage_msg ###
+#
+#   Print out the usage message
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+usage_msg()
+{
+$CLEAR
+$ECHO "
+`$BASENAME $0` -d <source_location> [-l <logfile_location>] [-S]
+
+Options:
+	-d 	Parameter specifing the full path to the
+		directory containing the software to install
+
+	-l      Optional parameter specifing the full path to the logfile
+	
+	-S	Optional parameter instructing the service 
+	    	for hostsync to be started
+"
+}
+
+# **********************************************************************
+#
+# ************************  Main body of program  **********************
+#
+# **********************************************************************
+#
+# Determine absolute path to software
+get_absolute_path
+
+while getopts ":l:d:S" arg; do
+  case $arg in
+    l) 	LOGFILE="$OPTARG"
+       	;;
+    d) 	SOFTWARE_SOURCE_FILE="$OPTARG"
+       	;;
+    S) 	START_SVC="true"
+       	;;
+   \?) 	usage_msg
+	exit 2
+       	;;
+  esac
+done
+shift `expr $OPTIND - 1`
+
+# Check Input Params
+check_params 
+
+# Set up environment variables for script.
+setup_env
+
+if [ ! "${LOGFILE}" ]; then
+    LOGFILE="${ENIQ_LOG_DIR}/hostsync/install_hostsync.log"
+fi	
+
+# Check/Create Logfile
+chk_create_logfile
+
+log_msg -t -h -s "Preparing to install hostsync SW" -l ${LOGFILE}
+
+# Stop service, if it exists
+stop_SVC
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not stop the hostsync service"
+    abort_script "${_err_msg_}"
+fi
+
+# Install the Software
+install_software
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not install the hostsync monitor scripts"
+    abort_script "${_err_msg_}"
+fi
+
+# Install the service unit
+install_unit
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not install the hostsync unit file"
+    abort_script "${_err_msg_}"
+fi
+
+# Create service by loading service unit
+load_unit
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not load the hostsync unit into systemd service."
+    abort_script "${_err_msg_}"
+fi
+
+# Restart service if the START_SVC flag is set to true,
+# or if I stopped service for an upgrade
+if [ "$START_SVC" == "true" -o "${I_STOPPED_SVC}" == "true" ]; then
+    start_SVC
+    if [ $? -ne 0 ]; then
+        _err_msg_="Could not start the hostsync service"
+        abort_script "${_err_msg_}"
+    fi
+fi
+
+exit 0

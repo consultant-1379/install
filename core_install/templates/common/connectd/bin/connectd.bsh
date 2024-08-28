@@ -1,0 +1,537 @@
+#!/bin/bash
+# ********************************************************************
+# Ericsson Radio Systems AB                                     SCRIPT
+# ********************************************************************
+#
+#
+# (c) Ericsson Radio Systems AB 2022 - All rights reserved.
+#
+# The copyright to the computer program(s) herein is the property
+# of Ericsson Radio Systems AB, Sweden. The programs may be used
+# and/or copied only with the written permission from Ericsson Radio
+# Systems AB or in accordance with the terms and conditions stipulated
+# in the agreement/contract under which the program(s) have been
+# supplied.
+#
+#
+# ********************************************************************
+# Name    : connectd.bsh
+# Date    : 13/02/2023
+# Revision: /main/12
+# Purpose : This script is started by SERVICE to monitor the NFS Mounts
+#           between ENIQ and each OSS/SFS.
+#
+# Overview: Each OSS setup on the system will have a sub-directory in
+#           the directory ${MOUNT_INFO_DIR}. This sub-directory will
+#           contain configuration data for that OSS.
+#           This script will cycle through each of the OSS(es) and
+#           enable or disable a NFS monitoring script for each one.
+#
+#
+# ********************************************************************
+#
+# **********************    Command Section     **********************
+#
+# ********************************************************************
+AWK=/usr/bin/awk
+BASH=/usr/bin/bash
+CP=/usr/bin/cp
+CUT=/usr/bin/cut
+CAT=/usr/bin/cat
+DATE=/usr/bin/date
+DIRNAME=/usr/bin/dirname
+ECHO=/usr/bin/echo
+EGREP=/usr/bin/egrep
+GREP=/usr/bin/grep
+ID=/usr/bin/id
+KILL=/usr/bin/kill
+LS=/usr/bin/ls
+MKDIR=/usr/bin/mkdir
+MOUNT=/usr/bin/mount
+PS=/usr/bin/ps
+RM=/usr/bin/rm
+SLEEP=/usr/bin/sleep
+
+# ********************************************************************
+#
+# **********************  Configuration Section  *********************
+#
+# ********************************************************************
+#
+readonly SERVER_HOSTNAME=`hostname`
+
+# ConnectD Software Directory
+CONNECTD_BASE_DIR=/eniq/connectd/
+
+# Location of ConnectD_Monitor Template
+CONNECTD_MONITOR_TEMPLATE=${CONNECTD_BASE_DIR}bin/connectd_monitor_template.bsh
+
+# Location of ConnectD Config Template
+CONNECTD_CONFIG_TEMPLATE=${CONNECTD_BASE_DIR}etc/connectd_config_template
+
+# Location of ConnectD Mount Info Directory
+MOUNT_INFO_DIR=${CONNECTD_BASE_DIR}mount_info/
+
+# Tempaory Directory which will contain OSS_SFS_connection scripts
+readonly TEMP=/tmp/connectd/
+
+# Location of Logfile
+readonly LOG_DIRECTORY="/eniq/local_logs/connectd/"
+$MKDIR -p ${LOG_DIRECTORY} >> /dev/null 2>&1
+readonly LOGFILE="${LOG_DIRECTORY}connectd.log"
+
+# If this file exists in the OSS specific subdirectory within the MOUNT_INFO_DIR
+# then this OSS will be disabled.
+readonly DISABLE_NODE_STR=disable_
+
+# Number of seconds to sleep for between monitoring OSS(es)
+readonly SLEEP_TIME=10
+
+
+# ********************************************************************
+#
+# **************************     Functions    ************************
+#
+# ********************************************************************
+#
+### Function: check_id ###
+#
+#   Check that the effective id of the user is correct
+#   If not print error msg and exit.
+#
+# Arguments:
+#       $1 : User ID name
+# Return Values:
+#       0 for success; 1 for failure;
+check_id()
+{
+    _check_id_=`$ID  | $AWK -F\( '{print $2}' | $AWK -F\) '{print $1}'`
+    if [ "${_check_id_}" != "$1" ]; then
+        return 1
+    else
+        return 0
+    fi
+}
+
+
+### Function: check_templates_dir ###
+#
+# Check for templates directory and all required templates
+#
+# Uses Global variables:      SCRIPTHOME
+# Uses/Sets Global variables: ENIQ_TEMPL_DIR
+# Arguments     : none
+# Return Values : 0 for success
+#                 1 for error
+check_templates_dir()
+{
+    local return_code=0
+
+    # Do we have a ConnectD Software Directory
+    if [ ! -d ${CONNECTD_BASE_DIR} ]; then
+        logit "Software directory ${CONNECTD_BASE_DIR} not found"
+        return_code=1
+    fi
+
+    # Location of ConnectD Mount Info Directory
+    if [ ! -d ${MOUNT_INFO_DIR} ]; then
+        logit "Mount info directory ${MOUNT_INFO_DIR} not found"
+        return_code=1
+    fi
+
+    # Location of ConnectD_Monitor Template
+    if [ ! -s  ${CONNECTD_MONITOR_TEMPLATE} ]; then
+        logit "ERROR:: File ${CONNECTD_MONITOR_TEMPLATE} not found"
+        return_code=1
+    fi
+
+    # Location of ConnectD Config Template
+    if [ ! -s  ${CONNECTD_CONFIG_TEMPLATE} ]; then
+        logit "ERROR:: File ${CONNECTD_CONFIG_TEMPLATE} not found"
+        return_code=1
+    fi
+
+    return  ${return_code}
+}
+
+
+### Function: get_absolute_path ###
+#
+# Determine absolute path to software
+#
+# Sets Global variables: SCRIPTHOME
+# Arguments     : none
+# Return Values : none
+get_absolute_path()
+{
+    _dir_=`$DIRNAME $0`
+    SCRIPTHOME=`cd $_dir_ 2>/dev/null && pwd || $ECHO $_dir_`
+}
+
+### Function: get_pid_list ###
+#
+# make the list of pids of all monitoring scripts
+# running
+#
+# Sets Global variables: MONITOR_PID_LIST
+# Arguments     : none
+# Return Values : none
+get_pid_list()
+{
+    unset MONITOR_PID_LIST
+    MONITOR_PID_LIST=`$PS -ef | $GREP -vw egrep | $EGREP "connectd_" |$EGREP "eniq_oss_[0-9]+_monitor" | $AWK '{ print $2 }'`
+}
+
+### Function: logit ###
+#
+#  Logs Messages to default logfile "LOGFILE"
+#
+# Uses Global Variables: "LOGFILE", "SERVER_HOSTNAME"
+# Arguments     :  log_message
+# Return Values : 0 for success
+#                 1 for error LOGFILE undefined
+logit()
+{
+    local _log_msg
+    local _id=`id | cut -f1 -d " "`
+
+    if [ -n "${1}" ]; then
+        _log_msg="${_id}::${SERVER_HOSTNAME}:: `$DATE '+%Y-%b-%d_%H.%M.%S'`:: ${1}"
+    else
+        _log_msg="${_id}::${SERVER_HOSTNAME}:: Error in Script $0 at `$DATE '+%Y-%b-%d_%H.%M.%S'`\n"
+    fi
+
+    if [ "${LOGFILE}" ]; then
+        $ECHO "${_log_msg}" >> ${LOGFILE}
+        return 0
+    else
+        $ECHO "\n${_log_msg}\n"
+        return 1
+    fi
+}
+
+
+### Function: restart_all_tunnel_monitor_scripts ###
+#
+# Stops and Restarts the ConnectD monitor between all OSS/SFS and ENIQ server
+#
+# Uses Global Variables: "WAKE"
+# Arguments     : none
+# Return Values : 0 = Success (All tunnels Stopped)
+#                 1 = Failure
+#
+restart_all_tunnel_monitor_scripts()
+{
+    logit "WARNING:: Restarting all connection monitor scripts"
+    # Exits from sleep function immediately if interrupted during a sleep
+    WAKE=true
+
+    # list of all pid
+    get_pid_list
+
+    if [  "${MONITOR_PID_LIST}" ]; then
+        $KILL -USR2 ${MONITOR_PID_LIST} >> /dev/null 2>&1
+    fi
+    return 0
+}
+
+
+### Function: sleep_function ###
+#
+# Sleep; but checks for interrupt every second
+# Any Interupt functions should set WAKE=true
+#
+# Uses Global Variables: "WAKE"
+# Arguments: Number of seconds to sleep for
+sleep_function()
+{
+    WAKE=false
+    if [[ -n "${1}" ]]; then
+        for (( i=0; i < ${1}; i++ )); do
+            $SLEEP 1
+            if [[ $WAKE = "true" ]]; then
+                return
+            fi
+        done
+    else
+        logit "ERROR:: Error sleep_function called without parameter."
+        $SLEEP 1
+    fi
+}
+
+
+### Function: start_OSS_tunnel_monitor ###
+#
+# Starts the ConnectD monitor between the OSS/SFS and ENIQ server
+#
+# Uses Global Variables: "OSS_MONITOR_SCRIPT"; "CONNECTD_MONITOR_TEMPLATE"
+# Arguments     : OSS_ALIAS
+# Return Values : 0 for success
+#                 1 for unspecified error
+#                 2 could not create oss monitor script
+#
+start_OSS_tunnel_monitor()
+{
+    local return_status
+    local OSS_NAME
+
+    if [[ -n "${1}" ]]; then
+        OSS_NAME=${1}
+        local OSS_MONITOR_SCRIPT=connectd_${OSS_NAME}_monitor
+    fi
+
+
+
+    if [[ ! -d "${TEMP}" ]]; then
+        mkdir -p ${TEMP}
+    fi
+
+    $CP ${CONNECTD_MONITOR_TEMPLATE} ${TEMP}${OSS_MONITOR_SCRIPT} >> /dev/null 2>&1
+    if [ $? -ne 0 ]; then
+        logit "ERROR:: starting connectd monitor for ${OSS_NAME}; Could not copy ${CONNECTD_MONITOR_TEMPLATE} to ${TEMP}/${OSS_MONITOR_SCRIPT}"
+        return_status=2
+    else
+        $BASH ${TEMP}${OSS_MONITOR_SCRIPT} -n ${OSS_NAME} &
+        return_status=0
+    fi
+
+    return ${return_status}
+}
+
+
+
+
+### Function: stop_all_tunnel_monitor_scripts ###
+#
+# Stops the ConnectD monitor scripts for all OSS(es)
+#
+# Arguments    : none
+# Return Values:
+#               0 = Success (All tunnels Stopped)
+#               1 = Failure ()
+#
+stop_all_tunnel_monitor_scripts()
+{
+    logit "WARNING:: Stopping all connectd monitor scripts"
+    logit "WARNING:: This will SHUTDOWN ALL OSS(es)."
+    # list of all pid
+    get_pid_list
+
+    if [  "${MONITOR_PID_LIST}" ]; then
+        $KILL -USR2 ${MONITOR_PID_LIST} >> /dev/null 2>&1
+    else
+        # There are no connectd monitor scripts running.
+        return 0
+    fi
+
+
+    sleep_function 15
+
+    # list of all pid
+    get_pid_list
+
+    if [ "${MONITOR_PID_LIST}" ]; then
+        $KILL -KILL ${MONITOR_PID_LIST} >> /dev/null 2>&1
+    else
+        # All connectd monitor scripts have finished correctly.
+        return 0
+    fi
+
+    $SLEEP 1
+
+    # list of all pid
+    get_pid_list
+
+    if [ "${MONITOR_PID_LIST}" ]; then
+        return 1
+    else
+        return 0
+    fi
+}
+
+
+### Function: stop_OSS_tunnel_monitor ###
+#
+# Stops the ConnectD monitor between the OSS/SFS and ENIQ server
+#
+# Uses Global Variables: "OSS_ALIAS"
+# Arguments     : OSS_ALIAS
+# Return Values : 0 = Success (OSS monitor script stopped)
+#                 1 = Failure
+#
+stop_OSS_tunnel_monitor()
+{
+    local OSS_NAME
+    local pid_of_OSS_MONITOR
+    if [[ -n "${1}" ]]; then
+        OSS_NAME=${1}
+    else
+        OSS_NAME=${OSS_ALIAS}
+    fi
+
+    pid_of_OSS_MONITOR=`$PS -ef |$GREP -vw grep | $GREP -w "connectd_${OSS_NAME}_monitor" | $AWK '{print $2 }'`
+    if [ ! "${pid_of_OSS_MONITOR}" ]; then
+        return 0
+    fi
+
+    logit "WARNING:: Stopping connectd monitor script for ${OSS_NAME}"
+    $KILL -USR2 ${pid_of_OSS_MONITOR}  >> /dev/null 2>&1 # USR2 = user defined (shutdown and exit) signal
+
+    sleep_function 10
+
+    pid_of_OSS_MONITOR=`$PS -ef |$GREP -vw grep | $GREP -w "connectd_${OSS_NAME}_monitor" | $AWK '{print $2 }'`
+    if [ "${pid_of_OSS_MONITOR}" ]; then
+        $KILL -KILL ${pid_of_OSS_MONITOR} >> /dev/null 2>&1
+        return 1
+    else
+        logit "Stopped connectd monitor script for ${OSS_NAME}"
+        return 0
+    fi
+}
+
+
+### Function: trap_shutdown_and_exit ###
+#
+# Shutdown and Exit is called by trapping the USR2 or any of the Terminate interrupts
+# Stops ALL ConnectD monitor scripts and exits
+#
+trap_shutdown_and_exit()
+{
+    local return_status
+
+    if [[ -n "${1}" ]]; then
+        return_status=${1}
+    else
+        return_status=1
+    fi
+
+    logit "INFO:: Trapped a SHUTDOWN ALL connectd interrupt"
+    stop_all_tunnel_monitor_scripts
+
+    logit "INFO:: Terminating connectd daemon"
+    exit ${return_status}
+}
+
+
+# **********************************************************************
+#
+# ********************** Main body of program  *************************
+#
+# **********************************************************************
+#
+logit "======================================================================="
+logit "******** Starting connectd monitor daemon for  ${SERVER_HOSTNAME} ******"
+logit "=======================================================================\n"
+#
+#****************************** Pre setup checks.**************************
+#
+# Check that the effective id of the user is root
+check_id root
+if [[ ${?} -ne 0 ]]; then
+    logit "ERROR:: You must be ROOT to execute Script $0 - exiting."
+    # SERVICE_EXIT_ERR_PERM     100
+    exit 100
+fi
+
+# Determine absolute path to software
+get_absolute_path
+cd ${SCRIPTHOME}
+
+# Check that I have all required templates.
+check_templates_dir
+if [[ ${?} -ne 0 ]]; then
+    logit "ERROR:: All required templates not found; Exiting."
+    # SERVICE_EXIT_ERR_CONFIG=96
+    # Unrecoverable configuration error. SMF will not restart.
+    exit 96
+fi
+
+#ulimit -n 2048
+
+trap "restart_all_tunnel_monitor_scripts" USR1 INT HUP  # Restart all connectD scripts
+trap "trap_shutdown_and_exit 0" USR2   # Stops connectD monitor script
+trap "trap_shutdown_and_exit 1" QUIT TERM ABRT TSTP # Stops connectD monitor scripts
+
+
+#
+# *************** Setup and Monitor connectD monitor for each OSS/SFS ****************
+#
+# local variables; Alias for OSS that we are working on
+ALIAS=""
+CONN_TYPE=""
+MONITOR_SCRIPT=""
+ENM_TYPE=""
+
+# Continueous loop to monitor 'connectd monitor scripts'
+# Loop repeats every ${SLEEP_TIME} seconds
+while true; do
+    #Get list of OSS Directories
+    LIST_OF_NODE_ALIAS=`${LS}  ${MOUNT_INFO_DIR} | $EGREP "eniq"`
+    for ALIAS in  ${LIST_OF_NODE_ALIAS}; do
+
+        if [ -s ${MOUNT_INFO_DIR}${ALIAS}/enm_type ]; then
+            ENM_TYPE=`$CAT ${MOUNT_INFO_DIR}${ALIAS}/enm_type`
+            if [ -z "${ENM_TYPE}" ]; then
+                logit "ERROR:: Error getting ENM_TYPE for ${ALIAS}"
+            fi
+            if [ "${ENM_TYPE}" == "cENM" ]; then
+                logit "INFO:: Successfully skipping creation of connectd monitor scripts for ${ALIAS} as ENM_TYPE=cENM"
+                continue
+            fi
+        fi
+
+                # Each OSS that we monitor has its own connectd monitor script created from a template
+                MONITOR_SCRIPT=connectd_${ALIAS}_monitor
+
+                _NODE_=`$ECHO ${ALIAS}|$AWK -F"_" '{print $2}'`
+
+                if [ "${_NODE_}" == "soem" ]; then
+                        CONN_TYPE="SOEM"
+                else
+                        CONN_TYPE="OSS"
+                fi
+
+                # Check if this OSS should be Disabled by presence of ${DISABLE_OSS} file.
+                if [ -f ${MOUNT_INFO_DIR}${ALIAS}/${DISABLE_NODE_STR}${CONN_TYPE} ]; then
+                    # Get the creation date of disable_${CONN_TYPE} file
+                    _disable_file_date_=`$LS -l --time-style='+%d %B %Y %H:%M:%S' ${MOUNT_INFO_DIR}${ALIAS}/${DISABLE_NODE_STR}${CONN_TYPE} | $AWK '{print $7,$6,$8,$9}'`
+
+                    # ***** The OSS Tunnel monitor should be disabled for this OSS *****
+                    # Check if the OSS_monitor process is already running.
+                    $PS -ef | $GREP -vw grep | $GREP -w "${MONITOR_SCRIPT}" >> /dev/null 2>&1
+                    if [[ $? -eq 0 ]]; then
+                        logit "INFO: File ${MOUNT_INFO_DIR}${ALIAS}/${DISABLE_NODE_STR}${CONN_TYPE} exists which was created on $_disable_file_date_"
+                        stop_OSS_tunnel_monitor ${ALIAS}
+                        if [ ${?} -eq 0 ]; then
+                            logit "INFO:: Successfully stopped connectd monitor scripts for ${ALIAS}"
+                        else
+                            logit "ERROR:: Error stopping connectd monitor scripts for ${ALIAS}"
+                        fi
+                    fi
+                    #Delete the monitor script for the
+                    if [ -f ${TEMP}${MONITOR_SCRIPT} ]; then
+                        $RM ${TEMP}${MONITOR_SCRIPT} >> /dev/null 2>&1
+                    fi
+                else
+                    # ***** The OSS ConnectD monitor should be Enabled for this OSS *****
+                    # Check if OSS_monitor process is already running.
+                    $PS -ef | $GREP -vw grep | $GREP -w "${MONITOR_SCRIPT}" >> /dev/null 2>&1
+                    if [[ $? -ne 0 ]]; then
+                        logit "INFO: File ${MOUNT_INFO_DIR}${ALIAS}/${DISABLE_NODE_STR}${CONN_TYPE} does not exist on the server."
+                        # monitor process not started; so start it.
+                        start_OSS_tunnel_monitor ${ALIAS}
+                        if [ ${?} -eq 0 ]; then
+                            logit "INFO:: Successfully started connectd monitor scripts for ${ALIAS}"
+                        else
+                            logit "ERROR:: Error starting connectd monitor scripts for ${ALIAS}"
+                        fi
+                    fi
+                fi
+
+
+    done # end of for each OSS in list of OSSes loop
+         sleep_function $SLEEP_TIME  # Loop repeats every ${SLEEP_TIME} seconds
+done     # End of while true loop. This monitor deamon should never end
+
+exit 1
+

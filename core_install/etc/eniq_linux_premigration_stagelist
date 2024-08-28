@@ -1,0 +1,10 @@
+get_migration_data
+create_snapshots
+create_nas_fs
+remote_premigration
+backup_iqheader
+backup_nas_data
+backup_zfs_data
+backup_root_data
+disconnect_storage
+cleanup_premigration

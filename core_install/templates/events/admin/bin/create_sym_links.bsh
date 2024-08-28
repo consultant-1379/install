@@ -1,0 +1,628 @@
+#!/bin/bash
+# ********************************************************************
+# Ericsson Radio Systems AB                                     SCRIPT
+# ********************************************************************
+#
+#
+# (c) Ericsson Radio Systems AB 2012 - All rights reserved.
+#
+# The copyright to the computer program(s) herein is the property
+# of Ericsson Radio Systems AB, Sweden. The programs may be used 
+# and/or copied only with the written permission from Ericsson Radio 
+# Systems AB or in accordance with the terms and conditions stipulated 
+# in the agreement/contract under which the program(s) have been 
+# supplied.
+#
+# ********************************************************************
+# Name    : create_sym_links.bsh
+# Date    : 19/10/2012
+# Revision: C.1
+# Purpose : This script will create the sybase database sym links
+#
+# Usage   : create_sym_links.bsh [ -l <path_to_logfile> ] [ -N ] -q
+#           
+# ********************************************************************
+#
+# 	Command Section
+#
+# ********************************************************************
+AWK=/usr/bin/awk
+BASENAME=/usr/bin/basename
+CAT=/usr/bin/cat
+CHMOD=/usr/bin/chmod
+CHOWN=/usr/bin/chown
+CLEAR=/usr/bin/clear
+CMP=/usr/bin/cmp
+CP=/usr/bin/cp
+CPIO=/usr/bin/cpio
+DATE=/usr/bin/date
+DIRNAME=/usr/bin/dirname
+DOMAINNAME=/usr/bin/domainname
+DTCONFIG=/usr/dt/bin/dtconfig
+ECHO=/usr/bin/echo
+EGREP=/usr/bin/egrep
+EJECT=/usr/bin/eject
+ENV=/usr/bin/env
+EXPR=/usr/bin/expr
+FIND=/usr/bin/find
+FLARCREATE=/usr/sbin/flarcreate
+FORMAT=/usr/sbin/format
+FUSER=/usr/sbin/fuser
+GETENT=/usr/bin/getent
+GETTEXT=/usr/bin/gettext
+GREP=/usr/bin/grep
+GROUPADD=/usr/sbin/groupadd
+GTAR=/usr/sfw/bin/gtar
+GZCAT=/usr/bin/gzcat
+HEAD=/usr/bin/head
+HOSTNAME=/usr/bin/hostname
+ID=/usr/bin/id
+INIT=/usr/sbin/init
+LN=/usr/bin/ln
+LS=/usr/bin/ls
+MKDIR=/usr/bin/mkdir
+MORE=/usr/bin/more
+MOUNT=/usr/sbin/mount
+MV=/usr/bin/mv
+NAWK=/usr/bin/nawk
+PGREP=/usr/bin/pgrep
+PING=/usr/sbin/ping
+PKGADD=/usr/sbin/pkgadd
+PKGINFO=/usr/bin/pkginfo
+PRTCONF=/usr/sbin/prtconf
+PSRINFO=/usr/sbin/psrinfo
+PWD=/usr/bin/pwd
+RM=/usr/bin/rm
+RCP=/usr/bin/rcp
+RSH=/usr/bin/rsh
+SED=/usr/bin/sed
+SLEEP=/usr/bin/sleep
+SORT=/usr/bin/sort
+SPLIT=/usr/bin/split
+SU=/usr/bin/su
+SVCADM=/usr/sbin/svcadm
+SVCCFG=/usr/sbin/svccfg
+SVCS=usr/bin/svcs
+SWAP=/usr/sbin/swap
+SYNC=/usr/sbin/sync
+TAIL=/usr/bin/tail
+TEE=/usr/bin/tee
+TOUCH=/usr/bin/touch
+TPUT=/usr/bin/tput
+UADMIN=/usr/sbin/uadmin
+UNAME=/usr/bin/uname
+UNIQ=/usr/bin/uniq
+USERADD=/usr/sbin/useradd
+VOLD=/usr/sbin/vold
+WC=/usr/bin/wc
+XARGS=/usr/bin/xargs
+ZFS=/usr/sbin/zfs
+ZPOOL=/usr/sbin/zpool
+
+
+# ********************************************************************
+#
+#       Configuration Section
+#
+# ********************************************************************
+# Flag to determine whether to compress log or not (Must be y/n)
+COMPRESS_LOG=n
+
+# Name of SunOS & ENIQ ini Files
+ENIQ_ENV=niq.rc
+ENIQ_INI=niq.ini
+DWH_INI=dwh.ini
+SUNOS_INI=SunOS.ini
+STORAGE_INI=storage.ini
+
+# Number of log files to keep
+NUM_LOGS=10
+
+# Size in kbytes that the log file is allowed to grow to
+SIZE_LOGS=204800
+
+LOG_RETENTION=60
+
+# ********************************************************************
+#
+#       Pre-execution Operations
+#
+# ********************************************************************
+unset SNAP_QUIET
+
+# ********************************************************************
+#
+# 	functions
+#
+# ********************************************************************
+### Function: abort_script ###
+#
+#   This will is called if the script is aborted thru an error
+#   error signal sent by the kernel such as CTRL-C or if a serious
+#   error is encountered during runtime
+#
+# Arguments:
+#       $1 - Error message from part of program (Not always used)
+# Return Values:
+#       none
+abort_script()
+{
+if [ "$1" ]; then
+    _err_msg_=$1
+else
+    _err_msg_="Script aborted.......\n"    
+fi
+
+# Check if log_msg() is defined, else define log()
+type log_msg > /dev/null 2>&1
+if [ $? -gt 0 ]; then
+    if [ "${LOGFILE}" ]; then
+	if [ ! "${SNAP_QUIET}" ]; then
+	    $ECHO "\n${_err_msg_}\n" |$TEE -a ${LOGFILE}
+	else
+	    $ECHO "\n${_err_msg_}\n" >> ${LOGFILE}
+        fi
+    else
+	$ECHO "\n${_err_msg_}\n"
+    fi
+else
+    if [ "${LOGFILE}" ]; then
+	log_msg -s "\n${_err_msg_}\n" -l ${LOGFILE} ${SNAP_QUIET}
+    else
+	log_msg -s "\n${_err_msg_}\n" ${SNAP_QUIET}
+    fi
+fi
+
+cd $SCRIPTHOME
+
+$RM -rf  ${TEM_DIR}
+
+if [ "$2" ]; then
+    exit ${2}
+else
+   exit 1
+fi
+}
+
+### Function: check_id ###
+#
+#   Check that the effective id of the user is correct
+#   If not print error msg and exit.
+#
+# Arguments:
+#       $1 : User ID name
+# Return Values:
+#       none
+check_id()
+{
+_check_id_=`$ID  | $AWK -F\( '{print $2}' | $AWK -F\) '{print $1}'`
+if [ "$_check_id_" != "$1" ]; then
+    _err_msg_="You must be $1 to execute this script."
+    abort_script "$_err_msg_"
+fi
+}
+
+### Function: chk_create_logfile ###
+#
+# Check/Create Logfile
+#
+# Arguments:
+#	none
+# Return Values:
+#	none
+chk_create_logfile()
+{
+$MKDIR -p `$DIRNAME ${LOGFILE}`
+if [ $? -ne 0 ]; then
+    unset LOGFILE
+    _err_msg_="Could not create directory `$DIRNAME ${LOGFILE}`"
+     abort_script "$_err_msg_"
+fi	
+
+$TOUCH -a ${LOGFILE}
+if [ $? -ne 0 ]; then
+    unset LOGFILE
+    _err_msg_="Could not write to file ${LOGFILE}"
+    abort_script "$_err_msg_"
+fi	
+
+if [ -s ${LOGFILE} ]; then
+    $ECHO "\n\n" >> ${LOGFILE}
+fi
+$ECHO "----------------------------------------------------------------" >> ${LOGFILE}
+$ECHO "----------------------------------------------------------------" >> ${LOGFILE}
+$ECHO "Sybase sym link creation started at ${RUN_TIME}\n" >> ${LOGFILE}
+}
+
+### Function: create_sys_main_links ###
+#
+# Create sys main sym link
+#
+# Arguments:
+#	none
+# Return Values:
+#	none
+create_sys_main_links()
+{
+$ECHO "\nGathering DWH_SYSTEM_MAIN info from ${CONF_DIR}/${DWH_INI}\n" | $TEE -a ${LOGFILE}
+
+MSTOREPATH=`iniget DWH_SYSTEM_MAIN -v Raw_Device -f ${CONF_DIR}/${DWH_INI}`
+MSTOREDB=`iniget DWH_SYSTEM_MAIN -v DBfile -f ${CONF_DIR}/${DWH_INI}`
+if [ ! "${MSTOREDB}" -o ! "${MSTOREPATH}" ]; then
+	_err_msg_="Could not read main dbspaces values from ${CONF_DIR}/${DWH_INI}"
+	abort_script "$_err_msg_"
+fi
+
+$ECHO "Changing ownership of ${MSTOREPATH} to ${_SYSUSER_}:${_sysgrp_}" >> ${LOGFILE}
+$CHOWN -R ${_sysuser_}:${_sysgrp_} ${MSTOREPATH}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not change ownership of ${MSTOREPATH} to ${_SYSUSER_}:${_sysgrp_}"
+    abort_script "$_err_msg_" "${EXEC_SHELL_CMD}"
+fi
+	
+$ECHO "Changing permissions of ${MSTOREPATH} to -rwxrwxr-x" >> ${LOGFILE}
+$CHMOD 775 ${MSTOREPATH}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not change permissions of ${MSTOREPATH} to -rwxrwxr-x"
+    abort_script "$_err_msg_" "${EXEC_SHELL_CMD}"
+fi
+
+# Check for the sym links
+if [ -L ${MSTOREDB} ]; then
+	$ECHO "Sym Link for ${MSTOREDB} already exists. We'll delete it so it can be recreated." | $TEE -a ${LOGFILE}
+        $RM -rf ${MSTOREDB}
+        if [ $? -ne 0 ]; then
+            _err_msg_="Could not delete sym link ${MSTOREDB}"
+            abort_script "$_err_msg_" "${EXEC_SHELL_CMD}"
+        fi
+fi
+
+$ECHO "Creating Sym link ${MSTOREPATH} --> ${MSTOREDB}" | $TEE -a ${LOGFILE}
+$LN -s ${MSTOREPATH} ${MSTOREDB}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not create Sym link ${MSTOREPATH} --> ${MSTOREDB}"
+    abort_script "$_err_msg_" "${EXEC_SHELL_CMD}"
+else
+    $ECHO "Sym link ${MSTOREPATH} --> ${MSTOREDB} successfully created\n" | $TEE -a ${LOGFILE}
+fi
+	
+}
+
+### Function: create_main_db_links ###
+#
+# Create main db sym links
+#
+# Arguments:
+#	none
+# Return Values:
+#	none
+create_main_db_links()
+{
+$ECHO "\nGathering DWH_DBSPACES_MAIN info from ${CONF_DIR}/${DWH_INI}\n" | $TEE -a ${LOGFILE}
+
+_dbfile_list_=`iniget DWH_DBSPACES_MAIN -f ${CONF_DIR}/${DWH_INI}`
+if [ "${_dbfile_list_}" ]; then
+    for _space_ in ${_dbfile_list_}; do
+	_raw_device_=`iniget ${_space_} -f ${CONF_DIR}/${DWH_INI} -v Raw_Device`
+        _dbfile_=`iniget ${_space_} -f ${CONF_DIR}/${DWH_INI} -v DBfile`
+	if [ ! "${_raw_device_}" -o ! "${_dbfile_}" ]; then
+            _err_msg_="Could not read values from ${CONF_DIR}/${DWH_INI}"
+	    abort_script "$_err_msg_"
+	fi
+		
+	$ECHO "Changing ownership of ${_raw_device_} to ${_SYSUSER_}:${_sysgrp_}" >> ${LOGFILE}
+	$CHOWN -R ${_sysuser_}:${_sysgrp_} ${_raw_device_}
+	if [ $? -ne 0 ]; then
+	    _err_msg_="Could not change ownership of ${_raw_device_} to ${_SYSUSER_}:${_sysgrp_}"
+	    abort_script "$_err_msg_" "${EXEC_SHELL_CMD}"
+	fi
+		
+	$ECHO "Changing permissions of ${_raw_device_} to -rwxrwxr-x" >> ${LOGFILE}
+	$CHMOD 775 ${_raw_device_}
+	if [ $? -ne 0 ]; then
+	    _err_msg_="Could not change permissions of ${_raw_device_} to -rwxrwxr-x"
+	    abort_script "$_err_msg_" "${EXEC_SHELL_CMD}"
+	fi
+
+        # Check for the sym links 
+	if [ -L ${_dbfile_} ]; then
+            $ECHO "Sym Link for ${_dbfile_} already exists. We'll delete it so it can be recreated." | $TEE -a ${LOGFILE}
+            $RM -rf ${_dbfile_}
+            if [ $? -ne 0 ]; then
+                _err_msg_="Could not delete sym link ${_dbfile_}"
+                abort_script "$_err_msg_" "${EXEC_SHELL_CMD}"
+            fi
+	fi
+        $ECHO "Creating Sym link ${_raw_device_} --> ${_dbfile_}" | $TEE -a ${LOGFILE}
+	$LN -s ${_raw_device_} ${_dbfile_}
+	if [ $? -ne 0 ]; then
+            _err_msg_="Failed to create Sym link ${_raw_device_} --> ${_dbfile_}"
+            abort_script "$_err_msg_" "${EXEC_SHELL_CMD}"
+	else
+            $ECHO "Sym link ${_raw_device_} --> ${_dbfile_} Successfully created\n" | $TEE -a ${LOGFILE}
+        fi	
+    done
+else
+    _err_msg_="Could not read DWH_DBSPACES_MAIN from ${CONF_DIR}/${DWH_INI}"
+    abort_script "$_err_msg_" "${EXEC_SHELL_CMD}"
+fi
+}
+
+### Function: create_temp_db_links ###
+#
+# Create temp db sym links
+#
+# Arguments:
+#	none
+# Return Values:
+#	none
+create_temp_db_links()
+{
+if [ "${CURR_SERVER_TYPE}" == "eniq_coordinator" -o "${CURR_SERVER_TYPE}" == "son_coordinator" -o "${CURR_SERVER_TYPE}" == "eniq_events" -o "${CURR_SERVER_TYPE}" == "eniq_iqw" ]; then
+    $ECHO "\nGathering COORDINATOR_DBSPACES_TEMP info from ${CONF_DIR}/${DWH_INI}\n" | $TEE -a ${LOGFILE}
+    _dbfile_list_=`iniget COORDINATOR_DBSPACES_TEMP -f ${CONF_DIR}/${DWH_INI}`
+else
+    # I must be a reader node
+    Server_Name=`/usr/bin/hostname`
+    IP_ADDRESS=`$GETENT hosts ${Server_Name} | $NAWK '{print $1}' | $SORT -u`
+
+    # Need to Determine which Reader am i.
+    _reader_num_=`$CAT ${CONF_DIR}/service_names | $GREP ${IP_ADDRESS} | $GREP dwh | $NAWK -F\:: '{print $3}' | $NAWK -F\_ '{print $NF}'`
+    if [ ! "${_reader_num_}" ]; then
+	_err_msg_="Could not read values from ${DWH_INI}"
+	abort_script "$_err_msg_"
+    fi
+
+    $ECHO "\nGathering DWH_DBSPACES_MAIN info from ${CONF_DIR}/${DWH_INI}\n" | $TEE -a ${LOGFILE}
+    _dbfile_list_=`iniget DWH_READER_${_reader_num_}_DBSPACES_TEMP -f ${CONF_DIR}/${DWH_INI}`
+fi
+
+if [ "${_dbfile_list_}" ]; then
+    for _space_ in ${_dbfile_list_}; do
+       _raw_device_=`iniget ${_space_} -f ${CONF_DIR}/${DWH_INI} -v Raw_Device`
+        _dbfile_=`iniget ${_space_} -f ${CONF_DIR}/${DWH_INI} -v DBfile`
+	if [ ! "${_raw_device_}" -o ! "${_dbfile_}" ]; then
+            _err_msg_="Could not read values from ${CONF_DIR}/${DWH_INI}"
+	    abort_script "$_err_msg_"
+	fi
+		
+	$ECHO "Changing ownership of ${_raw_device_} to ${_SYSUSER_}:${_sysgrp_}" >> ${LOGFILE}
+	$CHOWN -R ${_SYSUSER_}:${_sysgrp_} ${_raw_device_}
+	if [ $? -ne 0 ]; then
+	    _err_msg_="Could not change ownership of ${_raw_device_} to ${_SYSUSER_}:${_sysgrp_}"
+	    abort_script "$_err_msg_" "${EXEC_SHELL_CMD}"
+	fi
+		
+	$ECHO "Changing permissions of ${_raw_device_} to -rwxrwxr-x" >> ${LOGFILE}
+	$CHMOD 775 ${_raw_device_}
+	if [ $? -ne 0 ]; then
+	    _err_msg_="Could not change permissions of ${_raw_device_} to -rwxrwxr-x"
+	    abort_script "$_err_msg_" "${EXEC_SHELL_CMD}"
+	fi
+
+        # Check for the sym links 
+	if [ -L ${_dbfile_} ]; then
+            $ECHO "Sym Link for ${_dbfile_} already exists. We'll delete it so it can be recreated." | $TEE -a ${LOGFILE}
+            $RM -rf ${_dbfile_}
+            if [ $? -ne 0 ]; then
+                _err_msg_="Could not delete sym link ${_dbfile_}"
+                abort_script "$_err_msg_" "${EXEC_SHELL_CMD}"
+            fi
+	fi
+        $ECHO "Creating Sym link ${_raw_device_} --> ${_dbfile_}" | $TEE -a ${LOGFILE}
+	$LN -s ${_raw_device_} ${_dbfile_}
+	if [ $? -ne 0 ]; then
+            _err_msg_="Failed to create Sym link ${_raw_device_} --> ${_dbfile_}"
+            abort_script "$_err_msg_" "${EXEC_SHELL_CMD}"
+	else
+            $ECHO "Sym link ${_raw_device_} --> ${_dbfile_} Successfully created\n" | $TEE -a ${LOGFILE}
+        fi	
+    done
+else
+    _err_msg_="Could not read DBSPACES_TEMP from ${CONF_DIR}/${DWH_INI}"
+    abort_script "$_err_msg_" "${EXEC_SHELL_CMD}"
+fi
+}
+
+### Function: get_absolute_path ###
+#
+# Determine absolute path to software
+#
+# Arguments:
+#	none
+# Return Values:
+#	none
+get_absolute_path()
+{
+_dir_=`$DIRNAME $0`
+SCRIPTHOME=`cd $_dir_ 2>/dev/null && pwd || $ECHO $_dir_`
+}
+
+### Function: setup_env ###
+#
+# Setup up path environment etc
+#
+# Arguments:
+#	none
+# Return Values:
+#	none
+setup_env()
+{
+ENIQ_BASE_DIR=/eniq
+
+ADMIN_BIN=${ENIQ_BASE_DIR}/admin/bin
+
+ADMIN_SQL=${ENIQ_BASE_DIR}/admin/sql
+
+CONF_DIR=${ENIQ_BASE_DIR}/sw/conf
+
+BKUP_DIR=${ENIQ_BASE_DIR}/bkup_sw
+
+ENIQ_CONF_DIR=${ENIQ_BASE_DIR}/installation/config
+
+ENIQ_INST_DIR=${ENIQ_BASE_DIR}/installation
+
+# ENIQ Log Directory
+ENIQ_LOG_DIR=${ENIQ_BASE_DIR}/local_logs
+
+# Source the common functions
+if [ -s ${ENIQ_BASE_DIR}/admin/lib/common_functions.lib ]; then
+    . ${ENIQ_BASE_DIR}/admin/lib/common_functions.lib
+else
+    _err_msg_="File ${ENIQ_BASE_DIR}/admin/lib/common_functions.lib not found"
+    abort_script "$_err_msg_"
+fi
+
+# Get the System User/Group. All directories are owned by this
+_SYSUSER_=`iniget ENIQ_INSTALL_CONFIG -f ${ENIQ_CONF_DIR}/${SUNOS_INI} -v ENIQ_SYSUSER`
+if [ ! "${_SYSUSER_}" ]; then
+    _err_msg_="Could not read parameter ENIQ_SYSUSER from file ${ENIQ_CONF_DIR}/${SUNOS_INI}"
+    abort_script "$_err_msg_" "${EXEC_SHELL_CMD}"
+fi
+
+_sysgrp_=`$ID ${SYSUSER} | $NAWK '{print $2}' | $NAWK -F\( '{print $2}' | $NAWK -F\) '{print $1}'`
+if [ ! "${_sysgrp_}" ]; then
+    _err_msg_="Could not determine group ID of ${_sysgrp_}"
+    abort_script "$_err_msg_" "${EXEC_SHELL_CMD}"
+fi
+
+# Determine the current server type
+CURR_SERVER_TYPE=`$CAT $ENIQ_CONF_DIR/installed_server_type | $EGREP -v '^[     ]*#' | $SED -e 's/ //g'`
+if [ ! "${CURR_SERVER_TYPE}" ]; then
+        _err_msg_="Could not determine which server type this is"
+    abort_script "$_err_msg_"
+fi
+
+}
+
+### Function: user_confirm ###
+#
+# Get confirmation from user to proceed with snapshot action
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+user_confirm()
+{
+while :; do
+    unset USER_CONF
+    $CLEAR
+    $ECHO "\nAre you sure you wish to create/recreate the sybase sym link files"
+    $ECHO "Enter [Yes | No] (case sensitive) : \c"
+
+    read USER_CONF
+    if [ "$USER_CONF" == "Yes" -o "$USER_CONF" == "No" ]; then
+        break
+    fi
+done
+}
+
+# ********************************************************************
+#
+# 	Main body of program
+#
+# ********************************************************************
+#
+# Save the time of running. I do this here as I want all
+# dates and time to be the same
+RUN_TIME=`$DATE '+%Y-%m-%d_%H.%M.%S'`
+
+# Determine absolute path to software
+get_absolute_path
+
+# Check that the effective id of the user is root
+check_id root
+
+while getopts ":l:Nq" arg; do
+  case $arg in
+    l) LOGFILE="$OPTARG" 
+       ;;
+    N) NO_CONFIRM="YES"
+       ;;
+    q) SNAP_QUIET="-q"
+       ;;
+   \?) _err_msg_="`$BASENAME $0` [ -l <path_to_logfile> ] [ -N ] -q"
+       abort_script "$_err_msg_"
+       ;;
+  esac
+done
+shift `expr $OPTIND - 1`
+
+# Setup up path environment etc
+setup_env
+
+# Default Logfile location
+DEF_LOGFILE="${ENIQ_LOG_DIR}/iq/create_sym_links.log"
+
+# Set up default logfile if required
+if [ ! "${LOGFILE}" ]; then
+    LOGFILE="${DEF_LOGFILE}"
+fi
+
+# Check/Create Logfile
+chk_create_logfile
+    
+# Create a temporary Directory
+TEM_DIR=/tmp/create_sym_links.$$.$$
+$RM -rf ${TEM_DIR}
+$MKDIR -p ${TEM_DIR}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not create directory ${TEM_DIR}"
+    abort_script "$_err_msg_"
+fi	
+
+$CHMOD 777 ${TEM_DIR}
+
+if [ ! "$NO_CONFIRM" ]; then
+    user_confirm 
+    if [ $USER_CONF == No ]; then
+	$RM -rf ${TEM_DIR}
+	exit 0
+    fi
+fi
+
+# Need to shut down services before recreating the sym links
+$ECHO "Stopping all the ENIQ services "
+$BASH ${ADMIN_BIN}/manage_eniq_services.bsh -a stop -s ALL -N | $TEE -a ${LOGFILE}
+if [ $? -ne 0 ]; then
+    _err_msg_="Failed to stopped ENIQ services."
+    abort_script "$_err_msg_"
+fi
+
+# Set up the stages that I need to run to ensure ini files are upto date
+stage_list="add_storage update_disk_info"
+
+# Run required stages
+for i in ${stage_list}; do
+    $ECHO "\n`$DATE +%d.%m.%y_%H:%M:%S` - Running the core install stage $i\n"
+    ${ENIQ_INST_DIR}/core_install/bin/eniq_core_install.bsh -s ${i} -n 
+    if [ $? -ne 0 ]; then
+        _err_msg_="Error running stage ${i} during ENIQ restore"
+        abort_script "$_err_msg_"    
+    fi
+done
+
+create_sys_main_links
+create_main_db_links
+create_temp_db_links
+
+# Restart all the ENIQ services
+$ECHO "Starting all the ENIQ services "
+$BASH ${ADMIN_BIN}/manage_eniq_services.bsh -a start -s ALL -N | $TEE -a ${LOGFILE}
+if [ $? -ne 0 ]; then
+    _err_msg_="Failed to start ENIQ services."
+    abort_script "$_err_msg_"
+fi
+
+RUN_TIME=`$DATE '+%Y-%m-%d_%H.%M.%S'`
+$ECHO "\nSybase Sym link creation finished at ${RUN_TIME}" >> ${LOGFILE}
+$ECHO "----------------------------------------------------------------" >> ${LOGFILE}
+$ECHO "----------------------------------------------------------------" >> ${LOGFILE}
+
+
+# Rotate and compress the logs if necessary
+rotate_compress_logs ${LOGFILE} ${NUM_LOGS} ${SIZE_LOGS} ${COMPRESS_LOG}
+
+$RM -rf ${TEM_DIR}
+exit 0
